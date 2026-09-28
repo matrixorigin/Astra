@@ -1,0 +1,60 @@
+name: flash_spawn_prohibited_model_fail_closed
+description: |
+  Unhappy-path intent check: a user-only prohibition is not silently turned
+  into model inheritance or a substitute selection; the child is blocked.
+prompt: |
+  Call agent(action="spawn") exactly once with description "Prohibited model
+  check", agent_type "explore", and prompt "Reply exactly
+  PROHIBITED-MODEL-MUST-NOT-RUN". Do not use model glm-5.2 for this child;
+  that is a hard user prohibition, not a request to choose another model.
+  Leave requested_model_policy unset. Do not substitute a model, retry, or
+  call any other tool. Report why the child was not started. Do not call
+  Reflect.
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  # The parent may either submit the requested call and receive a fail-closed
+  # rejection, or refuse to submit an impossible call itself. Both outcomes
+  # prove the product safety invariant: no child was started.
+  - type: any_of
+    criteria:
+      - type: all_of
+        criteria:
+          - type: journal_tool_call_count
+            name: agent
+            min: 1
+            max: 1
+            document: arguments
+            path: /action
+            equals: spawn
+          - type: journal_tool_json
+            name: agent
+            document: result
+            path: /status
+            equals: failed
+          - type: journal_tool_json_contains
+            name: agent
+            document: result
+            path: /error_kind
+            contains: delegation_model_scope_unresolved
+      - type: all_of
+        criteria:
+          - type: journal_tool_call_count
+            name: agent
+            min: 0
+            max: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

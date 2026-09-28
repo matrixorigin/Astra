@@ -7,10 +7,10 @@
 use std::sync::Arc;
 
 use astra_turn_types::{
-    DurableToolReference, ResolvedSemanticCacheBaseline, ResolvedToolEffect,
-    ResolvedToolIdempotency, SemanticReadCacheContractError, SemanticReadCacheKey,
-    SemanticReadFreshnessContext, ToolInvocationContractError, ToolInvocationDecision,
-    ToolInvocationFingerprint,
+    DelegationModelAdmission, DurableToolReference, ResolvedSemanticCacheBaseline,
+    ResolvedToolEffect, ResolvedToolIdempotency, SemanticReadCacheContractError,
+    SemanticReadCacheKey, SemanticReadFreshnessContext, ToolInvocationContractError,
+    ToolInvocationDecision, ToolInvocationFingerprint,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -22,7 +22,7 @@ use super::tool_execution_binding::{
 };
 use super::tool_route_selection::ToolExecutionRouteKind;
 
-const DECISION_CONTRACT_VERSION: &str = "tool-dispatch-decision-v5";
+const DECISION_CONTRACT_VERSION: &str = "tool-dispatch-decision-v6";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct ToolInvocationDecisionSnapshot {
@@ -38,6 +38,8 @@ pub(crate) struct ToolInvocationDecisionSnapshot {
     pub semantic_cache: InvocationSemanticReadCacheDecision,
     pub permission_grant: Option<InvocationPermissionGrantSnapshot>,
     pub admission: ToolExecutionAdmissionSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_model_admission: Option<DelegationModelAdmission>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub runtime_process_authorization_required: bool,
     pub runtime_edge_dispatch_authorization_required: bool,
@@ -155,6 +157,36 @@ impl ToolInvocationDecisionSnapshot {
             .admission_snapshot
             .clone()
             .ok_or(ToolInvocationDecisionError::MissingAdmissionSnapshot)?;
+        let delegation_model_admission = request.policy.delegation_model_admission.clone();
+        if let Some(delegation) = &delegation_model_admission {
+            let expected_slots = delegation_slot_count(request).ok_or_else(|| {
+                ToolInvocationDecisionError::InvalidDelegationModelAdmission(
+                    "delegation model admission attached to an invalid delegation invocation"
+                        .to_string(),
+                )
+            })?;
+            delegation
+                .validate_identity(
+                    &request.tool_call_id,
+                    &astra_turn_types::canonical_public_arguments_hash(&request.args),
+                    delegation.source.control_epoch,
+                    expected_slots,
+                )
+                .map_err(|reason| {
+                    ToolInvocationDecisionError::InvalidDelegationModelAdmission(reason.to_string())
+                })?;
+            if delegation.source.user_id != request.user_id
+                || delegation.source.session_id != request.session_id
+                || delegation.source.run_id != request.run_id
+                || delegation.source.turn_chain_id != request.turn_chain_id
+            {
+                return Err(
+                    ToolInvocationDecisionError::InvalidDelegationModelAdmission(
+                        "delegation source does not match invocation identity".to_string(),
+                    ),
+                );
+            }
+        }
         if request.policy.semantic_read_freshness.is_some()
             || request.policy.semantic_read_condition.is_some()
         {
@@ -167,6 +199,7 @@ impl ToolInvocationDecisionSnapshot {
         transport_policy.resolved_provider_policy = None;
         transport_policy.permission_grant = None;
         transport_policy.admission_snapshot = None;
+        transport_policy.delegation_model_admission = None;
         transport_policy.semantic_read_freshness = None;
         transport_policy.semantic_read_condition = None;
 
@@ -222,6 +255,7 @@ impl ToolInvocationDecisionSnapshot {
                 }
             }),
             admission,
+            delegation_model_admission,
             runtime_process_authorization_required: request.runtime_process_authorization_required,
             runtime_edge_dispatch_authorization_required: request
                 .runtime_edge_dispatch_authorization_required,
@@ -230,6 +264,61 @@ impl ToolInvocationDecisionSnapshot {
 
     pub(crate) fn decision_id(&self) -> Result<String, ToolInvocationDecisionError> {
         Ok(self.durable()?.decision_id)
+    }
+
+    pub(crate) fn validate_frozen_delegation(
+        &self,
+        request: &ToolExecutionRequest,
+        admitted_control: Option<(i64, u64)>,
+    ) -> Result<(), ToolInvocationDecisionError> {
+        let Some(delegation) = &self.delegation_model_admission else {
+            if request.policy.delegation_model_admission.is_some() {
+                return Err(
+                    ToolInvocationDecisionError::InvalidDelegationModelAdmission(
+                        "frozen decision omitted proposed delegation admission".to_string(),
+                    ),
+                );
+            }
+            return Ok(());
+        };
+        let expected_slots = delegation_slot_count(request).ok_or_else(|| {
+            ToolInvocationDecisionError::InvalidDelegationModelAdmission(
+                "frozen admission is not a delegation invocation".to_string(),
+            )
+        })?;
+        let epoch = admitted_control
+            .and_then(|(epoch, generation)| {
+                (generation == delegation.source.owner_generation)
+                    .then(|| usize::try_from(epoch).ok())
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                ToolInvocationDecisionError::InvalidDelegationModelAdmission(
+                    "delegation has no current durable control admission".to_string(),
+                )
+            })?;
+        delegation
+            .validate_identity(
+                &request.tool_call_id,
+                &astra_turn_types::canonical_public_arguments_hash(&request.args),
+                epoch,
+                expected_slots,
+            )
+            .map_err(|reason| {
+                ToolInvocationDecisionError::InvalidDelegationModelAdmission(reason.to_string())
+            })?;
+        if delegation.source.user_id != request.user_id
+            || delegation.source.session_id != request.session_id
+            || delegation.source.run_id != request.run_id
+            || delegation.source.turn_chain_id != request.turn_chain_id
+        {
+            return Err(
+                ToolInvocationDecisionError::InvalidDelegationModelAdmission(
+                    "frozen delegation source does not match invocation identity".to_string(),
+                ),
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn durable(&self) -> Result<ToolInvocationDecision, ToolInvocationDecisionError> {
@@ -366,12 +455,28 @@ impl ToolInvocationDecisionSnapshot {
             }
         });
         request.policy.admission_snapshot = Some(self.admission.clone());
+        request.policy.delegation_model_admission = self.delegation_model_admission.clone();
         request.policy.semantic_read_freshness = None;
         request.policy.semantic_read_condition = None;
         request.runtime_process_authorization_required =
             self.runtime_process_authorization_required;
         request.runtime_edge_dispatch_authorization_required =
             self.runtime_edge_dispatch_authorization_required;
+    }
+}
+
+fn delegation_slot_count(request: &ToolExecutionRequest) -> Option<usize> {
+    match (
+        request.tool_name.as_str(),
+        request.args.get("action")?.as_str()?,
+    ) {
+        ("agent", "spawn") => Some(1),
+        ("agent_fanout", "start") => {
+            let count = usize::try_from(request.args.get("target_count")?.as_u64()?).ok()?;
+            let slots = request.args.get("slots")?.as_array()?;
+            (count == slots.len() && (1..=16).contains(&count)).then_some(count)
+        }
+        _ => None,
     }
 }
 
@@ -443,6 +548,8 @@ pub(crate) enum ToolInvocationDecisionError {
     },
     #[error("tool invocation is missing its frozen admission snapshot")]
     MissingAdmissionSnapshot,
+    #[error("invalid delegation model admission: {0}")]
+    InvalidDelegationModelAdmission(String),
     #[error("serialize tool invocation decision: {0}")]
     Serialization(String),
     #[error("unsupported tool invocation decision contract version '{0}'")]
@@ -471,7 +578,8 @@ mod tests {
         ProviderApprovalBaseline, ResolvedInvocationPolicy,
     };
     use astra_turn_types::{
-        NativeToolId, ProviderBindingRef, ResolvedToolDescriptorRef, SemanticFreshnessFact,
+        DelegationModelAdmissionOutcome, DelegationModelInstructionSource, NativeToolId,
+        ProviderBindingRef, ResolvedToolDescriptorRef, SemanticFreshnessFact,
         SemanticFreshnessScope, ToolIdentity,
     };
     use serde_json::json;
@@ -581,6 +689,82 @@ mod tests {
             first.canonical_arguments_hash,
             second.canonical_arguments_hash
         );
+    }
+
+    #[test]
+    fn delegation_admission_is_frozen_and_never_serialized_as_transport_policy() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut request = request();
+        request.tool_name = "agent".to_string();
+        request.args = json!({"action": "spawn", "task": "review"});
+        request.policy.delegation_model_admission = Some(DelegationModelAdmission {
+            source: DelegationModelInstructionSource {
+                user_id: request.user_id.clone(),
+                session_id: request.session_id.clone(),
+                run_id: request.run_id.clone(),
+                turn_chain_id: request.turn_chain_id.clone(),
+                owner_generation: 1,
+                control_epoch: 2,
+                applied_intent_id: None,
+                session_turn: 1,
+                user_intent_digest: "sha256:intent".to_string(),
+            },
+            invocation_id: request.tool_call_id.clone(),
+            arguments_digest: astra_turn_types::canonical_public_arguments_hash(&request.args),
+            child_requirements: vec![Default::default()],
+            outcome: DelegationModelAdmissionOutcome::ExplicitlyUnconstrained { slot_count: 1 },
+        });
+        let snapshot = ToolInvocationDecisionSnapshot::resolve(
+            &request,
+            ToolExecutionRouteKind::ServerLocal,
+            &registry,
+        )
+        .unwrap();
+        assert!(
+            snapshot
+                .transport_policy
+                .delegation_model_admission
+                .is_none()
+        );
+        let durable = snapshot.durable().unwrap();
+        let restored = ToolInvocationDecisionSnapshot::from_durable(&durable).unwrap();
+        assert!(
+            restored
+                .validate_frozen_delegation(&request, Some((2, 1)))
+                .is_ok()
+        );
+        assert!(
+            restored
+                .validate_frozen_delegation(&request, Some((3, 1)))
+                .is_err()
+        );
+        assert!(
+            restored
+                .validate_frozen_delegation(&request, Some((2, 2)))
+                .is_err()
+        );
+        assert!(restored.validate_frozen_delegation(&request, None).is_err());
+        assert_eq!(
+            restored.delegation_model_admission,
+            request.policy.delegation_model_admission
+        );
+        let mut replay = request.clone();
+        replay.policy.delegation_model_admission = None;
+        restored.apply_to_request(&mut replay);
+        assert_eq!(
+            replay.policy.delegation_model_admission,
+            request.policy.delegation_model_admission
+        );
+
+        request.args["task"] = json!("different task");
+        assert!(matches!(
+            ToolInvocationDecisionSnapshot::resolve(
+                &request,
+                ToolExecutionRouteKind::ServerLocal,
+                &registry
+            ),
+            Err(ToolInvocationDecisionError::InvalidDelegationModelAdmission(_))
+        ));
     }
 
     #[test]

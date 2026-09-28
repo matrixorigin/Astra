@@ -2019,7 +2019,7 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
     use astra_services::model_routing::{DECISION_KEY, EVENT_TYPE, ModelRoutingDecision};
     use astra_turn_types::model_routing::{AutoModelRoutingPolicy, ModelRoutingReason};
     let decision = ModelRoutingDecision {
-        schema_version: 1,
+        schema_version: 2,
         features: None,
         policy_version: "easy-read-only-v1".into(),
         policy: AutoModelRoutingPolicy {
@@ -2033,6 +2033,8 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
         assessment: None, reason: ModelRoutingReason::EasyReadOnly,
         work_admission: Some(astra_services::parse_work_admission_response(r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary"}"#).unwrap()),
         work_admission_skill_revision: 0,
+        delegation_model_requirement: None,
+        delegation_model_source: None,
     };
     let event =
         json!({"event_type": EVENT_TYPE, "idempotency_key": DECISION_KEY, "data": decision});

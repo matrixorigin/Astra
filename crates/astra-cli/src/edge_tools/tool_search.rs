@@ -12,13 +12,13 @@ use serde_json::Value;
 use super::{ToolExecutor, local_tool_schemas};
 
 impl ToolExecutor {
-    pub(super) fn tool_search(&self, args: &Value) -> String {
+    pub(super) fn tool_search(&self, args: &Value) -> astra_tools::ToolResult {
         let Some(allowed_names) = self.current_searchable_tool_names() else {
-            return astra_tools::tool_search::tool_search(&[], args);
+            return astra_tools::tool_search::tool_search_result(&[], args);
         };
         let mut pool = local_tool_schemas();
         pool.extend(self.provider_owned_schemas_snapshot("provider_owned_schemas_tool_search"));
         retain_tool_schemas_by_names(&mut pool, &allowed_names);
-        astra_tools::tool_search::tool_search(&pool, args)
+        astra_tools::tool_search::tool_search_result(&pool, args)
     }
 }

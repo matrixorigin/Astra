@@ -11,6 +11,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const SELECT_DESCRIPTION_MAX_CHARS: usize = 220;
+/// Selection evidence must reach the model whole. The server and CLI mark a
+/// successful selection as source-bounded instead of applying generic 8K
+/// truncation; oversized batches fail atomically and can be selected in
+/// smaller groups.
+pub const MAX_SELECTION_RESULT_BYTES: usize = 16_000;
 const TOOL_RESULT_STATUS_COMPLETED: &str = "completed";
 const TOOL_RESULT_STATUS_FAILED: &str = "failed";
 
@@ -118,13 +123,42 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         });
         let message = select_message(outcome, &result);
         add_tool_search_guidance(&mut result, outcome, message);
-        return result.to_string();
+        let output = result.to_string();
+        return if output.len() <= MAX_SELECTION_RESULT_BYTES {
+            output
+        } else {
+            tool_search_error("Selection contract is too large to present completely; select fewer tools at once.").to_string()
+        };
     }
 
     tool_search_error(
         "'query' must use select:NAME or select:NAME1,NAME2; intent matching is not performed",
     )
     .to_string()
+}
+
+/// Shared server/CLI/default-executor result contract. Only a complete,
+/// producer-bounded selection is presented inline and can become activation
+/// evidence; an oversized or malformed request is an ordinary tool failure.
+pub fn tool_search_result(schemas: &[Value], args: &Value) -> crate::ToolResult {
+    let output = tool_search(schemas, args);
+    let completed = serde_json::from_str::<Value>(&output)
+        .ok()
+        .is_some_and(|value| value["status"] == TOOL_RESULT_STATUS_COMPLETED);
+    if !completed {
+        crate::ToolResult::error(output)
+    } else {
+        crate::ToolResult::text(output).with_source_bounded_model_projection()
+    }
+}
+
+pub fn selection_presentation_failure() -> crate::ToolResult {
+    crate::ToolResult::error(
+        tool_search_error(
+            "Selection result could not be delivered intact; select fewer tools or retry.",
+        )
+        .to_string(),
+    )
 }
 
 pub use astra_core::tool_schema::tool_schema_name;
@@ -1133,11 +1167,11 @@ mod tests {
         let fanout = &parsed["matches"][0];
         let desc = fanout["description"].as_str().unwrap_or_default();
         assert!(
-            desc.contains("exactly that many slots")
+            desc.contains("target_count slots")
                 && desc.contains("description+prompt")
-                && desc.contains("never embed diffs")
-                && desc.contains("no brief/agents/background"),
-            "selection summary must keep the current fanout shape and shared-workspace constraints: {desc}"
+                && desc.contains("atomic")
+                && desc.contains("Hard requirements cannot be overridden"),
+            "selection summary must keep the current fanout admission contract: {desc}"
         );
 
         let result = tool_search(&schemas, &json!({"query": "select:agent"}));
@@ -1146,10 +1180,69 @@ mod tests {
         let desc = agent["description"].as_str().unwrap_or_default();
         assert!(
             desc.contains("description+prompt")
-                && desc.contains("agent_id")
-                && desc.contains("foreground")
-                && desc.contains("run_chain"),
+                && desc.contains("launched")
+                && desc.contains("parent continues")
+                && desc.contains("list: status")
+                && desc.contains("get_result: result"),
             "selection summary must keep agent action constraints: {desc}"
+        );
+    }
+
+    #[test]
+    fn agent_selection_is_complete_within_source_bound() {
+        let schemas = crate::schemas::all_tool_schemas();
+        for query in [
+            "select:agent",
+            "select:agent_fanout",
+            "select:agent,agent_fanout",
+        ] {
+            let selected = tool_search(&schemas, &json!({"query": query}));
+            let parsed: Value = serde_json::from_str(&selected).unwrap();
+            assert_eq!(parsed["selection_status"], "ok", "{query}: {parsed}");
+            assert!(
+                selected.len() <= super::MAX_SELECTION_RESULT_BYTES,
+                "{query} exceeds the source-bounded presentation: {} bytes",
+                selected.len()
+            );
+            let result = super::tool_search_result(&schemas, &json!({"query":query}));
+            assert!(!result.is_error);
+            assert_eq!(result.output, selected);
+            assert_eq!(
+                crate::model_result_presentation(result.metadata.as_ref()),
+                crate::ModelResultPresentation::SourceBounded
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_selection_fails_atomically_without_activation_evidence() {
+        let schemas = (0..100)
+            .map(|index| {
+                json!({"type":"function","function":{
+                    "name":format!("tool_{index}"),
+                    "description":"bounded selection test",
+                    "parameters":{"type":"object","properties":{
+                        "value":{"type":"string","enum":["x".repeat(200)]}
+                    }}
+                }})
+            })
+            .collect::<Vec<_>>();
+        let query = format!(
+            "select:{}",
+            (0..100)
+                .map(|index| format!("tool_{index}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let result = super::tool_search_result(&schemas, &json!({"query":query}));
+        assert!(result.is_error);
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["status"], "failed");
+        assert!(parsed.get("matches").is_none());
+        assert!(result.output.len() <= super::MAX_SELECTION_RESULT_BYTES);
+        assert_eq!(
+            crate::model_result_presentation(result.metadata.as_ref()),
+            crate::ModelResultPresentation::Generic
         );
     }
 

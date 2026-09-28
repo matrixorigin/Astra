@@ -64,6 +64,14 @@ completion under its inference contract; it does not prove task correctness.
 Cost evaluation must respect the usage-coverage contract in
 [observation-plane.md](observation-plane.md#model-request-attribution-and-usage).
 
+An Auto routing decision that reuses a Work judgment also retains that
+judgment's child-model requirement and authenticated user-intent identity.
+Recovery may rebind it to a new run-owner generation and advanced event cursor
+only when the user, session, run, turn chain, and instruction digest still match. Missing or changed
+source evidence fails closed; a restored `not_applicable` answer cannot erase a
+previously positive child-model requirement. This remains one durable routing
+fact, not a second judgment or database projection.
+
 ## Escalation
 
 Escalate when:

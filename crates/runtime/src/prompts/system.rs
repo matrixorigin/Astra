@@ -241,27 +241,16 @@ fn build_skill_listing_section_with_budget_and_caps(
     );
     if agent_spawn_available {
         body.push_str(
-            "PARALLEL ORCHESTRATION: `agent_fanout` controls execution topology; \
-             it does not replace a matching skill's workflow. When the user \
-             explicitly asks for parallel / multi-agent / multiple-agent \
-             fan-out (e.g. \"多agents\", \"N agents\", \"parallel review\", \
-             \"different angles in parallel\") and the request matches a listed \
-             skill, load that skill first and follow its instructions, including \
-             any required validation or synthesis. Use the `agent_fanout` tool \
-             exposed by the loaded skill. When no listed skill matches, use the \
-             native `agent_fanout` tool directly. If `agent_fanout` is not \
-             present in `tools[]` after any required skill load, first call \
-             `tool_search(query=\"select:agent_fanout\")` to fetch its full \
-             schema. Then call `agent_fanout` \
-             with one complete JSON argument object. Never write function-call \
-             text such as `agent_fanout(...)` into the arguments field. For a \
-             start call, use an argument object such as \
-             `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"API review\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"UI review\",\"prompt\":\"Review the UI and report findings.\"}]}`. \
-             Put each child's full brief in that slot's `prompt`, then collect \
-             by calling the same native tool with \
-             `{\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}`. The \
-             skill owns the quality and validation contract; fanout only runs \
-             the assigned work concurrently and returns its results.",
+            "PARALLEL ORCHESTRATION: When a matching skill is listed, load it \
+             first and follow its workflow. For independent delegated tasks, \
+             call `agent` with `action=spawn` once per child; each launch has \
+             its own result, so continue useful parent work and report any \
+             partial failure honestly. Use `agent_fanout` only when the task \
+             needs all-child preflight or group-wide control. If a \
+             needed tool is deferred, use `tool_search` to load its schema. \
+             Never write function-call text into an arguments field. Summarize \
+             only child results actually observed; a launch receipt is not a \
+             completed result.",
         );
     } else {
         body.push_str(
@@ -773,7 +762,7 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
     if agent_visible || agent_fanout_visible {
         let surface_guidance = match (agent_visible, agent_fanout_visible) {
             (true, true) => {
-                "Use visible `agent` with `agent_type=task` for one delegated executor or `agent_fanout` with `defaults.agent_type=task` for several"
+                "Use visible `agent` with `agent_type=task` for each independent delegated executor; use `agent_fanout` with `defaults.agent_type=task` only for group-wide preflight or control"
             }
             (true, false) => "Use visible `agent` with `agent_type=task` for a delegated executor",
             (false, true) => {
@@ -784,6 +773,14 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
         body.push_str(&format!(
             "         - `task` is an agent type, not a callable tool name. {surface_guidance}; use `start_work` for durable tracked outcomes. Never invent `task(...)` or use background task controls as the Work graph.\n"
         ));
+        body.push_str(
+            "         - Delegated model selection uses authorized catalog admission. A `model_catalog` page with `coverage=complete` lists all active Chat models for this principal; workspace files cannot verify or extend it. Do not inspect local configuration or credentials for model availability.\n",
+        );
+    }
+    if agent_visible {
+        body.push_str(
+            "         - After `agent.spawn`, continue only independent parent work needed for the user's request. If none remains, propose the final answer without polling or shell sleep: when this run owns pending direct children and continuation is available, the runtime waits for terminal results and gives another synthesis round. A `get_result` still-running snapshot is not a child failure.\n",
+        );
     }
     if tool_visible(tool_names, "bash") {
         body.push_str(
@@ -1694,7 +1691,14 @@ mod tests {
         let agent_surface = build_main_system_prompt(&["agent"], "");
         assert!(agent_surface.contains("`task` is an agent type, not a callable tool name"));
         assert!(agent_surface.contains("Use visible `agent` with `agent_type=task`"));
+        assert!(agent_surface.contains("the runtime waits for terminal results"));
+        assert!(
+            agent_surface.contains("only independent parent work needed for the user's request")
+        );
+        assert!(agent_surface.contains("`coverage=complete` lists all active Chat models"));
+        assert!(agent_surface.contains("workspace files cannot verify or extend it"));
         let fanout_surface = build_main_system_prompt(&["agent_fanout"], "");
+        assert!(fanout_surface.contains("workspace files cannot verify or extend it"));
         assert!(
             fanout_surface.contains("Use visible `agent_fanout` with `defaults.agent_type=task`")
         );

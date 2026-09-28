@@ -162,6 +162,7 @@ fn default_always_load_surface_has_a_fixed_schema_budget() {
         .expect("base tool surface must serialize")
         .len();
     const SAFETY_MARGIN_BYTES: usize = 256;
+    eprintln!("resident schemas: {bytes} bytes + {SAFETY_MARGIN_BYTES} bytes safety margin");
     assert!(
         bytes.saturating_add(SAFETY_MARGIN_BYTES) <= DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET,
         "default always-load schemas use {bytes} bytes, leaving less than the {SAFETY_MARGIN_BYTES}-byte fixed-prefix safety margin (budget={} bytes); defer a non-primitive workflow or simplify its schema",
@@ -171,6 +172,82 @@ fn default_always_load_surface_has_a_fixed_schema_budget() {
         bytes > base_bytes,
         "hot Work lifecycle schemas must be included in the default resident surface"
     );
+}
+
+#[test]
+fn models_discovery_is_easy_from_resident_and_selected_model_catalog() {
+    let schemas = catalog_schemas();
+    let surface = ToolSurface::build(schemas.clone(), &ToolSurfaceConfig::default(), &[]);
+    let introspect = surface
+        .always_load_schemas()
+        .into_iter()
+        .find(|schema| tool_schema_name(schema) == Some("introspect"))
+        .unwrap();
+    assert!(
+        introspect["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("select:model_catalog")
+    );
+    let description = introspect["function"]["description"].as_str().unwrap();
+    assert!(!description.contains("facet=models"));
+    let params = &introspect["function"]["parameters"]["properties"];
+    assert!(
+        !params["facet"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("models"))
+    );
+    assert!(params.get("catalog").is_none());
+    let model_catalog = schemas
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("model_catalog"))
+        .unwrap();
+    assert_eq!(
+        model_catalog["function"]["parameters"]["properties"]["limit"]["maximum"],
+        32
+    );
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "model_catalog",
+        &json!({"limit":16}),
+        model_catalog,
+    )
+    .unwrap();
+    let selected: Value = serde_json::from_str(&astra_tools::tool_search::tool_search(
+        &schemas,
+        &json!({"query":"select:model_catalog"}),
+    ))
+    .unwrap();
+    let contract = &selected["matches"][0];
+    assert!(
+        contract["description"]
+            .as_str()
+            .unwrap()
+            .contains("Authorized Chat model catalog")
+    );
+    assert!(contract["parameters"]["properties"]["limit"].is_object());
+    assert_eq!(contract["parameters"]["properties"]["limit"]["maximum"], 32);
+    let full = schemas
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("introspect"))
+        .unwrap();
+    // Presentation may shorten prose, never the existing observation contract.
+    assert_eq!(
+        params,
+        &without_descriptions(full["function"]["parameters"]["properties"].clone())
+    );
+    for args in [
+        // Advertised by the system prompt and turn wire assembly.
+        json!({"facet":"overview","depth":"summary","horizon":"recent"}),
+        json!({"topic":"runtime","horizon":"now","source_policy":"live_only","include_context":true}),
+    ] {
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "introspect",
+            &args,
+            &introspect,
+        )
+        .expect("prompt-guided observations must be directly callable");
+    }
 }
 
 #[test]

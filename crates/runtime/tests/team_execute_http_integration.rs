@@ -13,8 +13,9 @@
 //! asserting HTTP codes and `TeamExecutionReport` mapping (`failed` vs `partial` when only
 //! some agents terminate successfully).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
@@ -273,6 +274,33 @@ impl SubRunExecutor for HighTokenExecutor {
     }
 }
 
+/// Captures the effective optional-tool policy reaching spawned children.
+/// HTTP Team has no enabled-tools request field, so omission must arrive as
+/// an explicit empty allowlist rather than the unmanaged CLI `None` state.
+struct CaptureEnabledToolsExecutor {
+    seen: Arc<Mutex<Vec<Option<HashSet<String>>>>>,
+}
+
+#[async_trait]
+impl SubRunExecutor for CaptureEnabledToolsExecutor {
+    async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        self.seen
+            .lock()
+            .expect("capture mutex is not poisoned")
+            .push(config.request_constraints.enabled_tools.clone());
+        Ok(AgentResult {
+            agent_id: config.agent_profile.agent_id,
+            run_id: config.run_id,
+            status: astra_core::STATUS_COMPLETED.to_string(),
+            output: Some("captured".into()),
+            error: None,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            tool_calls: 0,
+        })
+    }
+}
+
 /// First `fail_after` sub-runs succeed; the next returns `Err` (infra / LLM hard failure).
 struct FailAfterSuccessExecutor {
     calls: AtomicUsize,
@@ -450,6 +478,34 @@ async fn http_execute_research_team_stub_success() {
     assert_eq!(body["agent_count"], 2);
     assert!(!body["delegation_id"].as_str().unwrap().is_empty());
     assert!(!body["parent_run_id"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn http_execute_omitted_optional_tools_are_explicitly_denied() {
+    let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let app = build_app_with_delegation(
+        store,
+        Arc::new(CaptureEnabledToolsExecutor { seen: seen.clone() }),
+    )
+    .await;
+
+    let (status, body) = post_json(
+        app,
+        "/teams/research/execute",
+        "test-user",
+        json!({ "task": "inspect the repository" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "completed");
+    let seen = seen.lock().expect("capture mutex is not poisoned");
+    assert_eq!(seen.len(), 2, "research team should spawn two children");
+    assert!(
+        seen.iter()
+            .all(|tools| tools.as_ref().is_some_and(HashSet::is_empty))
+    );
 }
 
 #[tokio::test]

@@ -299,7 +299,7 @@ fn yaml_json(entry: &serde_yaml_ng::Value, key: &str) -> Option<serde_json::Valu
 fn apply_optional_yaml_fields(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     entry: &serde_yaml_ng::Value,
-) {
+) -> Result<(), String> {
     if let Some(v) = yaml_str(entry, "description") {
         obj.insert("description".into(), serde_json::json!(v));
     }
@@ -317,12 +317,30 @@ fn apply_optional_yaml_fields(
     }
     let prompt_price = yaml_f64(entry, "pricing_prompt");
     let completion_price = yaml_f64(entry, "pricing_completion");
-    if prompt_price.is_some() || completion_price.is_some() {
+    let price_declared = entry.get("pricing_prompt").is_some()
+        || entry.get("pricing_completion").is_some()
+        || entry.get("pricing_currency").is_some()
+        || entry.get("pricing_unit").is_some();
+    if price_declared {
+        let prompt = prompt_price.ok_or("pricing_prompt must be an explicit number")?;
+        let completion = completion_price.ok_or("pricing_completion must be an explicit number")?;
+        if yaml_str(entry, "pricing_currency").as_deref() != Some("USD")
+            || yaml_str(entry, "pricing_unit").as_deref() != Some("per_token")
+        {
+            return Err(
+                "pricing requires pricing_currency: USD and pricing_unit: per_token".into(),
+            );
+        }
+        if !prompt.is_finite() || prompt < 0.0 || !completion.is_finite() || completion < 0.0 {
+            return Err("pricing rates must be finite non-negative USD-per-token numbers".into());
+        }
         obj.insert(
             "pricing".into(),
             serde_json::json!({
-                "prompt": prompt_price.unwrap_or(0.0),
-                "completion": completion_price.unwrap_or(0.0),
+                "currency": "USD",
+                "unit": "per_token",
+                "prompt": prompt,
+                "completion": completion,
             }),
         );
     }
@@ -383,6 +401,7 @@ fn apply_optional_yaml_fields(
             qobj.insert("probe_endpoint".into(), serde_json::json!(endpoint));
         }
     }
+    Ok(())
 }
 
 fn build_model_update_payload(
@@ -403,7 +422,7 @@ fn build_model_update_payload(
     if let Some(v) = base_url {
         obj.insert("base_url".into(), serde_json::json!(v));
     }
-    apply_optional_yaml_fields(&mut obj, entry);
+    apply_optional_yaml_fields(&mut obj, entry)?;
     Ok(serde_json::Value::Object(obj))
 }
 
@@ -429,7 +448,7 @@ fn build_model_create_payload(
         "context_window".into(),
         serde_json::json!(require_yaml_positive_i64(entry, "context_window")?),
     );
-    apply_optional_yaml_fields(&mut obj, entry);
+    apply_optional_yaml_fields(&mut obj, entry)?;
     Ok(serde_json::Value::Object(obj))
 }
 
@@ -1019,6 +1038,8 @@ mod tests {
             tags: [code, chat]
             supported_parameters: [tools]
             architecture: transformer
+            pricing_currency: USD
+            pricing_unit: per_token
             pricing_prompt: 0.001
             pricing_completion: 0.002
             "#,
@@ -1041,6 +1062,23 @@ mod tests {
         );
         assert_eq!(payload["architecture"], "transformer");
         assert!(payload["pricing"]["prompt"].as_f64().unwrap() > 0.0);
+        assert_eq!(payload["pricing"]["currency"], "USD");
+    }
+
+    #[test]
+    fn model_price_import_never_invents_missing_rates_or_currency() {
+        for fields in [
+            "pricing_prompt: 0",
+            "pricing_prompt: 0\npricing_completion: 0",
+            "pricing_currency: CNY\npricing_unit: per_token\npricing_prompt: 0\npricing_completion: 0",
+            "pricing_currency: USD\npricing_unit: per_token\npricing_prompt: 0",
+        ] {
+            let entry = yaml(&format!("context_window: 1000\n{fields}"));
+            assert!(
+                build_model_create_payload(&entry, "priced", "mock", "key", None).is_err(),
+                "{fields}"
+            );
+        }
     }
 
     #[test]

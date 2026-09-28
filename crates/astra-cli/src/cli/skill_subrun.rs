@@ -81,6 +81,7 @@ pub(crate) struct SubRunHost {
     pub(crate) token: String,
     pub(crate) model: Option<String>,
     pub(crate) offering_id: String,
+    pub(crate) requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
     pub(crate) project_root: PathBuf,
     pub(crate) executor: std::sync::Arc<edge_tools::ToolExecutor>,
     pub(crate) all_schemas: Vec<Value>,
@@ -95,6 +96,8 @@ pub(crate) struct SubRunHost {
     pub(crate) journal_identity: Option<SubRunJournalIdentity>,
     /// Per-response completion token limit from the skill manifest.
     pub(crate) max_completion_tokens: Option<u32>,
+    /// Explicit child request cap, retained across retries of round zero only.
+    pub(crate) initial_output_limit: Option<u32>,
     /// Effort level from the skill manifest.
     pub(crate) effort: Option<String>,
     /// Agent type hint from the skill manifest.
@@ -401,6 +404,13 @@ impl AgenticLoopHost for SubRunHost {
         self.execution_deadline.map(|deadline| deadline.remaining())
     }
 
+    fn parent_model_reasoning_snapshot(
+        &self,
+        _state: &AgenticLoopState,
+    ) -> Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning> {
+        self.executor.parent_model_reasoning_snapshot()
+    }
+
     fn deferred_tool_contract_schemas(&self) -> &[Value] {
         &self.all_schemas
     }
@@ -498,11 +508,13 @@ impl AgenticLoopHost for SubRunHost {
         // and makes soft runtime evidence look like user content.
         let runtime_volatile_injections = state.lease_volatile_pending()?;
 
-        let effective_model = self.model.as_deref();
         let effective_offering_id = self.offering_id.clone();
-        let thinking = effective_model
-            .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
-            .unwrap_or_default();
+        let thinking = state.thinking.clone();
+        self.executor.publish_parent_model_reasoning(
+            Some(&self.offering_id),
+            self.model.as_deref(),
+            thinking.clone(),
+        );
         let interaction_mode = TurnInteractionMode::NonInteractive;
         let interaction_scoped_restrictions =
             interaction_scoped_tool_restrictions(interaction_mode);
@@ -525,6 +537,7 @@ impl AgenticLoopHost for SubRunHost {
             inference_purpose: state.inference_purpose,
             round_index: state.current_round_index,
             offering_id: Some(effective_offering_id.as_str()),
+            expected_model_name: self.model.as_deref(),
             interaction_mode: Some(interaction_mode.label()),
             explain_verbose: false,
             explain_on: false,
@@ -534,6 +547,29 @@ impl AgenticLoopHost for SubRunHost {
             git_branch: None,
             thinking: thinking.clone(),
         });
+
+        if let Some(policy) = self.requested_model_policy.as_ref() {
+            payload["requested_model_policy"] = serde_json::to_value(policy)
+                .map_err(|error| format!("serialize requested model policy: {error}"))?;
+        }
+
+        // A local delegated child may make its next tool call through the
+        // canonical Server loop. Preserve the already-authenticated
+        // requirement snapshot across that transport boundary; the Server
+        // validates its source/session binding before using it and otherwise
+        // falls back to its normal root assessment.
+        let delegated_requirements = &state
+            .skills
+            .request_constraints
+            .delegated_model_requirements;
+        if !matches!(
+            delegated_requirements,
+            astra_turn_types::DelegationIntentRequirements::Unassessed
+        ) {
+            payload["context"][astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY] =
+                serde_json::to_value(delegated_requirements)
+                    .map_err(|error| format!("serialize delegated model handoff: {error}"))?;
+        }
 
         attach_runtime_volatile_injections(&mut payload, &runtime_volatile_injections);
 
@@ -587,7 +623,7 @@ impl AgenticLoopHost for SubRunHost {
             state.root_user_query_event_id.as_deref(),
         );
 
-        let server_payload =
+        let mut server_payload =
             crate::cli::chat_stream::server_loop_admission_payload_with_execution_time_budget(
                 &payload,
                 &state.message,
@@ -598,6 +634,12 @@ impl AgenticLoopHost for SubRunHost {
                     }),
             )
             .map_err(str::to_string)?;
+        if let Some(limit) = self
+            .initial_output_limit
+            .filter(|_| state.current_round_index == 0)
+        {
+            server_payload["context"]["max_output_tokens"] = json!(limit);
+        }
         let deadline = self.execution_deadline;
         let admission =
             self.api
@@ -645,7 +687,6 @@ impl AgenticLoopHost for SubRunHost {
             }
             other => astra_core::ClassifiedError::from(other.to_string()),
         })?;
-
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.map_err(|e| e.to_string())?;
@@ -1184,7 +1225,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         let effective_model = Some(model_selection.name);
         let thinking = effective_model
             .as_deref()
-            .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
+            .map(|model| astra_turn_core::thinking_config::resolve_model_thinking_request(model).1)
             .unwrap_or_default();
         // The model alias does not establish a cache protocol. The admitted
         // server execution owns provider-specific request shaping.
@@ -1230,12 +1271,14 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             token: self.token.clone(),
             model: effective_model.clone(),
             offering_id: model_selection.offering_id,
+            requested_model_policy: None,
             project_root: self.project_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,
             valid_tool_names: valid_tool_names.clone(),
             perm_manager,
             max_completion_tokens: max_tokens,
+            initial_output_limit: None,
             effort: effort.map(String::from),
             agent_type: agent_type.map(String::from),
             execution_deadline: None,
@@ -1849,6 +1892,7 @@ mod tests {
             token: String::new(),
             model: None,
             offering_id: "offer-test".to_string(),
+            requested_model_policy: None,
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1864,6 +1908,7 @@ mod tests {
                 persistence_blocked: false,
             }),
             max_completion_tokens: None,
+            initial_output_limit: None,
             effort: None,
             agent_type: None,
             execution_deadline: None,
@@ -1880,6 +1925,44 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn subrun_explicit_output_cap_survives_first_round_retry_only() {
+        use astra_runtime::turn::agentic_loop::host::make_test_loop_state;
+        let mock = crate::cli::mock_llm::MockLlmServer::start(
+            crate::cli::mock_llm::MockScenario::TextOnly,
+        )
+        .await
+        .unwrap();
+        let mut host = bare_subrun_host();
+        host.api = astra_thin_client::ThinClient::new(&mock.base_url, None).unwrap();
+        host.initial_output_limit = Some(32768);
+        host.max_completion_tokens = Some(64000);
+        let mut state = make_test_loop_state();
+        state.message = "Explain this".into();
+        state.thinking = astra_turn_core::thinking_config::ThinkingConfig::Enabled {
+            budget_tokens: 16384,
+        };
+        state.messages = vec![json!({"role":"user", "content":"Explain this"})];
+        for round in [0, 0, 1] {
+            state.current_round_index = round;
+            host.execute_turn(&mut state).await.unwrap();
+        }
+        let requests = mock.received_requests();
+        assert_eq!(requests.len(), 3);
+        for (index, request) in requests.iter().enumerate() {
+            assert_eq!(
+                request["context"]["thinking"],
+                serde_json::to_value(&state.thinking).unwrap()
+            );
+            assert_eq!(
+                request["context"].get("max_output_tokens").cloned(),
+                (index < 2).then(|| json!(32768))
+            );
+        }
+        assert_eq!(host.max_completion_tokens, Some(64000));
+        assert_eq!(host.initial_output_limit, Some(32768));
+    }
+
     fn bare_subrun_host() -> SubRunHost {
         let root = PathBuf::from(".");
         SubRunHost {
@@ -1887,6 +1970,7 @@ mod tests {
             token: String::new(),
             model: None,
             offering_id: "offer-test".to_string(),
+            requested_model_policy: None,
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
@@ -1895,6 +1979,7 @@ mod tests {
             journal: None,
             journal_identity: None,
             max_completion_tokens: None,
+            initial_output_limit: None,
             effort: None,
             agent_type: None,
             execution_deadline: None,
@@ -1996,12 +2081,14 @@ mod tests {
             token: String::new(),
             model: None,
             offering_id: "offer-test".to_string(),
+            requested_model_policy: None,
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
             max_completion_tokens: None,
+            initial_output_limit: None,
             effort: None,
             agent_type: None,
             execution_deadline: None,
@@ -2030,12 +2117,14 @@ mod tests {
             token: String::new(),
             model: None,
             offering_id: "offer-test".to_string(),
+            requested_model_policy: None,
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
             max_completion_tokens: None,
+            initial_output_limit: None,
             effort: None,
             agent_type: None,
             execution_deadline: None,
@@ -2150,12 +2239,14 @@ mod tests {
             token: String::new(),
             model: None,
             offering_id: "offer-test".to_string(),
+            requested_model_policy: None,
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
             max_completion_tokens: None,
+            initial_output_limit: None,
             effort: None,
             agent_type: None,
             execution_deadline: None,
@@ -2185,12 +2276,14 @@ mod tests {
             token: String::new(),
             model: None,
             offering_id: "offer-test".to_string(),
+            requested_model_policy: None,
             project_root: root.clone(),
             executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
             all_schemas: Vec::new(),
             valid_tool_names: HashSet::new(),
             perm_manager: PermissionManager::with_project(true, &root),
             max_completion_tokens: None,
+            initial_output_limit: None,
             effort: None,
             agent_type: None,
             execution_deadline: None,

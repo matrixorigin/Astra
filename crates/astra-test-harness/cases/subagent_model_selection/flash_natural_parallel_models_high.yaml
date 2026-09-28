@@ -1,0 +1,67 @@
+name: flash_natural_parallel_models_high
+description: |
+  A user asks for two different child models and high reasoning in ordinary
+  language. The agent chooses the tools; the test observes actual child runs.
+prompt: |
+  请同时请两个子代理帮忙：GLM 5.2 简要列出代码审查时该查什么；
+  deepseek-v4-flash 用 high 思考独立列出测试时该查什么。
+  你可以继续自己的分析；等他们完成后，告诉我各自的结论和所用模型。
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: glm-5.2
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: deepseek-v4-flash
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/thinking/effort
+      equals: high
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    json_match:
+      path: /payload/model
+      equals: glm-5.2
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+        related_match:
+          path: /metadata/model_configuration/prepared_selection/model_name
+          equals: glm-5.2
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    json_match:
+      path: /payload/model
+      equals: deepseek-v4-flash
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+        related_match:
+          path: /metadata/model_configuration/thinking/effort
+          equals: high
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 2
+    max: 2
+  - type: text_contains
+    needle: glm-5.2
+  - type: text_contains
+    needle: deepseek-v4-flash

@@ -43,12 +43,12 @@ impl LiveRuntimeProvider for LocalSessionProvider<'_> {
         host::introspect_token_pressure(self.state)
     }
 
-    fn cache_hit_ratio(&self) -> f64 {
+    fn cache_hit_ratio(&self) -> Option<f64> {
         let total_in = self.state.provider_input_tokens();
         if total_in > 0 {
-            self.state.total_cache_read as f64 / total_in as f64
+            Some(self.state.total_cache_read as f64 / total_in as f64)
         } else {
-            0.0
+            None
         }
     }
 
@@ -145,7 +145,7 @@ mod tests {
         let p = make_provider(&state);
         assert_eq!(p.budget_remaining(), 0);
         assert_eq!(p.budget_max(), 0);
-        assert!((p.cache_hit_ratio() - 0.0).abs() < f64::EPSILON);
+        assert_eq!(p.cache_hit_ratio(), None);
         assert!((p.current_error_rate() - 0.0).abs() < f64::EPSILON);
     }
 
@@ -168,17 +168,30 @@ mod tests {
         state.total_cache_creation = 50;
         // total_in = 1000, cache ratio = 750/1000 = 0.75
         let p = make_provider(&state);
-        assert!((p.cache_hit_ratio() - 0.75).abs() < 0.001);
+        assert_eq!(p.cache_hit_ratio(), Some(0.75));
+
+        state.total_prompt = 0;
+        state.total_cache_creation = 0;
+        assert_eq!(make_provider(&state).cache_hit_ratio(), Some(1.0));
     }
 
     #[test]
-    fn live_provider_cache_hit_ratio_zero_when_no_tokens() {
+    fn live_provider_cache_hit_ratio_unknown_without_input() {
         let mut state = make_state();
         state.total_cache_read = 0;
         state.total_prompt = 0;
         state.total_cache_creation = 0;
+        state.total_completion = 20;
         let p = make_provider(&state);
-        assert!((p.cache_hit_ratio() - 0.0).abs() < f64::EPSILON);
+        assert_eq!(p.cache_hit_ratio(), None);
+    }
+
+    #[test]
+    fn live_provider_cache_hit_ratio_zero_with_observed_input() {
+        let mut state = make_state();
+        state.total_prompt = 100;
+        let p = make_provider(&state);
+        assert_eq!(p.cache_hit_ratio(), Some(0.0));
     }
 
     // ── ObservationProvider tests ───────────────────────────────────────

@@ -197,6 +197,8 @@ mod tests {
                     parent_run_id: "root".into(),
                     parent_agent_id: "root".into(),
                     resolved_model_name: None,
+                    delegation_model_admission: None,
+                    parent_model_reasoning: None,
                     recursion_depth: 0,
                     parent_is_fork_child: false,
                     working_dir: std::path::PathBuf::from("/tmp"),

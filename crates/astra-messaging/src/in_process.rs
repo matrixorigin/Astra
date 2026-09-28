@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use async_trait::async_trait;
 use tokio::sync::{RwLock, broadcast, mpsc};
 
-use super::transport::{MessageStream, MessageTransport};
+use super::transport::{MailboxSubscription, MessageStream, MessageTransport};
 use super::types::{AgentAddress, AgentMessage, MailboxError};
 
 /// Broadcast channel capacity. Messages beyond this are dropped for slow receivers.
@@ -33,6 +33,8 @@ pub struct InProcessMetrics {
 
 // ─── InProcessTransport ─────────────────────────────────────────────────────
 
+type Inboxes = HashMap<AgentAddress, (MailboxSubscription, mpsc::Sender<Arc<AgentMessage>>)>;
+
 /// In-process message transport using tokio channels.
 ///
 /// - **Direct messages**: bounded `mpsc` channel per agent (cap [`DIRECT_CHANNEL_CAPACITY`]).
@@ -40,7 +42,7 @@ pub struct InProcessMetrics {
 /// - **Zero serialization**: messages are `Arc<AgentMessage>`, shared by reference.
 pub struct InProcessTransport {
     /// Direct message senders keyed by agent address.
-    inboxes: RwLock<HashMap<AgentAddress, mpsc::Sender<Arc<AgentMessage>>>>,
+    inboxes: RwLock<Inboxes>,
     /// Initial direct receivers keyed by agent address until the first subscribe().
     pending_receivers: RwLock<HashMap<AgentAddress, mpsc::Receiver<Arc<AgentMessage>>>>,
     /// Broadcast senders keyed by delegation ID.
@@ -104,74 +106,100 @@ impl MessageTransport for InProcessTransport {
         &self,
         addr: AgentAddress,
         delegation_id: Option<String>,
-    ) -> Result<(), MailboxError> {
+    ) -> Result<MailboxSubscription, MailboxError> {
         if self.is_shutdown.load(Ordering::Relaxed) {
             return Err(MailboxError::Transport("transport is shut down".into()));
         }
         let (tx, rx) = mpsc::channel(DIRECT_CHANNEL_CAPACITY);
+        let subscription = MailboxSubscription::new(addr.clone());
         let mut inboxes = self.inboxes.write().await;
         let mut pending_receivers = self.pending_receivers.write().await;
+        let mut memberships = self.memberships.write().await;
+        let previous_delegation = memberships.get(&addr).cloned();
+        let mut broadcasts = if delegation_id.is_some() || previous_delegation.is_some() {
+            Some(self.broadcasts.write().await)
+        } else {
+            None
+        };
+        if let (Some(did), Some(broadcasts)) = (delegation_id.as_deref(), broadcasts.as_mut()) {
+            broadcasts
+                .entry(did.to_string())
+                .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0);
+        }
+        // No await after publication begins: cancellation cannot leave an
+        // inbox, receiver, or delegation membership only partly installed.
         pending_receivers.insert(addr.clone(), rx);
-        inboxes.insert(addr.clone(), tx);
-
+        inboxes.insert(addr.clone(), (subscription.clone(), tx));
         if let Some(did) = delegation_id {
-            self.ensure_broadcast(&did).await;
-            self.memberships.write().await.insert(addr, did);
+            memberships.insert(addr, did);
+        } else {
+            memberships.remove(&addr);
+        }
+        if let (Some(previous), Some(broadcasts)) = (previous_delegation, broadcasts.as_mut())
+            && !memberships.values().any(|did| did == &previous)
+        {
+            broadcasts.remove(&previous);
         }
 
-        Ok(())
+        Ok(subscription)
     }
 
-    async fn unregister(&self, addr: &AgentAddress) -> Result<(), MailboxError> {
+    async fn unregister(&self, subscription: &MailboxSubscription) -> Result<(), MailboxError> {
+        let addr = subscription.address();
         let mut inboxes = self.inboxes.write().await;
+        if !inboxes
+            .get(addr)
+            .is_some_and(|(current, _)| current == subscription)
+        {
+            return Ok(());
+        }
         let mut pending_receivers = self.pending_receivers.write().await;
+        let mut memberships = self.memberships.write().await;
+        let mut broadcasts = self.broadcasts.write().await;
+        // No await after removing the inbox: cancellation cannot leave a
+        // routable group membership pointing to a closed direct mailbox.
         inboxes.remove(addr);
         pending_receivers.remove(addr);
-        // Extract the delegation_id in a separate statement so the write guard
-        // is dropped before we acquire a read lock below.
-        let did = self.memberships.write().await.remove(addr);
+        let did = memberships.remove(addr);
         if let Some(did) = did {
             // Clean up broadcast channel if no members remain.
-            let has_members = self.memberships.read().await.values().any(|d| d == &did);
+            let has_members = memberships.values().any(|d| d == &did);
             if !has_members {
-                self.broadcasts.write().await.remove(&did);
+                broadcasts.remove(&did);
             }
         }
         Ok(())
     }
 
-    async fn subscribe(&self, addr: &AgentAddress) -> Result<Box<dyn MessageStream>, MailboxError> {
+    async fn subscribe(
+        &self,
+        subscription: &MailboxSubscription,
+    ) -> Result<Box<dyn MessageStream>, MailboxError> {
+        let addr = subscription.address();
         if self.is_shutdown.load(Ordering::Relaxed) {
             return Err(MailboxError::Transport("transport is shut down".into()));
         }
-        // The first subscribe() should attach the receiver created during register()
-        // so messages sent during mailbox registration are preserved.
-        let mut inboxes = self.inboxes.write().await;
-        let mut pending_receivers = self.pending_receivers.write().await;
-        let rx = if let Some(rx) = pending_receivers.remove(addr) {
-            rx
-        } else {
-            let (tx, rx) = mpsc::channel(DIRECT_CHANNEL_CAPACITY);
-            if !inboxes.contains_key(addr) {
-                return Err(MailboxError::AgentNotFound(addr.clone()));
-            }
-            inboxes.insert(addr.clone(), tx);
-            rx
-        };
-
-        // Snapshot delegation membership while this subscribe still owns the
-        // direct-mailbox state. If the broadcast channel disappears before we
-        // subscribe, recreate it so a stale cleanup race does not abort mailbox
-        // registration for an otherwise live agent.
         let delegation_id = self.memberships.read().await.get(addr).cloned();
-        drop(pending_receivers);
-        drop(inboxes);
-
         let broadcast_rx = if let Some(did) = delegation_id {
             Some(self.ensure_broadcast(&did).await.subscribe())
         } else {
             None
         };
+
+        // All awaits that can fail or be cancelled precede receiver transfer.
+        // A replacement/unregister between the membership snapshot and here is
+        // fenced by the subscription check while the direct-mailbox locks are held.
+        let inboxes = self.inboxes.write().await;
+        if !inboxes
+            .get(addr)
+            .is_some_and(|(current, _)| current == subscription)
+        {
+            return Err(MailboxError::AgentNotFound(addr.clone()));
+        }
+        let mut pending_receivers = self.pending_receivers.write().await;
+        let rx = pending_receivers.remove(addr).ok_or_else(|| {
+            MailboxError::Protocol("subscription already attached; register a replacement".into())
+        })?;
 
         Ok(Box::new(InProcessStream {
             direct: rx,
@@ -228,7 +256,7 @@ impl MessageTransport for InProcessTransport {
         };
 
         let inboxes = self.inboxes.read().await;
-        let tx = inboxes
+        let (_, tx) = inboxes
             .get(&target)
             .ok_or(MailboxError::AgentNotFound(target))?;
         match tx.try_send(msg) {
@@ -361,6 +389,13 @@ impl MessageStream for InProcessStream {
 mod tests {
     use super::*;
     use crate::types::{AgentSignal, MessagePayload, MessageTarget};
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    fn poll_once_pending(future: std::pin::Pin<&mut impl Future>) {
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(future.poll(&mut context), Poll::Pending));
+    }
 
     fn addr(run: &str, agent: &str) -> AgentAddress {
         AgentAddress::new(run, agent)
@@ -383,10 +418,10 @@ mod tests {
         let a = addr("r1", "coder");
         let b = addr("r2", "reviewer");
 
-        transport.register(a.clone(), None).await.unwrap();
-        transport.register(b.clone(), None).await.unwrap();
+        let _a_subscription = transport.register(a.clone(), None).await.unwrap();
+        let _b_subscription = transport.register(b.clone(), None).await.unwrap();
 
-        let mut stream_b = transport.subscribe(&b).await.unwrap();
+        let mut stream_b = transport.subscribe(&_b_subscription).await.unwrap();
 
         let msg = text_msg(a.clone(), b.clone(), "please review");
         transport.send(msg).await.unwrap();
@@ -406,21 +441,21 @@ mod tests {
         let b = addr("r2", "worker-b");
         let del_id = "del-1";
 
-        transport
+        let _leader_subscription = transport
             .register(leader.clone(), Some(del_id.into()))
             .await
             .unwrap();
-        transport
+        let _a_subscription = transport
             .register(a.clone(), Some(del_id.into()))
             .await
             .unwrap();
-        transport
+        let _b_subscription = transport
             .register(b.clone(), Some(del_id.into()))
             .await
             .unwrap();
 
-        let mut stream_a = transport.subscribe(&a).await.unwrap();
-        let mut stream_b = transport.subscribe(&b).await.unwrap();
+        let mut stream_a = transport.subscribe(&_a_subscription).await.unwrap();
+        let mut stream_b = transport.subscribe(&_b_subscription).await.unwrap();
 
         let msg = Arc::new(AgentMessage::new(
             leader.clone(),
@@ -440,10 +475,10 @@ mod tests {
         let transport = InProcessTransport::new();
         let a = addr("r1", "a");
 
-        transport.register(a.clone(), None).await.unwrap();
+        let _a_subscription = transport.register(a.clone(), None).await.unwrap();
         assert_eq!(transport.agent_count().await, 1);
 
-        transport.unregister(&a).await.unwrap();
+        transport.unregister(&_a_subscription).await.unwrap();
         assert_eq!(transport.agent_count().await, 0);
 
         // Sending to unregistered agent fails.
@@ -452,10 +487,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_subscription_cannot_attach_or_unregister_replacement() {
+        let transport = InProcessTransport::new();
+        let address = addr("reused-run", "agent");
+        let old = transport.register(address.clone(), None).await.unwrap();
+        let _old_stream = transport.subscribe(&old).await.unwrap();
+        assert!(
+            transport.subscribe(&old).await.is_err(),
+            "registration attaches only once"
+        );
+        let new = transport.register(address.clone(), None).await.unwrap();
+        let mut stream = transport.subscribe(&new).await.unwrap();
+        transport.unregister(&old).await.unwrap();
+        assert!(transport.subscribe(&old).await.is_err());
+        let message = text_msg(addr("sender", "sender"), address, "new owner");
+        let id = message.id.clone();
+        transport.send(message).await.unwrap();
+        assert_eq!(stream.try_recv().unwrap().id, id);
+        transport.unregister(&new).await.unwrap();
+        assert_eq!(transport.agent_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_register_does_not_publish_partial_mailbox() {
+        let transport = InProcessTransport::new();
+        let address = addr("run", "agent");
+        let memberships = transport.memberships.write().await;
+        let mut registration = Box::pin(transport.register(address.clone(), None));
+        poll_once_pending(registration.as_mut());
+        drop(registration);
+        drop(memberships);
+
+        assert_eq!(transport.agent_count().await, 0);
+        let subscription = transport.register(address.clone(), None).await.unwrap();
+        assert!(transport.subscribe(&subscription).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_subscribe_does_not_take_buffered_receiver() {
+        let transport = InProcessTransport::new();
+        let address = addr("run", "agent");
+        let subscription = transport.register(address.clone(), None).await.unwrap();
+        let message = text_msg(addr("sender", "sender"), address, "still buffered");
+        let id = message.id.clone();
+        transport.send(message).await.unwrap();
+
+        let memberships = transport.memberships.write().await;
+        let mut attach = Box::pin(transport.subscribe(&subscription));
+        poll_once_pending(attach.as_mut());
+        drop(attach);
+        drop(memberships);
+
+        let mut stream = transport.subscribe(&subscription).await.unwrap();
+        assert_eq!(stream.try_recv().unwrap().id, id);
+    }
+
+    #[tokio::test]
+    async fn cancelled_unregister_keeps_direct_and_group_routes_together() {
+        let transport = InProcessTransport::new();
+        let address = addr("run", "agent");
+        let subscription = transport
+            .register(address.clone(), Some("delegation".into()))
+            .await
+            .unwrap();
+        let broadcasts = transport.broadcasts.write().await;
+        let mut cleanup = Box::pin(transport.unregister(&subscription));
+        poll_once_pending(cleanup.as_mut());
+        drop(cleanup);
+        drop(broadcasts);
+
+        assert_eq!(transport.agent_count().await, 1);
+        assert_eq!(
+            transport
+                .resolve_agent("delegation", "agent")
+                .await
+                .unwrap(),
+            address
+        );
+        transport.unregister(&subscription).await.unwrap();
+        assert_eq!(transport.agent_count().await, 0);
+    }
+
+    #[tokio::test]
     async fn subscribe_requires_registration() {
         let transport = InProcessTransport::new();
         let a = addr("r1", "a");
-        assert!(transport.subscribe(&a).await.is_err());
+        assert!(
+            transport
+                .subscribe(&MailboxSubscription::new(a))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -464,10 +586,10 @@ mod tests {
         let a = addr("r1", "a");
         let b = addr("r2", "b");
 
-        transport.register(a.clone(), None).await.unwrap();
-        transport.register(b.clone(), None).await.unwrap();
+        let _a_subscription = transport.register(a.clone(), None).await.unwrap();
+        let _b_subscription = transport.register(b.clone(), None).await.unwrap();
 
-        let mut stream_b = transport.subscribe(&b).await.unwrap();
+        let mut stream_b = transport.subscribe(&_b_subscription).await.unwrap();
 
         for i in 0..5 {
             let msg = text_msg(a.clone(), b.clone(), &format!("msg-{i}"));
@@ -485,21 +607,21 @@ mod tests {
         let b = addr("r2", "b");
         let del = "del-x";
 
-        transport
+        let _a_subscription = transport
             .register(a.clone(), Some(del.into()))
             .await
             .unwrap();
-        transport
+        let _b_subscription = transport
             .register(b.clone(), Some(del.into()))
             .await
             .unwrap();
 
         // Unregister one — broadcast should remain.
-        transport.unregister(&a).await.unwrap();
+        transport.unregister(&_a_subscription).await.unwrap();
         assert!(transport.broadcasts.read().await.contains_key(del));
 
         // Unregister last — broadcast should be cleaned up.
-        transport.unregister(&b).await.unwrap();
+        transport.unregister(&_b_subscription).await.unwrap();
         assert!(!transport.broadcasts.read().await.contains_key(del));
     }
 
@@ -509,14 +631,14 @@ mod tests {
         let a = addr("r1", "a");
         let del = "del-missing";
 
-        transport
+        let _a_subscription = transport
             .register(a.clone(), Some(del.into()))
             .await
             .unwrap();
         transport.broadcasts.write().await.remove(del);
 
         let _stream = transport
-            .subscribe(&a)
+            .subscribe(&_a_subscription)
             .await
             .expect("subscribe should heal a missing broadcast channel");
         assert!(transport.broadcasts.read().await.contains_key(del));
@@ -528,8 +650,8 @@ mod tests {
         let a = addr("r1", "a");
         let b = addr("r2", "b");
 
-        transport.register(a.clone(), None).await.unwrap();
-        transport.register(b.clone(), None).await.unwrap();
+        let _a_subscription = transport.register(a.clone(), None).await.unwrap();
+        let _b_subscription = transport.register(b.clone(), None).await.unwrap();
 
         transport.shutdown().await.unwrap();
 
@@ -542,7 +664,7 @@ mod tests {
         let transport = InProcessTransport::new();
         let a = addr("r1", "a");
 
-        transport
+        let _a_subscription = transport
             .register(a.clone(), Some("del".into()))
             .await
             .unwrap();
@@ -576,9 +698,9 @@ mod tests {
         let a = addr("r1", "a");
         let b = addr("r2", "b");
 
-        transport.register(a.clone(), None).await.unwrap();
-        transport.register(b.clone(), None).await.unwrap();
-        let _stream = transport.subscribe(&b).await.unwrap();
+        let _a_subscription = transport.register(a.clone(), None).await.unwrap();
+        let _b_subscription = transport.register(b.clone(), None).await.unwrap();
+        let _stream = transport.subscribe(&_b_subscription).await.unwrap();
 
         for i in 0..3 {
             let msg = text_msg(a.clone(), b.clone(), &format!("m{i}"));
@@ -594,10 +716,10 @@ mod tests {
         let a = addr("r1", "a");
         let b = addr("r2", "b");
 
-        transport.register(a.clone(), None).await.unwrap();
-        transport.register(b.clone(), None).await.unwrap();
+        let _a_subscription = transport.register(a.clone(), None).await.unwrap();
+        let _b_subscription = transport.register(b.clone(), None).await.unwrap();
         // Subscribe creates a bounded channel (cap 4096).
-        let _stream = transport.subscribe(&b).await.unwrap();
+        let _stream = transport.subscribe(&_b_subscription).await.unwrap();
 
         // Fill the channel beyond capacity.
         let mut sent = 0u64;
@@ -656,7 +778,7 @@ mod tests {
         let transport = InProcessTransport::new();
         let a = addr("r1", "a");
 
-        transport
+        let _a_subscription = transport
             .register(a.clone(), Some("del-empty".into()))
             .await
             .unwrap();
@@ -691,13 +813,13 @@ mod tests {
         let a = addr("r1", "a");
         let b = addr("r2", "b");
 
-        transport.register(a.clone(), None).await.unwrap();
-        transport.register(b.clone(), None).await.unwrap();
+        let _a_subscription = transport.register(a.clone(), None).await.unwrap();
+        let _b_subscription = transport.register(b.clone(), None).await.unwrap();
 
         let msg = text_msg(a.clone(), b.clone(), "queued before subscribe");
         transport.send(msg).await.unwrap();
 
-        let mut stream_b = transport.subscribe(&b).await.unwrap();
+        let mut stream_b = transport.subscribe(&_b_subscription).await.unwrap();
         let received = stream_b
             .try_recv()
             .expect("message queued before subscribe");

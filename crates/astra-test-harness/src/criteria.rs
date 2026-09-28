@@ -23,6 +23,58 @@ use crate::session_capture::SessionCapture;
 
 mod work_replacement;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventJsonMatch {
+    /// Missing fields do not match, even when `equals` is JSON null.
+    pub path: String,
+    pub equals: serde_json::Value,
+    /// Require every matching event to carry a distinct, non-empty string at
+    /// this pointer (for example, a child `run_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique_by: Option<String>,
+    /// Require the matched event's top-level `run_id` to equal an identity
+    /// carried by at least one event of this type. This links provider step
+    /// events to their durable `agent_spawned` child-run record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_run_as: Option<SessionEventRunIdMatch>,
+    /// Require the unique event IDs to equal IDs in a successful tool result
+    /// from the events' parent run (for example, returned fanout child runs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ids_match: Option<SessionEventResultIdMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventFieldMatch {
+    pub path: String,
+    pub equals: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventRunIdMatch {
+    pub event_type: String,
+    /// JSON pointer to the related event's run ID (for example,
+    /// `/metadata/run_id` on `agent_spawned`).
+    pub run_id_path: String,
+    /// Optional predicate on the related event. This lets a provider event
+    /// prove the exact child slot/configuration it belongs to, rather than
+    /// merely proving that some spawn with the same run ID exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_match: Option<SessionEventFieldMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventResultIdMatch {
+    pub tool_name: String,
+    /// Event pointer for the parent run that owns the matching tool call.
+    pub event_parent_run_id_path: String,
+    pub result_array_path: String,
+    pub item_id_path: String,
+}
+
 /// One declarative success check. Serialized into YAML cases as
 /// `type: <variant>` discriminator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,8 +156,10 @@ pub enum Criterion {
         successor_path: String,
     },
 
-    /// Passes when the session journal contains at least `min`
-    /// events with `type == event_type`. Requires session capture.
+    /// Passes when session capture contains at least `min`
+    /// events with `type == event_type`, optionally matching one exact
+    /// JSON pointer/value pair or linking a step-event `run_id` to a related
+    /// lifecycle event. Requires session capture.
     /// Use for structural checks ("at least one subagent_spawned
     /// event appears").
     ///
@@ -120,6 +174,12 @@ pub enum Criterion {
         event_type: String,
         #[serde(default = "default_event_min")]
         min: u32,
+        /// Optional upper bound; `min: 0, max: 0` proves absence.
+        #[serde(default)]
+        max: Option<u32>,
+        /// Optional exact JSON-pointer predicate against the complete event.
+        #[serde(default)]
+        json_match: Option<SessionEventJsonMatch>,
         /// When true, skip-pass when session is unavailable. Use
         /// sparingly — only for cases that are meaningful even
         /// without the journal check.
@@ -231,6 +291,15 @@ pub enum Criterion {
         document: JournalToolDocument,
         path: String,
         equals: serde_json::Value,
+        /// Optional predicate on the same durable call as `path`.
+        #[serde(default)]
+        where_match: Option<JournalJsonPredicate>,
+        /// When `equals` is JSON null, also accept a missing pointer. This
+        /// models optional API fields whose omitted and explicit-null forms
+        /// both mean "unset" without weakening exact JSON assertions by
+        /// default.
+        #[serde(default)]
+        allow_missing: bool,
     },
 
     /// Requires a durable JSON-pointer value to be a string containing the
@@ -1201,6 +1270,22 @@ fn journal_tool_document(
     }
 }
 
+fn journal_tool_missing_optional_property(value: &serde_json::Value, path: &str) -> bool {
+    let Some((parent_path, property)) = path.rsplit_once('/') else {
+        return false;
+    };
+    let parent = if parent_path.is_empty() {
+        Some(value)
+    } else {
+        value.pointer(parent_path)
+    };
+    let Some(parent) = parent.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let property = property.replace("~1", "/").replace("~0", "~");
+    !parent.contains_key(&property)
+}
+
 fn call_matches_predicates(
     call: &crate::session_capture::JournalToolCall,
     predicates: &[JournalJsonPredicate],
@@ -1369,6 +1454,79 @@ fn validate_text_json_dag(
         ));
     }
     Ok((node_ids.len(), unique_edges.len()))
+}
+
+fn session_event_ids_match_tool_result(
+    session: &SessionCapture,
+    events: &[&crate::session_capture::JournalEvent],
+    event_id_path: &str,
+    link: &SessionEventResultIdMatch,
+) -> bool {
+    let event_ids = events
+        .iter()
+        .filter_map(|event| {
+            event
+                .raw
+                .pointer(event_id_path)
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .collect::<std::collections::HashSet<_>>();
+    if event_ids.len() != events.len() {
+        return false;
+    }
+
+    let parent_run_ids = events
+        .iter()
+        .filter_map(|event| {
+            event
+                .raw
+                .pointer(&link.event_parent_run_id_path)
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+        })
+        .collect::<std::collections::HashSet<_>>();
+    if parent_run_ids.len() != 1
+        || events.iter().any(|event| {
+            event
+                .raw
+                .pointer(&link.event_parent_run_id_path)
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|run_id| run_id.trim().is_empty())
+        })
+    {
+        return false;
+    }
+    let parent_run_id = parent_run_ids.iter().next().copied();
+
+    session.journal_tool_calls().into_iter().any(|call| {
+        if call.name != link.tool_name
+            || call.ok != Some(true)
+            || call.run_id.as_deref() != parent_run_id
+        {
+            return false;
+        }
+        let Some(items) = call
+            .result
+            .as_ref()
+            .and_then(|result| result.pointer(&link.result_array_path))
+            .and_then(serde_json::Value::as_array)
+        else {
+            return false;
+        };
+        let result_ids = items
+            .iter()
+            .map(|item| {
+                item.pointer(&link.item_id_path)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_owned)
+            })
+            .collect::<Option<std::collections::HashSet<_>>>();
+        result_ids
+            .is_some_and(|result_ids| result_ids.len() == items.len() && result_ids == event_ids)
+    })
 }
 
 fn evaluate_one(
@@ -1776,6 +1934,8 @@ fn evaluate_one_with_primary_cache(
         Criterion::SessionEventCount {
             event_type,
             min,
+            max,
+            json_match,
             optional,
         } => {
             let Some(sess) = session else {
@@ -1805,13 +1965,111 @@ fn evaluate_one_with_primary_cache(
                     score: if passed { Some(1.0) } else { Some(0.0) },
                 };
             };
-            let n = sess.count_events(event_type);
-            let pass = n as u32 >= *min;
+            let matching_events = sess
+                .events
+                .iter()
+                .filter(|event| event.event_type == *event_type)
+                .filter(|event| {
+                    json_match.as_ref().is_none_or(|predicate| {
+                        event.raw.pointer(&predicate.path) == Some(&predicate.equals)
+                    })
+                })
+                .filter(|event| {
+                    let Some(link) = json_match
+                        .as_ref()
+                        .and_then(|predicate| predicate.same_run_as.as_ref())
+                    else {
+                        return true;
+                    };
+                    let Some(run_id) = event.raw.get("run_id").and_then(serde_json::Value::as_str)
+                    else {
+                        return false;
+                    };
+                    if run_id.trim().is_empty() {
+                        return false;
+                    }
+                    sess.events.iter().any(|related| {
+                        related.event_type == link.event_type
+                            && related
+                                .raw
+                                .pointer(&link.run_id_path)
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|related_id| {
+                                    !related_id.trim().is_empty()
+                                        && related_id == run_id
+                                        && link.related_match.as_ref().is_none_or(|predicate| {
+                                            related.raw.pointer(&predicate.path)
+                                                == Some(&predicate.equals)
+                                        })
+                                })
+                    })
+                })
+                .collect::<Vec<_>>();
+            let n = matching_events.len();
+            let unique_count = json_match
+                .as_ref()
+                .and_then(|predicate| predicate.unique_by.as_ref())
+                .map(|path| {
+                    matching_events
+                        .iter()
+                        .filter_map(|event| {
+                            event.raw.pointer(path).and_then(serde_json::Value::as_str)
+                        })
+                        .filter(|value| !value.trim().is_empty())
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                });
+            let result_ids_match = match json_match
+                .as_ref()
+                .and_then(|predicate| predicate.result_ids_match.as_ref())
+            {
+                None => true,
+                Some(link) => json_match
+                    .as_ref()
+                    .and_then(|predicate| predicate.unique_by.as_deref())
+                    .is_some_and(|id_path| {
+                        session_event_ids_match_tool_result(sess, &matching_events, id_path, link)
+                    }),
+            };
+            let pass = n as u32 >= *min
+                && max.is_none_or(|max| n as u32 <= max)
+                && unique_count.is_none_or(|unique_count| unique_count == n)
+                && result_ids_match;
+            let predicate = json_match.as_ref().map_or_else(String::new, |predicate| {
+                let unique_by = predicate
+                    .unique_by
+                    .as_ref()
+                    .map_or_else(String::new, |path| {
+                        format!(
+                            ", unique_by={path} distinct={}",
+                            unique_count.unwrap_or_default()
+                        )
+                    });
+                let id_link = predicate
+                    .result_ids_match
+                    .as_ref()
+                    .map_or_else(String::new, |_| {
+                        format!(", result_ids_match={result_ids_match}")
+                    });
+                let run_link = predicate
+                    .same_run_as
+                    .as_ref()
+                    .map_or_else(String::new, |link| {
+                        format!(", same_run_as={}", link.event_type)
+                    });
+                format!(
+                    ", {}={}{}{}{}",
+                    predicate.path, predicate.equals, unique_by, id_link, run_link
+                )
+            });
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed: pass,
-                detail: format!("session events type={event_type} count={n} (expected >= {min})"),
+                detail: format!(
+                    "session events type={event_type}{predicate} count={n} (expected {min}..={})",
+                    max.map_or("unbounded".to_string(), |max| max.to_string())
+                ),
                 full_detail: None,
                 score: if pass { Some(1.0) } else { Some(0.0) },
             }
@@ -2187,6 +2445,8 @@ fn evaluate_one_with_primary_cache(
             document,
             path,
             equals,
+            where_match,
+            allow_missing,
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_tool_json");
@@ -2194,16 +2454,35 @@ fn evaluate_one_with_primary_cache(
             let calls = session.journal_tool_calls();
             let passed = calls.iter().filter(|call| call.name == *name).any(|call| {
                 let value = journal_tool_document(call, *document);
-                value.and_then(|value| value.pointer(path)) == Some(equals)
+                if let Some(predicate) = where_match
+                    && journal_tool_document(call, predicate.document)
+                        .and_then(|value| value.pointer(&predicate.path))
+                        != Some(&predicate.equals)
+                {
+                    return false;
+                }
+                let actual = value.and_then(|value| value.pointer(path));
+                actual == Some(equals)
+                    || (*allow_missing
+                        && equals.is_null()
+                        && actual.is_none()
+                        && value.is_some_and(|value| {
+                            journal_tool_missing_optional_property(value, path)
+                        }))
             });
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed,
                 detail: format!(
-                    "journal tool {name} {document:?} pointer {path:?} {} expected {}",
+                    "journal tool {name} {document:?} pointer {path:?} {} expected {}{}",
                     if passed { "matched" } else { "did not match" },
-                    equals
+                    equals,
+                    if *allow_missing && equals.is_null() {
+                        " (missing also accepted)"
+                    } else {
+                        ""
+                    },
                 ),
                 full_detail: None,
                 score: None,
@@ -4194,15 +4473,19 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             name,
             path,
             document: _,
-            equals: _,
+            equals,
+            where_match,
+            allow_missing,
         } => {
             if name.trim().is_empty() {
                 return Err("JournalToolJson.name must not be empty".into());
             }
-            if !path.is_empty() && !path.starts_with('/') {
-                return Err(format!(
-                    "JournalToolJson.path must be an RFC 6901 JSON pointer; got {path:?}"
-                ));
+            validate_json_pointer("JournalToolJson.path", path)?;
+            if let Some(predicate) = where_match {
+                validate_json_pointer("JournalToolJson.where_match.path", &predicate.path)?;
+            }
+            if *allow_missing && !equals.is_null() {
+                return Err("JournalToolJson.allow_missing requires equals: null".into());
             }
             Ok(())
         }
@@ -4353,13 +4636,67 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             Ok(())
         }
         Criterion::SessionEventCount {
-            min, event_type, ..
+            min,
+            max,
+            event_type,
+            json_match,
+            ..
         } => {
-            if *min == 0 {
+            if let Some(predicate) = json_match {
+                validate_json_pointer("SessionEventCount.json_match.path", &predicate.path)?;
+                if let Some(path) = predicate.unique_by.as_ref() {
+                    validate_json_pointer("SessionEventCount.json_match.unique_by", path)?;
+                }
+                if let Some(link) = predicate.same_run_as.as_ref() {
+                    if link.event_type.trim().is_empty() {
+                        return Err(
+                            "SessionEventCount.same_run_as.event_type must not be empty".into()
+                        );
+                    }
+                    validate_json_pointer(
+                        "SessionEventCount.same_run_as.run_id_path",
+                        &link.run_id_path,
+                    )?;
+                    if let Some(related_match) = link.related_match.as_ref() {
+                        validate_json_pointer(
+                            "SessionEventCount.same_run_as.related_match.path",
+                            &related_match.path,
+                        )?;
+                    }
+                }
+                if let Some(link) = predicate.result_ids_match.as_ref() {
+                    if predicate.unique_by.is_none() {
+                        return Err(
+                            "SessionEventCount.result_ids_match requires json_match.unique_by"
+                                .into(),
+                        );
+                    }
+                    if link.tool_name.trim().is_empty() {
+                        return Err(
+                            "SessionEventCount.result_ids_match.tool_name must not be empty".into(),
+                        );
+                    }
+                    validate_json_pointer(
+                        "SessionEventCount.result_ids_match.event_parent_run_id_path",
+                        &link.event_parent_run_id_path,
+                    )?;
+                    validate_json_pointer(
+                        "SessionEventCount.result_ids_match.result_array_path",
+                        &link.result_array_path,
+                    )?;
+                    validate_json_pointer(
+                        "SessionEventCount.result_ids_match.item_id_path",
+                        &link.item_id_path,
+                    )?;
+                }
+            }
+            if *min == 0 && max.is_none() {
                 return Err(format!(
-                    "SessionEventCount.min must be >= 1 (min=0 is trivially-true for \
-                     event_type={event_type:?}; did you mean >= 1?)"
+                    "SessionEventCount with min=0 requires max for event_type={event_type:?}"
                 ));
+            }
+            if max.is_some_and(|max| max < *min) {
+                return Err("SessionEventCount.max must be >= min".into());
             }
             Ok(())
         }
@@ -4629,6 +4966,7 @@ mod tests {
             prompt_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_tokens: 0,
+            token_usage_coverage: None,
             duration_ms: 0,
             turn_rounds: 0,
             cache_hits: 0,
@@ -5322,6 +5660,8 @@ mod tests {
             &[Criterion::SessionEventCount {
                 event_type: "llm_round".into(),
                 min: 2,
+                max: None,
+                json_match: None,
                 optional: false,
             }],
             &out,
@@ -5329,6 +5669,402 @@ mod tests {
         );
         assert!(r[0].passed);
         assert_eq!(r[0].severity, CriterionSeverity::Hard);
+    }
+
+    #[test]
+    fn session_event_count_can_match_model_identity_in_spawn_metadata() {
+        fn spawn_event(
+            run_id: &str,
+            parent_run_id: &str,
+            group_id: &str,
+            slot_index: usize,
+            model_name: &str,
+        ) -> serde_json::Value {
+            let fanout_slot = serde_json::json!({
+                "group_id": group_id,
+                "target_count": 2,
+                "slot_index": slot_index,
+                "slot_id": run_id
+            });
+            let mut event =
+                astra_services::session_journal::JournalEvent::agent_spawned_with_fanout(
+                    Some("s"),
+                    run_id,
+                    run_id,
+                    parent_run_id,
+                    "explore",
+                    "fixture child",
+                    None,
+                    false,
+                    Some(&fanout_slot),
+                    None,
+                )
+                .with_producer_scope(Some(run_id));
+            event.metadata.as_mut().expect("spawn metadata")["model_configuration"] = serde_json::json!({
+                "prepared_selection": {"model_name": model_name}
+            });
+            serde_json::to_value(event).expect("serialize real journal event")
+        }
+
+        fn fanout_turn(parent_run_id: &str, child_ids: &[&str]) -> serde_json::Value {
+            let results = child_ids
+                .iter()
+                .map(|run_id| serde_json::json!({"run_id": run_id}))
+                .collect::<Vec<_>>();
+            let call = astra_services::session_journal::ToolCallRecord {
+                tool_call_id: Some("reused-call-id".into()),
+                name: "agent_fanout".into(),
+                ok: true,
+                args_full: Some(r#"{"action":"start"}"#.into()),
+                result_full: Some(
+                    serde_json::json!({
+                        "group_id": "flash-model-selection-test",
+                        "results": results
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            };
+            let event = astra_services::session_journal::JournalEvent::turn(
+                Some("s"),
+                1,
+                None,
+                "fixture",
+                "done",
+                1,
+                0,
+                0,
+                1,
+            )
+            .with_producer_scope(Some(parent_run_id))
+            .with_tool_calls(vec![call]);
+            serde_json::to_value(event).expect("serialize real journal tool record")
+        }
+
+        fn model_spawn_events() -> Vec<(&'static str, serde_json::Value)> {
+            vec![
+                (
+                    "agent_spawned",
+                    spawn_event(
+                        "child-1",
+                        "parent-1",
+                        "flash-model-selection-test",
+                        0,
+                        "deepseek-v4-flash",
+                    ),
+                ),
+                (
+                    "agent_spawned",
+                    spawn_event(
+                        "child-2",
+                        "parent-1",
+                        "flash-model-selection-test",
+                        1,
+                        "deepseek-v4-flash",
+                    ),
+                ),
+                (
+                    "agent_spawned",
+                    spawn_event("child-3", "parent-2", "another-group", 0, "another-model"),
+                ),
+            ]
+        }
+
+        let mut events = model_spawn_events();
+        events.push(("turn", fanout_turn("parent-1", &["child-1", "child-2"])));
+        let session = mk_session(&events);
+        let criterion = Criterion::SessionEventCount {
+            event_type: "agent_spawned".into(),
+            min: 2,
+            max: Some(2),
+            json_match: Some(SessionEventJsonMatch {
+                path: "/metadata/model_configuration/prepared_selection/model_name".into(),
+                equals: serde_json::json!("deepseek-v4-flash"),
+                unique_by: Some("/metadata/run_id".into()),
+                same_run_as: None,
+                result_ids_match: Some(SessionEventResultIdMatch {
+                    tool_name: "agent_fanout".into(),
+                    event_parent_run_id_path: "/metadata/parent_run_id".into(),
+                    result_array_path: "/results".into(),
+                    item_id_path: "/run_id".into(),
+                }),
+            }),
+            optional: false,
+        };
+        validate_criterion(&criterion).expect("valid event JSON predicate");
+        let results = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&session),
+        );
+        assert!(results[0].passed, "{}", results[0].detail);
+        assert!(results[0].detail.contains("count=2"));
+
+        let mut uniqueness_only = criterion.clone();
+        if let Criterion::SessionEventCount {
+            json_match: Some(predicate),
+            ..
+        } = &mut uniqueness_only
+        {
+            predicate.result_ids_match = None;
+        }
+        let duplicate_run_ids = mk_session(&[
+            (
+                "agent_spawned",
+                spawn_event(
+                    "same-child",
+                    "parent-1",
+                    "flash-model-selection-test",
+                    0,
+                    "deepseek-v4-flash",
+                ),
+            ),
+            (
+                "agent_spawned",
+                spawn_event(
+                    "same-child",
+                    "parent-1",
+                    "flash-model-selection-test",
+                    1,
+                    "deepseek-v4-flash",
+                ),
+            ),
+        ]);
+        let duplicate = evaluate_deterministic_with_session(
+            std::slice::from_ref(&uniqueness_only),
+            &outcome_with_tools(&[]),
+            Some(&duplicate_run_ids),
+        );
+        assert!(!duplicate[0].passed, "duplicate child run IDs must fail");
+
+        let mut mismatched_events = model_spawn_events();
+        mismatched_events.push((
+            "turn",
+            fanout_turn("parent-1", &["child-1", "unrelated-child"]),
+        ));
+        let mismatched_result = mk_session(&mismatched_events);
+        let mismatched = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&mismatched_result),
+        );
+        assert!(
+            !mismatched[0].passed,
+            "spawn IDs must match returned children"
+        );
+
+        let mut wrong_parent_events = model_spawn_events();
+        wrong_parent_events.push((
+            "turn",
+            fanout_turn("parent-1", &["unrelated-child-1", "unrelated-child-2"]),
+        ));
+        wrong_parent_events.push(("turn", fanout_turn("parent-2", &["child-1", "child-2"])));
+        let wrong_parent = mk_session(&wrong_parent_events);
+        let wrong_parent_result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&wrong_parent),
+        );
+        assert!(
+            !wrong_parent_result[0].passed,
+            "a different run reusing a tool call ID cannot authorize the match"
+        );
+
+        let mut missing_parent_identity = session.clone();
+        let child = missing_parent_identity
+            .events
+            .iter_mut()
+            .find(|event| {
+                event.event_type == "agent_spawned"
+                    && event
+                        .raw
+                        .pointer("/metadata/run_id")
+                        .and_then(|id| id.as_str())
+                        == Some("child-2")
+            })
+            .expect("second fixture spawn event");
+        child.raw["metadata"]
+            .as_object_mut()
+            .expect("metadata object")
+            .remove("parent_run_id");
+        let missing_parent = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&missing_parent_identity),
+        );
+        assert!(
+            !missing_parent[0].passed,
+            "every matched event must carry its parent run identity"
+        );
+    }
+
+    #[test]
+    fn session_event_json_match_preserves_yaml_null() {
+        let parsed: Criterion = serde_yaml_ng::from_str(
+            "type: session_event_count\nevent_type: agent_spawned\nmin: 1\njson_match:\n  path: /metadata/model\n  equals: null\n",
+        )
+        .expect("YAML preserves explicit null in the nested matcher");
+        let Criterion::SessionEventCount {
+            json_match: Some(predicate),
+            ..
+        } = &parsed
+        else {
+            panic!("expected a session event matcher");
+        };
+        assert!(predicate.equals.is_null());
+        validate_criterion(&parsed).expect("parsed null predicate is valid");
+        let session = mk_session(&[(
+            "agent_spawned",
+            serde_json::json!({"metadata": {"model": null}}),
+        )]);
+        let evaluated = evaluate_deterministic_with_session(
+            std::slice::from_ref(&parsed),
+            &outcome_with_tools(&[]),
+            Some(&session),
+        );
+        assert!(evaluated[0].passed, "{}", evaluated[0].detail);
+    }
+
+    #[test]
+    fn session_event_count_can_bind_completed_model_call_to_spawned_child_run() {
+        let criterion = Criterion::SessionEventCount {
+            event_type: "LlmRoundCompleted".into(),
+            min: 1,
+            max: None,
+            json_match: Some(SessionEventJsonMatch {
+                path: "/payload/model".into(),
+                equals: serde_json::json!("glm-5.2"),
+                unique_by: None,
+                same_run_as: Some(SessionEventRunIdMatch {
+                    event_type: "agent_spawned".into(),
+                    run_id_path: "/metadata/run_id".into(),
+                    related_match: None,
+                }),
+                result_ids_match: None,
+            }),
+            optional: false,
+        };
+        validate_criterion(&criterion).expect("related run identity path is valid");
+
+        let linked = mk_session(&[
+            (
+                "agent_spawned",
+                serde_json::json!({"metadata": {"run_id": "child-run"}}),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "child-run",
+                    "payload": {"model": "glm-5.2"}
+                }),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "parent-run",
+                    "payload": {"model": "glm-5.2"}
+                }),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "other-child",
+                    "payload": {"model": "other-model"}
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&linked),
+        );
+        assert!(result[0].passed, "{}", result[0].detail);
+        assert!(result[0].detail.contains("count=1"));
+
+        let unlinked = mk_session(&[(
+            "LlmRoundCompleted",
+            serde_json::json!({
+                "run_id": "parent-run",
+                "payload": {"model": "glm-5.2"}
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&unlinked),
+        );
+        assert!(
+            !result[0].passed,
+            "a parent call must not satisfy child evidence"
+        );
+    }
+
+    #[test]
+    fn session_event_count_can_bind_provider_call_to_a_specific_spawn_configuration() {
+        let criterion = Criterion::SessionEventCount {
+            event_type: "LlmRoundCompleted".into(),
+            min: 1,
+            max: Some(1),
+            json_match: Some(SessionEventJsonMatch {
+                path: "/payload/model".into(),
+                equals: serde_json::json!("glm-5.2"),
+                unique_by: None,
+                same_run_as: Some(SessionEventRunIdMatch {
+                    event_type: "agent_spawned".into(),
+                    run_id_path: "/metadata/run_id".into(),
+                    related_match: Some(SessionEventFieldMatch {
+                        path: "/metadata/fanout_slot/slot_index".into(),
+                        equals: serde_json::json!(1),
+                    }),
+                }),
+                result_ids_match: None,
+            }),
+            optional: false,
+        };
+        validate_criterion(&criterion).expect("specific related event predicate is valid");
+
+        let session = mk_session(&[
+            (
+                "agent_spawned",
+                serde_json::json!({
+                    "metadata": {
+                        "run_id": "plan-run",
+                        "fanout_slot": {"slot_index": 0}
+                    }
+                }),
+            ),
+            (
+                "agent_spawned",
+                serde_json::json!({
+                    "metadata": {
+                        "run_id": "review-run",
+                        "fanout_slot": {"slot_index": 1}
+                    }
+                }),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "review-run",
+                    "payload": {"model": "glm-5.2"}
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&session),
+        );
+        assert!(result[0].passed, "{}", result[0].detail);
+
+        let mut wrong_slot = session.clone();
+        wrong_slot.events[1].raw["metadata"]["fanout_slot"]["slot_index"] = serde_json::json!(0);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&wrong_slot),
+        );
+        assert!(!result[0].passed, "wrong slot must not satisfy the link");
     }
 
     #[test]
@@ -5341,6 +6077,8 @@ mod tests {
             &[Criterion::SessionEventCount {
                 event_type: "llm_round".into(),
                 min: 2,
+                max: None,
+                json_match: None,
                 optional: false,
             }],
             &out,
@@ -5357,6 +6095,8 @@ mod tests {
             &[Criterion::SessionEventCount {
                 event_type: "llm_round".into(),
                 min: 2,
+                max: None,
+                json_match: None,
                 optional: true,
             }],
             &out,
@@ -5675,18 +6415,24 @@ mod tests {
                 document: JournalToolDocument::Arguments,
                 path: "/target_count".into(),
                 equals: serde_json::json!(3),
+                where_match: None,
+                allow_missing: false,
             },
             Criterion::JournalToolJson {
                 name: "agent_fanout".into(),
                 document: JournalToolDocument::Result,
                 path: "/provenance/all_slots_delivered".into(),
                 equals: serde_json::json!(true),
+                where_match: None,
+                allow_missing: false,
             },
             Criterion::JournalToolJson {
                 name: "submit_task_resolution".into(),
                 document: JournalToolDocument::RuntimeMetadata,
                 path: "/pre_dispatch_rejection".into(),
                 equals: serde_json::json!("provider_schema_validation"),
+                where_match: None,
+                allow_missing: false,
             },
         ];
         let results =
@@ -5704,6 +6450,8 @@ mod tests {
                 document: JournalToolDocument::Result,
                 path: "/fanout/terminal".into(),
                 equals: serde_json::json!(2),
+                where_match: None,
+                allow_missing: false,
             }],
             &outcome_with_tools(&[]),
             Some(&sess),
@@ -5716,6 +6464,8 @@ mod tests {
                 document: JournalToolDocument::RuntimeMetadata,
                 path: "/pre_dispatch_rejection".into(),
                 equals: serde_json::json!("handler_error"),
+                where_match: None,
+                allow_missing: false,
             }],
             &outcome_with_tools(&[]),
             Some(&sess),
@@ -5723,6 +6473,159 @@ mod tests {
         assert!(
             !wrong_stage[0].passed,
             "another rejection stage must not match"
+        );
+    }
+
+    #[test]
+    fn durable_tool_json_can_assert_optional_field_is_unset() {
+        let session_with_args = |args: &str| {
+            mk_session(&[(
+                "turn",
+                serde_json::json!({
+                    "tool_calls": [{
+                        "tool_call_id": "spawn-call",
+                        "name": "agent",
+                        "ok": true,
+                        "args_full": args,
+                        "result_full": "{}"
+                    }]
+                }),
+            )])
+        };
+        let criterion = Criterion::JournalToolJson {
+            name: "agent".into(),
+            document: JournalToolDocument::Arguments,
+            path: "/requested_model_policy".into(),
+            equals: serde_json::Value::Null,
+            where_match: Some(JournalJsonPredicate {
+                document: JournalToolDocument::Arguments,
+                path: "/action".into(),
+                equals: serde_json::json!("spawn"),
+            }),
+            allow_missing: true,
+        };
+        let outcome = outcome_with_tools(&[]);
+
+        for args in [
+            r#"{"action":"spawn"}"#,
+            r#"{"action":"spawn","requested_model_policy":null}"#,
+        ] {
+            let session = session_with_args(args);
+            let result = evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&session),
+            );
+            assert!(result[0].passed, "unset selector should match: {result:?}");
+        }
+
+        let selected =
+            session_with_args(r#"{"action":"spawn","requested_model_policy":{"mode":"fixed"}}"#);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome,
+            Some(&selected),
+        );
+        assert!(!result[0].passed, "a non-null selection must not match");
+
+        let selected_then_retrieved = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [
+                    {"tool_call_id":"spawn-call", "name":"agent", "ok":true,
+                     "args_full":r#"{"action":"spawn","requested_model_policy":{"mode":"fixed"}}"#,
+                     "result_full":"{}"},
+                    {"tool_call_id":"get-call", "name":"agent", "ok":true,
+                     "args_full":r#"{"action":"get_result","agent_id":"child"}"#,
+                     "result_full":"{}"}
+                ]
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome,
+            Some(&selected_then_retrieved),
+        );
+        assert!(
+            !result[0].passed,
+            "get_result must not supply the spawn's absent selector"
+        );
+
+        let null_filter: Criterion = serde_json::from_value(serde_json::json!({
+            "type":"journal_tool_json", "name":"agent", "document":"arguments",
+            "path":"/requested_model_policy", "equals":null,
+            "allow_missing":true,
+            "where_match":{"document":"arguments","path":"/action","equals":null}
+        }))
+        .unwrap();
+        assert!(matches!(
+            &null_filter,
+            Criterion::JournalToolJson { where_match: Some(predicate), .. }
+                if predicate.equals.is_null()
+        ));
+        let explicit_null = session_with_args(r#"{"action":null,"requested_model_policy":null}"#);
+        assert!(
+            evaluate_deterministic_with_session(
+                &[null_filter.clone()],
+                &outcome,
+                Some(&explicit_null)
+            )[0]
+            .passed
+        );
+        let missing_action = session_with_args(r#"{"requested_model_policy":null}"#);
+        assert!(
+            !evaluate_deterministic_with_session(&[null_filter], &outcome, Some(&missing_action))
+                [0]
+            .passed
+        );
+
+        let strict = Criterion::JournalToolJson {
+            name: "agent".into(),
+            document: JournalToolDocument::Arguments,
+            path: "/requested_model_policy".into(),
+            equals: serde_json::Value::Null,
+            where_match: None,
+            allow_missing: false,
+        };
+        let missing = session_with_args(r#"{"action":"spawn"}"#);
+        let result = evaluate_deterministic_with_session(&[strict], &outcome, Some(&missing));
+        assert!(
+            !result[0].passed,
+            "exact null assertion must continue distinguishing a missing key"
+        );
+
+        for unusable in ["not-json", "[]", "null"] {
+            let session = session_with_args(unusable);
+            let result = evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&session),
+            );
+            assert!(
+                !result[0].passed,
+                "unusable/non-object arguments must not count as an omitted property: {unusable}"
+            );
+        }
+
+        let missing_document = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [{
+                    "tool_call_id": "spawn-call",
+                    "name": "agent",
+                    "ok": true,
+                    "result_full": "{}"
+                }]
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome,
+            Some(&missing_document),
+        );
+        assert!(
+            !result[0].passed,
+            "missing arguments evidence must not count as an omitted property"
         );
     }
 
@@ -7601,14 +8504,42 @@ mod tests {
     }
 
     #[test]
-    fn validate_session_event_count_rejects_min_zero() {
+    fn validate_session_event_count_rejects_unbounded_min_zero() {
         let err = validate_criterion(&Criterion::SessionEventCount {
             event_type: "llm_round".into(),
             min: 0,
+            max: None,
+            json_match: None,
             optional: false,
         })
         .expect_err("min=0 is trivially-true — should reject");
-        assert!(err.contains("min must be >= 1"));
+        assert!(err.contains("min=0 requires max"));
+    }
+
+    #[test]
+    fn session_event_count_can_prove_no_child_start() {
+        let session = mk_session(&[("llm_round", serde_json::json!({}))]);
+        let criterion = Criterion::SessionEventCount {
+            event_type: "agent_spawned".into(),
+            min: 0,
+            max: Some(0),
+            json_match: None,
+            optional: false,
+        };
+        validate_criterion(&criterion).expect("bounded absence check");
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&session),
+        );
+        assert!(result[0].passed, "{}", result[0].detail);
+        let started = mk_session(&[("agent_spawned", serde_json::json!({}))]);
+        let result = evaluate_deterministic_with_session(
+            &[criterion],
+            &outcome_with_tools(&[]),
+            Some(&started),
+        );
+        assert!(!result[0].passed, "{}", result[0].detail);
     }
 
     #[test]

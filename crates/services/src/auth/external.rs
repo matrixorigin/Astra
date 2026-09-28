@@ -19,9 +19,9 @@ use serde_json::{Map, Value};
 
 use crate::models::ModelListItem;
 use crate::runs::{
-    ResolvedModelSelection, RuntimeAuthRequest, RuntimeCapabilityDescriptorRequest,
-    RuntimeCapabilityDescriptorsRequest, RuntimeMcpBindingRequest,
-    RuntimeSemanticReadCapabilityRequest, RuntimeSkillBindingRequest,
+    ResolvedModelSelection, ResolvedModelSourceIdentity, RuntimeAuthRequest,
+    RuntimeCapabilityDescriptorRequest, RuntimeCapabilityDescriptorsRequest,
+    RuntimeMcpBindingRequest, RuntimeSemanticReadCapabilityRequest, RuntimeSkillBindingRequest,
 };
 use astra_turn_types::ModelSelection;
 
@@ -185,6 +185,7 @@ impl ExternalCatalogModel {
             max_completion_tokens: i32_value(&self.limits, "max_completion_tokens"),
             architecture: string_value(&self.metadata, "architecture"),
             thinking_capability: None,
+            pricing: None,
         }
     }
 }
@@ -471,6 +472,8 @@ pub struct ExternalRuntimeContextResponse {
 pub struct ExternalSelectedModelResponse {
     pub id: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<ResolvedModelSourceIdentity>,
 }
 
 impl ExternalSelectedModelResponse {
@@ -484,6 +487,7 @@ impl ExternalSelectedModelResponse {
         ResolvedModelSelection {
             offering_id: self.id.clone(),
             model_name: self.model.clone(),
+            source_identity: self.source_identity.clone(),
         }
     }
 }
@@ -1092,6 +1096,16 @@ pub fn validate_provider_runtime_context(
             provider.id, context.runtime_scope.allowed_model_id, requested_model_id
         )));
     }
+    if let Some(source) = context.selected_model.source_identity.as_ref() {
+        validate_exact_descriptor_string(
+            "selected_model.source_identity.provider",
+            &source.provider,
+        )?;
+        validate_exact_descriptor_string(
+            "selected_model.source_identity.access_label",
+            &source.access_label,
+        )?;
+    }
     validate_bearer_authorization(&context.runtime_auth.authorization)?;
     if context.runtime_auth.auth_type != "moi_runtime_grant" {
         return Err(provider_context_invalid(
@@ -1658,6 +1672,7 @@ mod tests {
             selected_model: ExternalSelectedModelResponse {
                 id: "model-qwen".to_string(),
                 model: "qwen".to_string(),
+                source_identity: None,
             },
             runtime_auth: ExternalRuntimeAuthResponse {
                 auth_type: "moi_runtime_grant".to_string(),
@@ -1698,6 +1713,7 @@ mod tests {
             selected_model: ExternalSelectedModelResponse {
                 id: "model-qwen".to_string(),
                 model: "qwen".to_string(),
+                source_identity: None,
             },
             runtime_auth: ExternalRuntimeAuthResponse {
                 auth_type: "moi_runtime_grant".to_string(),
@@ -1773,7 +1789,11 @@ mod tests {
         let value = json!({
             "selected_model": {
                 "id": "model-qwen",
-                "model": "qwen2.5"
+                "model": "qwen2.5",
+                "source_identity": {
+                    "provider": "deepseek",
+                    "access_label": "Genesis"
+                }
             },
             "runtime_auth": {
                 "type": "moi_runtime_grant",
@@ -1816,6 +1836,16 @@ mod tests {
 
         let mut context: ExternalRuntimeContextResponse =
             serde_json::from_value(value).expect("MOI runtime context should parse");
+        assert_eq!(
+            context
+                .selected_model
+                .to_resolved_model_selection()
+                .source_identity
+                .as_ref()
+                .map(|source| source.access_label.as_str()),
+            Some("Genesis"),
+            "authenticated provider context must preserve Offering source, not gateway protocol"
+        );
         validate_provider_runtime_context(
             &provider("http://127.0.0.1/external-auth".to_string()),
             "model-qwen",
@@ -1849,6 +1879,25 @@ mod tests {
             &context,
         )
         .expect("positive model context must pass provider validation");
+
+        let mut invalid_source = context.clone();
+        invalid_source
+            .selected_model
+            .source_identity
+            .as_mut()
+            .expect("fixture source identity")
+            .access_label = " Genesis ".into();
+        let error = validate_provider_runtime_context(
+            &provider("http://127.0.0.1/external-auth".to_string()),
+            "model-qwen",
+            "ws-1",
+            &invalid_source,
+        )
+        .expect_err("source identity must be an exact trusted descriptor string");
+        assert_eq!(
+            error.1.error_code.as_deref(),
+            Some("external_provider_runtime_context_invalid")
+        );
 
         context
             .capability_descriptors
@@ -1943,7 +1992,11 @@ mod tests {
         JsonFixture(json!({
             "selected_model": {
                 "id": "model-qwen",
-                "model": "qwen2.5"
+                "model": "qwen2.5",
+                "source_identity": {
+                    "provider": "deepseek",
+                    "access_label": "Genesis"
+                }
             },
             "runtime_auth": {
                 "type": "moi_runtime_grant",

@@ -29,6 +29,7 @@ pub(crate) fn genesis_execution() -> AdmittedModelExecution {
     let mut execution = AdmittedModelExecution::from_offering(ResolvedModelOffering {
         offering_id: OFFERING_ID.into(),
         model: ResolvedActiveLlmModel {
+            price_snapshot: None,
             model_name: MODEL_NAME.into(),
             wire_model_name: Some("genesis-wire-model".into()),
             api_key: "test-genesis-secret".into(),
@@ -170,6 +171,7 @@ pub(crate) async fn auto_parent_run(run_id: &str, execution: &AdmittedModelExecu
                 resolved_model_selection: Some(ResolvedModelSelection {
                     offering_id: OFFERING_ID.into(),
                     model_name: MODEL_NAME.into(),
+                    source_identity: None,
                 }),
                 ..Default::default()
             },
@@ -177,10 +179,12 @@ pub(crate) async fn auto_parent_run(run_id: &str, execution: &AdmittedModelExecu
         .await
         .unwrap();
     let decision = ModelRoutingDecision {
-        schema_version: 1,
+        schema_version: 2,
         features: None,
         work_admission: None,
         work_admission_skill_revision: 0,
+        delegation_model_requirement: None,
+        delegation_model_source: None,
         policy_version: astra_turn_core::model_routing::POLICY_VERSION.into(),
         policy: AutoModelRoutingPolicy {
             revision: "test-revision".into(),

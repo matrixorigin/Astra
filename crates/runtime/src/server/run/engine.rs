@@ -31,6 +31,9 @@
 //! 5. `recover_active_runs()` — On startup, loads runs that were active when process died
 //! 6. `load_run()` — Loads a run from store (cache miss path)
 
+#[path = "remote_child_wake.rs"]
+mod remote_child_wake;
+
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -63,6 +66,7 @@ use astra_services::{
     },
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
+use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_types::ModelSelection;
 
 use astra_core::{
@@ -350,6 +354,7 @@ fn restart_session_continuation_event(
 #[derive(Clone)]
 pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
+    remote_child_wake: Arc<remote_child_wake::RemoteChildWakeHub>,
     projection_store: Option<Arc<DatabaseStateProjectionStore>>,
     metrics_registry: Option<Arc<MetricsRegistry>>,
     owner_lease_authorities: Arc<Mutex<HashMap<RunOwnerLeaseKey, Weak<RunOwnerLeaseAuthority>>>>,
@@ -544,8 +549,20 @@ pub struct RunStartContext {
     pub agent_binding_id: Option<String>,
     pub agent_binding_name: Option<String>,
     pub agent_binding_schema_version: Option<String>,
+    /// Original sub-run selection intent, separate from the admitted model
+    /// identity below. `Some(inherit)` must remain distinct from omission.
+    pub requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
     pub model_selection: Option<ModelSelection>,
     pub resolved_model_selection: Option<ResolvedModelSelection>,
+    /// Immutable effective controls for an executable child run.
+    pub(crate) generation_controls: Option<RunGenerationControls>,
+    /// Frozen human model requirements for a child run's future delegations.
+    /// Root runs assess their user turn later, so they may omit this field.
+    pub(crate) delegated_model_requirements: Option<astra_turn_types::DelegationIntentRequirements>,
+    /// Trusted process-local proof that the complete model identity was
+    /// produced from admitted execution material for this run. This is not a
+    /// durable provenance label and is never reconstructed from request data.
+    pub model_identity_admitted: bool,
     pub runtime_profile: Option<RuntimeProfileRequest>,
     pub provider_request_fingerprint: Option<String>,
     pub provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
@@ -582,8 +599,12 @@ impl Default for RunStartContext {
             agent_binding_id: None,
             agent_binding_name: None,
             agent_binding_schema_version: None,
+            requested_model_policy: None,
             model_selection: None,
             resolved_model_selection: None,
+            generation_controls: None,
+            delegated_model_requirements: None,
+            model_identity_admitted: false,
             runtime_profile: None,
             provider_request_fingerprint: None,
             provider_run_owner: None,
@@ -593,6 +614,102 @@ impl Default for RunStartContext {
             validated_work_item_assignment: false,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunGenerationControls {
+    pub thinking: ThinkingConfig,
+    pub first_output_max_tokens: Option<u32>,
+    /// Whether inference must preserve this effective control against runtime overrides.
+    pub preserve_thinking: bool,
+}
+
+pub(crate) fn durable_run_generation_controls(
+    run: &DurableRunRecord,
+) -> Result<RunGenerationControls, String> {
+    let mut started = run
+        .events
+        .iter()
+        .filter(|event| event["event_type"] == "run_started");
+    let event = started
+        .next()
+        .ok_or_else(|| "durable run has no start event".to_string())?;
+    if started.next().is_some() {
+        return Err("durable run has conflicting start events".to_string());
+    }
+    let value = event
+        .pointer("/data/generation_controls")
+        .ok_or_else(|| "durable run is missing generation controls".to_string())?;
+    if !value
+        .as_object()
+        .is_some_and(|controls| controls.contains_key("first_output_max_tokens"))
+    {
+        return Err("durable run is missing its first-output limit field".to_string());
+    }
+    let controls: RunGenerationControls = serde_json::from_value(value.clone())
+        .map_err(|error| format!("durable run has invalid generation controls: {error}"))?;
+    if controls.first_output_max_tokens == Some(0) {
+        return Err("durable run has a zero first-output limit".to_string());
+    }
+    if let ThinkingConfig::Enabled { budget_tokens } = &controls.thinking {
+        if *budget_tokens < 1024 {
+            return Err("durable run has an invalid reasoning budget".to_string());
+        }
+        if let Some(limit) = controls.first_output_max_tokens {
+            controls.thinking.validate_output_budget(u64::from(limit))?;
+        }
+    }
+    Ok(controls)
+}
+
+pub(crate) fn durable_run_requested_model_policy(
+    run: &DurableRunRecord,
+) -> Result<Option<astra_turn_types::RequestedModelPolicy>, String> {
+    let mut started = run
+        .events
+        .iter()
+        .filter(|event| event["event_type"] == "run_started");
+    let event = started
+        .next()
+        .ok_or_else(|| "durable run has no start event".to_string())?;
+    if started.next().is_some() {
+        return Err("durable run has conflicting start events".into());
+    }
+    let value = event
+        .pointer("/data/requested_model_policy")
+        .ok_or_else(|| "durable run is missing requested model policy".to_string())?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| format!("durable run has invalid requested model policy: {error}"))
+}
+
+pub(crate) fn durable_run_delegated_model_requirements(
+    run: &DurableRunRecord,
+) -> Result<Option<astra_turn_types::DelegationIntentRequirements>, String> {
+    let mut started = run
+        .events
+        .iter()
+        .filter(|event| event["event_type"] == "run_started");
+    let event = started
+        .next()
+        .ok_or_else(|| "durable run has no start event".to_string())?;
+    if started.next().is_some() {
+        return Err("durable run has conflicting start events".into());
+    }
+    event
+        .pointer("/data/delegated_model_requirements")
+        .map(|value| {
+            let requirements: astra_turn_types::DelegationIntentRequirements =
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid durable model requirements: {error}"))?;
+            requirements.validate().map_err(str::to_string)?;
+            Ok(requirements)
+        })
+        .transpose()
 }
 
 fn durable_model_identity(
@@ -641,18 +758,15 @@ fn inherit_parent_run_identity(
                     context.resolved_model_selection = Some(ResolvedModelSelection {
                         offering_id: offering_id.to_string(),
                         model_name: model_name.to_string(),
+                        source_identity: None,
                     });
                     Ok(())
                 }
-                (Some(selection), Some(resolved))
-                    if selection.offering_id == offering_id
-                        && resolved.offering_id == offering_id
-                        && resolved.model_name == model_name =>
-                {
-                    Ok(())
+                (Some(_), Some(_)) if context.model_identity_admitted => {
+                    durable_model_identity(context).map(|_| ())
                 }
                 _ => Err(
-                    "child run model identity must inherit the admitted parent Offering"
+                    "child run model identity must be inherited or contain one matching admitted Offering and resolved model"
                         .to_string(),
                 ),
             }
@@ -920,6 +1034,14 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
         "interaction_mode".to_string(),
         serde_json::Value::String(requested_mode_label(context.interaction_mode).to_string()),
     );
+    data.insert(
+        "requested_model_policy".to_string(),
+        context
+            .requested_model_policy
+            .as_ref()
+            .map(|policy| serde_json::to_value(policy).expect("requested model policy serializes"))
+            .unwrap_or(serde_json::Value::Null),
+    );
     if let Some(interactive_client) = context.interactive_client {
         data.insert(
             "interactive_client".to_string(),
@@ -928,7 +1050,11 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
     }
     if let Some(metadata) = context.execution_metadata.as_ref() {
         for (key, value) in metadata {
-            if key != "execution_restrictions" && key != "admission_source" {
+            if key != "execution_restrictions"
+                && key != "admission_source"
+                && key != "generation_controls"
+                && key != "delegated_model_requirements"
+            {
                 data.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
@@ -943,6 +1069,18 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
         data.insert(
             "admission_source".into(),
             serde_json::to_value(source).expect("typed admission source serializes"),
+        );
+    }
+    if let Some(controls) = context.generation_controls.as_ref() {
+        data.insert(
+            "generation_controls".into(),
+            serde_json::to_value(controls).expect("typed generation controls serialize"),
+        );
+    }
+    if let Some(requirements) = context.delegated_model_requirements.as_ref() {
+        data.insert(
+            "delegated_model_requirements".into(),
+            serde_json::to_value(requirements).expect("typed model requirements serialize"),
         );
     }
     if let Some(fingerprint) = context.provider_request_fingerprint.as_ref() {
@@ -1058,6 +1196,7 @@ impl RunEngine {
     /// Create a new engine backed by the given store.
     pub fn new(store: Arc<dyn RunStateStore>) -> Self {
         Self {
+            remote_child_wake: remote_child_wake::RemoteChildWakeHub::new(store.clone()),
             store,
             projection_store: None,
             metrics_registry: None,
@@ -1653,22 +1792,71 @@ impl RunEngine {
         retry_of: Option<&str>,
         context: RunStartContext,
     ) -> Result<RunExecutionAuthority, String> {
-        let record = self
-            .build_run_start_record(
-                run_id,
-                user_id,
-                session_id,
-                parent_run_id,
-                delegation_id,
-                agent_id,
-                retry_of,
-                context,
-            )
-            .await?;
+        self.start_run_ext_with_context_with_deadline(
+            run_id,
+            user_id,
+            session_id,
+            parent_run_id,
+            delegation_id,
+            agent_id,
+            retry_of,
+            context,
+            None,
+        )
+        .await
+    }
+
+    /// Start a durable run within the caller's execution deadline. If the
+    /// database deadline races commit acknowledgement, the store must prove the
+    /// exact durable receipt before returning execution authority. Repairable
+    /// projection work is best-effort and shares the same deadline.
+    pub(crate) async fn start_run_ext_with_context_with_deadline(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        session_id: &str,
+        parent_run_id: Option<&str>,
+        delegation_id: Option<&str>,
+        agent_id: Option<&str>,
+        retry_of: Option<&str>,
+        context: RunStartContext,
+        execution_deadline: Option<tokio::time::Instant>,
+    ) -> Result<RunExecutionAuthority, String> {
+        let build_record = self.build_run_start_record(
+            run_id,
+            user_id,
+            session_id,
+            parent_run_id,
+            delegation_id,
+            agent_id,
+            retry_of,
+            context,
+        );
+        let record = match execution_deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, build_record)
+                .await
+                .map_err(|_| "sub-run deadline expired before durable admission".to_string())??,
+            None => build_record.await?,
+        };
+        if execution_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err("sub-run deadline expired before durable admission".to_string());
+        }
         let owner_generation = record.run_generation;
-        self.store.insert_run(record).await?;
-        self.project_delegation_run_if_needed(user_id, run_id, None)
-            .await?;
+        match execution_deadline {
+            Some(deadline) => {
+                self.store
+                    .insert_run_with_deadline(record, deadline)
+                    .await?;
+            }
+            None => self.store.insert_run(record).await?,
+        }
+        self.project_delegation_run_best_effort_with_deadline(
+            user_id,
+            run_id,
+            "run create",
+            execution_deadline,
+        )
+        .await;
         Ok(RunExecutionAuthority { owner_generation })
     }
 
@@ -1690,8 +1878,8 @@ impl RunEngine {
             .claim_run_start(record, requested_session_id)
             .await?;
         if matches!(claim, DurableRunStartClaim::Started { .. }) {
-            self.project_delegation_run_if_needed(user_id, run_id, None)
-                .await?;
+            self.project_delegation_run_best_effort(user_id, run_id, "run claim")
+                .await;
         }
         Ok(claim)
     }
@@ -3036,6 +3224,60 @@ impl RunEngine {
             })
     }
 
+    async fn project_delegation_run_best_effort(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        operation: &str,
+    ) {
+        self.project_delegation_run_best_effort_with_deadline(user_id, run_id, operation, None)
+            .await;
+    }
+
+    async fn project_delegation_run_best_effort_with_deadline(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        operation: &str,
+        execution_deadline: Option<tokio::time::Instant>,
+    ) {
+        if execution_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            tracing::warn!(
+                user_id,
+                run_id,
+                operation,
+                "durable run admitted but delegation projection skipped after execution deadline"
+            );
+            return;
+        }
+        let projection = self.project_delegation_run_if_needed(user_id, run_id, None);
+        let projection_result = if let Some(deadline) = execution_deadline {
+            match tokio::time::timeout_at(deadline, projection).await {
+                Ok(result) => Some(result),
+                Err(_) => {
+                    tracing::warn!(
+                        user_id,
+                        run_id,
+                        operation,
+                        "durable run admitted but delegation projection exceeded execution deadline"
+                    );
+                    return;
+                }
+            }
+        } else {
+            Some(projection.await)
+        };
+        if let Some(Err(error)) = projection_result {
+            tracing::warn!(
+                user_id,
+                run_id,
+                operation,
+                error = %error,
+                "durable run admitted but delegation projection refresh failed"
+            );
+        }
+    }
+
     /// Persist token/tool usage counters.
     pub async fn persist_usage(
         &self,
@@ -3356,6 +3598,17 @@ impl RunEngine {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<RunControlStatus>, String> {
+        Ok(self
+            .check_control_observation(user_id, run_id)
+            .await?
+            .status)
+    }
+
+    pub async fn check_control_observation(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<RunControlObservation, String> {
         let record = match self.store.load_run_control(user_id, run_id).await {
             Ok(record) => {
                 record_control_poll_attempt(self.metrics_registry.as_ref(), "status", "ok");
@@ -3368,20 +3621,28 @@ impl RunEngine {
             }
         };
         let Some(record) = record else {
-            return Ok(None);
+            return Ok(RunControlObservation::default());
+        };
+        let mut observation = RunControlObservation {
+            status: None,
+            last_event_idx: Some(record.last_event_idx),
+            session_id: Some(record.session_id.clone()),
+            run_generation: Some(record.run_generation),
         };
         let own_status = durable_run_status_kind(&record.status);
         if matches!(
             own_status,
             DurableRunStatusKind::Completed | DurableRunStatusKind::Failed
         ) {
-            return Ok(None);
+            return Ok(observation);
         }
         if matches!(own_status, DurableRunStatusKind::Cancelled) {
-            return Ok(Some(RunControlStatus::Cancelled));
+            observation.status = Some(RunControlStatus::Cancelled);
+            return Ok(observation);
         }
         if record.cancellation_requested {
-            return Ok(Some(RunControlStatus::Cancelled));
+            observation.status = Some(RunControlStatus::Cancelled);
+            return Ok(observation);
         }
 
         let ancestor_ids = match record.parent_run_id.as_deref() {
@@ -3443,7 +3704,8 @@ impl RunEngine {
         let mut inherited_pause = false;
         for ancestor in ancestors {
             if ancestor.cancellation_requested {
-                return Ok(Some(RunControlStatus::Cancelled));
+                observation.status = Some(RunControlStatus::Cancelled);
+                return Ok(observation);
             }
             match durable_run_status_kind(&ancestor.status) {
                 DurableRunStatusKind::Cancelled => {
@@ -3452,7 +3714,8 @@ impl RunEngine {
                         .await?
                         == Some(astra_turn_core::orchestration_types::CancellationOrigin::User)
                     {
-                        return Ok(Some(RunControlStatus::Cancelled));
+                        observation.status = Some(RunControlStatus::Cancelled);
+                        return Ok(observation);
                     }
                 }
                 DurableRunStatusKind::Paused if ancestor.waiting_for.is_some() => {
@@ -3462,12 +3725,13 @@ impl RunEngine {
             }
         }
 
-        Ok(match own_status {
+        observation.status = match own_status {
             DurableRunStatusKind::Cancelled => Some(RunControlStatus::Cancelled),
             DurableRunStatusKind::Paused => Some(RunControlStatus::Paused),
             _ if inherited_pause => Some(RunControlStatus::Paused),
             _ => None,
-        })
+        };
+        Ok(observation)
     }
 
     /// Return whether this exact run or one of its validated durable
@@ -4255,6 +4519,31 @@ impl RunEngine {
         self.store.commit_pre_durable_child_terminal(receipt).await
     }
 
+    pub async fn load_session_agent_recovery_for(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_ids: &[String],
+    ) -> Result<astra_services::runs::DurableSessionRunPage, String> {
+        self.store
+            .load_session_agent_recovery_for(user_id, session_id, run_ids)
+            .await
+    }
+
+    /// Process-wide, batched wake hints. Receivers own their subscription;
+    /// dropping the last receiver removes its observation on the next sweep.
+    /// A hint requires an exact durable recovery read, never finalization.
+    pub fn subscribe_remote_child_wake(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        parent_run_id: &str,
+        child_run_ids: &[String],
+    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, String> {
+        self.remote_child_wake
+            .subscribe(user_id, session_id, parent_run_id, child_run_ids)
+    }
+
     /// Access the underlying store (for advanced queries).
     pub fn store(&self) -> &Arc<dyn RunStateStore> {
         &self.store
@@ -4262,9 +4551,9 @@ impl RunEngine {
 }
 
 use crate::turn::run_control::{
-    ActionAdmissionRequest, ProviderBoundaryAuthorization, QueuedUserIntent, RunControlStatus,
-    RunStatusProvider, UserIntentAdmissionAuthority, UserIntentApplyAck, UserIntentPoll,
-    UserIntentPollIssue, UserIntentPollIssueKind, UserIntentProvider,
+    ActionAdmissionRequest, ProviderBoundaryAuthorization, QueuedUserIntent, RunControlObservation,
+    RunControlStatus, RunStatusProvider, UserIntentAdmissionAuthority, UserIntentApplyAck,
+    UserIntentPoll, UserIntentPollIssue, UserIntentPollIssueKind, UserIntentProvider,
 };
 
 fn durable_event_index(event: &serde_json::Value, fallback: usize) -> usize {
@@ -4534,6 +4823,14 @@ impl RunStatusProvider for RunEngine {
         run_id: &str,
     ) -> Result<Option<RunControlStatus>, String> {
         self.check_control_status(user_id, run_id).await
+    }
+
+    async fn control_observation(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<RunControlObservation, String> {
+        self.check_control_observation(user_id, run_id).await
     }
 
     async fn cancellation_origin(
@@ -7864,6 +8161,125 @@ mod tests {
         assert_eq!(run.events[0]["data"]["skill_auto_route_policy"], "disabled");
     }
 
+    #[tokio::test]
+    async fn generation_controls_round_trip_and_reject_missing_or_corrupt_snapshots() {
+        let engine = test_engine();
+        let controls = RunGenerationControls {
+            thinking: ThinkingConfig::Enabled {
+                budget_tokens: 2048,
+            },
+            first_output_max_tokens: Some(4096),
+            preserve_thinking: true,
+        };
+        engine
+            .start_run_with_context(
+                "controlled",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    generation_controls: Some(controls.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut run = engine
+            .load_run("user-1", "controlled")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable_run_generation_controls(&run).unwrap(), controls);
+
+        let valid_start = run.events[0].clone();
+        run.events.push(valid_start.clone());
+        assert!(durable_run_generation_controls(&run).is_err());
+        run.events.pop();
+
+        run.events[0]["data"]["generation_controls"] = serde_json::json!({
+            "thinking": {"mode": "off"},
+            "preserve_thinking": true
+        });
+        assert!(durable_run_generation_controls(&run).is_err());
+        run.events[0] = valid_start.clone();
+
+        run.events[0]["data"]["generation_controls"] = serde_json::json!({
+            "thinking": {"mode": "off"},
+            "first_output_max_tokens": null
+        });
+        assert!(durable_run_generation_controls(&run).is_err());
+        run.events[0] = valid_start;
+
+        run.events[0]["data"]["generation_controls"]["first_output_max_tokens"] =
+            serde_json::json!(0);
+        assert!(durable_run_generation_controls(&run).is_err());
+        run.events[0]["data"]["generation_controls"] = serde_json::json!({
+            "thinking": {"mode": "enabled", "budget_tokens": 4096},
+            "first_output_max_tokens": 4096,
+            "preserve_thinking": true
+        });
+        assert!(durable_run_generation_controls(&run).is_err());
+
+        run.events[0]["data"]["generation_controls"]["thinking"] =
+            serde_json::json!({"mode": "unknown"});
+        assert!(durable_run_generation_controls(&run).is_err());
+        run.events[0]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("generation_controls");
+        assert!(durable_run_generation_controls(&run).is_err());
+    }
+
+    #[tokio::test]
+    async fn requested_model_policy_round_trips_and_missing_snapshot_fails_closed() {
+        let engine = test_engine();
+        let policy = astra_turn_types::RequestedModelPolicy::Auto {
+            strategy: astra_turn_types::AutoModelStrategy::Balanced,
+        };
+        engine
+            .start_run_with_context(
+                "policy-run",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    requested_model_policy: Some(policy.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut run = engine
+            .load_run("user-1", "policy-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable_run_requested_model_policy(&run).unwrap(),
+            Some(policy)
+        );
+
+        let valid_start = run.events[0].clone();
+        run.events[0]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("requested_model_policy");
+        assert!(durable_run_requested_model_policy(&run).is_err());
+        run.events[0] = valid_start.clone();
+        run.events.push(valid_start);
+        assert!(durable_run_requested_model_policy(&run).is_err());
+    }
+
+    #[test]
+    fn execution_metadata_cannot_forge_generation_controls() {
+        let event = run_started_event_data(&RunStartContext {
+            execution_metadata: Some(serde_json::Map::from_iter([(
+                "generation_controls".to_string(),
+                serde_json::json!({"thinking": {"mode": "off"}, "first_output_max_tokens": 1}),
+            )])),
+            ..Default::default()
+        });
+        assert!(event.get("generation_controls").is_none());
+    }
+
     #[test]
     fn run_started_event_records_complete_ordered_binding_set() {
         let event = run_started_event_data(&RunStartContext {
@@ -7928,6 +8344,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-primary".to_string(),
                         model_name: "provider-model-v2".to_string(),
+                        source_identity: None,
                     }),
                     ..Default::default()
                 },
@@ -7962,6 +8379,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-b".to_string(),
                         model_name: "provider-model-v2".to_string(),
+                        source_identity: None,
                     }),
                     ..Default::default()
                 },
@@ -7993,6 +8411,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-primary".to_string(),
                         model_name: "provider-model-v2".to_string(),
+                        source_identity: None,
                     }),
                     provider_run_owner: Some(astra_services::runs::ProviderRunOwner {
                         provider_id: "moi".to_string(),
@@ -8034,6 +8453,169 @@ mod tests {
                 "provider_scope_id": "workspace-a"
             })
         );
+    }
+
+    #[tokio::test]
+    async fn delegated_run_accepts_a_distinct_admitted_child_model_identity() {
+        let engine = test_engine();
+        engine
+            .start_run_with_context(
+                "run-model-parent-explicit-child",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offer-parent".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-parent".to_string(),
+                        model_name: "parent-model".to_string(),
+                        source_identity: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        engine
+            .start_run_ext_with_context(
+                "run-model-explicit-child",
+                "user-1",
+                "sess-1",
+                Some("run-model-parent-explicit-child"),
+                Some("delegation-explicit-child"),
+                Some("reviewer"),
+                None,
+                RunStartContext {
+                    model_identity_admitted: true,
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offer-child".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-child".to_string(),
+                        model_name: "child-model".to_string(),
+                        source_identity: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a Server-admitted child Offering may differ from its parent");
+
+        let child = engine
+            .load_run("user-1", "run-model-explicit-child")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.model_offering_id.as_deref(), Some("offer-child"));
+        assert_eq!(child.resolved_model_name.as_deref(), Some("child-model"));
+    }
+
+    #[tokio::test]
+    async fn delegated_run_rejects_a_mismatched_explicit_child_model_identity() {
+        let engine = test_engine();
+        engine
+            .start_run_with_context(
+                "run-model-parent-invalid-child",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offer-parent".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-parent".to_string(),
+                        model_name: "parent-model".to_string(),
+                        source_identity: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = engine
+            .start_run_ext_with_context(
+                "run-model-invalid-child",
+                "user-1",
+                "sess-1",
+                Some("run-model-parent-invalid-child"),
+                Some("delegation-invalid-child"),
+                Some("reviewer"),
+                None,
+                RunStartContext {
+                    model_identity_admitted: true,
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offer-child-a".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-child-b".to_string(),
+                        model_name: "child-model".to_string(),
+                        source_identity: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("mismatched child identity must fail before persistence");
+        assert!(error.contains("matching admitted Offering"), "{error}");
+        assert!(
+            engine
+                .load_run("user-1", "run-model-invalid-child")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_run_rejects_an_unadmitted_explicit_child_model_identity() {
+        let engine = test_engine();
+        engine
+            .start_run_with_context(
+                "run-model-parent-unadmitted-child",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offer-parent".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-parent".to_string(),
+                        model_name: "parent-model".to_string(),
+                        source_identity: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = engine
+            .start_run_ext_with_context(
+                "run-model-unadmitted-child",
+                "user-1",
+                "sess-1",
+                Some("run-model-parent-unadmitted-child"),
+                Some("delegation-unadmitted-child"),
+                Some("reviewer"),
+                None,
+                RunStartContext {
+                    model_selection: Some(ModelSelection {
+                        offering_id: "offer-child".to_string(),
+                    }),
+                    resolved_model_selection: Some(ResolvedModelSelection {
+                        offering_id: "offer-child".to_string(),
+                        model_name: "child-model".to_string(),
+                        source_identity: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an explicit child identity requires trusted admission provenance");
+        assert!(error.contains("inherited or contain"), "{error}");
     }
 
     #[tokio::test]
@@ -8267,6 +8849,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-primary".to_string(),
                         model_name: "provider-model-v2".to_string(),
+                        source_identity: None,
                     }),
                     ..Default::default()
                 },
@@ -8290,6 +8873,7 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-unadmitted".to_string(),
                         model_name: "other-provider-model".to_string(),
+                        source_identity: None,
                     }),
                     ..Default::default()
                 },
@@ -8366,6 +8950,7 @@ mod tests {
     {
         let engine = test_engine();
         let request = astra_services::runs::ChatRequestData {
+            model_catalog_reader: None,
             message: "hello".to_string(),
             conversation_authority: None,
             user_intent: None,
@@ -8380,8 +8965,10 @@ mod tests {
             full_llm_capture: false,
             agent_id: None,
             model: None,
+            expected_model_name: None,
             model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
             model_selection: None,
+            requested_model_policy: None,
             resolved_model_selection: None,
             admitted_model_execution: None,
             capability_descriptors: None,

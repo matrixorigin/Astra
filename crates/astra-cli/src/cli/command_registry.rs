@@ -402,10 +402,8 @@ const TEAM_SUBCOMMANDS: &[(&str, &str)] = &[
 ];
 
 const MESSAGING_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("dlq", "Show dead letter queue"),
     ("help", "Show messaging help"),
     ("metrics", "Show metrics snapshot"),
-    ("status", "Show mailbox status"),
 ];
 
 const COMPACT_SUBCOMMANDS: &[(&str, &str)] = &[

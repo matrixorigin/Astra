@@ -4974,6 +4974,7 @@ mod tests {
             start_elapsed_ms: None,
             duration_ms: None,
             outcome: None,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),
@@ -10646,7 +10647,6 @@ mod tests {
             related_message_id: None,
             timestamp_ms: 42,
             correlation_id: None,
-            requires_ack: false,
         };
         widget.handle_event(AppEvent::wire(WireEvent::AgentCommunication(base.clone())));
         widget.handle_event(AppEvent::wire(WireEvent::AgentCommunication(

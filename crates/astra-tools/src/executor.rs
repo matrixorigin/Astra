@@ -988,7 +988,7 @@ impl DefaultToolExecutor {
             // ── Utility tools ────────────────────────────────────────
             "tool_search" => {
                 let schemas = self.tool_schemas();
-                string_to_result(crate::tool_search::tool_search(&schemas, args))
+                crate::tool_search::tool_search_result(&schemas, args)
             }
             "env" => string_to_result(crate::env_tools::env_tool(args)),
             "config" => {

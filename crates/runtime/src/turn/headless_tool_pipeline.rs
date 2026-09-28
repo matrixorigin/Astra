@@ -387,6 +387,9 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub current_turn_chain_id: Option<&'a str>,
     pub durable_dispatch_admission:
         Option<crate::server::tool_invocation_runtime::DurableDispatchAdmission>,
+    pub delegation_model_admissions: Option<
+        &'a HashMap<String, crate::turn::agentic_loop::host::PreparedDelegationModelAdmission>,
+    >,
     pub task_resolution_authority:
         Option<&'a astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     pub tool_calls: &'a [Value],
@@ -1061,6 +1064,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let run_id = self.ctx.current_run_id;
         let turn_chain_id = self.ctx.current_turn_chain_id;
         let durable_dispatch_admission = self.ctx.durable_dispatch_admission;
+        let delegation_model_admissions = self.ctx.delegation_model_admissions;
         let task_resolution_authority = self.ctx.task_resolution_authority;
         let session_turn = self.ctx.session_turn;
         let edge_round_present = !self.ctx.edge_tool_round.is_empty();
@@ -1098,6 +1102,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     ]));
                     return crate::server::runtime_tool_executor::RuntimeToolDispatchControl::Continue;
                 };
+                let delegation_model_admission =
+                    delegation_model_admissions.and_then(|admissions| admissions.get(&exec.id));
                 execute_tool_pure(
                     exec,
                     server_executor,
@@ -1107,6 +1113,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     run_id,
                     turn_chain_id,
                     durable_dispatch_admission,
+                    delegation_model_admission,
                     task_resolution_authority,
                     provider_policy.as_ref(),
                     permission_grant.as_ref(),
@@ -1500,6 +1507,7 @@ mod tests {
                     current_turn_chain_id: has_runtime_executor
                         .then_some(self.turn_chain_id.as_str()),
                     durable_dispatch_admission: None,
+                    delegation_model_admissions: None,
                     task_resolution_authority: None,
                     tool_calls: &self.tool_calls,
                     deferred_activations_by_call_id: &self.deferred_activations_by_call_id,
@@ -3295,6 +3303,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recorded_tool_selection_reaches_model_and_activation_history_intact() {
+        let selected = astra_tools::tool_search::tool_search_result(
+            &astra_tools::schemas::all_tool_schemas(),
+            &json!({"query":"select:agent,agent_fanout"}),
+        );
+        assert!(!selected.is_error);
+        assert!(
+            selected.output.len() > astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS
+        );
+        for (metadata, expected_names) in [
+            (selected.metadata.clone(), vec!["agent", "agent_fanout"]),
+            (None, vec![]),
+        ] {
+            let mut harness = PipelineHarness::new();
+            harness.messages.push(json!({
+                "role":"assistant",
+                "tool_calls":[{"id":"call-search","function":{
+                    "name":"tool_search","arguments":"{\"query\":\"select:agent,agent_fanout\"}"
+                }}]
+            }));
+            let mut pipeline = harness.pipeline();
+            pipeline
+                .record_execution(ExecutedExecution {
+                    execution: HeadlessResolvedExecution {
+                        id: "call-search".into(),
+                        name: "tool_search".into(),
+                        args: json!({"query":"select:agent,agent_fanout"}),
+                        result_str: selected.output.clone(),
+                        tool_result_fields: metadata,
+                        authoritative_is_error: Some(false),
+                        pending_runtime_completion: None,
+                        confirmed_invocation: None,
+                        edge_duration_ms: 0,
+                        is_edge_tool: false,
+                        edge_result_missing: false,
+                        edge_terminal_authority: false,
+                        early_exit_ms: 0,
+                    },
+                    idem_key: None,
+                    pre_tool_context: None,
+                    is_err: false,
+                    error_kind: None,
+                    executed_ms: 1,
+                })
+                .await;
+            drop(pipeline);
+            let names = astra_turn_core::tool::deferred_activation::deferred_tool_activations_from_messages(&harness.messages)
+                .into_iter()
+                .map(|activation| activation.name)
+                .collect::<Vec<_>>();
+            assert_eq!(names, expected_names);
+            let body = harness.messages.last().unwrap()["content"]
+                .as_str()
+                .unwrap();
+            if expected_names.is_empty() {
+                assert!(body.contains("could not be delivered intact"));
+            } else {
+                assert_eq!(body, selected.output);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn edge_nonexecution_and_real_failure_keep_distinct_dispositions_and_steps() {
         use astra_pipeline::step_protocol::StepEventType;
         use astra_services::session_journal::ToolCallDisposition;
@@ -3753,6 +3824,151 @@ mod tests {
                 .to_string()
                 .contains("hooked result")
         );
+    }
+
+    fn catalog_record_fixture() -> (String, ExecutedExecution) {
+        use astra_services::models::{ModelAccessKind, ModelExecutionPlacement, ModelListItem};
+        use astra_turn_core::model_catalog::{ModelCatalogRequest, catalog_page};
+        let item = ModelListItem {
+            offering_id: "fixture-offering".into(),
+            name: "fixture-model".into(),
+            provider: "openai".into(),
+            access_id: "fixture-access".into(),
+            access_kind: ModelAccessKind::CloudByok,
+            access_label: "L".repeat(3_000),
+            execution_placement: ModelExecutionPlacement::Server,
+            description: None,
+            is_active: true,
+            context_window: 32_768,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+            pricing: None,
+        };
+        let page = catalog_page(vec![item], &ModelCatalogRequest::default(), "user")
+            .unwrap()
+            .to_json();
+        let produced =
+            astra_tools::ToolResult::text(page.clone()).with_source_bounded_model_projection();
+        let executed = ExecutedExecution {
+            execution: HeadlessResolvedExecution {
+                confirmed_invocation: None,
+                id: "catalog-call".into(),
+                name: "model_catalog".into(),
+                args: json!({}),
+                result_str: produced.output,
+                tool_result_fields: produced.metadata,
+                authoritative_is_error: Some(false),
+                pending_runtime_completion: None,
+                edge_duration_ms: 0,
+                is_edge_tool: false,
+                edge_result_missing: false,
+                edge_terminal_authority: false,
+                early_exit_ms: 0,
+            },
+            idem_key: None,
+            pre_tool_context: None,
+            is_err: false,
+            error_kind: None,
+            executed_ms: 1,
+        };
+        (page, executed)
+    }
+
+    #[tokio::test]
+    async fn unmodified_model_catalog_page_reaches_journal_and_model_intact() {
+        let mut harness = PipelineHarness::new();
+        let (page, executed) = catalog_record_fixture();
+        harness.pipeline().record_execution(executed).await;
+
+        let record = &harness.tool_call_records[0];
+        assert!(record.ok, "{:?}", record.error_kind);
+        assert_eq!(record.result_full.as_deref(), Some(page.as_str()));
+        assert_eq!(harness.messages.last().unwrap()["content"], page);
+    }
+
+    #[tokio::test]
+    async fn same_invocation_model_catalog_replay_keeps_complete_json() {
+        let mut harness = PipelineHarness::new();
+        let (page, _) = catalog_record_fixture();
+        assert!(
+            page.len() > 2_000,
+            "exercise the generic replay preview boundary"
+        );
+        let call_id = "catalog-replay";
+        let args = json!({});
+        harness.valid_tool_names.insert("model_catalog".into());
+        harness.tool_calls = vec![json!({
+            "id": call_id,
+            "type": "function",
+            "function": {"name":"model_catalog", "arguments":"{}"}
+        })];
+        harness.edge_tool_round.clear();
+        begin_recorded_turn(&mut harness, 1);
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            harness.session_id.clone(),
+            harness.run_id.clone(),
+            harness.turn_chain_id.clone(),
+            call_id,
+        )
+        .unwrap();
+        let key = IdempotencyKey::new(&identity.storage_key(), 0, "model_catalog", &args);
+        harness.idempotency_cache.record(
+            &key,
+            CachedToolResult {
+                tool_name: "model_catalog".into(),
+                output: page.clone(),
+                is_error: false,
+                cached_at: 0,
+                context_signature: key.context_signature.clone(),
+            },
+        );
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
+        let mut pipeline = harness.pipeline_with_server_executor(1, Some(&executor));
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("catalog replay must pass validation"),
+        };
+        assert!(matches!(
+            pipeline.permit_execution(validated).await,
+            HeadlessPipelineStage::ShortCircuit
+        ));
+        assert_eq!(pipeline.ctx.messages.last().unwrap()["content"], page);
+        assert_eq!(
+            pipeline.ctx.tool_call_records.last().unwrap().disposition,
+            Some(astra_services::session_journal::ToolCallDisposition::Reused)
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tool_hook_cannot_rewrite_a_successful_model_catalog_page() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PostToolUse,
+            matcher: "model_catalog".into(),
+            action: HookAction::Shell {
+                command: r#"echo '{"output":"rewritten catalog"}'"#.into(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+        let (_, executed) = catalog_record_fixture();
+        harness.pipeline().record_execution(executed).await;
+
+        let record = &harness.tool_call_records[0];
+        assert!(!record.ok);
+        assert_eq!(
+            record.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        let visible = format!("{:?}", harness.tool_results);
+        assert!(visible.contains("invalid_catalog"), "{visible}");
+        assert!(!visible.contains("rewritten catalog"), "{visible}");
     }
 
     #[tokio::test]
@@ -6398,12 +6614,20 @@ mod tests {
         let mut pipeline = harness.pipeline();
         let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
         assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
+        let visible = pipeline.ctx.tool_results[0].to_string();
         assert!(
-            pipeline.ctx.tool_results[0]
-                .to_string()
-                .contains("retry_deferred: Busy-poll backoff"),
-            "repeated non-progress outcomes should trigger a short-term backoff"
+            visible.contains("retry_deferred: agent.get_result"),
+            "{visible}"
         );
+        assert!(
+            visible.contains("current child status is unknown"),
+            "{visible}"
+        );
+        assert!(
+            visible.contains("when continuation is available"),
+            "{visible}"
+        );
+        assert!(!visible.contains("Wait about"), "{visible}");
         drop(pipeline);
         assert_eq!(harness.tool_call_records.len(), 1);
         assert!(harness.tool_call_records[0].ok);
@@ -6412,7 +6636,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_slot_allows_poll_again_after_nonprogress_cooldown() {
+    fn validate_slot_reaches_runtime_binding_after_nonprogress_cooldown() {
         let mut harness = PipelineHarness::new();
         harness.valid_tool_names.insert("agent".to_string());
         let args = json!({"action":"get_result","agent_id":"general-purpose_demo@123"});
@@ -6421,17 +6645,6 @@ mod tests {
             "type": "function",
             "function": { "name": "agent", "arguments": serde_json::to_string(&args).unwrap() }
         }));
-        harness.edge_tool_round = vec![EdgeToolExecResult {
-            execution_completion: None,
-            request_id: "call-agent-1".to_string(),
-            tool: "agent".to_string(),
-            args: args.clone(),
-            output: r#"{"status":"still_running","agent_id":"general-purpose_demo@123"}"#
-                .to_string(),
-            tool_result_fields: Some(edge_runtime_environment_fields()),
-            status: "completed".to_string(),
-            duration_ms: 4,
-        }];
         let sig = astra_turn_core::tool_result_semantics::tool_health_identity("agent", &args);
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -6455,9 +6668,16 @@ mod tests {
         let mut pipeline = harness.pipeline();
         let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
         assert!(
-            matches!(result, HeadlessPipelineStage::Continue(_)),
-            "non-progress backoff must expire so long-running tasks can be polled again later"
+            matches!(result, HeadlessPipelineStage::ShortCircuit),
+            "the cold test has no multi-agent runtime binding: {:?}",
+            pipeline.ctx.tool_results
         );
+        let visible = pipeline.ctx.tool_results[0].to_string();
+        assert!(
+            visible.contains("multi-agent runtime is not connected"),
+            "{visible}"
+        );
+        assert!(!visible.contains("retry_deferred"), "{visible}");
     }
 
     #[tokio::test]

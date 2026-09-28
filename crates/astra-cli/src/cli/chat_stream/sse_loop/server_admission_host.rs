@@ -997,6 +997,13 @@ fn append_permission_mode_change_audit(
 
 #[async_trait]
 impl AgenticLoopHost for CliServerAdmissionHost<'_> {
+    fn parent_model_reasoning_snapshot(
+        &self,
+        _state: &AgenticLoopState,
+    ) -> Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning> {
+        self.executor.parent_model_reasoning_snapshot()
+    }
+
     fn is_pre_admission_rejection(&self) -> bool {
         is_pre_admission_rejection(
             self.last_error_code.as_deref(),
@@ -1011,6 +1018,25 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         } else {
             ContinuationAuthority::Runtime
         }
+    }
+
+    fn direct_child_completion_owner(
+        &self,
+        _state: &AgenticLoopState,
+    ) -> Option<Arc<astra_runtime::orchestration::FanoutParentAdmission>> {
+        Some(Arc::clone(
+            &self.executor.spawn_context.as_ref()?.fanout_admission,
+        ))
+    }
+
+    fn execution_time_budget_remaining(&self) -> Option<Duration> {
+        Some(
+            self.executor
+                .spawn_context
+                .as_ref()?
+                .execution_deadline?
+                .remaining(),
+        )
     }
 
     fn injects_round_guidance(&self) -> bool {
@@ -1900,6 +1926,13 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             return Vec::new();
         };
 
+        let mut agent_ids = agent_ids.to_vec();
+        for child in spawn_context.fanout_admission.pending_direct_children() {
+            if !child.status.is_terminal() && !agent_ids.contains(&child.agent_id) {
+                agent_ids.push(child.agent_id);
+            }
+        }
+
         // A tool receipt is not the lifecycle owner. Fanout may be admitted
         // before its result commits, so the known-id list can be empty when
         // the parent is interrupted. Cancel and fence the producer run tree
@@ -1912,7 +1945,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         }
 
         let mut cancelled = Vec::new();
-        for agent_id in agent_ids {
+        for agent_id in &agent_ids {
             let transfer = match origin {
                 astra_runtime::orchestration::CancellationOrigin::User => {
                     astra_runtime::orchestration::CancellationTransferOutcome::NotFound
@@ -2179,7 +2212,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         let provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
         let raw_provider = provider.raw_provider_name().to_owned();
         let capture_thinking =
-            astra_turn_core::thinking_config::resolve_model_thinking(model_selector).1;
+            astra_turn_core::thinking_config::resolve_model_thinking_request(model_selector).1;
         // Canonical prefix bytes: JSON-serialize the messages as-is.
         // This is the format `fork_reconstruct::reconstruct_messages`
         // expects on the consuming end. System prompts and tool

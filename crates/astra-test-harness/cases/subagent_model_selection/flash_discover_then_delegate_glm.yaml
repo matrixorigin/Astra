@@ -1,0 +1,68 @@
+name: flash_discover_then_delegate_glm
+description: |
+  The parent discovers its authorized Chat catalog before using an available
+  GLM child, without reading workspace configuration.
+prompt: |
+  Check which Chat models are currently available for you to delegate to.
+  If GLM 5.2 is available, ask a GLM 5.2 subagent to reply exactly
+  ASTRA-CATALOG-GLM-OK, then tell me its reply and which model it used.
+  Do not inspect local configuration or workspace files to find models.
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: model_catalog
+    min: 1
+    max: 3
+  - type: journal_tool_json
+    name: model_catalog
+    document: result
+    path: /purpose
+    equals: chat
+  - type: journal_tool_json
+    name: model_catalog
+    document: result
+    path: /error
+    equals: null
+  - type: journal_tool_outcome_count
+    name: model_catalog
+    ok: false
+    min: 0
+    max: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: glm-5.2
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    json_match:
+      path: /payload/model
+      equals: glm-5.2
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: text_contains
+    needle: ASTRA-CATALOG-GLM-OK
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: grep
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: read_file
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

@@ -802,7 +802,7 @@ async fn execute_repl_bridge_command_impl(
 
     let mut state = initialize_session_state(profile, global_model, cli_context);
     if slash_cmd == "/messaging" {
-        handle_messaging_command(arg, &state).await;
+        handle_messaging_command(arg, &state);
         return Ok(ExitCode::Success);
     }
     maybe_load_project_instructions(&mut state);
@@ -851,7 +851,7 @@ async fn execute_repl_bridge_command_impl(
             };
             slash_agent::handle_agent_command(arg, &ctx).await;
         }
-        "/messaging" => handle_messaging_command(arg, &state).await,
+        "/messaging" => handle_messaging_command(arg, &state),
         _ => return Err(format!("unsupported bridged command: {slash_cmd}")),
     }
 

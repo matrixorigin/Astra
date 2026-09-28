@@ -10,6 +10,7 @@ import type { ExplainAnalyzeNodeV1 } from "./explain-analyze";
 import type {
   ExplainAnalyzeContextMetricsV1,
   ExplainAnalyzeContextSourceKindV1,
+  ExplainAnalyzeDecisionDetailV1,
   ExplainAnalyzeOutcomeV1,
   ExplainAnalyzeUsageV1,
 } from "./types";
@@ -216,6 +217,14 @@ function renderNode(
   if (state.truncated) return;
 
   const detailPrefix = detailConnector(frame);
+  if (node.decisionDetail) {
+    appendLine(
+      lines,
+      `${detailPrefix}${explainAnalyzeDecisionDetailLine(node.decisionDetail)}`,
+      state,
+    );
+    if (state.truncated) return;
+  }
   for (const dependencyId of node.dependencyNodeIds.slice(0, MAX_RENDERED_DEPENDENCIES)) {
     const dependency = nodeById.get(dependencyId);
     appendLine(
@@ -250,6 +259,16 @@ function renderNode(
       state,
     );
   }
+}
+
+export function explainAnalyzeDecisionDetailLine(
+  detail: ExplainAnalyzeDecisionDetailV1,
+): string {
+  const requirement = detail.requirement_index + 1;
+  if (detail.match_count === 0) {
+    return `Requested model requirement ${requirement}: no active authorized Chat-capable model exactly matched in the current catalog snapshot; no child was started.`;
+  }
+  return `Requested model requirement ${requirement}: ${detail.match_count} active authorized Chat-capable catalog entries matched exactly; selection was ambiguous, so no child was started.`;
 }
 
 function renderUsage(

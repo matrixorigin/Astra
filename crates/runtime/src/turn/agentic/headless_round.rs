@@ -99,6 +99,9 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     /// capability in the same transaction as `Prepared -> Dispatched`.
     pub durable_dispatch_admission:
         Option<crate::server::tool_invocation_runtime::DurableDispatchAdmission>,
+    pub delegation_model_admissions: Option<
+        &'a HashMap<String, crate::turn::agentic_loop::host::PreparedDelegationModelAdmission>,
+    >,
     /// Exact provider calls, used only to append the assistant transcript.
     pub physical_tool_calls: &'a [Value],
     /// Admitted execution targets, used by policy, scheduling, and execution.
@@ -294,6 +297,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         current_run_id,
         current_turn_chain_id,
         durable_dispatch_admission,
+        delegation_model_admissions,
         physical_tool_calls,
         logical_tool_calls,
         deferred_activations_by_call_id,
@@ -440,6 +444,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             current_run_id,
             current_turn_chain_id,
             durable_dispatch_admission,
+            delegation_model_admissions,
             task_resolution_authority,
             tool_calls: logical_tool_calls,
             deferred_activations_by_call_id,

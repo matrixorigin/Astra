@@ -261,6 +261,17 @@ parallel graph formats. The version field is part of this schema's evolution,
 not a request to preserve superseded event shapes. Trace event schemas remain
 owned and versioned by the observation plane.
 
+A terminal blocked or rejected `admission` event may include a typed
+`decision_detail` when the existing execution path has bounded evidence that
+materially explains the decision. Delegated-model catalog resolution may report
+the requirement's zero-based position and the count of exact eligible matches
+from the already-loaded authorized catalog snapshot. It must not expose the
+user's quote, provider response, or candidate catalog entries, and this detail
+does not grant execution authority. The detail itself adds no event kind or
+database operation. A pre-execution rejection emits the existing Admission
+start and finish facts because that path previously bypassed this observation
+boundary.
+
 A terminal `turn` fact carries the producer's known `coverage_gaps`. The server
 measures Edge approval waits. Server-internal approval waits are not yet
 separately instrumented and remain part of dispatch-to-result wall time.

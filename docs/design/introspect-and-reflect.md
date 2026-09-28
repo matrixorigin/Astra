@@ -1,7 +1,7 @@
 # Introspect and reflect
 
 > Status: target design contract.
-> Last updated: 2026-07-07.
+> Last updated: 2026-09-28.
 
 Introspect and reflect are first-class backbone capabilities. They are not debug-only tools and not prompt decorations.
 
@@ -30,6 +30,47 @@ Introspect reports system facts. Reflect reasons over those facts.
 
 Introspection must be factual, structured, and bounded. Reflection may synthesize strategy, uncertainty, and next actions, but should not mutate state by itself.
 
+## On-demand authorized model discovery
+
+`model_catalog({"limit":16})` discovers authorized active Chat models as JSON.
+It is a deferred tool discoverable through `tool_search(select:model_catalog)`;
+resident introspect points to it. Its only optional inputs are `limit`, `cursor`,
+and `catalog_revision`. Unknown inputs and invalid pagination are typed errors.
+Introspect retains its observation, Explain, and artifact-recovery selectors,
+but model discovery no longer shares those diagnostic parameters.
+
+Authentication binds an inert, non-serialized reader, inherited by dynamic
+children and skill forks. HTTP and introspection share the authorization owner:
+normal principals use `ModelService::user_model_catalog`; restricted Edge
+registrations use `AuthService::external_catalog_by_scope`, never the owner's
+full catalog. Chat/WebSocket and Work turns retain the authenticated principal.
+Missing bindings (including local CLI) return `unsupported`; owner mismatches
+return `unauthorized`. Reconstruction requires a fresh authenticated binding.
+
+Only explicit discovery reads the catalog: one service read, potentially multiple
+SQL queries, with a five-second deadline. Ordinary turns and other facets add
+zero catalog/filesystem reads. Discovery bypasses diagnostic reads and never
+searches local configuration. No cache, background refresh or admission grant
+is created; execution still revalidates authorization and provider capabilities.
+
+The top-level page carries Chat purpose, scope, time, revision,
+items, total, returned count, cursor and coverage. Its allowlisted items expose
+Offering/name/provider/access identities, placement, context limits and nullable
+thinking capability/pricing—not descriptions, raw configuration, keys or endpoints.
+Unknown prices remain null; configuration timestamps are not billing facts.
+
+Pages default to 16, maximum 32 entries and 16 KiB for the complete envelope.
+Continue with `cursor=next_cursor` and the same `catalog_revision`.
+Sorting, revision and pagination use the one loaded snapshot; cursors identify
+the last returned row and must exist in the current authorized set. A changed
+revision returns `catalog_changed` and requires restarting. Oversized or unsafe
+rows fail explicitly; source-bounded presentation preserves full inline JSON.
+`complete` means the whole catalog fits this response; continuation pages remain
+`page`. Empty success has total zero; failure has null total and a fixed typed
+error with reason-specific retryability, never raw backend error text.
+
+## Runtime and artifact observations
+
 Explain snapshots are discovered lazily through the same `introspect` tool:
 `explain={target:"previous"}` excludes the current server root, while
 `explain={target:"run",run_id:"…"}` selects an exact authorized root in the
@@ -48,6 +89,23 @@ visible with incomplete token coverage; it is never a zero-token call. Explain
 uses the same ledger at turn scope. Classification confidence and reflection's
 inferred confidence are distinct; neither proves that a direction was applied
 or that Work was delivered.
+
+Reflect also summarizes its existing bounded request-context window by run,
+agent, Offering, provider, configured/upstream model, and purpose. Physical
+retries count separately; repeated terminal request facts count once. At most
+eight identity groups are rendered, with an explicit omitted-group count.
+Deduplication uses the canonical physical request ID, not a second composite
+identity derived from the attempt index. Conflicting terminal facts for that
+ID count as one unknown request; their usage and model attribution are excluded
+and the conflict count is visible. Input order cannot decide which conflicting
+identity or usage wins.
+The aggregate covers captured terminal requests, not complete session billing.
+Exact, partial, unavailable, and unknown usage remain separate. Missing usage
+renders unknown; a reported zero remains zero. Cache percentage is shown only
+when every captured terminal request has an exact usage payload, the producer
+reports cache coverage for every positive-input request, and the input
+denominator is positive. Incomplete usage retains known token counts without
+claiming a cache percentage. Display identities are bounded and escaped.
 The session view covers the supported judgment operations (request admission,
 skill routing, memory relevance/feedback, tool-result selection, verification,
 and completion-proxy turn intent), not every auxiliary model call. Routine hint/summary projections

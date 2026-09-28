@@ -92,6 +92,11 @@ pub struct RunOutcome {
     pub cached_input_tokens: u64,
     /// Prompt/input tokens written into provider prompt cache.
     pub cache_creation_tokens: u64,
+    /// Coverage of token usage for the root invocation's logical provider
+    /// calls. This is deliberately not a task-tree total: child executions
+    /// may have their own provider calls and coverage.
+    #[serde(default)]
+    pub token_usage_coverage: Option<TokenUsageCoverage>,
     pub duration_ms: u64,
     /// Number of provider LLM round-trips from the typed terminal summary,
     /// with step-event evidence used when the terminal envelope is absent.
@@ -119,6 +124,67 @@ pub struct RunOutcome {
     /// Canonical per-attempt facts; never sum repeated snapshots as usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain_capture: Option<crate::explain_capture::ExplainCapture>,
+}
+
+/// Provider-reported token usage coverage from the root CLI terminal summary.
+/// Missing coverage remains `None`; it must not be interpreted as zero calls.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TokenUsageCoverage {
+    pub scope: String,
+    pub attempts: u32,
+    pub provider_reported: u32,
+    pub unavailable: u32,
+    pub status: String,
+}
+
+#[derive(Deserialize)]
+struct TokenUsageCoverageWire {
+    scope: String,
+    attempts: u32,
+    provider_reported: u32,
+    unavailable: u32,
+    status: String,
+}
+
+impl<'de> Deserialize<'de> for TokenUsageCoverage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = TokenUsageCoverageWire::deserialize(deserializer)?;
+        let parsed = Self {
+            scope: wire.scope,
+            attempts: wire.attempts,
+            provider_reported: wire.provider_reported,
+            unavailable: wire.unavailable,
+            status: wire.status,
+        };
+        parsed.validate().map_err(serde::de::Error::custom)
+    }
+}
+
+impl TokenUsageCoverage {
+    fn from_terminal_json(value: &serde_json::Value) -> Option<Self> {
+        serde_json::from_value(value.clone()).ok()
+    }
+
+    fn validate(self) -> Result<Self, &'static str> {
+        let expected_status = if self.attempts == 0 || self.provider_reported == 0 {
+            "none"
+        } else if self.unavailable == 0 {
+            "complete"
+        } else {
+            "partial"
+        };
+        if self.scope != "logical_provider_calls"
+            || self.provider_reported.checked_add(self.unavailable) != Some(self.attempts)
+            || self.status != expected_status
+        {
+            return Err("inconsistent logical provider-call token usage coverage");
+        }
+        Ok(self)
+    }
 }
 
 impl RunOutcome {
@@ -312,6 +378,7 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
                 prompt_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_tokens: 0,
+                token_usage_coverage: None,
                 duration_ms: 0,
                 turn_rounds: 0,
                 cache_hits: 0,
@@ -447,6 +514,9 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
             })
             .and_then(|x| x.as_u64())
             .unwrap_or(0),
+        token_usage_coverage: v
+            .get("token_usage_coverage")
+            .and_then(TokenUsageCoverage::from_terminal_json),
         duration_ms: 0,
         turn_rounds: v
             .get("llm_rounds")
@@ -690,6 +760,7 @@ fn invalid_json_envelope(model: &str, payload: &str, reason: &str) -> RunOutcome
         prompt_tokens: 0,
         cached_input_tokens: 0,
         cache_creation_tokens: 0,
+        token_usage_coverage: None,
         duration_ms: 0,
         turn_rounds: 0,
         cache_hits: 0,
@@ -758,6 +829,90 @@ mod tests {
         assert_eq!(out.turn_rounds, 3);
         assert_eq!(out.cached_input_tokens, 7);
         assert_eq!(out.cache_creation_tokens, 3);
+    }
+
+    #[test]
+    fn parse_json_outcome_preserves_valid_root_usage_coverage() {
+        let stdout = r#"{
+            "text": "ok",
+            "exit_code": 0,
+            "tool_calls_count": 0,
+            "tools_used": [],
+            "completion_tokens": 5,
+            "fresh_prompt_tokens": 10,
+            "token_usage_coverage": {
+                "scope": "logical_provider_calls",
+                "attempts": 3,
+                "provider_reported": 2,
+                "unavailable": 1,
+                "status": "partial"
+            }
+        }"#;
+        let out = parse_json_outcome(stdout, "m");
+        assert_eq!(
+            out.token_usage_coverage,
+            Some(TokenUsageCoverage {
+                scope: "logical_provider_calls".into(),
+                attempts: 3,
+                provider_reported: 2,
+                unavailable: 1,
+                status: "partial".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_json_outcome_does_not_trust_inconsistent_usage_coverage() {
+        let stdout = r#"{
+            "text": "ok",
+            "exit_code": 0,
+            "tool_calls_count": 0,
+            "tools_used": [],
+            "completion_tokens": 5,
+            "fresh_prompt_tokens": 10,
+            "token_usage_coverage": {
+                "scope": "logical_provider_calls",
+                "attempts": 3,
+                "provider_reported": 2,
+                "unavailable": 0,
+                "status": "complete"
+            }
+        }"#;
+        let out = parse_json_outcome(stdout, "m");
+        assert!(out.token_usage_coverage.is_none());
+        assert_eq!(
+            out.exit_code, 0,
+            "coverage is observational, not execution authority"
+        );
+    }
+
+    #[test]
+    fn usage_coverage_deserialization_validates_wire_and_preserves_legacy_reports() {
+        let valid = TokenUsageCoverage {
+            scope: "logical_provider_calls".into(),
+            attempts: 2,
+            provider_reported: 1,
+            unavailable: 1,
+            status: "partial".into(),
+        };
+        let encoded = serde_json::to_string(&valid).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TokenUsageCoverage>(&encoded).unwrap(),
+            valid
+        );
+
+        let mut old_outcome = serde_json::to_value(RunOutcome::new("m")).unwrap();
+        old_outcome
+            .as_object_mut()
+            .unwrap()
+            .remove("token_usage_coverage");
+        let old_outcome: RunOutcome = serde_json::from_value(old_outcome).unwrap();
+        assert!(old_outcome.token_usage_coverage.is_none());
+
+        let invalid_scope = encoded.replace("logical_provider_calls", "session_tree");
+        assert!(serde_json::from_str::<TokenUsageCoverage>(&invalid_scope).is_err());
+        let invalid_status = encoded.replace("partial", "complete");
+        assert!(serde_json::from_str::<TokenUsageCoverage>(&invalid_status).is_err());
     }
 
     #[test]

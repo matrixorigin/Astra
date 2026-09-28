@@ -43,11 +43,175 @@ fn push_mailbox_model_preview(parts: &mut Vec<String>, value: String) {
         .collect::<String>();
     if chars.next().is_some() {
         parts.push(format!(
-            "{preview}… [message preview truncated; use agent.get_result for a full child terminal result]"
+            "{preview}… [message preview truncated; ask the sender for a concise follow-up if needed]"
         ));
     } else {
         parts.push(preview);
     }
+}
+
+/// One mailbox consumption owner for ordinary turns and waits. A transport
+/// wake is not permission to call the model; only injected context is.
+pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) -> Result<bool, astra_core::ClassifiedError> {
+    let mut model_context_changed = false;
+    let mut mailbox_batch_index: Option<usize> = None;
+    const MAX_MAILBOX_DRAIN_PER_TURN: usize = 64;
+    for _ in 0..MAX_MAILBOX_DRAIN_PER_TURN {
+        let Some(mailbox) = state.messaging.mailbox.as_mut() else {
+            break;
+        };
+        // A one-envelope lease prevents a later permission or transport await
+        // from rolling back messages that were already adopted or answered.
+        let lease = mailbox.lease_bounded(1);
+        let Some(msg) = lease.messages().first().cloned() else {
+            lease.commit();
+            break;
+        };
+        let has_more = lease.has_more();
+        let address = &lease.mailbox().address;
+        let mut parts = Vec::new();
+        let self_echo = msg.from == *address
+            && matches!(
+                msg.to,
+                astra_messaging::types::MessageTarget::Broadcast { .. }
+            );
+        if !self_echo {
+            let from_label = &msg.from.agent_id;
+            let is_transient_progress = matches!(
+                msg.payload,
+                astra_messaging::types::MessagePayload::Progress { .. }
+            );
+            if !is_transient_progress {
+                host.on_agent_communication(astra_messaging::agent_communication_event(
+                    address,
+                    astra_messaging::AgentCommunicationDirection::Received,
+                    &msg,
+                ));
+            }
+            if let Some(ref metrics) = state.messaging.metrics {
+                metrics.messages_received.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let mut handled_permission = false;
+            if let Some(ref handler) = state.permission_handler
+                && let Some((correlation_id, response)) = handler.process_message(&msg).await
+            {
+                handled_permission = true;
+                let response_msg = response.to_message(address, &msg.from, &correlation_id);
+                if let Err(error) = lease.mailbox().send(response_msg.clone()).await {
+                    astra_core::agent_warn!(
+                        "mailbox",
+                        "Failed to send permission response: {error}"
+                    );
+                    if !matches!(
+                        error,
+                        astra_messaging::types::MailboxError::AgentNotFound(_)
+                            | astra_messaging::types::MailboxError::ChannelClosed
+                    ) {
+                        // An uncertain send may have delivered the answer.
+                        // Keep this request and stop rather than retrying it
+                        // into a second permission decision.
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ToolOutcomeUnknown,
+                            format!("permission response delivery uncertain: {error}"),
+                        ));
+                    }
+                    // The child is definitively gone: no permission was
+                    // granted. Consume the obsolete request so an unrelated
+                    // parent task can continue without replaying it forever.
+                } else {
+                    host.on_agent_communication(astra_messaging::agent_communication_event(
+                        address,
+                        astra_messaging::AgentCommunicationDirection::Sent,
+                        &response_msg,
+                    ));
+                }
+            }
+
+            if !handled_permission {
+                match &msg.payload {
+                    astra_messaging::types::MessagePayload::Text { content, .. } => {
+                        push_mailbox_model_preview(
+                            &mut parts,
+                            format!("[{from_label}]: {content}"),
+                        );
+                    }
+                    astra_messaging::types::MessagePayload::Progress { .. } => {}
+                    astra_messaging::types::MessagePayload::Request { request_type, data } => {
+                        let data = (!data.is_null()).then(|| format!(" · {data}"));
+                        push_mailbox_model_preview(
+                            &mut parts,
+                            format!(
+                                "[{from_label} request]: {request_type:?}{}",
+                                data.as_deref().unwrap_or("")
+                            ),
+                        );
+                    }
+                    astra_messaging::types::MessagePayload::Response {
+                        request_id,
+                        accepted,
+                        data,
+                    } => {
+                        let data = data.as_ref().map(|data| format!(" · {data}"));
+                        push_mailbox_model_preview(
+                            &mut parts,
+                            format!(
+                                "[{from_label} response to {request_id}]: accepted={accepted}{}",
+                                data.as_deref().unwrap_or("")
+                            ),
+                        );
+                    }
+                    astra_messaging::types::MessagePayload::Signal(sig) => {
+                        push_mailbox_model_preview(
+                            &mut parts,
+                            format!("[{from_label} signal]: {sig:?}"),
+                        );
+                    }
+                }
+            }
+        }
+        lease.commit();
+        // No await separates releasing process-local ownership from staging
+        // this exact envelope for the next model request.
+        if !parts.is_empty() {
+            let content = parts.join("\n");
+            if let Some(index) = mailbox_batch_index {
+                if let serde_json::Value::String(batch) = &mut state.volatile_pending[index].payload
+                {
+                    batch.push('\n');
+                    batch.push_str(&content);
+                }
+            } else {
+                state.push_volatile(
+                    super::host::VolatileKind::Mailbox,
+                    format!(
+                        "📬 Message from another agent{}:\n{content}",
+                        if has_more { " (more queued)" } else { "" },
+                    ),
+                );
+                mailbox_batch_index = Some(state.volatile_pending.len() - 1);
+            }
+            model_context_changed = true;
+        }
+        if let Some(mailbox) = state.messaging.mailbox.as_ref()
+            && let Err(error) = mailbox
+                .acknowledge_received(std::slice::from_ref(&msg))
+                .await
+        {
+            astra_core::agent_warn!(
+                "mailbox",
+                "failed to confirm consumed message; transport may redeliver it: {error}"
+            );
+        }
+        if !has_more {
+            break;
+        }
+    }
+
+    Ok(model_context_changed)
 }
 
 #[derive(Clone, Copy)]
@@ -3808,190 +3972,12 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         state.permission_handler = Some(crate::orchestration::PermissionRequestHandler::new(ctx));
     }
 
-    const MAX_MAILBOX_DRAIN_PER_TURN: usize = 64;
-    if let Some(ref mut mailbox) = state.messaging.mailbox {
-        let (pending, has_more) = mailbox.drain_bounded(MAX_MAILBOX_DRAIN_PER_TURN);
-        if !pending.is_empty() {
-            let mut parts = Vec::with_capacity(pending.len());
-            let mut delivered_count = 0usize;
-            for msg in &pending {
-                // Transport-level broadcast groups include every subscriber,
-                // including the sender. `broadcast` is a peer-coordination
-                // intent, so consume/ack the sender echo without reinjecting
-                // its own guidance or generating a meaningless self-ack.
-                if msg.from == mailbox.address
-                    && matches!(
-                        msg.to,
-                        astra_messaging::types::MessageTarget::Broadcast { .. }
-                    )
-                {
-                    continue;
-                }
-                let from_label = &msg.from.agent_id;
-                let is_transient_progress = matches!(
-                    msg.payload,
-                    astra_messaging::types::MessagePayload::Progress { .. }
-                );
-                if !is_transient_progress {
-                    delivered_count += 1;
-                    host.on_agent_communication(astra_messaging::agent_communication_event(
-                        &mailbox.address,
-                        astra_messaging::AgentCommunicationDirection::Received,
-                        msg,
-                    ));
-                }
-
-                match &msg.payload {
-                    astra_messaging::types::MessagePayload::Ack { message_id } => {
-                        if let Some(ref tracker) = state.messaging.ack_tracker {
-                            tracker.acknowledge(message_id).await;
-                        }
-                        if let Some(ref metrics) = state.messaging.metrics {
-                            metrics.acks_received.fetch_add(1, Ordering::Relaxed);
-                        }
-                        parts.push(format!(
-                            "[{from_label} applied]: message {message_id} reached the receiver model boundary"
-                        ));
-                        continue;
-                    }
-                    astra_messaging::types::MessagePayload::Nack { message_id, reason } => {
-                        if let Some(ref tracker) = state.messaging.ack_tracker
-                            && let Some(astra_messaging::ack_tracker::AckOutcome::Rejected {
-                                message,
-                                ..
-                            }) = tracker.reject(message_id, reason.clone()).await
-                        {
-                            eprintln!(
-                                "  ⚠ messaging: nack for message {}: {}",
-                                message_id,
-                                reason.as_deref().unwrap_or("no reason")
-                            );
-                            if let Some(ref dlq) = state.messaging.dead_letter_queue {
-                                dlq.store(
-                                    Arc::clone(&message),
-                                    astra_messaging::dead_letter::DeadLetterReason::Rejected {
-                                        reason: reason.clone(),
-                                    },
-                                    1,
-                                )
-                                .await;
-                            }
-                            if let Some(ref metrics) = state.messaging.metrics {
-                                metrics.dead_letters.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        if let Some(ref metrics) = state.messaging.metrics {
-                            metrics.nacks_received.fetch_add(1, Ordering::Relaxed);
-                        }
-                        let r = reason.as_deref().unwrap_or("no reason");
-                        parts.push(format!(
-                            "[{from_label} nack]: message {message_id} rejected — {r}"
-                        ));
-                        continue;
-                    }
-                    _ => {}
-                }
-
-                if let Some(ref metrics) = state.messaging.metrics {
-                    metrics.messages_received.fetch_add(1, Ordering::Relaxed);
-                }
-
-                if msg.requires_ack {
-                    let ack_reply = msg.make_ack(mailbox.address.clone());
-                    if let Err(e) = mailbox.send(ack_reply.clone()).await {
-                        astra_core::agent_warn!("mailbox", "Failed to send ack: {e}");
-                    } else {
-                        host.on_agent_communication(astra_messaging::agent_communication_event(
-                            &mailbox.address,
-                            astra_messaging::AgentCommunicationDirection::Sent,
-                            &ack_reply,
-                        ));
-                    }
-                    if let Some(ref metrics) = state.messaging.metrics {
-                        metrics.acks_sent.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-
-                if let Some(ref handler) = state.permission_handler
-                    && let Some((correlation_id, response)) = handler.process_message(msg).await
-                {
-                    let response_msg =
-                        response.to_message(&mailbox.address, &msg.from, &correlation_id);
-                    if let Err(e) = mailbox.send(response_msg.clone()).await {
-                        astra_core::agent_warn!(
-                            "mailbox",
-                            "Failed to send permission response: {e}"
-                        );
-                    } else {
-                        host.on_agent_communication(astra_messaging::agent_communication_event(
-                            &mailbox.address,
-                            astra_messaging::AgentCommunicationDirection::Sent,
-                            &response_msg,
-                        ));
-                    }
-                    continue;
-                }
-
-                match &msg.payload {
-                    astra_messaging::types::MessagePayload::Text { content, .. } => {
-                        push_mailbox_model_preview(
-                            &mut parts,
-                            format!("[{from_label}]: {content}"),
-                        );
-                    }
-                    astra_messaging::types::MessagePayload::Progress { .. } => {}
-                    astra_messaging::types::MessagePayload::Request { request_type, data } => {
-                        let data = (!data.is_null()).then(|| format!(" · {data}"));
-                        push_mailbox_model_preview(
-                            &mut parts,
-                            format!(
-                                "[{from_label} request]: {request_type:?}{}",
-                                data.as_deref().unwrap_or("")
-                            ),
-                        );
-                    }
-                    astra_messaging::types::MessagePayload::Response {
-                        request_id,
-                        accepted,
-                        data,
-                    } => {
-                        let data = data.as_ref().map(|data| format!(" · {data}"));
-                        push_mailbox_model_preview(
-                            &mut parts,
-                            format!(
-                                "[{from_label} response to {request_id}]: accepted={accepted}{}",
-                                data.as_deref().unwrap_or("")
-                            ),
-                        );
-                    }
-                    astra_messaging::types::MessagePayload::Signal(sig) => {
-                        push_mailbox_model_preview(
-                            &mut parts,
-                            format!("[{from_label} signal]: {sig:?}"),
-                        );
-                    }
-                    astra_messaging::types::MessagePayload::Ack { .. } => {}
-                    astra_messaging::types::MessagePayload::Nack { .. } => {}
-                }
-            }
-            if let Err(error) = mailbox.acknowledge_received(&pending).await {
-                astra_core::agent_warn!(
-                    "mailbox",
-                    "failed to confirm consumed messages; transport may redeliver them: {error}"
-                );
-            }
-            if !parts.is_empty() {
-                let mailbox_text = format!(
-                    "📬 Messages from other agents ({}{}):\n{}",
-                    delivered_count,
-                    if has_more { "+, more queued" } else { "" },
-                    parts.join("\n")
-                );
-                state.push_volatile(super::host::VolatileKind::Mailbox, mailbox_text);
-            }
-        }
-    }
-
+    let _ = super::execution_phase::runtime_input_boundary(
+        host,
+        state,
+        super::execution_phase::RuntimeInputBoundary::Preparation,
+    )
+    .await?;
     if let Some(resolver) = &state.skills.resolver {
         // Phase-9: skill listing moves from per-turn volatile to
         // session-stable. The full skill catalog is rendered via

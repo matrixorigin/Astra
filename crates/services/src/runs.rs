@@ -730,7 +730,11 @@ impl std::fmt::Debug for RuntimeMcpBindingRequest {
 pub struct ResolvedModelSelection {
     pub offering_id: String,
     pub model_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<crate::models::ResolvedModelSourceIdentity>,
 }
+
+pub use crate::models::ResolvedModelSourceIdentity;
 
 pub const RUNTIME_SEMANTIC_READ_MCP_CONTRACT_VERSION: &str = "astra-semantic-read-mcp-v1";
 
@@ -999,6 +1003,9 @@ pub struct SessionAdmissionFacts {
 
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
+    /// Trusted, non-serialized observation binding. No catalog is read until
+    /// the model explicitly invokes model_catalog.
+    pub model_catalog_reader: Option<crate::models::AuthorizedModelCatalogReader>,
     pub message: String,
     pub user_intent: Option<String>,
     pub parts: Vec<serde_json::Value>,
@@ -1014,8 +1021,15 @@ pub struct ChatRequestData {
     pub full_llm_capture: bool,
     pub agent_id: Option<String>,
     pub model: Option<String>,
+    /// Optional exact-name assertion for a client-prepared child Offering.
+    /// This is not execution authority; the Server freshly admits the
+    /// Offering and rejects the request if the resolved name has drifted.
+    pub expected_model_name: Option<String>,
     pub model_selection_mode: ModelSelectionMode,
     pub model_selection: Option<ModelSelection>,
+    /// Caller intent before resolving to the admitted Offering. This is
+    /// durable run provenance, not model execution authority.
+    pub requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
     pub resolved_model_selection: Option<ResolvedModelSelection>,
     /// Short-lived execution material for the admitted Offering.
     /// This value is never client supplied, serialized, persisted, or logged.
@@ -1104,8 +1118,10 @@ impl std::fmt::Debug for ChatRequestData {
             .field("run_start_idempotency", &self.run_start_idempotency)
             .field("agent_id", &self.agent_id)
             .field("model", &self.model)
+            .field("expected_model_name", &self.expected_model_name)
             .field("model_selection_mode", &self.model_selection_mode)
             .field("model_selection", &self.model_selection)
+            .field("requested_model_policy", &self.requested_model_policy)
             .field("resolved_model_selection", &self.resolved_model_selection)
             .field(
                 "admitted_model_execution_present",
@@ -1371,6 +1387,18 @@ pub struct DurableSessionRunPage {
     /// working-set rows do not influence this value.
     pub recovery_next_cursor: Option<String>,
 }
+
+/// Exact tenant and lineage binding for a remote-child wake hint. This is a
+/// read selector, not completion evidence; callers still recover durable facts.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RemoteChildWakeKey {
+    pub user_id: String,
+    pub session_id: String,
+    pub parent_run_id: String,
+    pub run_id: String,
+}
+
+pub const REMOTE_CHILD_WAKE_BATCH_SIZE: usize = 128;
 
 #[must_use]
 pub fn validate_run_list_limit(limit: u32) -> u32 {
@@ -2569,6 +2597,10 @@ pub struct DurableRunControlRecord {
     pub ancestor_path: Option<String>,
     pub cancellation_requested: bool,
     pub run_generation: u64,
+    /// Latest durable event index, included in the existing narrow control
+    /// read so active executors can notice accepted input without another
+    /// periodic database query. This is a wake hint, not an applied cursor.
+    pub last_event_idx: i64,
     /// True only when the store can prove an execution owner with an
     /// unexpired lease using its authoritative clock.
     pub owner_lease_live: bool,
@@ -3103,6 +3135,7 @@ impl From<&DurableRunRecord> for DurableRunControlRecord {
             ancestor_path: run.ancestor_path.clone(),
             cancellation_requested: false,
             run_generation: run.run_generation,
+            last_event_idx: run.last_event_idx,
             owner_lease_live: run.owner_pod_id.is_some()
                 && in_memory_action_owner_lease_is_active(run).unwrap_or(true),
         }
@@ -3252,6 +3285,11 @@ const AGENT_RUN_RECOVERY_COLUMNS: &str = "run_id, user_id, session_id, parent_ru
      work_item_attempt_id, created_at, updated_at";
 pub const RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 64;
 const MAX_RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 256;
+const AGENT_RECOVERY_ID_BATCH_SIZE: usize = 128;
+const AGENT_RECOVERY_MAX_IDS: usize = 1024;
+const AGENT_RECOVERY_MAX_EVENTS: usize = 2048;
+const AGENT_RECOVERY_MAX_EVENT_BYTES: usize = 2 * 1024 * 1024;
+const AGENT_RECOVERY_MAX_TOTAL_EVENT_BYTES: usize = 16 * 1024 * 1024;
 const RUN_RECOVERY_CLAIM_COLLISION_RETRIES: usize = 4;
 const RUN_LIST_CURSOR_SELECT_SQL: &str =
     "DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s.%f') AS cursor_updated_at";
@@ -4883,6 +4921,22 @@ pub trait RunStateStore: Send + Sync {
     /// Insert a new run record.
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String>;
 
+    /// Insert a run without allowing durable admission to exceed the caller's
+    /// execution deadline. Implementations with an authoritative store should
+    /// reconcile a timed-out commit before returning success; an unknown
+    /// outcome must remain an error so callers never dispatch the child.
+    async fn insert_run_with_deadline(
+        &self,
+        record: DurableRunRecord,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        tokio::time::timeout_at(deadline, self.insert_run(record))
+            .await
+            .map_err(|_| {
+                String::from("durable run admission exceeded its deadline; outcome is unknown")
+            })?
+    }
+
     /// Atomically insert a caller-selected run identity or return the session
     /// already bound to that identity.
     async fn claim_run_start(
@@ -5641,6 +5695,28 @@ pub trait RunStateStore: Send + Sync {
             .await
     }
 
+    /// Refresh exact pending children and their parent-owned receipts. Unlike
+    /// session discovery, this must not truncate identities behind active work.
+    /// Callers include the parent ID to discover accepted children without rows.
+    async fn load_session_agent_recovery_for(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_ids: &[String],
+    ) -> Result<DurableSessionRunPage, String> {
+        let _ = (user_id, session_id, run_ids);
+        Err("exact agent recovery is not supported by this store".to_string())
+    }
+
+    /// Read only terminal hints, in cross-session batches. Never substitute a
+    /// per-child load here: idle waiter count must not determine SQL count.
+    async fn load_remote_child_wakes(
+        &self,
+        _keys: &[RemoteChildWakeKey],
+    ) -> Result<Vec<RemoteChildWakeKey>, String> {
+        Err("remote child wake observation is not supported by this store".into())
+    }
+
     /// Find runs in WAITING status (for resume engine).
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
 
@@ -6081,6 +6157,9 @@ impl InMemoryRunStateStore {
                 existing.start_request_fingerprint.as_deref(),
                 requested_session_id,
             ));
+        }
+        if !claim_existing && runs.contains_key(&run_id) {
+            return Err(format!("run identity {run_id} is already bound"));
         }
         reconcile_in_memory_execution_slot_for_session(
             &mut slots,
@@ -10002,6 +10081,89 @@ impl RunStateStore for InMemoryRunStateStore {
         })
     }
 
+    async fn load_session_agent_recovery_for(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_ids: &[String],
+    ) -> Result<DurableSessionRunPage, String> {
+        let selected = run_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+        let cancellations = self.cancellation_requests.read().await;
+        let runs = self.runs.read().await;
+        let scoped = runs
+            .values()
+            .filter(|run| run.user_id == user_id && run.session_id == session_id)
+            .collect::<Vec<_>>();
+        let mut included = selected.iter().copied().collect::<HashSet<_>>();
+        for run in &scoped {
+            if selected.contains(run.run_id.as_str())
+                && let Some(parent) = &run.parent_run_id
+            {
+                included.insert(parent);
+            }
+            if run.events.iter().any(|event| {
+                matches!(
+                    extract_event_type(event).as_str(),
+                    "agent_spawned" | PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
+                ) && extract_optional_string(event, "run_id")
+                    .is_some_and(|id| selected.contains(id.as_str()))
+            }) {
+                included.insert(&run.run_id);
+            }
+        }
+        let mut recovered = scoped
+            .into_iter()
+            .filter(|run| included.contains(run.run_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_session_run_tree(&mut recovered);
+        let recovery_cancellation_run_ids = recovered
+            .iter()
+            .filter(|run| {
+                matches!(
+                    run.status.as_str(),
+                    STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
+                ) && cancellations.contains(&(user_id.to_string(), run.run_id.clone()))
+            })
+            .map(|run| run.run_id.clone())
+            .collect();
+        Ok(DurableSessionRunPage {
+            runs: recovered,
+            limit: u32::try_from(selected.len()).unwrap_or(u32::MAX),
+            truncated: false,
+            recovery_cancellation_run_ids,
+            recovery_next_cursor: None,
+        })
+    }
+
+    async fn load_remote_child_wakes(
+        &self,
+        keys: &[RemoteChildWakeKey],
+    ) -> Result<Vec<RemoteChildWakeKey>, String> {
+        let runs = self.runs.read().await;
+        Ok(keys
+            .iter()
+            .filter(|key| {
+                let scoped = |id: &str| {
+                    runs.get(id).filter(|run| {
+                        run.user_id == key.user_id && run.session_id == key.session_id
+                    })
+                };
+                scoped(&key.run_id).is_some_and(|run| {
+                    run.parent_run_id.as_ref() == Some(&key.parent_run_id)
+                        && durable_run_status_is_terminal(&run.status)
+                }) || scoped(&key.parent_run_id).is_some_and(|run| {
+                    run.events.iter().any(|event| {
+                        extract_event_type(event) == PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
+                            && extract_optional_string(event, "run_id").as_ref()
+                                == Some(&key.run_id)
+                    })
+                })
+            })
+            .cloned()
+            .collect())
+    }
+
     async fn load_session_agent_recovery_after(
         &self,
         user_id: &str,
@@ -10548,6 +10710,7 @@ const FOREGROUND_RUN_CONTROL_DB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(
 // Orphan recovery is a retrying background worker. Keep each attempt short so
 // one contended run cannot starve the rest of the recovery scan.
 const BACKGROUND_RECOVERY_DB_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const RUN_START_TIMEOUT_RECEIPT_TIMEOUT: Duration = Duration::from_secs(2);
 const RUN_CONTROL_LOCK_WAIT_TIMEOUT_SECS: i64 = 3;
 
 #[derive(Clone, Copy)]
@@ -10758,6 +10921,8 @@ pub struct DatabaseRunStateStore {
     recovery_page_loaded: Option<std::sync::Arc<tokio::sync::Notify>>,
     #[cfg(test)]
     recovery_page_continue: Option<std::sync::Arc<tokio::sync::Notify>>,
+    #[cfg(test)]
+    recovery_batch_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 const UNSETTLED_USER_INTENT_EVENTS_SELECT_SQL: &str =
@@ -11399,7 +11564,332 @@ impl DatabaseRunStateStore {
             recovery_page_loaded: None,
             #[cfg(test)]
             recovery_page_continue: None,
+            #[cfg(test)]
+            recovery_batch_reads: Default::default(),
         }
+    }
+
+    async fn hydrate_agent_recovery_events(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        page: &mut DurableSessionRunPage,
+        receipt_subject_ids: &[String],
+        exact_subject_ids: Option<&[String]>,
+    ) -> Result<(), String> {
+        let mut included = page
+            .runs
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect::<HashSet<_>>();
+        // Keep the possible direct parents as event-query identities. We only
+        // load their run rows below if the bounded event query actually finds
+        // the parent-owned spawn or fanout-cancellation envelope; ordinary
+        // child recovery stays one read wave.
+        let parent_run_ids = page
+            .runs
+            .iter()
+            .filter_map(|run| run.parent_run_id.as_deref())
+            .filter(|parent_run_id| !included.contains(*parent_run_id))
+            .map(ToString::to_string)
+            .collect::<HashSet<_>>();
+        sort_session_run_tree(&mut page.runs);
+        if page.runs.is_empty() {
+            return Ok(());
+        }
+        // A root-only exact request is a bootstrap for its accepted children;
+        // a request naming children is a narrow refresh and must not reload
+        // every sibling's spawn/receipt history on each wake.
+        let exact_subject_ids = exact_subject_ids.filter(|ids| {
+            !ids.iter().all(|id| {
+                page.runs
+                    .iter()
+                    .any(|run| run.run_id == *id && run.parent_run_id.is_none())
+            })
+        });
+        // A fanout cancellation is recorded on the parent run, while the
+        // selected recovery page may contain only its child (for example when
+        // the parent fell outside the bounded active-run page). Include direct
+        // parent identities so the admission fence is not lost in that case.
+        let recovery_event_run_ids = page
+            .runs
+            .iter()
+            .flat_map(|run| {
+                std::iter::once(run.run_id.as_str()).chain(run.parent_run_id.as_deref())
+            })
+            .collect::<HashSet<_>>();
+        // Keep one spawn envelope per child of each selected parent, including
+        // children missing from the run page, plus the latest terminal facts.
+        // `event_idx` is run-local, so
+        // a global ORDER BY/LIMIT lets one noisy run starve every other run.
+        // Keep this as one bounded DB round trip, with the child identity
+        // normalized in `subject_run_id` rather than parsed from JSON here.
+        let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
+            "SELECT run_id, event_idx,
+                    CASE WHEN OCTET_LENGTH(payload_json) <= {AGENT_RECOVERY_MAX_EVENT_BYTES}
+                         THEN payload_json ELSE NULL END AS payload_json,
+                    OCTET_LENGTH(payload_json) AS payload_bytes FROM (
+               SELECT run_id, event_idx, payload_json FROM (
+                 SELECT run_id, event_idx, payload_json,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY subject_run_id ORDER BY event_idx DESC
+                        ) AS recovery_rank
+                 FROM agent_run_events
+                 WHERE user_id = ",
+        ));
+        builder
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND event_type = 'agent_spawned' AND (subject_run_id IN (");
+        {
+            let mut ids = builder.separated(",");
+            if let Some(run_ids) = exact_subject_ids {
+                for run_id in run_ids {
+                    ids.push_bind(run_id);
+                }
+            } else {
+                for run in &page.runs {
+                    ids.push_bind(run.run_id.as_str());
+                }
+            }
+        }
+        if exact_subject_ids.is_none() {
+            builder.push(") OR run_id IN (");
+            {
+                let mut ids = builder.separated(",");
+                for run in &page.runs {
+                    ids.push_bind(run.run_id.as_str());
+                }
+            }
+        }
+        builder
+            .push(
+                "))
+               ) ranked_spawns WHERE recovery_rank = 1
+               UNION ALL
+               SELECT run_id, event_idx, payload_json FROM (
+                 SELECT run_id, event_idx, payload_json,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY run_id, event_type ORDER BY event_idx DESC
+                        ) AS recovery_rank
+                 FROM agent_run_events
+                 WHERE user_id = ",
+            )
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND event_type IN ('text_done','run_error','run_finished') AND run_id IN (");
+        {
+            let mut ids = builder.separated(",");
+            for run in &page.runs {
+                ids.push_bind(run.run_id.as_str());
+            }
+        }
+        builder.push(
+            ")
+               ) ranked_terminal WHERE recovery_rank = 1",
+        );
+        if !recovery_event_run_ids.is_empty() {
+            builder.push(
+                "
+               UNION ALL
+               SELECT run_id, event_idx, payload_json FROM (
+                 SELECT run_id, event_idx, payload_json,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY run_id ORDER BY event_idx DESC
+                        ) AS recovery_rank
+                 FROM agent_run_events
+                 WHERE user_id = ",
+            );
+            builder
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND event_type = 'fanout_group_cancelled'")
+                .push(" AND JSON_TYPE(JSON_EXTRACT(payload_json, '$.data.group_id')) = 'STRING'")
+                .push(" AND TRIM(JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.group_id'))) <> ''")
+                .push(
+                    " AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.cancellation_origin')) IN ('user', 'runtime')",
+                )
+                .push(" AND run_id IN (");
+            {
+                let mut ids = builder.separated(",");
+                for run_id in &recovery_event_run_ids {
+                    ids.push_bind(*run_id);
+                }
+            }
+            builder.push(
+                ")
+               ) ranked_group_cancellations WHERE recovery_rank = 1",
+            );
+        }
+        // Parent-owned receipts also cover children without durable run rows.
+        builder.push(
+            " UNION ALL SELECT run_id, event_idx, payload_json
+              FROM agent_run_events WHERE user_id = ",
+        );
+        builder
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND event_type = ")
+            .push_bind(PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE)
+            .push(" AND (");
+        if exact_subject_ids.is_none() {
+            builder.push("run_id IN (");
+            {
+                let mut ids = builder.separated(",");
+                for run in &page.runs {
+                    ids.push_bind(run.run_id.as_str());
+                }
+            }
+            builder.push(")");
+        }
+        if !receipt_subject_ids.is_empty() {
+            if exact_subject_ids.is_none() {
+                builder.push(" OR ");
+            }
+            builder.push("subject_run_id IN (");
+            {
+                let mut ids = builder.separated(",");
+                for run_id in receipt_subject_ids {
+                    ids.push_bind(run_id);
+                }
+            }
+            builder.push(")");
+        }
+        builder.push(")");
+        builder.push(
+            ") recovery_events
+             ORDER BY run_id, event_idx",
+        );
+        builder
+            .push(" LIMIT ")
+            .push_bind((AGENT_RECOVERY_MAX_EVENTS + 1) as i64);
+        #[cfg(test)]
+        self.recovery_batch_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        use futures_util::StreamExt;
+        let query = builder.build();
+        let mut rows = query.fetch(self.pool.get());
+        let mut events_by_run = HashMap::<String, Vec<(i64, serde_json::Value)>>::new();
+        let mut event_count = 0usize;
+        let mut total_bytes = 0usize;
+        while let Some(row) = rows.next().await {
+            let row = row.map_err(|source| {
+                db_error("load_session_agent_recovery", session_id, source).to_string()
+            })?;
+            event_count += 1;
+            if event_count > AGENT_RECOVERY_MAX_EVENTS {
+                return Err(format!(
+                    "agent recovery discovery incomplete: more than {AGENT_RECOVERY_MAX_EVENTS} events; narrow the requested child set"
+                ));
+            }
+            let run_id: String = row.try_get("run_id").map_err(|source| {
+                db_error("decode_session_agent_recovery_run_id", session_id, source).to_string()
+            })?;
+            let event_idx: i64 = row.try_get("event_idx").map_err(|source| {
+                db_error("decode_session_agent_recovery_event_idx", &run_id, source).to_string()
+            })?;
+            let payload_bytes: i64 = row.try_get("payload_bytes").map_err(|source| {
+                db_error(
+                    "decode_session_agent_recovery_payload_bytes",
+                    &run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            let payload_bytes = usize::try_from(payload_bytes)
+                .map_err(|_| format!("invalid recovery event byte size for run {run_id}"))?;
+            if payload_bytes > AGENT_RECOVERY_MAX_EVENT_BYTES {
+                return Err(format!(
+                    "agent recovery discovery incomplete: event for run {run_id} exceeds {AGENT_RECOVERY_MAX_EVENT_BYTES} bytes"
+                ));
+            }
+            total_bytes = total_bytes.saturating_add(payload_bytes);
+            if total_bytes > AGENT_RECOVERY_MAX_TOTAL_EVENT_BYTES {
+                return Err(format!(
+                    "agent recovery discovery incomplete: event payload exceeds {AGENT_RECOVERY_MAX_TOTAL_EVENT_BYTES} bytes"
+                ));
+            }
+            let payload: String = row.try_get("payload_json").map_err(|source| {
+                db_error("decode_session_agent_recovery_payload", &run_id, source).to_string()
+            })?;
+            let payload = serde_json::from_str(&payload).map_err(|source| {
+                format!("invalid durable recovery event for run {run_id}: {source}")
+            })?;
+            events_by_run
+                .entry(run_id)
+                .or_default()
+                .push((event_idx, payload));
+        }
+        drop(rows);
+        // Spawn and group-cancellation events live on the parent run, but a
+        // bounded cancellation page can select only a child. Read missing
+        // direct parents only when the event query proves the parent owns one
+        // of those envelopes. A normal recovery refresh therefore pays no
+        // extra parent-row SQL round trip.
+        let parents_with_recovery_events = parent_run_ids
+            .into_iter()
+            .filter(|parent_run_id| {
+                events_by_run.get(parent_run_id).is_some_and(|events| {
+                    events.iter().any(|(_, event)| {
+                        matches!(
+                            extract_event_type(event).as_str(),
+                            "agent_spawned"
+                                | "fanout_group_cancelled"
+                                | PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
+                        )
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        if !parents_with_recovery_events.is_empty() {
+            let mut parent_query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
+                "SELECT {AGENT_RUN_RECOVERY_COLUMNS} FROM agent_runs WHERE user_id = "
+            ));
+            parent_query
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND run_id IN (");
+            {
+                let mut ids = parent_query.separated(",");
+                for run_id in &parents_with_recovery_events {
+                    ids.push_bind(run_id);
+                }
+            }
+            parent_query.push(")");
+            #[cfg(test)]
+            self.recovery_batch_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let parent_rows = parent_query
+                .build()
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("load_session_agent_recovery_parents", session_id, source).to_string()
+                })?;
+            for parent in parent_rows
+                .into_iter()
+                .map(run_record_from_row)
+                .collect::<DbStoreResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?
+            {
+                if included.insert(parent.run_id.clone()) {
+                    page.runs.push(parent);
+                }
+            }
+            sort_session_run_tree(&mut page.runs);
+        }
+        for run in &mut page.runs {
+            if let Some(mut events) = events_by_run.remove(&run.run_id) {
+                events.sort_by_key(|(event_idx, _)| *event_idx);
+                run.events = events.into_iter().map(|(_, event)| event).collect();
+            }
+        }
+        Ok(())
     }
 
     pub fn with_owner_pod_id(mut self, owner_pod_id: impl Into<String>) -> Self {
@@ -12720,12 +13210,16 @@ impl DatabaseRunStateStore {
     ) -> DbStoreResult<Option<DurableRunRecord>> {
         let sql =
             format!("SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = ? AND run_id = ?");
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| db_error("acquire_run_metadata_for_user", run_id, source))?;
         let row = sqlx::query(&sql)
             .bind(user_id)
             .bind(run_id)
-            .fetch_optional(self.pool.get())
+            .fetch_optional(connection.connection_mut())
             .await
             .map_err(|source| db_error("load_run_metadata_for_user", run_id, source))?;
+        connection.release();
         row.map(run_record_from_row).transpose()
     }
 
@@ -13650,6 +14144,42 @@ fn run_owner_lease_renewal_interval(lease_ttl: Duration) -> Duration {
     Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX))
 }
 
+fn durable_run_start_receipt_matches(
+    expected: &DurableRunRecord,
+    actual: &DurableRunRecord,
+) -> bool {
+    expected.run_id == actual.run_id
+        && expected.user_id == actual.user_id
+        && expected.session_id == actual.session_id
+        && expected.run_generation == actual.run_generation
+        && expected.parent_run_id == actual.parent_run_id
+        && expected.root_run_id.as_deref().unwrap_or(&expected.run_id)
+            == actual.root_run_id.as_deref().unwrap_or(&actual.run_id)
+        && expected
+            .ancestor_path
+            .as_deref()
+            .unwrap_or(&expected.run_id)
+            == actual.ancestor_path.as_deref().unwrap_or(&actual.run_id)
+        && expected.depth == actual.depth
+        && expected.delegation_id == actual.delegation_id
+        && expected.agent_id == actual.agent_id
+        && expected.retry_of == actual.retry_of
+        && expected
+            .retry_scope
+            .as_deref()
+            .unwrap_or(DEFAULT_RETRY_SCOPE)
+            == actual.retry_scope.as_deref().unwrap_or(DEFAULT_RETRY_SCOPE)
+        && expected.last_event_idx <= actual.last_event_idx
+        && expected.agent_binding_id == actual.agent_binding_id
+        && expected.agent_binding_name == actual.agent_binding_name
+        && expected.agent_binding_schema_version == actual.agent_binding_schema_version
+        && expected.model_offering_id == actual.model_offering_id
+        && expected.resolved_model_name == actual.resolved_model_name
+        && expected.runtime_profile == actual.runtime_profile
+        && expected.start_request_fingerprint == actual.start_request_fingerprint
+        && expected.work_binding == actual.work_binding
+}
+
 impl DatabaseRunStateStore {
     async fn existing_run_start_claim(
         &self,
@@ -13774,9 +14304,250 @@ impl DatabaseRunStateStore {
 
     async fn insert_run_record(
         &self,
+        record: DurableRunRecord,
+        claim_existing: bool,
+        requested_session_id: Option<&str>,
+    ) -> Result<DurableRunStartClaim, String> {
+        self.insert_run_record_with_deadline(record, claim_existing, requested_session_id, None)
+            .await
+    }
+
+    async fn insert_run_record_with_deadline(
+        &self,
         mut record: DurableRunRecord,
         claim_existing: bool,
         requested_session_id: Option<&str>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<DurableRunStartClaim, String> {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err("durable run admission deadline expired before the insert began".into());
+        }
+        let initial_event_rows = self.prepare_initial_run_event_rows(&mut record)?;
+        let receipt_record = deadline.map(|_| record.clone());
+        let transaction = self.insert_run_record_transaction(
+            record,
+            claim_existing,
+            requested_session_id,
+            &initial_event_rows,
+        );
+        let claim = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, transaction).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    let expected = receipt_record
+                        .as_ref()
+                        .expect("deadline-bound run insertion keeps its receipt identity");
+                    let owner_generation = self
+                        .reconcile_run_start_receipt(expected, &initial_event_rows)
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "durable run admission deadline expired; commit outcome is unknown: {error}"
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            "durable run admission deadline expired; exact commit receipt was not established and no child was dispatched".to_string()
+                        })?;
+                    tracing::warn!(
+                        user_id = %expected.user_id,
+                        session_id = %expected.session_id,
+                        run_id = %expected.run_id,
+                        "reconciled timed-out run-start commit from exact durable receipts"
+                    );
+                    DurableRunStartClaim::Started { owner_generation }
+                }
+            },
+            None => transaction.await?,
+        };
+
+        if matches!(claim, DurableRunStartClaim::Started { .. }) {
+            let receipt = initial_event_rows
+                .first()
+                .expect("run insertion always has at least one receipt event");
+            let projection = self.sync_projection_for_user(
+                &receipt.user_id,
+                &receipt.session_id,
+                &receipt.run_id,
+            );
+            let projection_result = match deadline {
+                Some(deadline) if tokio::time::Instant::now() >= deadline => None,
+                Some(deadline) => tokio::time::timeout_at(deadline, projection).await.ok(),
+                None => Some(projection.await),
+            };
+            if let Some(Err(error)) = projection_result {
+                tracing::warn!(
+                    user_id = %receipt.user_id,
+                    run_id = %receipt.run_id,
+                    error = %error,
+                    "run create committed but projection refresh failed or exceeded its deadline"
+                );
+            } else if projection_result.is_none() {
+                tracing::warn!(
+                    user_id = %receipt.user_id,
+                    run_id = %receipt.run_id,
+                    "run create committed but projection refresh was skipped at its deadline"
+                );
+            }
+        }
+        Ok(claim)
+    }
+
+    fn prepare_initial_run_event_rows(
+        &self,
+        record: &mut DurableRunRecord,
+    ) -> Result<Vec<RunEventInsertRow>, String> {
+        let mut events = std::mem::take(&mut record.events);
+        if events.is_empty() {
+            events.push(run_created_receipt_event(
+                &record.run_id,
+                &record.session_id,
+            ));
+        }
+        let rows = events
+            .iter()
+            .enumerate()
+            .map(|(event_idx, event)| {
+                build_run_event_insert_row(
+                    &record.user_id,
+                    &record.run_id,
+                    &record.session_id,
+                    record.agent_id.as_deref(),
+                    event_idx as i64,
+                    &self.owner_pod_id,
+                    event,
+                )
+            })
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        record.last_event_idx = rows.last().map_or(-1, |event| event.event_idx);
+        Ok(rows)
+    }
+
+    async fn reconcile_run_start_receipt(
+        &self,
+        expected: &DurableRunRecord,
+        initial_event_rows: &[RunEventInsertRow],
+    ) -> Result<Option<u64>, String> {
+        let receipt_deadline = tokio::time::Instant::now() + RUN_START_TIMEOUT_RECEIPT_TIMEOUT;
+        tokio::time::timeout_at(receipt_deadline, async {
+            for attempt in 0..2 {
+                if let Some(owner_generation) = self
+                    .read_run_start_receipt(expected, initial_event_rows)
+                    .await?
+                {
+                    return Ok(Some(owner_generation));
+                }
+                if attempt == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(None)
+        })
+        .await
+        .map_err(|_| "bounded run-start receipt check timed out".to_string())?
+    }
+
+    async fn read_run_start_receipt(
+        &self,
+        expected: &DurableRunRecord,
+        expected_events: &[RunEventInsertRow],
+    ) -> Result<Option<u64>, String> {
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "reconcile_timed_out_run_start_acquire",
+                    &expected.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+        for expected_event in expected_events {
+            let actual = sqlx::query(
+                "SELECT run_id, event_idx, event_hash FROM agent_run_events
+                 WHERE user_id = ? AND id = ? LIMIT 1",
+            )
+            .bind(&expected_event.user_id)
+            .bind(&expected_event.id)
+            .fetch_optional(connection.connection_mut())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "reconcile_timed_out_run_start_events",
+                    &expected.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            let Some(actual) = actual else {
+                connection.release();
+                return Ok(None);
+            };
+            let run_id: String = actual.try_get("run_id").map_err(|source| {
+                db_error(
+                    "reconcile_timed_out_run_start_events",
+                    &expected.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            let event_idx: i64 = actual.try_get("event_idx").map_err(|source| {
+                db_error(
+                    "reconcile_timed_out_run_start_events",
+                    &expected.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            let event_hash: String = actual.try_get("event_hash").map_err(|source| {
+                db_error(
+                    "reconcile_timed_out_run_start_events",
+                    &expected.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            if run_id != expected_event.run_id
+                || event_idx != expected_event.event_idx
+                || event_hash != expected_event.event_hash
+            {
+                connection.release();
+                return Ok(None);
+            }
+        }
+        let sql =
+            format!("SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = ? AND run_id = ?");
+        let row = sqlx::query(&sql)
+            .bind(&expected.user_id)
+            .bind(&expected.run_id)
+            .fetch_optional(connection.connection_mut())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "reconcile_timed_out_run_start_metadata",
+                    &expected.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+        connection.release();
+        let Some(actual) = row
+            .map(run_record_from_row)
+            .transpose()
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        Ok(durable_run_start_receipt_matches(expected, &actual).then_some(actual.run_generation))
+    }
+
+    async fn insert_run_record_transaction(
+        &self,
+        mut record: DurableRunRecord,
+        claim_existing: bool,
+        requested_session_id: Option<&str>,
+        initial_event_rows: &[RunEventInsertRow],
     ) -> Result<DurableRunStartClaim, String> {
         if (record.root_run_id.is_none() || record.ancestor_path.is_none())
             && let Some(parent_run_id) = record.parent_run_id.as_deref()
@@ -13807,33 +14578,6 @@ impl DatabaseRunStateStore {
             .unwrap_or(DEFAULT_RETRY_SCOPE)
             .to_string();
         validate_retry_scope(&record.run_id, &retry_scope).map_err(|e| e.to_string())?;
-
-        let mut events = std::mem::take(&mut record.events);
-        if events.is_empty() {
-            events.push(run_created_receipt_event(
-                &record.run_id,
-                &record.session_id,
-            ));
-        }
-        let initial_event_rows = events
-            .iter()
-            .enumerate()
-            .map(|(event_idx, event)| {
-                build_run_event_insert_row(
-                    &record.user_id,
-                    &record.run_id,
-                    &record.session_id,
-                    record.agent_id.as_deref(),
-                    event_idx as i64,
-                    &self.owner_pod_id,
-                    event,
-                )
-            })
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|error| error.to_string())?;
-        record.last_event_idx = initial_event_rows
-            .last()
-            .map_or(-1, |event| event.event_idx);
 
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
@@ -13990,7 +14734,7 @@ impl DatabaseRunStateStore {
         Self::insert_run_event_rows_tx(
             &mut tx,
             &record.run_id,
-            &initial_event_rows,
+            initial_event_rows,
             "insert_initial_run_events",
         )
         .await?;
@@ -14069,23 +14813,11 @@ impl DatabaseRunStateStore {
             }
         };
         if let Some(commit_error) = commit_error {
-            let exact_events = self
-                .exact_run_event_rows_are_durable(
-                    &initial_event_rows,
-                    "reconcile_run_create_commit",
-                )
+            let exact_owner_generation = self
+                .reconcile_run_start_receipt(&record, initial_event_rows)
                 .await
                 .map_err(|error| format!("{commit_error}; {error}"))?;
-            let exact_run = self
-                .load_run_metadata_for_user(&record.user_id, &record.run_id)
-                .await
-                .map_err(|error| format!("{commit_error}; {error}"))?
-                .is_some_and(|durable| {
-                    durable.session_id == record.session_id
-                        && durable.run_generation == record.run_generation
-                        && durable.last_event_idx >= record.last_event_idx
-                });
-            if !exact_events || !exact_run {
+            if exact_owner_generation != Some(record.run_generation) {
                 return Err(format!(
                     "{commit_error}; run create acknowledgement remains ambiguous"
                 ));
@@ -15352,6 +16084,16 @@ impl RunStateStore for DatabaseRunStateStore {
             origin: receipt.origin,
             reason: receipt.reason.clone(),
         })
+    }
+
+    async fn insert_run_with_deadline(
+        &self,
+        record: DurableRunRecord,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        self.insert_run_record_with_deadline(record, false, None, Some(deadline))
+            .await
+            .map(|_| ())
     }
 
     async fn claim_run_start(
@@ -17912,7 +18654,7 @@ impl RunStateStore for DatabaseRunStateStore {
     ) -> Result<Option<DurableRunControlRecord>, String> {
         let row = sqlx::query(
             "SELECT run_id, session_id, status, waiting_for, parent_run_id, ancestor_path,
-                    run_generation,
+                    run_generation, last_event_idx,
                     CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested,
                     CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL
                          AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live
@@ -17937,7 +18679,7 @@ impl RunStateStore for DatabaseRunStateStore {
         }
         let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "SELECT run_id, session_id, status, waiting_for, parent_run_id, ancestor_path,
-                    run_generation,
+                    run_generation, last_event_idx,
                     CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested,
                     CAST(owner_pod_id IS NOT NULL AND owner_lease_expires_at IS NOT NULL
                          AND owner_lease_expires_at >= NOW(6) AS SIGNED) AS owner_lease_live
@@ -22121,6 +22863,156 @@ impl RunStateStore for DatabaseRunStateStore {
         })
     }
 
+    async fn load_session_agent_recovery_for(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_ids: &[String],
+    ) -> Result<DurableSessionRunPage, String> {
+        let mut selected_ids = run_ids.to_vec();
+        selected_ids.sort();
+        selected_ids.dedup();
+        if selected_ids.len() > AGENT_RECOVERY_MAX_IDS {
+            return Err(format!(
+                "agent recovery discovery incomplete: more than {AGENT_RECOVERY_MAX_IDS} exact IDs"
+            ));
+        }
+        let mut recovered: HashMap<String, DurableRunRecord> = HashMap::new();
+        let mut retained_event_bytes = 0usize;
+        let mut cancellations = HashSet::new();
+        for batch in selected_ids.chunks(AGENT_RECOVERY_ID_BATCH_SIZE) {
+            // Fetch exact rows and their direct parents in one statement.
+            // Parent-owned receipts also anchor a child whose row is absent.
+            let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
+                "SELECT {AGENT_RUN_RECOVERY_COLUMNS},
+                 CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS recovery_cancel
+                 FROM agent_runs WHERE user_id = "
+            ));
+            query
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND (run_id IN (");
+            {
+                let mut ids = query.separated(",");
+                for id in batch {
+                    ids.push_bind(id);
+                }
+            }
+            query
+                .push(") OR run_id IN (SELECT parent_run_id FROM agent_runs WHERE user_id = ")
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND run_id IN (");
+            {
+                let mut ids = query.separated(",");
+                for id in batch {
+                    ids.push_bind(id);
+                }
+            }
+            query
+                .push(")) OR run_id IN (SELECT run_id FROM agent_run_events WHERE user_id = ")
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND event_type IN ('agent_spawned', ")
+                .push_bind(PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE)
+                .push(") AND subject_run_id IN (");
+            {
+                let mut ids = query.separated(",");
+                for id in batch {
+                    ids.push_bind(id);
+                }
+            }
+            query.push(")))");
+            #[cfg(test)]
+            self.recovery_batch_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let rows = query
+                .build()
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("load_exact_agent_recovery", session_id, source).to_string()
+                })?;
+            let mut page = DurableSessionRunPage {
+                runs: Vec::with_capacity(rows.len()),
+                limit: batch.len() as u32,
+                truncated: false,
+                recovery_cancellation_run_ids: Vec::new(),
+                recovery_next_cursor: None,
+            };
+            for row in rows {
+                let requested: i64 = row.try_get("recovery_cancel").map_err(|source| {
+                    db_error("decode_exact_agent_recovery_cancel", session_id, source).to_string()
+                })?;
+                let run = run_record_from_row(row).map_err(|error| error.to_string())?;
+                if requested != 0
+                    && matches!(
+                        run.status.as_str(),
+                        STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
+                    )
+                {
+                    cancellations.insert(run.run_id.clone());
+                }
+                page.runs.push(run);
+            }
+            self.hydrate_agent_recovery_events(user_id, session_id, &mut page, batch, Some(batch))
+                .await?;
+            for mut run in page.runs {
+                if let Some(previous) = recovered.remove(&run.run_id) {
+                    retained_event_bytes = retained_event_bytes.saturating_sub(
+                        previous
+                            .events
+                            .iter()
+                            .map(|event| event.to_string().len())
+                            .sum::<usize>(),
+                    );
+                    // One parent can be selected by several child batches.
+                    // Each batch hydrates only its own spawn/receipt subjects;
+                    // replacing the parent would silently lose an earlier
+                    // child's terminal proof. Keep the latest row fields but
+                    // union the bounded event projections by exact payload.
+                    let mut events = previous.events;
+                    let mut seen = events
+                        .iter()
+                        .map(serde_json::Value::to_string)
+                        .collect::<HashSet<_>>();
+                    for event in run.events {
+                        if seen.insert(event.to_string()) {
+                            events.push(event);
+                        }
+                    }
+                    run.events = events;
+                }
+                retained_event_bytes = retained_event_bytes.saturating_add(
+                    run.events
+                        .iter()
+                        .map(|event| event.to_string().len())
+                        .sum::<usize>(),
+                );
+                if retained_event_bytes > AGENT_RECOVERY_MAX_TOTAL_EVENT_BYTES {
+                    return Err(format!(
+                        "agent recovery discovery incomplete: retained event payload exceeds {AGENT_RECOVERY_MAX_TOTAL_EVENT_BYTES} bytes"
+                    ));
+                }
+                recovered.insert(run.run_id.clone(), run);
+            }
+        }
+        let mut runs = recovered.into_values().collect::<Vec<_>>();
+        sort_session_run_tree(&mut runs);
+        let mut recovery_cancellation_run_ids = cancellations.into_iter().collect::<Vec<_>>();
+        recovery_cancellation_run_ids.sort();
+        Ok(DurableSessionRunPage {
+            runs,
+            limit: u32::try_from(selected_ids.len()).unwrap_or(u32::MAX),
+            truncated: false,
+            recovery_cancellation_run_ids,
+            recovery_next_cursor: None,
+        })
+    }
+
     async fn load_session_agent_recovery(
         &self,
         user_id: &str,
@@ -22352,231 +23244,92 @@ impl RunStateStore for DatabaseRunStateStore {
                 page.runs.push(run);
             }
         }
-        // Keep the possible direct parents as event-query identities. We only
-        // load their run rows below if the bounded event query actually finds
-        // the parent-owned spawn or fanout-cancellation envelope; ordinary
-        // child recovery stays one read wave.
-        let parent_run_ids = page
-            .runs
-            .iter()
-            .filter_map(|run| run.parent_run_id.as_deref())
-            .filter(|parent_run_id| !included.contains(*parent_run_id))
-            .map(ToString::to_string)
-            .collect::<HashSet<_>>();
-        sort_session_run_tree(&mut page.runs);
-        if page.runs.is_empty() {
-            return Ok(page);
-        }
-        // A fanout cancellation is recorded on the parent run, while the
-        // selected recovery page may contain only its child (for example when
-        // the parent fell outside the bounded active-run page). Include direct
-        // parent identities so the admission fence is not lost in that case.
-        let recovery_event_run_ids = page
-            .runs
-            .iter()
-            .flat_map(|run| {
-                std::iter::once(run.run_id.as_str()).chain(run.parent_run_id.as_deref())
-            })
-            .collect::<HashSet<_>>();
-        // Recovery needs one exact spawn envelope per selected child plus the
-        // latest terminal facts per selected run. `event_idx` is run-local, so
-        // a global ORDER BY/LIMIT lets one noisy run starve every other run.
-        // Keep this as one bounded DB round trip, with the child identity
-        // normalized in `subject_run_id` rather than parsed from JSON here.
-        let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
-            "SELECT run_id, event_idx, payload_json FROM (
-               SELECT run_id, event_idx, payload_json FROM (
-                 SELECT run_id, event_idx, payload_json,
-                        ROW_NUMBER() OVER (
-                          PARTITION BY subject_run_id ORDER BY event_idx DESC
-                        ) AS recovery_rank
-                 FROM agent_run_events
-                 WHERE user_id = ",
-        );
-        builder
-            .push_bind(user_id)
-            .push(" AND session_id = ")
-            .push_bind(session_id)
-            .push(" AND event_type = 'agent_spawned' AND subject_run_id IN (");
-        {
-            let mut ids = builder.separated(",");
-            for run in &page.runs {
-                ids.push_bind(run.run_id.as_str());
-            }
-        }
-        builder
-            .push(
-                ")
-               ) ranked_spawns WHERE recovery_rank = 1
-               UNION ALL
-               SELECT run_id, event_idx, payload_json FROM (
-                 SELECT run_id, event_idx, payload_json,
-                        ROW_NUMBER() OVER (
-                          PARTITION BY run_id, event_type ORDER BY event_idx DESC
-                        ) AS recovery_rank
-                 FROM agent_run_events
-                 WHERE user_id = ",
-            )
-            .push_bind(user_id)
-            .push(" AND session_id = ")
-            .push_bind(session_id)
-            .push(" AND event_type IN ('text_done','run_error','run_finished') AND run_id IN (");
-        {
-            let mut ids = builder.separated(",");
-            for run in &page.runs {
-                ids.push_bind(run.run_id.as_str());
-            }
-        }
-        builder.push(
-            ")
-               ) ranked_terminal WHERE recovery_rank = 1",
-        );
-        if !recovery_event_run_ids.is_empty() {
-            builder.push(
-                "
-               UNION ALL
-               SELECT run_id, event_idx, payload_json FROM (
-                 SELECT run_id, event_idx, payload_json,
-                        ROW_NUMBER() OVER (
-                          PARTITION BY run_id ORDER BY event_idx DESC
-                        ) AS recovery_rank
-                 FROM agent_run_events
-                 WHERE user_id = ",
+        self.hydrate_agent_recovery_events(
+            user_id,
+            session_id,
+            &mut page,
+            &receipt_subject_ids,
+            None,
+        )
+        .await?;
+        Ok(page)
+    }
+
+    async fn load_remote_child_wakes(
+        &self,
+        keys: &[RemoteChildWakeKey],
+    ) -> Result<Vec<RemoteChildWakeKey>, String> {
+        let keys = keys.iter().collect::<std::collections::BTreeSet<_>>();
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        let mut ready = std::collections::BTreeSet::new();
+        for batch in keys.chunks(REMOTE_CHILD_WAKE_BATCH_SIZE) {
+            // Keep each owner/session/child/parent tuple together. Independent
+            // IN lists would allow cross-tenant or cross-session matches.
+            // The receipt lane covers children that never acquired a run row.
+            let mut query = QueryBuilder::<MySql>::new(
+                "SELECT user_id, session_id, parent_run_id, run_id FROM agent_runs \
+                 WHERE status IN ('completed','delegated','failed','cancelled') AND (",
             );
-            builder
-                .push_bind(user_id)
-                .push(" AND session_id = ")
-                .push_bind(session_id)
-                .push(" AND event_type = 'fanout_group_cancelled'")
-                .push(" AND JSON_TYPE(JSON_EXTRACT(payload_json, '$.data.group_id')) = 'STRING'")
-                .push(" AND TRIM(JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.group_id'))) <> ''")
+            for (index, key) in batch.iter().enumerate() {
+                if index != 0 {
+                    query.push(" OR ");
+                }
+                query
+                    .push("(user_id = ")
+                    .push_bind(&key.user_id)
+                    .push(" AND session_id = ")
+                    .push_bind(&key.session_id)
+                    .push(" AND run_id = ")
+                    .push_bind(&key.run_id)
+                    .push(" AND parent_run_id = ")
+                    .push_bind(&key.parent_run_id)
+                    .push(")");
+            }
+            query
                 .push(
-                    " AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.cancellation_origin')) IN ('user', 'runtime')",
+                    ") UNION SELECT user_id, session_id, run_id AS parent_run_id, \
+                subject_run_id AS run_id FROM agent_run_events WHERE event_type = ",
                 )
-                .push(" AND run_id IN (");
-            {
-                let mut ids = builder.separated(",");
-                for run_id in &recovery_event_run_ids {
-                    ids.push_bind(*run_id);
-                }
-            }
-            builder.push(
-                ")
-               ) ranked_group_cancellations WHERE recovery_rank = 1",
-            );
-        }
-        if !receipt_subject_ids.is_empty() {
-            builder.push(
-                " UNION ALL SELECT run_id, event_idx, payload_json
-                  FROM agent_run_events WHERE user_id = ",
-            );
-            builder
-                .push_bind(user_id)
-                .push(" AND session_id = ")
-                .push_bind(session_id)
-                .push(" AND event_type = ")
                 .push_bind(PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE)
-                .push(" AND subject_run_id IN (");
-            {
-                let mut ids = builder.separated(",");
-                for run_id in &receipt_subject_ids {
-                    ids.push_bind(run_id);
+                .push(" AND (");
+            for (index, key) in batch.iter().enumerate() {
+                if index != 0 {
+                    query.push(" OR ");
                 }
+                query
+                    .push("(user_id = ")
+                    .push_bind(&key.user_id)
+                    .push(" AND session_id = ")
+                    .push_bind(&key.session_id)
+                    .push(" AND subject_run_id = ")
+                    .push_bind(&key.run_id)
+                    .push(" AND run_id = ")
+                    .push_bind(&key.parent_run_id)
+                    .push(")");
             }
-            builder.push(")");
-        }
-        builder.push(
-            ") recovery_events
-             ORDER BY run_id, event_idx",
-        );
-        let rows = builder
-            .build()
-            .fetch_all(self.pool.get())
-            .await
-            .map_err(|source| {
-                db_error("load_session_agent_recovery", session_id, source).to_string()
-            })?;
-        let mut events_by_run = HashMap::<String, Vec<(i64, serde_json::Value)>>::new();
-        for row in rows {
-            let run_id: String = row.try_get("run_id").map_err(|source| {
-                db_error("decode_session_agent_recovery_run_id", session_id, source).to_string()
-            })?;
-            let event_idx: i64 = row.try_get("event_idx").map_err(|source| {
-                db_error("decode_session_agent_recovery_event_idx", &run_id, source).to_string()
-            })?;
-            let payload: String = row.try_get("payload_json").map_err(|source| {
-                db_error("decode_session_agent_recovery_payload", &run_id, source).to_string()
-            })?;
-            let payload = serde_json::from_str(&payload).map_err(|source| {
-                format!("invalid durable recovery event for run {run_id}: {source}")
-            })?;
-            events_by_run
-                .entry(run_id)
-                .or_default()
-                .push((event_idx, payload));
-        }
-        // Spawn and group-cancellation events live on the parent run, but a
-        // bounded cancellation page can select only a child. Read missing
-        // direct parents only when the event query proves the parent owns one
-        // of those envelopes. A normal recovery refresh therefore pays no
-        // extra parent-row SQL round trip.
-        let parents_with_recovery_events = parent_run_ids
-            .into_iter()
-            .filter(|parent_run_id| {
-                events_by_run.get(parent_run_id).is_some_and(|events| {
-                    events.iter().any(|(_, event)| {
-                        matches!(
-                            extract_event_type(event).as_str(),
-                            "agent_spawned"
-                                | "fanout_group_cancelled"
-                                | PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
-                        )
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
-        if !parents_with_recovery_events.is_empty() {
-            let mut parent_query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
-                "SELECT {AGENT_RUN_RECOVERY_COLUMNS} FROM agent_runs WHERE user_id = "
-            ));
-            parent_query
-                .push_bind(user_id)
-                .push(" AND session_id = ")
-                .push_bind(session_id)
-                .push(" AND run_id IN (");
-            {
-                let mut ids = parent_query.separated(",");
-                for run_id in &parents_with_recovery_events {
-                    ids.push_bind(run_id);
-                }
-            }
-            parent_query.push(")");
-            let parent_rows = parent_query
+            query.push(")");
+            #[cfg(test)]
+            self.recovery_batch_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let rows = query
                 .build()
                 .fetch_all(self.pool.get())
                 .await
-                .map_err(|source| {
-                    db_error("load_session_agent_recovery_parents", session_id, source).to_string()
-                })?;
-            for parent in parent_rows
-                .into_iter()
-                .map(run_record_from_row)
-                .collect::<DbStoreResult<Vec<_>>>()
-                .map_err(|error| error.to_string())?
-            {
-                if included.insert(parent.run_id.clone()) {
-                    page.runs.push(parent);
-                }
-            }
-            sort_session_run_tree(&mut page.runs);
-        }
-        for run in &mut page.runs {
-            if let Some(mut events) = events_by_run.remove(&run.run_id) {
-                events.sort_by_key(|(event_idx, _)| *event_idx);
-                run.events = events.into_iter().map(|(_, event)| event).collect();
+                .map_err(|error| db_error("load_remote_child_wakes", "batch", error).to_string())?;
+            for row in rows {
+                ready.insert(RemoteChildWakeKey {
+                    user_id: row.try_get("user_id").map_err(|error| error.to_string())?,
+                    session_id: row
+                        .try_get("session_id")
+                        .map_err(|error| error.to_string())?,
+                    parent_run_id: row
+                        .try_get("parent_run_id")
+                        .map_err(|error| error.to_string())?,
+                    run_id: row.try_get("run_id").map_err(|error| error.to_string())?,
+                });
             }
         }
-        Ok(page)
+        Ok(ready.into_iter().collect())
     }
 
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
@@ -22882,6 +23635,9 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
         retry_count: u32,
     ) -> Result<bool, String> {
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| db_error("update_retry_count_prepare", run_id, source).to_string())?;
         let result = sqlx::query(
             "UPDATE agent_runs
              SET retry_count = ?, updated_at = NOW(6)
@@ -22891,9 +23647,10 @@ impl RunStateStore for DatabaseRunStateStore {
         .bind(user_id)
         .bind(expected_session_id)
         .bind(run_id)
-        .execute(self.pool.get())
+        .execute(connection.connection_mut())
         .await
         .map_err(|source| db_error("update_retry_count", run_id, source).to_string())?;
+        connection.release();
         Ok(result.rows_affected() > 0)
     }
 }
@@ -23972,6 +24729,9 @@ fn decode_run_control_row(
             |source| db_error("decode_run_control_generation", entity, source).to_string(),
         )?)
         .map_err(|_| format!("negative run generation in control row for {entity}"))?,
+        last_event_idx: row.try_get("last_event_idx").map_err(|source| {
+            db_error("decode_run_control_event_index", entity, source).to_string()
+        })?,
         owner_lease_live: row
             .try_get::<i64, _>("owner_lease_live")
             .map_err(|source| {
@@ -25706,6 +26466,85 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 if let Some(transport) = data.get("transport").cloned() {
                     obj.insert("transport".to_string(), transport);
                 }
+                // Expose admitted initial controls, not private runtime context or
+                // a claim about which controls the provider ultimately consumed.
+                if let Some(offering_id) = data
+                    .get("model_selection")
+                    .and_then(|selection| selection.get("offering_id"))
+                    .filter(|value| value.is_string())
+                {
+                    obj.insert(
+                        "model_selection".to_string(),
+                        serde_json::json!({"offering_id": offering_id}),
+                    );
+                }
+                if let Some(selection) = data.get("resolved_model_selection")
+                    && let (Some(offering_id), Some(model_name)) = (
+                        selection
+                            .get("offering_id")
+                            .filter(|value| value.is_string()),
+                        selection
+                            .get("model_name")
+                            .filter(|value| value.is_string()),
+                    )
+                {
+                    obj.insert(
+                        "resolved_model_selection".to_string(),
+                        serde_json::json!({
+                            "offering_id": offering_id,
+                            "model_name": model_name,
+                        }),
+                    );
+                }
+                if let Some(controls) = data.get("generation_controls")
+                    && let (Some(thinking), Some(first_output_max_tokens), Some(preserve_thinking)) = (
+                        controls.get("thinking"),
+                        controls.get("first_output_max_tokens").filter(|value| {
+                            value.is_null()
+                                || value
+                                    .as_u64()
+                                    .is_some_and(|limit| limit > 0 && u32::try_from(limit).is_ok())
+                        }),
+                        controls
+                            .get("preserve_thinking")
+                            .filter(|value| value.is_boolean()),
+                    )
+                {
+                    let mode = thinking.get("mode").and_then(serde_json::Value::as_str);
+                    let projected_thinking = match mode {
+                        Some("off" | "model_default") => {
+                            mode.map(|mode| serde_json::json!({"mode": mode}))
+                        }
+                        Some("enabled") => thinking
+                            .get("budget_tokens")
+                            .filter(|value| {
+                                value
+                                    .as_u64()
+                                    .is_some_and(|budget| budget >= 1024 && u32::try_from(budget).is_ok())
+                            })
+                            .map(|budget| {
+                                serde_json::json!({"mode": "enabled", "budget_tokens": budget})
+                            }),
+                        Some("adaptive") => thinking
+                            .get("effort")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|effort| matches!(*effort, "low" | "medium" | "high" | "max"))
+                            .map(|effort| {
+                                serde_json::json!({"mode": "adaptive", "effort": effort})
+                            }),
+                        _ => None,
+                    };
+                    if let Some(thinking) = projected_thinking {
+                        obj.insert(
+                            "generation_controls".to_string(),
+                            serde_json::json!({
+                                "thinking": thinking,
+                                "first_output_max_tokens": first_output_max_tokens,
+                                "preserve_thinking": preserve_thinking,
+                            }),
+                        );
+                    }
+                }
             }
             out
         }
@@ -26934,6 +27773,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_agent_recovery_preserves_missing_receipts_and_cancellation_authority() {
+        let store = InMemoryRunStateStore::new();
+        let mut parent = durable_run_record("parent");
+        parent
+            .events
+            .push(json!({"type":"agent_spawned","run_id":"missing","agent_id":"reviewer"}));
+        store.insert_run(parent).await.unwrap();
+        let mut child = durable_run_record("child");
+        child.parent_run_id = Some("parent".into());
+        child.status = STATUS_COMPLETED.into();
+        child
+            .events
+            .push(json!({"type":"text_done","text":"completed result"}));
+        store.insert_run(child).await.unwrap();
+        for index in 0..205 {
+            let mut noise = durable_run_record(&format!("noise-{index}"));
+            noise.parent_run_id = Some("parent".into());
+            store.insert_run(noise).await.unwrap();
+        }
+        store
+            .request_run_cancellation("u1", "noise-0")
+            .await
+            .unwrap();
+        let selected = vec!["child".into(), "missing".into(), "noise-0".into()];
+        let exact = store
+            .load_session_agent_recovery_for("u1", "s1", &selected)
+            .await
+            .unwrap();
+        assert_eq!(exact.runs.len(), 3);
+        assert!(!exact.truncated);
+        assert!(
+            exact
+                .runs
+                .iter()
+                .any(|run| run.run_id == "parent" && run.events[0]["run_id"] == "missing")
+        );
+        assert!(
+            exact
+                .runs
+                .iter()
+                .any(|run| run.run_id == "child" && run.events[0]["text"] == "completed result")
+        );
+        assert_eq!(exact.recovery_cancellation_run_ids, vec!["noise-0"]);
+        assert!(
+            exact
+                .runs
+                .iter()
+                .any(|run| run.run_id == "noise-0" && run.status == STATUS_RUNNING)
+        );
+        assert!(
+            store
+                .load_session_agent_recovery_for("u2", "s1", &selected)
+                .await
+                .unwrap()
+                .runs
+                .is_empty()
+        );
+        assert!(
+            store
+                .load_session_agent_recovery_for("u1", "s2", &selected)
+                .await
+                .unwrap()
+                .runs
+                .is_empty()
+        );
+        assert!(
+            store
+                .load_session_agent_recovery_for("u1", "s1", &[])
+                .await
+                .unwrap()
+                .runs
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn pre_durable_child_terminal_is_exact_idempotent_and_recoverable_off_page() {
         let store = InMemoryRunStateStore::new();
         let mut parent = durable_run_record("receipt-parent");
@@ -27058,6 +27973,33 @@ mod tests {
             PreDurableChildTerminalCommit::ChildPresent,
             "a removed parent must not hide an existing child"
         );
+    }
+
+    #[test]
+    fn timed_out_run_start_receipt_requires_exact_durable_identity() {
+        let expected = durable_run_record("run-start-receipt");
+        let mut committed = expected.clone();
+        committed.last_event_idx = 0;
+        committed.owner_pod_id = Some("current-owner".into());
+        committed.owner_lease_expires_at = Some("later".into());
+        committed.updated_at = "later".into();
+
+        assert!(durable_run_start_receipt_matches(&expected, &committed));
+
+        let mut wrong_owner = committed.clone();
+        wrong_owner.user_id = "another-user".into();
+        assert!(!durable_run_start_receipt_matches(&expected, &wrong_owner));
+
+        let mut wrong_model = committed.clone();
+        wrong_model.resolved_model_name = Some("different-model".into());
+        assert!(!durable_run_start_receipt_matches(&expected, &wrong_model));
+
+        let mut missing_event = committed;
+        missing_event.last_event_idx = expected.last_event_idx - 1;
+        assert!(!durable_run_start_receipt_matches(
+            &expected,
+            &missing_event
+        ));
     }
 
     #[test]
@@ -30712,6 +31654,459 @@ mod tests {
         );
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_remote_child_wakes_batch_thousand_sessions_and_isolate_tenants() {
+        use std::sync::atomic::Ordering;
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let suffix = Uuid::new_v4();
+        let keys = (0..1000)
+            .map(|i| RemoteChildWakeKey {
+                user_id: format!("wake-owner-{}-{suffix}", i % 10),
+                session_id: format!("wake-session-{i}-{suffix}"),
+                parent_run_id: format!("wake-parent-{i}-{suffix}"),
+                run_id: format!("wake-child-{i}-{suffix}"),
+            })
+            .collect::<Vec<_>>();
+        // A batched fixture isolates the reader's statement count from run
+        // admission. Every run ID is generated for this test and removed below.
+        for batch in keys.chunks(128) {
+            let mut insert = QueryBuilder::<MySql>::new(
+                "INSERT INTO agent_runs (run_id,user_id,session_id,parent_run_id,root_run_id,ancestor_path,depth,status) ",
+            );
+            insert.push_values(batch, |mut row, key| {
+                row.push_bind(&key.run_id)
+                    .push_bind(&key.user_id)
+                    .push_bind(&key.session_id)
+                    .push_bind(&key.parent_run_id)
+                    .push_bind(&key.parent_run_id)
+                    .push_bind(format!("{}/{}", key.parent_run_id, key.run_id))
+                    .push_bind(1)
+                    .push_bind(STATUS_RUNNING);
+            });
+            insert.build().execute(pool.get()).await.unwrap();
+        }
+        store.recovery_batch_reads.store(0, Ordering::Relaxed);
+        assert!(store.load_remote_child_wakes(&[]).await.unwrap().is_empty());
+        assert_eq!(store.recovery_batch_reads.load(Ordering::Relaxed), 0);
+        assert!(
+            store
+                .load_remote_child_wakes(&keys)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.recovery_batch_reads.load(Ordering::Relaxed),
+            8,
+            "1000 waiting sessions require eight SQL statements"
+        );
+
+        // The selected terminal row is surrounded by >200 running rows.
+        sqlx::query(
+            "UPDATE agent_runs SET status = ? WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        )
+        .bind(STATUS_COMPLETED)
+        .bind(&keys[999].user_id)
+        .bind(&keys[999].session_id)
+        .bind(&keys[999].run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        let mut selected = vec![keys[999].clone()];
+        // Independently valid dimensions must never form a cross-tenant match.
+        let mut wrong_user = keys[999].clone();
+        wrong_user.user_id = keys[0].user_id.clone();
+        selected.push(wrong_user);
+        let mut wrong_session = keys[999].clone();
+        wrong_session.session_id = keys[0].session_id.clone();
+        selected.push(wrong_session);
+        let mut wrong_parent = keys[999].clone();
+        wrong_parent.parent_run_id = keys[0].parent_run_id.clone();
+        selected.push(wrong_parent);
+        selected.push(keys[999].clone());
+        store.recovery_batch_reads.store(0, Ordering::Relaxed);
+        assert_eq!(
+            store.load_remote_child_wakes(&selected).await.unwrap(),
+            vec![keys[999].clone()]
+        );
+        assert_eq!(store.recovery_batch_reads.load(Ordering::Relaxed), 1);
+
+        for batch in keys.chunks(128) {
+            let mut update = QueryBuilder::<MySql>::new("UPDATE agent_runs SET status = ");
+            update
+                .push_bind(STATUS_COMPLETED)
+                .push(" WHERE run_id IN (");
+            {
+                let mut ids = update.separated(",");
+                for key in batch {
+                    ids.push_bind(&key.run_id);
+                }
+            }
+            update.push(")");
+            update.build().execute(pool.get()).await.unwrap();
+        }
+        store.recovery_batch_reads.store(0, Ordering::Relaxed);
+        let all_ready = store.load_remote_child_wakes(&keys).await.unwrap();
+        assert_eq!(
+            all_ready
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            keys.iter().cloned().collect(),
+            "a 1000-child terminal burst must not lose a scoped wake"
+        );
+        assert_eq!(store.recovery_batch_reads.load(Ordering::Relaxed), 8);
+
+        // A missing child can have only its parent-owned pre-durable receipt.
+        let missing = RemoteChildWakeKey {
+            run_id: format!("wake-missing-{suffix}"),
+            ..keys[0].clone()
+        };
+        sqlx::query("INSERT INTO agent_run_events (id, event_id, event_hash, user_id, session_id, run_id, event_idx, event_type, subject_run_id, payload_json) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)")
+            .bind(Uuid::new_v4().to_string()).bind(Uuid::new_v4().to_string()).bind("wake-test-receipt")
+            .bind(&missing.user_id).bind(&missing.session_id).bind(&missing.parent_run_id)
+            .bind(PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE).bind(&missing.run_id)
+            .bind(json!({"event_type":PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE,"run_id":missing.run_id}).to_string())
+            .execute(pool.get()).await.unwrap();
+        assert_eq!(
+            store
+                .load_remote_child_wakes(std::slice::from_ref(&missing))
+                .await
+                .unwrap(),
+            vec![missing.clone()]
+        );
+        sqlx::query(
+            "DELETE FROM agent_run_events WHERE user_id = ? AND session_id = ? AND run_id = ? AND subject_run_id = ?",
+        )
+        .bind(&keys[0].user_id)
+        .bind(&keys[0].session_id)
+        .bind(&keys[0].parent_run_id)
+        .bind(&missing.run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        for batch in keys.chunks(128) {
+            let mut delete = QueryBuilder::<MySql>::new("DELETE FROM agent_runs WHERE run_id IN (");
+            {
+                let mut ids = delete.separated(",");
+                for key in batch {
+                    ids.push_bind(&key.run_id);
+                }
+            }
+            delete.push(")");
+            delete.build().execute(pool.get()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_exact_agent_recovery_covers_missing_and_off_page_children() {
+        use std::sync::atomic::Ordering;
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let suffix = Uuid::new_v4();
+        let user = format!("exact-owner-{suffix}");
+        let session = format!("exact-session-{suffix}");
+        let parent_id = format!("exact-parent-{suffix}");
+        let child_id = format!("exact-child-{suffix}");
+        let missing_id = format!("exact-missing-{suffix}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        let mut parent = durable_run_record(&parent_id);
+        parent.user_id = user.clone();
+        parent.session_id = session.clone();
+        store.insert_run(parent).await.unwrap();
+        let mut child = durable_run_record(&child_id);
+        child.user_id = user.clone();
+        child.session_id = session.clone();
+        child.parent_run_id = Some(parent_id.clone());
+        child.root_run_id = Some(parent_id.clone());
+        child.ancestor_path = Some(format!("{parent_id}/{child_id}"));
+        child.depth = 1;
+        child.agent_id = Some("reviewer".into());
+        child.status = STATUS_COMPLETED.into();
+        store.insert_run(child).await.unwrap();
+        store
+            .append_events_batch(
+                &user,
+                &session,
+                &parent_id,
+                &[
+                    json!({"type":"agent_spawned","run_id":child_id,"agent_id":"reviewer"}),
+                    json!({"type":"agent_spawned","run_id":missing_id,"agent_id":"missing",
+                "fanout_slot":{"group_id":"review","target_count":1,"slot_index":0}}),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .append_events_batch(
+                &user,
+                &session,
+                &child_id,
+                &[
+                    json!({"type":"text_done","text":"old result"}),
+                    json!({"type":"text_done","text":"exact completed result"}),
+                    json!({"event_type":"run_finished","data":{"status":STATUS_COMPLETED}}),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // The initial page contains only the active parent. Both the missing
+        // child and the completed off-page child must remain visible as duties.
+        let discovery = store
+            .load_session_agent_recovery(&user, &session, 1)
+            .await
+            .unwrap();
+        assert!(!discovery.runs.iter().any(|run| run.run_id == child_id));
+        let parent = discovery
+            .runs
+            .iter()
+            .find(|run| run.run_id == parent_id)
+            .unwrap();
+        for id in [&child_id, &missing_id] {
+            assert!(
+                parent
+                    .events
+                    .iter()
+                    .any(|event| extract_optional_string(event, "run_id").as_ref() == Some(id))
+            );
+        }
+
+        // Saturate ordinary discovery cheaply: fixture setup is one batch,
+        // not hundreds of transactional admissions unrelated to the reader.
+        let noise_ids = (0..205)
+            .map(|index| format!("exact-noise-{index}-{suffix}"))
+            .collect::<Vec<_>>();
+        let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "INSERT INTO agent_runs (run_id,user_id,session_id,parent_run_id,root_run_id,ancestor_path,depth,status) ",
+        );
+        insert.push_values(&noise_ids, |mut row, id| {
+            row.push_bind(id)
+                .push_bind(&user)
+                .push_bind(&session)
+                .push_bind(&parent_id)
+                .push_bind(&parent_id)
+                .push_bind(format!("{parent_id}/{id}"))
+                .push_bind(1)
+                .push_bind(STATUS_RUNNING);
+        });
+        insert.build().execute(pool.get()).await.unwrap();
+        let ordinary = store.list_session_runs(&user, &session, 200).await.unwrap();
+        assert!(ordinary.truncated);
+        assert!(!ordinary.runs.iter().any(|run| run.run_id == child_id));
+        let sibling_spawns = noise_ids
+            .iter()
+            .map(|run_id| json!({"type":"agent_spawned","run_id":run_id,"agent_id":run_id}))
+            .collect::<Vec<_>>();
+        store
+            .append_events_batch(&user, &session, &parent_id, &sibling_spawns)
+            .await
+            .unwrap();
+
+        store.recovery_batch_reads.store(0, Ordering::Relaxed);
+        assert!(
+            store
+                .load_session_agent_recovery_for(&user, &session, &[])
+                .await
+                .unwrap()
+                .runs
+                .is_empty()
+        );
+        assert_eq!(store.recovery_batch_reads.load(Ordering::Relaxed), 0);
+        let exact = store
+            .load_session_agent_recovery_for(
+                &user,
+                &session,
+                &[
+                    child_id.clone(),
+                    missing_id.clone(),
+                    parent_id.clone(),
+                    child_id.clone(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.recovery_batch_reads.load(Ordering::Relaxed),
+            2,
+            "one batched row read and one event read"
+        );
+        assert!(!exact.truncated);
+        assert_eq!(
+            exact.runs.len(),
+            2,
+            "an absent child is not fabricated as a completed run"
+        );
+        let exact_parent = exact
+            .runs
+            .iter()
+            .find(|run| run.run_id == parent_id)
+            .unwrap();
+        assert_eq!(
+            exact_parent
+                .events
+                .iter()
+                .filter(|event| extract_event_type(event) == "agent_spawned")
+                .count(),
+            2,
+            "exact child refresh must not amplify all sibling history"
+        );
+        let child = exact
+            .runs
+            .iter()
+            .find(|run| run.run_id == child_id)
+            .unwrap();
+        assert_eq!(child.status, STATUS_COMPLETED);
+        assert_eq!(
+            child
+                .events
+                .iter()
+                .filter(|event| extract_event_type(event) == "text_done")
+                .count(),
+            1
+        );
+        assert!(
+            child
+                .events
+                .iter()
+                .any(|event| event["text"] == "exact completed result")
+        );
+
+        // A receipt must resolve from either exact child identity or parent
+        // identity, even though there will never be a child row.
+        let receipt = PreDurableChildTerminal {
+            user_id: user.clone(),
+            session_id: session.clone(),
+            parent_run_id: parent_id.clone(),
+            child_run_id: missing_id.clone(),
+            cancellation_binding_id: format!("binding-{suffix}"),
+            agent_id: "missing".into(),
+            agent_type: "review".into(),
+            description: "Review".into(),
+            fanout_slot: Some(PreDurableFanoutSlot {
+                group_id: "review".into(),
+                target_count: 1,
+                slot_index: 0,
+                slot_id: None,
+            }),
+            origin: DurableCancellationOrigin::Runtime,
+            reason: "executor stopped before admission".into(),
+        };
+        store
+            .commit_pre_durable_child_terminal(&receipt)
+            .await
+            .unwrap();
+        for identity in [&missing_id, &parent_id] {
+            store.recovery_batch_reads.store(0, Ordering::Relaxed);
+            let page = store
+                .load_session_agent_recovery_for(&user, &session, std::slice::from_ref(identity))
+                .await
+                .unwrap();
+            assert_eq!(store.recovery_batch_reads.load(Ordering::Relaxed), 2);
+            assert!(page.runs.iter().any(|run| run.run_id == parent_id
+                && run.events.iter().any(
+                    |event| extract_event_type(event) == PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
+                )));
+        }
+
+        let mut cross_batch = vec![missing_id.clone()];
+        cross_batch.extend(noise_ids.iter().take(128).cloned());
+        let combined = store
+            .load_session_agent_recovery_for(&user, &session, &cross_batch)
+            .await
+            .unwrap();
+        let combined_parent = combined
+            .runs
+            .iter()
+            .find(|run| run.run_id == parent_id)
+            .unwrap();
+        assert!(combined_parent.events.iter().any(|event| {
+            extract_event_type(event) == PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
+                && extract_optional_string(event, "run_id").as_deref() == Some(missing_id.as_str())
+        }));
+        assert!(combined_parent.events.iter().any(|event| {
+            extract_event_type(event) == "agent_spawned"
+                && extract_optional_string(event, "run_id").as_deref()
+                    == Some(noise_ids[0].as_str())
+        }));
+
+        // Crossing the bind batch boundary never silently truncates identities.
+        store.recovery_batch_reads.store(0, Ordering::Relaxed);
+        let chunked = store
+            .load_session_agent_recovery_for(&user, &session, &noise_ids[..129])
+            .await
+            .unwrap();
+        assert_eq!(chunked.runs.len(), 130, "all 129 children and their parent");
+        assert_eq!(store.recovery_batch_reads.load(Ordering::Relaxed), 4);
+        store
+            .request_run_cancellation(&user, &noise_ids[0])
+            .await
+            .unwrap();
+        let requested = store
+            .load_session_agent_recovery_for(&user, &session, &noise_ids[..2])
+            .await
+            .unwrap();
+        assert_eq!(
+            requested.recovery_cancellation_run_ids,
+            vec![noise_ids[0].clone()]
+        );
+        assert!(
+            requested
+                .runs
+                .iter()
+                .all(|run| run.status == STATUS_RUNNING),
+            "a request alone is not committed cancellation"
+        );
+
+        for (other_user, other_session) in [
+            (format!("other-owner-{suffix}"), session.clone()),
+            (user.clone(), format!("other-session-{suffix}")),
+        ] {
+            assert!(
+                store
+                    .load_session_agent_recovery_for(
+                        &other_user,
+                        &other_session,
+                        &[parent_id.clone(), child_id.clone(), missing_id.clone()]
+                    )
+                    .await
+                    .unwrap()
+                    .runs
+                    .is_empty()
+            );
+        }
+
+        store
+            .append_events_batch(
+                &user,
+                &session,
+                &child_id,
+                &[json!({"type":"text_done","text":"x".repeat(AGENT_RECOVERY_MAX_EVENT_BYTES + 1)})],
+            )
+            .await
+            .unwrap();
+        let oversized = store
+            .load_session_agent_recovery_for(&user, &session, std::slice::from_ref(&child_id))
+            .await
+            .expect_err("oversized recovery evidence must fail explicitly");
+        assert!(oversized.contains("discovery incomplete"), "{oversized}");
+
+        // Cleanup is limited to this test's unique owner and session.
+        for sql in [
+            "DELETE FROM run_display_projections WHERE user_id = ? AND session_id = ?",
+            "DELETE FROM agent_run_events WHERE user_id = ? AND session_id = ?",
+            "DELETE FROM agent_runs WHERE user_id = ? AND session_id = ?",
+            "DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+        ] {
+            sqlx::query(sql)
+                .bind(&user)
+                .bind(&session)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -37847,7 +39242,6 @@ mod tests {
                         "payload_kind": "text",
                         "summary": "review this",
                         "timestamp_ms": 42,
-                        "requires_ack": false
                     }),
                 ),
                 &|o| {
@@ -38154,6 +39548,7 @@ mod tests {
         forward_headers.insert("__astra_connection_tokens".to_string(), "x-hop".to_string());
 
         let request = ChatRequestData {
+            model_catalog_reader: None,
             message: "hi".to_string(),
             user_intent: None,
             parts: Vec::new(),
@@ -38166,11 +39561,15 @@ mod tests {
             run_start_idempotency: None,
             agent_id: None,
             model: None,
+            expected_model_name: None,
             model_selection_mode: ModelSelectionMode::ExplicitOffering,
             model_selection: None,
+            requested_model_policy: None,
             resolved_model_selection: None,
             admitted_model_execution: Some(AdmittedModelExecution {
+                price_snapshot: None,
                 offering_id: "offer-gpt-4".to_string(),
+                source_identity: None,
                 access_kind: crate::ModelAccessKind::SelfHosted,
                 execution_placement: crate::ModelExecutionPlacement::Server,
                 model_name: "gpt-4".to_string(),
@@ -38236,6 +39635,112 @@ mod tests {
     }
 
     #[test]
+    fn run_started_projection_exposes_only_admitted_model_controls() {
+        let event = serde_json::json!({
+            "event_type": "run_started",
+            "data": {
+                "run_id": "child-1",
+                "model_selection": {"offering_id": "offer-child", "private": "do-not-project"},
+                "resolved_model_selection": {
+                    "offering_id": "offer-child", "model_name": "child-model", "credential": "do-not-project"
+                },
+                "generation_controls": {
+                    "thinking": {"mode": "adaptive", "effort": "high", "private": "do-not-project"},
+                    "first_output_max_tokens": null,
+                    "preserve_thinking": true,
+                    "private": "do-not-project"
+                },
+                "admission_source": {"private": "do-not-project"}
+            }
+        });
+        let projected = super::transform_run_event_for_client(event);
+        assert_eq!(projected["run_id"], "child-1");
+        assert_eq!(
+            projected["model_selection"],
+            serde_json::json!({"offering_id": "offer-child"})
+        );
+        assert_eq!(
+            projected["resolved_model_selection"],
+            serde_json::json!({
+                "offering_id": "offer-child", "model_name": "child-model"
+            })
+        );
+        assert_eq!(
+            projected["generation_controls"],
+            serde_json::json!({
+                "thinking": {"mode": "adaptive", "effort": "high"},
+                "first_output_max_tokens": null, "preserve_thinking": true
+            })
+        );
+        assert!(projected.get("admission_source").is_none());
+
+        let missing = super::transform_run_event_for_client(serde_json::json!({
+            "event_type": "run_started", "data": {"run_id": "parent-1"}
+        }));
+        assert!(missing.get("model_selection").is_none());
+        assert!(missing.get("generation_controls").is_none());
+
+        for invalid in [
+            serde_json::json!({"credential": "do-not-project"}),
+            serde_json::json!("secret"),
+            serde_json::json!(-1),
+            serde_json::json!(0),
+            serde_json::json!(u64::from(u32::MAX) + 1),
+        ] {
+            let projected = super::transform_run_event_for_client(serde_json::json!({
+                "event_type": "run_started",
+                "data": {"generation_controls": {
+                    "thinking": {"mode": "off"},
+                    "first_output_max_tokens": invalid,
+                    "preserve_thinking": false
+                }}
+            }));
+            assert!(projected.get("generation_controls").is_none());
+        }
+        for (thinking, cap) in [
+            (serde_json::json!({"mode": "off"}), serde_json::json!(1024)),
+            (
+                serde_json::json!({"mode": "model_default"}),
+                serde_json::Value::Null,
+            ),
+            (
+                serde_json::json!({"mode": "enabled", "budget_tokens": 1024}),
+                serde_json::json!(2048),
+            ),
+        ] {
+            let projected = super::transform_run_event_for_client(serde_json::json!({
+                "event_type": "run_started",
+                "data": {"generation_controls": {
+                    "thinking": thinking,
+                    "first_output_max_tokens": cap,
+                    "preserve_thinking": true
+                }}
+            }));
+            assert_eq!(projected["generation_controls"]["thinking"], thinking);
+            assert_eq!(
+                projected["generation_controls"]["first_output_max_tokens"],
+                cap
+            );
+        }
+        for invalid_budget in [
+            serde_json::json!(1023),
+            serde_json::json!(u64::from(u32::MAX) + 1),
+            serde_json::json!({"credential": "do-not-project"}),
+            serde_json::json!("secret"),
+        ] {
+            let projected = super::transform_run_event_for_client(serde_json::json!({
+                "event_type": "run_started",
+                "data": {"generation_controls": {
+                    "thinking": {"mode": "enabled", "budget_tokens": invalid_budget},
+                    "first_output_max_tokens": 2048,
+                    "preserve_thinking": true
+                }}
+            }));
+            assert!(projected.get("generation_controls").is_none());
+        }
+    }
+
+    #[test]
     fn runtime_auth_request_debug_redacts_authorization_value() {
         let runtime_auth = RuntimeAuthRequest {
             authorization: "Bearer secret-runtime-token".to_string(),
@@ -38251,6 +39756,7 @@ mod tests {
     #[test]
     fn chat_request_data_debug_redacts_runtime_auth_value() {
         let request = ChatRequestData {
+            model_catalog_reader: None,
             message: "hi".to_string(),
             user_intent: None,
             parts: Vec::new(),
@@ -38263,13 +39769,16 @@ mod tests {
             run_start_idempotency: None,
             agent_id: None,
             model: Some("gpt-4".to_string()),
+            expected_model_name: None,
             model_selection_mode: ModelSelectionMode::ExplicitOffering,
             model_selection: Some(ModelSelection {
                 offering_id: "offer-gpt-4".to_string(),
             }),
+            requested_model_policy: None,
             resolved_model_selection: Some(ResolvedModelSelection {
                 offering_id: "offer-gpt-4".to_string(),
                 model_name: "gpt-4".to_string(),
+                source_identity: None,
             }),
             admitted_model_execution: None,
             capability_descriptors: None,
@@ -38371,6 +39880,7 @@ mod tests {
             .create_run(
                 "u1".to_string(),
                 ChatRequestData {
+                    model_catalog_reader: None,
                     message: "hi".to_string(),
                     user_intent: None,
                     parts: Vec::new(),
@@ -38383,8 +39893,10 @@ mod tests {
                     run_start_idempotency: None,
                     agent_id: None,
                     model: None,
+                    expected_model_name: None,
                     model_selection_mode: ModelSelectionMode::ExplicitOffering,
                     model_selection: None,
+                    requested_model_policy: None,
                     resolved_model_selection: None,
                     admitted_model_execution: None,
                     capability_descriptors: None,

@@ -409,11 +409,11 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "replace_all",
                 "allow_structural_change",
             ][..],
-            "Replace file text. Batch/structural overrides: tool_search select:str_replace.",
+            "Edit text. Batch/structural: tool_search select:str_replace.",
         ),
         "ask_user" => (
             &["context", "questions"][..],
-            "Ask focused questions. Choices/headers/multi-select: tool_search select:ask_user.",
+            "Ask; choices/headers/multi-select: tool_search select:ask_user.",
         ),
         "introspect" => (
             &[
@@ -430,7 +430,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "offset",
                 "max_bytes",
             ][..],
-            "question=label. Server Explain: explain={target:previous} OR artifact=handle; never both.",
+            "Runtime/Explain: explain={target:previous} artifact=handle; never both. Chat models: select:model_catalog.",
         ),
         "reflect" => (
             &["question"][..],
@@ -442,12 +442,9 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
         ),
         "read_file" => (
             &["path", "start_line", "end_line", "outline"][..],
-            "Read a bounded file range or return its code outline.",
+            "Read file lines or outline.",
         ),
-        "list_dir" => (
-            &["path", "depth"][..],
-            "List entries in a bounded workspace directory.",
-        ),
+        "list_dir" => (&["path", "depth"][..], "List workspace entries."),
         "grep" => (
             &[
                 "pattern",
@@ -458,7 +455,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "max_matches",
                 "output_mode",
             ][..],
-            "Search workspace files with a bounded regular-expression query.",
+            "Search workspace files (regex).",
         ),
         "glob" => (
             &["pattern", "path", "sort_by", "offset", "head_limit"][..],
@@ -466,27 +463,21 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
         ),
         "write_file" => (
             &["path", "content", "delete"][..],
-            "Create, overwrite, or delete one workspace file. Use str_replace for targeted edits.",
+            "Write/delete file; str_replace for edits.",
         ),
         "skill" => (
             &["skill_name", "task"][..],
             "Run a listed skill before substantive work.",
         ),
-        "tool_search" => (
-            &["query"][..],
-            "Select deferred tools explicitly with select:NAME or select:NAME1,NAME2.",
-        ),
-        "notify" => (
-            &["message", "notification_type"][..],
-            "Send a user notification or status update.",
-        ),
+        "tool_search" => (&["query"][..], "Select: select:NAME or select:NAME1,NAME2."),
+        "notify" => (&["message", "notification_type"][..], "Notify user."),
         "start_work" => (
             &["goal", "activation", "tasks"][..],
             "Create one canonical Work graph: start assigns; defer waits. Once bound, never call start_work again; use a revision-pinned proposal.",
         ),
         "run_next_work_item" => (
             &[][..],
-            "Request the next canonical Work assignment only when start or settlement returned none.",
+            "Next Work assignment only if start/settlement returned none.",
         ),
         "settle_work_item" => (
             &[
@@ -495,7 +486,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "blocker_kind",
                 "unavailable_capabilities",
             ][..],
-            "Settle the active Work attempt truthfully before the final response; use blocked or failed when delivery evidence is incomplete.",
+            "Before final, settle active Work truthfully; blocked/failed if delivery evidence is incomplete.",
         ),
         _ => return schema,
     };
@@ -523,11 +514,9 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
     // are removed, close the reduced object so omitted advanced fields cannot
     // bypass deferred activation at execution admission.
     parameters.insert("additionalProperties".to_string(), Value::Bool(false));
-    if name == "start_work" {
-        // Discovery consumes the untouched catalog, not this resident wire
-        // schema. Its task guidance is already retained below at the field.
-        parameters.remove("x-astra-discovery-summary");
-    }
+    // Discovery consumes the untouched catalog; this duplicates resident prose
+    // and is not an argument-validation constraint.
+    parameters.remove("x-astra-discovery-summary");
     let Some(properties) = parameters
         .get_mut("properties")
         .and_then(Value::as_object_mut)

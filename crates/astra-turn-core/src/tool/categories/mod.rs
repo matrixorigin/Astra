@@ -199,6 +199,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     // ── Agent info / reflection (read-only) ──────────────────────────
     tool("get_agent_info", RO, C),
     tool("introspect", RO, C),
+    tool("model_catalog", RO, C),
     tool("reflect", RO, C),
     tool("inspect_work_plan", RO, C.union(OR)),
     tool("inspect_work_criteria", RO, C.union(OR)),

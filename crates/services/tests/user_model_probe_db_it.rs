@@ -281,9 +281,7 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
     }
     // Administrator legacy hints survive an inconclusive first check, and
     // fresh successful observations survive a later transient probe failure.
-    use astra_services::models::{
-        ModelCreateRequestData, PricingData, QuirksData, ThinkingCapability,
-    };
+    use astra_services::models::{ModelCreateRequestData, QuirksData, ThinkingCapability};
     service
         .create_model(
             owner.clone(),
@@ -298,12 +296,7 @@ async fn user_model_create_rotate_and_probe_enforce_provider_wire_contract() {
                 input_modalities: vec!["text".into()],
                 output_modalities: vec!["text".into()],
                 supported_parameters: vec![],
-                pricing: PricingData {
-                    prompt: 0.0,
-                    completion: 0.0,
-                    cache_read: None,
-                    cache_write: None,
-                },
+                pricing: None,
                 architecture: None,
                 tags: vec![],
                 quirks: Some(QuirksData {

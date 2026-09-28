@@ -6,8 +6,6 @@
 //! - Message creation & serialization
 //! - InProcessTransport throughput (direct + broadcast)
 //! - Router registration & lookup
-//! - AckTracker track/ack/sweep cycle
-//! - DeadLetterQueue store/list/purge
 //! - LatencyTracker record throughput
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
@@ -16,8 +14,8 @@ use std::time::Duration;
 
 use astra_runtime::messaging::metrics::LatencyTracker;
 use astra_runtime::messaging::{
-    AckConfig, AgentAddress, AgentMailboxRouter, AgentMessage, DeadLetterQueue, DeadLetterReason,
-    InProcessTransport, MessagePayload, MessageTarget, PendingAckTracker,
+    AgentAddress, AgentMailboxRouter, AgentMessage, InProcessTransport, MessagePayload,
+    MessageTarget,
 };
 use astra_runtime::server::delegation::engine::DelegationTracker;
 
@@ -64,12 +62,6 @@ fn bench_message_creation(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("new_text_with_ack", |b| {
-        b.iter(|| {
-            black_box(text_msg(("r1", "a1"), ("r2", "a2")).with_ack_required());
-        })
-    });
-
     // Varying payload sizes
     for size in [64, 256, 1024, 4096, 16384] {
         let body: String = "x".repeat(size);
@@ -80,14 +72,6 @@ fn bench_message_creation(c: &mut Criterion) {
             })
         });
     }
-
-    group.bench_function("make_ack", |b| {
-        let msg = text_msg(("r1", "a1"), ("r2", "a2"));
-        let responder = addr("r2", "a2");
-        b.iter(|| {
-            black_box(msg.make_ack(responder.clone()));
-        })
-    });
 
     group.finish();
 }
@@ -168,119 +152,6 @@ fn bench_inprocess_transport(c: &mut Criterion) {
                 );
                 let _ = parent_mb.send(msg).await;
             }
-        })
-    });
-
-    group.finish();
-}
-
-// ─── AckTracker Performance ─────────────────────────────────────────────────
-
-fn bench_ack_tracker(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    let mut group = c.benchmark_group("ack_tracker");
-
-    // Track + immediate acknowledge
-    group.bench_function("track_and_ack_1k", |b| {
-        b.to_async(&rt).iter(|| async {
-            let tracker = PendingAckTracker::new();
-            let mut ids = Vec::with_capacity(1000);
-            for i in 0..1000u32 {
-                let msg = Arc::new(
-                    text_msg(("r1", "sender"), ("r2", &format!("recv-{i}"))).with_ack_required(),
-                );
-                ids.push(msg.id.clone());
-                tracker.track(msg).await;
-            }
-            for id in &ids {
-                tracker.acknowledge(id).await;
-            }
-            assert_eq!(tracker.pending_count().await, 0);
-        })
-    });
-
-    // Sweep with all expired (worst case)
-    group.bench_function("sweep_1k_expired", |b| {
-        b.to_async(&rt).iter(|| async {
-            let config = AckConfig {
-                ack_timeout: Duration::from_nanos(1),
-                max_retries: 1,
-                sweep_interval: Duration::from_secs(1),
-            };
-            let tracker = PendingAckTracker::with_config(config);
-            for i in 0..1000u32 {
-                let msg =
-                    Arc::new(text_msg(("r1", "s"), ("r2", &format!("r-{i}"))).with_ack_required());
-                tracker.track(msg).await;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-            let outcomes = tracker.sweep().await;
-            assert_eq!(outcomes.len(), 1000);
-        })
-    });
-
-    group.finish();
-}
-
-// ─── Dead Letter Queue Performance ──────────────────────────────────────────
-
-fn bench_dead_letter_queue(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    let mut group = c.benchmark_group("dead_letter_queue");
-
-    // Store throughput
-    group.bench_function("store_1k", |b| {
-        b.to_async(&rt).iter(|| async {
-            let dlq = DeadLetterQueue::new();
-            for i in 0..1000u32 {
-                let msg = Arc::new(text_msg(("r1", "s"), ("r2", &format!("r-{i}"))));
-                dlq.store(msg, DeadLetterReason::AckTimeout { attempts: 3 }, 3)
-                    .await;
-            }
-            assert_eq!(dlq.count().await, 1000);
-        })
-    });
-
-    // Store with eviction (capacity 100, insert 1000)
-    group.bench_function("store_1k_evict_to_100", |b| {
-        b.to_async(&rt).iter(|| async {
-            let dlq = DeadLetterQueue::with_capacity(100);
-            for i in 0..1000u32 {
-                let msg = Arc::new(text_msg(("r1", "s"), ("r2", &format!("r-{i}"))));
-                dlq.store(msg, DeadLetterReason::AckTimeout { attempts: 3 }, 3)
-                    .await;
-            }
-            assert_eq!(dlq.count().await, 100);
-        })
-    });
-
-    // List + reason_summary
-    group.bench_function("reason_summary_1k", |b| {
-        b.to_async(&rt).iter(|| async {
-            let dlq = DeadLetterQueue::new();
-            for i in 0..1000u32 {
-                let msg = Arc::new(text_msg(("r1", "s"), ("r2", &format!("r-{i}"))));
-                let reason = if i % 3 == 0 {
-                    DeadLetterReason::AckTimeout { attempts: 3 }
-                } else if i % 3 == 1 {
-                    DeadLetterReason::Rejected {
-                        reason: Some("bad".into()),
-                    }
-                } else {
-                    DeadLetterReason::Expired
-                };
-                dlq.store(msg, reason, 1).await;
-            }
-            let summary = dlq.reason_summary().await;
-            assert!(summary.total > 0);
         })
     });
 
@@ -375,8 +246,6 @@ criterion_group!(
     benches,
     bench_message_creation,
     bench_inprocess_transport,
-    bench_ack_tracker,
-    bench_dead_letter_queue,
     bench_latency_tracker,
     bench_router,
 );

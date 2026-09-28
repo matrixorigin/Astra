@@ -61,6 +61,7 @@ pub mod introspect;
 pub mod invocation_ledger;
 pub mod lru_map;
 pub mod microcompact;
+pub mod model_catalog;
 pub mod observer;
 pub mod optimize_limits;
 pub mod orchestration;

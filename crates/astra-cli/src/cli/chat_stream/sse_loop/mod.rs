@@ -160,8 +160,7 @@ async fn finalize_root_mailbox(
 
     if let Some(mailbox) = mailbox.take() {
         let addr = mailbox.address.clone();
-        let router = mailbox.router();
-        if let Err(e) = router.unregister(&addr).await {
+        if let Err(e) = mailbox.unregister().await {
             eprintln!(
                 "astra: failed to unregister mailbox for run_id={} agent_id={}: {e}",
                 addr.run_id, addr.agent_id
@@ -431,11 +430,18 @@ pub(crate) async fn stream_chat_sse(
         // both sites closes the gap.
         if let Some(ref spawner) = p.agent_spawner {
             let spawn_ctx = edge_tools::agent_spawning::AgentActionContext {
-                fanout_admission: spawner.fanout_parent(&parent_turn_run_id),
+                fanout_admission: spawner.attach_fanout_parent(&parent_turn_run_id).await,
                 run_id: parent_turn_run_id.clone(),
                 agent_id: root_agent_id.to_string(),
                 delegation_chain: Vec::new(),
                 current_model: p.model.map(str::to_string),
+                delegation_model_admission: None,
+                parent_model_reasoning: None,
+                current_model_selection: p.offering_id.as_ref().map(|offering_id| {
+                    astra_turn_types::ModelSelection {
+                        offering_id: offering_id.clone(),
+                    }
+                }),
                 recursion_depth: 0,
                 is_fork_child: false,
                 working_dir: project_root.clone(),
@@ -483,7 +489,7 @@ pub(crate) async fn stream_chat_sse(
     let root_send_message_context = p.agent_spawner.as_ref().map(|spawner| {
         edge_tools::agent_messaging::SendMessageRuntimeContext {
             agent_id: root_agent_id.to_string(),
-            run_id: root_agent_id.to_string(),
+            run_id: parent_turn_run_id.clone(),
             router: spawner.mailbox_router(),
         }
     });
@@ -648,6 +654,12 @@ pub(crate) async fn stream_chat_sse(
     } else {
         None
     };
+    if let (Some(spawner), Some(mailbox)) = (p.agent_spawner.as_ref(), root_mailbox.as_ref()) {
+        spawner
+            .mailbox_router()
+            .record_parent_delivery_alias(&parent_turn_run_id, &mailbox.address)
+            .await;
+    }
     let task_profile = infer_task_execution_profile(p.message);
     let circuit_breaker_config = circuit_breaker_config.for_task_profile(task_profile);
 
@@ -977,12 +989,19 @@ pub(crate) async fn stream_chat_sse(
         },
         messaging: MessagingState {
             mailbox: root_mailbox,
-            ack_tracker: None,
             metrics: p.messaging_metrics.clone(),
             progress_emitter: None,
             ..Default::default()
         },
-        user_intents: Default::default(),
+        user_intents: {
+            let mut inputs = astra_runtime::turn::agentic_loop::host::UserIntentState::default();
+            inputs.bind_wake(
+                p.run_control
+                    .as_ref()
+                    .and_then(|control| control.input_wake()),
+            );
+            inputs
+        },
         cancellation: CancellationState {
             flag: None,
             pause_flag: None,
@@ -1041,7 +1060,7 @@ pub(crate) async fn stream_chat_sse(
         budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
         skill_produced_output: false,
-        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
         permission_context: Some(root_permission_context),
         applied_permission_mode: None,
         permission_handler: None,
@@ -1557,6 +1576,7 @@ mod tests {
         step_recorder_for_cli_turn,
     };
     use crate::cli::permission_manager::{PermissionManager, PermissionMode};
+    use astra_runtime::orchestration::AgentStatus;
     use astra_runtime::turn::permission_gate::{PermissionCheckResult, check_tool_permission};
     use astra_turn_core::chat_turn_heuristics::{
         TaskComplexity, TaskExecutionProfile, infer_task_execution_profile,
@@ -1564,10 +1584,262 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
     use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     fn mutating_profile() -> TaskExecutionProfile {
         TaskExecutionProfile::from_structured_intent(true, false, TaskComplexity::Standard)
+    }
+
+    struct NoDurableReads;
+
+    #[async_trait::async_trait]
+    impl astra_runtime::orchestration::DurableAgentReconciler for NoDurableReads {
+        async fn load_agent_recovery(
+            &self,
+        ) -> Result<Vec<astra_services::runs::DurableRunRecord>, String> {
+            panic!("owner attachment must use only in-memory projections");
+        }
+    }
+
+    fn recovery_test_spawner() -> astra_runtime::orchestration::DynamicAgentSpawner {
+        let transport = Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        astra_runtime::orchestration::DynamicAgentSpawner::new(router)
+    }
+
+    #[tokio::test]
+    async fn direct_child_attach_after_workspace_recovery_preserves_unhappy_results_once() {
+        for (status, expected_reason) in [
+            ("running", "local_executor_unavailable_after_resume"),
+            (
+                "waiting_for_input",
+                "local_executor_unavailable_after_resume",
+            ),
+            ("completed", "canonical_result_unavailable_after_resume"),
+            ("unknown", "unknown_restored_lifecycle"),
+            ("failed", "review failed"),
+        ] {
+            let spawner = recovery_test_spawner();
+            spawner
+                .set_durable_agent_reconciler(Arc::new(NoDurableReads))
+                .await;
+            let projection =
+                astra_services::session_workspace::BackgroundLocalAgentTaskProjection {
+                    id: "reviewer@lost".into(),
+                    run_id: "run-reviewer-lost".into(),
+                    parent_run_id: "root".into(),
+                    status: status.into(),
+                    title: "review storage".into(),
+                    started_at_ms: 42,
+                    ended_at_ms: None,
+                    output_tail: Some("partial finding".into()),
+                    terminal_reason: Some("review failed".into()),
+                    fanout: None,
+                };
+            let snapshot = std::slice::from_ref(&projection);
+            assert_eq!(
+                spawner.restore_workspace_agent_projections(snapshot).await,
+                1
+            );
+            // Match CLI startup: restore first, attach only when the exact
+            // parent execution is known. Recovery must not retain that owner.
+            let parent = spawner.fanout_parent("root");
+            assert!(!parent.has_direct_child_completion_history());
+            assert!(Arc::ptr_eq(
+                &parent,
+                &spawner.attach_fanout_parent("root").await
+            ));
+            assert_eq!(parent.pending_direct_children().len(), 1);
+            tokio::time::timeout(Duration::from_secs(1), parent.wait_for_direct_children())
+                .await
+                .unwrap();
+            let results = parent.take_completed_direct_children();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].agent_id, projection.id);
+            assert_eq!(results[0].run_id, projection.run_id);
+            match &results[0].status {
+                AgentStatus::Interrupted {
+                    partial_result,
+                    finish_reason,
+                } => {
+                    assert_eq!(partial_result, "partial finding");
+                    assert_eq!(finish_reason, expected_reason);
+                }
+                AgentStatus::Failed { error, .. } => assert_eq!(error, expected_reason),
+                other => panic!("incomplete recovered work must not become success: {other:?}"),
+            }
+            assert_eq!(
+                spawner.restore_workspace_agent_projections(snapshot).await,
+                0
+            );
+            let attached = spawner.attach_fanout_parent("root").await;
+            assert!(Arc::ptr_eq(&parent, &attached));
+            assert!(attached.has_direct_child_completion_history());
+            assert!(!attached.has_pending_direct_children());
+            assert!(attached.take_completed_direct_children().is_empty());
+
+            let weak = Arc::downgrade(&parent);
+            drop(parent);
+            drop(attached);
+            assert!(
+                weak.upgrade().is_none(),
+                "history must not retain the owner"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_child_attach_after_recovery_is_exact_parent_and_excludes_fanout() {
+        use astra_services::session_workspace::{
+            BackgroundLocalAgentFanoutProjection, BackgroundLocalAgentTaskProjection,
+        };
+        let spawner = recovery_test_spawner();
+        let mut projections = Vec::new();
+        for (id, parent_run_id) in [
+            ("direct", "root"),
+            ("sibling", "other-root"),
+            ("descendant", "run-direct"),
+            ("group-slot", "root"),
+        ] {
+            projections.push(BackgroundLocalAgentTaskProjection {
+                id: id.into(),
+                run_id: format!("run-{id}"),
+                parent_run_id: parent_run_id.into(),
+                status: "running".into(),
+                title: id.into(),
+                started_at_ms: 42,
+                ended_at_ms: None,
+                output_tail: None,
+                terminal_reason: None,
+                fanout: (id == "group-slot").then(|| BackgroundLocalAgentFanoutProjection {
+                    group_id: "recovered-group".into(),
+                    group_title: "Recovered group".into(),
+                    target_count: 1,
+                    slot_index: 0,
+                    slot_label: "only slot".into(),
+                }),
+            });
+        }
+        assert_eq!(
+            spawner
+                .restore_workspace_agent_projections(&projections)
+                .await,
+            4
+        );
+        let parent = spawner.attach_fanout_parent("root").await;
+        let children = parent.pending_direct_children();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].agent_id, "direct");
+        let unrelated = spawner.attach_fanout_parent("new-turn").await;
+        assert!(!unrelated.has_direct_child_completion_history());
+        let sibling = spawner.attach_fanout_parent("other-root").await;
+        assert_eq!(sibling.pending_direct_children()[0].agent_id, "sibling");
+        let descendant_parent = spawner.attach_fanout_parent("run-direct").await;
+        assert_eq!(
+            descendant_parent.pending_direct_children()[0].agent_id,
+            "descendant"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_child_attach_after_recovery_preserves_live_cancellation_and_consumption() {
+        use astra_runtime::orchestration::{
+            SpawnAgentExecutor, SpawnContext, SpawnRunConfig, SpawnRunResult,
+        };
+        use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
+
+        struct PendingExecutor;
+        #[async_trait::async_trait]
+        impl SpawnAgentExecutor for PendingExecutor {
+            async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+                std::future::pending().await
+            }
+        }
+        let workspace = tempdir().unwrap();
+        let spawner = recovery_test_spawner().with_executor(Arc::new(PendingExecutor));
+        spawner
+            .set_durable_agent_reconciler(Arc::new(NoDurableReads))
+            .await;
+        let context = SpawnContext {
+            delegation_model_admission: None,
+            parent_model_reasoning: None,
+            parent_run_id: "root".into(),
+            parent_agent_id: "root".into(),
+            resolved_model_name: None,
+            recursion_depth: 0,
+            parent_is_fork_child: false,
+            working_dir: workspace.path().to_path_buf(),
+            inherited_permissions: astra_runtime::orchestration::InheritedPermissions::auto_approve(
+            ),
+            inherited_skills: Vec::new(),
+            live_event_sink: None,
+            client_tool_delivery_tx: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
+            execution_metadata: None,
+            workspace_mutation: Default::default(),
+            delegation_chain: Vec::new(),
+        };
+        let input = SpawnAgentInput {
+            description: "live review".into(),
+            prompt: "review the change".into(),
+            agent_type: "explore".into(),
+            run_in_background: true,
+            ..Default::default()
+        };
+        let parent = spawner.attach_fanout_parent("root").await;
+        let SpawnAgentOutput::Launched { agent_id, .. } =
+            spawner.spawn(input, &context).await.unwrap()
+        else {
+            panic!("expected live child");
+        };
+        let live = spawner.get_agent_state(&agent_id).await.unwrap();
+        let projection = astra_services::session_workspace::BackgroundLocalAgentTaskProjection {
+            id: agent_id.clone(),
+            run_id: live.run_id.clone(),
+            parent_run_id: "root".into(),
+            status: "completed".into(),
+            title: "stale snapshot".into(),
+            started_at_ms: 42,
+            ended_at_ms: Some(43),
+            output_tail: Some("stale result".into()),
+            terminal_reason: None,
+            fanout: None,
+        };
+        let snapshot = std::slice::from_ref(&projection);
+        assert_eq!(
+            spawner.restore_workspace_agent_projections(snapshot).await,
+            0
+        );
+        let attached = spawner.attach_fanout_parent("root").await;
+        assert!(Arc::ptr_eq(&parent, &attached));
+        assert_eq!(attached.pending_direct_children().len(), 1);
+        assert!(!attached.pending_direct_children()[0].status.is_terminal());
+        assert!(attached.take_completed_direct_children().is_empty());
+        let wait = parent.wait_for_direct_children();
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        spawner
+            .cancel_agent_for_user(&agent_id, "stop review")
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), wait)
+            .await
+            .unwrap();
+        spawner.attach_fanout_parent("root").await;
+        let results = parent.take_completed_direct_children();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].agent_id, agent_id);
+        assert!(matches!(
+            &results[0].status,
+            AgentStatus::Cancelled { by_user: true, .. }
+        ));
+        spawner.restore_workspace_agent_projections(snapshot).await;
+        spawner.attach_fanout_parent("root").await;
+        assert!(!parent.has_pending_direct_children());
+        assert!(parent.take_completed_direct_children().is_empty());
+        spawner.shutdown_and_wait(Duration::from_secs(2)).await;
     }
 
     #[test]

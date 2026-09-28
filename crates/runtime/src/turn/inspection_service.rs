@@ -63,7 +63,7 @@ impl<'a> InspectionService<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct LiveMetrics {
     pub token_pressure: f64,
-    pub cache_hit_ratio: f64,
+    pub cache_hit_ratio: Option<f64>,
     pub current_error_rate: f64,
     pub turns_completed: u32,
     pub turns_remaining: u32,
@@ -158,14 +158,17 @@ impl InspectionService<'_> {
             ObservationFacet::Session | ObservationFacet::Overview => {
                 // ── Live metrics ──
                 let pressure = self.live.token_pressure();
-                let cache = self.live.cache_hit_ratio();
+                let cache = self.live.cache_hit_ratio().map_or_else(
+                    || "unknown".to_string(),
+                    |ratio| format!("{:.0}%", ratio * 100.0),
+                );
                 let error_rate = self.live.current_error_rate();
                 let remaining = self.session.remaining_turns();
                 let max_budget = self.session.max_turns();
                 lines.push(format!(
-                    "live: pressure={:.0}% prompt_cache_read_share={:.0}% prompt_cache_scope=current_runtime_snapshot error_rate={:.0}% remaining_turns={}/{}",
+                    "live: pressure={:.0}% prompt_cache_read_share={} prompt_cache_scope=current_runtime_snapshot error_rate={:.0}% remaining_turns={}/{}",
                     pressure * 100.0,
-                    cache * 100.0,
+                    cache,
                     error_rate * 100.0,
                     remaining,
                     max_budget,
@@ -436,7 +439,7 @@ mod tests {
         with_inspection(&state, |svc| {
             let metrics = svc.build_live_metrics();
             assert!((metrics.token_pressure - 0.0).abs() < f64::EPSILON);
-            assert!((metrics.cache_hit_ratio - 0.0).abs() < f64::EPSILON);
+            assert_eq!(metrics.cache_hit_ratio, None);
             assert!((metrics.current_error_rate - 0.0).abs() < f64::EPSILON);
             assert_eq!(metrics.phase_label, "execution");
             assert_eq!(metrics.circuit_breaker_state, "monitoring");
@@ -494,9 +497,20 @@ mod tests {
             assert!(summary.contains("Local Reflect Summary"));
             assert!(summary.contains("source=local_journal"));
             assert!(summary.contains("live:"));
+            assert!(summary.contains("prompt_cache_read_share=unknown"));
             assert!(summary.contains("streaks:"));
             assert!(!summary.contains("tasks:"));
             assert!(summary.contains("circuit_breaker:"));
+        });
+    }
+
+    #[test]
+    fn local_reflect_distinguishes_zero_cache_reads_from_missing_input() {
+        let mut state = host::make_test_loop_state();
+        state.total_prompt = 100;
+        with_inspection(&state, |svc| {
+            let summary = svc.local_reflect_summary(ObservationFacet::Session, 20);
+            assert!(summary.contains("prompt_cache_read_share=0%"));
         });
     }
 

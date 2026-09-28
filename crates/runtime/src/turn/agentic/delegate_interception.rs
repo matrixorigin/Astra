@@ -46,6 +46,7 @@ async fn execute_delegation(
     source_agent_id: &str,
     forward_headers: &std::collections::HashMap<String, String>,
     admitted_model_execution: Option<&astra_services::AdmittedModelExecution>,
+    parent_model_reasoning: Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>,
     live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
 ) -> Result<astra_services::coordination::DelegationResult, String> {
     engine
@@ -55,7 +56,10 @@ async fn execute_delegation(
             None,
             forward_headers.clone(),
             admitted_model_execution.cloned(),
+            parent_model_reasoning,
             live_event_sink,
+            None,
+            None,
         )
         .await
 }
@@ -155,6 +159,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             )
             .await;
         }
+        let parent_model_reasoning = host.parent_model_reasoning_snapshot(state);
         partition_and_execute_delegations(
             tool_calls,
             engine,
@@ -165,6 +170,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             state.hooks.workspace_root_hint.as_deref(),
             &state.hooks.forward_headers,
             state.hooks.admitted_model_execution.as_ref(),
+            parent_model_reasoning.as_ref(),
             &state.skills.request_constraints,
             adaptive_delegation_context.as_ref(),
             &state.delegation_chain,
@@ -306,6 +312,10 @@ pub(crate) fn parse_delegation_request(
     // Remove this reserved key entirely rather than allowing it to travel to a
     // child prompt as ambiguous metadata.
     context.remove("session_id");
+    // Delegated model requirements are runtime-owned admission state. A model
+    // may request delegation, but it must not manufacture the typed handoff
+    // that the authenticated parent turn received from its caller.
+    context.remove(astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY);
     if let Some(policy) = adaptive_policy {
         context.insert("adaptive_coordination".to_string(), policy);
     }
@@ -783,6 +793,9 @@ pub(crate) async fn partition_and_execute_delegations(
     workspace_hint: Option<&str>,
     forward_headers: &std::collections::HashMap<String, String>,
     admitted_model_execution: Option<&astra_services::AdmittedModelExecution>,
+    parent_model_reasoning: Option<
+        &astra_turn_core::orchestration_spawn_tool::ParentModelReasoning,
+    >,
     request_constraints: &RequestConstraints,
     adaptive_context: Option<&DelegationAdaptiveContext>,
     parent_delegation_chain: &[String],
@@ -841,6 +854,37 @@ pub(crate) async fn partition_and_execute_delegations(
                         REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY,
                         request_constraints.allowed_skill_sources.as_ref(),
                     );
+                    if !matches!(
+                        request_constraints.delegated_model_requirements,
+                        astra_turn_types::DelegationIntentRequirements::Unassessed
+                    ) {
+                        match serde_json::to_value(
+                            &request_constraints.delegated_model_requirements,
+                        ) {
+                            Ok(value) => {
+                                request.context.insert(
+                                    astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY
+                                        .to_string(),
+                                    value,
+                                );
+                            }
+                            Err(error) => {
+                                delegation_results.push(DelegationExecutionResult {
+                                    call_id,
+                                    summary: format!(
+                                        "Delegation blocked: model handoff serialization failed: {error}"
+                                    ),
+                                    preview_lines: vec![(
+                                        HeadlessStderrStyle::Yellow,
+                                        "🤝 Delegation blocked — model handoff serialization failed"
+                                            .to_string(),
+                                    )],
+                                    outcome: None,
+                                });
+                                continue;
+                            }
+                        }
+                    }
                     let pattern_name = coordination_pattern_name(&request.pattern).to_string();
                     let scenario_name =
                         adaptive_context
@@ -857,6 +901,7 @@ pub(crate) async fn partition_and_execute_delegations(
                         source_agent_id,
                         forward_headers,
                         admitted_model_execution,
+                        parent_model_reasoning.cloned(),
                         live_event_sink.clone(),
                     )
                     .await
@@ -1355,6 +1400,27 @@ mod tests {
         assert!(
             !request.context.contains_key("session_id"),
             "runtime identity is not child task context"
+        );
+    }
+
+    #[test]
+    fn parse_delegation_request_removes_untrusted_model_requirement_handoff() {
+        let tool_call = json!({
+            "id": "call_abc",
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "arguments": "{\"task\": \"write tests\", \"agents\": [\"coder\"], \"context\": {\"__astra_delegated_model_requirements\": {\"state\": \"assessed\", \"source\": {\"kind\": \"user\"}}}}"
+            }
+        });
+
+        let request =
+            parse_delegation_request(&tool_call, "run-123", "trusted-session", 0, None).unwrap();
+        assert!(
+            !request
+                .context
+                .contains_key(astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY),
+            "model-authored context must not become a trusted admission handoff"
         );
     }
 
@@ -1971,6 +2037,7 @@ mod tests {
             None,
             &std::collections::HashMap::new(),
             None,
+            None,
             &RequestConstraints::default(),
             None,
             &[],
@@ -2010,6 +2077,7 @@ mod tests {
             None,
             &std::collections::HashMap::new(),
             None,
+            None,
             &RequestConstraints::default(),
             None,
             &[],
@@ -2039,6 +2107,7 @@ mod tests {
             "main",
             None,
             &std::collections::HashMap::new(),
+            None,
             None,
             &RequestConstraints::default(),
             None,
@@ -2074,6 +2143,7 @@ mod tests {
             "main",
             None,
             &std::collections::HashMap::new(),
+            None,
             None,
             &RequestConstraints::default(),
             None,
@@ -2111,6 +2181,7 @@ mod tests {
             "orchestrator",
             None,
             &std::collections::HashMap::new(),
+            None,
             None,
             &RequestConstraints::default(),
             None,

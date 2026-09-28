@@ -85,6 +85,10 @@ pub struct AgentFanoutGroupProjection {
     pub target_count: usize,
     pub created_by_tool_use_id: Option<String>,
     pub parent_run_id: Option<String>,
+    /// Hash of the original fanout start request (excluding its transport
+    /// tool-call ID), kept in-memory to validate idempotent replay without
+    /// persisting prompts or adding database I/O.
+    pub start_request_fingerprint: Option<String>,
     pub slots: Vec<AgentFanoutSlot>,
     pub status: AgentFanoutStatus,
     /// Producer-owned material-state revision. Reads and LRU touches never
@@ -212,6 +216,7 @@ impl AgentFanoutGroupProjection {
             target_count,
             created_by_tool_use_id: None,
             parent_run_id: None,
+            start_request_fingerprint: None,
             slots,
             status: AgentFanoutStatus::Planned,
             revision: 1,

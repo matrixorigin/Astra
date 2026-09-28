@@ -576,6 +576,7 @@ mod tests {
             start_elapsed_ms: Some(12),
             duration_ms: Some(70),
             outcome: Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded),
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),

@@ -441,7 +441,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 should_backoff_from_nonprogress(&self.ctx.turn_guard.health, &health_identity)
         {
             let (reason_code, err_msg, status_line) =
-                nonprogress_backoff_message(&slot.name, repeat_count, remaining_secs);
+                nonprogress_backoff_message(&slot.name, &slot.args, repeat_count, remaining_secs);
             emit_blocked_tool_result(
                 HeadlessBlockedTool {
                     id: &slot.id,
@@ -742,6 +742,24 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let Some(mut cached) = self.ctx.idempotency_cache.check(idem_key).cloned() else {
             return false;
         };
+        let catalog_replay = execution.name == "model_catalog";
+        if catalog_replay {
+            let Ok(page) = serde_json::from_str::<astra_turn_core::model_catalog::ModelCatalogPage>(
+                &cached.output,
+            ) else {
+                return false;
+            };
+            if page.error.is_some()
+                || page.purpose != "chat"
+                || page.to_json() != cached.output
+                || cached.output.len() > astra_turn_core::model_catalog::MODEL_CATALOG_MAX_BYTES
+                || astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(&cached.output)
+                    .content
+                    != cached.output
+            {
+                return false;
+            }
+        }
         let cache_key = idem_key.cache_key();
         let args_preview = safe_args_preview(&execution.name, &execution.args);
         if !self.ctx.tool_event_hooks.is_empty()
@@ -753,6 +771,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             )
             .await
         {
+            // A catalog page is an authority-bearing observation. Re-execute
+            // through the normal governance path when a replay hook edits it.
+            if catalog_replay {
+                return false;
+            }
             cached.output = modified;
         }
         if !self.ctx.quiet {
@@ -768,12 +791,21 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 false,
             );
         }
-        let (mut tool_msg, tr) = headless_idempotency_hit_openai_pair(
-            &execution.id,
-            &execution.name,
-            &cached.output,
-            astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
-        );
+        let (mut tool_msg, tr) = if catalog_replay {
+            openai_tool_roundtrip_values(
+                &execution.id,
+                &execution.name,
+                &cached.output,
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
+            )
+        } else {
+            headless_idempotency_hit_openai_pair(
+                &execution.id,
+                &execution.name,
+                &cached.output,
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
+            )
+        };
         if let Some(obj) = tool_msg.as_object_mut() {
             obj.insert(
                 "_round_index".to_string(),
@@ -1214,9 +1246,20 @@ fn outcome_memory_block_message(
 
 fn nonprogress_backoff_message(
     tool_name: &str,
+    args: &Value,
     repeat_count: usize,
     remaining_secs: u64,
 ) -> (&'static str, String, String) {
+    if tool_name == "agent" && args.get("action").and_then(Value::as_str) == Some("get_result") {
+        return (
+            "nonprogress_retry_deferred",
+            format!(
+                "retry_deferred: agent.get_result was deferred because prior calls had no terminal result; current child status is unknown. If the result has since completed or was truncated, retrieve it with agent.get_result when the retry is available. {}",
+                astra_turn_core::orchestration::agent_result_wire::PENDING_CHILD_RUNTIME_WAIT_GUIDANCE
+            ),
+            format!("  ⚠ Busy-poll backoff: {tool_name} (~{remaining_secs}s)"),
+        );
+    }
     (
         "nonprogress_retry_deferred",
         format!(
@@ -1234,6 +1277,13 @@ fn nonprogress_backoff_message(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn ordinary_nonprogress_backoff_still_exposes_its_cooldown() {
+        let (_, message, _) =
+            nonprogress_backoff_message("read_file", &serde_json::json!({"path":"example"}), 2, 7);
+        assert!(message.contains("Wait about 7s"));
+    }
 
     fn names<const N: usize>(values: [&str; N]) -> HashSet<String> {
         values.into_iter().map(str::to_string).collect()

@@ -427,6 +427,7 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         // discovery round-trip; their resident projections remain compact,
         // while the canonical catalog retains the full diagnostic contract.
         control_plane("introspect", ToolLoadPolicy::AlwaysLoad),
+        control_plane("model_catalog", ToolLoadPolicy::Deferred),
         control_plane("reflect", ToolLoadPolicy::AlwaysLoad),
         control_plane("submit_task_resolution", ToolLoadPolicy::Deferred),
         // Non-blocking status updates are still part of the user communication

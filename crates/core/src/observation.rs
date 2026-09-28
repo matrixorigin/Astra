@@ -1032,6 +1032,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_catalog_is_not_an_observation_facet() {
+        for value in ["models", "Models", "model_catalog", "runtime/models"] {
+            assert!(value.parse::<ObservationFacet>().is_err());
+            assert!(serde_json::from_value::<ObservationFacet>(serde_json::json!(value)).is_err());
+        }
+    }
+
+    #[test]
     fn observation_facet_parses_advertised_edge_local_facets() {
         assert_eq!(
             "cache".parse::<ObservationFacet>().unwrap(),

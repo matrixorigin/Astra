@@ -7,7 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::explain_analyze_format::{alpha_label, diagnostic_label, format_ms, format_tokens};
+use crate::explain_analyze_format::{
+    alpha_label, decision_detail_line, diagnostic_label, format_ms, format_tokens,
+};
 use astra_turn_types::{
     ExplainAnalyzeEventV1, ExplainAnalyzeGraphV1, ExplainAnalyzeNodeKindV1,
     ExplainAnalyzeOutcomeV1, ExplainAnalyzeProjectedNodeV1, ExplainAnalyzeUsageBasisV1,
@@ -673,6 +675,12 @@ fn render_node(
         "<p class=\"detail-line\"><strong>Outcome:</strong> {}</p>",
         escape_html(outcome_label(node.outcome), MAX_TEXT_CHARS)
     ));
+    if let Some(detail) = &node.decision_detail {
+        body.push_str(&format!(
+            "<p class=\"detail-line\"><strong>Decision:</strong> {}</p>",
+            escape_html(&decision_detail_line(detail), MAX_TEXT_CHARS)
+        ));
+    }
     if node.conflicted {
         body.push_str("<p class=\"detail-line\"><span class=\"chip warning-chip\">conflicting facts were retained for review</span></p>");
     }
@@ -1049,6 +1057,7 @@ mod tests {
             start_elapsed_ms: (transition == ExplainAnalyzeTransitionV1::Finished).then_some(start),
             duration_ms: duration,
             outcome,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),

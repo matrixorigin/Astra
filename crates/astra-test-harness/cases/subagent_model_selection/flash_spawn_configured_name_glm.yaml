@@ -1,0 +1,66 @@
+name: flash_spawn_configured_name_glm
+description: |
+  Select an authorized child model by exact configured name from a live
+  DeepSeek Flash parent; verify the canonical Offering resolved before spawn.
+prompt: |
+  Call agent(action="spawn") exactly once. Set description to "GLM identity
+  check", agent_type to "explore", and prompt to "Reply exactly
+  GLM-CONFIGURED-NAME-OK". Set requested_model_policy to
+  {"mode":"fixed","selector":{"kind":"configured_name","model_name":"glm-5.2"}}.
+  Do not guess or write an Offering ID. Do not retry or call other tools.
+  After the child finishes, report its exact reply.
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+    ok: true
+    document: arguments
+    path: /action
+    equals: spawn
+  - type: journal_tool_json
+    name: agent
+    document: arguments
+    path: /requested_model_policy/selector/kind
+    equals: configured_name
+  - type: journal_tool_json
+    name: agent
+    document: arguments
+    path: /requested_model_policy/selector/model_name
+    equals: glm-5.2
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /status
+    equals: launched
+  - type: text_contains
+    needle: GLM-CONFIGURED-NAME-OK
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: glm-5.2
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    json_match:
+      path: /payload/model
+      equals: glm-5.2
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 1
+    max: 1
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

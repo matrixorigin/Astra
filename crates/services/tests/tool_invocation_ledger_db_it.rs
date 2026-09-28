@@ -8,6 +8,7 @@ mod common;
 
 use astra_services::tool_invocation_ledger::{
     DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission, ToolInvocationLedgerStoreError,
+    ToolInvocationPreparationProbe,
 };
 use astra_services::{
     DatabaseSessionContextCoordinator, SessionExecutionBindingStateV1, SessionExecutionBindingV1,
@@ -579,6 +580,20 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
     assert_eq!(hot_rows, 2);
     for (identity, expected) in identities.iter().zip(&expected) {
         assert_eq!(ledger.get(identity).await.unwrap().as_ref(), Some(expected));
+        let ToolInvocationPreparationProbe::Missing(miss) = ledger
+            .probe_for_prepare(identity, &invocation_fingerprint)
+            .await
+            .unwrap()
+        else {
+            panic!("compacted invocation remained hot");
+        };
+        assert!(matches!(
+            ledger
+                .finish_prepare_after_miss(miss, &invocation_decision)
+                .await
+                .unwrap(),
+            ToolInvocationPrepareOutcome::Existing(record) if record == *expected
+        ));
         assert!(matches!(
             ledger
                 .prepare(identity, &invocation_fingerprint, &invocation_decision)
@@ -594,6 +609,22 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
                 &fingerprint("conflicting archived invocation"),
                 &invocation_decision,
             )
+            .await,
+        Err(ToolInvocationLedgerStoreError::IdentityConflict { .. })
+    ));
+    let ToolInvocationPreparationProbe::Missing(conflicting_miss) = ledger
+        .probe_for_prepare(
+            &identities[0],
+            &fingerprint("conflicting archived invocation"),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("compacted invocation remained hot");
+    };
+    assert!(matches!(
+        ledger
+            .finish_prepare_after_miss(conflicting_miss, &invocation_decision)
             .await,
         Err(ToolInvocationLedgerStoreError::IdentityConflict { .. })
     ));
@@ -956,6 +987,135 @@ async fn dispatch_claim_atomically_orders_guidance_owner_and_invocation_state() 
         "only A's successful claim may leave an admission grant"
     );
 
+    cleanup(&pool, &first).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn split_prepare_reuses_one_initial_probe_and_keeps_transactional_winner() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let first = identity(&Uuid::new_v4().simple().to_string(), "split-call");
+    cleanup(&pool, &first).await;
+    insert_active_run(&pool, &first).await;
+    let ledger = DatabaseToolInvocationLedger::new(shared);
+    let original = fingerprint("inspect");
+    let original_decision = decision();
+    let competing_decision = named_decision("competing");
+
+    let ToolInvocationPreparationProbe::Missing(first_miss) =
+        ledger.probe_for_prepare(&first, &original).await.unwrap()
+    else {
+        panic!("fresh invocation already existed");
+    };
+    let ToolInvocationPreparationProbe::Missing(racing_miss) =
+        ledger.probe_for_prepare(&first, &original).await.unwrap()
+    else {
+        panic!("uncommitted invocation became visible");
+    };
+    assert!(matches!(
+        ledger
+            .finish_prepare_after_miss(first_miss, &original_decision)
+            .await
+            .unwrap(),
+        ToolInvocationPrepareOutcome::Prepared(_)
+    ));
+    assert!(matches!(
+        ledger
+            .finish_prepare_after_miss(racing_miss, &competing_decision)
+            .await
+            .unwrap(),
+        ToolInvocationPrepareOutcome::Existing(record)
+            if record.decision == original_decision
+    ));
+    assert!(matches!(
+        ledger.probe_for_prepare(&first, &original).await.unwrap(),
+        ToolInvocationPreparationProbe::Existing(record)
+            if record.decision == original_decision
+                && record.fingerprint.policy_decision_id == original_decision.decision_id
+    ));
+    assert!(matches!(
+        ledger
+            .probe_for_prepare(&first, &fingerprint("other"))
+            .await,
+        Err(ToolInvocationLedgerStoreError::IdentityConflict { .. })
+    ));
+
+    let parallel = identity(
+        first.user_id.strip_prefix("invocation-user-").unwrap(),
+        "parallel-call",
+    );
+    let ToolInvocationPreparationProbe::Missing(left) = ledger
+        .probe_for_prepare(&parallel, &original)
+        .await
+        .unwrap()
+    else {
+        panic!("parallel invocation already existed");
+    };
+    let ToolInvocationPreparationProbe::Missing(right) = ledger
+        .probe_for_prepare(&parallel, &original)
+        .await
+        .unwrap()
+    else {
+        panic!("parallel invocation already existed");
+    };
+    let (left_result, right_result) = tokio::join!(
+        ledger.finish_prepare_after_miss(left, &original_decision),
+        ledger.finish_prepare_after_miss(right, &competing_decision)
+    );
+    let results = [left_result.unwrap(), right_result.unwrap()];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|outcome| matches!(outcome, ToolInvocationPrepareOutcome::Prepared(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|outcome| matches!(outcome, ToolInvocationPrepareOutcome::Existing(_)))
+            .count(),
+        1
+    );
+    let authoritative = ledger.get(&parallel).await.unwrap().unwrap();
+    assert!(results.iter().all(|outcome| match outcome {
+        ToolInvocationPrepareOutcome::Prepared(record)
+        | ToolInvocationPrepareOutcome::Existing(record) => record == &authoritative,
+    }));
+
+    let closed = identity(
+        first.user_id.strip_prefix("invocation-user-").unwrap(),
+        "closed-after-probe",
+    );
+    let ToolInvocationPreparationProbe::Missing(closed_miss) =
+        ledger.probe_for_prepare(&closed, &original).await.unwrap()
+    else {
+        panic!("closing invocation already existed");
+    };
+    sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE user_id = ? AND run_id = ?")
+        .bind(&first.user_id)
+        .bind(&first.run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        ledger
+            .finish_prepare_after_miss(closed_miss, &original_decision)
+            .await,
+        Err(ToolInvocationLedgerStoreError::RunNotExecutable { .. })
+    ));
+    let ToolInvocationPreparationProbe::Missing(closed_retry) =
+        ledger.probe_for_prepare(&closed, &original).await.unwrap()
+    else {
+        panic!("closed run unexpectedly acquired a hot invocation");
+    };
+    assert!(matches!(
+        ledger
+            .finish_prepare_after_miss(closed_retry, &original_decision)
+            .await,
+        Err(ToolInvocationLedgerStoreError::RunNotExecutable { .. })
+    ));
     cleanup(&pool, &first).await;
 }
 

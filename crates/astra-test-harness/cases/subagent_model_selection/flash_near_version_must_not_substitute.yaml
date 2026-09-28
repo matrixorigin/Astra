@@ -1,0 +1,33 @@
+name: flash_near_version_must_not_substitute
+description: |
+  A nearby but unavailable version must not be silently replaced by the
+  authorized GLM 5.2 child. Run only when 5.3 is absent from the catalog.
+prompt: |
+  请让 glm-5.3 模型的子代理回答 ASTRA-EXACT-VERSION。
+  如果没有这个版本，请如实说明；不要用 glm-5.2 或其他模型替代。
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: grep
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: read_file
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

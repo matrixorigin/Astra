@@ -517,6 +517,84 @@ fn auxiliary_lines_for_outcome(label: &str, outcome: &RunOutcome) -> Vec<String>
     lines
 }
 
+#[derive(Default)]
+struct RootUsageCoverageTotals {
+    attempts: u64,
+    provider_reported: u64,
+    unavailable: u64,
+    observed_executions: u64,
+    unknown_executions: u64,
+}
+
+impl RootUsageCoverageTotals {
+    fn observe(&mut self, outcome: &RunOutcome) {
+        if let Some(coverage) = &outcome.token_usage_coverage {
+            self.attempts = self.attempts.saturating_add(u64::from(coverage.attempts));
+            self.provider_reported = self
+                .provider_reported
+                .saturating_add(u64::from(coverage.provider_reported));
+            self.unavailable = self
+                .unavailable
+                .saturating_add(u64::from(coverage.unavailable));
+            self.observed_executions = self.observed_executions.saturating_add(1);
+        } else if outcome.duration_ms > 0
+            || outcome.run_id.is_some()
+            || outcome.session_id.is_some()
+            || outcome.turn_rounds > 0
+            || outcome.prompt_tokens > 0
+            || outcome.cached_input_tokens > 0
+            || outcome.cache_creation_tokens > 0
+            || outcome.completion_tokens > 0
+        {
+            self.unknown_executions = self.unknown_executions.saturating_add(1);
+        }
+    }
+
+    fn for_report(report: &SuiteReport) -> Self {
+        let mut totals = Self::default();
+        for run in &report.runs {
+            if run.is_unavailable() {
+                continue;
+            }
+            // Attempts and steps retain the per-invocation evidence. The
+            // aggregate outcome duplicates their token counters, so use it
+            // only for older reports without attempt records.
+            if run.attempts.is_empty() {
+                totals.observe(&run.outcome);
+            } else {
+                for attempt in &run.attempts {
+                    totals.observe(&attempt.outcome);
+                }
+            }
+            for step in &run.steps {
+                totals.observe(&step.outcome);
+            }
+        }
+        totals
+    }
+
+    fn render(&self) -> String {
+        if self.observed_executions == 0 && self.unknown_executions == 0 {
+            return " root-usage-coverage=not observed".to_string();
+        }
+        if self.observed_executions == 0 {
+            return format!(
+                " root-usage-coverage=unknown ({} execution(s))",
+                self.unknown_executions
+            );
+        }
+        let unknown_suffix = if self.unknown_executions == 0 {
+            String::new()
+        } else {
+            format!("; {} execution(s) unknown", self.unknown_executions)
+        };
+        format!(
+            " root-usage-coverage={}/{} provider-reported, {} unavailable{}",
+            self.provider_reported, self.attempts, self.unavailable, unknown_suffix
+        )
+    }
+}
+
 fn render_text(report: &SuiteReport, verbose: bool) -> String {
     let mut s = String::new();
     s.push_str("=== astra-test suite report ===\n");
@@ -537,6 +615,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         .iter()
         .map(|r| r.outcome.cache_creation_tokens)
         .sum();
+    let root_coverage_summary = RootUsageCoverageTotals::for_report(report).render();
     let sum_dur: u64 = report.runs.iter().map(|r| r.outcome.duration_ms).sum();
     let wall_ms = if report.wall_time_ms > 0 {
         report.wall_time_ms
@@ -593,7 +672,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         },
     };
     s.push_str(&format!(
-        "total={} passed={} failed={} cancelled={} unavailable={} | terminal-reported tokens: {} fresh-in/{}out cache-read={} cache-write={} (not full model cost) | {} | wall: {}m{}s (sum: {}m{}s)\n\n",
+        "total={} passed={} failed={} cancelled={} unavailable={} | observed root tokens: {} fresh-in/{}out cache-read={} cache-write={} (not full model cost) | {} | {} | wall: {}m{}s (sum: {}m{}s)\n\n",
         report.total(),
         report.passed(),
         report.failed(),
@@ -604,6 +683,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         total_cache_read,
         total_cache_create,
         cache_ratio_pct,
+        root_coverage_summary,
         wall_secs / 60,
         wall_secs % 60,
         sum_dur / 1000 / 60,
@@ -1190,6 +1270,7 @@ mod tests {
             prompt_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_tokens: 0,
+            token_usage_coverage: None,
             duration_ms: 42,
             turn_rounds: 0,
             cache_hits: 0,
@@ -1803,14 +1884,144 @@ mod tests {
         };
         let out = render_text(&r, false);
         assert!(
-            out.contains("terminal-reported tokens: 0 fresh-in/0out cache-read=0 cache-write=0 (not full model cost)"),
+            out.contains("observed root tokens: 0 fresh-in/0out"),
             "missing token summary: {out}"
         );
+        assert!(out.contains("root-usage-coverage=unknown (1 execution(s))"));
         assert!(out.contains("wall: 0m5s"), "missing wall time: {out}");
     }
 
     #[test]
-    fn render_text_keeps_terminal_cache_counts_without_claiming_primary_share() {
+    fn render_text_labels_usage_coverage_as_root_only() {
+        let mut report = mk_report_passed();
+        report.runs[0].outcome.prompt_tokens = 12;
+        report.runs[0].outcome.completion_tokens = 4;
+        report.runs[0].outcome.token_usage_coverage = Some(crate::runner::TokenUsageCoverage {
+            scope: "logical_provider_calls".into(),
+            attempts: 2,
+            provider_reported: 2,
+            unavailable: 0,
+            status: "complete".into(),
+        });
+
+        let output = render_text(&report, false);
+        assert!(output.contains("observed root tokens: 12 fresh-in/4out"));
+        assert!(output.contains("root-usage-coverage=2/2 provider-reported, 0 unavailable"));
+        assert!(!output.contains("task tokens:"));
+    }
+
+    #[test]
+    fn render_text_combines_root_attempt_and_follow_up_coverage() {
+        let mut report = mk_report_passed();
+        let mut root = RunOutcome::new("m");
+        root.prompt_tokens = 10;
+        root.completion_tokens = 2;
+        root.token_usage_coverage = Some(crate::runner::TokenUsageCoverage {
+            scope: "logical_provider_calls".into(),
+            attempts: 1,
+            provider_reported: 1,
+            unavailable: 0,
+            status: "complete".into(),
+        });
+        report.runs[0].outcome = root.clone();
+        report.runs[0].attempts = vec![AttemptRecord {
+            attempt_index: 0,
+            outcome: root,
+        }];
+        let mut follow_up = RunOutcome::new("m");
+        follow_up.prompt_tokens = 5;
+        follow_up.completion_tokens = 2;
+        follow_up.token_usage_coverage = Some(crate::runner::TokenUsageCoverage {
+            scope: "logical_provider_calls".into(),
+            attempts: 1,
+            provider_reported: 0,
+            unavailable: 1,
+            status: "none".into(),
+        });
+        let mut unknown_follow_up = RunOutcome::new("m");
+        unknown_follow_up.prompt_tokens = 3;
+        unknown_follow_up.completion_tokens = 1;
+        unknown_follow_up.duration_ms = 1;
+        unknown_follow_up.run_id = Some("step-run".into());
+        report.runs[0].steps = vec![
+            StepResult {
+                step_index: 0,
+                prompt: "follow up".into(),
+                outcome: follow_up,
+                duration_ms: 1,
+                criteria: Vec::new(),
+                passed: true,
+            },
+            StepResult {
+                step_index: 1,
+                prompt: "another follow up".into(),
+                outcome: unknown_follow_up,
+                duration_ms: 1,
+                criteria: Vec::new(),
+                passed: true,
+            },
+        ];
+        report.runs[0].outcome.prompt_tokens = 18;
+        report.runs[0].outcome.completion_tokens = 5;
+
+        let output = render_text(&report, false);
+        assert!(output.contains("observed root tokens: 18 fresh-in/5out"));
+        assert!(output.contains(
+            "root-usage-coverage=1/2 provider-reported, 1 unavailable; 1 execution(s) unknown"
+        ));
+    }
+
+    #[test]
+    fn render_text_retry_keeps_missing_attempt_coverage_visible() {
+        let mut report = mk_report_passed();
+        let mut first = RunOutcome::new("m");
+        first.prompt_tokens = 2;
+        first.completion_tokens = 1;
+        first.token_usage_coverage = Some(crate::runner::TokenUsageCoverage {
+            scope: "logical_provider_calls".into(),
+            attempts: 1,
+            provider_reported: 1,
+            unavailable: 0,
+            status: "complete".into(),
+        });
+        let mut retry = RunOutcome::new("m");
+        retry.prompt_tokens = 3;
+        retry.completion_tokens = 2;
+        retry.run_id = Some("retry-run".into());
+        retry.duration_ms = 10;
+        report.runs[0].outcome = retry.clone();
+        report.runs[0].outcome.prompt_tokens = 5;
+        report.runs[0].outcome.completion_tokens = 3;
+        report.runs[0].attempts = vec![
+            AttemptRecord {
+                attempt_index: 0,
+                outcome: first,
+            },
+            AttemptRecord {
+                attempt_index: 1,
+                outcome: retry,
+            },
+        ];
+
+        let output = render_text(&report, false);
+        assert!(output.contains("observed root tokens: 5 fresh-in/3out"));
+        assert!(output.contains(
+            "root-usage-coverage=1/1 provider-reported, 0 unavailable; 1 execution(s) unknown"
+        ));
+    }
+
+    #[test]
+    fn render_text_does_not_count_unexecuted_rows_as_unknown_usage() {
+        let mut report = mk_report_passed();
+        report.runs[0].status = CaseRunStatus::Unavailable;
+        report.runs[0].outcome = RunOutcome::new("m");
+        report.runs[0].attempts.clear();
+        let output = render_text(&report, false);
+        assert!(output.contains("root-usage-coverage=not observed"));
+    }
+
+    #[test]
+    fn render_text_uses_total_input_for_cache_read_share() {
         let mut r = SuiteReport {
             runs: vec![CaseRunReport {
                 case_name: "cache".into(),
@@ -1847,9 +2058,9 @@ mod tests {
         let out = render_text(&r, false);
         assert!(
             out.contains(
-                "terminal-reported tokens: 200 fresh-in/50out cache-read=800 cache-write=0 (not full model cost)"
+                "observed root tokens: 200 fresh-in/50out cache-read=800 cache-write=0 (not full model cost)"
             ),
-            "reported cache counts must remain visible: {out}"
+            "reported root cache counts must remain visible: {out}"
         );
         assert!(out.contains("primary prompt-cache read=unknown"));
         let mut capture = crate::explain_capture::ExplainCapture::default();

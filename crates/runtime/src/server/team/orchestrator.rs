@@ -26,6 +26,7 @@ pub use astra_server_types::team_orchestrator_types::{
     append_merge_conflict_summary, derive_team_status, sum_usage, summarize_unsuccessful_agents,
 };
 use astra_server_types::warn_persist;
+use sha2::Digest;
 
 use crate::server::conflict_resolver;
 use astra_server_types::worktree_isolation::{MergeResult, RepoLock, WorktreeManager};
@@ -43,6 +44,9 @@ pub struct TeamExecutionReport {
     pub parent_run_id: String,
     pub delegation_result: Option<DelegationResult>,
     pub merge_result: Option<MergeResult>,
+    /// Branches retained after cancellation so partial isolated work remains
+    /// recoverable instead of being deleted by normal cleanup.
+    pub preserved_worktree_branches: Vec<String>,
     pub status: TeamExecutionStatus,
     pub error_kind: Option<TeamExecutionErrorKind>,
     pub error: Option<String>,
@@ -118,6 +122,16 @@ pub struct TeamExecutionOrchestrator {
     repo_lock: RepoLock,
     /// Optional conflict resolver for LLM-assisted merge conflict resolution.
     conflict_resolver: Option<Arc<dyn conflict_resolver::ConflictResolver>>,
+    /// Whether this orchestrator is serving the authenticated HTTP Team
+    /// boundary. HTTP Team requests do not currently expose optional-tool
+    /// selection, so omission must mean an explicit deny. Local CLI Team
+    /// execution leaves this disabled to preserve its unmanaged tool policy.
+    server_request_boundary: bool,
+    /// Optional caller-owned cancellation signal. Server callers normally use
+    /// the orchestrator's private token; the local CLI supplies its Ctrl-C
+    /// token so cancellation reaches both the child executor and this
+    /// lifecycle owner.
+    cancellation_token: Option<Arc<tokio_util::sync::CancellationToken>>,
 }
 
 impl TeamExecutionOrchestrator {
@@ -138,7 +152,32 @@ impl TeamExecutionOrchestrator {
             config,
             repo_lock: astra_server_types::worktree_isolation::new_repo_lock(),
             conflict_resolver: None,
+            server_request_boundary: false,
+            cancellation_token: None,
         }
+    }
+
+    /// Mark this orchestrator as the authenticated server Team boundary.
+    ///
+    /// The HTTP request contract has no optional-tool selection field. Make
+    /// that absence explicit before the request enters the shared delegation
+    /// engine, so an omitted field cannot accidentally inherit the engine's
+    /// unmanaged/local default.
+    pub fn with_server_request_boundary(mut self) -> Self {
+        self.server_request_boundary = true;
+        self
+    }
+
+    /// Use a caller-owned cancellation signal for the execution lifecycle.
+    /// Cancellation remains cooperative and is settled by the orchestrator
+    /// before it returns, so callers do not leave durable children behind by
+    /// dropping the delegation future.
+    pub fn with_cancellation_token(
+        mut self,
+        token: Arc<tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        self.cancellation_token = Some(token);
+        self
     }
 
     /// Set a shared repository lock for concurrent team executions.
@@ -192,6 +231,39 @@ impl TeamExecutionOrchestrator {
         task: &str,
         repo_root: Option<std::path::PathBuf>,
     ) -> TeamExecutionReport {
+        self.execute_team_inner(team_name, task, repo_root, None)
+            .await
+    }
+
+    /// Execute a direct CLI Team command with its authenticated, frozen model
+    /// requirements. The typed sideband is not placed in DelegationRequest.
+    pub async fn execute_team_with_model_plan(
+        &self,
+        team_name: &str,
+        task: &str,
+        repo_root: Option<std::path::PathBuf>,
+        model_plan: astra_turn_types::DirectDelegationModelPlan,
+        command_identity: astra_turn_types::DirectDelegationCommandIdentity,
+    ) -> TeamExecutionReport {
+        self.execute_team_inner(
+            team_name,
+            task,
+            repo_root,
+            Some((model_plan, command_identity)),
+        )
+        .await
+    }
+
+    async fn execute_team_inner(
+        &self,
+        team_name: &str,
+        task: &str,
+        repo_root: Option<std::path::PathBuf>,
+        direct_command: Option<(
+            astra_turn_types::DirectDelegationModelPlan,
+            astra_turn_types::DirectDelegationCommandIdentity,
+        )>,
+    ) -> TeamExecutionReport {
         // ── Phase 1: Prepare ────────────────────────────────────────────
         let team = match self
             .team_store
@@ -219,7 +291,15 @@ impl TeamExecutionOrchestrator {
             }
         };
 
-        let parent_run_id = uuid::Uuid::new_v4().to_string();
+        // A direct command identity is also the durable parent-run identity.
+        // The existing run primary key then provides the single admission
+        // boundary for retries and concurrent duplicate submissions without a
+        // new lookup/table on the normal path. Conversational Team execution
+        // keeps its generated run identity.
+        let parent_run_id = direct_command
+            .as_ref()
+            .map(|(_, identity)| identity.command_intent_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let (request, profiles) =
             match resolve_team(&team, task, &parent_run_id, &self.config.session_id) {
                 Ok(resolved) => resolved,
@@ -252,6 +332,49 @@ impl TeamExecutionOrchestrator {
                 }
             }
         };
+        if let Some((plan, command_identity)) = &direct_command {
+            if request.parent_run_id != command_identity.command_intent_id {
+                return self.fail_report(
+                    team_name,
+                    &request.delegation_id,
+                    &parent_run_id,
+                    TeamExecutionErrorKind::InvalidTeam,
+                    "direct Team command identity was not bound to its parent run".into(),
+                );
+            }
+            let slot_plan = match astra_services::delegation_model_requirement::canonical_team_delegation_slot_plan(
+                &request,
+                &profiles,
+            ) {
+                Ok(slot_plan) => slot_plan,
+                Err(error) => {
+                    return self.fail_report(
+                        team_name,
+                        "",
+                        &parent_run_id,
+                        TeamExecutionErrorKind::InvalidTeam,
+                        format!("canonical Team model slots are invalid: {error}"),
+                    );
+                }
+            };
+            let task_digest = format!("sha256:{:x}", sha2::Sha256::digest(request.task.as_bytes()));
+            if let Err(error) = plan.validate_identity(
+                command_identity,
+                &self.config.user_id,
+                &self.config.session_id,
+                &task_digest,
+                &slot_plan.digest,
+                slot_plan.briefs.len(),
+            ) {
+                return self.fail_report(
+                    team_name,
+                    "",
+                    &parent_run_id,
+                    TeamExecutionErrorKind::InvalidTeam,
+                    format!("direct Team model plan was rejected: {error}"),
+                );
+            }
+        }
         let delegation_id = request.delegation_id.clone();
 
         // Start parent durable run only after the complete private execution
@@ -318,10 +441,19 @@ impl TeamExecutionOrchestrator {
             }
             mgr
         });
+        let mut preserved_worktree_branches = Vec::new();
 
         let agent_ids: Vec<String> = profiles.iter().map(|p| p.agent_id.clone()).collect();
 
         let mut effective_request = request;
+
+        if self.server_request_boundary {
+            effective_request.context.insert(
+                crate::turn::agentic::delegate_interception::REQUEST_ENABLED_TOOLS_CONTEXT_KEY
+                    .to_string(),
+                serde_json::json!([]),
+            );
+        }
 
         // Inject budget and max_parallel into request context for downstream consumers.
         // `max_duration_secs` is enforced via tokio::time::timeout + CancellationToken.
@@ -423,12 +555,20 @@ impl TeamExecutionOrchestrator {
         // Create a cancellation token for cooperative shutdown of spawned sub-runs.
         // On budget timeout, we cancel this token so fan-out/fork tasks stop promptly
         // instead of being orphaned when the delegation future is dropped.
-        let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+        let cancel_token = self
+            .cancellation_token
+            .clone()
+            .unwrap_or_else(|| Arc::new(tokio_util::sync::CancellationToken::new()));
 
+        let (model_plan, command_identity) = direct_command
+            .map(|(plan, identity)| (Some(plan), Some(identity)))
+            .unwrap_or((None, None));
         let delegation_future = self.delegation_engine.execute_delegation(
             effective_request,
             &self.config.source_agent_id,
             profile_snapshot,
+            model_plan,
+            command_identity,
             Some(cancel_token.clone()),
         );
 
@@ -447,15 +587,17 @@ impl TeamExecutionOrchestrator {
         // Create budget timeout once (if configured) so it tracks cumulative time
         let budget_deadline = budget_timeout.map(|dur| tokio::time::Instant::now() + dur);
 
+        let mut budget_exceeded_reason = None;
         let delegation_outcome: Result<DelegationResult, String> = loop {
             // Check if budget has been exceeded
             if let Some(deadline) = budget_deadline {
                 if tokio::time::Instant::now() >= deadline {
-                    cancel_token.cancel();
-                    break Err(format!(
+                    budget_exceeded_reason = Some(format!(
                         "team execution exceeded budget timeout of {}s",
                         budget_timeout.map(|d| d.as_secs()).unwrap_or(0)
                     ));
+                    cancel_token.cancel();
+                    break delegation_future.await;
                 }
             }
 
@@ -464,6 +606,13 @@ impl TeamExecutionOrchestrator {
 
                 result = &mut delegation_future => {
                     break result;
+                }
+                _ = cancel_token.cancelled() => {
+                    // The child executor receives the same token. The
+                    // delegation engine owns its bounded cancellation drain
+                    // and durable reconciliation; keep awaiting that owner
+                    // instead of dropping it at the first Ctrl-C.
+                    break delegation_future.await;
                 }
                 _ = tokio::time::sleep(poll_interval) => {
                     // Poll and emit intermediate progress
@@ -506,36 +655,54 @@ impl TeamExecutionOrchestrator {
         let delegation_result = match delegation_outcome {
             Ok(r) => r,
             Err(e) => {
-                self.persist_active_run_outcome(&parent_run_id, STATUS_FAILED, Some(&e))
-                    .await;
+                let error = budget_exceeded_reason
+                    .as_deref()
+                    .map(|reason| format!("{reason}; delegation failed: {e}"))
+                    .unwrap_or_else(|| e.clone());
                 if let Some(ref mut mgr) = worktree_mgr {
-                    if let Err(ce) = mgr.cleanup().await {
+                    if cancel_token.is_cancelled() {
+                        preserved_worktree_branches = mgr
+                            .preserve()
+                            .into_iter()
+                            .map(|info| info.branch_name)
+                            .collect();
+                    } else if let Err(ce) = mgr.cleanup().await {
                         eprintln!(
                             "[team-orchestrator] worktree cleanup failed after delegation error: {ce}"
                         );
                     }
                 }
+                self.persist_preserved_worktree_branches(
+                    &parent_run_id,
+                    &delegation_id,
+                    &preserved_worktree_branches,
+                )
+                .await;
+                self.persist_active_run_outcome(&parent_run_id, STATUS_FAILED, Some(&error))
+                    .await;
                 // Cleanup delegation state even on error path
                 let failure = match self
                     .delegation_tracker
                     .cleanup_delegation(&delegation_id)
                     .await
                 {
-                    Ok(()) => format!("delegation failed: {e}"),
+                    Ok(()) => error.clone(),
                     Err(cleanup_err) => {
                         eprintln!(
                             "[team-orchestrator] delegation cleanup skipped after error: {cleanup_err}"
                         );
-                        format!("delegation failed: {e}; cleanup skipped: {cleanup_err}")
+                        format!("{error}; cleanup skipped: {cleanup_err}")
                     }
                 };
-                return self.fail_report(
+                let mut report = self.fail_report(
                     team_name,
                     &delegation_id,
                     &parent_run_id,
                     TeamExecutionErrorKind::Execution,
                     failure,
                 );
+                report.preserved_worktree_branches = preserved_worktree_branches;
+                return report;
             }
         };
 
@@ -621,10 +788,29 @@ impl TeamExecutionOrchestrator {
             agent_count: delegation_result.agent_results.len(),
         });
 
-        let merge_result = if team.worktree_mode == WorktreeMode::Isolated {
+        // Shared workspaces have no integration step. Keep that fact explicit:
+        // `None` is otherwise ambiguous with cancellation before an isolated
+        // merge started.
+        let integration_required =
+            team.worktree_mode == WorktreeMode::Isolated && worktree_mgr.is_some();
+        let merge_result = if !integration_required {
+            None
+        } else if cancel_token.is_cancelled() {
+            // A cancelled child may have produced a partial commit. Never
+            // merge an interrupted team into the caller's branch; the durable
+            // child outcomes remain available for inspection/recovery.
+            None
+        } else if team.worktree_mode == WorktreeMode::Isolated {
             if let Some(ref mgr) = worktree_mgr {
-                match mgr.merge_worktrees(&delegation_id, &agent_ids).await {
-                    Ok(r) => Some(r),
+                match mgr
+                    .merge_worktrees_with_cancellation(
+                        &delegation_id,
+                        &agent_ids,
+                        cancel_token.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(r) => r,
                     Err(e) => {
                         eprintln!("[team-orchestrator] worktree merge warning: {e}");
                         None
@@ -663,6 +849,75 @@ impl TeamExecutionOrchestrator {
         } else {
             (status, error)
         };
+        let (status, error) = if let Some(reason) = budget_exceeded_reason {
+            let error = Some(match error {
+                Some(error) => format!("{error}; {reason}"),
+                None => reason,
+            });
+            let status = match status {
+                TeamExecutionStatus::Completed => TeamExecutionStatus::CompletedOverBudget,
+                other => other,
+            };
+            (status, error)
+        } else {
+            (status, error)
+        };
+
+        // A cancellation that arrives after child execution but before (or
+        // during) integration must not be presented as a completed team run.
+        // Child results remain useful, but the caller branch was deliberately
+        // not updated and the recovery references are the next action. If all
+        // merge units already settled before cancellation, preserve the actual
+        // completed outcome instead of rewriting history.
+        let integration_incomplete = cancel_token.is_cancelled()
+            && integration_required
+            && match &merge_result {
+                None => true,
+                Some(result) => {
+                    result.merged.len() + result.skipped.len() + result.conflicts.len()
+                        < agent_ids.len()
+                }
+            };
+        let (status, error) = if integration_incomplete {
+            let integration_message = match &merge_result {
+                None => {
+                    "execution cancelled before isolated worktree integration began; isolated worktree merge skipped"
+                }
+                Some(_) => {
+                    "execution cancelled during isolated worktree integration; some worktree changes were not merged"
+                }
+            };
+            let error = Some(match error {
+                Some(error) => format!("{error}; {integration_message}"),
+                None => integration_message.to_string(),
+            });
+            let status = match status {
+                TeamExecutionStatus::Completed
+                | TeamExecutionStatus::CompletedWithConflicts
+                | TeamExecutionStatus::CompletedOverBudget => TeamExecutionStatus::Unfinished,
+                other => other,
+            };
+            (status, error)
+        } else {
+            (status, error)
+        };
+
+        if cancel_token.is_cancelled()
+            && let Some(ref mut mgr) = worktree_mgr
+        {
+            preserved_worktree_branches = mgr
+                .preserve()
+                .into_iter()
+                .map(|info| info.branch_name)
+                .collect();
+        }
+
+        self.persist_preserved_worktree_branches(
+            &parent_run_id,
+            &delegation_id,
+            &preserved_worktree_branches,
+        )
+        .await;
 
         self.emit_progress(ExecutionPhase::Reporting {
             status: status.clone(),
@@ -686,6 +941,7 @@ impl TeamExecutionOrchestrator {
             "total_completion_tokens": total_completion,
             "total_tool_calls": total_tools,
             "has_conflicts": has_conflicts,
+            "preserved_worktree_branches": &preserved_worktree_branches,
         });
         warn_persist!(
             self.team_store
@@ -709,13 +965,15 @@ impl TeamExecutionOrchestrator {
                         "event_type": "team_complete",
                         "status": status.to_string(),
                         "has_conflicts": has_conflicts,
+                        "preserved_worktree_branches": &preserved_worktree_branches,
                     }),
                 )
                 .await,
             "Failed to run_engine.append_event"
         );
 
-        // Cleanup worktrees
+        // Cleanup worktrees after normal completion. Cancellation detached the
+        // manager above, keeping its branch/worktree reference recoverable.
         if let Some(ref mut mgr) = worktree_mgr {
             if let Err(ce) = mgr.cleanup().await {
                 eprintln!("[team-orchestrator] worktree cleanup failed: {ce}");
@@ -737,6 +995,7 @@ impl TeamExecutionOrchestrator {
             parent_run_id,
             delegation_result: Some(delegation_result),
             merge_result,
+            preserved_worktree_branches,
             status,
             error_kind: error.as_ref().map(|_| TeamExecutionErrorKind::Execution),
             error,
@@ -770,6 +1029,36 @@ impl TeamExecutionOrchestrator {
         }
     }
 
+    /// Keep recovery references in the same durable run timeline as the team
+    /// outcome. Normal cleanup has no extra write; cancellation writes one
+    /// event only when isolated work remains recoverable.
+    async fn persist_preserved_worktree_branches(
+        &self,
+        parent_run_id: &str,
+        delegation_id: &str,
+        branches: &[String],
+    ) {
+        if branches.is_empty() {
+            return;
+        }
+        warn_persist!(
+            self.run_engine
+                .append_event(
+                    &self.config.user_id,
+                    &self.config.session_id,
+                    parent_run_id,
+                    serde_json::json!({
+                        "event_type": "team_worktrees_preserved",
+                        "delegation_id": delegation_id,
+                        "branches": branches,
+                        "reason": "cancellation_before_integration",
+                    }),
+                )
+                .await,
+            "Failed to persist preserved worktree branches"
+        );
+    }
+
     fn fail_report(
         &self,
         team_name: &str,
@@ -784,6 +1073,7 @@ impl TeamExecutionOrchestrator {
             parent_run_id: parent_run_id.to_string(),
             delegation_result: None,
             merge_result: None,
+            preserved_worktree_branches: Vec::new(),
             status: TeamExecutionStatus::Failed,
             error_kind: Some(error_kind),
             error: Some(error),
@@ -805,8 +1095,12 @@ mod tests {
     use crate::server::run::engine::RunEngine;
     use astra_services::coordination::{AgentResult, AgentTier};
     use astra_services::runs::InMemoryRunStateStore;
-    use astra_services::team_persistence::InMemoryTeamStore;
+    use astra_services::team_persistence::{
+        InMemoryTeamStore, TeamCoordination, TeamDefinition, TeamMemberDef, WorktreeMode,
+    };
     use async_trait::async_trait;
+    use std::process::Command;
+    use tokio::sync::Notify;
 
     struct StatusExecutor {
         status: &'static str,
@@ -823,6 +1117,93 @@ mod tests {
                 output: Some(format!("[{}] yielded", self.status)),
                 error: self.error.map(ToString::to_string),
                 prompt_tokens: 1,
+                completion_tokens: 0,
+                tool_calls: 0,
+            })
+        }
+    }
+
+    struct CancellationAwareExecutor {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl SubRunExecutor for CancellationAwareExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            self.started.notify_waiters();
+            let token = config
+                .cancel_token
+                .ok_or_else(|| "cancellation token missing".to_string())?;
+            token.cancelled().await;
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: astra_core::STATUS_CANCELLED.to_string(),
+                output: None,
+                error: Some("cancelled by caller".to_string()),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            })
+        }
+    }
+
+    struct CommitThenCancelExecutor {
+        started: Arc<Notify>,
+        wait_for_cancel: bool,
+    }
+
+    #[async_trait]
+    impl SubRunExecutor for CommitThenCancelExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            let key = format!("worktree_path_{}", config.agent_profile.agent_id);
+            let path = config
+                .context
+                .get(&key)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("missing isolated worktree context: {key}"))?;
+            std::fs::write(
+                std::path::Path::new(path).join("cancelled.txt"),
+                "must not merge\n",
+            )
+            .map_err(|error| format!("write test commit: {error}"))?;
+            for args in [
+                vec!["add", "cancelled.txt"],
+                vec!["commit", "-m", "cancelled child"],
+            ] {
+                let status = Command::new("git")
+                    .args(&args)
+                    .current_dir(path)
+                    .status()
+                    .map_err(|error| format!("run git {args:?}: {error}"))?;
+                if !status.success() {
+                    return Err(format!("git {args:?} failed with {status}"));
+                }
+            }
+            self.started.notify_waiters();
+            if !self.wait_for_cancel {
+                return Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: STATUS_COMPLETED.to_string(),
+                    output: Some("committed child result".to_string()),
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                });
+            }
+            let token = config
+                .cancel_token
+                .ok_or_else(|| "cancellation token missing".to_string())?;
+            token.cancelled().await;
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: astra_core::STATUS_CANCELLED.to_string(),
+                output: None,
+                error: Some("cancelled by caller".to_string()),
+                prompt_tokens: 0,
                 completion_tokens: 0,
                 tool_calls: 0,
             })
@@ -895,6 +1276,313 @@ mod tests {
         assert!(report.delegation_result.is_some());
         let dr = report.delegation_result.unwrap();
         assert_eq!(dr.agent_results.len(), 2); // explorer + synthesizer
+    }
+
+    #[tokio::test]
+    async fn cancellation_settles_parent_and_children_before_returning() {
+        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+        let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let _ = reg.register(AgentProfile::new(
+                "orchestrator",
+                "orchestrator",
+                AgentTier::Orchestrator,
+            ));
+        }
+
+        let run_store = Arc::new(InMemoryRunStateStore::new());
+        let run_engine = Arc::new(RunEngine::new(run_store));
+        let tracker = Arc::new(DelegationTracker::new());
+        let started = Arc::new(Notify::new());
+        let delegation = Arc::new(DelegationEngine::with_executor(
+            registry.clone(),
+            run_engine.clone(),
+            tracker.clone(),
+            Arc::new(CancellationAwareExecutor {
+                started: started.clone(),
+            }),
+        ));
+        let cancellation = Arc::new(tokio_util::sync::CancellationToken::new());
+        let orchestrator = TeamExecutionOrchestrator::new(
+            store,
+            delegation,
+            tracker.clone(),
+            run_engine.clone(),
+            registry,
+            OrchestratorConfig {
+                user_id: "test-user".to_string(),
+                session_id: "test-session".to_string(),
+                source_agent_id: "orchestrator".to_string(),
+                progress: None,
+            },
+        )
+        .with_cancellation_token(cancellation.clone());
+
+        let execution = tokio::spawn(async move {
+            orchestrator
+                .execute_team("research", "cancel this task", None)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("at least one child should start before cancellation");
+        cancellation.cancel();
+        let report = tokio::time::timeout(std::time::Duration::from_secs(3), execution)
+            .await
+            .expect("cancellation should settle within its bounded grace period")
+            .expect("orchestrator task should not panic");
+
+        assert_ne!(report.status, TeamExecutionStatus::Completed);
+        let parent = run_engine
+            .load_run("test-user", &report.parent_run_id)
+            .await
+            .expect("parent run lookup")
+            .expect("parent run should remain durable");
+        assert_eq!(parent.status, STATUS_FAILED);
+        assert!(
+            tracker.get_sub_runs(&report.delegation_id).await.is_empty(),
+            "cancellation must not leave live tracker children behind"
+        );
+        for child in report
+            .delegation_result
+            .expect("cancellation should retain child results")
+            .agent_results
+        {
+            let durable = run_engine
+                .load_run("test-user", &child.run_id)
+                .await
+                .expect("child run lookup")
+                .expect("child run should remain durable");
+            assert!(
+                durable.status == astra_core::STATUS_CANCELLED || durable.status == STATUS_FAILED,
+                "child must be terminal after cancellation, got {}",
+                durable.status
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_does_not_merge_partial_isolated_worktree() {
+        let repo = tempfile::tempdir().expect("temporary repository");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Astra Test"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(&args)
+                    .current_dir(repo.path())
+                    .status()
+                    .expect("start git")
+                    .success(),
+                "git {args:?} failed"
+            );
+        }
+        std::fs::write(repo.path().join("README.md"), "base\n").expect("write repository");
+        for args in [vec!["add", "README.md"], vec!["commit", "-m", "initial"]] {
+            assert!(
+                Command::new("git")
+                    .args(&args)
+                    .current_dir(repo.path())
+                    .status()
+                    .expect("start git")
+                    .success(),
+                "git {args:?} failed"
+            );
+        }
+
+        let store = Arc::new(InMemoryTeamStore::new());
+        store
+            .save_team(&TeamDefinition {
+                team_id: "cancel-isolated-id".to_string(),
+                user_id: "test-user".to_string(),
+                name: "cancel-isolated".to_string(),
+                description: "cancellation merge guard".to_string(),
+                coordination: TeamCoordination::Pipeline,
+                members: vec![TeamMemberDef {
+                    role: "worker".to_string(),
+                    agent_id: Some("cancel-worker".to_string()),
+                    system_prompt: Some("make a change".to_string()),
+                    skills: Vec::new(),
+                    model_selection: None,
+                    mcp_servers: Vec::new(),
+                    can_delegate: false,
+                    max_delegation_depth: 0,
+                }],
+                context: std::collections::HashMap::new(),
+                worktree_mode: WorktreeMode::Isolated,
+                budget: None,
+                max_parallel: 0,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .expect("save isolated cancellation team");
+
+        let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let _ = reg.register(AgentProfile::new(
+                "orchestrator",
+                "orchestrator",
+                AgentTier::Orchestrator,
+            ));
+        }
+        let run_store = Arc::new(InMemoryRunStateStore::new());
+        let run_engine = Arc::new(RunEngine::new(run_store));
+        let tracker = Arc::new(DelegationTracker::new());
+        let started = Arc::new(Notify::new());
+        let delegation = Arc::new(DelegationEngine::with_executor(
+            registry.clone(),
+            run_engine.clone(),
+            tracker.clone(),
+            Arc::new(CommitThenCancelExecutor {
+                started: started.clone(),
+                wait_for_cancel: false,
+            }),
+        ));
+        let cancellation = Arc::new(tokio_util::sync::CancellationToken::new());
+        let progress_cancellation = cancellation.clone();
+        let orchestrator = TeamExecutionOrchestrator::new(
+            store,
+            delegation,
+            tracker,
+            run_engine.clone(),
+            registry,
+            OrchestratorConfig {
+                user_id: "test-user".to_string(),
+                session_id: "test-session".to_string(),
+                source_agent_id: "orchestrator".to_string(),
+                progress: Some(Arc::new(move |phase| {
+                    if matches!(phase, ExecutionPhase::Merging { .. }) {
+                        progress_cancellation.cancel();
+                    }
+                })),
+            },
+        )
+        .with_cancellation_token(cancellation.clone());
+
+        let repo_path = repo.path().to_path_buf();
+        let execution = tokio::spawn(async move {
+            orchestrator
+                .execute_team(
+                    "cancel-isolated",
+                    "cancel after child commit",
+                    Some(repo_path),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), started.notified())
+            .await
+            .expect("child should commit before cancellation");
+        let report = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+            .await
+            .expect("cancellation should settle")
+            .expect("orchestrator task should not panic");
+
+        assert_ne!(report.status, TeamExecutionStatus::Completed);
+        assert_eq!(report.status, TeamExecutionStatus::Unfinished);
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("integration"))
+        );
+        assert!(
+            report.merge_result.is_none(),
+            "cancelled teams must not merge partial isolated worktrees"
+        );
+        assert!(
+            !repo.path().join("cancelled.txt").exists(),
+            "the cancelled child commit must not reach the caller branch"
+        );
+        assert_eq!(report.preserved_worktree_branches.len(), 1);
+        let branch = &report.preserved_worktree_branches[0];
+        let parent = run_engine
+            .load_run("test-user", &report.parent_run_id)
+            .await
+            .expect("parent run lookup")
+            .expect("parent run should remain durable");
+        assert!(
+            parent.events.iter().any(|event| {
+                event["event_type"] == "team_worktrees_preserved"
+                    && event["branches"]
+                        .as_array()
+                        .is_some_and(|branches| branches.iter().any(|value| value == branch))
+            }),
+            "preserved branch must be recorded in the parent run timeline"
+        );
+        assert!(
+            Command::new("git")
+                .args(["cat-file", "-e", &format!("{branch}:cancelled.txt")])
+                .current_dir(repo.path())
+                .status()
+                .expect("inspect preserved child branch")
+                .success(),
+            "cancelled child commit should remain recoverable on {branch}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_shared_children_settled_keeps_completed_outcome() {
+        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+        let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let _ = reg.register(AgentProfile::new(
+                "orchestrator",
+                "orchestrator",
+                AgentTier::Orchestrator,
+            ));
+        }
+        let run_store = Arc::new(InMemoryRunStateStore::new());
+        let run_engine = Arc::new(RunEngine::new(run_store));
+        let tracker = Arc::new(DelegationTracker::new());
+        let delegation = Arc::new(DelegationEngine::with_executor(
+            registry.clone(),
+            run_engine.clone(),
+            tracker.clone(),
+            Arc::new(StatusExecutor {
+                status: STATUS_COMPLETED,
+                error: None,
+            }),
+        ));
+        let cancellation = Arc::new(tokio_util::sync::CancellationToken::new());
+        let progress_cancellation = cancellation.clone();
+        let orchestrator = TeamExecutionOrchestrator::new(
+            store,
+            delegation,
+            tracker,
+            run_engine.clone(),
+            registry,
+            OrchestratorConfig {
+                user_id: "test-user".to_string(),
+                session_id: "test-session".to_string(),
+                source_agent_id: "orchestrator".to_string(),
+                progress: Some(Arc::new(move |phase| {
+                    if matches!(phase, ExecutionPhase::Merging { .. }) {
+                        progress_cancellation.cancel();
+                    }
+                })),
+            },
+        )
+        .with_cancellation_token(cancellation);
+
+        let report = orchestrator
+            .execute_team("research", "finish the shared-workspace task", None)
+            .await;
+
+        assert_eq!(report.status, TeamExecutionStatus::Completed);
+        assert_eq!(report.error, None);
+        assert!(report.merge_result.is_none());
+        let parent = run_engine
+            .load_run("test-user", &report.parent_run_id)
+            .await
+            .expect("parent run lookup")
+            .expect("parent run should remain durable");
+        assert_eq!(parent.status, STATUS_COMPLETED);
     }
 
     #[tokio::test]
@@ -1086,6 +1774,82 @@ mod tests {
         // StubSubRunExecutor produces results with default token counts
         // Usage should have been persisted (even if 0 from stubs)
         assert_eq!(run.status, "completed");
+    }
+
+    #[tokio::test]
+    async fn direct_team_replay_reuses_run_identity_without_second_execution_tree() {
+        use astra_services::delegation_model_requirement::canonical_team_delegation_slot_plan;
+        use astra_turn_types::{
+            DelegationIntentRequirements, DelegationModelAdmissionOutcome,
+            DelegationUserRequirementSource, DirectDelegationCommandIdentity,
+        };
+
+        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+        let (orch, run_engine, _) = setup_with_engines(store.clone()).await;
+        let task = "analyze codebase";
+        let command = DirectDelegationCommandIdentity {
+            command_intent_id: "2bd9f48d-7b44-43d6-92ee-d0f93aa0fbe7".into(),
+            session_turn: 1,
+        };
+        let team = store
+            .load_team("test-user", "research")
+            .await
+            .unwrap()
+            .expect("built-in research team");
+        let (request, profiles) =
+            resolve_team(&team, task, &command.command_intent_id, "test-session").unwrap();
+        let slot_plan = canonical_team_delegation_slot_plan(&request, &profiles).unwrap();
+        let source = DelegationUserRequirementSource {
+            user_id: "test-user".into(),
+            session_id: "test-session".into(),
+            session_turn: command.session_turn,
+            applied_intent_id: None,
+            command_intent_id: Some(command.command_intent_id.clone()),
+            user_intent_digest: format!("sha256:{:x}", sha2::Sha256::digest(task.as_bytes())),
+        };
+        let plan = astra_turn_types::DirectDelegationModelPlan {
+            source: source.clone(),
+            slot_plan_digest: slot_plan.digest,
+            outcome: DelegationModelAdmissionOutcome::ExplicitlyUnconstrained {
+                slot_count: profiles.len() as u32,
+            },
+            child_requirements: vec![
+                DelegationIntentRequirements::Unconstrained {
+                    source: source.clone(),
+                };
+                profiles.len()
+            ],
+        };
+
+        let first = orch
+            .execute_team_with_model_plan("research", task, None, plan.clone(), command.clone())
+            .await;
+        assert_eq!(first.status, TeamExecutionStatus::Completed);
+        assert_eq!(first.parent_run_id, command.command_intent_id);
+        let before = run_engine
+            .load_run("test-user", &first.parent_run_id)
+            .await
+            .unwrap()
+            .expect("first command created its durable parent run");
+
+        let second = orch
+            .execute_team_with_model_plan("research", task, None, plan, command.clone())
+            .await;
+        assert_eq!(second.status, TeamExecutionStatus::Failed);
+        assert_eq!(second.error_kind, Some(TeamExecutionErrorKind::Persistence));
+        assert!(
+            second.error.as_deref().is_some_and(
+                |error| error.contains("already exists") || error.contains("already bound")
+            ),
+            "duplicate authenticated command must stop at the run admission boundary: {:?}",
+            second.error
+        );
+        let after = run_engine
+            .load_run("test-user", &first.parent_run_id)
+            .await
+            .unwrap()
+            .expect("the first run remains the only durable parent");
+        assert_eq!(after.events.len(), before.events.len());
     }
 
     #[tokio::test]
@@ -1404,6 +2168,8 @@ mod tests {
             },
             repo_lock: astra_server_types::worktree_isolation::new_repo_lock(),
             conflict_resolver: None,
+            server_request_boundary: false,
+            cancellation_token: None,
         };
 
         let report = orch.fail_report(

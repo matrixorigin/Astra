@@ -594,18 +594,9 @@ fn raw_llm_response_cache_hit_ratio(event: &crate::session_capture::JournalEvent
         .and_then(|response| response.get("response"))
         .and_then(|response| response.get("usage"))?;
 
-    let input_tokens = usage
-        .get("input_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let cache_read_tokens = usage
-        .get("cached_input_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let cache_creation_tokens = usage
-        .get("cache_creation_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let input_tokens = usage.get("input_tokens")?.as_u64()?;
+    let cache_read_tokens = usage.get("cached_input_tokens")?.as_u64()?;
+    let cache_creation_tokens = usage.get("cache_creation_tokens")?.as_u64()?;
     let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
         input_tokens,
         cache_read_tokens,
@@ -1386,6 +1377,39 @@ mod tests {
         assert_eq!(report.feedback_observations, 4);
         assert_eq!(report.cache_hit_ratios, None);
         assert_eq!(report.avg_cache_hit_ratio, None);
+    }
+
+    #[test]
+    fn zero_input_feedback_is_valid_without_a_cache_percentage() {
+        let mut output_only = make_feedback_event(1, 0.0);
+        output_only.raw["metadata"]["runtime_feedback"]["request_usage"]["prompt"] =
+            serde_json::json!(0);
+        output_only.raw["metadata"]["runtime_feedback"]["run_usage"]["prompt"] =
+            serde_json::json!(0);
+        let report = analyze_pipeline_health(&make_capture(vec![output_only.clone()]), &[]);
+        assert_eq!(report.invalid_events, 0);
+        assert_eq!(report.feedback_observations, 1);
+        assert_eq!(report.cache_hit_ratios, None);
+        assert_eq!(report.avg_cache_hit_ratio, None);
+        assert!(render_pipeline_health(&report).contains("unknown (incomplete input evidence)"));
+        for optional in [false, true] {
+            let result = crate::criteria::evaluate_deterministic_with_session(
+                &[crate::criteria::Criterion::PipelineAvgCacheHitRatio { min: 0.5, optional }],
+                &crate::runner::RunOutcome::new("m"),
+                Some(&make_capture(vec![output_only.clone()])),
+            );
+            assert_eq!(result[0].passed, optional);
+            assert!(
+                result[0]
+                    .detail
+                    .contains("unknown (incomplete input evidence)")
+            );
+            if optional {
+                assert!(result[0].detail.contains("optional criterion skipped"));
+            } else {
+                assert!(result[0].detail.contains("cannot evaluate cache ratio"));
+            }
+        }
     }
 
     #[test]

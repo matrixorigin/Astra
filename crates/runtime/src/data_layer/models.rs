@@ -1,9 +1,10 @@
+use astra_server_types::{ModelAdmissionRequestV1, ModelAdmissionResponseV1};
 use astra_services::{MAX_API_LIST_LIMIT, models::*};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::AppState;
-use astra_core::{ErrorResponse, error_response, internal_error};
+use astra_core::{ErrorResponse, error_response, error_response_coded, internal_error};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -244,22 +245,24 @@ async fn effective_model_catalog(
     let cursor = query.cursor()?;
     let principal = state.auth_service.current_principal(headers).await?;
     if principal.is_edge_registration() {
-        let catalog = state
-            .auth_service
-            .external_catalog_by_scope(&principal)
-            .await?;
-        let provider_default = catalog
-            .default_model_id
-            .map(|offering_id| ModelDefaultCandidate {
-                offering_id,
-                source: ModelDefaultSource::ExternalProvider,
-                scope: ModelDefaultScope::EffectiveCatalog,
-            });
+        let catalog = read_authorized_model_catalog(
+            state.model_service.as_ref(),
+            state.auth_service.as_ref(),
+            &principal,
+        )
+        .await?;
+        let provider_default =
+            catalog
+                .default_offering_id
+                .map(|offering_id| ModelDefaultCandidate {
+                    offering_id,
+                    source: ModelDefaultSource::ExternalProvider,
+                    scope: ModelDefaultScope::EffectiveCatalog,
+                });
         let mut offerings = model_catalog_for_purpose(
             catalog
-                .models
+                .items
                 .into_iter()
-                .map(ModelListItem::from)
                 .filter(|item| !active_only || item.is_active)
                 .collect::<Vec<_>>(),
             query.purpose,
@@ -300,12 +303,17 @@ async fn effective_model_catalog(
             catalog_revision,
         });
     }
-    let user = principal.user;
+    let user = &principal.user;
     let is_admin = !active_only
         && query.purpose == astra_core::model_wire::purpose::ModelCatalogPurpose::All
         && state.admin.authorizer.require_admin(headers).await.is_ok();
     if !is_admin {
-        let mut catalog = state.model_service.user_model_catalog(user.user_id).await?;
+        let mut catalog = read_authorized_model_catalog(
+            state.model_service.as_ref(),
+            state.auth_service.as_ref(),
+            &principal,
+        )
+        .await?;
         catalog.items.retain(|item| !active_only || item.is_active);
         catalog.items = model_catalog_for_purpose(catalog.items, query.purpose);
         let declared = astra_services::models::server_model_access_declarations(
@@ -469,6 +477,33 @@ pub async fn get_model_access_handler(
         projection.default_resolution = None;
     }
     Ok(Json(projection))
+}
+
+/// Check all requested child Offerings before a CLI fanout launches any slot.
+/// The response is a safe display projection, never credential material or a
+/// grant that bypasses the next inference admission.
+pub async fn admit_child_models_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ModelAdmissionRequestV1>,
+) -> Result<Json<ModelAdmissionResponseV1>, (StatusCode, Json<ErrorResponse>)> {
+    if request.slots.is_empty() || request.slots.len() > 64 {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "model admission requires 1 to 64 slots",
+            "model_admission_batch_invalid",
+        ));
+    }
+    let slots = crate::server::model_execution_admission::prepare_child_model_slots(request.slots)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    Ok(Json(
+        crate::server::model_execution_admission::admit_child_model_slots(
+            &state.model_service,
+            user.user_id,
+            slots,
+        )
+        .await?,
+    ))
 }
 
 pub async fn get_model_handler(
@@ -644,6 +679,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         }
     }
 

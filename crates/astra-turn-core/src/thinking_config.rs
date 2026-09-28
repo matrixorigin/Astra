@@ -21,6 +21,9 @@ use serde_json::{Value, json};
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ThinkingConfig {
+    /// Preserve the admitted Offering/provider default without emitting or
+    /// removing reasoning controls.
+    ModelDefault,
     /// Thinking disabled (default).
     #[default]
     Off,
@@ -67,6 +70,18 @@ fn default_effort() -> ThinkingEffort {
 }
 
 impl ThinkingConfig {
+    /// Exact budget controls cannot be silently shrunk to fit output policy.
+    pub fn validate_output_budget(&self, output_limit: u64) -> Result<(), String> {
+        if let Self::Enabled { budget_tokens } = self
+            && (*budget_tokens < 1024 || u64::from(*budget_tokens) >= output_limit)
+        {
+            return Err(format!(
+                "reasoning budget {budget_tokens} must be at least 1024 and below output limit {output_limit}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Final OpenAI-chat emission shared with the model probe's wire contract.
     /// This is deliberately independent of model names and endpoint heuristics.
     pub fn apply_openai_protocol(
@@ -74,6 +89,9 @@ impl ThinkingConfig {
         body: &mut Value,
         protocol: astra_core::model_wire::thinking::ThinkingProtocol,
     ) {
+        if matches!(self, Self::ModelDefault) {
+            return;
+        }
         let effort = match self {
             Self::Adaptive { effort } => Some(effort_str(*effort)),
             _ => None,
@@ -86,13 +104,14 @@ impl ThinkingConfig {
     }
 
     pub fn is_enabled(&self) -> bool {
-        !self.is_off()
+        matches!(self, Self::Enabled { .. } | Self::Adaptive { .. })
     }
 
     /// Apply thinking config to a Bedrock Converse request body.
     /// Sets `additionalModelRequestFields.thinking` and removes incompatible fields.
     pub fn apply_bedrock(&self, body: &mut Value) {
         match self {
+            Self::ModelDefault => {}
             Self::Off => {}
             Self::Enabled { budget_tokens } => {
                 body["additionalModelRequestFields"] = json!({
@@ -126,6 +145,7 @@ impl ThinkingConfig {
     /// Sets top-level `thinking` field and removes incompatible fields.
     pub fn apply_anthropic(&self, body: &mut Value) {
         match self {
+            Self::ModelDefault => {}
             Self::Off => {}
             Self::Enabled { budget_tokens } => {
                 body["thinking"] = json!({
@@ -156,6 +176,7 @@ impl ThinkingConfig {
     /// Only Adaptive maps to `reasoning_effort`; Enabled is a no-op for OpenAI.
     pub fn apply_openai(&self, body: &mut Value) {
         match self {
+            Self::ModelDefault => {}
             Self::Off => {}
             Self::Enabled { .. } => {
                 // OpenAI doesn't have a budget-based thinking mode.
@@ -216,6 +237,7 @@ pub fn fork_capture_thinking_slice(
     model: &str,
 ) -> Option<crate::fork_prefix::ThinkingConfigSlice> {
     match thinking {
+        ThinkingConfig::ModelDefault => None,
         ThinkingConfig::Off => {
             crate::reasoning_capabilities::reasoning_capabilities(provider, model)
                 .requires_replay()
@@ -285,6 +307,7 @@ impl fmt::Display for ThinkingEffort {
 impl fmt::Display for ThinkingConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ThinkingConfig::ModelDefault => write!(f, "model_default"),
             ThinkingConfig::Off => write!(f, "off"),
             ThinkingConfig::Enabled { budget_tokens } => {
                 write!(f, "enabled(budget:{})", budget_tokens)
@@ -346,6 +369,7 @@ impl ThinkingConfig {
             return self.clone();
         }
         match self {
+            ThinkingConfig::ModelDefault => ThinkingConfig::ModelDefault,
             ThinkingConfig::Off => ThinkingConfig::Off,
             ThinkingConfig::Enabled { budget_tokens } => {
                 // Cap at 4k for lightweight turns. This covers Anthropic's minimum
@@ -397,6 +421,7 @@ fn remove_key(body: &mut Value, key: &str) {
 /// Encode a ThinkingConfig as a model name suffix for storage in state.model.
 pub fn thinking_suffix_for(config: &ThinkingConfig) -> String {
     match config {
+        ThinkingConfig::ModelDefault => String::new(),
         ThinkingConfig::Off => String::new(),
         ThinkingConfig::Enabled { budget_tokens } => {
             format!("(thinking:budget:{})", budget_tokens)
@@ -475,6 +500,21 @@ pub fn resolve_model_thinking(model_selector: &str) -> (&str, ThinkingConfig) {
     }
 
     (model_selector, ThinkingConfig::Off)
+}
+
+/// Parse an optional thinking suffix as a request override.
+///
+/// A plain model selector carries no request to disable reasoning, so it uses
+/// the admitted Offering's default. Explicit typed `ThinkingConfig::Off`
+/// remains available at request boundaries that support it; the legacy model
+/// suffix syntax has never encoded that distinction.
+pub fn resolve_model_thinking_request(model_selector: &str) -> (&str, ThinkingConfig) {
+    let (base_model, config) = resolve_model_thinking(model_selector);
+    if base_model == model_selector && matches!(config, ThinkingConfig::Off) {
+        (base_model, ThinkingConfig::ModelDefault)
+    } else {
+        (base_model, config)
+    }
 }
 
 // ─── Two-level /model selection ─────────────────────────────────────────────
@@ -652,6 +692,28 @@ pub fn strip_think_tags(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exact_budget_must_fit_without_adjustment() {
+        let thinking = super::ThinkingConfig::Enabled {
+            budget_tokens: 8_000,
+        };
+        assert!(thinking.validate_output_budget(8_000).is_err());
+        assert!(thinking.validate_output_budget(8_001).is_ok());
+        assert!(thinking.validate_output_budget(4_000).is_err());
+        assert!(
+            super::ThinkingConfig::Enabled {
+                budget_tokens: 1023
+            }
+            .validate_output_budget(8_000)
+            .is_err()
+        );
+        assert_eq!(
+            thinking,
+            super::ThinkingConfig::Enabled {
+                budget_tokens: 8_000
+            }
+        );
+    }
     use super::*;
 
     // ─── Bedrock Converse wire format ───────────────────────────────────
@@ -951,6 +1013,22 @@ mod tests {
         let (name, cfg) = resolve_model_thinking("us.anthropic.claude-opus-4-6-v1");
         assert_eq!(name, "us.anthropic.claude-opus-4-6-v1");
         assert_eq!(cfg, ThinkingConfig::Off);
+    }
+
+    #[test]
+    fn request_parser_treats_an_unsuffixed_model_as_provider_default() {
+        let (name, cfg) = resolve_model_thinking_request("us.anthropic.claude-opus-4-6-v1");
+        assert_eq!(name, "us.anthropic.claude-opus-4-6-v1");
+        assert_eq!(cfg, ThinkingConfig::ModelDefault);
+
+        let (name, cfg) = resolve_model_thinking_request("some-model(thinking:high)");
+        assert_eq!(name, "some-model");
+        assert_eq!(
+            cfg,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High
+            }
+        );
     }
 
     #[test]
@@ -1491,5 +1569,16 @@ mod fork_capture_thinking_slice_tests {
         assert!(slice.enabled);
         assert_eq!(slice.budget_tokens, 5000);
         assert_eq!(slice.kind, "enabled");
+    }
+
+    #[test]
+    fn model_default_preserves_existing_wire_controls() {
+        let mut body = json!({"reasoning_effort":"high","enable_thinking":true});
+        ThinkingConfig::ModelDefault.apply_openai_protocol(
+            &mut body,
+            astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort,
+        );
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["enable_thinking"], true);
     }
 }

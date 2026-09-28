@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use serde_json::{Map, Value, json};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use astra_core::{
@@ -751,6 +751,8 @@ pub struct RunState {
     pub pause_flag: Arc<AtomicBool>,
     /// Cancelled together with `cancel_flag` on `cancel_run` for low-latency LLM abort.
     pub llm_cancel_token: Arc<CancellationToken>,
+    /// Process-local wake hint for newly committed current-run guidance.
+    pub input_wake: watch::Sender<i64>,
     /// Live fanout for clients that reattach to an active run after navigating away.
     pub live_tx: Option<broadcast::Sender<Value>>,
     /// Weak reference to the original POST stream's delivery lane.

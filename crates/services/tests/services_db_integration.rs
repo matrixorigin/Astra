@@ -4754,7 +4754,7 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_audit_does_not_price_unattributed_turn_usage() {
+async fn session_audit_usage_counts_physical_attempts_without_repricing_history() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
@@ -4777,7 +4777,7 @@ async fn session_audit_does_not_price_unattributed_turn_usage() {
     .bind(r#"["text"]"#)
     .bind("[]")
     .bind(
-        r#"{"prompt":0.000002,"completion":0.000008,"cache_read":0.0000005,"cache_write":0.0000015}"#,
+        r#"{"currency":"USD","unit":"per_token","prompt":0.000002,"completion":0.000008,"cache_read":0.0000005,"cache_write":0.0000015}"#,
     )
     .bind("[]")
     .bind("{}")
@@ -4834,15 +4834,88 @@ async fn session_audit_does_not_price_unattributed_turn_usage() {
     .await
     .expect("insert priced audit event");
 
+    let other_user = Uuid::new_v4().to_string();
+    let attempt_ids = [
+        Uuid::new_v4().to_string(),
+        Uuid::new_v4().to_string(),
+        Uuid::new_v4().to_string(),
+    ];
+    for (index, owner, status, coverage, counts) in [
+        (
+            0,
+            &user_id,
+            "succeeded",
+            "provider_exact",
+            [1_000_000, 500_000, 2_000_000, 1_000_000],
+        ),
+        (1, &user_id, "failed", "provider_partial", [30_000, 0, 0, 0]),
+        (
+            2,
+            &other_user,
+            "succeeded",
+            "provider_exact",
+            [99_000_000, 0, 0, 0],
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO inference_provider_attempts \
+             (attempt_id, invocation_id, user_id, session_id, attempt_index, provider, \
+              admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes, \
+              status, usage_status, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) \
+             VALUES (?, ?, ?, ?, 0, 'mock', ?, 'openai_compatible', ?, 1, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&attempt_ids[index])
+        .bind(Uuid::new_v4().to_string())
+        .bind(owner)
+        .bind(&session_id)
+        .bind("00000000000000000000000000000000")
+        .bind("0".repeat(64))
+        .bind(status)
+        .bind(coverage)
+        .bind(counts[0])
+        .bind(counts[1])
+        .bind(counts[2])
+        .bind(counts[3])
+        .execute(&pool)
+        .await
+        .expect("insert physical attempt");
+    }
+
     let audit = DatabaseSessionAuditService::new(settings).with_pool(shared);
     let summary = audit
         .get_summary(&user_id, &session_id)
         .await
-        .expect("get priced session summary");
-    assert_eq!(summary.cost.priced_turn_count, 0);
-    assert_eq!(summary.cost.unpriced_turn_count, 1);
+        .expect("get session summary");
+    assert_eq!(summary.request_usage.request_count, 2);
+    assert_eq!(
+        summary.request_usage.fresh_input_tokens.known_tokens,
+        Some(1_030_000)
+    );
+    assert_eq!(
+        summary.request_usage.fresh_input_tokens.observed_attempts,
+        2
+    );
+    assert_eq!(
+        summary.request_usage.output_tokens.known_tokens,
+        Some(500_000)
+    );
+    assert_eq!(summary.request_usage.output_tokens.observed_attempts, 1);
     assert_eq!(summary.cost.estimated_cost_usd, None);
-    assert!(summary.cost.per_model_cost_usd.is_empty());
+    assert_eq!(
+        summary.cost.unavailable_reason,
+        astra_services::session_audit::SessionCostUnavailableReason::HistoricalPricingNotCaptured
+    );
+
+    sqlx::query(
+        "DELETE FROM inference_provider_attempts WHERE session_id = ? AND attempt_id IN (?, ?, ?)",
+    )
+    .bind(&session_id)
+    .bind(&attempt_ids[0])
+    .bind(&attempt_ids[1])
+    .bind(&attempt_ids[2])
+    .execute(&pool)
+    .await
+    .expect("delete physical attempts");
 
     cleanup_agent_sessions_and_events_for_owner(
         &pool,

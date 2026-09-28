@@ -40,6 +40,131 @@ pub struct ModelSelection {
     pub offering_id: String,
 }
 
+/// A caller's fixed-model request, before Server resolves it to an exact
+/// Offering. Names are lookup keys only; execution and authorization always
+/// use the returned [`ModelSelection`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelSelector {
+    OfferingId {
+        offering_id: String,
+    },
+    ConfiguredName {
+        model_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+}
+
+impl ModelSelector {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let valid = |value: &str, max_chars: usize| {
+            !value.is_empty()
+                && value.trim() == value
+                && value.chars().count() <= max_chars
+                && !value.chars().any(char::is_control)
+        };
+        match self {
+            Self::OfferingId { offering_id } if valid(offering_id, 64) => Ok(()),
+            Self::OfferingId { .. } => Err("Offering ID selector is invalid"),
+            Self::ConfiguredName { model_name, source }
+                if valid(model_name, 256)
+                    && source.as_deref().is_none_or(|source| valid(source, 128)) =>
+            {
+                Ok(())
+            }
+            Self::ConfiguredName { .. } => Err("configured model-name selector is invalid"),
+        }
+    }
+}
+
+/// The user's requested model behavior before it is resolved to an Offering.
+///
+/// This is intentionally distinct from [`ModelSelection`]: `inherit` and
+/// `auto` can resolve to the same Offering as a fixed request while retaining
+/// different semantics for nested delegation, retries, and explanation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RequestedModelPolicy {
+    Inherit,
+    Fixed { selector: ModelSelector },
+    Auto { strategy: AutoModelStrategy },
+}
+
+/// Resolve the caller's fixed selector without consulting a model catalog.
+/// Configured names remain selectors until authenticated Server admission;
+/// inherited choices are converted back to their canonical Offering ID.
+pub fn resolve_requested_model_selector(
+    requested: Option<&RequestedModelPolicy>,
+    inherited: Option<&ModelSelection>,
+) -> Result<Option<ModelSelector>, RequestedModelPolicyError> {
+    match requested {
+        None | Some(RequestedModelPolicy::Inherit) => {
+            Ok(inherited.map(|selection| ModelSelector::OfferingId {
+                offering_id: selection.offering_id.clone(),
+            }))
+        }
+        Some(RequestedModelPolicy::Fixed { selector }) => {
+            selector
+                .validate()
+                .map_err(|_| RequestedModelPolicyError::InvalidSelector)?;
+            Ok(Some(selector.clone()))
+        }
+        Some(RequestedModelPolicy::Auto { .. }) => {
+            Err(RequestedModelPolicyError::AutomaticRoutingUnavailable)
+        }
+    }
+}
+
+/// The optimization objective for a requested automatic model choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoModelStrategy {
+    CostPriority,
+    Balanced,
+}
+
+/// Resolve the model policy when automatic routing is not installed.
+///
+/// `None` on the request means ordinary inheritance, just like an explicit
+/// `inherit`; callers retain the original optional policy separately for
+/// precedence and durable provenance.
+pub fn resolve_requested_model_selection(
+    requested: Option<&RequestedModelPolicy>,
+    inherited: Option<&ModelSelection>,
+) -> Result<Option<ModelSelection>, RequestedModelPolicyError> {
+    match resolve_requested_model_selector(requested, inherited)? {
+        None => Ok(None),
+        Some(ModelSelector::OfferingId { offering_id }) => Ok(Some(ModelSelection { offering_id })),
+        Some(ModelSelector::ConfiguredName { .. }) => {
+            Err(RequestedModelPolicyError::ConfiguredNameRequiresCatalog)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestedModelPolicyError {
+    AutomaticRoutingUnavailable,
+    ConfiguredNameRequiresCatalog,
+    InvalidSelector,
+}
+
+impl std::fmt::Display for RequestedModelPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AutomaticRoutingUnavailable => {
+                f.write_str("automatic model routing is not available yet: comparable task-level cost, quality, and completion-time evidence is unavailable; choose a fixed model")
+            }
+            Self::ConfiguredNameRequiresCatalog => {
+                f.write_str("configured model names must be resolved by Server admission")
+            }
+            Self::InvalidSelector => f.write_str("requested model selector is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for RequestedModelPolicyError {}
+
 /// Durable owner and causal coordinates for one logical model invocation.
 ///
 /// Auxiliary work such as memory extraction can belong to a session without
@@ -445,6 +570,83 @@ mod tests {
                 "gateway": "provider-gateway"
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn requested_policy_remains_distinct_from_its_resolved_offering() {
+        let inherited = ModelSelection {
+            offering_id: "offer-parent".to_string(),
+        };
+        assert_eq!(
+            resolve_requested_model_selection(
+                Some(&RequestedModelPolicy::Inherit),
+                Some(&inherited)
+            )
+            .unwrap(),
+            Some(inherited.clone())
+        );
+        assert_eq!(
+            resolve_requested_model_selection(
+                Some(&RequestedModelPolicy::Fixed {
+                    selector: ModelSelector::OfferingId {
+                        offering_id: "offer-child".to_string(),
+                    },
+                }),
+                Some(&inherited),
+            )
+            .unwrap()
+            .map(|selection| selection.offering_id),
+            Some("offer-child".to_string())
+        );
+        assert_eq!(
+            resolve_requested_model_selection(
+                Some(&RequestedModelPolicy::Auto {
+                    strategy: AutoModelStrategy::Balanced,
+                }),
+                Some(&inherited),
+            ),
+            Err(RequestedModelPolicyError::AutomaticRoutingUnavailable)
+        );
+        assert_eq!(
+            resolve_requested_model_selection(
+                Some(&RequestedModelPolicy::Fixed {
+                    selector: ModelSelector::ConfiguredName {
+                        model_name: "glm-5.2".to_string(),
+                        source: None,
+                    },
+                }),
+                Some(&inherited),
+            ),
+            Err(RequestedModelPolicyError::ConfiguredNameRequiresCatalog)
+        );
+        assert_eq!(
+            resolve_requested_model_selector(
+                Some(&RequestedModelPolicy::Fixed {
+                    selector: ModelSelector::ConfiguredName {
+                        model_name: "glm-5.2".to_string(),
+                        source: Some("provider-a".to_string()),
+                    },
+                }),
+                Some(&inherited),
+            )
+            .unwrap(),
+            Some(ModelSelector::ConfiguredName {
+                model_name: "glm-5.2".to_string(),
+                source: Some("provider-a".to_string()),
+            })
+        );
+        assert_eq!(
+            resolve_requested_model_selector(
+                Some(&RequestedModelPolicy::Fixed {
+                    selector: ModelSelector::ConfiguredName {
+                        model_name: " glm-5.2".to_string(),
+                        source: None,
+                    },
+                }),
+                Some(&inherited),
+            ),
+            Err(RequestedModelPolicyError::InvalidSelector)
         );
     }
 }

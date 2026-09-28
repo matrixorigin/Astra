@@ -2121,7 +2121,6 @@ mod tests {
             related_message_id: None,
             timestamp_ms: 42,
             correlation_id: None,
-            requires_ack: false,
         };
         let item = |item_seq: i64,
                     source_event_id: &str,

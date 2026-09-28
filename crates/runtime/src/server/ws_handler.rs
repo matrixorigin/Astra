@@ -1319,6 +1319,7 @@ fn build_ws_chat_request(
     is_plan_subtask: Option<bool>,
 ) -> astra_services::runs::ChatRequestData {
     astra_services::runs::ChatRequestData {
+        model_catalog_reader: None,
         message: content.to_string(),
         user_intent,
         parts: Vec::new(),
@@ -1332,8 +1333,10 @@ fn build_ws_chat_request(
         full_llm_capture: false,
         agent_id,
         model: None,
+        expected_model_name: None,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: Some(model_selection),
+        requested_model_policy: None,
         resolved_model_selection: None,
         admitted_model_execution: None,
         capability_descriptors: None,

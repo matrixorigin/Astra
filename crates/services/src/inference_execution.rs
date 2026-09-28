@@ -76,6 +76,9 @@ pub struct InferenceInvocationPlan {
     owner_token: String,
     owner_generation: u64,
     input: InferenceInvocationInput,
+    // Serialized once from validated admission material. Pricing is evidence,
+    // not part of invocation identity: a catalog update cannot authorize replay.
+    price_snapshot_json: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -130,6 +133,20 @@ pub struct InferenceProviderWireIdentity {
 }
 
 impl InferenceInvocationPlan {
+    pub fn with_price_snapshot(
+        mut self,
+        snapshot: Option<&crate::models::InferencePriceSnapshot>,
+    ) -> ServiceResult<Self> {
+        self.price_snapshot_json =
+            snapshot
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| {
+                    ServiceError::invalid(format!("serialize inference price: {error}"))
+                })?;
+        Ok(self)
+    }
+
     #[must_use]
     pub fn route_id(&self) -> &str {
         &self.route_id
@@ -1060,6 +1077,7 @@ pub fn plan_inference_invocation(
         owner_token: new_admission_token(),
         owner_generation: 1,
         input,
+        price_snapshot_json: None,
     })
 }
 
@@ -2597,8 +2615,8 @@ async fn insert_inference_invocation_admission(
             "INSERT INTO inference_routes
                  (route_id, user_id, session_id, scope_kind, run_id,
                   offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, ?, 'run', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+                  execution_placement, access_kind, purpose, price_snapshot_json, created_at)
+                 VALUES (?, ?, ?, 'run', ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
@@ -2608,8 +2626,8 @@ async fn insert_inference_invocation_admission(
             "INSERT INTO inference_routes
                  (route_id, user_id, session_id, scope_kind,
                   offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, ?, 'session', ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+                  execution_placement, access_kind, purpose, price_snapshot_json, created_at)
+                 VALUES (?, ?, ?, 'session', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
@@ -2618,8 +2636,8 @@ async fn insert_inference_invocation_admission(
             "INSERT INTO inference_routes
                  (route_id, user_id, scope_kind, harness_run_id,
                   offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, 'harness_run', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+                  execution_placement, access_kind, purpose, price_snapshot_json, created_at)
+                 VALUES (?, ?, 'harness_run', ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
@@ -2633,6 +2651,7 @@ async fn insert_inference_invocation_admission(
         .bind(plan.input.execution_placement.as_str())
         .bind(plan.input.access_kind.as_str())
         .bind(plan.input.purpose.as_str())
+        .bind(&plan.price_snapshot_json)
         .execute(&mut *connection)
         .await
         .map_err(|error| {
@@ -8392,7 +8411,7 @@ fn projected_cache_read_share(
         .then(|| usage.input.cache_read_tokens as f64 / total as f64)
 }
 
-fn projected_auxiliary_usage(
+pub(crate) fn projected_auxiliary_usage(
     protocol: &str,
     status: &str,
     counts: [i64; 4],
@@ -8519,8 +8538,11 @@ pub async fn load_session_auxiliary_capture(
     } else {
         "SELECT a.attempt_id, a.provider, a.provider_protocol, r.offering_id, r.upstream_model_name, i.purpose, i.operation_id, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens"
     };
+    // Delegation/model-selector judgments use request-specific operation IDs;
+    // classify their usage by the admitted introspection purpose instead of
+    // attempting to enumerate hashed operation identities.
     let rows = sqlx::query(&format!(
-        "{select} FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND (i.operation_id IN ('request_judgment', 'skill_auto_route', 'work_plan', 'memory_relevance', 'memory_feedback', 'verification_judge', 'completion_proxy:turn_intent', 'completion_proxy:tool_result_rerank') OR i.purpose IN ('memory_retrieval_rerank', 'tool_result_rerank', 'verification_judge')) ORDER BY a.attempt_id LIMIT ?"
+        "{select} FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND (i.operation_id IN ('request_judgment', 'skill_auto_route', 'work_plan', 'memory_relevance', 'memory_feedback', 'verification_judge', 'completion_proxy:turn_intent', 'completion_proxy:tool_result_rerank') OR i.purpose IN ('introspection', 'memory_retrieval_rerank', 'tool_result_rerank', 'verification_judge')) ORDER BY a.attempt_id LIMIT ?"
     ))
         .bind(user_id)
         .bind(session_id)
@@ -8674,6 +8696,100 @@ mod tests {
                 expected_owner_pod_id: "test-inference-owner".to_string(),
                 expected_control_epoch: 0,
             }),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and a current-schema MatrixOne database"]
+    async fn inference_price_snapshot_survives_persisted_replay_and_recovery() {
+        let _ = dotenvy::dotenv();
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let mut settings = astra_core::MatrixOneSettings::from_env();
+        settings.db_pool_max_connections = 2;
+        settings.db_pool_min_connections = 0;
+        let catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        crate::storage::ensure_core_schema(&settings, &catalog)
+            .await
+            .unwrap();
+        let pool = SharedPool::new(&settings).await.unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let user_id = format!("price-snapshot-{suffix}");
+        let session_id = format!("price-snapshot-{suffix}");
+        sqlx::query("INSERT INTO agent_sessions (session_id, user_id, status, event_count, project_retention_policy, created_at, updated_at, last_active_at) VALUES (?, ?, 'active', 0, 'session', NOW(6), NOW(6), NOW(6))")
+            .bind(&session_id).bind(&user_id).execute(pool.get()).await.unwrap();
+        let mut input = input();
+        input.user_id = user_id.clone();
+        input.run_authority = None;
+        input.scope = InferenceInvocationScope::Session {
+            session_id: session_id.clone(),
+            turn: 0,
+            round: 0,
+            operation_id: "price_snapshot".into(),
+            logical_attempt: 0,
+        };
+        let snapshot = |rate| {
+            crate::models::InferencePriceSnapshot::from_stored(
+                &json!({
+                    "calculation_version": 1,
+                    "currency": "USD", "unit": "per_token", "source": "configured",
+                    "prompt": rate, "completion": rate,
+                    "configuration_updated_at": "2026-09-27",
+                })
+                .to_string(),
+            )
+            .unwrap()
+        };
+        let original = plan_inference_invocation(input.clone())
+            .unwrap()
+            .with_price_snapshot(Some(&snapshot(0.000001)))
+            .unwrap();
+        admit_inference_invocation(&pool, &original).await.unwrap();
+        let replay = plan_inference_invocation(input)
+            .unwrap()
+            .with_price_snapshot(Some(&snapshot(0.000002)))
+            .unwrap();
+        assert_eq!(original.route_id(), replay.route_id());
+        assert_eq!(original.invocation_id(), replay.invocation_id());
+        assert_ne!(original.price_snapshot_json, replay.price_snapshot_json);
+        assert!(admit_inference_invocation(&pool, &replay).await.is_err());
+        let recovery = original
+            .clone()
+            .with_price_snapshot(Some(&snapshot(0.000002)))
+            .unwrap();
+        let terminal = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::Cancelled,
+            usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
+            provider_response_id: None,
+            error_kind: Some("cancelled".into()),
+            error_message: None,
+        };
+        assert_eq!(
+            settle_uncertain_inference_admission(&pool, &recovery, &terminal)
+                .await
+                .unwrap(),
+            InferenceInvocationAdmissionResolution::Settled,
+        );
+        let retained: String = sqlx::query_scalar(
+            "SELECT CAST(price_snapshot_json AS CHAR) FROM inference_routes WHERE user_id = ? AND route_id = ?",
+        )
+        .bind(&user_id).bind(original.route_id()).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(
+            crate::models::InferencePriceSnapshot::from_stored(&retained),
+            Some(snapshot(0.000001))
+        );
+        for table in [
+            "inference_invocation_settlement_debts",
+            "inference_invocations",
+            "inference_routes",
+            "agent_sessions",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
+                .bind(&user_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
         }
     }
 

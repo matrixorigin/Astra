@@ -511,9 +511,39 @@ pub struct AgentDeliveryRollup {
 #[derive(Debug, Clone, Default, PartialEq)]
 struct ModelRequestSummary {
     terminal_requests: u64,
+    conflicting_requests: u64,
     input: astra_turn_types::NormalizedPromptCacheUsage,
     output_tokens: u64,
     cache_invalidations: u64,
+    usage_observations: u64,
+    cache_usage_observations: u64,
+    usage_coverage: ModelRequestUsageCoverage,
+    groups: Vec<ModelRequestGroup>,
+    omitted_groups: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ModelRequestUsageCoverage {
+    exact: u64,
+    partial: u64,
+    unavailable: u64,
+    unknown: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ModelRequestGroup {
+    run_id: Option<String>,
+    agent_id: Option<String>,
+    offering_id: String,
+    provider: String,
+    model: String,
+    upstream_model: Option<String>,
+    purpose: String,
+    terminal_requests: u64,
+    input: astra_turn_types::NormalizedPromptCacheUsage,
+    output_tokens: u64,
+    usage_observations: u64,
+    usage_coverage: ModelRequestUsageCoverage,
 }
 
 /// Bounded latency facts from durable `llm_round` events. This is deliberately
@@ -572,37 +602,107 @@ fn llm_round_latency_summary_from_row(
 
 impl ModelRequestSummary {
     fn from_records(records: &[ModelRequestContextRecord]) -> Option<Self> {
+        const MAX_GROUPS: usize = 8;
         let mut summary = Self::default();
+        let mut requests: BTreeMap<&str, Option<&ModelRequestContextRecord>> = BTreeMap::new();
         for record in records {
             if record.stage != ModelRequestEventStage::Terminal {
                 continue;
             }
+            // request_id is already the canonical physical-attempt ID. Keep
+            // conflicts sticky so input order cannot select an identity or
+            // usage payload, even if a later row repeats the first version.
+            requests
+                .entry(record.event.identity.request_id.as_str())
+                .and_modify(|existing| {
+                    if existing.is_some_and(|first| {
+                        first.event.identity != record.event.identity
+                            || first.event.route != record.event.route
+                            || first.event.usage != record.event.usage
+                            || first.event.usage_status != record.event.usage_status
+                            || first.event.cache != record.event.cache
+                            || first.event.terminal_status != record.event.terminal_status
+                            || first.terminal_status != record.terminal_status
+                    }) {
+                        *existing = None;
+                    }
+                })
+                .or_insert(Some(record));
+        }
+        let mut groups = BTreeMap::new();
+        for record in requests.into_values() {
             summary.terminal_requests = summary.terminal_requests.saturating_add(1);
+            let Some(record) = record else {
+                summary.conflicting_requests += 1;
+                summary.usage_coverage.observe(None);
+                continue;
+            };
+            let identity = &record.event.identity;
+            summary
+                .usage_coverage
+                .observe(record.event.usage_status.as_deref());
+            let key = (
+                identity.run_id.clone(),
+                identity.agent_id.clone(),
+                identity.offering_id.clone(),
+                identity.provider.clone(),
+                identity.model.clone(),
+                record
+                    .event
+                    .route
+                    .as_ref()
+                    .map(|route| route.upstream_model.clone()),
+                identity.inference_purpose.clone(),
+            );
+            let group = groups
+                .entry(key.clone())
+                .or_insert_with(|| ModelRequestGroup {
+                    run_id: key.0,
+                    agent_id: key.1,
+                    offering_id: key.2,
+                    provider: key.3,
+                    model: key.4,
+                    upstream_model: key.5,
+                    purpose: key.6,
+                    ..ModelRequestGroup::default()
+                });
+            group.terminal_requests = group.terminal_requests.saturating_add(1);
+            group
+                .usage_coverage
+                .observe(record.event.usage_status.as_deref());
             if let Some(usage) = record.event.usage.as_ref() {
-                summary.input.fresh_input_tokens = summary
-                    .input
-                    .fresh_input_tokens
-                    .saturating_add(usage.input.fresh_input_tokens);
+                summary.usage_observations = summary.usage_observations.saturating_add(1);
+                // The producer owns cache coverage (System One, for example,
+                // reports input/output but no cache buckets). Do not infer it
+                // from normalized zero buckets or an exact input/output status.
+                if record.event.cache.cache_read_share.is_some()
+                    || usage.input.total_input_tokens() == 0
+                {
+                    summary.cache_usage_observations += 1;
+                }
+                group.usage_observations = group.usage_observations.saturating_add(1);
+                add_prompt_cache_usage(&mut summary.input, &usage.input);
                 summary.output_tokens = summary.output_tokens.saturating_add(usage.output_tokens);
-                summary.input.cache_read_tokens = summary
-                    .input
-                    .cache_read_tokens
-                    .saturating_add(usage.input.cache_read_tokens);
-                summary.input.cache_creation_tokens = summary
-                    .input
-                    .cache_creation_tokens
-                    .saturating_add(usage.input.cache_creation_tokens);
+                add_prompt_cache_usage(&mut group.input, &usage.input);
+                group.output_tokens = group.output_tokens.saturating_add(usage.output_tokens);
             }
             if !record.event.cache.invalidation_reasons.is_empty() {
                 summary.cache_invalidations = summary.cache_invalidations.saturating_add(1);
             }
         }
+        summary.omitted_groups = groups.len().saturating_sub(MAX_GROUPS);
+        summary.groups = groups.into_values().take(MAX_GROUPS).collect();
         (summary.terminal_requests > 0).then_some(summary)
     }
 
     fn render(&self) -> String {
         let total_input_tokens = self.input.total_input_tokens();
-        let cache_share = if total_input_tokens == 0 {
+        let cache_share = if self.terminal_requests == 0
+            || self.usage_observations != self.terminal_requests
+            || self.cache_usage_observations != self.terminal_requests
+            || self.usage_coverage.exact != self.terminal_requests
+            || total_input_tokens == 0
+        {
             "unknown".to_string()
         } else {
             format!(
@@ -610,17 +710,99 @@ impl ModelRequestSummary {
                 self.input.cache_read_tokens as f64 / total_input_tokens as f64 * 100.0
             )
         };
-        format!(
-            "Model requests: {} terminal; cache read {cache_share} ({}/{} total input; {} fresh, {} cache write), {} model-context invalidation record(s), {} output tokens. Pipeline cache-break alerts, when present, are reported separately as session issues.",
+        let mut rendered = format!(
+            "Model requests (bounded captured window; not complete session billing): {} terminal; known cache read {cache_share} ({}/{} known input; {} fresh, {} cache write), {} model-context invalidation record(s), observed output tokens: {}; usage coverage exact={}, partial={}, unavailable={}, unknown={}.",
             self.terminal_requests,
-            self.input.cache_read_tokens,
-            total_input_tokens,
-            self.input.fresh_input_tokens,
-            self.input.cache_creation_tokens,
+            render_known_usage(self.usage_observations, self.input.cache_read_tokens),
+            render_known_usage(self.usage_observations, total_input_tokens),
+            render_known_usage(self.usage_observations, self.input.fresh_input_tokens),
+            render_known_usage(self.usage_observations, self.input.cache_creation_tokens),
             self.cache_invalidations,
-            self.output_tokens,
-        )
+            render_known_usage(self.usage_observations, self.output_tokens),
+            self.usage_coverage.exact,
+            self.usage_coverage.partial,
+            self.usage_coverage.unavailable,
+            self.usage_coverage.unknown,
+        );
+        if self.conflicting_requests > 0 {
+            rendered.push_str(&format!(
+                " {} conflicting physical request(s) counted as unknown; their usage and identity groups are excluded.",
+                self.conflicting_requests,
+            ));
+        }
+        for group in &self.groups {
+            rendered.push_str(&format!(
+                "\n- run={} agent={} offering={} provider={} model={} upstream_model={} purpose={} requests={} known_input={} known_output={} usage(exact={}, partial={}, unavailable={}, unknown={})",
+                render_model_request_identity(group.run_id.as_deref()),
+                render_model_request_identity(group.agent_id.as_deref()),
+                render_model_request_identity(Some(&group.offering_id)),
+                render_model_request_identity(Some(&group.provider)),
+                render_model_request_identity(Some(&group.model)),
+                render_model_request_identity(group.upstream_model.as_deref()),
+                render_model_request_identity(Some(&group.purpose)),
+                group.terminal_requests,
+                render_known_usage(group.usage_observations, group.input.total_input_tokens()),
+                render_known_usage(group.usage_observations, group.output_tokens),
+                group.usage_coverage.exact,
+                group.usage_coverage.partial,
+                group.usage_coverage.unavailable,
+                group.usage_coverage.unknown,
+            ));
+        }
+        if self.omitted_groups > 0 {
+            rendered.push_str(&format!(
+                "\n- {0} additional model identity group(s) omitted",
+                self.omitted_groups
+            ));
+        }
+        rendered.push_str(" Pipeline cache-break alerts, when present, are reported separately as session issues.");
+        rendered
     }
+}
+
+impl ModelRequestUsageCoverage {
+    fn observe(&mut self, status: Option<&str>) {
+        match status {
+            Some("provider_exact") => self.exact = self.exact.saturating_add(1),
+            Some("provider_partial") => self.partial = self.partial.saturating_add(1),
+            Some("unavailable") => self.unavailable = self.unavailable.saturating_add(1),
+            _ => self.unknown = self.unknown.saturating_add(1),
+        }
+    }
+}
+
+fn add_prompt_cache_usage(
+    total: &mut astra_turn_types::NormalizedPromptCacheUsage,
+    usage: &astra_turn_types::NormalizedPromptCacheUsage,
+) {
+    total.fresh_input_tokens = total
+        .fresh_input_tokens
+        .saturating_add(usage.fresh_input_tokens);
+    total.cache_read_tokens = total
+        .cache_read_tokens
+        .saturating_add(usage.cache_read_tokens);
+    total.cache_creation_tokens = total
+        .cache_creation_tokens
+        .saturating_add(usage.cache_creation_tokens);
+}
+
+fn render_known_usage(observations: u64, value: u64) -> String {
+    if observations == 0 {
+        "unknown".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn render_model_request_identity(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "unknown".to_string();
+    };
+    let mut bounded = value.chars().take(128).collect::<String>();
+    if value.chars().nth(128).is_some() {
+        bounded.push('…');
+    }
+    serde_json::to_string(&bounded).expect("string serialization cannot fail")
 }
 
 impl AgentDeliveryRollup {
@@ -697,7 +879,6 @@ pub(crate) enum InsightKind {
     ToolConcentration { tool: String },
     ModelFanout { decision_type: String },
     EmptySession,
-    DecisionStall,
 }
 
 impl InsightKind {
@@ -708,7 +889,6 @@ impl InsightKind {
             Self::ToolConcentration { .. } => "tool_concentration",
             Self::ModelFanout { .. } => "model_fanout",
             Self::EmptySession => "empty_session",
-            Self::DecisionStall => "decision_stall",
         }
     }
 }
@@ -1387,15 +1567,6 @@ pub(crate) fn generate_insights(
         });
     }
 
-    if overview.total_events > 20 && overview.total_decisions == 0 {
-        insights.push(Insight {
-            severity: "warning".into(),
-            kind: InsightKind::DecisionStall,
-            message: "Many events but no decisions — possible routing issue".into(),
-            evidence: format!("{} events, 0 decisions", overview.total_events),
-        });
-    }
-
     insights
 }
 
@@ -1426,9 +1597,6 @@ pub(crate) fn generate_recommendations(
             InsightKind::ToolConcentration { .. } => {
                 Some("Consider using more diverse tools for better coverage")
             }
-            InsightKind::DecisionStall => {
-                Some("Review agent routing — events without decisions may be misconfigured")
-            }
             InsightKind::ErrorRate
             | InsightKind::ToolFailure { .. }
             | InsightKind::ModelFanout { .. }
@@ -1454,6 +1622,38 @@ pub(crate) fn generate_recommendations(
 
     recs.dedup();
     recs
+}
+
+fn mark_model_request_usage_unavailable(
+    summary: &mut String,
+    coverage: &mut ObservationDataCoverage,
+) {
+    summary.insert_str(
+        0,
+        "Model-request usage unavailable; this does not establish zero requests. ",
+    );
+    coverage.overall = "partial".into();
+    coverage.providers.insert(
+        "model_request_context".into(),
+        astra_core::ObservationProviderCoverage {
+            status: "missing".into(),
+            freshness_ms: None,
+            reason: Some("source_unavailable".into()),
+        },
+    );
+    coverage.warnings.push(
+        "Model-request usage is unavailable; absence of records does not establish zero requests."
+            .into(),
+    );
+}
+
+fn summarize_model_request_result<E>(
+    result: Result<Vec<ModelRequestContextRecord>, E>,
+) -> (Option<ModelRequestSummary>, bool) {
+    match result {
+        Ok(records) => (ModelRequestSummary::from_records(&records), false),
+        Err(_) => (None, true),
+    }
 }
 
 // ── Database implementation ──────────────────────────────────────────────────
@@ -1673,17 +1873,16 @@ impl ReflectService for DatabaseReflectService {
         // source for prompt-cache accounting. Read a bounded session window
         // only for an explicit reflection request; this keeps the hot turn
         // path untouched while making cache misses explainable to the user.
-        let model_request_summary = if let Some(shared_pool) = self.pool.as_ref() {
-            match crate::model_request_context::list_model_request_context_events(
-                shared_pool,
-                user_id,
-                session_id,
-                500,
-            )
-            .await
-            {
-                Ok(records) => ModelRequestSummary::from_records(&records),
-                Err(error) => {
+        let (model_request_summary, model_request_unavailable) =
+            if let Some(shared_pool) = self.pool.as_ref() {
+                let result = crate::model_request_context::list_model_request_context_events(
+                    shared_pool,
+                    user_id,
+                    session_id,
+                    500,
+                )
+                .await;
+                if let Err(error) = &result {
                     tracing::warn!(
                         target: "astra_services::reflect",
                         user_id = %user_id,
@@ -1691,12 +1890,11 @@ impl ReflectService for DatabaseReflectService {
                         error = %error,
                         "model request context unavailable during reflection"
                     );
-                    None
                 }
-            }
-        } else {
-            None
-        };
+                summarize_model_request_result(result)
+            } else {
+                (None, true)
+            };
 
         let include_semantic_execution = matches!(
             request.depth,
@@ -2037,6 +2235,9 @@ impl ReflectService for DatabaseReflectService {
             &budget_result,
         );
         let mut view = request.view(overview.total_events, overview.total_decisions);
+        if model_request_unavailable {
+            mark_model_request_usage_unavailable(&mut summary, &mut view.data_coverage);
+        }
         if let Some(semantics) = &semantic_judgments {
             view.data_coverage.providers.insert(
                 "semantic_judgment_trace".into(),
@@ -2537,8 +2738,7 @@ mod tests {
         assert!(!summary.contains("validated"), "{summary}");
     }
 
-    #[test]
-    fn model_request_summary_uses_terminal_typed_cache_facts() {
+    fn model_request_test_record() -> ModelRequestContextRecord {
         let identity = ModelRequestIdentity {
             request_id: "request-1".into(),
             provider_response_id: Some("response-1".into()),
@@ -2585,6 +2785,7 @@ mod tests {
             wire_composition: ModelRequestWireComposition::default(),
             tool_result_projections: Vec::new(),
             cache: ModelRequestCache {
+                cache_read_share: Some(950.0 / 1050.0),
                 invalidation_reasons: vec!["tool_schemas_changed".into()],
                 ..Default::default()
             },
@@ -2593,7 +2794,7 @@ mod tests {
             usage_status: Some("provider_exact".into()),
             error_kind: None,
         };
-        let record = ModelRequestContextRecord {
+        ModelRequestContextRecord {
             event_id: "event-1".into(),
             stage: ModelRequestEventStage::Terminal,
             terminal_status: Some("succeeded".into()),
@@ -2601,23 +2802,220 @@ mod tests {
             created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
                 .unwrap()
                 .naive_utc(),
-        };
+        }
+    }
 
-        let summary =
-            ModelRequestSummary::from_records(&[record]).expect("terminal request summary");
+    #[test]
+    fn model_request_summary_uses_terminal_typed_cache_facts() {
+        let record = model_request_test_record();
+        let summary = ModelRequestSummary::from_records(std::slice::from_ref(&record))
+            .expect("terminal request summary");
         assert_eq!(summary.terminal_requests, 1);
         assert_eq!(
             summary.input,
             astra_turn_types::NormalizedPromptCacheUsage::new(50, 950, 50)
         );
         assert_eq!(summary.cache_invalidations, 1);
+        assert_eq!(summary.usage_coverage.exact, 1);
+        assert_eq!(summary.groups.len(), 1);
+        assert_eq!(summary.groups[0].run_id.as_deref(), Some("run-1"));
+        assert_eq!(summary.groups[0].offering_id, "offering-1");
         assert!(
-            summary
-                .render()
-                .contains("cache read 90.5% (950/1050 total input; 50 fresh, 50 cache write)"),
+            summary.render().contains(
+                "known cache read 90.5% (950/1050 known input; 50 fresh, 50 cache write)"
+            ),
             "{}",
             summary.render()
         );
+        assert!(summary.render().contains("usage coverage exact=1"));
+
+        let mut no_cache_evidence = record.clone();
+        no_cache_evidence.event.identity.request_id = "request-systemone".into();
+        no_cache_evidence.event.identity.provider_protocol = "typesafe_systemone".into();
+        no_cache_evidence.event.cache.cache_read_share = None;
+        no_cache_evidence.event.usage.as_mut().unwrap().input =
+            astra_turn_types::NormalizedPromptCacheUsage::new(100, 0, 0);
+        for records in [
+            vec![no_cache_evidence.clone()],
+            vec![record.clone(), no_cache_evidence],
+        ] {
+            let no_cache_evidence = ModelRequestSummary::from_records(&records).unwrap();
+            assert!(
+                no_cache_evidence
+                    .render()
+                    .contains("known cache read unknown")
+            );
+        }
+
+        let mut child = record.clone();
+        child.event_id = "event-2".into();
+        child.event.identity.request_id = "request-2".into();
+        child.event.identity.run_id = Some("child-run".into());
+        child.event.identity.agent_id = Some("child-agent".into());
+        child.event.identity.parent_run_id = Some("run-1".into());
+        child.event.identity.offering_id = "offering-2".into();
+        child.event.identity.inference_purpose = "sub_agent".into();
+        child.event.usage_status = Some("provider_partial".into());
+        let mut retry = child.clone();
+        retry.event_id = "event-3".into();
+        retry.event.identity.request_id = "request-3".into();
+        retry.event.identity.physical_attempt = 1;
+        retry.event.usage = None;
+        retry.event.usage_status = Some("unavailable".into());
+        let duplicate_retry = retry.clone();
+        let unavailable = ModelRequestSummary::from_records(std::slice::from_ref(&retry))
+            .expect("unavailable request summary");
+        assert!(unavailable.render().contains("known_input=unknown"));
+        assert!(unavailable.render().contains("known_output=unknown"));
+
+        let mut exact_zero = record.clone();
+        exact_zero.event.identity.request_id = "request-zero".into();
+        exact_zero.event.usage = Some(ModelRequestUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::default(),
+            output_tokens: 0,
+        });
+        let exact_zero = ModelRequestSummary::from_records(std::slice::from_ref(&exact_zero))
+            .expect("measured-zero request summary");
+        assert!(exact_zero.render().contains("known_input=0"));
+        assert!(exact_zero.render().contains("known_output=0"));
+
+        let mixed = ModelRequestSummary::from_records(&[record, child, retry, duplicate_retry])
+            .expect("mixed parent and child request summary");
+        assert_eq!(
+            mixed.terminal_requests, 3,
+            "duplicate terminal facts collapse"
+        );
+        assert_eq!(mixed.groups.len(), 2);
+        assert_eq!(mixed.usage_coverage.exact, 1);
+        assert_eq!(mixed.usage_coverage.partial, 1);
+        assert_eq!(mixed.usage_coverage.unavailable, 1);
+        let child_group = mixed
+            .groups
+            .iter()
+            .find(|group| group.run_id.as_deref() == Some("child-run"))
+            .expect("child identity group");
+        assert_eq!(child_group.offering_id, "offering-2");
+        assert_eq!(child_group.terminal_requests, 2);
+        assert_eq!(child_group.usage_coverage.partial, 1);
+        assert_eq!(child_group.usage_coverage.unavailable, 1);
+        let rendered = mixed.render();
+        assert!(
+            rendered.contains("run=\"child-run\" agent=\"child-agent\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("partial=1, unavailable=1"), "{rendered}");
+        assert!(rendered.contains("known cache read unknown"), "{rendered}");
+        assert_eq!(
+            render_model_request_identity(Some("model\nforged")),
+            "\"model\\nforged\""
+        );
+        let long_identity = "x".repeat(200);
+        let rendered_identity = render_model_request_identity(Some(&long_identity));
+        assert!(rendered_identity.contains('…'));
+        assert!(rendered_identity.chars().count() <= 131);
+    }
+
+    #[test]
+    fn model_request_duplicates_quarantine_conflicts_independently_of_order() {
+        let original = model_request_test_record();
+        let mut changed_index = original.clone();
+        changed_index.event.identity.physical_attempt += 1;
+        let mut changed_identity = original.clone();
+        changed_identity.event.identity.offering_id = "conflicting-offering".into();
+        changed_identity.event.identity.run_id = Some("conflicting-run".into());
+        let mut changed_usage = original.clone();
+        changed_usage.event.usage.as_mut().unwrap().output_tokens += 1;
+        let mut changed_coverage = original.clone();
+        changed_coverage.event.usage_status = Some("provider_partial".into());
+        let mut changed_cache = original.clone();
+        changed_cache.event.cache.cache_read_share = None;
+
+        let mut retry = original.clone();
+        retry.event.identity.request_id = "distinct-retry".into();
+        retry.event.identity.physical_attempt += 1;
+        let retry_summary =
+            ModelRequestSummary::from_records(std::slice::from_ref(&retry)).unwrap();
+
+        for conflicting in [
+            changed_index,
+            changed_identity,
+            changed_usage,
+            changed_coverage,
+            changed_cache,
+        ] {
+            let mut expected = retry_summary.clone();
+            expected.terminal_requests += 1;
+            expected.conflicting_requests = 1;
+            expected.usage_coverage.unknown = 1;
+            for records in [
+                vec![
+                    original.clone(),
+                    conflicting.clone(),
+                    original.clone(),
+                    retry.clone(),
+                ],
+                vec![
+                    conflicting.clone(),
+                    original.clone(),
+                    retry.clone(),
+                    original.clone(),
+                ],
+                vec![
+                    retry.clone(),
+                    original.clone(),
+                    original.clone(),
+                    conflicting.clone(),
+                ],
+            ] {
+                let summary = ModelRequestSummary::from_records(&records).unwrap();
+                assert_eq!(summary, expected);
+                assert_eq!(summary.render(), expected.render());
+                assert!(summary.render().contains("known cache read unknown"));
+                assert!(
+                    summary
+                        .render()
+                        .contains("1 conflicting physical request(s)")
+                );
+            }
+            let all_conflicted =
+                ModelRequestSummary::from_records(&[original.clone(), conflicting]).unwrap();
+            assert_eq!(all_conflicted.terminal_requests, 1);
+            assert_eq!(all_conflicted.usage_coverage.unknown, 1);
+            assert!(all_conflicted.groups.is_empty());
+            assert_eq!(all_conflicted.usage_observations, 0);
+            assert!(
+                all_conflicted
+                    .render()
+                    .contains("observed output tokens: unknown")
+            );
+        }
+    }
+
+    #[test]
+    fn model_request_duplicates_count_once_but_distinct_retry_ids_count_separately() {
+        let original = model_request_test_record();
+        let mut duplicate = original.clone();
+        // Capture metadata is not physical identity or usage evidence.
+        duplicate.event_id = "replayed-event".into();
+        duplicate.created_at += chrono::Duration::seconds(1);
+        let mut retry = original.clone();
+        retry.event.identity.request_id = "retry-request".into();
+        retry.event.identity.physical_attempt += 1;
+        let expected =
+            ModelRequestSummary::from_records(&[original.clone(), retry.clone()]).unwrap();
+        assert_eq!(expected.terminal_requests, 2);
+        assert_eq!(expected.conflicting_requests, 0);
+        assert_eq!(expected.output_tokens, 20);
+        assert_eq!(expected.groups[0].terminal_requests, 2);
+        for records in [
+            vec![original.clone(), duplicate.clone(), retry.clone()],
+            vec![retry, duplicate, original],
+        ] {
+            assert_eq!(
+                ModelRequestSummary::from_records(&records).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -2627,14 +3025,54 @@ mod tests {
             input: astra_turn_types::NormalizedPromptCacheUsage::new(222, 76_800, 0),
             output_tokens: 176,
             cache_invalidations: 0,
+            usage_observations: 3,
+            cache_usage_observations: 3,
+            usage_coverage: ModelRequestUsageCoverage {
+                exact: 3,
+                ..Default::default()
+            },
+            ..ModelRequestSummary::default()
         };
 
         let rendered = summary.render();
         assert!(
-            rendered.contains("cache read 99.7% (76800/77022 total input; 222 fresh"),
+            rendered.contains("known cache read 99.7% (76800/77022 known input; 222 fresh"),
             "{rendered}"
         );
         assert!(!rendered.contains("34594"), "{rendered}");
+
+        for coverage in [
+            ModelRequestUsageCoverage {
+                exact: 2,
+                partial: 1,
+                ..Default::default()
+            },
+            ModelRequestUsageCoverage {
+                exact: 2,
+                unavailable: 1,
+                ..Default::default()
+            },
+            ModelRequestUsageCoverage {
+                exact: 2,
+                unknown: 1,
+                ..Default::default()
+            },
+        ] {
+            let incomplete = ModelRequestSummary {
+                usage_coverage: coverage,
+                ..summary.clone()
+            };
+            assert!(incomplete.render().contains("known cache read unknown"));
+        }
+        let missing_payload = ModelRequestSummary {
+            usage_observations: 2,
+            ..summary
+        };
+        assert!(
+            missing_payload
+                .render()
+                .contains("known cache read unknown")
+        );
     }
 
     #[test]
@@ -3255,14 +3693,11 @@ mod tests {
     }
 
     #[test]
-    fn insight_stall_many_events_no_decisions() {
+    fn missing_context_decision_audits_do_not_imply_routing_failure() {
         let overview = make_overview(50, 0, vec![], 0, None);
         let insights = generate_insights(&overview, &[], &[]);
-        assert!(
-            insights
-                .iter()
-                .any(|i| i.kind == InsightKind::DecisionStall)
-        );
+        assert!(insights.is_empty());
+        assert!(generate_recommendations(&overview, &[], &insights).is_empty());
     }
 
     #[test]
@@ -3326,24 +3761,8 @@ mod tests {
             affected_tool: "bash".into(),
             fix_hint: "   ".into(),
         }];
-        let insights = vec![Insight {
-            severity: "warning".into(),
-            kind: InsightKind::DecisionStall,
-            message: "Many events but no decisions — possible routing issue".into(),
-            evidence: "50 events, 0 decisions".into(),
-        }];
-
-        let recs = generate_recommendations(&overview, &diagnoses, &insights);
-
-        assert_eq!(
-            recs[0].summary,
-            "Review agent routing — events without decisions may be misconfigured"
-        );
-        assert_eq!(
-            recs[0].source,
-            ReflectRecommendationSource::Insight(InsightKind::DecisionStall)
-        );
-        assert!(recs.iter().all(|rec| !rec.summary.trim().is_empty()));
+        let recs = generate_recommendations(&overview, &diagnoses, &[]);
+        assert!(recs.is_empty());
     }
 
     #[test]
@@ -3568,22 +3987,14 @@ mod tests {
             "how is the session going?",
         );
         let overview = make_overview(80, 0, vec![("bash".into(), 64)], 0, Some(8.0));
-        let insights = vec![
-            Insight {
-                severity: "warning".into(),
-                kind: InsightKind::DecisionStall,
-                message: "Many events but no decisions - possible routing issue".into(),
-                evidence: "80 events, 0 decisions".into(),
+        let insights = vec![Insight {
+            severity: "info".into(),
+            kind: InsightKind::ToolConcentration {
+                tool: "bash".into(),
             },
-            Insight {
-                severity: "info".into(),
-                kind: InsightKind::ToolConcentration {
-                    tool: "bash".into(),
-                },
-                message: "Over-reliance on bash: 80%".into(),
-                evidence: "64/80".into(),
-            },
-        ];
+            message: "Over-reliance on bash: 80%".into(),
+            evidence: "64/80".into(),
+        }];
         let recommendations = generate_recommendations(&overview, &[], &insights);
 
         let (_, observations, _, action_hints, failure_clusters) = build_observation_envelope(
@@ -3597,17 +4008,11 @@ mod tests {
         );
 
         assert_eq!(observations[0].topic, "execution");
-        assert_eq!(observations[0].facet, "stall");
-        assert_eq!(observations[1].topic, "execution");
-        assert_eq!(observations[1].facet, "tools");
-        assert_eq!(action_hints.len(), 2);
+        assert_eq!(observations[0].facet, "tools");
+        assert_eq!(action_hints.len(), 1);
         assert_eq!(
             action_hints[0].observation_refs,
             vec![observations[0].ref_id.clone()]
-        );
-        assert_eq!(
-            action_hints[1].observation_refs,
-            vec![observations[1].ref_id.clone()]
         );
         assert!(
             failure_clusters.is_empty(),
@@ -3671,7 +4076,8 @@ mod tests {
         let (summary, observations, evidence, action_hints, failure_clusters) =
             build_observation_envelope("sess-healthy", &request, &overview, &[], &[], &[], None);
 
-        assert!(summary.contains("Session healthy"));
+        assert!(summary.contains("No classified error events observed"));
+        assert!(summary.contains("task completion is not established"));
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].kind, "session_health");
         assert_eq!(observations[0].severity, "info");
@@ -4069,6 +4475,22 @@ mod tests {
         );
         let mut parsed: ReflectReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, parsed);
+        let mut unavailable = report.clone();
+        unavailable.depth = "hint".into();
+        unavailable.summary = "long preceding summary ".repeat(50);
+        let view = unavailable.view.as_mut().unwrap();
+        view.depth = "hint".into();
+        mark_model_request_usage_unavailable(&mut unavailable.summary, &mut view.data_coverage);
+        unavailable.data_coverage = view.data_coverage.clone();
+        let projected_unavailable = unavailable.project_lightweight();
+        assert!(projected_unavailable.summary.starts_with(
+            "Model-request usage unavailable; this does not establish zero requests."
+        ));
+        assert_eq!(projected_unavailable.data_coverage.overall, "partial");
+        assert_eq!(
+            projected_unavailable.data_coverage,
+            projected_unavailable.view.unwrap().data_coverage
+        );
         // Old reports omit the new optional field; new unavailable captures
         // carry unknown counts rather than inventing zero semantic calls.
         assert!(parsed.semantic_judgments.is_none());
@@ -4086,6 +4508,35 @@ mod tests {
             serde_json::from_value::<ReflectReport>(value).unwrap(),
             projected
         );
+    }
+
+    #[test]
+    fn model_request_read_failure_is_not_an_empty_usage_window() {
+        let (summary, unavailable) = summarize_model_request_result::<&str>(Err("read failed"));
+        assert!(summary.is_none());
+        assert!(unavailable);
+
+        let mut coverage = ObservationDataCoverage {
+            overall: "fresh".into(),
+            source: "server_db".into(),
+            events: 1,
+            decisions: 0,
+            providers: Default::default(),
+            warnings: vec![],
+        };
+        let mut report_summary = "long preceding summary ".repeat(50);
+        mark_model_request_usage_unavailable(&mut report_summary, &mut coverage);
+        assert!(report_summary.starts_with("Model-request usage unavailable"));
+        assert_eq!(coverage.overall, "partial");
+        let provider = &coverage.providers["model_request_context"];
+        assert_eq!(provider.status, "missing");
+        assert_eq!(provider.reason.as_deref(), Some("source_unavailable"));
+        assert!(coverage.warnings[0].contains("does not establish zero requests"));
+
+        let (empty_summary, empty_unavailable) =
+            summarize_model_request_result::<&str>(Ok(Vec::new()));
+        assert!(empty_summary.is_none());
+        assert!(!empty_unavailable);
     }
 
     #[test]

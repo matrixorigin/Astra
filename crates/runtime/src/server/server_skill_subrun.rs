@@ -148,6 +148,7 @@ impl Drop for OuterSkillDispatchGuard {
 /// Creates a [`ServerAgenticLoopHost`] for each sub-run with isolated context
 /// but shared LLM credentials and skill resolver.
 pub struct ServerSkillSubRunExecutor {
+    model_catalog_reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
     model_service: Option<Arc<dyn astra_services::ModelService>>,
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
@@ -262,6 +263,13 @@ impl ServerSkillSubRunExecutor {
         .await
     }
 
+    pub fn with_model_catalog_reader(
+        mut self,
+        reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
+    ) -> Self {
+        self.model_catalog_reader = reader;
+        self
+    }
     pub fn with_model_service(
         mut self,
         service: Option<Arc<dyn astra_services::ModelService>>,
@@ -277,6 +285,7 @@ impl ServerSkillSubRunExecutor {
     ) -> Self {
         Self {
             model_service: None,
+            model_catalog_reader: None,
             matrixone,
             encryptor,
             shared_pool: None,
@@ -573,6 +582,7 @@ impl ServerSkillSubRunExecutor {
             None,
         )
         .with_reflect_service(Arc::clone(&self.reflect_service))
+        .with_model_catalog_reader(self.model_catalog_reader.clone())
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             self.shared_pool.is_some(),
             self.reflect_service.is_configured(),
@@ -1826,6 +1836,7 @@ mod tests {
                     },
                 ),
                 None,
+                None,
             )
             .await;
         assert!(
@@ -1867,6 +1878,7 @@ mod tests {
                         expected_execution_binding_generation: None,
                     },
                 ),
+                None,
                 None,
             )
             .await;

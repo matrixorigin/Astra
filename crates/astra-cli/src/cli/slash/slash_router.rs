@@ -408,7 +408,7 @@ pub(crate) async fn handle_slash_command(
         }
 
         "/messaging" => {
-            handle_messaging_command(arg, state).await;
+            handle_messaging_command(arg, state);
         }
 
         "/agent" => {
@@ -675,6 +675,7 @@ mod model_list_json_tests {
             max_completion_tokens: Some(8192),
             architecture: None,
             thinking_capability: Some(astra_services::models::ThinkingCapability::Both),
+            pricing: None,
         }
     }
 

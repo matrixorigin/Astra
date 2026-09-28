@@ -3,7 +3,7 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStruct};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, query, query_scalar};
+use sqlx::{QueryBuilder, Row, query, query_scalar};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
@@ -14,12 +14,15 @@ use uuid::Uuid;
 
 use crate::auth::FernetTokenEncryptor;
 use astra_core::model_wire::thinking::{ThinkingProtocol, canonical_thinking_protocol};
+use astra_turn_types::ModelSelector;
+mod catalog_reader;
 mod genesis;
 mod thinking_probe;
 use astra_core::{
     ErrorKind, ErrorResponse, MatrixOneSettings, SharedPool,
     classify_model_resolution_error_message, error_response, error_response_coded, internal_error,
 };
+pub use catalog_reader::{AuthorizedModelCatalogReader, read_authorized_model_catalog};
 use thinking_probe::{
     ThinkingProbeSnapshot, cached_capability, probe_chat_protocol, probe_identity,
 };
@@ -40,6 +43,147 @@ pub struct PricingData {
     /// Cache-creation price in USD per token. Missing means the rate is unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write: Option<f64>,
+}
+
+/// Administrator-supplied rates. Unlike legacy usage accounting, every
+/// component needed to publish a price must be explicit at the write boundary.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConfiguredPricingData {
+    pub currency: String,
+    pub unit: String,
+    pub prompt: f64,
+    pub completion: f64,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+}
+
+impl ConfiguredPricingData {
+    fn validate(&self) -> Result<(), String> {
+        if self.currency != "USD" || self.unit != "per_token" {
+            return Err("pricing requires currency=USD and unit=per_token".into());
+        }
+        validate_pricing_data(&PricingData {
+            prompt: self.prompt,
+            completion: self.completion,
+            cache_read: self.cache_read,
+            cache_write: self.cache_write,
+        })
+    }
+}
+
+/// Configured catalog rate, not a provider bill or a task-cost estimate.
+/// Missing pricing remains `None`; an explicitly configured zero is valid.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCatalogPricing {
+    pub currency: String,
+    pub unit: String,
+    pub source: String,
+    pub prompt: f64,
+    pub completion: f64,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+    /// Model configuration update, which need not be a price change.
+    pub configuration_updated_at: String,
+}
+
+fn catalog_pricing_from_stored(raw: &str, updated_at: &str) -> Option<ModelCatalogPricing> {
+    let price = configured_pricing_from_stored(raw)?;
+    let updated_at = updated_at.trim();
+    if updated_at.is_empty() {
+        return None;
+    }
+    Some(ModelCatalogPricing {
+        currency: "USD".into(),
+        unit: "per_token".into(),
+        source: "configured".into(),
+        prompt: price.prompt,
+        completion: price.completion,
+        cache_read: price.cache_read,
+        cache_write: price.cache_write,
+        configuration_updated_at: updated_at.into(),
+    })
+}
+
+pub(crate) fn configured_pricing_from_stored(raw: &str) -> Option<ConfiguredPricingData> {
+    let price = serde_json::from_str::<ConfiguredPricingData>(raw).ok()?;
+    price.validate().ok()?;
+    Some(price)
+}
+
+/// Immutable configured price basis captured at model admission. This is an
+/// admission-rate estimate basis, not a verified provider bill. Private fields
+/// ensure that only validated USD-per-token rates enter the inference ledger.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct InferencePriceSnapshot {
+    calculation_version: u32,
+    #[serde(flatten)]
+    pricing: ModelCatalogPricing,
+}
+
+impl InferencePriceSnapshot {
+    fn from_configured(raw: &str, configuration_updated_at: &str) -> Option<Self> {
+        Some(Self {
+            calculation_version: 1,
+            pricing: catalog_pricing_from_stored(raw, configuration_updated_at)?,
+        })
+    }
+
+    /// Decode retained evidence without consulting today's model catalog.
+    /// Unsupported versions or malformed rates remain unknown.
+    pub fn from_stored(raw: &str) -> Option<Self> {
+        #[derive(Deserialize)]
+        struct Stored {
+            calculation_version: u32,
+            #[serde(flatten)]
+            pricing: ModelCatalogPricing,
+        }
+        let stored: Stored = serde_json::from_str(raw).ok()?;
+        let price = &stored.pricing;
+        if stored.calculation_version != 1
+            || price.currency != "USD"
+            || price.unit != "per_token"
+            || price.source != "configured"
+            || price.configuration_updated_at.trim().is_empty()
+        {
+            return None;
+        }
+        validate_pricing_data(&PricingData {
+            prompt: price.prompt,
+            completion: price.completion,
+            cache_read: price.cache_read,
+            cache_write: price.cache_write,
+        })
+        .ok()?;
+        Some(Self {
+            calculation_version: stored.calculation_version,
+            pricing: stored.pricing,
+        })
+    }
+
+    /// All token lanes must be observed. In particular, an absent cache count
+    /// is not zero, and an observed cache count needs its own configured rate.
+    pub fn estimated_cost_usd(
+        &self,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+    ) -> Option<f64> {
+        PricingData {
+            prompt: self.pricing.prompt,
+            completion: self.pricing.completion,
+            cache_read: self.pricing.cache_read,
+            cache_write: self.pricing.cache_write,
+        }
+        .estimated_cost_usd(
+            input_tokens?,
+            output_tokens?,
+            cache_read_tokens?,
+            cache_write_tokens?,
+        )
+    }
 }
 
 impl PricingData {
@@ -359,7 +503,7 @@ pub struct ModelCreateRequestData {
     pub input_modalities: Vec<String>,
     pub output_modalities: Vec<String>,
     pub supported_parameters: Vec<String>,
-    pub pricing: PricingData,
+    pub pricing: Option<ConfiguredPricingData>,
     pub architecture: Option<String>,
     pub tags: Vec<String>,
     pub quirks: Option<QuirksData>,
@@ -397,7 +541,7 @@ pub struct ModelUpdateRequestData {
     pub input_modalities: Option<Vec<String>>,
     pub output_modalities: Option<Vec<String>>,
     pub supported_parameters: Option<Vec<String>>,
-    pub pricing: Option<PricingData>,
+    pub pricing: Option<ConfiguredPricingData>,
     pub architecture: Option<String>,
     pub tags: Option<Vec<String>>,
     pub is_active: Option<bool>,
@@ -540,6 +684,7 @@ pub struct ModelListItem {
     pub max_completion_tokens: Option<i32>,
     pub architecture: Option<String>,
     pub thinking_capability: Option<ThinkingCapability>,
+    pub pricing: Option<ModelCatalogPricing>,
 }
 
 /// Apply purpose eligibility to the complete catalog before pagination,
@@ -620,6 +765,7 @@ pub fn model_catalog_revision(items: &[ModelListItem]) -> String {
 /// any future `tracing::debug!(?model)` would otherwise leak the raw key.
 #[derive(Clone, PartialEq)]
 pub struct ResolvedActiveLlmModel {
+    pub price_snapshot: Option<InferencePriceSnapshot>,
     /// Local model name used for routing, telemetry, fallback_chain lookups,
     /// and capture-file labels. Unique per row.
     pub model_name: String,
@@ -685,6 +831,17 @@ pub enum ModelAccessKind {
     SelfHosted,
 }
 
+/// Non-secret identity of the authorized Offering source, distinct from its
+/// provider transport. Provider-runtime gateways retain this catalog
+/// provenance rather than substituting protocol-derived `provider` or the
+/// endpoint's default access kind.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedModelSourceIdentity {
+    pub provider: String,
+    pub access_label: String,
+}
+
 /// One declaration policy shared by catalog display and server-default run
 /// admission. No source is inferred from a model name or an API credential.
 pub fn server_model_access_declarations(
@@ -693,30 +850,42 @@ pub fn server_model_access_declarations(
 ) -> Vec<DeclaredModelAccess> {
     let kinds: BTreeSet<_> = kinds.into_iter().collect();
     let mut declared = Vec::new();
-    let mut add = |id: &str, label: &str, kind| {
+    let mut add = |id: &str, kind: ModelAccessKind| {
         declared.push(DeclaredModelAccess {
             id: id.into(),
-            label: label.into(),
+            label: kind.source_label().into(),
             kind,
             execution_placement: ModelExecutionPlacement::Server,
             availability: ModelAccessAvailability::Ready,
         })
     };
     if allows_deployment {
-        add("self-hosted", "Self-hosted", ModelAccessKind::SelfHosted);
+        add("self-hosted", ModelAccessKind::SelfHosted);
     }
     if kinds.contains(&ModelAccessKind::AstraCloud) {
-        add("genesis", "Genesis", ModelAccessKind::AstraCloud);
+        add("genesis", ModelAccessKind::AstraCloud);
     }
     if kinds.contains(&ModelAccessKind::CloudByok)
         || !allows_deployment && !kinds.contains(&ModelAccessKind::AstraCloud)
     {
-        add("cloud-byok", "Cloud BYOK", ModelAccessKind::CloudByok);
+        add("cloud-byok", ModelAccessKind::CloudByok);
     }
     declared
 }
 
 impl ModelAccessKind {
+    /// Stable display/source qualifier used by the authorized model catalog.
+    #[must_use]
+    pub fn source_label(self) -> &'static str {
+        match self {
+            Self::AstraCloud => "Genesis",
+            Self::CloudByok => "Cloud BYOK",
+            Self::Workspace => "Workspace",
+            Self::ThisDevice => "This device",
+            Self::SelfHosted => "Self-hosted",
+        }
+    }
+
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -768,11 +937,14 @@ impl ModelExecutionPlacement {
 /// Non-serializable execution material produced once at the trusted model
 /// admission boundary and consumed by every inference surface.
 ///
-/// Credential origin is intentionally absent. Executors receive one normalized
-/// invocation shape and never branch on the product source that produced it.
+/// Credentials are normalized for execution. The optional source identity is
+/// non-secret provenance used only to preserve and validate the selected
+/// Offering; inference adapters never branch on it.
 #[derive(Clone, PartialEq)]
 pub struct AdmittedModelExecution {
+    pub price_snapshot: Option<InferencePriceSnapshot>,
     pub offering_id: String,
+    pub source_identity: Option<ResolvedModelSourceIdentity>,
     pub access_kind: ModelAccessKind,
     pub execution_placement: ModelExecutionPlacement,
     pub model_name: String,
@@ -797,10 +969,37 @@ pub struct AdmittedModelExecution {
 }
 
 impl AdmittedModelExecution {
+    /// Whether refreshed admission still refers to the same selected model.
+    ///
+    /// Credentials, endpoint URLs, and capability metadata may legitimately
+    /// rotate while an Offering remains selected. The provider and effective
+    /// upstream model name may not: changing either would silently replace the
+    /// model the caller authorized for this execution.
+    #[must_use]
+    pub fn has_same_execution_identity(&self, other: &Self) -> bool {
+        self.offering_id == other.offering_id
+            && self.source_identity == other.source_identity
+            && self.access_kind == other.access_kind
+            && self.execution_placement == other.execution_placement
+            && self.provider == other.provider
+            && self.upstream_model_name() == other.upstream_model_name()
+    }
+
+    /// Name sent in the provider request's `model` field.
+    #[must_use]
+    pub fn upstream_model_name(&self) -> &str {
+        self.wire_model_name.as_deref().unwrap_or(&self.model_name)
+    }
+
     pub fn from_offering(offering: ResolvedModelOffering) -> Result<Self, String> {
         let header_overrides = offering.model.execution_header_overrides()?;
         Ok(Self {
+            price_snapshot: offering.model.price_snapshot,
             offering_id: offering.offering_id,
+            source_identity: Some(ResolvedModelSourceIdentity {
+                provider: offering.model.provider.clone(),
+                access_label: ModelAccessKind::SelfHosted.source_label().to_string(),
+            }),
             access_kind: ModelAccessKind::SelfHosted,
             execution_placement: ModelExecutionPlacement::Server,
             model_name: offering.model.model_name,
@@ -831,7 +1030,9 @@ impl AdmittedModelExecution {
         context_window: u32,
     ) -> Self {
         Self {
+            price_snapshot: None,
             offering_id,
+            source_identity: None,
             access_kind: ModelAccessKind::ThisDevice,
             execution_placement: ModelExecutionPlacement::Edge,
             model_name,
@@ -881,6 +1082,7 @@ impl std::fmt::Debug for AdmittedModelExecution {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelOfferingResolutionError {
     InvalidOfferingId,
+    BatchTooLarge,
     NotFound {
         offering_id: String,
     },
@@ -904,6 +1106,9 @@ fn model_offering_resolution_error_response(
         ModelOfferingResolutionError::InvalidOfferingId => {
             (StatusCode::BAD_REQUEST, "model_selection_invalid")
         }
+        ModelOfferingResolutionError::BatchTooLarge => {
+            (StatusCode::BAD_REQUEST, "model_admission_batch_too_large")
+        }
         ModelOfferingResolutionError::NotFound { .. } => {
             (StatusCode::NOT_FOUND, "model_offering_not_found")
         }
@@ -923,6 +1128,7 @@ impl std::fmt::Display for ModelOfferingResolutionError {
             Self::InvalidOfferingId => {
                 f.write_str("offering_id must be an exact non-empty identifier of at most 64 bytes")
             }
+            Self::BatchTooLarge => f.write_str("Too many model Offerings in one admission"),
             Self::NotFound { offering_id } => {
                 write!(f, "Offering '{offering_id}' is not available")
             }
@@ -1125,6 +1331,18 @@ fn active_llm_model_resolution_cache_remove(key: &ActiveLlmModelCacheKey) {
         .remove(key);
 }
 
+fn deployment_batch_query_error(
+    matrixone: &MatrixOneSettings,
+    offering_ids: &[&str],
+    error: sqlx::Error,
+) -> ModelOfferingResolutionError {
+    for offering_id in offering_ids {
+        let key = ActiveLlmModelCacheKey::for_offering_id(matrixone, offering_id);
+        active_llm_model_resolution_cache_remove(&key);
+    }
+    ModelOfferingResolutionError::Backend(format!("DB query: {error}"))
+}
+
 fn active_llm_model_resolution_lock(key: &ActiveLlmModelCacheKey) -> Arc<tokio::sync::Mutex<()>> {
     ACTIVE_LLM_MODEL_RESOLUTION_LOCKS
         .lock()
@@ -1282,6 +1500,16 @@ fn build_resolved_active_llm_from_row(
     }
 
     Ok(ResolvedActiveLlmModel {
+        price_snapshot: row
+            .try_get::<Option<String>, _>("pricing_json")
+            .ok()
+            .flatten()
+            .zip(
+                row.try_get::<Option<String>, _>("configuration_updated_at")
+                    .ok()
+                    .flatten(),
+            )
+            .and_then(|(raw, revision)| InferencePriceSnapshot::from_configured(&raw, &revision)),
         model_name,
         wire_model_name,
         api_key,
@@ -1505,6 +1733,7 @@ pub fn format_inactive_model_error(requested: &str, canonical: &str) -> String {
 /// Shared columns for all model-resolution queries.
 const RESOLVE_COLS: &str = "\
     model_name, api_key_encrypted, base_url, provider, \
+    CAST(updated_at AS CHAR) AS configuration_updated_at, \
     CAST(quirks AS CHAR) AS quirks_json, \
     CAST(pricing AS CHAR) AS pricing_json, \
     CAST(tags AS CHAR) AS tags_json, \
@@ -1597,6 +1826,129 @@ pub fn validate_model_offering_id(offering_id: &str) -> Result<&str, ModelOfferi
         return Err(ModelOfferingResolutionError::InvalidOfferingId);
     }
     Ok(offering_id)
+}
+
+const MAX_MODEL_ADMISSION_BATCH: usize = 64;
+
+fn resolve_model_selector_offerings(
+    selectors: &[ModelSelector],
+    catalog: &[ModelListItem],
+) -> Result<Vec<String>, (StatusCode, Json<ErrorResponse>)> {
+    if selectors.len() > MAX_MODEL_ADMISSION_BATCH {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "model selector batch exceeds the supported limit",
+            "model_admission_batch_invalid",
+        ));
+    }
+    for selector in selectors {
+        selector.validate().map_err(|detail| {
+            error_response_coded(StatusCode::BAD_REQUEST, detail, "model_selection_invalid")
+        })?;
+    }
+    crate::delegation_model_requirement::resolve_model_selectors(selectors, catalog)
+        .map(|selections| {
+            selections
+                .into_iter()
+                .map(|selection| selection.offering_id)
+                .collect()
+        })
+        .map_err(|detail| {
+            error_response_coded(StatusCode::BAD_REQUEST, detail, "model_selection_invalid")
+        })
+}
+
+fn model_selection_changed_during_admission() -> (StatusCode, Json<ErrorResponse>) {
+    error_response_coded(
+        StatusCode::CONFLICT,
+        "The selected model changed during admission. Refresh model access and retry.",
+        "model_selection_changed",
+    )
+}
+
+/// Keep the catalog identity that resolved a configured name attached through
+/// the existing admission read. If the Offering changes between those reads,
+/// reject it instead of executing a different model under the same request.
+/// This is an in-memory check and adds no database access.
+fn validate_model_selector_admissions(
+    selectors: &[ModelSelector],
+    offering_ids: &[String],
+    catalog: Option<&[ModelListItem]>,
+    admitted: &[AdmittedModelExecution],
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if selectors.len() != offering_ids.len() || selectors.len() != admitted.len() {
+        return Err(error_response_coded(
+            StatusCode::BAD_GATEWAY,
+            "Model admission returned an incomplete selection batch.",
+            "model_admission_incomplete",
+        ));
+    }
+
+    for ((selector, offering_id), execution) in selectors.iter().zip(offering_ids).zip(admitted) {
+        if execution.offering_id != *offering_id {
+            return Err(model_selection_changed_during_admission());
+        }
+
+        let snapshot_item = if let Some(catalog) = catalog {
+            let mut matches = catalog
+                .iter()
+                .filter(|item| item.offering_id == *offering_id);
+            let item = matches.next();
+            if matches.next().is_some() {
+                return Err(model_selection_changed_during_admission());
+            }
+            item
+        } else {
+            None
+        };
+
+        let Some(item) = snapshot_item else {
+            if matches!(selector, ModelSelector::ConfiguredName { .. }) {
+                return Err(model_selection_changed_during_admission());
+            }
+            continue;
+        };
+
+        if let ModelSelector::ConfiguredName { model_name, source } = selector
+            && (!item.is_active
+                || !astra_core::model_wire::purpose::ModelRequestPurpose::Chat
+                    .supported_by(&item.provider)
+                || !item.name.eq_ignore_ascii_case(model_name)
+                || source.as_deref().is_some_and(|source| {
+                    !item.provider.eq_ignore_ascii_case(source)
+                        && !item.access_label.eq_ignore_ascii_case(source)
+                }))
+        {
+            return Err(model_selection_changed_during_admission());
+        }
+
+        if item.is_active
+            && astra_core::model_wire::purpose::ModelRequestPurpose::Chat
+                .supported_by(&item.provider)
+            && (execution.model_name != item.name
+                || execution.provider != item.provider
+                || execution.access_kind != item.access_kind
+                || execution.execution_placement != item.execution_placement
+                || execution.source_identity.as_ref().is_none_or(|source| {
+                    source.provider != item.provider || source.access_label != item.access_label
+                }))
+        {
+            return Err(model_selection_changed_during_admission());
+        }
+    }
+    Ok(())
+}
+
+fn validate_model_admission_batch(
+    offering_ids: &[String],
+) -> Result<(), ModelOfferingResolutionError> {
+    if offering_ids.len() > MAX_MODEL_ADMISSION_BATCH {
+        return Err(ModelOfferingResolutionError::BatchTooLarge);
+    }
+    for offering_id in offering_ids {
+        validate_model_offering_id(offering_id)?;
+    }
+    Ok(())
 }
 
 /// Resolve a client-visible effective Offering by durable ID.
@@ -1708,121 +2060,271 @@ pub async fn revalidate_admitted_model_execution(
     offering_id: &str,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
 ) -> Result<AdmittedModelExecution, ModelOfferingResolutionError> {
-    let offering_id = validate_model_offering_id(offering_id)?;
-    let pool = require_pool(pool, matrixone)
+    let executions = revalidate_admitted_model_executions(
+        matrixone,
+        encryptor,
+        user_id,
+        &[offering_id.to_owned()],
+        pool,
+    )
+    .await?;
+    Ok(executions.into_iter().next().expect("singleton admission"))
+}
+
+/// Resolve a fixed request-local set with one owner lookup and, if needed,
+/// one deployment lookup. No result escapes when any member is invalid.
+/// Every call reads current rows; this is not an authorization cache.
+pub async fn revalidate_admitted_model_executions(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    user_id: &str,
+    offering_ids: &[String],
+    provided_pool: Option<&sqlx::MySqlPool>,
+) -> Result<Vec<AdmittedModelExecution>, ModelOfferingResolutionError> {
+    revalidate_admitted_model_executions_with_access(
+        matrixone,
+        encryptor,
+        user_id,
+        offering_ids,
+        provided_pool,
+        None,
+    )
+    .await
+}
+
+/// Same batch revalidation when the caller already performed the request's
+/// deployment-access check while loading the authorized catalog. Reusing that
+/// fact avoids a second identity/policy query; the exact model rows are still
+/// read here immediately before provider execution.
+async fn revalidate_admitted_model_executions_with_access(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    user_id: &str,
+    offering_ids: &[String],
+    provided_pool: Option<&sqlx::MySqlPool>,
+    deployment_access: Option<bool>,
+) -> Result<Vec<AdmittedModelExecution>, ModelOfferingResolutionError> {
+    validate_model_admission_batch(offering_ids)?;
+    if offering_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pool = require_pool(provided_pool, matrixone)
         .await
         .map_err(ModelOfferingResolutionError::Backend)?;
-    let row = query(
-        "SELECT model_alias, model_name, provider, api_key_encrypted, base_url, \
-         context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json FROM user_llm_models \
-         WHERE user_id = ? AND model_id = ? LIMIT 1",
-    )
-    .bind(user_id)
-    .bind(offering_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|error| ModelOfferingResolutionError::Backend(format!("DB query: {error}")))?;
+    let mut seen = BTreeSet::new();
+    let unique: Vec<&str> = offering_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|offering_id| seen.insert(*offering_id))
+        .collect();
 
-    if let Some(row) = row {
-        let alias: String = row.try_get("model_alias").map_err(|error| {
-            ModelOfferingResolutionError::Backend(format!(
-                "invalid user_llm_models.model_alias: {error}"
-            ))
-        })?;
-        let is_active: i16 = row.try_get("is_active").map_err(|error| {
-            ModelOfferingResolutionError::Backend(format!(
-                "invalid user_llm_models.is_active: {error}"
-            ))
-        })?;
-        if is_active == 0 {
-            return Err(ModelOfferingResolutionError::Inactive {
-                offering_id: offering_id.to_string(),
-                model_name: alias,
-            });
-        }
-        let encrypted: String = row.try_get("api_key_encrypted").map_err(|error| {
-            ModelOfferingResolutionError::Backend(format!(
-                "invalid user_llm_models.api_key_encrypted: {error}"
-            ))
-        })?;
-        let api_key = encryptor
-            .decrypt(&encrypted)
-            .map_err(ModelOfferingResolutionError::Backend)?;
-        let context_window: i32 = row.try_get("context_window").map_err(|error| {
-            ModelOfferingResolutionError::Backend(format!(
-                "invalid user_llm_models.context_window: {error}"
-            ))
-        })?;
-        let context_window = u32::try_from(context_window).map_err(|_| {
-            ModelOfferingResolutionError::Backend(
-                "invalid user_llm_models.context_window: must be positive".to_string(),
-            )
-        })?;
-        let provider: String = row
-            .try_get("provider")
-            .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-        let base_url: String = row
-            .try_get("base_url")
-            .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-        if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
-            crate::byok_endpoint::require_endpoint_policy(&pool, &base_url)
-                .await
-                .map_err(ModelOfferingResolutionError::Backend)?;
-        }
-        let upstream: String = row
-            .try_get("model_name")
-            .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-        let protocol = canonical_thinking_protocol(&provider, &base_url, &upstream);
-        let snapshot: Option<String> = row
-            .try_get("thinking_probe_json")
-            .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
-        let identity = probe_identity(&provider, &base_url, &upstream, &encrypted, "");
-        let thinking_capability = cached_capability(snapshot.as_deref(), &identity, protocol);
-        return Ok(AdmittedModelExecution {
-            offering_id: offering_id.to_string(),
-            access_kind: ModelAccessKind::CloudByok,
-            execution_placement: ModelExecutionPlacement::Server,
-            model_name: alias,
-            wire_model_name: Some(row.try_get("model_name").map_err(|error| {
-                ModelOfferingResolutionError::Backend(format!(
-                    "invalid user_llm_models.model_name: {error}"
-                ))
-            })?),
-            api_key,
-            base_url: row.try_get("base_url").map_err(|error| {
-                ModelOfferingResolutionError::Backend(format!(
-                    "invalid user_llm_models.base_url: {error}"
-                ))
-            })?,
-            provider: row.try_get("provider").map_err(|error| {
-                ModelOfferingResolutionError::Backend(format!(
-                    "invalid user_llm_models.provider: {error}"
-                ))
-            })?,
-            cache_capability: None,
-            thinking_capability,
-            fixed_temperature: None,
-            thinking_protocol: Some(protocol),
-            request_body_overrides: None,
-            context_window: Some(context_window),
-            max_completion_tokens: None,
-            header_overrides: HashMap::new(),
-            completions_url_override: None,
-            request_timeout_ms: None,
-        });
-    }
-
-    if !deployment_models_allowed(&pool, user_id)
-        .await
-        .map_err(ModelOfferingResolutionError::Backend)?
+    let mut personal_query = QueryBuilder::<sqlx::MySql>::new(
+        "SELECT model_id, model_alias, model_name, provider, api_key_encrypted, base_url, \
+         context_window, is_active, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json \
+         FROM user_llm_models WHERE user_id = ",
+    );
+    personal_query.push_bind(user_id).push(" AND model_id IN (");
     {
-        return Err(ModelOfferingResolutionError::NotFound {
+        let mut separated = personal_query.separated(", ");
+        for offering_id in &unique {
+            separated.push_bind(*offering_id);
+        }
+    }
+    personal_query.push(')');
+    let mut personal = HashMap::new();
+    for row in personal_query
+        .build()
+        .fetch_all(&pool)
+        .await
+        .map_err(|error| ModelOfferingResolutionError::Backend(format!("DB query: {error}")))?
+    {
+        let id: String = row.try_get("model_id").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!(
+                "invalid user_llm_models.model_id: {error}"
+            ))
+        })?;
+        personal.insert(id, row);
+    }
+
+    let unresolved: Vec<&str> = unique
+        .iter()
+        .copied()
+        .filter(|id| !personal.contains_key(*id))
+        .collect();
+    let deployment_allowed = if unresolved.is_empty() {
+        false
+    } else if let Some(allowed) = deployment_access {
+        allowed
+    } else {
+        deployment_models_allowed(&pool, user_id)
+            .await
+            .map_err(ModelOfferingResolutionError::Backend)?
+    };
+    let mut deployment = HashMap::new();
+    if deployment_allowed {
+        let mut deployment_query = QueryBuilder::<sqlx::MySql>::new(format!(
+            "SELECT model_id, {RESOLVE_COLS}, is_active FROM infra_llm_models WHERE model_id IN ("
+        ));
+        {
+            let mut separated = deployment_query.separated(", ");
+            for offering_id in &unresolved {
+                separated.push_bind(*offering_id);
+            }
+        }
+        deployment_query.push(')');
+        let deployment_rows = deployment_query
+            .build()
+            .fetch_all(&pool)
+            .await
+            .map_err(|error| deployment_batch_query_error(matrixone, &unresolved, error))?;
+        for row in deployment_rows {
+            let id: String = row.try_get("model_id").map_err(|error| {
+                ModelOfferingResolutionError::Backend(format!(
+                    "invalid infra_llm_models.model_id: {error}"
+                ))
+            })?;
+            deployment.insert(id, row);
+        }
+    }
+
+    let mut resolved: HashMap<&str, AdmittedModelExecution> = HashMap::new();
+    let mut ordered = Vec::with_capacity(offering_ids.len());
+    for offering_id in offering_ids {
+        if let Some(execution) = resolved.get(offering_id.as_str()) {
+            ordered.push(execution.clone());
+            continue;
+        }
+        let execution = if let Some(row) = personal.get(offering_id) {
+            admitted_user_model_from_row(row, offering_id, encryptor)?
+        } else {
+            let cache_key = ActiveLlmModelCacheKey::for_offering_id(matrixone, offering_id);
+            let row = deployment.get(offering_id).ok_or_else(|| {
+                active_llm_model_resolution_cache_remove(&cache_key);
+                ModelOfferingResolutionError::NotFound {
+                    offering_id: offering_id.clone(),
+                }
+            })?;
+            let model = resolved_active_llm_from_offering_row(row, offering_id, encryptor)
+                .inspect_err(|_| {
+                    active_llm_model_resolution_cache_remove(&cache_key);
+                })?;
+            let execution = AdmittedModelExecution::from_offering(ResolvedModelOffering {
+                offering_id: offering_id.clone(),
+                model: model.clone(),
+            })
+            .map_err(|error| {
+                active_llm_model_resolution_cache_remove(&cache_key);
+                ModelOfferingResolutionError::Backend(error)
+            })?;
+            active_llm_model_resolution_cache_store(cache_key, model);
+            execution
+        };
+        resolved.insert(offering_id.as_str(), execution.clone());
+        ordered.push(execution);
+    }
+    let compatible_endpoints = ordered
+        .iter()
+        .filter(|execution| {
+            execution.access_kind == ModelAccessKind::CloudByok
+                && execution.provider == crate::byok_endpoint::COMPATIBLE_PROVIDER
+        })
+        .map(|execution| execution.base_url.as_str())
+        .collect::<Vec<_>>();
+    crate::byok_endpoint::require_endpoint_policies(&pool, &compatible_endpoints)
+        .await
+        .map_err(ModelOfferingResolutionError::Backend)?;
+    Ok(ordered)
+}
+
+fn admitted_user_model_from_row(
+    row: &sqlx::mysql::MySqlRow,
+    offering_id: &str,
+    encryptor: &FernetTokenEncryptor,
+) -> Result<AdmittedModelExecution, ModelOfferingResolutionError> {
+    let alias: String = row.try_get("model_alias").map_err(|error| {
+        ModelOfferingResolutionError::Backend(format!(
+            "invalid user_llm_models.model_alias: {error}"
+        ))
+    })?;
+    let is_active: i16 = row.try_get("is_active").map_err(|error| {
+        ModelOfferingResolutionError::Backend(format!("invalid user_llm_models.is_active: {error}"))
+    })?;
+    if is_active == 0 {
+        return Err(ModelOfferingResolutionError::Inactive {
             offering_id: offering_id.to_string(),
+            model_name: alias,
         });
     }
-    let offering =
-        revalidate_active_llm_offering(matrixone, encryptor, offering_id, Some(&pool)).await?;
-    AdmittedModelExecution::from_offering(offering).map_err(ModelOfferingResolutionError::Backend)
+    let encrypted: String = row.try_get("api_key_encrypted").map_err(|error| {
+        ModelOfferingResolutionError::Backend(format!(
+            "invalid user_llm_models.api_key_encrypted: {error}"
+        ))
+    })?;
+    let api_key = encryptor
+        .decrypt(&encrypted)
+        .map_err(ModelOfferingResolutionError::Backend)?;
+    let context_window: i32 = row.try_get("context_window").map_err(|error| {
+        ModelOfferingResolutionError::Backend(format!(
+            "invalid user_llm_models.context_window: {error}"
+        ))
+    })?;
+    let context_window = u32::try_from(context_window).map_err(|_| {
+        ModelOfferingResolutionError::Backend(
+            "invalid user_llm_models.context_window: must be positive".to_string(),
+        )
+    })?;
+    let provider: String = row
+        .try_get("provider")
+        .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+    let base_url: String = row
+        .try_get("base_url")
+        .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+    let upstream: String = row
+        .try_get("model_name")
+        .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+    let protocol = canonical_thinking_protocol(&provider, &base_url, &upstream);
+    let snapshot: Option<String> = row
+        .try_get("thinking_probe_json")
+        .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+    let identity = probe_identity(&provider, &base_url, &upstream, &encrypted, "");
+    let thinking_capability = cached_capability(snapshot.as_deref(), &identity, protocol);
+    Ok(AdmittedModelExecution {
+        price_snapshot: None,
+        offering_id: offering_id.to_string(),
+        source_identity: Some(ResolvedModelSourceIdentity {
+            provider: provider.clone(),
+            access_label: ModelAccessKind::CloudByok.source_label().to_string(),
+        }),
+        access_kind: ModelAccessKind::CloudByok,
+        execution_placement: ModelExecutionPlacement::Server,
+        model_name: alias,
+        wire_model_name: Some(row.try_get("model_name").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!(
+                "invalid user_llm_models.model_name: {error}"
+            ))
+        })?),
+        api_key,
+        base_url: row.try_get("base_url").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!(
+                "invalid user_llm_models.base_url: {error}"
+            ))
+        })?,
+        provider: row.try_get("provider").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!(
+                "invalid user_llm_models.provider: {error}"
+            ))
+        })?,
+        cache_capability: None,
+        thinking_capability,
+        fixed_temperature: None,
+        thinking_protocol: Some(protocol),
+        request_body_overrides: None,
+        context_window: Some(context_window),
+        max_completion_tokens: None,
+        header_overrides: HashMap::new(),
+        completions_url_override: None,
+        request_timeout_ms: None,
+    })
 }
 
 /// Shared eligibility gate for catalog and execution, including resumed runs.
@@ -1877,6 +2379,14 @@ async fn resolve_active_llm_offering_uncached(
         offering_id: offering_id.to_string(),
     })?;
 
+    resolved_active_llm_from_offering_row(&row, offering_id, encryptor)
+}
+
+fn resolved_active_llm_from_offering_row(
+    row: &sqlx::mysql::MySqlRow,
+    offering_id: &str,
+    encryptor: &FernetTokenEncryptor,
+) -> Result<ResolvedActiveLlmModel, ModelOfferingResolutionError> {
     let is_active: i16 = row.try_get("is_active").map_err(|error| {
         ModelOfferingResolutionError::Backend(format!(
             "invalid infra_llm_models.is_active: {error}"
@@ -1894,7 +2404,7 @@ async fn resolve_active_llm_offering_uncached(
         });
     }
 
-    build_resolved_active_llm_from_row(&row, encryptor)
+    build_resolved_active_llm_from_row(row, encryptor)
         .map_err(ModelOfferingResolutionError::Backend)
 }
 
@@ -2180,7 +2690,7 @@ pub async fn resolve_memory_offerings(
 
 /// Return the index of the cheapest entry by `pricing.completion`.
 ///
-/// * Missing / unparseable pricing and `completion <= 0` are treated as `+infinity`,
+/// * Missing / unproven pricing is treated as `+infinity`,
 ///   so they lose to any priced row.
 /// * Ties on price are broken by ascending `model_name` (so the result is deterministic).
 ///
@@ -2209,10 +2719,8 @@ pub(crate) fn rank_cheapest_index(entries: &[(String, String)]) -> usize {
 }
 
 fn score_completion(pricing_json: &str) -> f64 {
-    serde_json::from_str::<PricingData>(pricing_json)
+    configured_pricing_from_stored(pricing_json)
         .map(|p| p.completion)
-        .ok()
-        .filter(|c| *c > 0.0)
         .unwrap_or(f64::INFINITY)
 }
 
@@ -2585,6 +3093,94 @@ pub trait ModelService: Send + Sync {
         AdmittedModelExecution::from_offering(offering).map_err(internal_error)
     }
 
+    /// Admit a bounded set of exact Offerings for one authenticated user.
+    /// Implementations with storage should batch their reads; the default
+    /// keeps custom ModelService implementations compatible with this owner.
+    async fn admit_model_offerings(
+        &self,
+        user_id: String,
+        offering_ids: Vec<String>,
+    ) -> Result<Vec<AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)> {
+        validate_model_admission_batch(&offering_ids)
+            .map_err(model_offering_resolution_error_response)?;
+        let mut admitted: HashMap<String, AdmittedModelExecution> = HashMap::new();
+        let mut ordered = Vec::with_capacity(offering_ids.len());
+        for offering_id in offering_ids {
+            if let Some(execution) = admitted.get(&offering_id) {
+                ordered.push(execution.clone());
+                continue;
+            }
+            let execution = self
+                .admit_model_offering(user_id.clone(), offering_id.clone())
+                .await?;
+            admitted.insert(offering_id, execution.clone());
+            ordered.push(execution);
+        }
+        Ok(ordered)
+    }
+
+    /// Resolve and admit a bounded child selection batch. Exact Offering IDs
+    /// retain the existing admission-only path. Configured names trigger one
+    /// authorized catalog read for the whole batch, followed by the same
+    /// all-or-error Offering admission; no per-slot lookup is permitted.
+    async fn admit_model_selectors(
+        &self,
+        user_id: String,
+        selectors: Vec<ModelSelector>,
+    ) -> Result<Vec<AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)> {
+        if selectors.len() > MAX_MODEL_ADMISSION_BATCH {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "model selector batch exceeds the supported limit",
+                "model_admission_batch_invalid",
+            ));
+        }
+        for selector in &selectors {
+            selector.validate().map_err(|detail| {
+                error_response_coded(StatusCode::BAD_REQUEST, detail, "model_selection_invalid")
+            })?;
+        }
+        if selectors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (offering_ids, catalog) = if selectors
+            .iter()
+            .any(|selector| matches!(selector, ModelSelector::ConfiguredName { .. }))
+        {
+            let catalog = self.list_models(user_id.clone(), false).await?;
+            let offering_ids = resolve_model_selector_offerings(&selectors, &catalog)?;
+            (offering_ids, Some(catalog))
+        } else {
+            for selector in &selectors {
+                selector.validate().map_err(|detail| {
+                    error_response_coded(StatusCode::BAD_REQUEST, detail, "model_selection_invalid")
+                })?;
+            }
+            let offering_ids = selectors
+                .iter()
+                .map(|selector| match selector {
+                    ModelSelector::OfferingId { offering_id } => Ok(offering_id.clone()),
+                    ModelSelector::ConfiguredName { .. } => Err(error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        "configured model name requires catalog resolution",
+                        "model_selection_invalid",
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (offering_ids, None)
+        };
+        let admitted = self
+            .admit_model_offerings(user_id, offering_ids.clone())
+            .await?;
+        validate_model_selector_admissions(
+            &selectors,
+            &offering_ids,
+            catalog.as_deref(),
+            &admitted,
+        )?;
+        Ok(admitted)
+    }
+
     async fn create_model(
         &self,
         user_id: String,
@@ -2819,6 +3415,10 @@ impl DatabaseModelService {
         let cap_str: Option<String> = row.try_get("thinking_capability").map_err(internal_error)?;
         let thinking_capability =
             ThinkingCapability::try_from_db_column(cap_str.as_deref()).map_err(internal_error)?;
+        let pricing_json: String = row.try_get("pricing_json").map_err(internal_error)?;
+        let configuration_updated_at: String = row
+            .try_get("configuration_updated_at")
+            .map_err(internal_error)?;
 
         Ok(ModelListItem {
             offering_id: row.try_get("model_id").map_err(internal_error)?,
@@ -2836,6 +3436,7 @@ impl DatabaseModelService {
                 .map_err(internal_error)?,
             architecture: row.try_get("architecture").map_err(internal_error)?,
             thinking_capability,
+            pricing: catalog_pricing_from_stored(&pricing_json, &configuration_updated_at),
         })
     }
 
@@ -2922,33 +3523,7 @@ impl DatabaseModelService {
 
         let mut models = Vec::with_capacity(rows.len());
         for row in rows {
-            let is_active_int: i16 = row.try_get("is_active").map_err(internal_error)?;
-            let name: String = row.try_get("model_name").map_err(internal_error)?;
-            let context_window: i32 = row.try_get("context_window").map_err(internal_error)?;
-            let context_window =
-                model_context_window_from_db(context_window, &name).map_err(internal_error)? as i32;
-            models.push(ModelListItem {
-                offering_id: row.try_get("model_id").map_err(internal_error)?,
-                access_id: "self-hosted".to_string(),
-                access_kind: ModelAccessKind::SelfHosted,
-                access_label: "Self-hosted".to_string(),
-                execution_placement: ModelExecutionPlacement::Server,
-                name,
-                provider: row.try_get("provider").map_err(internal_error)?,
-                description: row.try_get("description").map_err(internal_error)?,
-                is_active: is_active_int != 0,
-                context_window,
-                max_completion_tokens: row
-                    .try_get("max_completion_tokens")
-                    .map_err(internal_error)?,
-                architecture: row.try_get("architecture").map_err(internal_error)?,
-                thinking_capability: {
-                    let cap_str: Option<String> =
-                        row.try_get("thinking_capability").map_err(internal_error)?;
-                    ThinkingCapability::try_from_db_column(cap_str.as_deref())
-                        .map_err(internal_error)?
-                },
-            });
+            models.push(Self::model_list_item_from_row(&row)?);
         }
         if !is_admin && !user_id.is_empty() {
             let user_rows = query(&format!(
@@ -2982,6 +3557,7 @@ impl DatabaseModelService {
                     max_completion_tokens: None,
                     architecture: None,
                     thinking_capability,
+                    pricing: None,
                 });
             }
         }
@@ -3004,6 +3580,40 @@ impl DatabaseModelService {
         .await
         .map_err(internal_error)
     }
+
+    async fn admit_row_model_offerings(
+        &self,
+        user_id: &str,
+        offering_ids: &[String],
+    ) -> Result<Vec<AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)> {
+        revalidate_admitted_model_executions(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            user_id,
+            offering_ids,
+            self.pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(model_offering_resolution_error_response)
+    }
+
+    async fn admit_row_model_offerings_with_access(
+        &self,
+        user_id: &str,
+        offering_ids: &[String],
+        deployment_allowed: bool,
+    ) -> Result<Vec<AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)> {
+        revalidate_admitted_model_executions_with_access(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            user_id,
+            offering_ids,
+            self.pool.as_ref().map(SharedPool::get),
+            Some(deployment_allowed),
+        )
+        .await
+        .map_err(model_offering_resolution_error_response)
+    }
 }
 
 pub const MODEL_SELECT_COLS: &str = "\
@@ -3019,7 +3629,8 @@ pub const MODEL_SELECT_COLS: &str = "\
 const MODEL_LIST_SELECT_COLS: &str = "\
     model_id, model_name, provider, description, is_active, \
     context_window, max_completion_tokens, architecture, \
-    thinking_capability";
+    thinking_capability, CAST(pricing AS CHAR) AS pricing_json, \
+    CAST(updated_at AS CHAR) AS configuration_updated_at";
 const MODEL_LIST_CURSOR_SQL: &str = " AND (provider > ? \
      OR (provider = ? AND model_name > ?) \
      OR (provider = ? AND model_name = ? AND model_id > ?))";
@@ -3561,15 +4172,102 @@ impl ModelService for DatabaseModelService {
         if let Some(subject) = self.uc_subject(&user_id).await? {
             return self.admit_genesis(&subject, &offering_id).await;
         }
-        revalidate_admitted_model_execution(
-            &self.matrixone,
-            self.encryptor.as_ref(),
-            &user_id,
-            &offering_id,
-            self.pool.as_ref().map(SharedPool::get),
-        )
-        .await
-        .map_err(model_offering_resolution_error_response)
+        self.admit_row_model_offerings(&user_id, std::slice::from_ref(&offering_id))
+            .await
+            .map(|mut executions| {
+                executions
+                    .pop()
+                    .expect("singleton model admission returned no execution")
+            })
+    }
+
+    async fn admit_model_offerings(
+        &self,
+        user_id: String,
+        offering_ids: Vec<String>,
+    ) -> Result<Vec<AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)> {
+        validate_model_admission_batch(&offering_ids)
+            .map_err(model_offering_resolution_error_response)?;
+        if offering_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(subject) = self.uc_subject(&user_id).await? {
+            let catalog = self.genesis_catalog(&subject).await?;
+            return offering_ids
+                .iter()
+                .map(|offering_id| self.admit_genesis_from_catalog(&catalog, offering_id))
+                .collect();
+        }
+        self.admit_row_model_offerings(&user_id, &offering_ids)
+            .await
+    }
+
+    async fn admit_model_selectors(
+        &self,
+        user_id: String,
+        selectors: Vec<ModelSelector>,
+    ) -> Result<Vec<AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)> {
+        if selectors.len() > MAX_MODEL_ADMISSION_BATCH {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "model selector batch exceeds the supported limit",
+                "model_admission_batch_invalid",
+            ));
+        }
+        if selectors.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !selectors
+            .iter()
+            .any(|selector| matches!(selector, ModelSelector::ConfiguredName { .. }))
+        {
+            for selector in &selectors {
+                selector.validate().map_err(|detail| {
+                    error_response_coded(StatusCode::BAD_REQUEST, detail, "model_selection_invalid")
+                })?;
+            }
+            let offering_ids = selectors
+                .iter()
+                .map(|selector| match selector {
+                    ModelSelector::OfferingId { offering_id } => Ok(offering_id.clone()),
+                    ModelSelector::ConfiguredName { .. } => unreachable!(),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let admitted = self
+                .admit_model_offerings(user_id, offering_ids.clone())
+                .await?;
+            validate_model_selector_admissions(&selectors, &offering_ids, None, &admitted)?;
+            return Ok(admitted);
+        }
+        if let Some(subject) = self.uc_subject(&user_id).await? {
+            let catalog = self.genesis_catalog(&subject).await?;
+            let offering_ids = resolve_model_selector_offerings(&selectors, &catalog.items)?;
+            let admitted = offering_ids
+                .iter()
+                .map(|offering_id| self.admit_genesis_from_catalog(&catalog, offering_id))
+                .collect::<Result<Vec<_>, _>>()?;
+            validate_model_selector_admissions(
+                &selectors,
+                &offering_ids,
+                Some(&catalog.items),
+                &admitted,
+            )?;
+            return Ok(admitted);
+        }
+        // `uc_subject` already established that this caller is not mapped to
+        // a Genesis identity. Materialize the normal authorized catalog
+        // directly instead of calling `list_models`, which would repeat the
+        // same identity lookup before reading the catalog.
+        let deployment_allowed = self.allows_deployment_models(user_id.clone()).await?;
+        let catalog = self
+            .list_models_with_deployment_access(user_id.clone(), false, deployment_allowed)
+            .await?;
+        let offering_ids = resolve_model_selector_offerings(&selectors, &catalog)?;
+        let admitted = self
+            .admit_row_model_offerings_with_access(&user_id, &offering_ids, deployment_allowed)
+            .await?;
+        validate_model_selector_admissions(&selectors, &offering_ids, Some(&catalog), &admitted)?;
+        Ok(admitted)
     }
 
     async fn create_model(
@@ -3577,8 +4275,11 @@ impl ModelService for DatabaseModelService {
         user_id: String,
         request: ModelCreateRequestData,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-        validate_pricing_data(&request.pricing)
-            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        if let Some(pricing) = request.pricing.as_ref() {
+            pricing
+                .validate()
+                .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        }
         let pool = self.get_pool().await.map_err(internal_error)?;
         let context_window = require_create_context_window(request.context_window)?;
 
@@ -3640,7 +4341,13 @@ impl ModelService for DatabaseModelService {
             .unwrap_or_else(|_| r#"["text"]"#.to_string());
         let supported = serde_json::to_string(&request.supported_parameters)
             .unwrap_or_else(|_| "[]".to_string());
-        let pricing = serde_json::to_string(&request.pricing).unwrap_or_else(|_| "{}".to_string());
+        let pricing = request
+            .pricing
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(internal_error)?
+            .unwrap_or_else(|| "{}".to_string());
         let tags = serde_json::to_string(&request.tags).unwrap_or_else(|_| "[]".to_string());
         let quirks = request
             .quirks
@@ -3896,7 +4603,8 @@ impl ModelService for DatabaseModelService {
         request: ModelUpdateRequestData,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
         if let Some(pricing) = request.pricing.as_ref() {
-            validate_pricing_data(pricing)
+            pricing
+                .validate()
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         }
         let pool = self.get_pool().await.map_err(internal_error)?;
@@ -4996,8 +5704,7 @@ pub struct ModelCreateRequest {
     pub output_modalities: Vec<String>,
     #[serde(default)]
     pub supported_parameters: Vec<String>,
-    #[serde(default)]
-    pub pricing: PricingData,
+    pub pricing: Option<ConfiguredPricingData>,
     pub architecture: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -5019,7 +5726,7 @@ pub struct ModelUpdateRequest {
     pub input_modalities: Option<Vec<String>>,
     pub output_modalities: Option<Vec<String>>,
     pub supported_parameters: Option<Vec<String>>,
-    pub pricing: Option<PricingData>,
+    pub pricing: Option<ConfiguredPricingData>,
     pub architecture: Option<String>,
     pub tags: Option<Vec<String>>,
     pub is_active: Option<bool>,
@@ -5067,6 +5774,7 @@ pub struct ModelListItemResponse {
     pub max_completion_tokens: Option<i32>,
     pub architecture: Option<String>,
     pub thinking_capability: Option<ThinkingCapability>,
+    pub pricing: Option<ModelCatalogPricing>,
 }
 
 impl From<ModelRecord> for ModelResponse {
@@ -5110,6 +5818,28 @@ impl From<ModelListItem> for ModelListItemResponse {
             max_completion_tokens: r.max_completion_tokens,
             architecture: r.architecture,
             thinking_capability: r.thinking_capability,
+            pricing: r.pricing,
+        }
+    }
+}
+
+impl From<ModelListItemResponse> for ModelListItem {
+    fn from(item: ModelListItemResponse) -> Self {
+        Self {
+            offering_id: item.offering_id,
+            access_id: item.access_id,
+            access_kind: item.access_kind,
+            access_label: item.access_label,
+            execution_placement: item.execution_placement,
+            name: item.name,
+            provider: item.provider,
+            description: item.description,
+            is_active: item.is_active,
+            context_window: item.context_window,
+            max_completion_tokens: item.max_completion_tokens,
+            architecture: item.architecture,
+            thinking_capability: item.thinking_capability,
+            pricing: item.pricing,
         }
     }
 }
@@ -5761,7 +6491,178 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         }
+    }
+
+    #[test]
+    fn configured_name_admission_rejects_identity_drift() {
+        let selector = ModelSelector::ConfiguredName {
+            model_name: "selected-model".to_string(),
+            source: Some("openai".to_string()),
+        };
+        let offering_id = "selected-offering".to_string();
+        let catalog = [test_model_list_item(
+            "openai",
+            "selected-model",
+            &offering_id,
+        )];
+        let selected = AdmittedModelExecution::from_offering(ResolvedModelOffering {
+            offering_id: offering_id.clone(),
+            model: sample_resolved_active_model("selected-model"),
+        })
+        .expect("admitted selection");
+
+        validate_model_selector_admissions(
+            std::slice::from_ref(&selector),
+            std::slice::from_ref(&offering_id),
+            Some(&catalog),
+            std::slice::from_ref(&selected),
+        )
+        .expect("unchanged catalog identity is admitted");
+
+        let changed_name = AdmittedModelExecution {
+            model_name: "different-model".to_string(),
+            ..selected.clone()
+        };
+        let error = validate_model_selector_admissions(
+            std::slice::from_ref(&selector),
+            std::slice::from_ref(&offering_id),
+            Some(&catalog),
+            std::slice::from_ref(&changed_name),
+        )
+        .expect_err("admission must not silently change the selected model");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+
+        let changed_source = AdmittedModelExecution {
+            source_identity: Some(ResolvedModelSourceIdentity {
+                provider: "openai".to_string(),
+                access_label: "Different source".to_string(),
+            }),
+            ..selected
+        };
+        let error = validate_model_selector_admissions(
+            std::slice::from_ref(&selector),
+            std::slice::from_ref(&offering_id),
+            Some(&catalog),
+            std::slice::from_ref(&changed_source),
+        )
+        .expect_err("admission must not silently change the selected source");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn catalog_pricing_preserves_explicit_zero_and_unknown_rates() {
+        let updated_at = "2026-09-23 12:00:00.000000";
+        let priced = catalog_pricing_from_stored(
+            r#"{"currency":"USD","unit":"per_token","prompt":0,"completion":0.000002,"cache_read":0.0000002}"#,
+            updated_at,
+        )
+        .unwrap();
+        assert_eq!(priced.prompt, 0.0);
+        assert_eq!(priced.completion, 0.000002);
+        assert_eq!(priced.cache_read, Some(0.0000002));
+        assert_eq!(priced.cache_write, None);
+        assert_eq!(priced.currency, "USD");
+        assert_eq!(priced.unit, "per_token");
+        assert_eq!(priced.source, "configured");
+        assert_eq!(priced.configuration_updated_at, updated_at);
+
+        for raw in [
+            "null",
+            "{}",
+            r#"{"prompt":0}"#,
+            r#"{"prompt":0,"completion":0}"#,
+            r#"{"prompt":1,"completion":2}"#,
+            r#"{"currency":"CNY","unit":"per_token","prompt":1,"completion":2}"#,
+            r#"{"currency":"USD","unit":"per_million_tokens","prompt":1,"completion":2}"#,
+            r#"{"currency":"USD","unit":"per_token","prompt":"0","completion":1}"#,
+            r#"{"currency":"USD","unit":"per_token","prompt":-1,"completion":1}"#,
+            r#"{"currency":"USD","unit":"per_token","prompt":1,"completion":2,"cache_read":-1}"#,
+            r#"{"currency":"USD","unit":"per_token","prompt":1,"completion":2,"cache_write":"free"}"#,
+            r#"{"currency":"USD","unit":"per_token","prompt":1e999,"completion":2}"#,
+        ] {
+            assert!(
+                catalog_pricing_from_stored(raw, updated_at).is_none(),
+                "{raw}"
+            );
+        }
+        assert!(
+            catalog_pricing_from_stored(
+                r#"{"currency":"USD","unit":"per_token","prompt":0,"completion":0}"#,
+                " "
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn configured_price_requires_explicit_currency_unit_and_both_rates() {
+        for raw in [
+            r#"{"prompt":0,"completion":0}"#,
+            r#"{"currency":"USD","unit":"per_token","prompt":0}"#,
+            r#"{"currency":"CNY","unit":"per_token","prompt":0,"completion":0}"#,
+        ] {
+            if let Ok(price) = serde_json::from_str::<ConfiguredPricingData>(raw) {
+                assert!(price.validate().is_err(), "{raw}");
+            }
+        }
+        let price: ConfiguredPricingData = serde_json::from_str(
+            r#"{"currency":"USD","unit":"per_token","prompt":0,"completion":0}"#,
+        )
+        .unwrap();
+        assert!(price.validate().is_ok());
+        assert_eq!(
+            catalog_pricing_from_stored(&serde_json::to_string(&price).unwrap(), "2026-09-23")
+                .unwrap()
+                .prompt,
+            0.0
+        );
+    }
+
+    #[test]
+    fn model_create_request_keeps_omitted_price_unknown() {
+        let base = serde_json::json!({
+            "name": "priced",
+            "provider": "mock",
+            "api_key": "fixture",
+        });
+        let omitted: ModelCreateRequest = serde_json::from_value(base.clone()).unwrap();
+        assert!(omitted.pricing.is_none());
+        let mut partial = base.clone();
+        partial["pricing"] = serde_json::json!({
+            "currency": "USD", "unit": "per_token", "prompt": 0.0
+        });
+        assert!(serde_json::from_value::<ModelCreateRequest>(partial).is_err());
+        let mut explicit = base;
+        explicit["pricing"] = serde_json::json!({
+            "currency": "USD", "unit": "per_token", "prompt": 0.0, "completion": 0.0
+        });
+        assert!(
+            serde_json::from_value::<ModelCreateRequest>(explicit)
+                .unwrap()
+                .pricing
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn catalog_revision_changes_with_configured_price_evidence() {
+        let mut item = test_model_list_item("openai", "flash", "offer-1");
+        let unknown = model_catalog_revision(&[item.clone()]);
+        item.pricing = catalog_pricing_from_stored(
+            r#"{"currency":"USD","unit":"per_token","prompt":0,"completion":0}"#,
+            "2026-09-23 12:00:00.000000",
+        );
+        let free = model_catalog_revision(&[item.clone()]);
+        assert_ne!(unknown, free);
+        item.pricing.as_mut().unwrap().completion = 0.000002;
+        assert_ne!(free, model_catalog_revision(&[item.clone()]));
+        let changed_rate = model_catalog_revision(&[item.clone()]);
+        item.pricing.as_mut().unwrap().configuration_updated_at = "2026-09-24".into();
+        assert_ne!(changed_rate, model_catalog_revision(&[item]));
     }
 
     #[test]
@@ -6097,6 +6998,7 @@ mod tests {
 
     fn sample_resolved_active_model(name: &str) -> ResolvedActiveLlmModel {
         ResolvedActiveLlmModel {
+            price_snapshot: None,
             model_name: name.to_string(),
             wire_model_name: None,
             api_key: "sk-test".to_string(),
@@ -6126,6 +7028,49 @@ mod tests {
         .expect("admitted execution");
 
         assert_eq!(execution.fixed_temperature, Some(0.6));
+    }
+
+    #[test]
+    fn admitted_execution_identity_allows_material_rotation_but_not_model_drift() {
+        let mut model = sample_resolved_active_model("selected-alias");
+        model.wire_model_name = Some("upstream-model-a".to_string());
+        let selected = AdmittedModelExecution::from_offering(ResolvedModelOffering {
+            offering_id: "selected-offering".to_string(),
+            model,
+        })
+        .expect("admitted execution");
+
+        let refreshed_material = AdmittedModelExecution {
+            api_key: "rotated-secret".to_string(),
+            base_url: "https://rotated-endpoint.example/v1".to_string(),
+            context_window: Some(256_000),
+            ..selected.clone()
+        };
+        assert!(selected.has_same_execution_identity(&refreshed_material));
+
+        let changed_upstream = AdmittedModelExecution {
+            wire_model_name: Some("upstream-model-b".to_string()),
+            ..selected.clone()
+        };
+        assert!(!selected.has_same_execution_identity(&changed_upstream));
+
+        let changed_provider = AdmittedModelExecution {
+            provider: "anthropic".to_string(),
+            ..selected.clone()
+        };
+        assert!(!selected.has_same_execution_identity(&changed_provider));
+
+        let changed_source = AdmittedModelExecution {
+            source_identity: Some(ResolvedModelSourceIdentity {
+                provider: "openai".to_string(),
+                access_label: "Genesis".to_string(),
+            }),
+            ..selected.clone()
+        };
+        assert!(
+            !selected.has_same_execution_identity(&changed_source),
+            "Offering source identity must remain stable across refreshed admission"
+        );
     }
 
     #[test]
@@ -6159,6 +7104,31 @@ mod tests {
             Some(&model),
             "expired entries remain available for stale-if-DB-error fallback"
         );
+    }
+
+    #[test]
+    fn deployment_batch_query_failure_evicts_only_attempted_offerings() {
+        let settings = MatrixOneSettings::mock();
+        let attempted = ActiveLlmModelCacheKey::for_offering_id(&settings, "attempted-model");
+        let unrelated = ActiveLlmModelCacheKey::for_offering_id(&settings, "unrelated-model");
+        active_llm_model_resolution_cache_store(
+            attempted.clone(),
+            sample_resolved_active_model("attempted-model"),
+        );
+        active_llm_model_resolution_cache_store(
+            unrelated.clone(),
+            sample_resolved_active_model("unrelated-model"),
+        );
+
+        let error = deployment_batch_query_error(
+            &settings,
+            &["attempted-model"],
+            sqlx::Error::PoolTimedOut,
+        );
+        assert!(matches!(error, ModelOfferingResolutionError::Backend(_)));
+        assert!(active_llm_model_resolution_cache_stale_lookup(&attempted).is_none());
+        assert!(active_llm_model_resolution_cache_stale_lookup(&unrelated).is_some());
+        active_llm_model_resolution_cache_remove(&unrelated);
     }
 
     #[test]
@@ -6359,7 +7329,9 @@ mod tests {
 
     fn entry(name: &str, completion: Option<f64>) -> (String, String) {
         let json = match completion {
-            Some(c) => format!(r#"{{"completion": {c}}}"#),
+            Some(c) => {
+                format!(r#"{{"currency":"USD","unit":"per_token","prompt":0,"completion":{c}}}"#)
+            }
             None => "{}".to_string(),
         };
         (name.to_string(), json)
@@ -6392,10 +7364,22 @@ mod tests {
     }
 
     #[test]
-    fn rank_cheapest_treats_zero_as_infinity() {
-        // Zero or negative completion is treated as "unpriced" so it loses to any priced row.
+    fn rank_cheapest_never_compares_unproven_or_cny_rates_as_usd() {
+        let entries = vec![
+            ("legacy".into(), r#"{"prompt":0,"completion":0}"#.into()),
+            (
+                "cny".into(),
+                r#"{"currency":"CNY","unit":"per_token","prompt":0,"completion":0}"#.into(),
+            ),
+            entry("verified-usd", Some(0.5)),
+        ];
+        assert_eq!(rank_cheapest_index(&entries), 2);
+    }
+
+    #[test]
+    fn rank_cheapest_accepts_explicit_zero() {
         let entries = vec![entry("zero_priced", Some(0.0)), entry("normal", Some(0.02))];
-        assert_eq!(rank_cheapest_index(&entries), 1);
+        assert_eq!(rank_cheapest_index(&entries), 0);
     }
 
     #[test]
@@ -6411,6 +7395,71 @@ mod tests {
     }
 
     // -- PricingData --
+
+    #[test]
+    fn inference_price_snapshot_survives_catalog_price_change_and_restore() {
+        let mut model = sample_resolved_active_model("priced-model");
+        model.price_snapshot = InferencePriceSnapshot::from_configured(
+            r#"{"currency":"USD","unit":"per_token","prompt":0.000001,"completion":0.000002,"cache_read":0.0000001,"cache_write":0}"#,
+            "2026-09-27 01:00:00.000000",
+        );
+        let admitted = AdmittedModelExecution::from_offering(ResolvedModelOffering {
+            offering_id: "priced-offering".into(),
+            model: model.clone(),
+        })
+        .unwrap();
+        let retained = serde_json::to_string(admitted.price_snapshot.as_ref().unwrap()).unwrap();
+
+        model.price_snapshot = InferencePriceSnapshot::from_configured(
+            r#"{"currency":"USD","unit":"per_token","prompt":1,"completion":2}"#,
+            "2026-09-27 02:00:00.000000",
+        );
+        let restored = InferencePriceSnapshot::from_stored(&retained).unwrap();
+        assert_eq!(Some(&restored), admitted.price_snapshot.as_ref());
+        assert_ne!(Some(&restored), model.price_snapshot.as_ref());
+        let estimate = restored
+            .estimated_cost_usd(Some(100), Some(20), Some(50), Some(0))
+            .unwrap();
+        assert!((estimate - 0.000145).abs() < 1e-12);
+    }
+
+    #[test]
+    fn inference_price_snapshot_keeps_absent_rates_and_usage_unknown() {
+        let snapshot = InferencePriceSnapshot::from_configured(
+            r#"{"currency":"USD","unit":"per_token","prompt":0,"completion":0}"#,
+            "2026-09-27",
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.estimated_cost_usd(Some(100), Some(20), Some(0), Some(0)),
+            Some(0.0)
+        );
+        for counts in [
+            [Some(100), Some(20), Some(1), Some(0)],
+            [Some(100), Some(20), Some(0), Some(1)],
+            [Some(100), None, Some(0), Some(0)],
+            [Some(100), Some(20), None, Some(0)],
+            [None, Some(20), Some(0), Some(0)],
+        ] {
+            assert_eq!(
+                snapshot.estimated_cost_usd(counts[0], counts[1], counts[2], counts[3]),
+                None
+            );
+        }
+        assert!(InferencePriceSnapshot::from_configured("{}", "2026-09-27").is_none());
+        let stored = serde_json::to_value(&snapshot).unwrap();
+        for (field, value) in [
+            ("currency", serde_json::json!("CNY")),
+            ("unit", serde_json::json!("per_million_tokens")),
+            ("calculation_version", serde_json::json!(2)),
+            ("prompt", serde_json::json!(-1)),
+            ("cache_read", serde_json::json!(-1)),
+        ] {
+            let mut invalid = stored.clone();
+            invalid[field] = value;
+            assert!(InferencePriceSnapshot::from_stored(&invalid.to_string()).is_none());
+        }
+    }
 
     #[test]
     fn pricing_data_serialization_roundtrip() {
@@ -6566,6 +7615,7 @@ mod tests {
     #[test]
     fn resolved_upstream_name_prefers_wire_model_name_when_set() {
         let r = ResolvedActiveLlmModel {
+            price_snapshot: None,
             model_name: "deepseek-v4-pro-anthropic".into(),
             wire_model_name: Some("deepseek-v4-pro".into()),
             api_key: "k".into(),
@@ -6590,6 +7640,7 @@ mod tests {
     #[test]
     fn resolved_upstream_name_falls_back_to_local_name_when_unset() {
         let r = ResolvedActiveLlmModel {
+            price_snapshot: None,
             model_name: "claude-sonnet-4-6".into(),
             wire_model_name: None,
             api_key: "k".into(),
@@ -6917,6 +7968,11 @@ mod tests {
 
     #[test]
     fn model_list_item_to_response_preserves_fields() {
+        let configured_price = catalog_pricing_from_stored(
+            r#"{"currency":"USD","unit":"per_token","prompt":0.000001,"completion":0.000002}"#,
+            "2026-09-23 12:00:00.000000",
+        )
+        .expect("explicit configured USD price");
         let item = ModelListItem {
             offering_id: "m1".into(),
             access_id: "self-hosted".into(),
@@ -6931,6 +7987,7 @@ mod tests {
             max_completion_tokens: Some(16384),
             architecture: Some("transformer".into()),
             thinking_capability: Some(ThinkingCapability::Both),
+            pricing: Some(configured_price),
         };
         let resp = ModelListItemResponse::from(item.clone());
         assert_eq!(resp.offering_id, item.offering_id);
@@ -6939,6 +7996,11 @@ mod tests {
         assert_eq!(resp.name, item.name);
         assert_eq!(resp.context_window, 128000);
         assert_eq!(resp.thinking_capability, Some(ThinkingCapability::Both));
+        assert_eq!(resp.pricing, item.pricing);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["pricing"]["currency"], "USD");
+        assert_eq!(json["pricing"]["cache_read"], Value::Null);
+        assert!(json.get("api_key").is_none());
     }
 
     #[test]
@@ -6957,12 +8019,14 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
         let resp = ModelListItemResponse::from(item);
         assert!(resp.description.is_none());
         assert!(resp.max_completion_tokens.is_none());
         assert!(resp.architecture.is_none());
         assert!(resp.thinking_capability.is_none());
+        assert_eq!(serde_json::to_value(&resp).unwrap()["pricing"], Value::Null);
     }
 
     #[test]
@@ -6988,6 +8052,7 @@ mod tests {
             max_completion_tokens: Some(8_192),
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         });
 
         let ready = project_model_access(
@@ -7153,6 +8218,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
 
         let error = project_model_access(
@@ -7187,6 +8253,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
         let alpha = offering("offer-alpha", "Alpha");
         let beta = offering("offer-beta", "Beta");
@@ -7233,6 +8300,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
 
         let projection = project_model_access_page(
@@ -7286,6 +8354,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
 
         let projection = project_model_access_page_with_default_catalog(
@@ -7331,6 +8400,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
         let alpha = offering("offer-alpha", "Alpha");
         let beta = offering("offer-beta", "Beta");
@@ -7376,6 +8446,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
         let projection = project_model_access_with_default(
             vec![declared],
@@ -7423,6 +8494,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         };
         let invalid_id = "not-a-valid\noffering-id";
         let projection = project_model_access_with_default(
@@ -7473,6 +8545,7 @@ mod tests {
                 max_completion_tokens: None,
                 architecture: None,
                 thinking_capability: None,
+                pricing: None,
             }],
             "2026-07-20T00:00:00Z".into(),
         )
@@ -7731,6 +8804,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: Some(ThinkingCapability::Both),
+            pricing: None,
         };
         let resp = ModelListItemResponse::from(item);
         let v = serde_json::to_value(&resp).expect("serialize ModelListItemResponse");
@@ -7841,11 +8915,11 @@ mod tests {
             ),
             (
                 "qwen-flash".to_string(),
-                r#"{"prompt":0.00000015,"completion":0.0000015}"#.to_string(),
+                r#"{"currency":"USD","unit":"per_token","prompt":0.00000015,"completion":0.0000015}"#.to_string(),
             ),
             (
                 "qwen3-flash".to_string(),
-                r#"{"prompt":0.0000002,"completion":0.000002}"#.to_string(),
+                r#"{"currency":"USD","unit":"per_token","prompt":0.0000002,"completion":0.000002}"#.to_string(),
             ),
         ];
         // selector_rows indices: [1, 2]

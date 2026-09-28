@@ -10,6 +10,45 @@ use async_trait::async_trait;
 
 use super::types::{AgentAddress, AgentMessage, MailboxError};
 
+/// Authority to close one registration, never whichever registration happens
+/// to occupy the same logical address later. Keep the returned value with the
+/// mailbox/cleanup owner; do not resolve it again when cleaning up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MailboxSubscription {
+    address: AgentAddress,
+    id: String,
+}
+
+impl MailboxSubscription {
+    pub fn new(address: AgentAddress) -> Self {
+        Self {
+            address,
+            id: uuid::Uuid::new_v4().simple().to_string(),
+        }
+    }
+
+    pub fn address(&self) -> &AgentAddress {
+        &self.address
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl std::ops::Deref for MailboxSubscription {
+    type Target = AgentAddress;
+    fn deref(&self) -> &Self::Target {
+        &self.address
+    }
+}
+
+impl std::fmt::Display for MailboxSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.address.fmt(f)
+    }
+}
+
 // ─── MessageStream ──────────────────────────────────────────────────────────
 
 /// An async stream of messages for a single agent.
@@ -29,6 +68,13 @@ pub trait MessageStream: Send {
     /// by the receiver once dequeued and therefore uses the no-op default.
     async fn acknowledge(&mut self, _message: &AgentMessage) -> Result<(), MailboxError> {
         Ok(())
+    }
+
+    /// Original durable claim authority for this exact delivered envelope.
+    /// Never resolve the current database token by message ID to acknowledge
+    /// an older delivery. In-memory transports have no durable claim.
+    fn claim_token(&self, _message: &AgentMessage) -> Option<&str> {
+        None
     }
 
     /// Drain all currently buffered messages without blocking.
@@ -69,6 +115,13 @@ pub trait MessageStream: Send {
 /// (CLI impl vs Server impl).
 #[async_trait]
 pub trait MessageTransport: Send + Sync {
+    /// Whether unregistering a subscriber preserves its unacknowledged
+    /// deliveries for a later registration at the same logical address.
+    /// Volatile transports must hand off unread envelopes before closing.
+    fn recovers_unacknowledged_on_unregister(&self) -> bool {
+        false
+    }
+
     /// Register an agent so it can receive messages.
     ///
     /// `delegation_id` — if provided, the agent joins a broadcast group.
@@ -76,16 +129,19 @@ pub trait MessageTransport: Send + Sync {
         &self,
         addr: AgentAddress,
         delegation_id: Option<String>,
-    ) -> Result<(), MailboxError>;
+    ) -> Result<MailboxSubscription, MailboxError>;
 
-    /// Unregister an agent. Its message stream will be closed.
-    async fn unregister(&self, addr: &AgentAddress) -> Result<(), MailboxError>;
+    /// Close only this subscription. A stale handle is an idempotent no-op.
+    async fn unregister(&self, subscription: &MailboxSubscription) -> Result<(), MailboxError>;
 
     /// Subscribe to messages for this agent.
     ///
-    /// Must be called after `register`. Returns a stream that yields messages
-    /// addressed to this agent (both direct and broadcast).
-    async fn subscribe(&self, addr: &AgentAddress) -> Result<Box<dyn MessageStream>, MailboxError>;
+    /// Attach once to the registration returned by `register`. Replacing a
+    /// subscriber requires a fresh registration (and hence fresh authority).
+    async fn subscribe(
+        &self,
+        subscription: &MailboxSubscription,
+    ) -> Result<Box<dyn MessageStream>, MailboxError>;
 
     /// Resolve an agent inside one delegation namespace. Implementations for
     /// distributed deployments must use shared state, not process-local

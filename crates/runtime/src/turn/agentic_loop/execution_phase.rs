@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
@@ -38,6 +39,400 @@ const USER_INTENT_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_USER_INTENT_BOUNDARY_PAGES: usize = 16;
 const MAX_USER_INTENT_BOUNDARY_FACTS: usize = 4_096;
 const MAX_TEXTLESS_RESPONSE_RETRIES: u32 = 1;
+
+const DIRECT_CHILD_WAIT_LIMIT: Duration = Duration::from_secs(300);
+const DIRECT_CHILD_RESULT_SCHEMA: &str = "direct_child_completion.v1";
+
+/// Use the existing journal/trace sink, including its early-error flush. The
+/// digest joins the adopted evidence to the required-context payload without
+/// copying potentially private child output into another trace field.
+fn record_direct_child_barrier<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    parent_run_id: &str,
+    outcome: &str,
+    children: &serde_json::Value,
+    started: Instant,
+) {
+    let children = children.as_array().cloned().unwrap_or_default();
+    let identities: Vec<_> = children
+        .iter()
+        .map(|child| {
+            serde_json::json!({
+                "agent_id": child["agent_id"],
+                "run_id": child["run_id"],
+                "parent_agent_id": child["parent_agent_id"],
+                "status": child["status"],
+                "result_sha256": child["result_sha256"],
+                "result_truncated": child["result_truncated"],
+            })
+        })
+        .collect();
+    let attrs = std::collections::HashMap::from([
+        ("parent_run_id".to_string(), parent_run_id.to_string()),
+        ("outcome".to_string(), outcome.to_string()),
+        (
+            "children".to_string(),
+            serde_json::json!(identities).to_string(),
+        ),
+        (
+            "round_index".to_string(),
+            state.current_round_index.to_string(),
+        ),
+    ]);
+    tracing::info!(target: "astra::direct_child_barrier", parent_run_id, outcome,
+        children = %serde_json::json!(identities), duration_ms = started.elapsed().as_millis() as u64,
+        "parent-child completion barrier");
+    host.on_direct_child_completion_boundary(state, outcome, children.len(), started);
+    let end_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    if let Some(buffer) = state.turn_event_buffer.as_mut() {
+        let event = astra_services::session_journal::TraceSpanBuilder::default()
+            .session_id(state.current_session_id.as_deref())
+            .turn(Some(state.session_turn))
+            .span_id(format!("direct_child_barrier_{}", Uuid::new_v4()))
+            .name("direct_child_completion_barrier".into())
+            .trace_id(Some(parent_run_id.to_string()))
+            .start_us(end_us.saturating_sub(started.elapsed().as_micros() as u64))
+            .end_us(end_us)
+            .attrs(Some(&attrs))
+            .build()
+            .with_producer_scope(Some(parent_run_id));
+        buffer.record(event);
+    }
+}
+
+fn stage_direct_child_results<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) -> bool {
+    let Some(owner) = host.direct_child_completion_owner(state) else {
+        return false;
+    };
+    // The required-context lane is checkpointed. After a process restart the
+    // producer may reconstruct the same terminal child from its recovery
+    // snapshot; do not inject a second copy of an already retained result.
+    let retained: HashSet<_> = state
+        .volatile_pending
+        .iter()
+        .filter(|injection| injection.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA)
+        .filter_map(|injection| injection.payload["children"].as_array())
+        .flatten()
+        .filter_map(|child| Some((child["agent_id"].as_str()?, child["run_id"].as_str()?)))
+        .collect();
+    let children: Vec<_> = owner
+        .take_completed_direct_children()
+        .into_iter()
+        .filter(|child| !retained.contains(&(child.agent_id.as_str(), child.run_id.as_str())))
+        .collect();
+    if children.is_empty() {
+        return false;
+    }
+    let children = serde_json::json!(children);
+    record_direct_child_barrier(
+        host,
+        state,
+        owner.parent_run_id(),
+        "results_staged",
+        &children,
+        Instant::now(),
+    );
+    // This accumulative, required lane survives provider-attempt failure and
+    // cannot overwrite an unrelated mailbox message or sibling result.
+    state.push_volatile_payload(super::host::VolatileKind::BackgroundTaskNotification, serde_json::json!({
+        "schema": DIRECT_CHILD_RESULT_SCHEMA,
+        "parent_run_id": owner.parent_run_id(),
+        "children": children,
+        "instruction": "These are producer-owned terminal child outcomes. Use the actual results in your next decision; report failures and incomplete work truthfully before finalizing.",
+    }));
+    true
+}
+
+fn finish_direct_child_barrier_incomplete(state: &mut AgenticLoopState, reason: &str) {
+    // A tentative provider answer cannot become the interruption's partial
+    // answer when it was composed without the required child evidence.
+    state.hooks.completion_settlement.latest_provider_text = None;
+    state.hooks.completion_settlement.deferred_candidate_text = None;
+    state.final_text = "The child work could not be collected and incorporated before this run stopped. Progress is preserved, but the request is incomplete.".into();
+    state.final_text_streamed = false;
+    if state.interruption.is_none() {
+        state.interruption = Some(InterruptionRecord::new(
+            InterruptionKind::ExecutionIncomplete,
+            ResumeAction::ContinueImmediately,
+            interruption_state_summary(state, Some(reason.to_string())),
+        ));
+    }
+}
+
+pub(crate) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) {
+    let Some(owner) = host.direct_child_completion_owner(state) else {
+        return;
+    };
+    if !owner.has_direct_child_completion_history() {
+        return;
+    }
+    let children = owner.pending_direct_children();
+    let undelivered = state.volatile_pending.iter().any(|injection| {
+        injection.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+            && injection.payload["observed_by_provider"] != true
+    });
+    let owner_matches_run = state.current_run_id.as_deref() == Some(owner.parent_run_id());
+    let foreign_notification = state.volatile_pending.iter().any(|injection| {
+        injection.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+            && injection.payload["parent_run_id"].as_str() != Some(owner.parent_run_id())
+    });
+    let incomplete =
+        !owner_matches_run || foreign_notification || !children.is_empty() || undelivered;
+    if incomplete {
+        finish_direct_child_barrier_incomplete(
+            state,
+            "parent finalization reached an unobserved direct-child obligation",
+        );
+    }
+    record_direct_child_barrier(
+        host,
+        state,
+        owner.parent_run_id(),
+        if incomplete {
+            "finalization_incomplete"
+        } else if state.interruption.is_some() {
+            "finalization_interrupted"
+        } else {
+            "finalization_accepted"
+        },
+        &serde_json::json!(children),
+        Instant::now(),
+    );
+    if !incomplete && state.interruption.is_none() {
+        // The journal is evaluated after this fence. Snapshot only exact,
+        // observed receipt refs before removing provider context so recovery
+        // cannot replay the completed child message into another round.
+        state.stall.terminal_child_evaluation_refs = Some((
+            owner.parent_run_id().to_string(),
+            state
+                .stall
+                .tool_call_records
+                .iter()
+                .filter(|record| nonterminal_child_receipt_superseded(state, record))
+                .filter_map(|record| record.execution_completion.clone())
+                .collect(),
+        ));
+        state
+            .volatile_pending
+            .retain(|injection| injection.payload["schema"] != DIRECT_CHILD_RESULT_SCHEMA);
+    }
+}
+
+/// Wait only at a proposed final answer; ordinary tool/model work stays
+/// concurrent. Return true to enter one normal, accounted synthesis boundary.
+async fn await_direct_children_before_completion<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    continuation: ContinuationAuthority,
+) -> Result<bool, astra_core::ClassifiedError> {
+    let Some(owner) = host.direct_child_completion_owner(state) else {
+        return Ok(false);
+    };
+    if !owner.has_pending_direct_children() {
+        return Ok(false);
+    }
+    state.final_text.clear();
+    state.final_text_streamed = false;
+    let started = Instant::now();
+    let remaining = host.execution_time_budget_remaining();
+    let slice_exhausted =
+        state.remaining_turns == 0 || state.current_round_index as usize + 1 >= state.max_turns;
+    let no_synthesis_budget = (slice_exhausted
+        && !super::lifecycle::adaptive_budget_is_renewable(state))
+        || state
+            .agentic_turn_budget
+            .hard_turn_limit
+            .is_some_and(|limit| state.llm_rounds_completed as usize >= limit.get());
+    let outcome = if continuation != ContinuationAuthority::Runtime {
+        "remote_owner_unsettled"
+    } else if no_synthesis_budget {
+        "synthesis_budget_exhausted"
+    } else {
+        let children = serde_json::json!(owner.pending_direct_children());
+        record_direct_child_barrier(
+            host,
+            state,
+            owner.parent_run_id(),
+            "wait_started",
+            &children,
+            started,
+        );
+        host.emit_headless_line(
+            HeadlessStderrStyle::Dim,
+            "Waiting for child work before the final answer.".into(),
+        );
+        let wait_budget = remaining.map_or(DIRECT_CHILD_WAIT_LIMIT, |remaining| {
+            remaining.saturating_sub(
+                astra_turn_core::chat_turn_heuristics::PROVIDER_ACTION_CONVERGENCE_BUDGET,
+            )
+        });
+        let deadline = tokio::time::Instant::now() + wait_budget;
+        let executor = state.runtime_tool_executor.clone();
+        let cancellation = state.cancellation.clone();
+        let mut mailbox_open = state.messaging.mailbox.is_some();
+        let mut intent_wake = state.user_intents.wake.clone();
+        let mut checked_watermark = -1_i64;
+        #[derive(Clone, Copy)]
+        enum ReadySource {
+            Child,
+            Intent(Option<i64>),
+            Mailbox(bool),
+        }
+        'waiting: loop {
+            // Keep remote reconciliation alive across presentation-only
+            // messages. Recreate it only after a child fact was observed.
+            let child_update = async {
+                if let Some(executor) = executor.as_ref() {
+                    executor.wait_for_direct_child_update(&owner).await;
+                } else {
+                    owner.wait_for_direct_child_update().await;
+                }
+            };
+            tokio::pin!(child_update);
+            loop {
+                let source = tokio::select! {
+                    biased;
+                    _ = direct_child_parent_cancelled(&cancellation) => {
+                        record_direct_child_barrier(host, state, owner.parent_run_id(), "cancelled", &children, started);
+                        return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::Cancelled,
+                            "parent cancelled while waiting for direct children"));
+                    }
+                    _ = tokio::time::sleep_until(deadline) => break 'waiting "deadline",
+                    _ = &mut child_update => ReadySource::Child,
+                    watermark = async {
+                        match intent_wake.as_mut() {
+                            Some(wake) => {
+                                let current = *wake.borrow_and_update();
+                                if current > checked_watermark {
+                                    Some(current)
+                                } else if wake.changed().await.is_ok() {
+                                    Some(*wake.borrow_and_update())
+                                } else {
+                                    None
+                                }
+                            }
+                            None => std::future::pending().await,
+                        }
+                    }, if intent_wake.is_some() => ReadySource::Intent(watermark),
+                    message = async {
+                        match state.messaging.mailbox.as_mut().filter(|_| mailbox_open) {
+                            Some(mailbox) => mailbox.wait_ready().await,
+                            None => std::future::pending().await,
+                        }
+                    } => ReadySource::Mailbox(message),
+                };
+                let boundary = match source {
+                    ReadySource::Child => RuntimeInputBoundary::ChildReady,
+                    ReadySource::Intent(Some(index)) => {
+                        checked_watermark = checked_watermark.max(index);
+                        if index
+                            < i64::try_from(state.user_intents.user_intent_cursor())
+                                .unwrap_or(i64::MAX)
+                        {
+                            continue;
+                        }
+                        RuntimeInputBoundary::IntentReady
+                    }
+                    ReadySource::Intent(None) => {
+                        intent_wake = None;
+                        continue;
+                    }
+                    ReadySource::Mailbox(true) => RuntimeInputBoundary::MailboxReady,
+                    ReadySource::Mailbox(false) => {
+                        mailbox_open = false;
+                        continue;
+                    }
+                };
+                // The whole input transaction, including DB ACK/poll I/O, is
+                // inside the same absolute deadline and hard-cancel boundary.
+                let observed = tokio::select! {
+                    biased;
+                    _ = direct_child_parent_cancelled(&cancellation) => {
+                        record_direct_child_barrier(host, state, owner.parent_run_id(), "cancelled", &children, started);
+                        return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::Cancelled,
+                            "parent cancelled while applying runtime input"));
+                    }
+                    _ = tokio::time::sleep_until(deadline) => break 'waiting "deadline",
+                    result = runtime_input_boundary(host, state, boundary) => result?,
+                };
+                if observed.model_context_changed
+                    || matches!(source, ReadySource::Child) && !owner.has_pending_direct_children()
+                {
+                    break 'waiting if matches!(source, ReadySource::Child) {
+                        "synthesis_ready"
+                    } else {
+                        "runtime_input_ready"
+                    };
+                }
+                if matches!(source, ReadySource::Child) {
+                    continue 'waiting;
+                }
+            }
+        }
+    };
+    record_direct_child_barrier(
+        host,
+        state,
+        owner.parent_run_id(),
+        outcome,
+        &serde_json::json!(owner.pending_direct_children()),
+        started,
+    );
+    if outcome == "synthesis_ready" || outcome == "runtime_input_ready" {
+        // Continue through normal preparation, accounting, and budget checks.
+        // This barrier never extends a slice or a user-owned hard limit.
+        return Ok(true);
+    }
+    let _ = super::lifecycle::cancel_unfinished_child_agents(
+        host,
+        state,
+        "parent direct-child completion boundary stopped",
+        crate::orchestration::CancellationOrigin::Runtime,
+    )
+    .await;
+    finish_direct_child_barrier_incomplete(state, outcome);
+    Ok(false)
+}
+
+async fn direct_child_parent_cancelled(cancellation: &super::host::CancellationState) {
+    let flagged = || {
+        cancellation
+            .flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+            || cancellation
+                .execution_lease_lost
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    };
+    if flagged() {
+        return;
+    }
+    if let Some(token) = &cancellation.token {
+        token.cancelled().await;
+    } else if cancellation.flag.is_some() || cancellation.execution_lease_lost.is_some() {
+        // Legacy hosts may have only an atomic flag. No per-parent timer is
+        // scheduled for the normal token-backed runtime.
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if flagged() {
+                return;
+            }
+        }
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderBoundaryGate {
@@ -2551,6 +2946,58 @@ fn terminally_relevant_unresolved_tool_outcomes(
         .collect()
 }
 
+/// A launch receipt or running snapshot is not a failed child. It stops
+/// blocking completion only after the same child has a producer-owned
+/// successful terminal result that the parent model actually observed.
+pub(crate) fn nonterminal_child_receipt_superseded(
+    state: &AgenticLoopState,
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    if record.name != "agent"
+        || !record.ok
+        || record.disposition
+            != Some(astra_services::session_journal::ToolCallDisposition::Executed)
+    {
+        return false;
+    }
+    let Some(args) = record
+        .authoritative_args_full()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    else {
+        return false;
+    };
+    let Some(result) = record
+        .runtime_model_result_full
+        .as_deref()
+        .or(record.result_full.as_deref())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    else {
+        return false;
+    };
+    let Some(agent_id) = result["agent_id"].as_str() else {
+        return false;
+    };
+    if !matches!(
+        (args["action"].as_str(), result["status"].as_str()),
+        (Some("spawn"), Some("launched")) | (Some("get_result"), Some("still_running"))
+    ) || (args["action"] == "get_result" && args["agent_id"] != agent_id)
+    {
+        return false;
+    }
+    state.volatile_pending.iter().any(|entry| {
+        entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+            && entry.payload["parent_run_id"].as_str() == state.current_run_id.as_deref()
+            && entry.payload["observed_by_provider"] == true
+            && entry.payload["children"]
+                .as_array()
+                .is_some_and(|children| {
+                    children.iter().any(|child| {
+                        child["agent_id"] == agent_id && child["status"] == "completed"
+                    })
+                })
+    })
+}
+
 fn unresolved_tool_outcome_is_terminally_relevant(
     state: &AgenticLoopState,
     failure: &astra_turn_core::evaluation::UnresolvedToolOutcome,
@@ -2560,6 +3007,17 @@ fn unresolved_tool_outcome_is_terminally_relevant(
         astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_CLASS_AGENT_INCOMPLETE
             | astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_CLASS_FANOUT_INCOMPLETE
     ) {
+        if failure.result_class
+            == astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_CLASS_AGENT_INCOMPLETE
+            && failure.invocation.as_ref().is_some_and(|reference| {
+                state.stall.tool_call_records.iter().any(|record| {
+                    record.execution_completion.as_ref() == Some(reference)
+                        && nonterminal_child_receipt_superseded(state, record)
+                })
+            })
+        {
+            return false;
+        }
         return true;
     }
 
@@ -3523,7 +3981,11 @@ async fn inject_polled_user_intents_before_settlement<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<bool, astra_core::ClassifiedError> {
-    inject_polled_user_intents_inner(host, state, true).await
+    Ok(
+        runtime_input_boundary(host, state, RuntimeInputBoundary::Settlement)
+            .await?
+            .model_context_changed,
+    )
 }
 
 /// Reconcile guidance after provider inference and before admitting any tool
@@ -3534,7 +3996,11 @@ pub(crate) async fn inject_polled_user_intents_before_action<H: AgenticLoopHost>
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<bool, astra_core::ClassifiedError> {
-    inject_polled_user_intents_inner(host, state, true).await
+    Ok(
+        runtime_input_boundary(host, state, RuntimeInputBoundary::Action)
+            .await?
+            .model_context_changed,
+    )
 }
 
 /// Reconcile the durable control lane immediately before beginning another
@@ -3546,7 +4012,67 @@ async fn inject_polled_user_intents_before_provider<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<bool, astra_core::ClassifiedError> {
-    inject_polled_user_intents_inner(host, state, true).await
+    Ok(
+        runtime_input_boundary(host, state, RuntimeInputBoundary::Provider)
+            .await?
+            .model_context_changed,
+    )
+}
+
+/// Every agent execution uses this boundary regardless of root/child role.
+/// The boundary selects only the sources that can have changed; each source
+/// retains its own authority, acknowledgement and checkpoint owner.
+#[derive(Clone, Copy)]
+pub(crate) enum RuntimeInputBoundary {
+    Preparation,
+    Provider,
+    Action,
+    Settlement,
+    MailboxReady,
+    IntentReady,
+    ChildReady,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RuntimeInputOutcome {
+    pub(crate) model_context_changed: bool,
+    pub(crate) durable_guidance_applied: bool,
+}
+
+pub(crate) async fn runtime_input_boundary<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    boundary: RuntimeInputBoundary,
+) -> Result<RuntimeInputOutcome, astra_core::ClassifiedError> {
+    let guidance = if matches!(
+        boundary,
+        RuntimeInputBoundary::Provider
+            | RuntimeInputBoundary::Action
+            | RuntimeInputBoundary::Settlement
+            | RuntimeInputBoundary::IntentReady
+    ) {
+        inject_polled_user_intents_inner(host, state, true).await?
+    } else {
+        false
+    };
+    // The receive batch is bounded; transport-specific ACK I/O remains in
+    // the mailbox owner. Progress never changes model context.
+    let message = super::lifecycle::drain_mailbox_model_context(host, state).await?;
+    let child = if matches!(
+        boundary,
+        RuntimeInputBoundary::Provider
+            | RuntimeInputBoundary::Action
+            | RuntimeInputBoundary::Settlement
+            | RuntimeInputBoundary::ChildReady
+    ) {
+        stage_direct_child_results(host, state)
+    } else {
+        false
+    };
+    Ok(RuntimeInputOutcome {
+        model_context_changed: guidance || message || child,
+        durable_guidance_applied: guidance,
+    })
 }
 
 async fn inject_polled_user_intents_inner<H: AgenticLoopHost>(
@@ -4967,7 +5493,46 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
     let mut turn_result = match turn_result {
         Ok(turn_result) => {
+            let delivered_children: Vec<_> = state
+                .volatile_pending
+                .iter()
+                .filter(|injection| {
+                    injection.attempt_leased
+                        && injection.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                })
+                .map(|injection| injection.payload.clone())
+                .collect();
+            for payload in &delivered_children {
+                let outcome = if providerless_control_plane_turn
+                    || turn_result.accum.error_message.is_some()
+                {
+                    "result_delivery_deferred"
+                } else {
+                    "results_adopted"
+                };
+                record_direct_child_barrier(
+                    host,
+                    state,
+                    payload["parent_run_id"].as_str().unwrap_or_default(),
+                    outcome,
+                    &payload["children"],
+                    llm_wall_start,
+                );
+            }
             state.commit_volatile_attempt_lease();
+            // Provider context is not guaranteed to be append-only. Retain
+            // child evidence across later tool/model rounds and checkpoint
+            // boundaries; one successful response is delivery, not durable
+            // conversation history or proof the model used the result.
+            for mut payload in delivered_children {
+                if !providerless_control_plane_turn && turn_result.accum.error_message.is_none() {
+                    payload["observed_by_provider"] = serde_json::Value::Bool(true);
+                }
+                state.push_volatile_payload(
+                    super::host::VolatileKind::BackgroundTaskNotification,
+                    payload,
+                );
+            }
             turn_result
         }
         Err(error) => {
@@ -4999,7 +5564,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 // Admission rejected this request before HTTP delivery. Consume
                 // the authoritative guidance using the ordinary control lane;
                 // never retry the stale request or manufacture a new run.
-                if inject_polled_user_intents_before_action(host, state).await? {
+                if runtime_input_boundary(host, state, RuntimeInputBoundary::Action)
+                    .await?
+                    .durable_guidance_applied
+                {
                     state.final_text.clear();
                     state.final_text_streamed = false;
                     state.step_recorder.end_turn(false);
@@ -5033,25 +5601,24 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         record_superseded_llm_round(state, &turn_result, prep.turn_start_time);
         update_turn_trace_collector(state, &turn_result);
     }
-    let guidance_applied = match action_fence {
+    let input_changed = match action_fence {
         Ok(applied) => applied,
         Err(error) => return Err(error),
     };
-    if guidance_applied {
+    if input_changed {
         // Usage/round accounting above remains true provider evidence, but
         // neither text nor tool calls from the older context may enter the
-        // canonical conversation or execution lane. The applied intent was
-        // appended by the poll and the next request starts from that exact
-        // typed control epoch.
+        // canonical conversation or execution lane. New runtime input was
+        // retained by its source owner and the next request sees it.
         state.final_text.clear();
         state.final_text_streamed = false;
         state.push_volatile_payload(
-            super::host::VolatileKind::UserIntentBoundary,
+            super::host::VolatileKind::RuntimeInputBoundary,
             serde_json::json!({
-                "schema": "user_intent_action_fence.v1",
+                "schema": "runtime_input_action_fence.v1",
                 "signal": "provider_response_superseded",
                 "execution_authority": "none",
-                "instruction": "The preceding provider response was generated before newly accepted user guidance. Re-evaluate the current objective from the applied guidance before choosing any action or final response.",
+                "instruction": "The preceding provider response was generated before new runtime input was applied. Re-evaluate the current objective using the newly retained input before choosing any action or final response.",
             }),
         );
         state.step_recorder.end_turn(false);
@@ -5788,6 +6355,34 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
             }
 
+            // Child completion is a producer fact, never assistant prose.
+            // Fence it before committing final user-intent/Work settlement.
+            if host
+                .direct_child_completion_owner(state)
+                .is_some_and(|owner| owner.has_pending_direct_children())
+            {
+                // Close provider timing before waiting. The wait is its own
+                // Explain interval, never part of model inference time.
+                record_early_exit_llm_round(
+                    state,
+                    &turn_result,
+                    prep.turn_start_time,
+                    Some("direct_child_completion_wait"),
+                );
+                let child_barrier =
+                    await_direct_children_before_completion(host, state, continuation_authority)
+                        .await;
+                state.step_recorder.end_turn(false);
+                try_write_heavy_checkpoint(state);
+                return child_barrier.map(|continue_loop| {
+                    if continue_loop {
+                        TurnExecutionControl::ContinueLoop
+                    } else {
+                        TurnExecutionControl::Return(AgenticLoopOutcome::Completed)
+                    }
+                });
+            }
+
             let user_intent_settlement_fence = commit_user_intent_settlement_fence(state).await?;
 
             // Close the last-model-boundary race for remotely accepted user
@@ -5795,15 +6390,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             // without this forced durable poll, an intent accepted while the
             // final response was in flight could be acknowledged by the
             // server after that poll and then stranded by terminal settlement.
-            // If guidance arrived, the response just produced is an
-            // intermediate assistant message and the same run continues once
-            // so the model observes the accepted input exactly once.
+            // If authoritative guidance or another semantic runtime input
+            // arrived, this response is intermediate and the same run makes
+            // another normally accounted decision.
             if inject_polled_user_intents_before_settlement(host, state).await? {
                 record_early_exit_llm_round(
                     state,
                     &turn_result,
                     prep.turn_start_time,
-                    Some("user_intent_arrived_before_settlement"),
+                    Some("runtime_input_arrived_before_settlement"),
                 );
                 state.step_recorder.end_turn(false);
                 return continue_after_user_intent_settlement_fence(user_intent_settlement_fence)
@@ -9046,6 +9641,527 @@ mod tests {
     };
     use crate::turn::run_control::{RunStatusProvider, UserIntentPoll, UserIntentProvider};
     use astra_turn_core::chat_turn_sse_dispatch::{ChatTurnSseAccum, ServerLoopExecutionSummary};
+
+    #[tokio::test]
+    async fn semantic_child_message_wakes_parent_without_completing_child() {
+        use astra_messaging::in_process::InProcessTransport;
+        use astra_messaging::router::AgentMailboxRouter;
+        use astra_messaging::types::{AgentAddress, AgentMessage, MessagePayload, MessageTarget};
+
+        let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "parent-run",
+            "child-agent",
+        );
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            agent_id: "child-agent".into(),
+            run_id: "child-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            status: crate::orchestration::AgentStatus::Running {
+                activity: "reviewing".into(),
+            },
+        });
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
+        ));
+        let parent_address = AgentAddress::new("parent-run", "parent-agent");
+        let child_address = AgentAddress::new("child-run", "child-agent");
+        let parent_mailbox = router.register(parent_address.clone(), None).await.unwrap();
+        let _child_mailbox = router.register(child_address.clone(), None).await.unwrap();
+        let wait_started = Arc::new(tokio::sync::Notify::new());
+        let mut host = MockHost::new(vec![
+            text_result("provisional", 10, 2, Some(10)),
+            text_result("still working", 10, 2, Some(10)),
+            text_result("synthesized", 10, 2, Some(10)),
+        ]);
+        host.direct_child_owner = Some(Arc::clone(&owner));
+        host.child_wait_started = Some(Arc::clone(&wait_started));
+        let mut state = make_state();
+        state.current_run_id = Some("parent-run".into());
+        state.messaging.mailbox = Some(parent_mailbox);
+        let run = tokio::spawn(async move {
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            (host, state, outcome)
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), wait_started.notified())
+            .await
+            .expect("parent must reach child barrier");
+        router
+            .send(AgentMessage::new(
+                child_address.clone(),
+                MessageTarget::Direct {
+                    address: parent_address.clone(),
+                },
+                MessagePayload::Progress {
+                    turn_index: 1,
+                    tool_calls: 0,
+                    status: "reviewing".into(),
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), wait_started.notified())
+                .await
+                .is_err(),
+            "transient progress must not spend another parent model round"
+        );
+        router
+            .send(AgentMessage::new(
+                child_address,
+                MessageTarget::Direct {
+                    address: parent_address,
+                },
+                MessagePayload::Text {
+                    content: "please decide the review scope".into(),
+                    summary: None,
+                },
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), wait_started.notified())
+            .await
+            .expect("semantic message must wake parent before child completes");
+        assert!(
+            owner
+                .pending_direct_children()
+                .iter()
+                .any(|child| !child.status.is_terminal())
+        );
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            agent_id: "child-agent".into(),
+            run_id: "child-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            status: crate::orchestration::AgentStatus::Completed {
+                result: "review complete".into(),
+                finish_reason: None,
+            },
+        });
+        let (host, _, outcome) = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("parent must settle after child completion")
+            .unwrap();
+        assert!(
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+            "{outcome:?}"
+        );
+        assert!(
+            serde_json::to_string(&host.executed_volatile[1])
+                .unwrap()
+                .contains("please decide the review scope")
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_user_guidance_wakes_shared_child_barrier() {
+        let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "parent-run",
+            "child-agent",
+        );
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            agent_id: "child-agent".into(),
+            run_id: "child-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            status: crate::orchestration::AgentStatus::Running {
+                activity: "reviewing".into(),
+            },
+        });
+        let provider = Arc::new(StubRunControlProvider::new(vec![]));
+        let (wake_tx, wake_rx) = tokio::sync::watch::channel(-1);
+        let wait_started = Arc::new(tokio::sync::Notify::new());
+        let mut host = MockHost::new(vec![]);
+        host.direct_child_owner = Some(Arc::clone(&owner));
+        host.child_wait_started = Some(Arc::clone(&wait_started));
+        let mut state = make_state();
+        state.current_run_id = Some("parent-run".into());
+        state.current_session_id = Some("parent-session".into());
+        state.context_manifest_user_id = Some("parent-user".into());
+        state.run_control = Some(provider.clone());
+        state.user_intents.wake = Some(wake_rx);
+        let task = tokio::spawn(async move {
+            let outcome = await_direct_children_before_completion(
+                &mut host,
+                &mut state,
+                ContinuationAuthority::Runtime,
+            )
+            .await;
+            (host, state, outcome)
+        });
+        tokio::time::timeout(Duration::from_secs(2), wait_started.notified())
+            .await
+            .expect("parent must reach child barrier");
+        provider.polls.lock().await.push_back(UserIntentPoll {
+            next_cursor: 1,
+            snapshot_page_fact_count: 1,
+            inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                intent_id: "guidance-1".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                event_index: 0,
+                input: serde_json::json!({"content": "Use GLM for review."}),
+            }],
+            ..UserIntentPoll::default()
+        });
+        wake_tx.send(0).expect("active parent receiver");
+        let (host, state, outcome) = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("guidance must wake parent")
+            .unwrap();
+        assert!(outcome.unwrap());
+        assert_eq!(host.user_intent_applied_indices, vec![0]);
+        assert_eq!(state.message, "Use GLM for review.");
+        assert_eq!(provider.poll_call_count().await, 1);
+        assert!(owner.has_pending_direct_children());
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_stalled_runtime_input_poll() {
+        let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "agent-run",
+            "child-agent",
+        );
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            agent_id: "child-agent".into(),
+            run_id: "child-run".into(),
+            parent_agent_id: "agent".into(),
+            status: crate::orchestration::AgentStatus::Running {
+                activity: "working".into(),
+            },
+        });
+        let poll_entered = Arc::new(tokio::sync::Notify::new());
+        let poll_release = Arc::new(tokio::sync::Notify::new());
+        let mut provider = StubRunControlProvider::new(vec![]);
+        provider.poll_gate = Some((poll_entered.clone(), poll_release));
+        let provider = Arc::new(provider);
+        let (wake_tx, wake_rx) = tokio::sync::watch::channel(-1);
+        let cancellation = Arc::new(tokio_util::sync::CancellationToken::new());
+        let wait_started = Arc::new(tokio::sync::Notify::new());
+        let mut host = MockHost::new(vec![]);
+        host.direct_child_owner = Some(Arc::clone(&owner));
+        host.child_wait_started = Some(Arc::clone(&wait_started));
+        let mut state = make_state();
+        state.current_run_id = Some("agent-run".into());
+        state.current_session_id = Some("session".into());
+        state.context_manifest_user_id = Some("user".into());
+        state.run_control = Some(provider);
+        state.user_intents.bind_wake(Some(wake_rx));
+        state.cancellation.token = Some(cancellation.clone());
+        let task = tokio::spawn(async move {
+            await_direct_children_before_completion(
+                &mut host,
+                &mut state,
+                ContinuationAuthority::Runtime,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), wait_started.notified())
+            .await
+            .expect("wait started");
+        wake_tx.send(0).expect("active receiver");
+        tokio::time::timeout(Duration::from_secs(2), poll_entered.notified())
+            .await
+            .expect("authoritative poll started");
+        cancellation.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancellation must not wait for the stalled poll")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+        assert!(owner.has_pending_direct_children());
+    }
+
+    #[tokio::test]
+    async fn action_boundary_handles_mailbox_identically_for_root_and_nested_agent() {
+        use astra_messaging::in_process::InProcessTransport;
+        use astra_messaging::router::AgentMailboxRouter;
+        use astra_messaging::types::{AgentAddress, AgentMessage, MessagePayload, MessageTarget};
+
+        for (run_id, agent_id, depth) in [
+            ("root-run", "root-agent", 0),
+            ("nested-run", "nested-agent", 2),
+        ] {
+            let router = Arc::new(AgentMailboxRouter::new(
+                Arc::new(InProcessTransport::new()),
+                Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
+            ));
+            let address = AgentAddress::new(run_id, agent_id);
+            let sender = AgentAddress::new("sender-run", "peer-agent");
+            let mut state = make_state();
+            state.recursion_depth = depth;
+            state.messaging.mailbox = Some(router.register(address.clone(), None).await.unwrap());
+            let _sender_mailbox = router.register(sender.clone(), None).await.unwrap();
+            let mut host = MockHost::new(vec![]);
+
+            router
+                .send(AgentMessage::new(
+                    sender.clone(),
+                    MessageTarget::Direct {
+                        address: address.clone(),
+                    },
+                    MessagePayload::Progress {
+                        turn_index: 1,
+                        tool_calls: 0,
+                        status: "working".into(),
+                        detail: None,
+                    },
+                ))
+                .await
+                .unwrap();
+            assert!(
+                !runtime_input_boundary(&mut host, &mut state, RuntimeInputBoundary::Action)
+                    .await
+                    .unwrap()
+                    .model_context_changed,
+                "progress must not supersede a tool action"
+            );
+
+            router
+                .send(AgentMessage::new(
+                    sender,
+                    MessageTarget::Direct { address },
+                    MessagePayload::Text {
+                        content: "Review the cancellation path before editing.".into(),
+                        summary: None,
+                    },
+                ))
+                .await
+                .unwrap();
+            assert!(
+                runtime_input_boundary(&mut host, &mut state, RuntimeInputBoundary::Action)
+                    .await
+                    .unwrap()
+                    .model_context_changed,
+                "semantic input must supersede the stale tool action"
+            );
+            assert!(
+                serde_json::to_string(&state.volatile_pending)
+                    .unwrap()
+                    .contains("Review the cancellation path before editing.")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mailbox_batches_accumulate_across_safe_boundaries_until_provider_delivery() {
+        use astra_messaging::in_process::InProcessTransport;
+        use astra_messaging::router::AgentMailboxRouter;
+        use astra_messaging::types::{AgentAddress, AgentMessage, MessagePayload, MessageTarget};
+
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
+        ));
+        let recipient = AgentAddress::new("recipient-run", "recipient");
+        let sender = AgentAddress::new("sender-run", "sender");
+        let mut state = make_state();
+        state.messaging.mailbox = Some(router.register(recipient.clone(), None).await.unwrap());
+        let _sender = router.register(sender.clone(), None).await.unwrap();
+        for index in 0..65 {
+            router
+                .send(AgentMessage::new(
+                    sender.clone(),
+                    MessageTarget::Direct {
+                        address: recipient.clone(),
+                    },
+                    MessagePayload::Text {
+                        content: format!("message-{index}"),
+                        summary: None,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let mut host = MockHost::new(vec![]);
+        assert!(
+            runtime_input_boundary(&mut host, &mut state, RuntimeInputBoundary::Preparation)
+                .await
+                .unwrap()
+                .model_context_changed
+        );
+        assert!(
+            runtime_input_boundary(&mut host, &mut state, RuntimeInputBoundary::Provider)
+                .await
+                .unwrap()
+                .model_context_changed
+        );
+        let retained = state
+            .volatile_pending
+            .iter()
+            .filter(|item| item.kind == VolatileKind::Mailbox)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained.len(),
+            2,
+            "a later drain cannot replace an earlier confirmed batch"
+        );
+        let context = serde_json::to_string(&retained).unwrap();
+        assert!(context.contains("message-0"));
+        assert!(context.contains("message-64"));
+    }
+
+    #[tokio::test]
+    async fn one_child_result_is_consumable_while_a_sibling_keeps_running() {
+        let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "agent-run",
+            "first-child",
+        );
+        for child in ["first-child", "second-child"] {
+            owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+                agent_id: child.into(),
+                run_id: format!("{child}-run"),
+                parent_agent_id: "agent".into(),
+                status: crate::orchestration::AgentStatus::Running {
+                    activity: "working".into(),
+                },
+            });
+        }
+        let wait_started = Arc::new(tokio::sync::Notify::new());
+        let mut host = MockHost::new(vec![]);
+        host.direct_child_owner = Some(Arc::clone(&owner));
+        host.child_wait_started = Some(Arc::clone(&wait_started));
+        let mut state = make_state();
+        let task = tokio::spawn(async move {
+            let result = await_direct_children_before_completion(
+                &mut host,
+                &mut state,
+                ContinuationAuthority::Runtime,
+            )
+            .await;
+            (state, result)
+        });
+        tokio::time::timeout(Duration::from_secs(2), wait_started.notified())
+            .await
+            .expect("wait started");
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            agent_id: "first-child".into(),
+            run_id: "first-child-run".into(),
+            parent_agent_id: "agent".into(),
+            status: crate::orchestration::AgentStatus::Completed {
+                result: "reviewed".into(),
+                finish_reason: None,
+            },
+        });
+        let (state, result) = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("first child must wake execution")
+            .unwrap();
+        assert!(result.unwrap());
+        assert!(
+            serde_json::to_string(&state.volatile_pending)
+                .unwrap()
+                .contains("reviewed")
+        );
+        assert!(
+            owner.has_pending_direct_children(),
+            "second child still owns completion obligation"
+        );
+    }
+
+    #[test]
+    fn child_receipt_requires_observed_matching_successful_terminal() {
+        let mut state = make_state();
+        state.current_run_id = Some("parent-run".into());
+        let record = ToolCallRecord {
+            name: "agent".into(),
+            ok: true,
+            disposition: Some(ToolCallDisposition::Executed),
+            args_full: Some(r#"{"action":"get_result","agent_id":"child@run"}"#.into()),
+            result_full: Some(r#"{"status":"still_running","agent_id":"child@run"}"#.into()),
+            ..Default::default()
+        };
+        state.push_volatile_payload(
+            VolatileKind::BackgroundTaskNotification,
+            serde_json::json!({
+                "schema": DIRECT_CHILD_RESULT_SCHEMA,
+                "parent_run_id": "parent-run",
+                "children": [{"agent_id":"child@run","status":"completed"}]
+            }),
+        );
+        assert!(!nonterminal_child_receipt_superseded(&state, &record));
+        state.volatile_pending[0].payload["observed_by_provider"] = serde_json::json!(true);
+        assert!(nonterminal_child_receipt_superseded(&state, &record));
+        state.volatile_pending[0].payload["parent_run_id"] = serde_json::json!("other-parent");
+        assert!(!nonterminal_child_receipt_superseded(&state, &record));
+        state.volatile_pending[0].payload["parent_run_id"] = serde_json::json!("parent-run");
+        state.volatile_pending[0].payload["children"][0]["agent_id"] =
+            serde_json::json!("other@run");
+        assert!(!nonterminal_child_receipt_superseded(&state, &record));
+        state.volatile_pending[0].payload["children"][0]["agent_id"] =
+            serde_json::json!("child@run");
+        state.volatile_pending[0].payload["children"][0]["status"] = serde_json::json!("failed");
+        assert!(!nonterminal_child_receipt_superseded(&state, &record));
+        state.volatile_pending[0].payload["children"][0]["status"] = serde_json::json!("completed");
+        let launched = ToolCallRecord {
+            args_full: Some(r#"{"action":"spawn","description":"child","prompt":"work"}"#.into()),
+            result_full: Some(r#"{"status":"launched","agent_id":"child@run"}"#.into()),
+            ..record.clone()
+        };
+        assert!(nonterminal_child_receipt_superseded(&state, &launched));
+        let mut failed_call = launched.clone();
+        failed_call.ok = false;
+        assert!(!nonterminal_child_receipt_superseded(&state, &failed_call));
+        let mut rejected_call = launched.clone();
+        rejected_call.disposition = Some(ToolCallDisposition::Rejected);
+        assert!(!nonterminal_child_receipt_superseded(
+            &state,
+            &rejected_call
+        ));
+        let mut terminal_failure = record.clone();
+        terminal_failure.result_full =
+            Some(r#"{"status":"interrupted","agent_id":"child@run"}"#.into());
+        assert!(!nonterminal_child_receipt_superseded(
+            &state,
+            &terminal_failure
+        ));
+    }
+
+    #[tokio::test]
+    async fn delivered_direct_child_evidence_survives_a_provider_round() {
+        let mut state = make_state();
+        state.push_volatile_payload(
+            VolatileKind::BackgroundTaskNotification,
+            serde_json::json!({
+                "schema": DIRECT_CHILD_RESULT_SCHEMA,
+                "parent_run_id": "parent-run",
+                "children": [{"agent_id": "child", "status": "completed", "result_sha256": "sha256:test"}],
+            }),
+        );
+        // The production host leases required context when assembling the
+        // provider request; the lightweight mock only does so with an owner.
+        state.volatile_pending[0].attempt_leased = true;
+        let mut read = make_edge_tool("read_file", "evidence");
+        read.args = serde_json::json!({"path": "/app/evidence.txt"});
+        let mut host = MockHost::new(vec![edge_tool_result(vec![read], 10, 5, Some(1))])
+            .with_valid_tools(&["read_file"]);
+        execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
+            .await
+            .expect("provider round");
+        assert!(
+            host.executed_volatile[0]
+                .iter()
+                .any(|entry| { entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA })
+        );
+        assert!(
+            state.volatile_pending.iter().any(|entry| {
+                entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                    && entry.payload["observed_by_provider"] == true
+                    && !entry.attempt_leased
+            }),
+            "pending={:?}",
+            state.volatile_pending
+        );
+        let mut next = MockHost::new(vec![text_result("Done", 10, 5, Some(1))]);
+        execute_turn_and_ingest_phase(&mut next, &mut state, 1, prep(false))
+            .await
+            .expect("next provider round");
+        assert!(next.executed_volatile[0].iter().any(|entry| {
+            entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                && entry.payload["observed_by_provider"] == true
+        }));
+    }
 
     #[test]
     fn restored_workspace_observation_unavailable_does_not_grant_repair_or_success() {
@@ -15428,11 +16544,13 @@ mod tests {
     fn rejected_work_settlement_opens_repair_before_budget_settlement() {
         let mut state = make_state();
         let mut rejected_settlement = executed_record("settle_work_item", false, None);
+        rejected_settlement.tool_call_id = Some("call-settle".into());
         rejected_settlement.disposition = Some(ToolCallDisposition::Rejected);
         rejected_settlement.result_full = Some(
             serde_json::json!({
                 "status": "rejected",
                 "error_kind": "unresolved_work_validation",
+                "retryable": false,
                 "validation_state": "failed"
             })
             .to_string(),
@@ -15484,6 +16602,28 @@ mod tests {
             entry.payload["signal"] == "canonical_validation_failed_repair_once"
                 && entry.payload["origin"] == "rejected_work_settlement"
         }));
+        super::super::tool_phase::settle_non_retryable_tool_rejections(
+            &mut state,
+            &[serde_json::json!({
+                "id": "call-settle",
+                "type": "function",
+                "function": {"name": "settle_work_item", "arguments": "{}"}
+            })],
+            2,
+            false,
+            true,
+        );
+        assert_eq!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .as_ref()
+                .map(|window| &window.action),
+            Some(&CompletionAction::CanonicalWorkRepair),
+            "the later terminal-rejection gate must not revoke Work repair authority"
+        );
+        assert!(!state.hooks.completion_settlement.work_settlement_only);
         // The same rejection cannot authorize repair after a local suffix
         // record is lost. Keep the positive control above.
         state.stall.verification_frontier =
@@ -20287,6 +21427,7 @@ mod tests {
     struct StubRunControlProvider {
         polls: Mutex<VecDeque<UserIntentPoll>>,
         poll_calls: Mutex<Vec<usize>>,
+        poll_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         released: Mutex<Vec<usize>>,
         release_failures: Mutex<usize>,
         terminal_on_release: bool,
@@ -20304,6 +21445,7 @@ mod tests {
             Self {
                 polls: Mutex::new(VecDeque::from(polls)),
                 poll_calls: Mutex::new(Vec::new()),
+                poll_gate: None,
                 released: Mutex::new(Vec::new()),
                 release_failures: Mutex::new(0),
                 terminal_on_release: false,
@@ -20318,37 +21460,15 @@ mod tests {
         }
 
         fn with_release_failures(polls: Vec<UserIntentPoll>, release_failures: usize) -> Self {
-            Self {
-                polls: Mutex::new(VecDeque::from(polls)),
-                poll_calls: Mutex::new(Vec::new()),
-                released: Mutex::new(Vec::new()),
-                release_failures: Mutex::new(release_failures),
-                terminal_on_release: false,
-                provider_authorization_calls: std::sync::atomic::AtomicUsize::new(0),
-                provider_authorizations: Mutex::new(VecDeque::new()),
-                fence_calls: std::sync::atomic::AtomicUsize::new(0),
-                reopen_calls: std::sync::atomic::AtomicUsize::new(0),
-                fence_generations: Mutex::new(Vec::new()),
-                reopen_generations: Mutex::new(Vec::new()),
-                reopen_error: None,
-            }
+            let mut provider = Self::new(polls);
+            *provider.release_failures.get_mut() = release_failures;
+            provider
         }
 
         fn with_terminal_release(polls: Vec<UserIntentPoll>) -> Self {
-            Self {
-                polls: Mutex::new(VecDeque::from(polls)),
-                poll_calls: Mutex::new(Vec::new()),
-                released: Mutex::new(Vec::new()),
-                release_failures: Mutex::new(0),
-                terminal_on_release: true,
-                provider_authorization_calls: std::sync::atomic::AtomicUsize::new(0),
-                provider_authorizations: Mutex::new(VecDeque::new()),
-                fence_calls: std::sync::atomic::AtomicUsize::new(0),
-                reopen_calls: std::sync::atomic::AtomicUsize::new(0),
-                fence_generations: Mutex::new(Vec::new()),
-                reopen_generations: Mutex::new(Vec::new()),
-                reopen_error: None,
-            }
+            let mut provider = Self::new(polls);
+            provider.terminal_on_release = true;
+            provider
         }
 
         fn with_reopen_error(polls: Vec<UserIntentPoll>, error: &str) -> Self {
@@ -20569,6 +21689,10 @@ mod tests {
             after_event_index: usize,
         ) -> UserIntentPoll {
             self.poll_calls.lock().await.push(after_event_index);
+            if let Some((entered, release)) = &self.poll_gate {
+                entered.notify_one();
+                release.notified().await;
+            }
             self.polls
                 .lock()
                 .await

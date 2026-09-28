@@ -16,6 +16,12 @@ pub struct ModelRoutingDecision {
     /// Full canonical semantic decision, including graph, topology and capabilities.
     pub work_admission: Option<crate::WorkAdmissionDecision>,
     pub work_admission_skill_revision: usize,
+    /// The same judgment's child-model requirement, never inferred from its
+    /// Work decision after recovery.
+    pub delegation_model_requirement: Option<crate::WorkAdmissionTruth>,
+    /// Authenticated intent that the requirement described. Rebind only after
+    /// matching it to the restored turn; owner generation can change.
+    pub delegation_model_source: Option<astra_turn_types::DelegationModelInstructionSource>,
     pub policy_version: String,
     pub policy: AutoModelRoutingPolicy,
     pub run_id: String,
@@ -30,9 +36,15 @@ pub struct ModelRoutingDecision {
 
 impl ModelRoutingDecision {
     pub fn validate_identity(&self, run_id: &str, session_id: &str) -> Result<(), String> {
-        if self.schema_version != 1
+        if self.schema_version != 2
             || self.run_id != run_id
             || self.session_id != session_id
+            || self.delegation_model_requirement.is_some() != self.delegation_model_source.is_some()
+            || self.delegation_model_requirement.is_some() && self.work_admission.is_none()
+            || self
+                .delegation_model_source
+                .as_ref()
+                .is_some_and(|source| source.run_id != run_id || source.session_id != session_id)
             || self.selected_model.trim().is_empty()
             || self.selected_model.len() > 255
             || (self.selected_offering_id != self.policy.economy_offering_id

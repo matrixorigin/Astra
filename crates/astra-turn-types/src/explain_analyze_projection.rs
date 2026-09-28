@@ -37,6 +37,7 @@ pub struct ExplainAnalyzeProjectedNodeV1 {
     pub end_elapsed_ms: Option<u64>,
     pub duration_ms: Option<u64>,
     pub outcome: Option<ExplainAnalyzeOutcomeV1>,
+    pub decision_detail: Option<crate::ExplainAnalyzeDecisionDetailV1>,
     pub usage: Option<ExplainAnalyzeTokenUsageV1>,
     pub context: Option<ExplainAnalyzeContextMetricsV1>,
     pub auxiliary_usage: Option<Box<crate::ExplainAnalyzeAuxiliaryUsageV1>>,
@@ -948,6 +949,7 @@ impl ExplainAnalyzeGraphV1 {
             end_elapsed_ms: terminal.then_some(event.elapsed_ms),
             duration_ms: event.duration_ms,
             outcome: event.outcome,
+            decision_detail: event.decision_detail.clone(),
             usage: event.usage.clone(),
             context: event.context.clone(),
             auxiliary_usage: event.auxiliary_usage.clone(),
@@ -1094,6 +1096,7 @@ impl ExplainAnalyzeGraphV1 {
                     || node.end_elapsed_ms != Some(event.elapsed_ms)
                     || node.duration_ms != event.duration_ms
                     || node.outcome != event.outcome
+                    || node.decision_detail != event.decision_detail
                     || node.usage != event.usage
                     || node.auxiliary_usage != event.auxiliary_usage
                     || node.auxiliary_details != event.auxiliary_details
@@ -1113,6 +1116,7 @@ impl ExplainAnalyzeGraphV1 {
                 node.end_elapsed_ms = Some(event.elapsed_ms);
                 node.duration_ms = event.duration_ms;
                 node.outcome = event.outcome;
+                node.decision_detail = event.decision_detail.clone();
                 node.usage = event.usage.clone();
                 node.context = event.context.clone();
                 node.auxiliary_usage = event.auxiliary_usage.clone();
@@ -1355,6 +1359,7 @@ mod tests {
             start_elapsed_ms: None,
             duration_ms: None,
             outcome: None,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),
@@ -1639,6 +1644,44 @@ mod tests {
         estimated.usage.as_mut().unwrap().basis =
             crate::ExplainAnalyzeUsageBasisV1::RuntimeEstimated;
         assert_eq!(build(estimated).primary_prompt_cache_read_tokens(), None);
+    }
+
+    #[test]
+    fn decision_detail_is_retained_and_conflicting_terminal_evidence_is_detected() {
+        let mut graph = ExplainAnalyzeGraphV1::default();
+        let start = started(
+            "admission-agent",
+            ExplainAnalyzeNodeKindV1::Admission,
+            Some("turn-1"),
+            "clock-1",
+            4,
+        );
+        let mut terminal = finished(start, 4, 9);
+        terminal.outcome = Some(ExplainAnalyzeOutcomeV1::Blocked);
+        terminal.decision_detail = Some(
+            crate::ExplainAnalyzeDecisionDetailV1::DelegationCatalogResolution {
+                requirement_index: 1,
+                match_count: 0,
+            },
+        );
+        graph.apply(terminal.clone());
+        graph.apply(terminal.clone());
+        assert_eq!(graph.duplicate_event_count(), 1);
+        assert_eq!(graph.nodes()[0].decision_detail, terminal.decision_detail);
+
+        terminal.event_id.push_str("-conflict");
+        terminal.decision_detail = Some(
+            crate::ExplainAnalyzeDecisionDetailV1::DelegationCatalogResolution {
+                requirement_index: 1,
+                match_count: 3,
+            },
+        );
+        graph.apply(terminal);
+        assert!(graph.nodes()[0].conflicted);
+        assert_eq!(
+            graph.conflicted_node_ids().collect::<Vec<_>>(),
+            ["admission-agent"]
+        );
     }
 
     #[test]

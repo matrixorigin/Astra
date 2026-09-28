@@ -13161,6 +13161,7 @@ mod tests {
             start_elapsed_ms: None,
             duration_ms: None,
             outcome: None,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),
@@ -15460,7 +15461,6 @@ mod tests {
             related_message_id: None,
             timestamp_ms: 42,
             correlation_id: None,
-            requires_ack: false,
         };
         let event = astra_services::session_journal::JournalEvent::transcript_evidence(
             "parent-session",
@@ -15858,6 +15858,8 @@ mod tests {
             parent_run_id: "root".to_string(),
             parent_agent_id: "root".to_string(),
             resolved_model_name: None,
+            delegation_model_admission: None,
+            parent_model_reasoning: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
@@ -18387,7 +18389,6 @@ mod tests {
             related_message_id: None,
             timestamp_ms: 42,
             correlation_id: None,
-            requires_ack: true,
         });
 
         apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget);

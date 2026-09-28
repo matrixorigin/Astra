@@ -218,6 +218,10 @@ pub struct ToolPolicySnapshot {
     /// route execution, preventing policy TOCTOU within one invocation.
     #[serde(skip)]
     pub admission_snapshot: Option<ToolExecutionAdmissionSnapshot>,
+    /// Trusted, invocation-local delegation instruction. The durable decision
+    /// persists this separately; provider/tool arguments must never carry it.
+    #[serde(skip)]
+    pub delegation_model_admission: Option<astra_turn_types::DelegationModelAdmission>,
     /// Server-derived Session provider-selection generation. It is runtime
     /// authority only and is deliberately omitted from serialized provider
     /// requests and durable tool decisions.

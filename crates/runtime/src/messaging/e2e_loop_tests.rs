@@ -2,7 +2,7 @@
 //!
 //! Verifies:
 //! 1. The legacy standalone send_message schema is never injected
-//! 2. Turn-start drain formats pending messages as system messages
+//! 2. Queued messages reach volatile model context without application receipts
 //! 3. Execution progress stays on the live projection instead of the mailbox
 
 #[cfg(test)]
@@ -351,38 +351,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_injects_pending_messages_as_system_msg() {
-        let (_router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
+    async fn send_message_queues_context_without_application_reply() {
+        let (router, mut parent_mb, child_mb, _dt) = setup_two_agents().await;
 
-        // Parent sends a message to child BEFORE the loop starts.
-        let msg = AgentMessage::new(
-            parent_mb.address.clone(),
-            MessageTarget::Direct {
-                address: child_mb.address.clone(),
-            },
-            MessagePayload::Text {
-                content: "Please focus on auth module.".into(),
-                summary: None,
-            },
-        );
-        parent_mb.send(msg).await.unwrap();
-
-        // Verify child has a pending message.
-        let pending = child_mb.try_recv();
-        assert!(pending.is_some(), "child should have a pending message");
-
-        // Put it back by sending again (try_recv consumed it).
-        let msg2 = AgentMessage::new(
-            parent_mb.address.clone(),
-            MessageTarget::Direct {
-                address: child_mb.address.clone(),
-            },
-            MessagePayload::Text {
-                content: "Focus on auth module.".into(),
-                summary: None,
-            },
-        );
-        parent_mb.send(msg2).await.unwrap();
+        // The public sender returns before the receiver's loop starts.
+        let queued = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+            &json!({
+                "action": "send_message",
+                "to": child_mb.address.run_id,
+                "message": "Focus on auth module.",
+            }),
+            &router,
+            &parent_mb.address.run_id,
+            &parent_mb.address.agent_id,
+        )
+        .await;
+        let queued: Value = serde_json::from_str(&queued).unwrap();
+        assert_eq!(queued["success"], true);
+        assert_eq!(queued["status"], "queued");
+        assert!(parent_mb.try_recv().is_none());
 
         let mut host = MockHost::new(vec![text_result("Working on auth.")]);
         let mut state = make_state();
@@ -394,9 +381,11 @@ mod tests {
         // Post-Task #45: drained mailbox rides the structured volatile
         // lane (Kind::Mailbox) instead of state.messages.
         let has_mailbox_msg = state.volatile_pending.iter().any(|inj| {
-            inj.payload
-                .as_str()
-                .is_some_and(|text| text.contains("📬") && text.contains("orchestrator"))
+            inj.payload.as_str().is_some_and(|text| {
+                text.contains("📬")
+                    && text.contains("orchestrator")
+                    && text.contains("Focus on auth module.")
+            })
         });
         assert!(
             has_mailbox_msg,
@@ -405,8 +394,21 @@ mod tests {
         );
         assert_eq!(host.communication_events.len(), 1);
         assert_eq!(
+            host.communication_events[0].message_id,
+            queued["message_id"].as_str().unwrap()
+        );
+        assert_eq!(
+            host.communication_events[0].direction,
+            astra_turn_types::AgentCommunicationDirection::Received
+        );
+        assert_eq!(
             host.communication_events[0].payload_kind,
             astra_turn_types::AgentCommunicationPayloadKind::Text
+        );
+        assert_eq!(host.current_turn, 1);
+        assert!(
+            parent_mb.try_recv().is_none(),
+            "no application receipt traffic"
         );
     }
 
@@ -569,6 +571,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnected_child_permission_request_does_not_stop_parent() {
+        let (_router, parent_mb, child_mb, _dt) = setup_two_agents().await;
+        let request = PermissionRequest::new("bash", json!({"command": "echo hi"}))
+            .to_message(&child_mb.address, &parent_mb.address)
+            .with_correlation("perm-disconnected");
+        child_mb.send(request).await.unwrap();
+        child_mb.unregister().await.unwrap();
+
+        let mut host = MockHost::new(vec![text_result("must not run")]);
+        let mut state = make_state();
+        state.messaging.mailbox = Some(parent_mb);
+        state.permission_context = Some(PermissionSyncContext::shared_root(PermissionMode::Auto));
+
+        run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .expect("obsolete child request must not abort unrelated parent work");
+        assert!(host.current_turn > 0);
+        assert!(
+            state
+                .messaging
+                .mailbox
+                .as_mut()
+                .unwrap()
+                .try_recv()
+                .is_none(),
+            "definitively undeliverable request must not poison later boundaries"
+        );
+    }
+
+    #[tokio::test]
     async fn child_tool_round_records_blocked_permission_denial() {
         let tool_calls = vec![json!({
             "id": "call-bash-perm",
@@ -612,6 +644,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            delegation_model_admissions: None,
             task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
@@ -699,6 +732,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            delegation_model_admissions: None,
             task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
@@ -795,6 +829,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            delegation_model_admissions: None,
             task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
@@ -897,6 +932,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            delegation_model_admissions: None,
             task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
@@ -1039,6 +1075,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            delegation_model_admissions: None,
             task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
@@ -1168,6 +1205,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            delegation_model_admissions: None,
             task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
@@ -1277,6 +1315,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            delegation_model_admissions: None,
             task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
@@ -1416,6 +1455,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            delegation_model_admissions: None,
             task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
@@ -1557,6 +1597,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            delegation_model_admissions: None,
             task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,
@@ -1652,6 +1693,7 @@ mod tests {
             current_run_id: None,
             current_turn_chain_id: None,
             durable_dispatch_admission: None,
+            delegation_model_admissions: None,
             task_resolution_authority: None,
             physical_tool_calls: &tool_calls,
             logical_tool_calls: &tool_calls,

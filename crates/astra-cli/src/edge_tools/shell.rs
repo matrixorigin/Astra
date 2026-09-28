@@ -6585,6 +6585,7 @@ mod tests {
                     tool_call_id: Some("call"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    delegation_model_admission: None,
                 },
                 None,
             )
@@ -6643,6 +6644,7 @@ mod tests {
                     tool_call_id: Some("wrapper-exit"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    delegation_model_admission: None,
                 },
                 None,
             )
@@ -6722,6 +6724,7 @@ mod tests {
                     tool_call_id: Some("timeout"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    delegation_model_admission: None,
                 },
                 None,
             )
@@ -6798,6 +6801,7 @@ mod tests {
                     tool_call_id: Some("cancel"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    delegation_model_admission: None,
                 },
                 Some(&cancel),
             )

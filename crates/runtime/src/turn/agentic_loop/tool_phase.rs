@@ -233,24 +233,58 @@ fn provider_tool_call_facts(tool_calls: &[Value]) -> (u32, Vec<String>) {
     )
 }
 
-/// A non-retryable admission rejection is a terminal execution boundary for
-/// the current tool-shaped response. If every requested call was rejected
-/// before dispatch, give the model one text-only repair opportunity; repeated
-/// tool requests must become an interruption instead of an unbounded loop or
-/// a falsely completed turn.
+/// Only exact, recorded non-execution receipts can close the batch. A
+/// pre-resolved result alone is not proof that a skill or edge callback had no
+/// side effect; the terminal tool ledger owns that distinction.
 fn all_requested_calls_rejected_non_retryable(
     requested: &[Value],
-    admission: &super::host::ToolCallAdmission,
+    records: &[ToolCallRecord],
 ) -> bool {
     !requested.is_empty()
-        && admission.admitted.is_empty()
-        && admission.rejected.len() == requested.len()
-        && admission.rejected.iter().all(|rejected| {
-            serde_json::from_str::<Value>(&rejected.result)
-                .ok()
-                .and_then(|result| result.get("retryable").and_then(Value::as_bool))
-                == Some(false)
+        && records.iter().all(|record| !record.was_executed())
+        && requested.iter().all(|call| {
+            let Some(id) = call.get("id").and_then(Value::as_str) else {
+                return false;
+            };
+            let mut matches = records
+                .iter()
+                .filter(|record| record.tool_call_id.as_deref() == Some(id));
+            let Some(record) = matches.next() else {
+                return false;
+            };
+            matches.next().is_none()
+                && !record.ok
+                && record.disposition
+                    == Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+                && record
+                    .runtime_model_result_full
+                    .as_deref()
+                    .or(record.result_full.as_deref())
+                    .and_then(|result| serde_json::from_str::<Value>(result).ok())
+                    .and_then(|value| value.get("retryable").and_then(Value::as_bool))
+                    == Some(false)
         })
+}
+
+/// Reconcile the terminal tool batch without overriding a typed action that
+/// Work or completion recovery has already authorized from those same facts.
+pub(crate) fn settle_non_retryable_tool_rejections(
+    state: &mut AgenticLoopState,
+    requested: &[Value],
+    round_records_start: usize,
+    edge_results_present: bool,
+    active_work_attempt: bool,
+) {
+    if edge_results_present
+        || super::execution_phase::completion_action_window_requires_followup(state)
+        || !all_requested_calls_rejected_non_retryable(
+            requested,
+            &state.stall.tool_call_records[round_records_start..],
+        )
+    {
+        return;
+    }
+    engage_non_retryable_admission_boundary(state, active_work_attempt, requested.len());
 }
 
 /// Select the terminal repair boundary for a provider batch that could not
@@ -2105,16 +2139,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         &admission,
     )
     .map_err(|error| format!("tool admission contract violation: {error}"))?;
-    if all_requested_calls_rejected_non_retryable(&turn_result.accum.tool_calls, &admission) {
-        let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
-            crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
-        );
-        engage_non_retryable_admission_boundary(
-            state,
-            active_work_attempt,
-            admission.rejected.len(),
-        );
-    }
 
     // Edge callbacks may already have executed while the stream was open.
     // Correlate their typed tool/argument receipt with the same action frame.
@@ -2201,17 +2225,41 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         }
         state.hooks.completion_settlement.text_only = true;
     }
-    let admitted_tool_calls = admission.admitted;
-    let admitted_logical_calls = admitted_tool_calls
+    let mut admitted_tool_calls = admission.admitted;
+    let mut admitted_logical_calls = admitted_tool_calls
         .iter()
         .map(|call| call.logical_target_call().clone())
         .collect::<Vec<_>>();
     let mut admitted_tool_call_control = super::host::AdmittedToolCallControl::Continue;
+    let mut delegation_model_admissions = std::collections::HashMap::new();
     if !admitted_logical_calls.is_empty() {
         let delivered = host
             .handle_admitted_tool_invocations(state, &admitted_tool_calls)
             .await;
         admitted_tool_call_control = delivered.control;
+        delegation_model_admissions = delivered.delegation_model_admissions;
+        if !delivered.pre_execution_rejections.is_empty() {
+            let rejected_ids = delivered
+                .pre_execution_rejections
+                .iter()
+                .map(|rejected| rejected.provider_call_id().to_string())
+                .collect::<HashSet<_>>();
+            admitted_tool_calls.retain(|call| {
+                call.provider_call_id()
+                    .is_none_or(|id| !rejected_ids.contains(id))
+            });
+            admitted_logical_calls.retain(|call| {
+                call.get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|id| !rejected_ids.contains(id))
+            });
+            admission
+                .rejected
+                .extend(delivered.pre_execution_rejections);
+        }
+        if let Some(usage) = delivered.auxiliary_usage {
+            state.settle_admitted_auxiliary_usage(usage);
+        }
         record_trusted_client_pipeline_skills(state, &admitted_logical_calls, &delivered.results);
         turn_result.edge_tool_round.extend(delivered.results);
     }
@@ -2461,6 +2509,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     }
                 },
             ),
+            delegation_model_admissions: Some(&delegation_model_admissions),
             physical_tool_calls,
             logical_tool_calls: all_tool_calls,
             deferred_activations_by_call_id: &deferred_activations_by_call_id,
@@ -2779,11 +2828,14 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     if tool_round_superseded {
         if !superseding_guidance_applied {
-            let applied =
-                super::execution_phase::inject_polled_user_intents_before_action(host, state)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            if !applied {
+            let observed = super::execution_phase::runtime_input_boundary(
+                host,
+                state,
+                super::execution_phase::RuntimeInputBoundary::Action,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            if !observed.durable_guidance_applied {
                 return Err(
                     "edge action authority changed but no durable guidance could be applied"
                         .to_string(),
@@ -2849,6 +2901,21 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         state,
         evo_records_before,
         reconciliation_boundary.as_deref(),
+    );
+
+    // Admission and server preflight are one causal boundary. The latter can
+    // reject an admitted call non-retryably; wait until its terminal result,
+    // tool ledger, output batch, and Work reconciliation are settled before
+    // constraining the next provider round.
+    let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
+        crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
+    );
+    settle_non_retryable_tool_rejections(
+        state,
+        &turn_result.accum.tool_calls,
+        round_records_start,
+        !edge_tool_round.is_empty(),
+        active_work_attempt,
     );
 
     let waiting_reason = execution_boundary_blocked_wait_reason(&new_tool_results);
@@ -3562,6 +3629,58 @@ mod tests {
             projected_without_owner_snapshot.is_empty(),
             "a rejected journal disposition cannot override the typed terminal owner"
         );
+    }
+
+    #[test]
+    fn server_preflight_rejection_has_one_record_and_reliable_terminal_owner() {
+        let mut state = make_state();
+        let call = json!({
+            "id": "blocked-fanout",
+            "type": "function",
+            "function": {"name": "agent_fanout", "arguments": "{}"}
+        });
+        let rejection = super::super::host::RejectedToolCall::ordinary(
+            call.clone(),
+            json!({
+                "status": "failed",
+                "error_kind": "delegation_model_scope_unresolved",
+                "retryable": false,
+                "advisory": {"executed": false},
+                "error": "Model requirement assessment did not complete."
+            })
+            .to_string(),
+        );
+        let (_, pre_resolved) =
+            crate::turn::agentic::tool_interception::record_pre_execution_rejections(
+                &mut state,
+                vec![rejection],
+            );
+        assert_eq!(pre_resolved.len(), 1);
+        assert_eq!(pre_resolved[0].call_id, "blocked-fanout");
+        let records = &state.stall.tool_call_records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].disposition,
+            Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+        );
+        assert!(!records[0].was_executed());
+        assert!(all_requested_calls_rejected_non_retryable(
+            std::slice::from_ref(&call),
+            records
+        ));
+        assert_eq!(
+            pre_resolved_server_tool_terminal_records(records, &[], &HashSet::new(), &[]).len(),
+            1
+        );
+        settle_non_retryable_tool_rejections(
+            &mut state,
+            std::slice::from_ref(&call),
+            0,
+            false,
+            false,
+        );
+        assert!(state.hooks.completion_settlement.text_only);
+        assert!(!state.hooks.completion_settlement.work_settlement_only);
     }
 
     fn publish_test_feedback(
@@ -4604,19 +4723,62 @@ mod tests {
             ],
             completion_action_applied: true,
         };
+        let mut state = make_state();
+        crate::turn::agentic::tool_interception::record_pre_execution_rejections(
+            &mut state,
+            admission.rejected,
+        );
         assert!(all_requested_calls_rejected_non_retryable(
-            &requested, &admission
+            &requested,
+            &state.stall.tool_call_records
         ));
 
-        let mut retryable = admission.clone();
-        retryable.rejected[1].result = json!({
-            "status":"rejected",
-            "retryable":true,
-            "error_kind":"tool_validation"
-        })
-        .to_string();
+        state.stall.tool_call_records[1].result_full = Some(
+            json!({
+                "status":"rejected",
+                "retryable":true,
+                "error_kind":"tool_validation"
+            })
+            .to_string(),
+        );
         assert!(!all_requested_calls_rejected_non_retryable(
-            &requested, &retryable
+            &requested,
+            &state.stall.tool_call_records
+        ));
+    }
+
+    #[test]
+    fn post_admission_preflight_rejection_is_a_terminal_non_retryable_receipt() {
+        use astra_services::session_journal::ToolCallDisposition;
+
+        let requested = vec![json!({"id":"spawn","function":{"name":"agent","arguments":"{}"}})];
+        let mut records = vec![ToolCallRecord {
+            tool_call_id: Some("spawn".into()),
+            name: "agent".into(),
+            ok: false,
+            disposition: Some(ToolCallDisposition::Rejected),
+            result_full: Some(
+                json!({
+                    "status":"failed",
+                    "error_kind":"delegation_model_scope_unresolved",
+                    "retryable":false,
+                    "advisory":{"executed":false}
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        }];
+        assert!(all_requested_calls_rejected_non_retryable(
+            &requested, &records
+        ));
+        records[0].disposition = Some(ToolCallDisposition::Executed);
+        assert!(!all_requested_calls_rejected_non_retryable(
+            &requested, &records
+        ));
+        records[0].disposition = Some(ToolCallDisposition::Rejected);
+        records[0].tool_call_id = Some("other".into());
+        assert!(!all_requested_calls_rejected_non_retryable(
+            &requested, &records
         ));
     }
 
@@ -6180,7 +6342,7 @@ esac
 
         // LiveRuntimeProvider
         assert_eq!(provider.token_pressure(), 0.0);
-        assert_eq!(provider.cache_hit_ratio(), 0.0);
+        assert_eq!(provider.cache_hit_ratio(), None);
         assert_eq!(provider.current_error_rate(), 0.0);
         assert_eq!(provider.budget_remaining(), 10);
         assert_eq!(provider.budget_max(), 10);

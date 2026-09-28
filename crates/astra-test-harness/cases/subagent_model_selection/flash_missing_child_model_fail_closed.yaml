@@ -1,0 +1,24 @@
+name: flash_missing_child_model_fail_closed
+description: |
+  An unavailable fixed model must not silently fall back to the parent model.
+prompt: |
+  请让 glm-99.99 模型的子代理回答 ASTRA-MISSING-MODEL-MUST-NOT-RUN。
+  如果这个模型不可用，请如实说明；不要换模型，也不要重试。
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

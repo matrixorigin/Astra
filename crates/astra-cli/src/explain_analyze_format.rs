@@ -1,6 +1,6 @@
 //! Shared labels used by the text and HTML Explain Analyze renderers.
 
-use astra_turn_types::ExplainAnalyzeProjectionDiagnosticCodeV1;
+use astra_turn_types::{ExplainAnalyzeDecisionDetailV1, ExplainAnalyzeProjectionDiagnosticCodeV1};
 
 pub(crate) fn alpha_label(mut ordinal: usize) -> String {
     let mut label = String::new();
@@ -27,6 +27,25 @@ pub(crate) fn diagnostic_label(code: ExplainAnalyzeProjectionDiagnosticCodeV1) -
         MissingParent => "parent stage was not observed",
         ParentCycle => "cyclic stage hierarchy",
         UnresolvedTerminalNode => "stage did not reach a recorded end",
+    }
+}
+
+pub(crate) fn decision_detail_line(detail: &ExplainAnalyzeDecisionDetailV1) -> String {
+    match detail {
+        ExplainAnalyzeDecisionDetailV1::DelegationCatalogResolution {
+            requirement_index,
+            match_count,
+        } if *match_count == 0 => format!(
+            "Requested model requirement {}: no eligible model matched in the authorized catalog snapshot; no child was started.",
+            requirement_index.saturating_add(1)
+        ),
+        ExplainAnalyzeDecisionDetailV1::DelegationCatalogResolution {
+            requirement_index,
+            match_count,
+        } => format!(
+            "Requested model requirement {}: {match_count} eligible models matched; selection was ambiguous, so no child was started.",
+            requirement_index.saturating_add(1)
+        ),
     }
 }
 

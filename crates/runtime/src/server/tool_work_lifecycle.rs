@@ -3166,6 +3166,7 @@ mod tests {
                 tool_call_id: Some("physical-1"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
+                delegation_model_admission: None,
                 task_resolution_authority: None,
             },
         )
@@ -3181,6 +3182,7 @@ mod tests {
                 tool_call_id: Some("physical-1"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
+                delegation_model_admission: None,
                 task_resolution_authority: None,
             },
         )
@@ -3202,6 +3204,7 @@ mod tests {
                 tool_call_id: Some("physical-2"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
+                delegation_model_admission: None,
                 task_resolution_authority: None,
             },
         )
@@ -3252,6 +3255,7 @@ mod tests {
                 tool_call_id: Some("untrusted-later-start"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
+                delegation_model_admission: None,
                 task_resolution_authority: None,
             },
         )
@@ -3349,6 +3353,7 @@ mod tests {
                 tool_call_id: Some("physical-defer"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
+                delegation_model_admission: None,
                 task_resolution_authority: None,
             },
         )
@@ -3400,6 +3405,7 @@ mod tests {
                 tool_call_id: Some("physical-plan-only"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
+                delegation_model_admission: None,
                 task_resolution_authority: None,
             },
         )
@@ -3455,6 +3461,7 @@ mod tests {
                 tool_call_id: Some("physical-active-defer"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
+                delegation_model_admission: None,
                 task_resolution_authority: None,
             },
         )
@@ -3483,6 +3490,7 @@ mod tests {
                 tool_call_id: Some("physical-assignment-replay"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
+                delegation_model_admission: None,
                 task_resolution_authority: None,
             },
         )
@@ -3604,6 +3612,7 @@ mod tests {
                     tool_call_id: Some(&physical_call_id),
                     admission_source: Some(ToolInvocationAdmissionSource::Policy),
                     expected_control_epoch: None,
+                    delegation_model_admission: None,
                     task_resolution_authority: None,
                 },
             )
@@ -3715,6 +3724,7 @@ mod tests {
                 tool_call_id: Some("physical-foreign-fence"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
+                delegation_model_admission: None,
                 task_resolution_authority: None,
             },
         )

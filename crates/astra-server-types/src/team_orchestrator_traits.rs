@@ -60,6 +60,8 @@ pub trait DelegationExecutor: Send + Sync {
         request: DelegationRequest,
         source_agent_id: &str,
         profile_snapshot: AgentProfileRegistry,
+        model_plan: Option<astra_turn_types::DirectDelegationModelPlan>,
+        command_identity: Option<astra_turn_types::DirectDelegationCommandIdentity>,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String>;
 

@@ -275,6 +275,7 @@ impl DatabaseModelService {
                         .then_some(model.max_output_tokens),
                     architecture: None,
                     thinking_capability: None,
+                    pricing: None,
                 });
             }
             if page.next_page_token.is_empty() {
@@ -303,9 +304,17 @@ impl DatabaseModelService {
         selected: &str,
     ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
         let catalog = self.genesis_catalog(subject).await?;
+        self.admit_genesis_from_catalog(&catalog, selected)
+    }
+
+    pub(super) fn admit_genesis_from_catalog(
+        &self,
+        catalog: &GenesisCatalog,
+        selected: &str,
+    ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
         let item = catalog
             .items
-            .into_iter()
+            .iter()
             .find(|item| item.offering_id == selected)
             .ok_or_else(|| {
                 model_offering_resolution_error_response(ModelOfferingResolutionError::NotFound {
@@ -314,12 +323,17 @@ impl DatabaseModelService {
             })?;
         let provider = self.uc_provider.as_ref().ok_or_else(unavailable)?;
         Ok(AdmittedModelExecution {
-            offering_id: item.offering_id,
+            price_snapshot: None,
+            offering_id: item.offering_id.clone(),
+            source_identity: Some(crate::models::ResolvedModelSourceIdentity {
+                provider: "openai".into(),
+                access_label: ModelAccessKind::AstraCloud.source_label().to_string(),
+            }),
             access_kind: ModelAccessKind::AstraCloud,
             execution_placement: ModelExecutionPlacement::Server,
-            model_name: item.name,
+            model_name: item.name.clone(),
             wire_model_name: None,
-            api_key: catalog.api_key,
+            api_key: catalog.api_key.clone(),
             base_url: format!("{}/v1", provider.settings.genesis_url),
             provider: "openai".into(),
             cache_capability: None,

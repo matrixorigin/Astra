@@ -2761,7 +2761,7 @@ mod tests {
     async fn recording_host_receives_typed_agent_communication() {
         let events = sse_event(
             "agent_communication",
-            ",\"schema_version\":\"astra.agent_communication.v1\",\"observed_by\":{\"run_id\":\"run-review\",\"agent_id\":\"reviewer\"},\"direction\":\"received\",\"message_id\":\"msg-1\",\"from\":{\"run_id\":\"run-code\",\"agent_id\":\"coder\"},\"to\":{\"kind\":\"direct\",\"address\":{\"run_id\":\"run-review\",\"agent_id\":\"reviewer\"}},\"payload_kind\":\"text\",\"summary\":\"review this\",\"timestamp_ms\":42,\"requires_ack\":false",
+            ",\"schema_version\":\"astra.agent_communication.v1\",\"observed_by\":{\"run_id\":\"run-review\",\"agent_id\":\"reviewer\"},\"direction\":\"received\",\"message_id\":\"msg-1\",\"from\":{\"run_id\":\"run-code\",\"agent_id\":\"coder\"},\"to\":{\"kind\":\"direct\",\"address\":{\"run_id\":\"run-review\",\"agent_id\":\"reviewer\"}},\"payload_kind\":\"text\",\"summary\":\"review this\",\"timestamp_ms\":42",
         );
         let mut stream = stream::iter(chunks_from_sse(&events));
         let mut host = RecordingSseStreamHost::new();

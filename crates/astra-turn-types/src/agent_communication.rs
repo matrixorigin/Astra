@@ -6,7 +6,10 @@ pub const AGENT_COMMUNICATION_SCHEMA_VERSION: &str = "astra.agent_communication.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentCommunicationDirection {
+    /// The routing/transport path accepted the envelope.
     Sent,
+    /// The target runtime observed the envelope; this does not prove model
+    /// inclusion, compliance, or task completion.
     Received,
 }
 
@@ -22,8 +25,6 @@ pub enum AgentCommunicationPayloadKind {
     Request,
     Response,
     Signal,
-    Ack,
-    Nack,
 }
 
 impl AgentCommunicationPayloadKind {
@@ -40,8 +41,6 @@ impl AgentCommunicationPayloadKind {
             Self::Request => "request",
             Self::Response => "response",
             Self::Signal => "signal",
-            Self::Ack => "ack",
-            Self::Nack => "nack",
         }
     }
 }
@@ -92,5 +91,4 @@ pub struct AgentCommunicationEvent {
     pub timestamp_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
-    pub requires_ack: bool,
 }

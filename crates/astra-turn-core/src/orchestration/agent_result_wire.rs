@@ -600,6 +600,8 @@ pub fn render_completed_agent_result(
     body.to_string()
 }
 
+pub const PENDING_CHILD_RUNTIME_WAIT_GUIDANCE: &str = "This observation is not a terminal result. Continue only work needed for the user's request. For a pending direct child owned by this run, proposing a final answer lets the runtime wait and resume when continuation is available. Otherwise inspect the child's status or waiting reason. Do not busy-poll or use shell sleep solely to wait.";
+
 pub fn render_wait_timeout_outcome(
     agent_id: &str,
     live_status: Option<&AgentStatus>,
@@ -612,7 +614,7 @@ pub fn render_wait_timeout_outcome(
             "current_status": format!("{status:?}"),
             "waited_secs": timeout.as_secs(),
             "delivery": "asynchronous_parent_mailbox",
-            "hint": "The child agent is still working. Continue independent parent work; its terminal result will be delivered to the parent mailbox. Do not busy-poll, treat this as failure, or fabricate what the child would have returned.",
+            "hint": PENDING_CHILD_RUNTIME_WAIT_GUIDANCE,
         })
         .to_string(),
         _ => json!({
@@ -710,7 +712,7 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
             "current_status": "running",
             "activity": activity,
             "delivery": "asynchronous_parent_mailbox",
-            "hint": "The child agent is still working. Continue independent parent work; its terminal result will arrive through the parent mailbox. Do not busy-poll.",
+            "hint": PENDING_CHILD_RUNTIME_WAIT_GUIDANCE,
         })
         .to_string(),
         AgentStatus::Idle => json!({
@@ -718,7 +720,7 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
             "agent_id": agent_id,
             "current_status": "idle",
             "delivery": "asynchronous_parent_mailbox",
-            "hint": "The child agent is still running. Continue independent parent work; its terminal result will arrive through the parent mailbox. Do not busy-poll.",
+            "hint": PENDING_CHILD_RUNTIME_WAIT_GUIDANCE,
         })
         .to_string(),
     }
@@ -1125,11 +1127,31 @@ mod tests {
         assert_eq!(parsed["status"], "still_running");
         assert_eq!(parsed["waited_secs"], 1);
         assert_eq!(parsed["delivery"], "asynchronous_parent_mailbox");
+        assert_eq!(parsed["hint"], PENDING_CHILD_RUNTIME_WAIT_GUIDANCE);
+        assert!(PENDING_CHILD_RUNTIME_WAIT_GUIDANCE.contains("when continuation is available"));
+        assert!(PENDING_CHILD_RUNTIME_WAIT_GUIDANCE.contains("Do not busy-poll"));
+        assert!(PENDING_CHILD_RUNTIME_WAIT_GUIDANCE.contains("shell sleep"));
+        let idle: Value = serde_json::from_str(&render_wait_for_agent_status(
+            "reviewer",
+            &AgentStatus::Idle,
+        ))
+        .unwrap();
+        assert_eq!(idle["hint"], PENDING_CHILD_RUNTIME_WAIT_GUIDANCE);
+        let waiting: Value = serde_json::from_str(&render_wait_timeout_outcome(
+            "reviewer",
+            Some(&AgentStatus::Waiting {
+                reason: "needs user input".to_string(),
+            }),
+            Duration::from_secs(1),
+        ))
+        .unwrap();
         assert!(
-            parsed["hint"]
+            waiting["current_status"]
                 .as_str()
-                .is_some_and(|hint| hint.contains("Do not busy-poll"))
+                .unwrap()
+                .contains("needs user input")
         );
+        assert_eq!(waiting["hint"], PENDING_CHILD_RUNTIME_WAIT_GUIDANCE);
     }
 
     #[test]

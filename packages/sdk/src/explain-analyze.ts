@@ -1,6 +1,9 @@
 import { EXPLAIN_ANALYZE_HTML_STYLE } from "./explain-analyze-html-style";
 import { layoutExplainAnalyzeGraph } from "./explain-analyze-layout";
-import { renderExplainAnalyzeText } from "./explain-analyze-text";
+import {
+  explainAnalyzeDecisionDetailLine,
+  renderExplainAnalyzeText,
+} from "./explain-analyze-text";
 import type {
   ExplainAnalyzeEventV1,
   ExplainAnalyzeCoverageGapV1,
@@ -8,6 +11,7 @@ import type {
   ExplainAnalyzeContextMetricsV1,
   ExplainAnalyzeAuxiliaryDetailsV1,
   ExplainAnalyzeAdmissionSettlementV1,
+  ExplainAnalyzeDecisionDetailV1,
   ExplainAnalyzeRequestJudgmentResultV1,
   ExplainAnalyzeRequestJudgmentFieldV1,
   MemorySelectionReport,
@@ -28,6 +32,7 @@ export type ExplainAnalyzeNodeV1 = {
   endElapsedMs?: number;
   durationMs?: number;
   outcome?: ExplainAnalyzeEventV1["outcome"];
+  decisionDetail?: ExplainAnalyzeDecisionDetailV1;
   usage?: ExplainAnalyzeUsageV1;
   context?: ExplainAnalyzeContextMetricsV1;
   auxiliaryUsage?: ExplainAnalyzeEventV1["auxiliary_usage"];
@@ -116,6 +121,7 @@ const allowedEventKeys = new Set([
   "start_elapsed_ms",
   "duration_ms",
   "outcome",
+  "decision_detail",
   "usage",
   "context",
   "coverage_gaps", "auxiliary_usage", "auxiliary_details",
@@ -161,6 +167,10 @@ export function isExplainAnalyzeEventV1(
       (value.kind !== "turn" || value.transition !== "finished" || !isAuxiliaryUsage(value.auxiliary_usage))) return false;
   if (value.auxiliary_details !== undefined &&
       (value.kind !== "turn" || value.transition !== "finished" || !isExplainAnalyzeAuxiliaryDetails(value.auxiliary_details, value.elapsed_ms))) return false;
+  if (value.decision_detail !== undefined &&
+      (value.kind !== "admission" || value.transition !== "finished" ||
+        (value.outcome !== "blocked" && value.outcome !== "rejected") ||
+        !isExplainAnalyzeDecisionDetail(value.decision_detail))) return false;
   if (value.coverage_gaps !== undefined &&
     (value.kind !== "turn" || value.transition !== "finished" ||
       !isCoverageGapList(value.coverage_gaps))) {
@@ -178,6 +188,7 @@ export function isExplainAnalyzeEventV1(
       value.start_elapsed_ms === undefined &&
       value.duration_ms === undefined &&
       value.outcome === undefined &&
+      value.decision_detail === undefined &&
       value.usage === undefined && value.context === undefined && value.coverage_gaps === undefined
         && value.auxiliary_details === undefined
     );
@@ -279,6 +290,16 @@ function isExplainAnalyzeAuxiliaryCall(value: unknown, terminalElapsedMs: number
     value.start_elapsed_ms <= terminalElapsedMs &&
     value.duration_ms <= terminalElapsedMs - value.start_elapsed_ms + 1 &&
     typeof value.outcome === "string" && outcomes.has(value.outcome);
+}
+
+function isExplainAnalyzeDecisionDetail(
+  value: unknown,
+): value is ExplainAnalyzeDecisionDetailV1 {
+  return isRecord(value) &&
+    Object.keys(value).length === 3 &&
+    value.kind === "delegation_catalog_resolution" &&
+    isNonNegativeInteger(value.requirement_index) && value.requirement_index < 16 &&
+    isNonNegativeInteger(value.match_count) && value.match_count !== 1;
 }
 
 function isExplainId(value: unknown): value is string {
@@ -703,6 +724,7 @@ export function reduceExplainAnalyzeEvents(
               ...(value.context ? { context: value.context } : {}),
               ...(value.auxiliary_usage ? { auxiliaryUsage: value.auxiliary_usage } : {}),
               ...(value.auxiliary_details ? { auxiliaryDetails: value.auxiliary_details } : {}),
+              ...(value.decision_detail ? { decisionDetail: value.decision_detail } : {}),
             }
           : {}),
         startObserved: value.transition === "started",
@@ -747,6 +769,7 @@ export function reduceExplainAnalyzeEvents(
         stableJson(node.context ?? null) !== stableJson(value.context ?? null) ||
         stableJson(node.auxiliaryUsage ?? null) !== stableJson(value.auxiliary_usage ?? null) ||
         stableJson(node.auxiliaryDetails ?? null) !== stableJson(value.auxiliary_details ?? null) ||
+        stableJson(node.decisionDetail ?? null) !== stableJson(value.decision_detail ?? null) ||
         stableJson(node.coverageGaps) !== stableJson(value.coverage_gaps ?? [])
       ) {
         node.conflicted = true;
@@ -764,6 +787,7 @@ export function reduceExplainAnalyzeEvents(
       node.context = value.context;
       node.auxiliaryUsage = value.auxiliary_usage;
       node.auxiliaryDetails = value.auxiliary_details;
+      node.decisionDetail = value.decision_detail;
       node.coverageGaps = value.coverage_gaps ?? [];
       node.terminalObserved = true;
     }
@@ -1198,7 +1222,8 @@ function renderHtmlNodeGraph(graph: ExplainAnalyzeGraphV1): string {
       const kind = node.kind.replace(/_/g, "-");
       const duration = node.durationMs === undefined ? "Not recorded" : formatMs(node.durationMs);
       const usage = node.usage ? formatUsage(node.usage) : node.context ? formatExplainAnalyzeContext(node.context) : "";
-      return `<a class="dag-card dag-kind-${kind} dag-status-${status.className}" href="#${detailIds.get(node.nodeId)}" style="left:${position.x}px;top:${position.y}px;width:${position.width}px;height:${position.height}px" aria-label="Inspect ${escapeHtml(node.label)}, ${escapeHtml(status.label)}, ${duration}"><span class="dag-card-head"><i aria-hidden="true"></i><span>${escapeHtml(status.label)}</span><b>${duration}</b></span><strong class="dag-card-title">${escapeHtml(node.label)}</strong>${usage ? `<span class="dag-card-usage" title="${escapeHtml(usage)}">${escapeHtml(usage)}</span>` : `<span class="dag-card-usage">${escapeHtml(formatMs(node.startElapsedMs))} → ${node.endElapsedMs === undefined ? "End not recorded" : escapeHtml(formatMs(node.endElapsedMs))}</span>`}</a>`;
+      const decision = node.decisionDetail ? explainAnalyzeDecisionDetailLine(node.decisionDetail) : "";
+      return `<a class="dag-card dag-kind-${kind} dag-status-${status.className}" href="#${detailIds.get(node.nodeId)}" style="left:${position.x}px;top:${position.y}px;width:${position.width}px;height:${position.height}px" aria-label="Inspect ${escapeHtml(node.label)}, ${escapeHtml(status.label)}, ${duration}${decision ? `, ${escapeHtml(decision)}` : ""}"><span class="dag-card-head"><i aria-hidden="true"></i><span>${escapeHtml(status.label)}</span><b>${duration}</b></span><strong class="dag-card-title">${escapeHtml(node.label)}</strong>${usage ? `<span class="dag-card-usage" title="${escapeHtml(usage)}">${escapeHtml(usage)}</span>` : `<span class="dag-card-usage">${escapeHtml(formatMs(node.startElapsedMs))} → ${node.endElapsedMs === undefined ? "End not recorded" : escapeHtml(formatMs(node.endElapsedMs))}</span>`}</a>`;
     }).join("");
     return `<section class="dag-domain" aria-label="Execution graph timeline ${domainIndex + 1}"><div class="dag-domain-head"><strong>Timeline ${domainIndex + 1}</strong><span><i class="dag-key-parent"></i> Nested stage <i class="dag-key-dependency"></i> Runs after</span></div><div class="dag-scroll"><div class="dag-canvas" style="width:${domain.width}px;height:${domain.height}px"><svg width="${domain.width}" height="${domain.height}" aria-hidden="true"><defs><marker id="${markerId}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7376df"/></marker></defs>${edges}</svg>${cards}</div></div></section>`;
   }).join("");
@@ -1207,9 +1232,12 @@ function renderHtmlNodeGraph(graph: ExplainAnalyzeGraphV1): string {
 function renderHtmlGraphDetails(graph: ExplainAnalyzeGraphV1): string {
   return graph.nodes.map((node, index) => {
     const status = nodeStatus(node);
+    const decision = node.decisionDetail
+      ? `<p>${escapeHtml(explainAnalyzeDecisionDetailLine(node.decisionDetail))}</p>`
+      : "";
     const usage = node.usage ? `<p>${escapeHtml(formatUsageDetail(node.usage))}</p>` : "";
     const context = node.context ? explainAnalyzeContextSections(node.context).map((section) => `<h4>${escapeHtml(section.title)}</h4><p>${escapeHtml(section.description)}</p><dl>${section.rows.map((row) => `<dt>${escapeHtml(row.label)}</dt><dd>${escapeHtml(row.value)}</dd>`).join("")}</dl>`).join("") : "";
-    return `<section id="report-stage-${index}" class="dag-inspection" tabindex="-1"><a href="#secondary-graph" class="dag-close">Close details</a><h3>${escapeHtml(node.label)}</h3><p>${escapeHtml(status.label)} · ${formatMs(node.startElapsedMs)} → ${node.endElapsedMs === undefined ? "End not recorded" : formatMs(node.endElapsedMs)} · ${node.durationMs === undefined ? "Duration not recorded" : formatMs(node.durationMs)}</p>${usage}${context}</section>`;
+    return `<section id="report-stage-${index}" class="dag-inspection" tabindex="-1"><a href="#secondary-graph" class="dag-close">Close details</a><h3>${escapeHtml(node.label)}</h3><p>${escapeHtml(status.label)} · ${formatMs(node.startElapsedMs)} → ${node.endElapsedMs === undefined ? "End not recorded" : formatMs(node.endElapsedMs)} · ${node.durationMs === undefined ? "Duration not recorded" : formatMs(node.durationMs)}</p>${decision}${usage}${context}</section>`;
   }).join("");
 }
 

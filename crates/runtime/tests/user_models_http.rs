@@ -218,6 +218,7 @@ async fn model_access_matches_run_eligibility_across_catalog_pages() {
         max_completion_tokens: None,
         architecture: None,
         thinking_capability: None,
+        pricing: None,
     };
     for (allows_deployment, catalog, expected) in [
         (
@@ -287,6 +288,7 @@ async fn catalog_purpose_is_applied_before_pagination_and_shared_by_model_access
         max_completion_tokens: None,
         architecture: None,
         thinking_capability: None,
+        pricing: None,
     })
     .collect::<Vec<_>>();
     let service = TestModelService {

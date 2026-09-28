@@ -377,7 +377,8 @@ pub(crate) async fn execute_team_handler(
             source_agent_id: "orchestrator".to_string(),
             progress: None,
         },
-    );
+    )
+    .with_server_request_boundary();
 
     let report = orch.execute_team(&name, &body.task, None).await;
     map_team_execution_report_to_http(report)
@@ -432,6 +433,8 @@ pub(crate) struct TeamExecuteResponse {
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
     pub total_tool_calls: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub preserved_worktree_branches: Vec<String>,
 }
 
 impl From<TeamExecutionReport> for TeamExecuteResponse {
@@ -456,6 +459,7 @@ impl From<TeamExecutionReport> for TeamExecuteResponse {
             total_prompt_tokens: tp,
             total_completion_tokens: tc,
             total_tool_calls: tt,
+            preserved_worktree_branches: r.preserved_worktree_branches,
         }
     }
 }
@@ -663,6 +667,7 @@ mod tests {
             parent_run_id: String::new(),
             delegation_result: None,
             merge_result: None,
+            preserved_worktree_branches: Vec::new(),
             status: astra_server_types::team_orchestrator_types::TeamExecutionStatus::Failed,
             error_kind: Some(kind),
             error: Some(message.to_string()),

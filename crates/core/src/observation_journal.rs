@@ -583,18 +583,20 @@ pub fn render_compact_status(
     alerts: &[String],
     circuit_breaker_state: &str,
     token_pressure: f64,
-    cache_hit_ratio: f64,
+    cache_hit_ratio: Option<f64>,
     turns_completed: u32,
 ) -> String {
     let mut s = String::with_capacity(1024);
     s.push_str("\n## ⚡ Self-Status\n");
 
     // ── Core metrics ──
+    let cache = cache_hit_ratio
+        .map(|ratio| format!("{:.0}%", ratio * 100.0))
+        .unwrap_or_else(|| "unknown".to_string());
     let _ = write!(
         s,
-        "Round {turns_completed} | Token pressure: {pressure:.0}% | Cache: {cache:.0}%",
+        "Round {turns_completed} | Token pressure: {pressure:.0}% | Prompt cache read: {cache}",
         pressure = token_pressure * 100.0,
-        cache = cache_hit_ratio * 100.0,
     );
 
     if token_pressure > 0.80 {
@@ -835,13 +837,18 @@ mod tests {
             &["test_alert".to_string()],
             "closed",
             0.45,
-            0.30,
+            Some(0.30),
             3,
         );
         assert!(status.contains("Self-Status"));
         assert!(status.contains("Round 3"));
+        assert!(status.contains("Prompt cache read: 30%"));
         assert!(!status.contains("remaining"));
         assert!(status.contains("test_alert"));
+        let unknown = render_compact_status(&journal, &[], "closed", 0.45, None, 3);
+        assert!(unknown.contains("Prompt cache read: unknown"));
+        let zero = render_compact_status(&journal, &[], "closed", 0.45, Some(0.0), 3);
+        assert!(zero.contains("Prompt cache read: 0%"));
     }
 
     // ─── extract_facts tests ───────────────────────────────────────────

@@ -208,6 +208,7 @@ impl ModelService for Catalog {
                 max_completion_tokens: model.max_completion_tokens.map(|value| value as i32),
                 architecture: None,
                 thinking_capability: None,
+                pricing: None,
             })
             .collect())
     }
@@ -310,6 +311,7 @@ async fn fixture() -> (
                 resolved_model_selection: Some(astra_services::runs::ResolvedModelSelection {
                     offering_id: "strong".into(),
                     model_name: "strong".into(),
+                    source_identity: None,
                 }),
                 ..Default::default()
             },
@@ -317,6 +319,8 @@ async fn fixture() -> (
         .await
         .unwrap();
     state.current_run_owner_generation = Some(authority.owner_generation);
+    state.context_manifest_user_id = Some("router-user".into());
+    state.canonical_turn_chain_id = Some("router-turn".into());
     state.message = "explain this result".into();
     state.user_intent = state.message.clone();
     state.messages = vec![json!({"role":"user", "content":state.message})];
@@ -581,7 +585,7 @@ async fn http_auto_admission_requires_opt_in_config_and_rejects_explicit_or_prov
         .await
         .is_err()
     );
-    for case in ["explicit", "provider", "fixed"] {
+    for case in ["explicit", "provider", "fixed", "expected"] {
         let mut request = parse(wire.clone());
         match case {
             "explicit" => {
@@ -594,6 +598,7 @@ async fn http_auto_admission_requires_opt_in_config_and_rejects_explicit_or_prov
                 request.execution_policy.turn_intent =
                     astra_services::runs::TurnIntentExecutionPolicy::FixedDefault
             }
+            "expected" => request.expected_model_name = Some("strong-model".into()),
             _ => unreachable!(),
         }
         assert!(
@@ -660,6 +665,7 @@ async fn auto_children_inherit_the_committed_model_instead_of_cached_baseline() 
                 resolved_model_selection: Some(astra_services::runs::ResolvedModelSelection {
                     offering_id: inherited.offering_id.clone(),
                     model_name: inherited.model_name.clone(),
+                    source_identity: None,
                 }),
                 ..Default::default()
             },
@@ -741,7 +747,13 @@ async fn auto_recovery_restores_required_work_before_first_primary_request() {
     crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut restored, &mut state, 0)
         .await
         .unwrap();
-    assert_eq!(restored.pending_work_admission.as_ref(), Some(&admission));
+    assert_eq!(
+        restored
+            .pending_work_admission
+            .as_ref()
+            .map(|assessment| &assessment.decision),
+        Some(&admission)
+    );
     assert_eq!(
         restored.work_admission_capabilities,
         admission.required_capabilities()
@@ -761,4 +773,61 @@ async fn auto_recovery_restores_required_work_before_first_primary_request() {
         serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
     assert_eq!(args["goal"], "Inspect the source");
     assert_eq!(args["tasks"][0]["objective"], "Inspect source");
+}
+
+#[tokio::test]
+async fn auto_recovery_retains_source_bound_child_model_requirement() {
+    let (catalog, engine, mut first, mut state) = fixture().await;
+    let source = delegation_intent_source_from_state(&state).expect("authenticated user intent");
+    let admission = first
+        .pending_work_admission
+        .take()
+        .expect("fixture Work decision")
+        .decision;
+    first.apply_classified_work_admission(ClassifiedWorkAdmission {
+        decision: admission,
+        delegation_model_requirement: Some(astra_services::WorkAdmissionTruth::Yes),
+        source: Some(source.clone()),
+        work_handoff_pending: true,
+    });
+    first
+        .prepare_auto_model_selection(&mut state)
+        .await
+        .unwrap();
+
+    // A new execution owner can recover the same authenticated instruction,
+    // but must not turn a positive model requirement into Unconstrained.
+    state.current_run_owner_generation = Some(source.owner_generation + 1);
+    state.user_intents.set_user_intent_cursor_for_test(42);
+    let mut restored = host(catalog.clone(), engine.clone());
+    assert!(restored.restore_model_routing(&state).await.unwrap());
+    let classified = restored.pending_work_admission.as_ref().unwrap();
+    assert_eq!(
+        classified.delegation_model_requirement,
+        Some(astra_services::WorkAdmissionTruth::Yes)
+    );
+    assert_eq!(
+        classified.source.as_ref().unwrap().owner_generation,
+        source.owner_generation + 1
+    );
+    assert_eq!(classified.source.as_ref().unwrap().control_epoch, 42);
+    let absent = r#"{"disposition":"not_applicable"}"#;
+    assert!(
+        astra_services::delegation_model_requirement::parse_delegation_intent_requirements(
+            absent,
+            &state.message,
+            &[],
+            None,
+            classified.delegation_model_requirement
+                == Some(astra_services::WorkAdmissionTruth::Yes),
+        )
+        .is_err(),
+        "a recovered positive model requirement must reject no-requirement output"
+    );
+
+    state.message = "a different instruction".into();
+    state.user_intent = state.message.clone();
+    state.messages = vec![json!({"role":"user", "content":state.message})];
+    let mut stale = host(catalog, engine);
+    assert!(stale.restore_model_routing(&state).await.is_err());
 }

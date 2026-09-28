@@ -212,6 +212,7 @@ pub(crate) fn run_start_context_from_request(
                 .collect()
         });
     RunStartContext {
+        delegated_model_requirements: None,
         interaction_mode: super::engine::effective_requested_interaction_mode(
             request.interaction_mode,
             request.interactive_client,
@@ -248,8 +249,11 @@ pub(crate) fn run_start_context_from_request(
         agent_binding_name: resolved_primary_binding.map(|binding| binding.binding_name.clone()),
         agent_binding_schema_version: resolved_primary_binding
             .map(|binding| binding.binding_schema_version.clone()),
+        requested_model_policy: request.requested_model_policy.clone(),
         model_selection: request.model_selection.clone(),
         resolved_model_selection: request.resolved_model_selection.clone(),
+        generation_controls: None,
+        model_identity_admitted: false,
         runtime_profile: effective_runtime_profile(request),
         provider_request_fingerprint: None,
         provider_run_owner: request.provider_run_owner.clone(),
@@ -545,6 +549,7 @@ mod tests {
 
     fn test_request(message: &str) -> astra_services::runs::ChatRequestData {
         astra_services::runs::ChatRequestData {
+            model_catalog_reader: None,
             message: message.to_string(),
             conversation_authority: None,
             user_intent: None,
@@ -559,8 +564,10 @@ mod tests {
             full_llm_capture: false,
             agent_id: None,
             model: None,
+            expected_model_name: None,
             model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
             model_selection: None,
+            requested_model_policy: None,
             resolved_model_selection: None,
             admitted_model_execution: None,
             capability_descriptors: None,
@@ -607,6 +614,19 @@ mod tests {
         assert_eq!(
             context.runtime_profile,
             Some(astra_services::runs::RuntimeProfileRequest::AgentBindingRegistry)
+        );
+    }
+
+    #[test]
+    fn run_start_context_preserves_requested_model_policy() {
+        let mut request = test_request("child task");
+        request.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Inherit);
+
+        let context = run_start_context_from_request(&request, None, None);
+
+        assert_eq!(
+            context.requested_model_policy,
+            request.requested_model_policy
         );
     }
 

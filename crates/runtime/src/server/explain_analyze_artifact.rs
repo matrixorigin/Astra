@@ -1632,6 +1632,7 @@ mod tests {
             start_elapsed_ms: finished.then_some(0),
             duration_ms: finished.then_some(1),
             outcome: finished.then_some(astra_turn_types::ExplainAnalyzeOutcomeV1::Completed),
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),

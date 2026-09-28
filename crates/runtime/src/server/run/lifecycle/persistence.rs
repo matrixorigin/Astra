@@ -5262,7 +5262,6 @@ mod tests {
                 "payload_kind": payload_kind,
                 "summary": "bounded summary",
                 "timestamp_ms": 42,
-                "requires_ack": false
             })
         };
         assert_eq!(

@@ -8530,6 +8530,7 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
             tool_call_id: tool_call_id_for_blocking.as_deref(),
             admission_source: admission_source_for_blocking,
             expected_control_epoch: None,
+            delegation_model_admission: None,
         };
         executor_for_blocking.execute_blocking_shell_tool(
             &tool_for_blocking,

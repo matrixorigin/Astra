@@ -98,6 +98,7 @@ pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
     register_handler_or_log!(engine, "enter_plan_mode", EnterPlanModeToolHandler);
     register_handler_or_log!(engine, "exit_plan_mode", ExitPlanModeToolHandler);
     register_handler_or_log!(engine, "introspect", IntrospectToolHandler);
+    register_handler_or_log!(engine, "model_catalog", ModelCatalogToolHandler);
     register_handler_or_log!(engine, "reflect", ReflectToolHandler);
     register_handler_or_log!(engine, "compress_context", CompressContextToolHandler);
     register_handler_or_log!(
@@ -345,9 +346,9 @@ impl ToolHandler<RuntimeToolExecutor> for ToolSearchToolHandler {
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         let pool = context.current_tool_search_pool_schemas();
-        let output = astra_tools::tool_search::tool_search(&pool, args);
+        let result = astra_tools::tool_search::tool_search_result(&pool, args);
         if let Some(query) = args.get("query").and_then(Value::as_str) {
-            let selected = serde_json::from_str::<Value>(&output).ok();
+            let selected = serde_json::from_str::<Value>(&result.output).ok();
             let selected_digests = selected
                 .as_ref()
                 .and_then(|value| value.get("matches"))
@@ -372,7 +373,7 @@ impl ToolHandler<RuntimeToolExecutor> for ToolSearchToolHandler {
                 "deferred discovery contract selected"
             );
         }
-        tool_result_from_output(output)
+        result
     }
 }
 
@@ -703,6 +704,7 @@ impl ToolHandler<RuntimeToolExecutor> for AgentToolHandler {
             context.agent_tool_context_snapshot().as_ref(),
             args,
             invocation.tool_call_id,
+            invocation.delegation_model_admission,
         )
         .await
     }
@@ -743,6 +745,7 @@ impl ToolHandler<RuntimeToolExecutor> for AgentFanoutToolHandler {
             context.agent_tool_context_snapshot().as_ref(),
             args,
             invocation.tool_call_id,
+            invocation.delegation_model_admission,
         )
         .await
     }
@@ -853,6 +856,26 @@ impl ToolHandler<RuntimeToolExecutor> for ExitPlanModeToolHandler {
             )
             .await,
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelCatalogToolHandler;
+
+#[async_trait]
+impl ToolHandler<RuntimeToolExecutor> for ModelCatalogToolHandler {
+    async fn execute(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        _cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        crate::server::tool_model_catalog::handle_model_catalog(
+            args,
+            &context.user_id,
+            context.model_catalog_reader.as_ref(),
+        )
+        .await
     }
 }
 

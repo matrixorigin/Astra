@@ -497,6 +497,13 @@ impl DatabaseStateProjectionStore {
                 child.depth.max(1),
             )
         };
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| StateProjectionError::Database {
+                operation: "acquire_delegation_tree_projection",
+                entity: child_run_id.to_string(),
+                source,
+            })?;
         let tree_update = sqlx::query(
             "UPDATE agent_runs
              SET root_run_id = ?, ancestor_path = ?, depth = ?, updated_at = NOW(6)
@@ -507,13 +514,14 @@ impl DatabaseStateProjectionStore {
         .bind(i64::from(depth))
         .bind(user_id)
         .bind(child_run_id)
-        .execute(self.pool.get())
+        .execute(connection.connection_mut())
         .await
         .map_err(|source| StateProjectionError::Database {
             operation: "sync_delegation_run_tree",
             entity: child_run_id.to_string(),
             source,
         })?;
+        connection.release();
         if tree_update.rows_affected() == 0 {
             return Err(StateProjectionError::Database {
                 operation: "sync_delegation_run_tree",
@@ -1149,6 +1157,13 @@ impl DatabaseStateProjectionStore {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<RunProjectionRow>, StateProjectionError> {
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| StateProjectionError::Database {
+                operation: "acquire_run_projection",
+                entity: run_id.to_string(),
+                source,
+            })?;
         let row = sqlx::query(
             "SELECT run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path,
                     depth, delegation_id, agent_id, status, retry_of, retry_scope
@@ -1156,13 +1171,14 @@ impl DatabaseStateProjectionStore {
         )
         .bind(user_id)
         .bind(run_id)
-        .fetch_optional(self.pool.get())
+        .fetch_optional(connection.connection_mut())
         .await
         .map_err(|source| StateProjectionError::Database {
             operation: "load_run_projection_for_user",
             entity: run_id.to_string(),
             source,
         })?;
+        connection.release();
         row.map(|row| decode_run_projection_row(&row, run_id))
             .transpose()
     }

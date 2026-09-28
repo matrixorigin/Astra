@@ -1144,6 +1144,7 @@ mod usage_attribution_tests {
             start_elapsed_ms: Some(0),
             duration_ms: Some(10),
             outcome: Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded),
+            decision_detail: None,
             usage,
             auxiliary_usage: None,
             context: None,
@@ -1204,6 +1205,7 @@ mod usage_attribution_tests {
             start_elapsed_ms: Some(0),
             duration_ms: Some(20),
             outcome: Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Completed),
+            decision_detail: None,
             usage: None,
             auxiliary_usage: Some(Box::new(astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
                 available,
@@ -1247,6 +1249,7 @@ mod usage_attribution_tests {
             start_elapsed_ms: Some(0),
             duration_ms: Some(20),
             outcome: Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Completed),
+            decision_detail: None,
             usage: None,
             auxiliary_usage: Some(Box::new(astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
                 available: true,

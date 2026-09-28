@@ -722,7 +722,9 @@ mod tests {
 
     fn summary_execution(base_url: String) -> astra_services::AdmittedModelExecution {
         astra_services::AdmittedModelExecution {
+            price_snapshot: None,
             offering_id: "summary-offering".to_string(),
+            source_identity: None,
             access_kind: astra_services::ModelAccessKind::SelfHosted,
             execution_placement: astra_services::ModelExecutionPlacement::Server,
             model_name: "summary-model".to_string(),
@@ -1662,7 +1664,9 @@ mod tests {
         );
         let base_url = spawn_summary_test_server(app).await;
         let execution = astra_services::AdmittedModelExecution {
+            price_snapshot: None,
             offering_id: "summary-offering".to_string(),
+            source_identity: None,
             access_kind: astra_services::ModelAccessKind::SelfHosted,
             execution_placement: astra_services::ModelExecutionPlacement::Server,
             model_name: "summary-model".to_string(),

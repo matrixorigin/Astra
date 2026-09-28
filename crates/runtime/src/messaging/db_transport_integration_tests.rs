@@ -19,7 +19,7 @@ mod tests {
     use crate::messaging::db_transport::{
         DatabaseTransport, ensure_schema, mark_direct_failed_by_identity,
     };
-    use crate::messaging::transport::MessageTransport;
+    use crate::messaging::transport::{MailboxSubscription, MessageTransport};
     use astra_messaging::types::*;
     use sqlx::Row;
 
@@ -93,11 +93,11 @@ mod tests {
         let first = addr("run-directory-a", "reviewer");
         let second = addr("run-directory-b", "reviewer");
 
-        first_replica
+        let _first_subscription = first_replica
             .register(first.clone(), Some("del-directory-a".into()))
             .await
             .unwrap();
-        second_replica
+        let _second_subscription = second_replica
             .register(second.clone(), Some("del-directory-b".into()))
             .await
             .unwrap();
@@ -131,7 +131,10 @@ mod tests {
             "a live scoped identity must have exactly one mailbox owner"
         );
 
-        first_replica.unregister(&first).await.unwrap();
+        first_replica
+            .unregister(&_first_subscription)
+            .await
+            .unwrap();
         assert!(
             second_replica
                 .resolve_agent("del-directory-a", "reviewer")
@@ -142,8 +145,14 @@ mod tests {
             .register(competing.clone(), Some("del-directory-a".into()))
             .await
             .expect("released scoped identity should be reclaimable immediately");
-        competing_replica.unregister(&competing).await.unwrap();
-        second_replica.unregister(&second).await.unwrap();
+        competing_replica
+            .unregister(&MailboxSubscription::new(competing))
+            .await
+            .unwrap();
+        second_replica
+            .unregister(&_second_subscription)
+            .await
+            .unwrap();
     }
 
     // ── Direct Messages ─────────────────────────────────────────────────────
@@ -159,10 +168,10 @@ mod tests {
         let a = addr("run-db-1", "sender");
         let b = addr("run-db-2", "receiver");
 
-        transport.register(a.clone(), None).await.unwrap();
-        transport.register(b.clone(), None).await.unwrap();
+        let _a_subscription = transport.register(a.clone(), None).await.unwrap();
+        let _b_subscription = transport.register(b.clone(), None).await.unwrap();
 
-        let mut stream_b = transport.subscribe(&b).await.unwrap();
+        let mut stream_b = transport.subscribe(&_b_subscription).await.unwrap();
 
         let msg = Arc::new(AgentMessage::new(
             a.clone(),
@@ -237,22 +246,22 @@ mod tests {
         let w2 = addr("run-db-w2", "worker-2");
         let del = "del-db-test";
 
-        transport
+        let _leader_subscription = transport
             .register(leader.clone(), Some(del.into()))
             .await
             .unwrap();
-        transport
+        let _w1_subscription = transport
             .register(w1.clone(), Some(del.into()))
             .await
             .unwrap();
-        transport
+        let _w2_subscription = transport
             .register(w2.clone(), Some(del.into()))
             .await
             .unwrap();
 
-        let mut stream_w1 = transport.subscribe(&w1).await.unwrap();
-        let mut stream_w2 = transport.subscribe(&w2).await.unwrap();
-        let mut stream_leader = transport.subscribe(&leader).await.unwrap();
+        let mut stream_w1 = transport.subscribe(&_w1_subscription).await.unwrap();
+        let mut stream_w2 = transport.subscribe(&_w2_subscription).await.unwrap();
+        let mut stream_leader = transport.subscribe(&_leader_subscription).await.unwrap();
 
         let msg = Arc::new(AgentMessage::new(
             leader.clone(),
@@ -296,10 +305,10 @@ mod tests {
         let a = addr("run-db-order-a", "alice");
         let b = addr("run-db-order-b", "bob");
 
-        transport.register(a.clone(), None).await.unwrap();
-        transport.register(b.clone(), None).await.unwrap();
+        let _a_subscription = transport.register(a.clone(), None).await.unwrap();
+        let _b_subscription = transport.register(b.clone(), None).await.unwrap();
 
-        let mut stream_b = transport.subscribe(&b).await.unwrap();
+        let mut stream_b = transport.subscribe(&_b_subscription).await.unwrap();
 
         // Send 5 messages in order.
         for i in 0..5 {
@@ -344,8 +353,8 @@ mod tests {
         let a = addr("run-db-ttl-a", "alice");
         let b = addr("run-db-ttl-b", "bob");
 
-        transport.register(a.clone(), None).await.unwrap();
-        transport.register(b.clone(), None).await.unwrap();
+        let _a_subscription = transport.register(a.clone(), None).await.unwrap();
+        let _b_subscription = transport.register(b.clone(), None).await.unwrap();
 
         // Send a message with TTL=0 (immediately expired).
         let msg = AgentMessage::new(
@@ -372,7 +381,7 @@ mod tests {
         ));
         transport.send(msg2).await.unwrap();
 
-        let mut stream_b = transport.subscribe(&b).await.unwrap();
+        let mut stream_b = transport.subscribe(&_b_subscription).await.unwrap();
 
         // Should only receive the non-expired message.
         let received = tokio::time::timeout(Duration::from_secs(2), stream_b.recv())
@@ -422,10 +431,10 @@ mod tests {
         let sender = addr("run-db-bad-json-a", "alice");
         let receiver = addr("run-db-bad-json-b", "bob");
 
-        transport.register(sender.clone(), None).await.unwrap();
-        transport.register(receiver.clone(), None).await.unwrap();
+        let _sender_subscription = transport.register(sender.clone(), None).await.unwrap();
+        let _receiver_subscription = transport.register(receiver.clone(), None).await.unwrap();
 
-        let mut stream_b = transport.subscribe(&receiver).await.unwrap();
+        let mut stream_b = transport.subscribe(&_receiver_subscription).await.unwrap();
         let message_id = "test-invalid-direct-json";
 
         sqlx::query(
@@ -485,8 +494,8 @@ mod tests {
         let sender = addr("run-db-message-id-failure-a", "alice");
         let receiver = addr("run-db-message-id-failure-b", "bob");
 
-        transport.register(sender.clone(), None).await.unwrap();
-        transport.register(receiver.clone(), None).await.unwrap();
+        let _sender_subscription = transport.register(sender.clone(), None).await.unwrap();
+        let _receiver_subscription = transport.register(receiver.clone(), None).await.unwrap();
 
         let msg = Arc::new(AgentMessage::new(
             sender.clone(),
@@ -504,7 +513,7 @@ mod tests {
         let claimed_by = format!("{}@{}", receiver.run_id, receiver.agent_id);
         sqlx::query(
             "UPDATE agent_message_queue
-             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, claim_token = 'failure-token'
              WHERE message_id = ?",
         )
         .bind(&claimed_by)
@@ -514,7 +523,7 @@ mod tests {
         .await
         .unwrap();
 
-        mark_direct_failed_by_identity(&pool, Some(&message_id), &claimed_by)
+        mark_direct_failed_by_identity(&pool, Some(&message_id), &claimed_by, "failure-token")
             .await
             .unwrap();
 
@@ -551,8 +560,8 @@ mod tests {
         let right_consumer = format!("{}@{}", receiver.agent_id, receiver.run_id);
         let wrong_consumer = "mallory@run-db-ack-z";
 
-        transport.register(sender.clone(), None).await.unwrap();
-        transport.register(receiver.clone(), None).await.unwrap();
+        let _sender_subscription = transport.register(sender.clone(), None).await.unwrap();
+        let _receiver_subscription = transport.register(receiver.clone(), None).await.unwrap();
 
         let msg = Arc::new(AgentMessage::new(
             sender.clone(),
@@ -582,7 +591,7 @@ mod tests {
 
         assert!(
             !transport
-                .ack_message(&message_id, wrong_consumer)
+                .ack_message(&message_id, wrong_consumer, "ack-token")
                 .await
                 .unwrap(),
             "wrong consumer must not ack someone else's claim"
@@ -608,7 +617,7 @@ mod tests {
 
         assert!(
             transport
-                .ack_message(&message_id, &right_consumer)
+                .ack_message(&message_id, &right_consumer, "ack-token")
                 .await
                 .unwrap()
         );
@@ -647,8 +656,8 @@ mod tests {
         let right_consumer = format!("{}@{}", receiver.agent_id, receiver.run_id);
         let wrong_consumer = "mallory@run-db-nack-z";
 
-        transport.register(sender.clone(), None).await.unwrap();
-        transport.register(receiver.clone(), None).await.unwrap();
+        let _sender_subscription = transport.register(sender.clone(), None).await.unwrap();
+        let _receiver_subscription = transport.register(receiver.clone(), None).await.unwrap();
 
         let msg = Arc::new(AgentMessage::new(
             sender.clone(),
@@ -678,7 +687,7 @@ mod tests {
 
         assert!(
             !transport
-                .nack_message(&message_id, wrong_consumer)
+                .nack_message(&message_id, wrong_consumer, "nack-token")
                 .await
                 .unwrap(),
             "wrong consumer must not nack someone else's claim"
@@ -686,7 +695,7 @@ mod tests {
 
         assert!(
             transport
-                .nack_message(&message_id, &right_consumer)
+                .nack_message(&message_id, &right_consumer, "nack-token")
                 .await
                 .unwrap()
         );
@@ -724,10 +733,10 @@ mod tests {
         let receiver = addr("run-db-claim-scope-b", "bob");
         let consumer_id = format!("{}@{}", receiver.agent_id, receiver.run_id);
 
-        transport.register(sender.clone(), None).await.unwrap();
-        transport.register(receiver.clone(), None).await.unwrap();
+        let _sender_subscription = transport.register(sender.clone(), None).await.unwrap();
+        let _receiver_subscription = transport.register(receiver.clone(), None).await.unwrap();
 
-        let mut stream = transport.subscribe(&receiver).await.unwrap();
+        let mut stream = transport.subscribe(&_receiver_subscription).await.unwrap();
 
         let stale = AgentMessage::new(
             sender.clone(),
@@ -826,16 +835,16 @@ mod tests {
         let worker = addr("run-db-bcast-ttl-worker", "worker");
         let del = "del-db-bcast-ttl";
 
-        transport
+        let _leader_subscription = transport
             .register(leader.clone(), Some(del.into()))
             .await
             .unwrap();
-        transport
+        let _worker_subscription = transport
             .register(worker.clone(), Some(del.into()))
             .await
             .unwrap();
 
-        let mut stream_worker = transport.subscribe(&worker).await.unwrap();
+        let mut stream_worker = transport.subscribe(&_worker_subscription).await.unwrap();
 
         let msg = AgentMessage::new(
             leader.clone(),
@@ -893,7 +902,7 @@ mod tests {
         let a = addr("run-db-clean-a", "alice");
         let b = addr("run-db-clean-b", "bob");
 
-        transport.register(a.clone(), None).await.unwrap();
+        let _a_subscription = transport.register(a.clone(), None).await.unwrap();
 
         // Insert an expired message.
         let msg = AgentMessage::new(
@@ -930,7 +939,7 @@ mod tests {
         let acked_target = addr("run-db-cleanup-age-d", "dave");
         let failed_target = addr("run-db-cleanup-age-e", "erin");
 
-        transport.register(sender.clone(), None).await.unwrap();
+        let _sender_subscription = transport.register(sender.clone(), None).await.unwrap();
 
         let pending_msg = Arc::new(AgentMessage::new(
             sender.clone(),
@@ -1095,9 +1104,9 @@ mod tests {
         let retryable = addr("run-db-reclaim-b", "bob");
         let exhausted = addr("run-db-reclaim-c", "carol");
 
-        transport.register(sender.clone(), None).await.unwrap();
-        transport.register(retryable.clone(), None).await.unwrap();
-        transport.register(exhausted.clone(), None).await.unwrap();
+        let _sender_subscription = transport.register(sender.clone(), None).await.unwrap();
+        let _retryable_subscription = transport.register(retryable.clone(), None).await.unwrap();
+        let _exhausted_subscription = transport.register(exhausted.clone(), None).await.unwrap();
 
         let retryable_msg = Arc::new(AgentMessage::new(
             sender.clone(),
@@ -1198,8 +1207,8 @@ mod tests {
         let sender = addr("run-db-auto-reclaim-a", "alice");
         let receiver = addr("run-db-auto-reclaim-b", "bob");
 
-        transport.register(sender.clone(), None).await.unwrap();
-        transport.register(receiver.clone(), None).await.unwrap();
+        let _sender_subscription = transport.register(sender.clone(), None).await.unwrap();
+        let _receiver_subscription = transport.register(receiver.clone(), None).await.unwrap();
 
         let msg = Arc::new(AgentMessage::new(
             sender,
@@ -1260,11 +1269,11 @@ mod tests {
             DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
 
         let a = addr("run-db-unreg", "agent");
-        transport.register(a.clone(), None).await.unwrap();
+        let _a_subscription = transport.register(a.clone(), None).await.unwrap();
         assert_eq!(transport.agent_count().await, 1);
-        let mut stream = transport.subscribe(&a).await.unwrap();
+        let mut stream = transport.subscribe(&_a_subscription).await.unwrap();
 
-        transport.unregister(&a).await.unwrap();
+        transport.unregister(&_a_subscription).await.unwrap();
         assert_eq!(transport.agent_count().await, 0);
         let closed = tokio::time::timeout(Duration::from_millis(500), stream.recv())
             .await
@@ -1290,8 +1299,8 @@ mod tests {
         let receiver = addr("run-db-unreg-release-b", "bob");
         let consumer_id = format!("{}@{}", receiver.agent_id, receiver.run_id);
 
-        transport.register(sender.clone(), None).await.unwrap();
-        transport.register(receiver.clone(), None).await.unwrap();
+        let _sender_subscription = transport.register(sender.clone(), None).await.unwrap();
+        let _receiver_subscription = transport.register(receiver.clone(), None).await.unwrap();
 
         let retryable = Arc::new(AgentMessage::new(
             sender.clone(),
@@ -1319,28 +1328,30 @@ mod tests {
         let claimed_at_ms = chrono::Utc::now().timestamp_millis();
         sqlx::query(
             "UPDATE agent_message_queue
-             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, attempt_count = 1
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, attempt_count = 1, claim_token = ?
              WHERE message_id = ?",
         )
         .bind(&consumer_id)
         .bind(claimed_at_ms)
+        .bind(format!("{}fixture", _receiver_subscription.id()))
         .bind(&retryable.id)
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
             "UPDATE agent_message_queue
-             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, attempt_count = 2
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, attempt_count = 2, claim_token = ?
              WHERE message_id = ?",
         )
         .bind(&consumer_id)
         .bind(claimed_at_ms)
+        .bind(format!("{}fixture", _receiver_subscription.id()))
         .bind(&exhausted.id)
         .execute(&pool)
         .await
         .unwrap();
 
-        transport.unregister(&receiver).await.unwrap();
+        transport.unregister(&_receiver_subscription).await.unwrap();
 
         let rows = sqlx::query(
             "SELECT message_id, status, claimed_by, claimed_at_ms
@@ -1388,8 +1399,8 @@ mod tests {
         let receiver = addr("run-db-shutdown-release-b", "bob");
         let consumer_id = format!("{}@{}", receiver.agent_id, receiver.run_id);
 
-        transport.register(sender.clone(), None).await.unwrap();
-        transport.register(receiver.clone(), None).await.unwrap();
+        let _sender_subscription = transport.register(sender.clone(), None).await.unwrap();
+        let _receiver_subscription = transport.register(receiver.clone(), None).await.unwrap();
 
         let retryable = Arc::new(AgentMessage::new(
             sender.clone(),
@@ -1417,22 +1428,24 @@ mod tests {
         let claimed_at_ms = chrono::Utc::now().timestamp_millis();
         sqlx::query(
             "UPDATE agent_message_queue
-             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, attempt_count = 1
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, attempt_count = 1, claim_token = ?
              WHERE message_id = ?",
         )
         .bind(&consumer_id)
         .bind(claimed_at_ms)
+        .bind(format!("{}fixture", _receiver_subscription.id()))
         .bind(&retryable.id)
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
             "UPDATE agent_message_queue
-             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, attempt_count = 2
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, attempt_count = 2, claim_token = ?
              WHERE message_id = ?",
         )
         .bind(&consumer_id)
         .bind(claimed_at_ms)
+        .bind(format!("{}fixture", _receiver_subscription.id()))
         .bind(&exhausted.id)
         .execute(&pool)
         .await
@@ -1483,7 +1496,7 @@ mod tests {
         let transport = DatabaseTransport::new(pool.clone());
         let a = addr("run-db-noreg", "ghost");
 
-        let result = transport.subscribe(&a).await;
+        let result = transport.subscribe(&MailboxSubscription::new(a)).await;
         assert!(result.is_err(), "subscribe without register should fail");
     }
 
@@ -1498,7 +1511,7 @@ mod tests {
         let sender = addr("run-db-shutdown-reject-a", "alice");
         let receiver = addr("run-db-shutdown-reject-b", "bob");
 
-        transport.register(sender.clone(), None).await.unwrap();
+        let _sender_subscription = transport.register(sender.clone(), None).await.unwrap();
         transport.shutdown().await.unwrap();
 
         let register_err = transport
@@ -1507,7 +1520,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(register_err, MailboxError::Transport(_)));
 
-        let subscribe_err = match transport.subscribe(&sender).await {
+        let subscribe_err = match transport.subscribe(&_sender_subscription).await {
             Ok(_) => panic!("subscribe should fail after shutdown"),
             Err(err) => err,
         };

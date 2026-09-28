@@ -1016,6 +1016,7 @@ mod tests {
             tool_call_id: Some(call_id),
             admission_source,
             expected_control_epoch: None,
+            delegation_model_admission: None,
             task_resolution_authority: None,
         }
     }

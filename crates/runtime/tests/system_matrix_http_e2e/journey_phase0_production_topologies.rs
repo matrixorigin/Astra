@@ -1695,7 +1695,6 @@ async fn create_window_offerings(
                     "input_modalities": source.input_modalities,
                     "output_modalities": source.output_modalities,
                     "supported_parameters": source.supported_parameters,
-                    "pricing": source.pricing,
                     "architecture": source.architecture,
                     "tags": source.tags,
                     "quirks": source.quirks,

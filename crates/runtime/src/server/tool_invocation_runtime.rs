@@ -57,6 +57,44 @@ pub(crate) enum InvocationPrepareDisposition {
     },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum InvocationPreparationProbe {
+    Existing(Box<ToolInvocationRecord>),
+    Missing(MissingInvocationPreparation),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum MissingInvocationPreparation {
+    Database(Box<astra_services::tool_invocation_ledger::MissingToolInvocationPreparation>),
+    InMemory(Box<InMemoryMissingInvocationPreparation>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InMemoryMissingInvocationPreparation {
+    identity: ToolInvocationIdentity,
+    tool: astra_turn_types::DurableToolReference,
+    canonical_arguments_hash: String,
+}
+
+impl MissingInvocationPreparation {
+    pub(crate) fn matches(
+        &self,
+        identity: &ToolInvocationIdentity,
+        fingerprint: &ToolInvocationFingerprint,
+    ) -> bool {
+        match self {
+            Self::Database(missing) => {
+                missing.identity() == identity && missing.matches_tool_and_arguments(fingerprint)
+            }
+            Self::InMemory(missing) => {
+                missing.identity == *identity
+                    && missing.tool == fingerprint.tool
+                    && missing.canonical_arguments_hash == fingerprint.canonical_arguments_hash
+            }
+        }
+    }
+}
+
 /// Per-call durable control boundary supplied by the agentic loop. The owner
 /// pod capability is bound separately when the database ledger is composed,
 /// so provider-authored arguments cannot choose either authority value.
@@ -484,6 +522,58 @@ impl RuntimeToolInvocationLedger {
         }
     }
 
+    pub(crate) async fn probe_for_prepare(
+        &self,
+        identity: &ToolInvocationIdentity,
+        fingerprint: &ToolInvocationFingerprint,
+    ) -> Result<InvocationPreparationProbe, RuntimeInvocationLedgerError> {
+        match self {
+            Self::Database { ledger, .. } => Ok(match ledger.probe_for_prepare(identity, fingerprint).await? {
+                astra_services::tool_invocation_ledger::ToolInvocationPreparationProbe::Existing(record) => InvocationPreparationProbe::Existing(record),
+                astra_services::tool_invocation_ledger::ToolInvocationPreparationProbe::Missing(missing) => InvocationPreparationProbe::Missing(MissingInvocationPreparation::Database(missing)),
+            }),
+            Self::InMemory { .. } => match self.get(identity).await? {
+                Some(record) if record.fingerprint.same_tool_and_arguments(fingerprint) => {
+                    Ok(InvocationPreparationProbe::Existing(Box::new(record)))
+                }
+                Some(_) => Err(RuntimeInvocationLedgerError::InvalidRecord(
+                    "delegation invocation identity changed tool or arguments".into(),
+                )),
+                None => Ok(InvocationPreparationProbe::Missing(
+                    MissingInvocationPreparation::InMemory(Box::new(InMemoryMissingInvocationPreparation {
+                        identity: identity.clone(),
+                        tool: fingerprint.tool.clone(),
+                        canonical_arguments_hash: fingerprint.canonical_arguments_hash.clone(),
+                    })),
+                )),
+            },
+        }
+    }
+
+    pub(crate) async fn prepare_after_miss(
+        &self,
+        missing: MissingInvocationPreparation,
+        decision: &ToolInvocationDecision,
+    ) -> Result<ToolInvocationPrepareOutcome, RuntimeInvocationLedgerError> {
+        match (self, missing) {
+            (Self::Database { ledger, .. }, MissingInvocationPreparation::Database(missing)) => {
+                Ok(ledger.finish_prepare_after_miss(missing, decision).await?)
+            }
+            (Self::InMemory { .. }, MissingInvocationPreparation::InMemory(missing)) => {
+                let fingerprint = ToolInvocationFingerprint {
+                    tool: missing.tool.clone(),
+                    canonical_arguments_hash: missing.canonical_arguments_hash.clone(),
+                    policy_decision_id: decision.decision_id.clone(),
+                };
+                self.prepare(&missing.identity, &fingerprint, decision)
+                    .await
+            }
+            _ => Err(RuntimeInvocationLedgerError::InvalidRecord(
+                "delegation preparation belongs to another ledger backend".into(),
+            )),
+        }
+    }
+
     pub(crate) async fn dispatch(
         &self,
         identity: &ToolInvocationIdentity,
@@ -838,6 +928,56 @@ impl RuntimeToolInvocationLedger {
             ToolInvocationPrepareOutcome::Prepared(record)
             | ToolInvocationPrepareOutcome::Existing(record) => record,
         };
+        self.prepared_record_disposition(identity, record, validate_decision)
+            .await
+    }
+
+    pub(crate) async fn prepare_for_execution_with_probe(
+        &self,
+        identity: &ToolInvocationIdentity,
+        fingerprint: &ToolInvocationFingerprint,
+        probe: InvocationPreparationProbe,
+        decision: Option<&ToolInvocationDecision>,
+        validate_decision: impl FnOnce(&ToolInvocationDecision) -> Result<(), String>,
+    ) -> Result<InvocationPrepareDisposition, RuntimeInvocationLedgerError> {
+        let record = match probe {
+            InvocationPreparationProbe::Existing(record) => {
+                if &record.identity != identity
+                    || !record.fingerprint.same_tool_and_arguments(fingerprint)
+                {
+                    return Err(RuntimeInvocationLedgerError::InvalidRecord(
+                        "replayed delegation changed tool or arguments".into(),
+                    ));
+                }
+                *record
+            }
+            InvocationPreparationProbe::Missing(missing) => {
+                if !missing.matches(identity, fingerprint) {
+                    return Err(RuntimeInvocationLedgerError::InvalidRecord(
+                        "delegation preparation does not match invocation".into(),
+                    ));
+                }
+                let decision = decision.ok_or_else(|| {
+                    RuntimeInvocationLedgerError::InvalidRecord(
+                        "new delegation has no complete decision".into(),
+                    )
+                })?;
+                match self.prepare_after_miss(missing, decision).await? {
+                    ToolInvocationPrepareOutcome::Prepared(record)
+                    | ToolInvocationPrepareOutcome::Existing(record) => record,
+                }
+            }
+        };
+        self.prepared_record_disposition(identity, record, validate_decision)
+            .await
+    }
+
+    async fn prepared_record_disposition(
+        &self,
+        identity: &ToolInvocationIdentity,
+        record: ToolInvocationRecord,
+        validate_decision: impl FnOnce(&ToolInvocationDecision) -> Result<(), String>,
+    ) -> Result<InvocationPrepareDisposition, RuntimeInvocationLedgerError> {
         match record.state {
             ToolInvocationState::Prepared => {
                 validate_decision(&record.decision)

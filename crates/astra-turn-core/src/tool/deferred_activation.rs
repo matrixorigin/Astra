@@ -607,6 +607,9 @@ pub fn deferred_tool_activations_from_tool_search_output(
     if value.get("mode").and_then(Value::as_str) != Some("select") {
         return Vec::new();
     }
+    if value.get("status").and_then(Value::as_str) != Some("completed") {
+        return Vec::new();
+    }
     let Some(query) = value.get("query").and_then(Value::as_str) else {
         return Vec::new();
     };
@@ -1039,6 +1042,7 @@ mod tests {
         let digest = format!("sha256:{}", "a".repeat(64));
         let output = json!({
             "mode": "select",
+            "status": "completed",
             "query": "select:invoke_tool,read_file,web_fetch",
             "requested": ["invoke_tool", "read_file", "web_fetch"],
             "resolved": ["invoke_tool", "read_file", "web_fetch"],
@@ -1073,6 +1077,7 @@ mod tests {
         let digest = format!("sha256:{}", "a".repeat(64));
         let selected = json!({
             "mode": "select",
+            "status": "completed",
             "query": "select:github,web_fetch",
             "requested": ["github", "web_fetch"],
             "resolved": ["github", "web_fetch"],
@@ -1100,6 +1105,7 @@ mod tests {
         let valid_digest = format!("sha256:{}", "b".repeat(64));
         let base = json!({
             "mode": "select",
+            "status": "completed",
             "query": "select:github",
             "requested": ["github"],
             "resolved": ["github"],
@@ -1110,6 +1116,10 @@ mod tests {
             deferred_tool_activations_from_tool_search_output(&base.to_string()).len(),
             1
         );
+
+        let mut failed = base.clone();
+        failed["status"] = json!("failed");
+        assert!(deferred_tool_activations_from_tool_search_output(&failed.to_string()).is_empty());
 
         let mut forged = base.clone();
         forged["requested"] = json!(["web_fetch"]);
@@ -1428,6 +1438,7 @@ mod tests {
         let selection = |digest: char| {
             json!({
                 "mode": "select",
+                "status": "completed",
                 "query": "select:web_fetch",
                 "requested": ["web_fetch"],
                 "resolved": ["web_fetch"],

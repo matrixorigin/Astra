@@ -625,6 +625,34 @@ pub fn evaluate_tool_call_records_with_thresholds(
 
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
+    input: &str,
+    recent_tools: &[String],
+    tool_call_records: &[ToolCallRecord],
+    stall_count: usize,
+    verdict_warning: bool,
+    budget_pressure: f64,
+    thresholds: EvaluationThresholds,
+    telemetry: TurnEvaluationTelemetry,
+) -> TurnEvaluation {
+    evaluate_tool_call_records_with_resolved_children(
+        input,
+        recent_tools,
+        tool_call_records,
+        stall_count,
+        verdict_warning,
+        budget_pressure,
+        thresholds,
+        telemetry,
+        &[],
+    )
+}
+
+/// Final-turn evaluation can consume producer-owned child completions that
+/// supersede earlier nonterminal agent receipts. The execution records remain
+/// unchanged for audit; only this quality projection treats proven receipts
+/// as settled. Callers must validate the child identity and delivery first.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_tool_call_records_with_resolved_children(
     _input: &str,
     _recent_tools: &[String],
     tool_call_records: &[ToolCallRecord],
@@ -633,6 +661,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     budget_pressure: f64,
     thresholds: EvaluationThresholds,
     telemetry: TurnEvaluationTelemetry,
+    resolved_children: &[astra_turn_types::task_resolution::ToolExecutionEvidenceRef],
 ) -> TurnEvaluation {
     // Execution health is computed only from calls that reached an executor.
     // Rejected, reused, suppressed, and deferred requests remain available as
@@ -798,7 +827,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     revoke_all_tools_healthy_when_quality_signals_disagree(&mut eval, &tool_calls);
     align_high_cost_low_yield_verdict(&mut eval, &tool_calls, telemetry);
     apply_blocked_tool_failures(&mut eval, tool_call_records);
-    apply_unresolved_tool_outcome_failures(&mut eval, tool_call_records);
+    apply_unresolved_tool_outcome_failures(&mut eval, tool_call_records, resolved_children);
     calibrate_confidence_after_quality_penalties(&mut eval);
 
     eval
@@ -1075,11 +1104,30 @@ fn operation_identity_key(record: &ToolCallRecord) -> Option<String> {
 
 fn unresolved_tool_outcome_failure_counts(
     records: &[ToolCallRecord],
+    resolved_children: &[astra_turn_types::task_resolution::ToolExecutionEvidenceRef],
 ) -> std::collections::BTreeMap<String, usize> {
     unresolved_tool_outcome_fact_counts(
         &records
             .iter()
-            .map(ToolEvaluationFact::from_record)
+            .map(|record| {
+                let mut fact = ToolEvaluationFact::from_record(record);
+                if record.name == "agent"
+                    && record.ok
+                    && fact.effective_result_class.as_deref() == Some(RESULT_CLASS_AGENT_INCOMPLETE)
+                    && record
+                        .execution_completion
+                        .as_ref()
+                        .is_some_and(|reference| {
+                            resolved_children
+                                .iter()
+                                .any(|resolved| resolved == reference)
+                        })
+                {
+                    fact.effective_result_class = Some("success".into());
+                    fact.non_failure_outcome = true;
+                }
+                fact
+            })
             .collect::<Vec<_>>(),
     )
 }
@@ -1353,7 +1401,7 @@ pub fn rejected_operation_key(record: &ToolCallRecord) -> Option<String> {
 /// result for the same operation removes the earlier failure, so runtime
 /// feedback does not keep advising about a problem the agent already fixed.
 pub fn count_unresolved_tool_outcome_failures(records: &[ToolCallRecord]) -> usize {
-    unresolved_tool_outcome_failure_counts(records)
+    unresolved_tool_outcome_failure_counts(records, &[])
         .values()
         .copied()
         .sum()
@@ -1473,8 +1521,12 @@ fn record_is_rejected_attempt(record: &ToolCallRecord) -> bool {
             || record.was_blocked_by_policy())
 }
 
-fn apply_unresolved_tool_outcome_failures(eval: &mut TurnEvaluation, records: &[ToolCallRecord]) {
-    let counts = unresolved_tool_outcome_failure_counts(records);
+fn apply_unresolved_tool_outcome_failures(
+    eval: &mut TurnEvaluation,
+    records: &[ToolCallRecord],
+    resolved_children: &[astra_turn_types::task_resolution::ToolExecutionEvidenceRef],
+) {
+    let counts = unresolved_tool_outcome_failure_counts(records, resolved_children);
     let total: usize = counts.values().sum();
     if total == 0 {
         return;
@@ -1998,9 +2050,7 @@ fn observation_evidence_identities(
         return (None, None);
     };
     let result_key = if record.name == "introspect"
-        && args_value
-            .as_ref()
-            .is_some_and(|args| args.get("artifact").is_none() && args.get("explain").is_none())
+        && args_value.as_ref().is_some_and(is_live_snapshot_request)
     {
         let result = delivered_model_result(record).filter(|value| !value.is_empty());
         let Some(result) = result else {
@@ -2028,6 +2078,10 @@ fn observation_evidence_identities(
     )
 }
 
+fn is_live_snapshot_request(args: &serde_json::Value) -> bool {
+    args.get("artifact").is_none() && args.get("explain").is_none()
+}
+
 fn observation_coverage(record: &ToolCallRecord) -> Option<Vec<String>> {
     if record.name != "introspect"
         || !record.ok
@@ -2044,7 +2098,7 @@ fn observation_coverage(record: &ToolCallRecord) -> Option<Vec<String>> {
         return None;
     }
     let args = serde_json::from_str::<serde_json::Value>(args).ok()?;
-    if args.get("artifact").is_some() || args.get("explain").is_some() {
+    if !is_live_snapshot_request(&args) {
         return None;
     }
     let result = delivered_model_result(record).filter(|value| !value.is_empty())?;
@@ -2093,7 +2147,7 @@ fn observation_scope(record: &ToolCallRecord) -> Option<ObservationScope> {
         return None;
     }
     let args = serde_json::from_str::<serde_json::Value>(args).ok()?;
-    if args.get("artifact").is_some() || args.get("explain").is_some() {
+    if !is_live_snapshot_request(&args) {
         return None;
     }
     Some(ObservationScope::from_request(
@@ -2117,7 +2171,7 @@ fn observation_request_key(
     let Some(args) = args else {
         return operation_identity_key(record);
     };
-    if args.get("artifact").is_some() || args.get("explain").is_some() {
+    if !is_live_snapshot_request(args) {
         return operation_identity_key(record);
     }
     let request = crate::introspect::IntrospectRequest::from_args(args);
@@ -4704,6 +4758,26 @@ mod tests {
             ]),
             0,
             "a missing result must not be treated as unchanged evidence"
+        );
+    }
+
+    #[test]
+    fn model_catalog_pages_do_not_collapse_into_one_live_snapshot_request() {
+        let mut first = journal_ok_call("model_catalog");
+        first.args_full = Some(serde_json::json!({}).to_string());
+        first.result_full = Some("first complete JSON page".into());
+        let mut second = first.clone();
+        second.args_full =
+            Some(serde_json::json!({"cursor":"next","catalog_revision":"revision"}).to_string());
+        second.result_full = Some("second complete JSON page".into());
+        assert!(observation_scope(&first).is_none());
+        assert!(observation_scope(&second).is_none());
+        let a: serde_json::Value = serde_json::from_str(first.args_full.as_ref().unwrap()).unwrap();
+        let b: serde_json::Value =
+            serde_json::from_str(second.args_full.as_ref().unwrap()).unwrap();
+        assert_ne!(
+            observation_request_key(&first, Some(&a)),
+            observation_request_key(&second, Some(&b))
         );
     }
 

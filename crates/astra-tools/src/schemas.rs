@@ -681,7 +681,7 @@ fn start_work_schema() -> Value {
         "type": "function",
         "function": {
             "name": "start_work",
-            "description": "Establish the conversation's one canonical Work with an initial ordered task list. This is the genesis transition: call it only when no Work is bound; once bound, never call start_work again. For 2+ independently useful deliverables/evidence tracks, call this before exploration. Count user acceptance units: A and B are separate only when each owes its own payload or evidence and remains useful alone; inputs serving one combined conclusion are one outcome. Same-turn multi-agent topology alone uses agent_fanout, not Work; simple questions and one-shot responses do not use Work. activation=start assigns the first task; use activation=defer when this turn only establishes/prepares a plan or explicitly says not to execute; defer creates no attempt. Supply the smallest independently executable outcomes; task identities are server-owned; declare only explicit execution prerequisites via after_initial_tasks. Preserve chronology: outcomes said to be added, replaced, cancelled, discovered, or decided later are omitted from initial tasks until the typed graph-update boundary. One bounded operation producing all requested evidence is one task; exclude synthesis, formatting, reporting, and restatement. Preserve N explicitly named execution tracks as exactly N tasks unless scope changes. A successful result normally includes initial_task; execute it directly instead of calling run_next_work_item. For a bound Work, inspect_work_plan then propose_work_plan is the only graph-change path.",
+            "description": "Establish the conversation's one canonical Work with an initial ordered task list. This is the genesis transition: call it only when no Work is bound; once bound, never call start_work again. When the user explicitly requests durable Work with 2+ independently useful deliverables/evidence tracks, call this before exploration. Count user acceptance units: A and B are separate only when each owes its own payload or evidence and remains useful alone; inputs serving one combined conclusion are one outcome. Same-turn multi-agent topology alone uses independent agent.spawn calls, or agent_fanout when group control is needed, not Work; simple questions and one-shot responses do not use Work. activation=start assigns the first task; use activation=defer when this turn only establishes/prepares a plan or explicitly says not to execute; defer creates no attempt. Supply the smallest independently executable outcomes; task identities are server-owned; declare only explicit execution prerequisites via after_initial_tasks. Preserve chronology: outcomes said to be added, replaced, cancelled, discovered, or decided later are omitted from initial tasks until the typed graph-update boundary. One bounded operation producing all requested evidence is one task; exclude synthesis, formatting, reporting, and restatement. Preserve N explicitly named execution tracks as exactly N tasks unless scope changes. A successful result normally includes initial_task; execute it directly instead of calling run_next_work_item. For a bound Work, inspect_work_plan then propose_work_plan is the only graph-change path.",
             "parameters": {
                 "type": "object",
                 "additionalProperties": false,
@@ -1293,6 +1293,72 @@ macro_rules! heap_schema_vec {
     }};
 }
 
+fn requested_model_policy_schema() -> Value {
+    json!({
+        "description": "Requested model behavior, distinct from the resolved Offering. Omission applies any trusted user model requirement before ordinary parent inheritance. A fixed selector may use an exact Offering ID or an exact configured model name, optionally qualified by its exact provider/access source; never put a display name in offering_id and never guess an Offering ID. A configured name must resolve to exactly one authorized active Chat model or admission fails before any child starts. Unresolved or unavailable requirements block new child execution. Explicit inherit cannot override a hard user requirement. Auto cost-priority and balanced requests are preserved, but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable.",
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {"mode": {"const": "inherit"}},
+                "required": ["mode"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "mode": {"const": "fixed"},
+                    "selector": {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"const": "offering_id"},
+                                    "offering_id": {"type": "string", "minLength": 1, "maxLength": 64}
+                                },
+                                "required": ["kind", "offering_id"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"const": "configured_name"},
+                                    "model_name": {"type": "string", "minLength": 1, "maxLength": 256},
+                                    "source": {"type": "string", "minLength": 1, "maxLength": 128}
+                                },
+                                "required": ["kind", "model_name"],
+                                "additionalProperties": false
+                            }
+                        ]
+                    }
+                },
+                "required": ["mode", "selector"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "mode": {"const": "auto"},
+                    "strategy": {"type": "string", "enum": ["cost_priority", "balanced"]}
+                },
+                "required": ["mode", "strategy"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+fn fanout_reasoning_schema() -> Value {
+    json!({
+        "description": "Exact reasoning control. Omit to inherit parent thinking for the same Offering; model_default explicitly uses the target default. Different Offerings never inherit parent controls.",
+        "oneOf": [
+            {"type": "object", "properties": {"mode": {"const": "model_default"}}, "required": ["mode"], "additionalProperties": false},
+            {"type": "object", "properties": {"mode": {"const": "off"}}, "required": ["mode"], "additionalProperties": false},
+            {"type": "object", "properties": {"mode": {"const": "enabled"}, "budget_tokens": {"type": "integer", "minimum": 1024, "maximum": 4294967295_u64}}, "required": ["mode", "budget_tokens"], "additionalProperties": false},
+            {"type": "object", "properties": {"mode": {"const": "adaptive"}, "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]}}, "required": ["mode", "effort"], "additionalProperties": false}
+        ]
+    })
+}
+
 fn all_tool_schemas_core() -> Vec<Value> {
     heap_schema_vec![
         submit_task_resolution_schema(),
@@ -1838,25 +1904,27 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent",
-                "description": "Actions: spawn needs description+prompt (not task/type/agent_id; foreground fan-in by default; no background arg); get_result needs the returned agent_id of explicitly backgrounded work; run_chain needs name+description+steps.\n\n\
-         Multi-agent and local fixed-chain operations. Actions: spawn, get_result, run_chain, send_message. `run_chain` is a local executor pipeline, not a durable task list. If the user asks for task/Work tracking and `start_work` is visible, call `start_work` directly instead of using `agent`.\n\n\
+                "description": "Actions: spawn needs description+prompt (not task/type/agent_id; returns a launched receipt promptly so the parent continues; no background arg); list reads child status; get_result needs the returned agent_id; run_chain needs name+description+steps.\n\n\
+         Multi-agent and local fixed-chain operations. Actions: spawn, list, get_result, run_chain, send_message. `run_chain` is a local executor pipeline, not a durable task list. If the user asks for task/Work tracking and `start_work` is visible, call `start_work` directly instead of using `agent`.\n\n\
          ## Required fields per action\n\
-         - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `model`, `initial_turns`, `max_output_tokens`, `complexity`, `isolated`, `allowed_tools`, `name`, `inherit_prefix`.)\n\
-         - `get_result`: REQUIRES `action`, `agent_id`.\n\
+         - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `requested_model_policy`, `reasoning`, `initial_turns`, `max_output_tokens`, `complexity`, `isolated`, `allowed_tools`, `name`, `inherit_prefix`.)\n\
+         - `list`: REQUIRES `action`; optional exact `agent_id`. Read-only status of this agent's direct owned children in the current session's in-memory cache. No database query, terminal wait, or result collection. Missing entries are unknown, not completed.\n\
+         - `get_result`: REQUIRES `action`, `agent_id`. Collect the child outcome when needed, including after an ordinary spawn. May briefly wait or reconcile durable state; use `list` for status only and do not busy-poll.\n\
          - `run_chain`: REQUIRES `action`, `name`, `description`, `steps`.\n\
-         - `send_message`: REQUIRES `action`, `to`, `message`; returns `queued`, then the receiver emits an applied acknowledgement at its next model boundary.\n\n\
-         For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is ONLY for `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Later `get_result` calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
+         - `send_message`: REQUIRES `action`, `to`, `message`; returns `queued` when the routing/transport path accepts the message. Receiver observation does not prove model inclusion, compliance, or task completion.\n\n\
+         For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is for `list` and `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Status filters and result calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `list` or `get_result`.\n\n\
+         Model choice uses `requested_model_policy`, not a `model` field. When the user names a child model in natural language, omit this field: the server resolves the authenticated requirement against the authorized catalog. Do not read workspace configuration or credentials to translate the name. A fixed selector can use an exact configured model name (and optional exact source) without an Offering ID; never disguise that name as an Offering ID. Runtime resolves it to one authorized Offering before child admission.\n\n\
          ## Spawn example\n\
          `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\",\"agent_type\":\"general-purpose\"}`\n\n\
          ## Execution mode\n\
-         `spawn` is foreground by contract: it waits for the child's terminal result while the runtime streams live progress and keeps client controls responsive. In the terminal, the user may explicitly press Ctrl+B to move the live child to the background; do not pass a background flag. A background handoff returns a stable agent_id/run_id and its terminal result is delivered to the parent mailbox.\n\n\
+         `spawn` returns a `launched` receipt with a runtime-generated `agent_id` promptly after execution ownership is established, while the child runs and the parent continues independent work. No background flag or Ctrl+B is needed. The receipt proves launch, not completion; collect the child outcome before relying on it. Normal model admission, tool permissions, execution deadlines, lineage, and cancellation ownership still apply. Launching does not extend the deadline or grant permissions.\n\n\
          ## Parallel sub-agent fan-out\n\
-         For a fixed-size parallel group, call `agent_fanout` with its JSON object schema; do not simulate it with an `agents:[...]` payload on `agent`. Slots may include `id` as a caller-facing label; runtime-generated `agent_id` values come back in the result.\n\
+         For independent parallel tasks, call `agent` with `action=spawn` once per child. Each launch has its own receipt and may succeed or fail independently; report partial outcomes honestly. Use `agent_fanout` only when the user needs all-child preflight, target-count accounting, or group-wide control. Preflight does not guarantee every child will execute successfully. Do not simulate a group with an `agents:[...]` payload on `agent`. `agent_fanout.start` remains joined: it waits for accepted children and returns one group result unless the user explicitly hands it to the background. Slots may include `id` as a caller-facing label; runtime-generated `agent_id` values come back in the result.\n\
          For plan lifecycle, if `enter_plan_mode` / `exit_plan_mode` are visible in the current tool surface, call them directly; never wrap them in the `agent` `run_chain` action.\n\
          Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. `agent` launches one child; `agent_fanout` launches a fixed parallel group.
 
          ## Canonical Work and delegation
-         - `agent(spawn)` + optional `agent(get_result)`: one foreground sub-agent, or one explicitly backgrounded child the user later inspects.
+         - `agent(spawn)`: one concurrent, parent-owned child; `agent(list)` observes status and `agent(get_result)` collects its outcome when needed.
          - `agent_fanout`: fixed-size parallel sub-agent groups with target-count accounting.
          - Shell commands/processes are separate execution tools; do not represent them as sub-agents.
          - When no canonical Work exists and the current turn requires durable task tracking, establish it with `start_work` before delegating. When canonical Work already exists, keep that Work as the durable scope rather than trying to create another one. `agent` and `agent_fanout` do not themselves create or replace a canonical task list.
@@ -1866,25 +1934,27 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "x-astra-action-surfaces": {
                         "spawn": ["local", "server"],
+                        "list": ["local", "server"],
                         "get_result": ["local", "server"],
                         "run_chain": ["local"],
                         "send_message": ["local", "server"]
                     },
                     "x-astra-surface-descriptions": {
-                        "server": "Server-owned single-agent lifecycle. Actions: spawn, get_result, send_message. This tool does not create a durable task list: when the user asks for task/Work tracking, call the visible start_work tool directly. For a fixed-size parallel group use agent_fanout."
+                        "server": "Server-owned single-agent lifecycle. Actions: spawn, list, get_result, send_message. spawn requires description+prompt and returns a launched receipt with agent_id promptly after execution ownership is established; the parent continues independent work. A receipt proves launch, not completion. Normal model admission, tool permissions, execution deadlines, lineage, and cancellation ownership still apply; no background flag or Ctrl+B is needed. Independent parallel tasks use multiple spawn calls; each has its own receipt and partial failure is possible. list is read-only status of this agent's direct owned children in the current session's in-memory cache; optional exact agent_id filters it. No database query, terminal wait, or result collection; missing entries are unknown, not completed. get_result requires the returned agent_id and collects the child outcome when needed, including after an ordinary spawn; it may briefly wait or reconcile durable state, so use list for status only and do not busy-poll. This tool does not create a durable task list: when the user asks for task/Work tracking, call the visible start_work tool directly. Use agent_fanout.start only for all-child preflight, target-count accounting, or group-wide control; it remains joined unless the user explicitly hands it to the background."
                     },
                     "x-astra-surface-discovery-summaries": {
-                        "server": "spawn: action+description+prompt; foreground fan-in unless the user backgrounds it. get_result: action+agent_id. send_message: action+to+message. Durable task lists use start_work."
+                        "server": "Omitted requested_model_policy: user model requirements. Hard requirements cannot be overridden; no workspace config reads. spawn->launched; parent continues useful work. Else final; runtime waits. No unrelated tools."
                     },
                     "x-astra-per-action-discovery-summaries": {
-                        "spawn": "action+description+prompt; foreground fan-in unless the user backgrounds it",
-                        "get_result": "action+agent_id",
+                        "spawn": "Omitted requested_model_policy: user model requirements. Hard requirements cannot be overridden; no workspace config reads. spawn->launched; parent continues relevant work. No unrelated tools.",
+                        "get_result": "action+returned agent_id; collect outcome when needed; may briefly wait or reconcile durable state; use list for status; do not busy-poll",
+                        "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
                         "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
                         "send_message": "action+to+message"
                     },
-                    "x-astra-discovery-summary": "spawn: action+description+prompt; foreground fan-in unless the user backgrounds it. get_result: action+agent_id. run_chain: local fixed pipeline with action+name+description+steps, never a durable task list. send_message: action+to+message. Durable task lists use the separate start_work tool.",
+                    "x-astra-discovery-summary": "Omitted requested_model_policy keeps user model requirements. Hard requirements cannot be overridden; no workspace config reads. spawn: description+prompt -> launched; parent continues. list: status. get_result: result.",
                     "properties": {
-                        "action": {"type": "string", "enum": ["spawn","get_result","run_chain","send_message"]},
+                        "action": {"type": "string", "enum": ["spawn","list","get_result","run_chain","send_message"]},
                         "steps": {
                             "type": "array",
                             "minItems": 1,
@@ -1904,7 +1974,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "description": {"type": "string", "description": "Short operation description when required by the selected action."},
                         "prompt": {"type": "string", "description": "Full child task brief for spawn. Non-empty and required with description."},
                         "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: general-purpose."},
-                        "model": {"type": "string", "description": "Model override (spawn). Default: parent's model."},
+                        "requested_model_policy": requested_model_policy_schema(),
+                        "reasoning": fanout_reasoning_schema(),
                         "name": {"type": "string", "description": "Action label when accepted by the selected action."},
                         "input": {"type": "object", "description": "Optional run_chain template input."},
                         "rollback_on_failure": {"type": "boolean", "description": "Rollback bounded chain mutations after failure."},
@@ -1932,9 +2003,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "required": ["item_id", "item_revision"],
                             "additionalProperties": false
                         },
-                        "agent_id": {"type": "string", "description": "ONLY for action='get_result'. Must be the exact runtime-generated agent_id returned by a prior spawn, not the optional spawn name. Never prefill this on spawn."},
+                        "agent_id": {"type": "string", "description": "For get_result (required) or list (optional): exact runtime-generated agent_id, not a spawn name. Never prefill this on spawn."},
                         "to": {"type": "string", "description": "REQUIRED for action='send_message'. Active child/peer agent_id, related exact run_id within the current delegation boundary, 'parent', or '*' for broadcast."},
-                        "message": {"description": "REQUIRED for action='send_message'. Message content."},
+                        "message": {"description": "REQUIRED for action='send_message'. Concise coordination message (at most 3000 characters); share an artifact for larger content."},
                         "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
                         "request_id": {"type": "string", "description": "Optional correlation id when answering or following up on an earlier message."}
                     },
@@ -1944,11 +2015,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "spawn": ["description", "prompt"],
                         "run_chain": ["name", "description", "steps"],
                         "get_result": ["agent_id"],
+                        "list": [],
                         "send_message": ["to", "message"]
                     },
                     "x-astra-per-action-allowed": {
-                        "spawn": ["action", "description", "prompt", "agent_type", "model", "name", "initial_turns", "max_output_tokens", "complexity", "isolated", "allowed_tools", "inherit_prefix", "work_item"],
+                        "spawn": ["action", "description", "prompt", "agent_type", "requested_model_policy", "reasoning", "name", "initial_turns", "max_output_tokens", "complexity", "isolated", "allowed_tools", "inherit_prefix", "work_item"],
                         "get_result": ["action", "agent_id"],
+                        "list": ["action", "agent_id"],
                         "run_chain": ["action", "name", "description", "steps", "input", "rollback_on_failure"],
                         "send_message": ["action", "to", "message", "message_type", "request_id"]
                     }
@@ -1965,16 +2038,16 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `get_results`: requires `action` and returned `group_id` for an explicitly backgrounded group. It takes a short non-blocking snapshot; terminal updates also arrive through the parent mailbox, so do not busy-poll. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
          - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
          - `stop_group`: requires `action` and `group_id`; it requests cancellation for every non-terminal child in one group operation.\n\n\
-         Use this for independent parallel work only when the user request or loaded workflow contains an explicit topology directive. Quality, scope, and complexity requirements alone do not imply extra agents or parallel execution; when neither authority explicitly requires delegation or parallelism, keep the work in the parent turn. Put each concise child instruction only in `slots[i].prompt`. Children inherit the current execution binding; only tools exposed in a child's own tool surface are usable. If `agent_type` is omitted, the server uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly for mutation or full-surface work. Do not start workspace-dependent slots when the current workspace provider is unavailable. Never paste file contents, diffs, or prior tool output into a slot prompt. Fanout already decomposes work: keep each slot narrowly scoped and normally use `normal`; omit `initial_turns` unless there is a specific first-checkpoint reason. It is renewable, never a user execution limit. Do not mark every review slot `deep`. A per-slot or shared tool allowlist is named `allowed_tools`; there is no `tools` field. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start waits for accepted children concurrently and returns one canonical group result. In the terminal only the user may press Ctrl+B to hand the live group to the background; that explicit handoff returns stable child identities and later terminal results remain available through the group mailbox/get_results contract.",
+         Use this for independent parallel work only when the user request or loaded workflow contains an explicit topology directive. Quality, scope, and complexity requirements alone do not imply extra agents or parallel execution; when neither authority explicitly requires delegation or parallelism, keep the work in the parent turn. Put each concise child instruction only in `slots[i].prompt`. Children inherit the current execution binding unless an exact authorized Offering or reasoning control is set per slot or in defaults; those overrides require batch atomic model admission before any slot starts. When the user names child models naturally, omit requested_model_policy and let the server resolve their authenticated requirements against the authorized catalog; do not inspect workspace configuration or credentials for model identity. Only tools exposed in a child's own tool surface are usable. If `agent_type` is omitted, the server uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly for mutation or full-surface work. Do not start workspace-dependent slots when the current workspace provider is unavailable. Never paste file contents, diffs, or prior tool output into a slot prompt. Fanout already decomposes work: keep each slot narrowly scoped and normally use `normal`; omit `initial_turns` unless there is a specific first-checkpoint reason. It is renewable, never a user execution limit. Do not mark every review slot `deep`. A per-slot or shared tool allowlist is named `allowed_tools`; there is no `tools` field. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start waits for accepted children concurrently and returns one canonical group result. In the terminal only the user may press Ctrl+B to hand the live group to the background; that explicit handoff returns stable child identities and later terminal results remain available through the group mailbox/get_results contract.",
                 "parameters": {
                     "type": "object",
                     "x-astra-per-action-discovery-summaries": {
-                        "start": "target_count + exactly that many slots; description+prompt each; no brief/agents/background; never embed diffs",
+                        "start": "Omitted requested_model_policy preserves user model requirements; server resolves natural names. No workspace config reads. Hard requirements cannot be overridden. start: target_count slots, description+prompt; atomic.",
                         "get_results": "action+group_id; use bounded result windows and follow next_call",
                         "stop_slot": "action+group_id+slot_index",
                         "stop_group": "action+group_id"
                     },
-                     "x-astra-discovery-summary": "start: target_count + exactly that many slots; description+prompt each; no brief/agents/background; never embed diffs. Omit agent_type=read-only explore; task/general-purpose=mutation. Child surface authoritative.",
+                     "x-astra-discovery-summary": "Omitted requested_model_policy preserves user model requirements; server resolves natural names. No workspace config reads. Hard requirements cannot be overridden. start: target_count slots, description+prompt; atomic.",
                     "properties": {
                         "action": {"type": "string", "enum": ["start","get_results","stop_slot","stop_group"]},
                         "group_id": {"type": "string", "description": "Fanout group id. Optional on start; required for get_results, stop_slot, and stop_group."},
@@ -1991,12 +2064,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                     "description": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS, "description": "Short UI summary for this slot."},
                                     "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Concise child task brief. The child inherits current provider bindings and can use only its exposed tools; never paste file contents, diffs, or prior tool output here."},
                                     "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Child persona. Omit for bounded read-only explore; choose task/general-purpose explicitly for mutation or full-surface work."},
-                                    "model": {"type": "string"},
                                     "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
-                                    "max_output_tokens": {"type": "integer"},
+                                    "max_output_tokens": {"type": "integer", "minimum": 1},
                                     "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                     "isolated": {"type": "boolean"},
-                                    "allowed_tools": {"type": "array", "items": {"type": "string"}}
+                                    "allowed_tools": {"type": "array", "items": {"type": "string"}},
+                                    "requested_model_policy": requested_model_policy_schema(),
+                                    "reasoning": fanout_reasoning_schema()
                                 },
                                 "required": ["description", "prompt"]
                             }
@@ -2007,12 +2081,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "additionalProperties": false,
                             "properties": {
                                 "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Shared child persona. Omit for bounded read-only explore; choose task/general-purpose explicitly for mutation or full-surface work."},
-                                "model": {"type": "string"},
                                 "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
-                                "max_output_tokens": {"type": "integer"},
+                                "max_output_tokens": {"type": "integer", "minimum": 1},
                                 "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                 "isolated": {"type": "boolean"},
-                                "allowed_tools": {"type": "array", "items": {"type": "string"}}
+                                "allowed_tools": {"type": "array", "items": {"type": "string"}},
+                                "requested_model_policy": requested_model_policy_schema(),
+                                "reasoning": fanout_reasoning_schema()
                             }
                         },
                         "slot_index": {"type": "integer", "minimum": 0, "description": "REQUIRED for stop_slot. Optional for get_results to read one slot result window."},
@@ -2039,13 +2114,31 @@ fn all_tool_schemas_core() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
-                "name": "introspect",
-                "description": "Read bounded live/runtime observations or artifacts. Server Explain: explain={target:previous} excludes the current root; target=run requires run_id. Returns the first window and fixed artifact handle. CLI/Edge selectors are unsupported. Start with facet=overview and depth=summary; use hint for quick checks. Do not repeat an identical introspect request unless state or a requested deep audit changed; a cached repeat adds no evidence. Live horizons are not historical truth; use reflect for persisted causal evidence. `urn:astra:observation:*` and `urn:astra:evidence:*` are citations, not artifact handles. Use `artifact://session/tool-result/<opaque_token>` for artifacts; omit it for live state.",
+                "name": "model_catalog",
+                "description": "Read the current user's authorized active Chat models. Returns one complete JSON page with exact offering/name/provider/access identities, capabilities, nullable prices, revision and continuation cursor. Use this when the user asks which delegated models are available; never inspect workspace configuration for model identity. Discovery is not execution permission: delegation revalidates the selected Offering. Omit cursor and catalog_revision on the first page; send both unchanged when following next_cursor.",
                 "parameters": {
                     "type": "object",
+                    "x-astra-discovery-summary": "Authorized Chat model catalog, JSON only. limit defaults 16; follow next_cursor with catalog_revision. No workspace config reads. Discovery is not execution admission.",
+                    "properties": {
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 32, "default": 16},
+                        "cursor": {"type": "string", "minLength": 1, "maxLength": 2048},
+                        "catalog_revision": {"type": "string", "minLength": 71, "maxLength": 71}
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "introspect",
+                "description": "Read bounded live/runtime observations or artifacts; use model_catalog for available Chat models. Server Explain: explain={target:previous} excludes the current root; target=run requires run_id. Returns the first window and fixed artifact handle. CLI/Edge Explain selectors are unsupported. Start runtime retrospectives with facet=overview and depth=summary; use hint for quick checks. Do not repeat identical diagnostics without new state or a requested deep audit; a cached repeat adds no evidence. Live horizons are not historical truth; use reflect for persisted causal evidence. Observation/evidence URNs such as urn:astra:observation:* are citations, not artifact handles. Use artifact://session/tool-result/<opaque_token> for artifacts; omit it for live state.",
+                "parameters": {
+                    "type": "object",
+                    "x-astra-discovery-summary": "Live runtime observation and Server Explain/artifact recovery. For authorized Chat models use model_catalog, not workspace configuration.",
                     "properties": {
                         "topic": {"type": "string", "enum": ["overview","runtime","execution","knowledge"], "description": "Area: runtime is default; execution covers errors/trace, knowledge covers context artifacts."},
-                        "facet": {"type": "string", "enum": ["session","overview","recent","errors","trace","volatile","stall","noise","cache","session_memory"], "description": "Live view. Start retrospectives with overview; use another facet only for a reported gap. cache/session_memory may require CLI/Edge data."},
+                        "facet": {"type": "string", "enum": ["session","overview","recent","errors","trace","volatile","stall","noise","cache","session_memory"], "description": "Live runtime observation facet."},
                         "depth": {"type": "string", "enum": ["hint","summary","diagnostic","forensic"], "description": "Detail level. diagnostic/forensic include bounded full live data when available."},
                         "horizon": {"type": "string", "enum": ["now","current_turn","recent","turn","session","cross_session"], "description": "Window label. Historical labels return a marked recent live projection; use reflect for persisted history."},
                         "question": {"type": "string", "description": "Optional context label; it does not widen evidence."},
@@ -2541,7 +2634,7 @@ mod tests {
     // `execute_code` is NOT in the schema list (so the model doesn't
     // hallucinate it).
 
-    // ── agent tool: structured foreground contract ────────────────────────
+    // ── agent tool: parent-owned launch and observation contract ───────────
 
     #[test]
     fn agent_schema_does_not_expose_model_background_parameter() {
@@ -2554,10 +2647,155 @@ mod tests {
             .expect("agent must expose parameters.properties");
         assert!(
             props.get("run_in_background").is_none(),
-            "foreground/background is a user control; the model must not choose scheduling policy"
+            "single-child concurrency needs no model flag; explicit handoff remains a user control"
         );
+        assert!(props.get("background").is_none());
         assert!(props.get("max_turns").is_none());
         assert!(props.get("initial_turns").is_some());
+    }
+
+    #[test]
+    fn agent_model_policy_describes_canonical_selection_and_human_name_handling() {
+        let schemas = all_tool_schemas();
+        let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
+        let description = agent["function"]["description"]
+            .as_str()
+            .expect("agent description");
+        assert!(description.contains("`requested_model_policy`, `reasoning`"));
+        assert!(description.contains("Do not read workspace configuration or credentials"));
+        assert!(!description.contains("Optional: `agent_type`, `model`"));
+        let properties = &agent["function"]["parameters"]["properties"];
+        assert!(properties.get("model").is_none());
+        let policy_description = properties["requested_model_policy"]["description"]
+            .as_str()
+            .expect("requested model policy description");
+        assert!(policy_description.contains("exact Offering ID or an exact configured model name"));
+        assert!(policy_description.contains("never put a display name in offering_id"));
+        assert!(policy_description.contains("exactly one authorized active Chat model"));
+        assert!(policy_description.contains("Omission applies any trusted user model requirement"));
+        assert!(policy_description.contains("cannot override a hard user requirement"));
+    }
+
+    #[test]
+    fn deferred_delegation_discovery_preserves_user_model_requirements() {
+        for surface in ["server", "local"] {
+            let mut schemas = all_tool_schemas();
+            project_action_schemas_for_surface(&mut schemas, surface);
+
+            for name in ["agent", "agent_fanout"] {
+                let schema = find_schema(&schemas, name).expect("delegation schema must exist");
+                let selection = crate::tool_search::tool_selection_contract(schema)
+                    .expect("delegation schema must have a discovery contract");
+                if surface == "server" {
+                    assert_eq!(
+                        selection["description_truncated"], false,
+                        "load-bearing Server guidance must fit deferred discovery for {name}"
+                    );
+                }
+                let summary = selection["description"]
+                    .as_str()
+                    .expect("delegation discovery summary");
+                assert!(
+                    summary
+                        .to_ascii_lowercase()
+                        .contains("user model requirements"),
+                    "{surface}/{name}: {summary}"
+                );
+                assert!(
+                    summary
+                        .to_ascii_lowercase()
+                        .contains("omitted requested_model_policy"),
+                    "{surface}/{name}: {summary}"
+                );
+                assert!(
+                    summary
+                        .to_ascii_lowercase()
+                        .contains("hard requirements cannot be overridden"),
+                    "{surface}/{name}: {summary}"
+                );
+                assert!(
+                    summary.contains("workspace config"),
+                    "{surface}/{name}: {summary}"
+                );
+                if name == "agent" {
+                    assert!(summary.contains("launched"), "{surface}: {summary}");
+                    assert!(summary.contains("parent continues"), "{surface}: {summary}");
+                    assert!(!summary.contains("foreground"), "{surface}: {summary}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn agent_observation_contract_survives_surface_and_action_projection() {
+        for surface in ["local", "server"] {
+            let mut schemas = all_tool_schemas();
+            project_action_schemas_for_surface(&mut schemas, surface);
+            let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
+            let description = agent["function"]["description"].as_str().unwrap();
+            assert!(description.contains("direct owned children"));
+            assert!(description.contains("execution deadlines"));
+            assert!(description.contains("tool permissions"));
+            assert!(description.contains("remains joined"));
+            let params = &agent["function"]["parameters"];
+            assert!(
+                params["properties"]["action"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("list"))
+            );
+            assert_eq!(params[PER_ACTION_REQUIRED_KEY]["list"], json!([]));
+            assert_eq!(
+                params[PER_ACTION_ALLOWED_KEY]["list"],
+                json!(["action", "agent_id"])
+            );
+            if surface == "server" {
+                let selection = crate::tool_search::tool_selection_contract(agent).unwrap();
+                assert!(
+                    selection["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("No unrelated tools")
+                );
+                assert!(
+                    selection["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("runtime waits")
+                );
+                let mut spawn = agent.clone();
+                project_action_discovery_summary(
+                    spawn["function"]["parameters"].as_object_mut().unwrap(),
+                    &["spawn".to_string()],
+                );
+                let selection = crate::tool_search::tool_selection_contract(&spawn).unwrap();
+                assert!(
+                    selection["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("No unrelated tools")
+                );
+            }
+
+            for (action, guidance) in [
+                (
+                    "list",
+                    "read-only in-memory status of direct owned children",
+                ),
+                ("get_result", "may briefly wait or reconcile durable state"),
+            ] {
+                let mut selected = agent.clone();
+                project_action_discovery_summary(
+                    selected["function"]["parameters"].as_object_mut().unwrap(),
+                    &[action.to_string()],
+                );
+                let selection = crate::tool_search::tool_selection_contract(&selected).unwrap();
+                assert_eq!(selection["description_truncated"], false);
+                let summary = selection["description"].as_str().unwrap();
+                assert!(summary.contains(guidance), "{surface}/{action}: {summary}");
+                assert!(!summary.contains("spawn:"), "{surface}/{action}: {summary}");
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -2662,6 +2900,25 @@ mod tests {
         );
         assert!(slot_props.get("slot_id").is_none());
         assert_eq!(
+            slot_props["requested_model_policy"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            slot_props["reasoning"]["oneOf"].as_array().unwrap().len(),
+            4
+        );
+        assert_eq!(
+            params["properties"]["defaults"]["properties"]["requested_model_policy"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(params["properties"]["defaults"]["properties"]["reasoning"].is_object());
+        assert_eq!(
             slot_props["description"]["maxLength"],
             crate::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS
         );
@@ -2686,7 +2943,9 @@ mod tests {
             .as_str()
             .expect("fanout description");
         assert!(
-            description.contains("only tools exposed in a child's own tool surface are usable")
+            description
+                .to_ascii_lowercase()
+                .contains("only tools exposed in a child's own tool surface are usable")
                 && description.contains("workspace provider is unavailable"),
             "fanout must distinguish inherited bindings from actual provider availability"
         );
@@ -2792,6 +3051,23 @@ mod tests {
             result_with_mailbox_name.issues,
             vec!["field(s) not allowed for action `get_result`: name"]
         );
+
+        validate_tool_arguments("agent", &json!({"action": "list"}))
+            .expect("list needs only its action");
+        validate_tool_arguments(
+            "agent",
+            &json!({"action": "list", "agent_id": "runtime-id"}),
+        )
+        .expect("list accepts an exact child identity filter");
+        for field in ["name", "prompt", "run_in_background"] {
+            let invalid = json!({"action": "list", field: "not-a-list-argument"});
+            assert!(
+                validate_tool_arguments("agent", &invalid).is_err(),
+                "list must reject {field}"
+            );
+        }
+        validate_tool_arguments("agent", &json!({"action": "get_result"}))
+            .expect_err("get_result still requires the returned child identity");
     }
 
     #[test]
@@ -3435,13 +3711,22 @@ mod tests {
         assert_eq!(properties["max_bytes"]["minimum"], 1);
         assert_eq!(properties["offset"]["minimum"], 0);
         assert_eq!(enum_values(&properties["format"]), vec!["text", "json"]);
-        let serialized_bytes = serde_json::to_vec(introspect)
-            .expect("introspect schema must serialize")
-            .len();
-        assert!(
-            serialized_bytes <= 3_000,
-            "introspect eager schema uses {serialized_bytes} bytes; keep the fixed-prefix contract at or below 3000 bytes"
-        );
+    }
+
+    #[test]
+    fn model_catalog_has_a_small_strict_discovery_contract() {
+        let schemas = all_tool_schemas();
+        let catalog = find_schema(&schemas, "model_catalog").expect("model catalog tool exists");
+        let params = &catalog["function"]["parameters"];
+        assert_eq!(params["additionalProperties"], false);
+        let properties = params["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 3);
+        assert_eq!(properties["limit"]["minimum"], 1);
+        assert_eq!(properties["limit"]["maximum"], 32);
+        assert!(properties.contains_key("cursor"));
+        assert!(properties.contains_key("catalog_revision"));
+        assert!(properties.get("facet").is_none());
+        assert!(properties.get("format").is_none());
     }
 
     #[test]

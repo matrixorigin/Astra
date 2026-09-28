@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 pub use astra_turn_types::ExplainAnalyzeEventV1;
-pub use astra_turn_types::ModelSelection;
+pub use astra_turn_types::{ModelSelection, ModelSelector, RequestedModelPolicy};
 
 /// `POST /chat/stream` body — superset of server `ChatRequest` plus optional edge fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -24,6 +24,8 @@ pub struct ChatStreamRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     pub model_selection: ModelSelection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model_policy: Option<RequestedModelPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interaction_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,6 +78,7 @@ impl ChatStreamRequest {
             session_id: None,
             agent_id: None,
             model_selection,
+            requested_model_policy: None,
             interaction_mode: None,
             context: None,
             execution_budget: None,
@@ -1129,6 +1132,11 @@ mod tests {
             model_selection: ModelSelection {
                 offering_id: "offer-m".into(),
             },
+            requested_model_policy: Some(RequestedModelPolicy::Fixed {
+                selector: ModelSelector::OfferingId {
+                    offering_id: "offer-m".into(),
+                },
+            }),
             interaction_mode: Some("auto".into()),
             context: None,
             execution_budget: Some(ExecutionBudget {
@@ -1557,7 +1565,6 @@ mod tests {
             "payload_kind": "text",
             "summary": "Please review the patch",
             "timestamp_ms": 42,
-            "requires_ack": true
         });
 
         let StreamEvent::AgentCommunication(event) = classify_stream_event(value).unwrap() else {

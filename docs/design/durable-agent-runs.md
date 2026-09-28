@@ -180,6 +180,14 @@ must not be interpreted as permission to use Server defaults. Credentials are
 not persisted in this descriptor.
 This record is not complete reconstruction authorization; restoring consumed
 rounds and automatically reconstructing the same run remain unimplemented.
+The initial `run_started` event also records effective generation controls:
+reasoning mode, an explicitly nullable first-round output cap, and whether
+the host preserves the effective control against runtime overrides. Root
+omission and explicit `Off` are distinct. Child retries compare these controls
+against the already loaded event and reject drift; execution uses the recorded
+controls. This is an admission snapshot, not authorization to replay an
+in-flight inference or
+to reset round position during recovery.
 Execution heavy checkpoints additionally carry versioned run-budget facts:
 producer run and owner generation, actual charged iterations, current grant,
 remaining iterations, and an explicitly present nullable effective hard limit.

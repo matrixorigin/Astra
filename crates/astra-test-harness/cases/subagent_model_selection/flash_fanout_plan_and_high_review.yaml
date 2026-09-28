@@ -1,0 +1,195 @@
+name: flash_fanout_plan_and_high_review
+description: |
+  Fixed-model control journey: the current DeepSeek Flash parent assigns a plan
+  slot and a different high-reasoning review slot. In this configured pairing,
+  GLM-5.2 is the plan slot and DeepSeek Flash is the high-reasoning review
+  slot: the GLM route exposes a thinking toggle, while the DeepSeek route
+  exposes an effort-capable thinking protocol. The test verifies the
+  requested controls, exact child-slot identity chain, and provider rounds.
+  It is a protocol smoke test; it does not claim that the review consumes the
+  plan result. A separate task-quality case must establish that data flow.
+prompt: |
+  Run exactly one foreground agent_fanout.start group with group_id
+  plan-and-high-review and target_count 2. Use two explore slots.
+  Slot 0 is the plan writer: set requested_model_policy to
+  {"mode":"fixed","selector":{"kind":"configured_name","model_name":"glm-5.2"}}
+  and ask it to reply exactly PLAN-CHILD-OK.
+  Slot 1 is the reviewer: set requested_model_policy to
+  {"mode":"fixed","selector":{"kind":"configured_name","model_name":"deepseek-v4-flash"}}
+  and set reasoning to {"mode":"adaptive","effort":"high"}; ask it
+  to reply exactly HIGH-REVIEW-CHILD-OK.
+  Do not omit, merge, or replace either model control. Do not retry, replace,
+  or launch a separate child. Wait for the group result, report both exact
+  replies and 2/2, and do not call Reflect or any other diagnostic tool.
+debug_log: true
+capability: delegation
+timeout_seconds: 300
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent_fanout
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: start
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /target_count
+    equals: 2
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /slots/0/requested_model_policy/selector/model_name
+    equals: glm-5.2
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /slots/1/requested_model_policy/selector/model_name
+    equals: deepseek-v4-flash
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /slots/1/reasoning/mode
+    equals: adaptive
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /slots/1/reasoning/effort
+    equals: high
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /fanout/accepted
+    equals: 2
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /fanout/terminal
+    equals: 2
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/fanout_slot/slot_index
+      equals: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/fanout_slot/slot_index
+      equals: 1
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: glm-5.2
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: deepseek-v4-flash
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    max: 1
+    json_match:
+      path: /payload/model
+      equals: glm-5.2
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+        related_match:
+          path: /metadata/fanout_slot/slot_index
+          equals: 0
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    max: 1
+    json_match:
+      path: /payload/model
+      equals: deepseek-v4-flash
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+        related_match:
+          path: /metadata/fanout_slot/slot_index
+          equals: 1
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    max: 1
+    json_match:
+      path: /payload/model
+      equals: glm-5.2
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+        related_match:
+          path: /metadata/model_configuration/prepared_selection/model_name
+          equals: glm-5.2
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    max: 1
+    json_match:
+      path: /payload/model
+      equals: deepseek-v4-flash
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+        related_match:
+          path: /metadata/model_configuration/prepared_selection/model_name
+          equals: deepseek-v4-flash
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    max: 1
+    json_match:
+      path: /payload/model
+      equals: deepseek-v4-flash
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+        related_match:
+          path: /metadata/model_configuration/thinking/mode
+          equals: adaptive
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    max: 1
+    json_match:
+      path: /payload/model
+      equals: deepseek-v4-flash
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+        related_match:
+          path: /metadata/model_configuration/thinking/effort
+          equals: high
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /results/0/result/result
+    equals: PLAN-CHILD-OK
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /results/1/result/result
+    equals: HIGH-REVIEW-CHILD-OK
+  - type: text_contains
+    needle: PLAN-CHILD-OK
+  - type: text_contains
+    needle: HIGH-REVIEW-CHILD-OK
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

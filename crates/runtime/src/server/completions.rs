@@ -492,6 +492,7 @@ mod tests {
             Ok(ResolvedModelOffering {
                 offering_id,
                 model: ResolvedActiveLlmModel {
+                    price_snapshot: None,
                     model_name: "catalog-display-model".into(),
                     wire_model_name: Some("provider-wire-model".into()),
                     api_key: "provider-secret".into(),
@@ -547,6 +548,7 @@ mod tests {
             turn: 1,
             round: 0,
             logical_attempt: 0,
+            command_intent_id: None,
             model_selection: Some(astra_turn_types::ModelSelection {
                 offering_id: offering_id.to_string(),
             }),

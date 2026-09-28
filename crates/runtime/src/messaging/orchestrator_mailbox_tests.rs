@@ -482,10 +482,11 @@ mod tests {
         let (executor, barrier, results) = DelayedProgressExecutor::new(2);
         let h = setup_harness(Arc::new(executor));
 
-        // The engine will auto-register the parent. We need to unregister it
-        // after the engine starts but before agents send progress.
+        // Keep the original cleanup authority instead of looking up whichever
+        // subscription occupies this address after the engine starts.
         let parent_addr = AgentAddress::new("parent-run", "orch");
         let router_clone = h.router.clone();
+        let parent_mailbox = router_clone.register(parent_addr, None).await.unwrap();
 
         let request = make_request(
             CoordinationPattern::FanOut {
@@ -507,7 +508,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         // Forcibly unregister the parent while agents are waiting.
-        let _ = router_clone.unregister(&parent_addr).await;
+        parent_mailbox.unregister().await.unwrap();
 
         // Release agents — they will now try to send progress.
         barrier.wait().await;
@@ -884,12 +885,11 @@ mod tests {
 
         // First registration succeeds.
         let addr = AgentAddress::new("run-1", "agent-1");
-        let result = router.register_if_absent(addr.clone(), None).await;
-        assert!(result.is_ok());
-        assert!(
-            result.unwrap().is_some(),
-            "first registration should return Some"
-        );
+        let _first_mailbox = router
+            .register_if_absent(addr.clone(), None)
+            .await
+            .unwrap()
+            .expect("first registration should return Some");
 
         // Second registration with same run_id returns None (no clobber).
         let addr2 = AgentAddress::new("run-1", "agent-1");
