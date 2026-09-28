@@ -223,6 +223,14 @@ pub(crate) fn run_start_context_from_request(
             let mut fields = execution_bindings
                 .map(binding_snapshot_fields)
                 .unwrap_or_default();
+            if let astra_services::runs::ModelSelectionMode::Auto(policy) =
+                &request.model_selection_mode
+            {
+                fields.insert(
+                    "model_routing_policy".to_string(),
+                    serde_json::to_value(policy).expect("serializable routing policy"),
+                );
+            }
             if let Some(generation) = request.execution_binding_generation {
                 fields.insert(
                     "execution_binding_generation".to_string(),

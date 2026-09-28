@@ -49,7 +49,7 @@ help:
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
 	@echo "  make test-offline       - Rust workspace + e2e-hooks + @astra/sdk (30s per case; default 2 nextest threads, override: NEXTEST_OFFLINE_THREADS=<n> / NEXTEST_OFFLINE_PROFILE=<profile>)"
 	@echo "  make validate-capability-matrix - Verify capability system-test references resolve"
-	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see .config/nextest.toml)"
+	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (60s per case via profile=strict-online; see .config/nextest.toml)"
 	@echo "  make test-memoria-databases - Verify Memoria database bootstrap contract"
 	@echo "  make test-stack-bootstrap - Verify stack startup bootstraps Memoria before API"
 	@echo "  make test-memoria-online-contract - Real Memoria missing-ID/circuit-recovery contract (explicit)"

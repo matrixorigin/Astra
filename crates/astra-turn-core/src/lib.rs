@@ -236,3 +236,4 @@ pub use sse::stream_host as sse_stream_host;
 
 // Re-exports: stop_hooks_* → stop_hooks::*
 pub use stop_hooks::stop_hooks_yaml;
+pub mod model_routing;

@@ -40,6 +40,12 @@ Model access and inference defines how Astra presents model capability as a prod
 
 ## Ownership
 
+Opt-in Auto chat routing uses the existing authenticated Offering admission
+for its baseline and selected model. It cannot authorize a new access source,
+change billing ownership, or replace a provider-bound model with a Server
+credential. The currently implemented scope and selection policy are described
+in [model routing](model-routing.md#deterministic-auto-selection-stage-3).
+
 This document owns:
 
 - the user-facing Model Access product model;

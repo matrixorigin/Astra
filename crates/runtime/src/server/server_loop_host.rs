@@ -26,6 +26,8 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+mod model_routing;
+
 use crate::orchestration::{AgentProgressEvent, CancellationOrigin, ProgressEventType};
 use crate::server::run::lifecycle::run_state::TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD;
 use crate::server::tool_admission::{
@@ -3904,6 +3906,7 @@ impl ExplainAnalyzeNode {
 
 pub struct ServerAgenticLoopHost {
     model_service: Option<Arc<dyn astra_services::ModelService>>,
+    model_routing: Option<model_routing::AutoRoutingContext>,
     execution_handoff: Option<ExecutionHandoffContext>,
     // ── LLM resolution ──
     matrixone: MatrixOneSettings,
@@ -6313,6 +6316,7 @@ impl ServerAgenticLoopHostBuilder {
 
         ServerAgenticLoopHost {
             model_service: self.model_service,
+            model_routing: None,
             execution_handoff: None,
             matrixone: self.matrixone,
             encryptor: self.encryptor,
@@ -8993,13 +8997,35 @@ impl ServerAgenticLoopHost {
         else {
             return;
         };
+        self.project_work_admission_semantics(state, true);
+        crate::turn::agentic_loop::host::complete_turn_phase_at(
+            self,
+            state,
+            TurnPhaseReceipt {
+                started_at,
+                finished_at,
+                phase: TurnPhaseKind::SemanticAdmission,
+                round_index,
+                attempt_index: 0,
+                outcome,
+                duration_ms: 0,
+            },
+            format!("work_admission_{round_index}"),
+        );
+    }
+
+    fn project_work_admission_semantics(
+        &mut self,
+        state: &mut AgenticLoopState,
+        record_feedback: bool,
+    ) {
         if let Some(decision) = self.pending_work_admission.as_ref() {
             // The boundary classifier is the single semantic owner for both
             // Work and workspace effects. Keep its minimal typed projection
             // on loop state so delegation and completion policy inherit the
             // same authority instead of running disconnected classifiers.
             let boundary_intent = decision.turn_intent();
-            if boundary_intent.assessment.is_some() {
+            if record_feedback && boundary_intent.assessment.is_some() {
                 crate::turn::agentic_loop::lifecycle::record_current_user_turn_semantics(
                     state,
                     &boundary_intent,
@@ -9073,20 +9099,6 @@ impl ServerAgenticLoopHost {
                 executor.set_workspace_mutation_intent(intent.workspace_mutation);
             }
         }
-        crate::turn::agentic_loop::host::complete_turn_phase_at(
-            self,
-            state,
-            TurnPhaseReceipt {
-                started_at,
-                finished_at,
-                phase: TurnPhaseKind::SemanticAdmission,
-                round_index,
-                attempt_index: 0,
-                outcome,
-                duration_ms: 0,
-            },
-            format!("work_admission_{round_index}"),
-        );
     }
 
     async fn abort_pending_work_admission(&mut self) {
@@ -10903,6 +10915,11 @@ impl ServerAgenticLoopHost {
     }
 
     async fn revalidate_catalog_execution(&mut self) -> Result<(), String> {
+        if let Some(execution) = self.revalidate_auto_execution().await? {
+            self.admitted_model_execution = Some(execution);
+            self.clear_resolved_llm_config();
+            return Ok(());
+        }
         let Some(admitted) = self.admitted_model_execution.as_ref() else {
             return Ok(());
         };
@@ -18032,6 +18049,12 @@ fn server_context_manifest_identity(
 
 #[async_trait]
 impl AgenticLoopHost for ServerAgenticLoopHost {
+    async fn prepare_model_selection(
+        &mut self,
+        state: &mut AgenticLoopState,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        self.prepare_auto_model_selection(state).await
+    }
     fn apply_permission_mode(
         &mut self,
         mode: astra_turn_types::PermissionMode,
@@ -18749,6 +18772,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         state: &AgenticLoopState,
     ) -> crate::turn::agentic_loop::host::TurnIntentJudgeOutcome {
+        let restored_routing = match self.restore_model_routing(state).await {
+            Ok(restored) => restored,
+            Err(_) => {
+                // Model selection replays or propagates the same read failure
+                // in prepare_model_selection before any primary provider I/O.
+                return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable;
+            }
+        };
         if let Err(error) = self.hydrate_pending_work_establishment(state).await {
             tracing::error!(
                 target: "astra::turn_intent",
@@ -18762,6 +18793,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
         if self.pending_work_establishment.is_some() {
             return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault;
+        }
+        if restored_routing && self.pending_work_admission.is_some() {
+            // The exact saved Work decision is projected by model preparation.
+            return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable;
         }
         if self.turn_intent_policy == TurnIntentExecutionPolicy::Auto
             && self.work_lifecycle_is_active(state)
@@ -24942,10 +24977,10 @@ mod tests {
         assert_eq!(approval_waits[0]["outcome"], "resolved");
     }
 
-    struct SequencedSummaryClient {
-        provenance: astra_turn_types::JudgmentResponseProvenance,
-        responses: std::sync::Mutex<std::collections::VecDeque<String>>,
-        requests: Arc<std::sync::Mutex<Vec<Vec<Value>>>>,
+    pub(super) struct SequencedSummaryClient {
+        pub(super) provenance: astra_turn_types::JudgmentResponseProvenance,
+        pub(super) responses: std::sync::Mutex<std::collections::VecDeque<String>>,
+        pub(super) requests: Arc<std::sync::Mutex<Vec<Vec<Value>>>>,
     }
 
     struct UsageSequencedSummaryClient {
@@ -25202,7 +25237,7 @@ mod tests {
         }
     }
 
-    fn classification_response(required: bool) -> String {
+    pub(super) fn classification_response(required: bool) -> String {
         let request = astra_services::work_admission_classification_request(&Default::default());
         let mut answers = serde_json::Map::new();
         for key in request.questions.keys() {
@@ -27762,19 +27797,19 @@ mod tests {
         assert_eq!(entries.len(), schemas.len());
     }
 
-    struct EnvVarGuard {
+    pub(super) struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
     }
 
     impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
+        pub(super) fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var_os(key);
             unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
 
-        fn remove(key: &'static str) -> Self {
+        pub(super) fn remove(key: &'static str) -> Self {
             let previous = std::env::var_os(key);
             unsafe { std::env::remove_var(key) };
             Self { key, previous }
@@ -27792,11 +27827,11 @@ mod tests {
         }
     }
 
-    fn mock_matrixone() -> MatrixOneSettings {
+    pub(super) fn mock_matrixone() -> MatrixOneSettings {
         MatrixOneSettings::mock()
     }
 
-    fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
+    pub(super) fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
         // Use a valid Fernet key for testing
         Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
     }
@@ -42319,7 +42354,7 @@ mod tests {
         }
     }
 
-    fn create_durable_execution_test_state(session_id: &str) -> AgenticLoopState {
+    pub(super) fn create_durable_execution_test_state(session_id: &str) -> AgenticLoopState {
         let mut state = create_test_state();
         state.current_session_id = Some(session_id.to_string());
         state.current_run_id = Some(format!("test-run-{session_id}"));
@@ -42365,7 +42400,7 @@ mod tests {
         response: Value,
     }
 
-    async fn spawn_gateway(
+    pub(super) async fn spawn_gateway(
         status: axum::http::StatusCode,
         response: Value,
     ) -> (
@@ -46215,7 +46250,7 @@ mod tests {
         assert!(resolved.request_timeout.is_none());
     }
 
-    fn admitted_test_offering() -> astra_services::ResolvedModelOffering {
+    pub(super) fn admitted_test_offering() -> astra_services::ResolvedModelOffering {
         astra_services::ResolvedModelOffering {
             offering_id: "offer-primary".to_string(),
             model: astra_services::ResolvedActiveLlmModel {

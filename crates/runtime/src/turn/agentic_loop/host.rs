@@ -717,12 +717,17 @@ pub trait AgenticLoopHost: Send {
         self.handle_admitted_tool_calls(state, &tool_calls).await
     }
 
-    /// Optional semantic judge for the current user turn.
-    ///
-    /// The default implementation returns no semantic intent. Hosts that have
-    /// an LLM judge or another explicit structured signal should override this;
-    /// runtime defaults must not infer natural-language intent from keyword
-    /// lists.
+    /// Finalize an opted-in model selection before model-dependent context
+    /// preparation. Delegating hosts leave authority with the Server.
+    async fn prepare_model_selection(
+        &mut self,
+        _state: &mut AgenticLoopState,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        Ok(())
+    }
+
+    /// Optional semantic judge for the current user turn. Defaults must not
+    /// infer natural-language intent from keyword lists.
     async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> TurnIntentJudgeOutcome {
         TurnIntentJudgeOutcome::Unavailable
     }

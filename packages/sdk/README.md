@@ -43,6 +43,12 @@ const run = await client.createRun({
 
 ### Runs, delegation, and session observability
 
+For HTTP chat streaming, `modelSelection: "auto"` opts into the Server's
+configured model-routing policy. Explicit `{ offeringId: "..." }` selection
+keeps its existing behavior. Auto requires a qualified Server-catalog pair;
+provider model gateways and WebSocket chat continue to use explicit Offerings.
+See [model routing](../../docs/design/model-routing.md#deterministic-auto-selection-stage-3).
+
 ```typescript
 // List durable runs (GET /runs)
 const firstPage = await client.listRuns({ limit: 20 });

@@ -20,6 +20,10 @@ use std::path::PathBuf;
 /// Complete runtime configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
+    /// Opt-in Server Auto routing. Pair must be qualified by the operator;
+    /// absence disables Auto. This never grants access to either Offering.
+    #[serde(default)]
+    pub model_routing: Option<astra_turn_types::model_routing::AutoModelRoutingPolicy>,
     /// Configuration version for compatibility checking.
     #[serde(default = "default_config_version")]
     pub version: String,
@@ -411,6 +415,7 @@ fn default_config_version() -> String {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            model_routing: None,
             version: default_config_version(),
             compression: CompressionConfig::default(),
             memory: MemoryConfig::default(),
@@ -2149,6 +2154,7 @@ impl RuntimeConfig {
     /// Merge another config into this one (other takes precedence).
     pub fn merge(mut self, other: RuntimeConfig) -> Self {
         let RuntimeConfig {
+            model_routing,
             version,
             compression,
             memory,
@@ -2169,6 +2175,10 @@ impl RuntimeConfig {
             budget_policy,
             explain,
         } = other;
+
+        if model_routing.is_some() {
+            self.model_routing = model_routing;
+        }
 
         merge_if_non_default(&mut self.version, version, default_config_version());
 
@@ -2988,8 +2998,30 @@ mod tests {
     }
 
     #[test]
+    fn auto_model_routing_config_is_opt_in_and_survives_overlays() {
+        assert!(RuntimeConfig::default().model_routing.is_none());
+        let configured: RuntimeConfig = toml::from_str(
+            r#"
+            [model_routing]
+            revision = "qualified-v1"
+            economy_offering_id = "economy"
+            strong_offering_id = "strong"
+        "#,
+        )
+        .unwrap();
+        let expected = configured.model_routing.clone();
+        let merged = RuntimeConfig::default()
+            .merge(configured)
+            .merge(RuntimeConfig::default());
+        assert_eq!(merged.model_routing, expected);
+        let restored: RuntimeConfig = toml::from_str(&merged.to_toml().unwrap()).unwrap();
+        assert_eq!(restored.model_routing, expected);
+    }
+
+    #[test]
     fn test_merge_applies_non_default_fields_across_sections() {
         let merged = RuntimeConfig::default().merge(RuntimeConfig {
+            model_routing: None,
             version: "2.0".to_string(),
             compression: CompressionConfig {
                 max_history_tokens: 12345,

@@ -688,3 +688,13 @@ and declaration/execution/delivery states before allocating space to large raw
 result previews. Snapshot and upsert remain distinct; omitted task counts are
 explicit. The excerpt copies typed receipt facts and never infers cancellation
 or completion from the assistant's answer.
+
+## Offline router training
+
+`astra-test router-source-hashes --input evidence.json` computes review digests.
+`astra-test router-offline --input evidence.json --authorization authorization.json
+--output new-artifact-directory` validates approved structural evidence and
+builds an offline-only candidate plus dataset and comparison report. These
+commands bypass live suite/preflight/provider execution. See the
+[offline router guide](../../docs/guides/model-router-offline.md) for the evidence
+contract, synthetic fixture, split controls, and revocation requirements.

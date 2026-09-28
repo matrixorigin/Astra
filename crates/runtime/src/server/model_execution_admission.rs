@@ -10,6 +10,85 @@ use axum::{Json, http::StatusCode};
 
 use crate::error_response_coded;
 
+/// Resolve the baseline before any model-dependent prompt construction.
+pub(crate) async fn admit_auto_model_request(
+    service: &Arc<dyn ModelService>,
+    user_id: &str,
+    mut request: astra_services::runs::ChatRequestData,
+    policy: Option<astra_turn_types::model_routing::AutoModelRoutingPolicy>,
+) -> Result<astra_services::runs::ChatRequestData, (StatusCode, Json<ErrorResponse>)> {
+    use astra_services::runs::{ModelSelectionMode, TurnIntentExecutionPolicy};
+    if request.provider_runtime_authorized
+        || request
+            .capability_descriptors
+            .as_ref()
+            .is_some_and(|descriptors| descriptors.model_gateway.is_some())
+        || request.model_selection_mode != ModelSelectionMode::ExplicitOffering
+        || request.model_selection.is_some()
+        || request.resolved_model_selection.is_some()
+        || request.admitted_model_execution.is_some()
+        || request.model.is_some()
+        || request.work_binding.is_some()
+        || request.execution_policy.turn_intent != TurnIntentExecutionPolicy::Auto
+    {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "Auto requires a primary Server-catalog turn with no explicit model or provider model binding",
+            "model_routing_unsupported",
+        ));
+    }
+    let policy = policy.ok_or_else(|| {
+        error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Auto model routing has no configured policy",
+            "model_routing_unavailable",
+        )
+    })?;
+    if policy.revision.trim().is_empty()
+        || policy.revision.len() > 128
+        || policy.revision.trim() != policy.revision
+        || policy.revision.chars().any(char::is_control)
+        || policy.economy_offering_id == policy.strong_offering_id
+        || astra_services::validate_model_offering_id(&policy.economy_offering_id).is_err()
+        || astra_services::validate_model_offering_id(&policy.strong_offering_id).is_err()
+    {
+        return Err(error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Auto model routing policy is invalid",
+            "model_routing_unavailable",
+        ));
+    }
+    let selection = ModelSelection {
+        offering_id: policy.strong_offering_id.clone(),
+    };
+    let admitted = admit_model_execution(
+        service,
+        astra_core::model_wire::purpose::ModelRequestPurpose::Chat,
+        user_id,
+        &selection,
+        None,
+        None,
+        None,
+    )
+    .await?;
+    if admitted.execution_placement != astra_services::ModelExecutionPlacement::Server {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "Auto requires Server-catalog model execution",
+            "model_routing_unsupported",
+        ));
+    }
+    request.model = Some(admitted.model_name.clone());
+    request.resolved_model_selection = Some(ResolvedModelSelection {
+        offering_id: admitted.offering_id.clone(),
+        model_name: admitted.model_name.clone(),
+    });
+    request.model_selection = Some(selection);
+    request.admitted_model_execution = Some(admitted);
+    request.model_selection_mode = ModelSelectionMode::Auto(policy);
+    Ok(request)
+}
+
 /// Admit one Offering into the single execution-material contract consumed by
 /// every agent and inference adapter.
 ///
@@ -402,3 +481,57 @@ mod tests {
         );
     }
 }
+
+pub(crate) fn model_execution_contract_root(execution: &AdmittedModelExecution) -> String {
+    use sha2::{Digest, Sha256};
+    let contract = serde_json::json!({
+        "offering": execution.offering_id, "model": execution.model_name,
+        "wire_model": execution.wire_model_name, "provider": execution.provider,
+        "access": execution.access_kind, "placement": execution.execution_placement,
+        "context": execution.context_window, "output": execution.max_completion_tokens,
+        "thinking": execution.thinking_capability, "protocol": execution.thinking_protocol,
+        "temperature": execution.fixed_temperature, "cache": execution.cache_capability,
+        "parameters": execution.request_body_overrides,
+        "endpoint": execution.completions_url_override.as_deref().unwrap_or(&execution.base_url),
+        "headers": execution.header_overrides.iter().filter(|(key, _)| !matches!(key.to_ascii_lowercase().as_str(), "authorization" | "x-api-key" | "api-key")).collect::<std::collections::BTreeMap<_, _>>(),
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(astra_core::canonical_json_string(&contract).as_bytes())
+    )
+}
+
+/// Process-local executors may have been built before Auto committed. Resolve
+/// inheritance from the same immutable run fact rather than their old baseline.
+pub(crate) async fn inherit_routed_execution<F, Fut>(
+    engine: &crate::server::run::engine::RunEngine,
+    user_id: &str,
+    session_id: &str,
+    parent_run_id: &str,
+    inherited: Option<&AdmittedModelExecution>,
+    resolve: F,
+) -> Result<Option<AdmittedModelExecution>, String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<AdmittedModelExecution, String>>,
+{
+    use astra_services::model_routing::{DECISION_KEY, EVENT_TYPE, ModelRoutingDecision};
+    let Some(event) = engine
+        .load_run_event_by_idempotency_key(user_id, parent_run_id, EVENT_TYPE, DECISION_KEY)
+        .await?
+    else {
+        return Ok(inherited.cloned());
+    };
+    let decision: ModelRoutingDecision = serde_json::from_value(event["data"].clone())
+        .map_err(|_| "Invalid durable Auto routing decision".to_string())?;
+    decision.validate_identity(parent_run_id, session_id)?;
+    let execution = resolve(decision.selected_offering_id).await?;
+    if model_execution_contract_root(&execution) != decision.selected_contract_root {
+        return Err("The inherited Auto model contract changed; start a new turn".into());
+    }
+    Ok(Some(execution))
+}
+
+#[cfg(test)]
+#[path = "model_execution_admission_test_support.rs"]
+pub(crate) mod inheritance_test_support;

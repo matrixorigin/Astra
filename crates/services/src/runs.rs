@@ -526,6 +526,11 @@ impl DurableExecutionRestrictions {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionPolicyRequest {
+    #[serde(
+        default,
+        skip_serializing_if = "astra_turn_types::model_routing::ModelRoutingMode::is_explicit"
+    )]
+    pub model_routing: astra_turn_types::model_routing::ModelRoutingMode,
     #[serde(default)]
     pub turn_intent: TurnIntentExecutionPolicy,
     #[serde(default)]
@@ -903,14 +908,16 @@ pub enum RunStartIdempotencyKind {
 
 /// Selects who owns model choice for one internal run-start request.
 ///
-/// Public chat transports always use [`Self::ExplicitOffering`]. Product
-/// boundaries such as Work may instead ask the Server to apply its existing
-/// default Offering policy without exposing model routing in their wire DTO.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Public chat transports enter with [`Self::ExplicitOffering`]; opted-in Auto
+/// admission installs a Server-owned policy snapshot. Product boundaries such
+/// as Work may instead request the existing Server-default Offering policy.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ModelSelectionMode {
     #[default]
     ExplicitOffering,
     ServerDefault,
+    /// Server-admitted policy snapshot; never accepted as client authority.
+    Auto(astra_turn_types::model_routing::AutoModelRoutingPolicy),
 }
 
 /// Server-derived exact identity for a logical run start.
@@ -1587,7 +1594,8 @@ pub struct DurableRunRecord {
     /// Effective Offering selected for this run. This is an authorization
     /// identity, not a display model name or provider route.
     pub model_offering_id: Option<String>,
-    /// Concrete model identity resolved when the run was admitted.
+    /// Concrete model identity currently pinned for the run. Auto finalization
+    /// updates this together with its immutable selection event before dispatch.
     pub resolved_model_name: Option<String>,
     pub runtime_profile: Option<String>,
     /// Canonical request fingerprint bound atomically to a caller-derived
@@ -5305,7 +5313,8 @@ pub trait RunStateStore: Send + Sync {
         Ok(())
     }
 
-    /// Append immutable facts without rewriting lifecycle state, but only
+    /// Append immutable facts and their model-selection identity without rewriting
+    /// lifecycle state, but only
     /// while the exact execution generation and one of the expected statuses
     /// still match. This is the late-drain primitive for accounting produced
     /// before a control-plane pause/cancel stopped owner lease renewal.
@@ -9070,6 +9079,11 @@ impl RunStateStore for InMemoryRunStateStore {
                     continue;
                 }
                 new_events.push(event.clone());
+            }
+            let selection = crate::model_routing::selection_for_new_events(run, &new_events)?;
+            if let Some(selection) = selection {
+                run.model_offering_id = Some(selection.selected_offering_id);
+                run.resolved_model_name = Some(selection.selected_model);
             }
             if !new_events.is_empty() {
                 run.events.extend(new_events);
@@ -18986,6 +19000,7 @@ impl RunStateStore for DatabaseRunStateStore {
             return Ok(true);
         }
 
+        let selection = crate::model_routing::selection_for_new_events(&run, &events_to_commit)?;
         let mut event_rows = Vec::with_capacity(events_to_commit.len());
         for (offset, event) in events_to_commit.iter().enumerate() {
             event_rows.push(
@@ -19005,6 +19020,12 @@ impl RunStateStore for DatabaseRunStateStore {
         let mut update =
             sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET last_event_idx = ");
         update.push_bind(next_last_event_idx);
+        if let Some(selection) = &selection {
+            update.push(", model_offering_id = ");
+            update.push_bind(&selection.selected_offering_id);
+            update.push(", resolved_model_name = ");
+            update.push_bind(&selection.selected_model);
+        }
         update.push(", updated_at = NOW(6) WHERE user_id = ");
         update.push_bind(user_id);
         update.push(" AND session_id = ");
@@ -26488,6 +26509,11 @@ mod tests {
 
     #[test]
     fn execution_policy_defaults_to_semantic_work_admission() {
+        assert_eq!(
+            serde_json::to_value(ExecutionPolicyRequest::default()).unwrap(),
+            serde_json::json!({"turn_intent":"auto", "skill_auto_route":"auto"}),
+            "default request fingerprints must remain stable across an Auto rollout"
+        );
         assert_eq!(
             ExecutionPolicyRequest::default().turn_intent,
             TurnIntentExecutionPolicy::Auto

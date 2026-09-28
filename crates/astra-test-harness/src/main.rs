@@ -27,6 +27,8 @@ use astra_test_harness::suite::{
     about = "Declarative CLI test harness for astra: cases × models × agent judger."
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Option<astra_test_harness::router_offline::RouterCommand>,
     /// Directory containing case YAML files.
     /// Optional when --live-dashboard is used (auto-detected).
     #[arg(long, value_name = "DIR")]
@@ -324,12 +326,16 @@ fn main() -> Result<()> {
     {
         return Ok(());
     }
+    let mut args = Args::parse();
+    if let Some(command) = args.command.take() {
+        return command.run();
+    }
     initialize_execution_environment()?;
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()?
-        .block_on(run())
+        .block_on(run(args))
 }
 
 fn initialize_execution_environment() -> Result<()> {
@@ -363,8 +369,7 @@ async fn wait_for_suite_interrupt() -> std::io::Result<()> {
     tokio::signal::ctrl_c().await
 }
 
-async fn run() -> Result<()> {
-    let args = Args::parse();
+async fn run(args: Args) -> Result<()> {
     if args.skip_preflight && std::env::var_os("ASTRA_EXPECTED_BUILD_GIT_SHA").is_some() {
         anyhow::bail!("--skip-preflight cannot bypass ASTRA_EXPECTED_BUILD_GIT_SHA verification");
     }
