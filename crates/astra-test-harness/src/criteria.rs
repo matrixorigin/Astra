@@ -34,9 +34,9 @@ pub struct SessionEventJsonMatch {
     /// this pointer (for example, a child `run_id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique_by: Option<String>,
-    /// Require the matched event's top-level `run_id` to equal an identity
-    /// carried by at least one event of this type. This links provider step
-    /// events to their durable `agent_spawned` child-run record.
+    /// Require the matched event's `run_id` (top-level for step events,
+    /// `metadata.run_id` for lifecycle events) to equal an identity carried
+    /// by an event of this type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub same_run_as: Option<SessionEventRunIdMatch>,
     /// Require the unique event IDs to equal IDs in a successful tool result
@@ -2102,7 +2102,11 @@ fn evaluate_one_with_primary_cache(
                     else {
                         return true;
                     };
-                    let Some(run_id) = event.raw.get("run_id").and_then(serde_json::Value::as_str)
+                    let Some(run_id) = event
+                        .raw
+                        .get("run_id")
+                        .or_else(|| event.raw.pointer("/metadata/run_id"))
+                        .and_then(serde_json::Value::as_str)
                     else {
                         return false;
                     };
@@ -6273,6 +6277,52 @@ mod tests {
             !result[0].passed,
             "a parent call must not satisfy child evidence"
         );
+    }
+
+    #[test]
+    fn session_event_count_binds_lifecycle_metadata_run_without_spoofing_step_run() {
+        let criterion = Criterion::SessionEventCount {
+            event_type: "agent_terminated".into(),
+            min: 1,
+            max: Some(1),
+            json_match: Some(SessionEventJsonMatch {
+                path: "/metadata/status".into(),
+                equals: serde_json::json!("completed"),
+                unique_by: None,
+                same_run_as: Some(SessionEventRunIdMatch {
+                    event_type: "agent_spawned".into(),
+                    run_id_path: "/metadata/run_id".into(),
+                    related_match: None,
+                }),
+                result_ids_match: None,
+            }),
+            optional: false,
+        };
+        let check = |termination: serde_json::Value| {
+            let session = mk_session(&[
+                (
+                    "agent_spawned",
+                    serde_json::json!({"metadata": {"run_id": "child-run"}}),
+                ),
+                ("agent_terminated", termination),
+            ]);
+            evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome_with_tools(&[]),
+                Some(&session),
+            )[0]
+            .passed
+        };
+        assert!(check(serde_json::json!({"metadata": {
+            "run_id": "child-run", "status": "completed"
+        }})));
+        assert!(!check(serde_json::json!({"metadata": {
+            "run_id": "other-run", "status": "completed"
+        }})));
+        assert!(!check(serde_json::json!({
+            "run_id": "other-run",
+            "metadata": {"run_id": "child-run", "status": "completed"}
+        })));
     }
 
     #[test]

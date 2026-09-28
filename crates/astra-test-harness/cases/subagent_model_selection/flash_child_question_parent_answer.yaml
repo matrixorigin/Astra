@@ -3,11 +3,14 @@ description: |
   A GLM child asks its parent a question, waits for the correlated answer,
   and only then completes its work.
 prompt: |
-  Ask a GLM 5.2 subagent to produce a one-line handoff marker. It must first
-  ask you which format to use, wait for your answer, and then produce exactly
-  ASTRA-CHILD-ANSWERED-JSON if you answer JSON. Do not tell it the format in
-  its initial task. When it asks, answer JSON, continue your own brief
-  independent analysis, and report the child's final marker.
+  Ask a GLM 5.2 subagent to produce a one-line handoff marker. In its initial
+  task, give it both possible outputs: JSON means exactly
+  ASTRA-CHILD-ANSWERED-JSON, while TEXT means exactly
+  ASTRA-CHILD-ANSWERED-TEXT. Do not choose the format for it yet. It must ask
+  you which format to use and wait for your answer before producing its final
+  line. When it asks, answer JSON. While the child runs, independently check
+  that the two outputs differ. Report the child's actual final line and your
+  independent check; do not replace an unobserved child result with your own.
 debug_log: true
 capability: delegation
 timeout_seconds: 90
