@@ -2115,10 +2115,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "model_catalog",
-                "description": "Read the current user's authorized active Chat models. Returns one complete JSON page with exact offering/name/provider/access identities, capabilities, nullable prices, revision and continuation cursor. Use this when the user asks which delegated models are available; never inspect workspace configuration for model identity. Discovery is not execution permission: delegation revalidates the selected Offering. Omit cursor and catalog_revision on the first page; send both unchanged when following next_cursor.",
+                "description": "Read the current user's authorized active Chat models. Returns one complete JSON page with exact offering/name/provider/access identities, capabilities, nullable prices, revision and continuation cursor. Call only when the user asks which delegated models are available, compares models, or leaves model identity ambiguous; never call this merely to spawn a user-named model—runtime resolves and revalidates that requirement. Never inspect workspace configuration for model identity. Omit cursor and catalog_revision on the first page; send both unchanged when following next_cursor.",
                 "parameters": {
                     "type": "object",
-                    "x-astra-discovery-summary": "Authorized Chat model catalog, JSON only. limit defaults 16; follow next_cursor with catalog_revision. No workspace config reads. Discovery is not execution admission.",
+                    "x-astra-discovery-summary": "Authorized Chat model availability/comparison only; never a user-named spawn prerequisite. JSON only. limit defaults 16; follow next_cursor with catalog_revision. No workspace config reads. Discovery is not execution admission.",
                     "properties": {
                         "limit": {"type": "integer", "minimum": 1, "maximum": 32, "default": 16},
                         "cursor": {"type": "string", "minLength": 1, "maxLength": 2048},
