@@ -372,7 +372,7 @@ impl ToolSurface {
 /// prompt-surface optimization rather than an executor capability reduction.
 /// Keeping rare, safety-specialized fields off the default prefix prevents a
 /// single broad tool from consuming the budget meant for every first request.
-fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
+pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
     let Some(function) = schema.get_mut("function").and_then(Value::as_object_mut) else {
         return schema;
     };
@@ -413,7 +413,11 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
         ),
         "ask_user" => (
             &["context", "questions"][..],
-            "Ask; choices/headers/multi-select: tool_search select:ask_user.",
+            "Ask; advanced choices: tool_search select:ask_user.",
+        ),
+        "agent" => (
+            &["action", "description", "prompt"][..],
+            "Spawn child: action=spawn; description=label; prompt=task. Runtime waits at final.",
         ),
         "introspect" => (
             &[
@@ -430,7 +434,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "offset",
                 "max_bytes",
             ][..],
-            "Runtime/Explain: explain={target:previous} artifact=handle; never both. Chat models: select:model_catalog.",
+            "Explain: question=label; explain={target:previous} artifact=handle; never both. Models: select:model_catalog.",
         ),
         "reflect" => (
             &["question"][..],
@@ -438,7 +442,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
         ),
         "memory" => (
             &["action", "content", "query", "memory_type", "scope"][..],
-            "remember:content; recall:query; scope=session. forget/update: tool_search select:memory; invoke_tool.",
+            "remember/recall; forget/update: tool_search select:memory; invoke_tool.",
         ),
         "read_file" => (
             &["path", "start_line", "end_line", "outline"][..],
@@ -473,7 +477,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
         "notify" => (&["message", "notification_type"][..], "Notify user."),
         "start_work" => (
             &["goal", "activation", "tasks"][..],
-            "Create one canonical Work graph: start assigns; defer waits. Once bound, never call start_work again; use a revision-pinned proposal.",
+            "Create one canonical Work graph. Once bound, never call start_work again; use a revision-pinned proposal.",
         ),
         "run_next_work_item" => (
             &[][..],
@@ -486,7 +490,7 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
                 "blocker_kind",
                 "unavailable_capabilities",
             ][..],
-            "Before final, settle active Work truthfully; blocked/failed if delivery evidence is incomplete.",
+            "Settle Work before final; blocked/failed when evidence incomplete.",
         ),
         _ => return schema,
     };
@@ -497,7 +501,13 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
     else {
         return schema;
     };
-    if name == "str_replace" {
+    if name == "agent" {
+        parameters.insert(
+            "required".to_string(),
+            serde_json::json!(["action", "description", "prompt"]),
+        );
+        parameters.retain(|key, _| !key.starts_with("x-astra-"));
+    } else if name == "str_replace" {
         parameters.insert(
             "x-astra-per-action-required".to_string(),
             serde_json::json!({"single": ["path", "old_str", "new_str"]}),
@@ -531,6 +541,11 @@ fn resident_schema_projection(name: &str, mut schema: Value) -> Value {
             "enum".to_string(),
             serde_json::json!(["remember", "recall"]),
         );
+    }
+    if name == "agent"
+        && let Some(action) = properties.get_mut("action").and_then(Value::as_object_mut)
+    {
+        action.insert("enum".to_string(), serde_json::json!(["spawn"]));
     }
     if name == "ask_user"
         && let Some(question_items) = properties

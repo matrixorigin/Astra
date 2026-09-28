@@ -70,6 +70,29 @@ It requires an actual GLM child model round, a child web fetch, and a Sina link
 in the final answer. This live-news case depends on the public site; report
 site/network unavailability separately from model-selection failures.
 
+`direct_simple_no_spawn` and `flash_delegate_simple_glm` are the primary
+paired efficiency control. Both ask for the same trivial arithmetic answer;
+the delegated request naturally names GLM 5.2. Run the direct case once with
+DeepSeek Flash and once with GLM 5.2, and the delegated case with DeepSeek
+Flash. This isolates selection/spawn/wait/handoff much better than a website
+task. The oracle requires exactly one spawn, a real GLM child round, linked
+child completion and parent adoption; a parent-computed `42` alone cannot
+pass. Both final answers must be exactly `42`. Report all physical calls,
+auxiliary judgments, token/cache coverage, tool attempts, and elapsed phases,
+not just whether the answer is right. Use repeated runs for latency claims.
+
+`direct_user_news_no_spawn` is the matched direct-execution control for the
+journey. Run it with DeepSeek Flash and GLM 5.2 on the same candidate revision,
+close in time to the delegated case. Report all three traces separately:
+DeepSeek direct shows the parent model's own work, GLM direct isolates the
+worker model's task execution, and DeepSeek→GLM shows selection, spawn, child
+work, and parent handoff. News/site changes and model differences make one
+run unsuitable for a causal latency claim. Compare repeated runs, outcome
+quality, physical model rounds, tool calls, judgment waits, cache buckets,
+time-to-first-useful-action, child critical path, and final handoff; unknown
+usage or prices are not zero. Direct paths may also have waste that warrants
+independent optimization.
+
 `flash_semantic_model_reference_glm` isolates candidate-aware semantic
 selection from live websites. The user says `5.2glm` without tool syntax;
 the case requires the authorized `glm-5.2` child to make a real provider call

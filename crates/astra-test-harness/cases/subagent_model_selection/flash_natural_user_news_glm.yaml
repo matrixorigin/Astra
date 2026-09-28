@@ -37,3 +37,15 @@ criteria:
     name: reflect
     min: 0
     max: 0
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: grep
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: read_file
+    min: 0
+    max: 0

@@ -269,6 +269,7 @@ fn default_surface_keeps_small_primitives_and_defers_complex_workflows() {
         "bash",
         "read_file",
         "write_file",
+        "agent",
     ] {
         assert!(
             always_load.contains(name),
@@ -277,7 +278,6 @@ fn default_surface_keeps_small_primitives_and_defers_complex_workflows() {
     }
     for name in [
         "agent_fanout",
-        "agent",
         "glob",
         "worktree",
         "inspect_work_plan",
@@ -486,6 +486,31 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     );
     assert!(!memory_properties.contains_key("memory_id"));
 
+    let agent = find(&resident, "agent");
+    let agent_params = &agent["function"]["parameters"];
+    assert_eq!(
+        agent_params["properties"]["action"]["enum"],
+        serde_json::json!(["spawn"])
+    );
+    assert_eq!(
+        agent_params["required"],
+        serde_json::json!(["action", "description", "prompt"])
+    );
+    assert_eq!(agent_params["additionalProperties"], false);
+    assert!(
+        agent_params["properties"]
+            .get("requested_model_policy")
+            .is_none()
+    );
+    assert!(agent_params["properties"].get("agent_id").is_none());
+    assert!(
+        agent_params
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.starts_with("x-astra-"))
+    );
+
     let ask_user = find(&resident, "ask_user");
     assert_eq!(
         ask_user["function"]["parameters"]["properties"]["questions"]["items"]["additionalProperties"],
@@ -518,6 +543,39 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
             .get("memory_id")
             .is_some()
     );
+    let full_agent = find(&full, "agent");
+    assert!(
+        full_agent["function"]["parameters"]["properties"]
+            .get("requested_model_policy")
+            .is_some()
+    );
+    let ordinary_spawn =
+        json!({"action":"spawn","description":"Review","prompt":"Review the change"});
+    astra_tools::schemas::validate_tool_arguments_against_schema("agent", &ordinary_spawn, agent)
+        .expect("the user-facing spawn instruction must match the resident contract");
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "agent",
+            &json!({"action":"spawn","description":"Review"}),
+            agent,
+        )
+        .is_err()
+    );
+    let advanced_spawn = json!({"action":"spawn","description":"Review","prompt":"Review the change","agent_type":"task"});
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "agent",
+            &advanced_spawn,
+            agent,
+        )
+        .is_err()
+    );
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "agent",
+        &advanced_spawn,
+        full_agent,
+    )
+    .expect("selected canonical contract retains advanced spawn fields");
     let full_ask_user = find(&full, "ask_user");
     assert!(
         full_ask_user["function"]["parameters"]["properties"]["questions"]["items"]["properties"]

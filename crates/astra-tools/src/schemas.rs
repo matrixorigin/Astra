@@ -1940,7 +1940,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "send_message": ["local", "server"]
                     },
                     "x-astra-surface-descriptions": {
-                        "server": "Server-owned single-agent lifecycle. Actions: spawn, list, get_result, send_message. spawn requires description+prompt and returns a launched receipt with agent_id promptly after execution ownership is established; the parent continues independent work. If no relevant independent work remains, propose a final answer: the runtime waits and presents the child result before accepting it. Do not shell-sleep or poll to wait. A receipt proves launch, not completion. Normal model admission, tool permissions, execution deadlines, lineage, and cancellation ownership still apply; no background flag or Ctrl+B is needed. Independent parallel tasks use multiple spawn calls; each has its own receipt and partial failure is possible. list is read-only status of this agent's direct owned children in the current session's in-memory cache; optional exact agent_id filters it. No database query, terminal wait, or result collection; missing entries are unknown, not completed. get_result requires the returned agent_id and collects the child outcome when needed, including after an ordinary spawn; it may briefly wait or reconcile durable state, so use list for status only and do not busy-poll. A child asking its parent uses send_message with to=parent and message_type=question, not ask_user; the parent answers with message_type=answer and the exact request_id. This tool does not create a durable task list: when the user asks for task/Work tracking, call the visible start_work tool directly. Use agent_fanout.start only for all-child preflight, target-count accounting, or group-wide control; it remains joined unless the user explicitly hands it to the background."
+                        "server": "Server-owned single-agent lifecycle. Actions: spawn, list, get_result, send_message. When the user names a child model in natural language, omit requested_model_policy; the server resolves that requirement against the authorized catalog. Do not inspect workspace files, model configuration, or credentials to translate the name. spawn requires description+prompt and returns a launched receipt with agent_id promptly after execution ownership is established; the parent continues independent work. If no relevant independent work remains, propose a final answer: the runtime waits and presents the child result before accepting it. Do not shell-sleep or poll to wait. A receipt proves launch, not completion. Normal model admission, tool permissions, execution deadlines, lineage, and cancellation ownership still apply; no background flag or Ctrl+B is needed. Independent parallel tasks use multiple spawn calls; each has its own receipt and partial failure is possible. list is read-only status of this agent's direct owned children in the current session's in-memory cache; optional exact agent_id filters it. No database query, terminal wait, or result collection; missing entries are unknown, not completed. get_result requires the returned agent_id and collects the child outcome when needed, including after an ordinary spawn; it may briefly wait or reconcile durable state, so use list for status only and do not busy-poll. A child asking its parent uses send_message with to=parent and message_type=question, not ask_user; the parent answers with message_type=answer and the exact request_id. This tool does not create a durable task list: when the user asks for task/Work tracking, call the visible start_work tool directly. Use agent_fanout.start only for all-child preflight, target-count accounting, or group-wide control; it remains joined unless the user explicitly hands it to the background."
                     },
                     "x-astra-surface-discovery-summaries": {
                         "server": "Omit requested_model_policy for user model; hard reqs bind; no config reads. spawn->launched; work or propose final (runtime waits). Ask parent via agent question; no shell sleep."
@@ -2772,6 +2772,16 @@ mod tests {
             assert!(description.contains("message_type=question"));
             assert!(description.contains("ask_user"));
             assert!(description.contains("runtime waits and presents the child"));
+            if surface == "server" {
+                assert!(
+                    description.contains(
+                        "server resolves that requirement against the authorized catalog"
+                    )
+                );
+                assert!(description.contains(
+                    "Do not inspect workspace files, model configuration, or credentials"
+                ));
+            }
             let params = &agent["function"]["parameters"];
             let child_brief = params["properties"]["prompt"]["description"]
                 .as_str()

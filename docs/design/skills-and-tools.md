@@ -34,6 +34,15 @@ its contract and capability remain current. Selection is knowledge, not a
 permission grant: request projection and execution still enforce current provider
 and policy admission. After compaction removes necessary argument knowledge,
 rediscovery is legitimate; do not require or prohibit it merely by turn count.
+Ordinary `agent` spawn is a compact resident action (`action`, `description`,
+`prompt`) when the delegation capability is admitted. Other agent actions and
+advanced spawn fields still require selection of the canonical contract through
+`tool_search` and `invoke_tool`; both routes share the same executor and
+admission checks. If the final authorized surface omits `tool_search`, the
+visible `agent` instead carries its full owner-authorized contract directly;
+filtering discovery must not strand child messaging or result retrieval.
+The resident projection must remain inside the fixed tool
+schema budget, so ordinary delegation does not add a large repeated prompt.
 
 ## Relationship
 

@@ -1,0 +1,33 @@
+name: direct_user_news_no_spawn
+description: |
+  Direct-execution control for the natural delegated-news journey. Run once
+  with DeepSeek Flash and once with GLM 5.2 to separate parent overhead from
+  the model doing the actual news work.
+prompt: 查一下最新新浪的一条新闻
+debug_log: true
+capability: delegation
+timeout_seconds: 240
+criteria:
+  - type: exit_code
+    code: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: web_fetch
+    min: 1
+  - type: text_contains
+    needle: sina.com.cn
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: grep
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: read_file
+    min: 0
+    max: 0

@@ -1,0 +1,53 @@
+name: flash_delegate_simple_glm
+description: |
+  Minimal natural-language delegation with the same arithmetic as the direct
+  control. Measures selection, spawn, child execution, wait, and handoff.
+prompt: 让 glm5.2 的子代理算一下 17×19−281 是多少，并把答案告诉我。只输出结果这个整数，不要解释或标点。
+debug_log: true
+capability: delegation
+timeout_seconds: 120
+criteria:
+  - type: exit_code
+    code: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: glm-5.2
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    json_match:
+      path: /payload/model
+      equals: glm-5.2
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/status
+      equals: completed
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: session_child_result_adopted
+    expected_result: "42"
+  - type: text_equals
+    expected: "42"
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: read_file
+    min: 0
+    max: 0

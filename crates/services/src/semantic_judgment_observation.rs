@@ -383,6 +383,22 @@ pub fn project_semantic_judgment_observations(
     max_candidates: usize,
     max_observations: usize,
 ) -> SemanticJudgmentCapture {
+    project_semantic_judgment_observations_for_owners(
+        rows,
+        &[user_id],
+        session_id,
+        max_candidates,
+        max_observations,
+    )
+}
+
+fn project_semantic_judgment_observations_for_owners(
+    rows: impl IntoIterator<Item = SemanticJudgmentTraceRow>,
+    owner_ids: &[&str],
+    session_id: &str,
+    max_candidates: usize,
+    max_observations: usize,
+) -> SemanticJudgmentCapture {
     use SemanticJudgmentCaptureGap as Gap;
     let limit = max_candidates.min(MAX_SEMANTIC_JUDGMENT_CANDIDATES);
     let output_limit = max_observations.min(MAX_SEMANTIC_JUDGMENT_CANDIDATES);
@@ -399,7 +415,7 @@ pub fn project_semantic_judgment_observations(
             break;
         }
         capture.candidates_scanned += 1;
-        if row.user_id != user_id || row.session_id != session_id {
+        if !owner_ids.contains(&row.user_id.as_str()) || row.session_id != session_id {
             gaps.insert(Gap::ScopeMismatch);
             continue;
         }
@@ -703,43 +719,72 @@ pub fn project_local_semantic_judgments(
     session_id: &str,
     depth: astra_core::ObservationDepth,
 ) -> SemanticJudgmentView {
+    project_attached_semantic_judgments(&[(owner, window)], session_id, depth)
+}
+
+/// Merge only caller-authorized owner windows through one bounded canonical
+/// projection. Ownership remains attached to each row; copied trace metadata
+/// cannot grant access to another account's journal.
+pub fn project_attached_semantic_judgments(
+    sources: &[(
+        &crate::OwnerScope,
+        &crate::session_journal::JournalObservationWindow,
+    )],
+    session_id: &str,
+    depth: astra_core::ObservationDepth,
+) -> SemanticJudgmentView {
     use crate::session_journal::JournalEventType;
-    let rows = window
-        .events
+    let owner_ids: Vec<_> = sources.iter().map(|(owner, _)| owner.id()).collect();
+    let mut events: Vec<_> = sources
         .iter()
-        .rev()
-        .filter(|event| event.event_type == JournalEventType::TraceSpan)
-        .map(|event| {
-            let metadata_json = event.metadata.as_ref().map(Value::to_string);
-            // Reuse the canonical decoder, including its size/strict-schema checks.
-            // Missing or conflicting journal turns cannot authenticate a typed fact.
-            let turn_mismatch = metadata_json
-                .as_deref()
-                .and_then(|raw| decode_semantic_judgment_trace(raw).ok().flatten())
-                .is_some_and(|fact| event.turn != Some(fact.observation.correlation.turn));
-            SemanticJudgmentTraceRow {
-                user_id: owner.id().to_string(),
-                session_id: if turn_mismatch {
-                    String::new()
-                } else {
-                    event.session_id.clone().unwrap_or_default()
-                },
-                metadata_json,
-                metadata_oversized: false,
-            }
-        });
-    let mut capture = if window.available {
-        project_semantic_judgment_observations(rows, owner.id(), session_id, 512, 32)
+        .flat_map(|(owner, window)| {
+            window
+                .events
+                .iter()
+                .filter(|event| event.event_type == JournalEventType::TraceSpan)
+                .map(move |event| (*owner, event))
+        })
+        .collect();
+    events.sort_by(|left, right| right.1.ts.cmp(&left.1.ts));
+    let rows = events.into_iter().map(|(owner, event)| {
+        let metadata_json = event.metadata.as_ref().map(Value::to_string);
+        // Reuse the canonical decoder, including its size/strict-schema checks.
+        // Missing or conflicting journal turns cannot authenticate a typed fact.
+        let turn_mismatch = metadata_json
+            .as_deref()
+            .and_then(|raw| decode_semantic_judgment_trace(raw).ok().flatten())
+            .is_some_and(|fact| event.turn != Some(fact.observation.correlation.turn));
+        SemanticJudgmentTraceRow {
+            user_id: owner.id().to_string(),
+            session_id: if turn_mismatch {
+                String::new()
+            } else {
+                event.session_id.clone().unwrap_or_default()
+            },
+            metadata_json,
+            metadata_oversized: false,
+        }
+    });
+    let mut capture = if sources.iter().any(|(_, window)| window.available) {
+        project_semantic_judgment_observations_for_owners(rows, &owner_ids, session_id, 512, 32)
     } else {
         SemanticJudgmentCapture::unavailable()
     };
-    if window.truncated {
+    if sources.iter().any(|(_, window)| !window.available) {
+        capture
+            .gaps
+            .push(SemanticJudgmentCaptureGap::SourceUnavailable);
+    }
+    if sources.iter().any(|(_, window)| window.truncated) {
         capture.truncated = true;
         capture
             .gaps
             .push(SemanticJudgmentCaptureGap::CandidateLimit);
     }
-    if window.malformed_records > 0 {
+    if sources
+        .iter()
+        .any(|(_, window)| window.malformed_records > 0)
+    {
         capture
             .gaps
             .push(SemanticJudgmentCaptureGap::InvalidObservation);
@@ -2218,6 +2263,89 @@ mod tests {
         assert_eq!(
             missing.coverage,
             SemanticJudgmentCoverage::SourceUnavailable
+        );
+    }
+
+    #[test]
+    fn attached_projection_keeps_local_fact_when_account_has_no_fact() {
+        let fact = observation();
+        let event = semantic_judgment_trace("local", &fact, 100)
+            .unwrap()
+            .session_id(Some("session-1"))
+            .build();
+        let local_owner = crate::OwnerScope::user("local-owner").unwrap();
+        let account_owner = crate::OwnerScope::user("account-owner").unwrap();
+        let local = crate::session_journal::JournalObservationWindow {
+            events: vec![event.clone()],
+            available: true,
+            truncated: false,
+            malformed_records: 0,
+        };
+        let account = crate::session_journal::JournalObservationWindow {
+            events: vec![],
+            available: true,
+            truncated: false,
+            malformed_records: 0,
+        };
+        let view = project_attached_semantic_judgments(
+            &[(&local_owner, &local), (&account_owner, &account)],
+            "session-1",
+            astra_core::ObservationDepth::Diagnostic,
+        );
+        assert_eq!(view.observations.len(), 1);
+        assert_eq!(view.counts.unwrap().not_dispatched, 1);
+        let unavailable = crate::session_journal::JournalObservationWindow {
+            events: vec![],
+            available: false,
+            truncated: false,
+            malformed_records: 0,
+        };
+        let partial = project_attached_semantic_judgments(
+            &[(&local_owner, &local), (&account_owner, &unavailable)],
+            "session-1",
+            astra_core::ObservationDepth::Diagnostic,
+        );
+        assert_eq!(partial.observations.len(), 1);
+        assert!(
+            partial
+                .capture_gaps
+                .contains(&SemanticJudgmentCaptureGap::SourceUnavailable)
+        );
+        let mirrored = crate::session_journal::JournalObservationWindow {
+            events: vec![event],
+            available: true,
+            truncated: false,
+            malformed_records: 0,
+        };
+        let deduplicated = project_attached_semantic_judgments(
+            &[(&local_owner, &local), (&account_owner, &mirrored)],
+            "session-1",
+            astra_core::ObservationDepth::Diagnostic,
+        );
+        assert_eq!(deduplicated.observations.len(), 1);
+        assert_eq!(deduplicated.counts.unwrap().not_dispatched, 1);
+        let mut contrary = fact;
+        contrary.fact.result = decided();
+        let contrary_event = semantic_judgment_trace("account", &contrary, 100)
+            .unwrap()
+            .session_id(Some("session-1"))
+            .build();
+        let conflicting = crate::session_journal::JournalObservationWindow {
+            events: vec![contrary_event],
+            available: true,
+            truncated: false,
+            malformed_records: 0,
+        };
+        let excluded = project_attached_semantic_judgments(
+            &[(&local_owner, &local), (&account_owner, &conflicting)],
+            "session-1",
+            astra_core::ObservationDepth::Diagnostic,
+        );
+        assert!(excluded.observations.is_empty());
+        assert!(
+            excluded
+                .capture_gaps
+                .contains(&SemanticJudgmentCaptureGap::ConflictingEvaluation)
         );
     }
 

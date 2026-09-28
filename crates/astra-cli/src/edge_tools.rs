@@ -3809,13 +3809,10 @@ impl ToolExecutor {
             if snap.semantic_judgments.is_none()
                 || request.source_policy == astra_core::SourcePolicy::LocalOnly
             {
-                let owner = astra_services::OwnerScope::local_user();
-                let window = astra_services::session_journal::read_journal_observation_window(
-                    &owner,
-                    &session_id,
-                );
+                let window =
+                    crate::cli::journal_digest::read_attached_observation_window(&session_id, None);
                 let mut view = match window {
-                    Ok(window) => astra_services::semantic_judgment_observation::project_local_semantic_judgments(&window, &owner, &session_id, request.depth),
+                    Ok(window) => window.semantic_judgments(&session_id, request.depth),
                     Err(_) => astra_services::semantic_judgment_observation::SemanticJudgmentView::unavailable(astra_services::semantic_judgment_observation::SemanticJudgmentCoverage::SourceUnavailable),
                 };
                 view.scope = astra_services::semantic_judgment_observation::SemanticJudgmentScope::LocalJournalAtRead;

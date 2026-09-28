@@ -57,6 +57,14 @@ Progress should be derived from durable events:
 - checkpoint saved;
 - stream cursor advanced.
 
+The explicit CLI `journal digest` reads the complete authorized profile and
+attached account journals. Terminal turn usage is the qualified accounting
+source; `LlmRound` tokens are a separate diagnostic observation. The JSON
+`usage_coverage` and round-conflict fields identify unknown buckets and
+excluded contradictions. Root-plus-child observed totals mix sources and are
+never a bill or proof of complete session cost. No journal cursor grants
+access to another owner's file.
+
 ## Stuck detection
 
 A run may appear stuck because of:

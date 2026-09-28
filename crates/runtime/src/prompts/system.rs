@@ -762,9 +762,15 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
     if agent_visible || agent_fanout_visible {
         let surface_guidance = match (agent_visible, agent_fanout_visible) {
             (true, true) => {
-                "Use visible `agent` with `agent_type=task` for each independent delegated executor; use `agent_fanout` with `defaults.agent_type=task` only for group-wide preflight or control"
+                "Use visible `agent` with action=spawn, description, and prompt for each independent child; use `agent_fanout` with `defaults.agent_type=task` only for group-wide preflight or control"
             }
-            (true, false) => "Use visible `agent` with `agent_type=task` for a delegated executor",
+            (true, false) => {
+                if tool_visible(tool_names, "tool_search") {
+                    "Use visible `agent` with action=spawn, description, and prompt for an ordinary child; fields/actions absent from its schema require tool_search select:agent and invoke_tool"
+                } else {
+                    "Use the visible `agent` schema directly for its permitted actions, including child messages and results when present"
+                }
+            }
             (false, true) => {
                 "Use visible `agent_fanout` with `defaults.agent_type=task` for delegated executors"
             }
@@ -1690,7 +1696,13 @@ mod tests {
 
         let agent_surface = build_main_system_prompt(&["agent"], "");
         assert!(agent_surface.contains("`task` is an agent type, not a callable tool name"));
-        assert!(agent_surface.contains("Use visible `agent` with `agent_type=task`"));
+        assert!(
+            agent_surface
+                .contains("Use the visible `agent` schema directly for its permitted actions")
+        );
+        assert!(!agent_surface.contains("tool_search select:agent"));
+        let agent_with_discovery = build_main_system_prompt(&["agent", "tool_search"], "");
+        assert!(agent_with_discovery.contains("tool_search select:agent"));
         assert!(agent_surface.contains("the runtime waits for terminal results"));
         assert!(
             agent_surface.contains("only independent parent work needed for the user's request")
@@ -1702,7 +1714,7 @@ mod tests {
         assert!(
             fanout_surface.contains("Use visible `agent_fanout` with `defaults.agent_type=task`")
         );
-        assert!(!fanout_surface.contains("Use visible `agent` with `agent_type=task` for one"));
+        assert!(!fanout_surface.contains("Use visible `agent` with action=spawn"));
 
         let stable_work_surface = build_main_system_prompt(
             &[
@@ -2264,6 +2276,17 @@ mod tests {
     }
 
     #[test]
+    fn agent_guidance_without_discovery_uses_direct_authorized_schema() {
+        let direct = tool_conditional_section(&["agent"]);
+        assert!(direct.contains("child messages and results when present"));
+        assert!(!direct.contains("tool_search select:agent"));
+        assert!(!direct.contains("invoke_tool"));
+
+        let discoverable = tool_conditional_section(&["agent", "tool_search"]);
+        assert!(discoverable.contains("tool_search select:agent"));
+    }
+
+    #[test]
     fn test_sections_scopes_and_content() {
         let tools = vec!["bash", "read_file", "glob", "grep"];
         let sections = build_system_prompt_sections(&tools, "cwd: /tmp");
@@ -2768,13 +2791,17 @@ mod tests {
             build_skill_listing_section_with_context_window_and_caps(&skills, Some(200_000), false)
                 .expect("skill listing should render when fanout is unavailable");
 
-        assert!(with_fanout.text.contains("\"action\":\"start\""));
         assert!(
             with_fanout
                 .text
-                .contains("does not replace a matching skill's workflow")
+                .contains("call `agent` with `action=spawn` once per child")
         );
-        assert!(!without_fanout.text.contains("\"action\":\"start\""));
+        assert!(
+            with_fanout
+                .text
+                .contains("load it first and follow its workflow")
+        );
+        assert!(!without_fanout.text.contains("`action=spawn`"));
         assert!(
             without_fanout
                 .text

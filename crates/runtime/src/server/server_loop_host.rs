@@ -6447,6 +6447,24 @@ impl ServerAgenticLoopHostBuilder {
             &astra_tools::schemas::all_tool_schemas(),
             "server",
         );
+        // Owner-specific action projection can replace an edge-supplied
+        // agent schema after ToolSurface built the compact resident contract.
+        // Keep the full authorized contract when discovery is unavailable:
+        // otherwise a narrow child could spawn but never message or retrieve
+        // its child. A visible tool_search gets the runtime-owned carrier.
+        if tool_schemas
+            .iter()
+            .any(|schema| tool_schema_name(schema) == Some("tool_search"))
+        {
+            for schema in &mut tool_schemas {
+                if tool_schema_name(schema) == Some("agent") {
+                    *schema = crate::tool_registry::surface::resident_schema_projection(
+                        "agent",
+                        std::mem::take(schema),
+                    );
+                }
+            }
+        }
 
         let mut valid_tools: HashSet<String> = tool_schemas
             .iter()
@@ -17669,6 +17687,22 @@ impl ServerAgenticLoopHost {
                 tool_schema_name(schema) != Some("agent_fanout")
                     || remove_tool_action_branch(schema, "start")
             });
+        }
+        // Restrictions and runtime readiness have now settled. If discovery
+        // was removed but agent remains callable, expose its full authorized
+        // contract directly so communication/result actions still work.
+        if !tools
+            .iter()
+            .any(|schema| tool_schema_name(schema) == Some("tool_search"))
+            && let Some(full) = self
+                .deferred_tool_schemas
+                .iter()
+                .find(|schema| tool_schema_name(schema) == Some("agent"))
+            && let Some(agent) = tools
+                .iter_mut()
+                .find(|schema| tool_schema_name(schema) == Some("agent"))
+        {
+            *agent = full.clone();
         }
         stabilize_work_role_tool_order(&mut tools);
         tools
@@ -31897,17 +31931,16 @@ mod tests {
             active_primary_deferred.contains("agent"),
             "an active WorkItem keeps the recursive single-child topology discoverable"
         );
-        for lifecycle_tool in [
-            "run_next_work_item",
-            "settle_work_item",
-            "agent",
-            "agent_fanout",
-        ] {
+        for lifecycle_tool in ["run_next_work_item", "settle_work_item", "agent_fanout"] {
             assert!(
                 !active_primary_visible.contains(lifecycle_tool),
                 "this fixture has no durable Work service and cannot expose {lifecycle_tool}: surface={active_primary_visible:?}"
             );
         }
+        assert!(
+            active_primary_visible.contains("agent"),
+            "a bound child context exposes ordinary spawn without a Work service"
+        );
         assert!(
             parallel_bound_deferred.contains("agent_fanout")
                 && parallel_bound_deferred.contains("agent"),
@@ -32096,11 +32129,9 @@ mod tests {
                 assigned_deferred.contains(attempt_tool),
                 "an exact WorkItem attempt must retain {attempt_tool} through typed discovery"
             );
-            assert!(
-                !assigned_visible.contains(attempt_tool),
-                "an exact WorkItem attempt must not expand the resident prefix with {attempt_tool}: {assigned_visible:?}"
-            );
         }
+        assert!(!assigned_visible.contains("agent_fanout"));
+        assert!(assigned_visible.contains("agent"));
         for coordinator_tool in [
             "start_work",
             "inspect_work_plan",
@@ -33923,7 +33954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normal_edge_root_keeps_server_agent_in_deferred_discovery() {
+    async fn normal_edge_root_exposes_spawn_and_keeps_full_agent_discoverable() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -33942,17 +33973,34 @@ mod tests {
         state.runtime_tool_executor = Some(Arc::clone(&executor));
 
         let visible = host.visible_turn_tools(&mut state);
-        assert!(!schema_names(&visible).contains("agent"));
-        assert!(
-            host.current_deferred_tool_names.contains("agent"),
-            "server-owned agent must remain discoverable when the edge supplies the workspace"
+        let resident = visible
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some("agent"))
+            .expect("ordinary spawn is resident when delegation is authorized");
+        assert_eq!(
+            resident["function"]["parameters"]["properties"]["action"]["enum"],
+            json!(["spawn"])
         );
+        assert!(!host.current_deferred_tool_names.contains("agent"));
         let result = executor
             .execute_with_metadata("tool_search", &json!({"query": "select:agent"}))
             .await;
         let parsed: Value = serde_json::from_str(&result.output).expect("tool_search JSON");
         assert_eq!(parsed["status"], "completed");
         assert_eq!(parsed["matches"][0]["name"], "agent");
+
+        state.restricted_tools.insert("tool_search".to_string());
+        let narrowed = host.visible_turn_tools(&mut state);
+        assert!(!schema_names(&narrowed).contains("tool_search"));
+        let direct_agent = narrowed
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some("agent"))
+            .expect("authorized agent remains callable after discovery is removed");
+        let actions = direct_agent["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("full action enum");
+        assert!(actions.iter().any(|action| action == "send_message"));
+        assert!(actions.iter().any(|action| action == "get_result"));
     }
 
     fn message_text(message: &Value) -> String {
@@ -34288,7 +34336,7 @@ mod tests {
             "user1".to_string(),
             "sess1".to_string(),
         )
-        .with_edge_tools(sample_edge_tools())
+        .with_edge_tools(sample_edge_tools_full())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_edge_profile(profile)
         .build();
@@ -34301,6 +34349,16 @@ mod tests {
                 "edge-owned child restriction must prevent the server from re-adding {restricted}: {names:?}"
             );
         }
+        let agent = host
+            .tool_schemas
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some("agent"))
+            .expect("authorized agent remains visible without discovery");
+        let actions = agent["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("full authorized agent contract without discovery");
+        assert!(actions.iter().any(|action| action == "get_result"));
+        assert!(actions.iter().any(|action| action == "send_message"));
         assert!(
             !host.always_load_tool_names.contains("propose_work_plan"),
             "restricted server tools must not remain in cache-boundary metadata"
@@ -44452,10 +44510,7 @@ mod tests {
             !schema_names(&stabilized).contains("agent_fanout"),
             "strict-history cache ordering must not reinsert a deferred topology schema"
         );
-        assert!(
-            !primary.contains("agent"),
-            "primary topology keeps the single-child schema behind typed discovery: {primary:?}"
-        );
+        assert!(primary.contains("agent"));
 
         host.on_user_intent_applied(&crate::turn::run_control::QueuedUserIntent {
             intent_id: "intent-new-topology".to_string(),
@@ -44523,16 +44578,13 @@ mod tests {
         ))
         .expect("parallel discovery selection");
         let selected_agent = &selected["matches"][0];
+        let selected_actions = selected_agent["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("selected contract retains action enum");
+        assert!(selected_actions.iter().any(|action| action == "get_result"));
         assert!(
-            selected_agent["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("get_result:"))
-        );
-        assert!(
-            selected_agent["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("spawn:")),
-            "discovery retains the stable spawn declaration; terminal admission enforces authoritative topology"
+            selected_actions.iter().any(|action| action == "spawn"),
+            "discovery retains spawn; terminal admission enforces authoritative topology"
         );
     }
 

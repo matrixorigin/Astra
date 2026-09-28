@@ -415,9 +415,10 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         // Blocking clarification is part of the default safety loop: when the
         // model needs a user decision, ask_user must already be callable.
         control_plane("ask_user", ToolLoadPolicy::AlwaysLoad),
-        // Delegation is a workflow decision, not a first-turn primitive. Its
-        // multi-action schema belongs behind discovery alongside fanout.
-        control_plane("agent", ToolLoadPolicy::Deferred),
+        // Ordinary spawn is a first-class interaction. The resident surface
+        // projects only its small spawn contract; other actions still require
+        // explicit selection of the full canonical agent contract.
+        control_plane("agent", ToolLoadPolicy::AlwaysLoad),
         control_plane("agent_fanout", ToolLoadPolicy::Deferred),
         control_plane("enter_plan_mode", ToolLoadPolicy::Deferred),
         control_plane("exit_plan_mode", ToolLoadPolicy::Deferred),
@@ -2001,7 +2002,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_topology_is_discoverable_without_a_fixed_schema_tax() {
+    fn ordinary_spawn_is_resident_while_fanout_remains_deferred() {
         let registry = registry();
         for name in ["agent", "agent_fanout"] {
             let spec = registry
@@ -2016,8 +2017,8 @@ mod tests {
         }
         assert_eq!(
             registry.get("agent").expect("agent registered").load_policy,
-            ToolLoadPolicy::Deferred,
-            "delegation is a workflow decision, not a first-request primitive"
+            ToolLoadPolicy::AlwaysLoad,
+            "ordinary spawn has a compact resident projection; admission still controls dispatch"
         );
         assert_eq!(
             registry

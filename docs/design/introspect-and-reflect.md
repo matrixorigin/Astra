@@ -302,16 +302,35 @@ Explicit `diagnostic` and `forensic` requests retain deeper evidence and graph
 inspection. This is progressive disclosure, not a usage quota or tool disablement.
 Server-backed and local-journal reflection share the same report projection.
 
-CLI reflection also projects typed semantic judgment traces from an explicitly
-owner-local journal window through the shared strict decoder/projector. The
-scope is `local_journal_at_read`, not server history or the requested time
-horizon. Reads retain at most 512 journal records and read at most 256 KiB;
-boundary records may be conservatively omitted. Truncation, malformed records,
-and session/turn mismatches remain coverage gaps. Missing or unreadable journals
-have unavailable counts, not known zero judgments. Even an empty existing
-journal cannot establish that no judgments occurred upstream.
+CLI reflection and introspection resolve the profile-local and attached
+authenticated-account journal owners from one CLI identity snapshot; a
+conversation cursor is lineage, never read authority. Each authorized source
+uses the same bounded observation reader (at most 512 records / 256 KiB per
+source), with session identity checked before merging and duplicate run/round
+facts counted once. Account runtime rounds and trace spans can therefore be
+observed even when the root conversation is profile-local. Conflicting rounds
+are excluded and reported, not attributed by file order. Typed semantic
+judgments from both authorized sources use one canonical deduplication and
+conflict projection; an empty account window cannot hide a local fact. This is bounded historical
+evidence (`local_journal_at_read`), not complete session history or a billing
+ledger. Missing sources, truncation, malformed records and identity mismatches
+remain explicit coverage gaps; an empty window does not prove no judgment ran.
+These reads are local files only and do not add database or network calls.
+An I/O error in either journal degrades that source's coverage without
+discarding valid observations from the other authorized source; a
+session-identity mismatch still fails closed. Default CLI reflection reuses this already-read bounded window for
+local evidence, while retaining its existing cloud snapshot lookup; it does
+not reread the entire local journal for presentation.
+Execution reflection can report the count and slowest duration of captured
+LLM rounds plus the longest captured trace span; overlapping spans are not
+summed into wall time. Preview metadata is an allowlist, not raw trace attrs.
 
 `local_only` CLI reflection bypasses cloud restoration entirely. CLI reflection
+with `cloud_only` reads only the cloud snapshot, not local workspace or journal;
+`live_only` has no live CLI observation source and reports unavailable without
+falling back to persisted state. `auto`, `live_first`, and `durable_first`
+reuse the bounded local window and the existing cloud snapshot lookup.
+CLI reflection
 and introspection can read physical judgment usage from the latest owner-local
 typed Explain artifact, bounded to 4 MiB with a 16 KiB index. The reader checks
 handle, checksum, size, schema and session/run/turn identity, then uses the

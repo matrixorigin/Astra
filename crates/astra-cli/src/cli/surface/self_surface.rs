@@ -147,22 +147,7 @@ impl SelfSurfaceArtifactLoader for CliSelfSurfaceArtifactLoader {
                     .await?
             }
         };
-        if let Some(restored) = restored.as_ref() {
-            workspace = Some(match workspace {
-                Some(existing) => merge_workspace_with_restored(existing, restored),
-                None => merge_workspace_with_restored(
-                    restored.workspace.clone().unwrap_or_else(|| {
-                        session_workspace::WorkspaceMetadata::with_context(
-                            session_id,
-                            restored.model.as_deref().unwrap_or("default"),
-                            ".",
-                            restored.git_branch.as_deref(),
-                        )
-                    }),
-                    restored,
-                ),
-            });
-        }
+        workspace = merge_optional_restored_workspace(session_id, workspace, restored.as_ref());
         if workspace.is_none() && restored.is_none() && journal_events.is_empty() {
             return Err(format!(
                 "no persistent local or cloud state found for session {session_id}"
@@ -218,6 +203,29 @@ fn merge_workspace_with_restored(
     workspace
 }
 
+fn merge_optional_restored_workspace(
+    session_id: &str,
+    workspace: Option<session_workspace::WorkspaceMetadata>,
+    restored: Option<&astra_services::session_restore::RestoredSession>,
+) -> Option<session_workspace::WorkspaceMetadata> {
+    let Some(restored) = restored else {
+        return workspace;
+    };
+    Some(merge_workspace_with_restored(
+        workspace.unwrap_or_else(|| {
+            restored.workspace.clone().unwrap_or_else(|| {
+                session_workspace::WorkspaceMetadata::with_context(
+                    session_id,
+                    restored.model.as_deref().unwrap_or("default"),
+                    ".",
+                    restored.git_branch.as_deref(),
+                )
+            })
+        }),
+        restored,
+    ))
+}
+
 /// LocalOnly never consults restore providers. Journal IO is bounded by the
 /// shared observation reader; workspace metadata is not a cloud substitute.
 pub(crate) fn load_local_observation_artifacts(
@@ -237,6 +245,64 @@ pub(crate) fn load_local_observation_artifacts(
         restored: None,
         journal_events,
         latest_full_context_trace,
+    })
+}
+
+/// Reflection already owns a bounded, owner-authorized observation window.
+/// Preserve the existing cloud snapshot fallback without rereading the whole
+/// local journal or reconstructing a second local history projection.
+pub(crate) async fn load_observation_artifacts_with_profile(
+    session_id: &str,
+    profile: Option<&str>,
+    journal_events: Vec<session_journal::JournalEvent>,
+) -> Result<LoadedSelfSurfaceArtifacts, String> {
+    let mut artifacts = load_local_observation_artifacts(session_id, journal_events)?;
+    artifacts.restored =
+        session_restore_client::fetch_cloud_session_snapshot(profile, session_id).await?;
+    artifacts.workspace = merge_optional_restored_workspace(
+        session_id,
+        artifacts.workspace.take(),
+        artifacts.restored.as_ref(),
+    );
+    if artifacts.workspace.is_none()
+        && artifacts.restored.is_none()
+        && artifacts.journal_events.is_empty()
+    {
+        return Err(format!(
+            "no persistent local or cloud state found for session {session_id}"
+        ));
+    }
+    Ok(artifacts)
+}
+
+/// A source policy is an I/O boundary, not merely a display filter.
+pub(crate) async fn load_cloud_observation_artifacts(
+    session_id: &str,
+    profile: Option<&str>,
+) -> Result<LoadedSelfSurfaceArtifacts, String> {
+    session_journal::validate_session_id(session_id)?;
+    let restored =
+        session_restore_client::fetch_cloud_session_snapshot(profile, session_id).await?;
+    let workspace = merge_optional_restored_workspace(session_id, None, restored.as_ref());
+    Ok(LoadedSelfSurfaceArtifacts {
+        session_id: session_id.to_string(),
+        workspace,
+        restored,
+        journal_events: vec![],
+        latest_full_context_trace: None,
+    })
+}
+
+pub(crate) fn unavailable_observation_artifacts(
+    session_id: &str,
+) -> Result<LoadedSelfSurfaceArtifacts, String> {
+    session_journal::validate_session_id(session_id)?;
+    Ok(LoadedSelfSurfaceArtifacts {
+        session_id: session_id.to_string(),
+        workspace: None,
+        restored: None,
+        journal_events: vec![],
+        latest_full_context_trace: None,
     })
 }
 
@@ -280,8 +346,20 @@ fn runtime_config_from_json(tuned_config_json: Option<&str>) -> Result<RuntimeCo
 
 #[cfg(test)]
 mod tests {
-    use super::merge_workspace_with_restored;
+    use super::{merge_optional_restored_workspace, merge_workspace_with_restored};
     use astra_services::session_workspace;
+
+    #[test]
+    fn missing_cloud_snapshot_keeps_local_workspace() {
+        let local = session_workspace::WorkspaceMetadata::with_context(
+            "sid",
+            "gpt-5.4",
+            "/repo",
+            Some("main"),
+        );
+        let merged = merge_optional_restored_workspace("sid", Some(local.clone()), None);
+        assert_eq!(merged.unwrap().model, local.model);
+    }
 
     #[test]
     fn merge_workspace_with_restored_adopts_restored_persistence_error() {

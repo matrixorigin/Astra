@@ -1601,6 +1601,31 @@ struct SubrunToolSurfaceContext<'a> {
     interaction_mode: TurnInteractionMode,
 }
 
+fn restore_agent_contract_without_discovery(
+    visible: &mut [Value],
+    catalog: &[Value],
+    restricted: &HashSet<String>,
+) {
+    use astra_turn_core::tool::schema::tool_schema_name;
+
+    if restricted.contains("agent")
+        || visible
+            .iter()
+            .any(|schema| tool_schema_name(schema) == Some("tool_search"))
+    {
+        return;
+    }
+    if let Some(full) = catalog
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("agent"))
+        && let Some(agent) = visible
+            .iter_mut()
+            .find(|schema| tool_schema_name(schema) == Some("agent"))
+    {
+        *agent = full.clone();
+    }
+}
+
 fn attach_subrun_tool_surface(
     payload: &mut Value,
     mut schemas_to_use: Vec<Value>,
@@ -1655,6 +1680,15 @@ fn attach_subrun_tool_surface(
         schemas_to_use,
         context.restricted_tools,
     );
+    // Decide against the final authorized surface, not the pre-filter
+    // candidate set: an allowlist may remove discovery after selection.
+    if let Some(visible) = payload.get_mut("edge_tools").and_then(Value::as_array_mut) {
+        restore_agent_contract_without_discovery(
+            visible,
+            context.all_schemas,
+            context.restricted_tools,
+        );
+    }
     let final_visible_schemas: Vec<Value> = payload
         .get("edge_tools")
         .and_then(Value::as_array)
@@ -2491,6 +2525,35 @@ mod tests {
             json!(["tool_search"]),
             "the server must receive the typed child deny set so it cannot re-add its own tools"
         );
+    }
+
+    #[test]
+    fn narrow_subrun_without_discovery_keeps_authorized_agent_operations() {
+        let restricted_tools = HashSet::from(["tool_search".to_string()]);
+        let canonical = astra_tools::schemas::all_tool_schemas()
+            .into_iter()
+            .find(|schema| astra_turn_core::tool::schema::tool_schema_name(schema) == Some("agent"))
+            .expect("canonical agent contract");
+        let mut candidates = vec![canonical.clone(), schema("tool_search")];
+        candidates[0]["function"]["parameters"]["properties"]["action"]["enum"] = json!(["spawn"]);
+        let mut payload = json!({"edge_profile": {}});
+        astra_runtime::turn::agentic_prepare_payload::attach_filtered_edge_tools_to_payload(
+            &mut payload,
+            candidates,
+            &restricted_tools,
+        );
+        let visible = payload["edge_tools"]
+            .as_array_mut()
+            .expect("filtered surface");
+        super::restore_agent_contract_without_discovery(visible, &[canonical], &restricted_tools);
+
+        assert_eq!(visible.len(), 1, "discovery must remain denied");
+        let agent = &visible[0];
+        let actions = agent["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        assert!(actions.iter().any(|action| action == "send_message"));
+        assert!(actions.iter().any(|action| action == "get_result"));
     }
 
     #[test]
