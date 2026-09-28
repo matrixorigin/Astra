@@ -2004,6 +2004,10 @@ impl RuntimeToolExecutor {
             .is_ok_and(|attempt| attempt.is_some())
     }
 
+    pub(crate) fn has_assigned_work_item_attempt(&self) -> bool {
+        self.work_item_attempt_bound || self.has_active_primary_work_attempt()
+    }
+
     pub(super) fn active_primary_work_attempt(&self) -> Option<ActivePrimaryWorkAttempt> {
         self.active_primary_work_attempt.read().ok()?.clone()
     }

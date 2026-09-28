@@ -851,7 +851,7 @@ fn work_lifecycle_section(tool_names: &[&str]) -> String {
     }
     if can_settle {
         body.push_str(
-            "- Work item: prove expected_result with direct evidence; stop and settle on success; if incomplete, continue or report blocked/failed. Never broaden/delegate or claim delivery.\n",
+            "- Work item: only assigned attempts settle; child waits alone are not Work. Prove expected_result; settle on success, else continue or report blocked/failed. Never broaden/claim delivery.\n",
         );
     }
     body
@@ -1678,8 +1678,8 @@ mod tests {
         assert!(executable.contains("owns no active attempt"));
         assert!(executable.contains("run_next_work_item"));
         assert!(executable.contains("`initial_task`"));
-        assert!(executable.contains("Work item: prove expected_result with direct evidence"));
-        assert!(executable.contains("stop and settle on success"));
+        assert!(executable.contains("Work item: only assigned attempts settle"));
+        assert!(executable.contains("settle on success"));
         assert!(executable.contains("report blocked/failed"));
         assert!(
             DURABLE_WORK_ATTEMPT_FRAME_INSTRUCTION
@@ -1710,6 +1710,7 @@ mod tests {
         assert!(agent_surface.contains("call visible `agent` spawn directly"));
         assert!(agent_surface.contains("not a spawn prerequisite"));
         assert!(agent_surface.contains("silently substitute an unavailable or prohibited model"));
+        assert!(!agent_surface.contains("settle_work_item"));
         let fanout_surface = build_main_system_prompt(&["agent_fanout"], "");
         assert!(!fanout_surface.contains("call visible `agent` spawn directly"));
         assert!(

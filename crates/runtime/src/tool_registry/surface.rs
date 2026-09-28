@@ -490,7 +490,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "blocker_kind",
                 "unavailable_capabilities",
             ][..],
-            "Settle Work before final; blocked/failed when evidence incomplete.",
+            "Settle only a runtime-assigned WorkItem attempt; an ordinary child wait is not Work.",
         ),
         _ => return schema,
     };

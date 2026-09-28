@@ -713,31 +713,30 @@ impl MessageTransport for DatabaseTransport {
         }
         let previous = self.registrations.read().await.get(&addr).cloned();
         let subscription = MailboxSubscription::new(addr.clone());
-        if let Some(delegation_id) = delegation_id.as_deref() {
-            if let Err(error) = self
+        if let Some(delegation_id) = delegation_id.as_deref()
+            && let Err(error) = self
                 .register_directory_entry(
                     delegation_id,
                     &subscription,
                     previous.as_ref().map(|(previous, _)| previous),
                 )
                 .await
+        {
+            // SQL can commit a new owner token but report an unknown
+            // outcome. A token-fenced cleanup is safe even when this
+            // attempt never reached the directory; never delete by name.
+            if let Err(cleanup) = self
+                .unregister_directory_entry(delegation_id, &subscription)
+                .await
             {
-                // SQL can commit a new owner token but report an unknown
-                // outcome. A token-fenced cleanup is safe even when this
-                // attempt never reached the directory; never delete by name.
-                if let Err(cleanup) = self
-                    .unregister_directory_entry(delegation_id, &subscription)
-                    .await
-                {
-                    tracing::warn!(
-                        target: "astra_runtime::messaging",
-                        addr = %addr,
-                        error = %cleanup,
-                        "uncertain directory registration cleanup failed; lease will expire"
-                    );
-                }
-                return Err(error);
+                tracing::warn!(
+                    target: "astra_runtime::messaging",
+                    addr = %addr,
+                    error = %cleanup,
+                    "uncertain directory registration cleanup failed; lease will expire"
+                );
             }
+            return Err(error);
         }
         self.registrations
             .write()

@@ -274,9 +274,14 @@ pub(crate) fn settle_non_retryable_tool_rejections(
     round_records_start: usize,
     edge_results_present: bool,
     active_work_attempt: bool,
+    pending_run_dependency: bool,
 ) {
     if edge_results_present
         || super::execution_phase::completion_action_window_requires_followup(state)
+        // A rejected operation cannot terminate the turn while this run still
+        // owns an unfinished child or correlated reply. The request remains
+        // rejected, but existing communication authority must survive.
+        || (pending_run_dependency && !active_work_attempt)
         || !all_requested_calls_rejected_non_retryable(
             requested,
             &state.stall.tool_call_records[round_records_start..],
@@ -285,6 +290,15 @@ pub(crate) fn settle_non_retryable_tool_rejections(
         return;
     }
     engage_non_retryable_admission_boundary(state, active_work_attempt, requested.len());
+}
+
+fn has_pending_run_dependency<H: AgenticLoopHost>(host: &H, state: &AgenticLoopState) -> bool {
+    let Some(run_id) = state.current_run_id.as_deref() else {
+        return false;
+    };
+    host.direct_child_completion_owner(state)
+        .is_some_and(|owner| owner.parent_run_id() == run_id && owner.has_pending_direct_children())
+        || state.messaging.reply_obligations.has_pending(run_id)
 }
 
 /// Select the terminal repair boundary for a provider batch that could not
@@ -2910,12 +2924,14 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
         crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
     );
+    let pending_run_dependency = has_pending_run_dependency(host, state);
     settle_non_retryable_tool_rejections(
         state,
         &turn_result.accum.tool_calls,
         round_records_start,
         !edge_tool_round.is_empty(),
         active_work_attempt,
+        pending_run_dependency,
     );
 
     let waiting_reason = execution_boundary_blocked_wait_reason(&new_tool_results);
@@ -3676,6 +3692,7 @@ mod tests {
             &mut state,
             std::slice::from_ref(&call),
             0,
+            false,
             false,
             false,
         );
@@ -4745,6 +4762,101 @@ mod tests {
             &requested,
             &state.stall.tool_call_records
         ));
+    }
+
+    #[test]
+    fn pending_run_dependency_preserves_communication_after_non_retryable_rejection() {
+        let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "parent-run",
+            "child-agent",
+        );
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            agent_id: "child-agent".into(),
+            run_id: "child-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            status: crate::orchestration::AgentStatus::Running {
+                activity: "working".into(),
+            },
+        });
+        let mut host = MockHost::new(Vec::new());
+        host.direct_child_owner = Some(Arc::clone(&owner));
+        let mut state = make_state();
+        state.current_run_id = Some("parent-run".into());
+        assert!(has_pending_run_dependency(&host, &state));
+
+        let call =
+            json!({"id":"bad-settle","function":{"name":"settle_work_item","arguments":"{}"}});
+        crate::turn::agentic::tool_interception::record_pre_execution_rejections(
+            &mut state,
+            vec![super::super::host::RejectedToolCall::ordinary(
+                call.clone(),
+                json!({"status":"rejected","retryable":false,"error_kind":"canonical_work_attempt_required"}).to_string(),
+            )],
+        );
+        assert!(all_requested_calls_rejected_non_retryable(
+            std::slice::from_ref(&call),
+            &state.stall.tool_call_records
+        ));
+        let pending_run_dependency = has_pending_run_dependency(&host, &state);
+        settle_non_retryable_tool_rejections(
+            &mut state,
+            std::slice::from_ref(&call),
+            0,
+            false,
+            false,
+            pending_run_dependency,
+        );
+        assert!(!state.hooks.completion_settlement.text_only);
+        assert!(!state.hooks.completion_settlement.work_settlement_only);
+
+        state.current_run_id = Some("foreign-run".into());
+        assert!(!has_pending_run_dependency(&host, &state));
+        state.current_run_id = Some("parent-run".into());
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            agent_id: "child-agent".into(),
+            run_id: "child-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            status: crate::orchestration::AgentStatus::Completed {
+                result: "done".into(),
+                finish_reason: None,
+            },
+        });
+        assert!(has_pending_run_dependency(&host, &state));
+        assert_eq!(owner.take_completed_direct_children().len(), 1);
+        assert!(!has_pending_run_dependency(&host, &state));
+
+        state
+            .messaging
+            .reply_obligations
+            .reserve(
+                "parent-run",
+                "question-1",
+                astra_messaging::types::AgentAddress::new("peer-run", "peer-agent"),
+            )
+            .expect("current-run question");
+        assert!(has_pending_run_dependency(&host, &state));
+        state
+            .messaging
+            .reply_obligations
+            .reject("parent-run", "question-1");
+        assert!(!has_pending_run_dependency(&host, &state));
+    }
+
+    #[test]
+    fn pending_child_does_not_bypass_active_work_settlement_boundary() {
+        let call = json!({"id":"rejected-call","function":{"name":"read_file","arguments":"{}"}});
+        let mut state = make_state();
+        crate::turn::agentic::tool_interception::record_pre_execution_rejections(
+            &mut state,
+            vec![super::super::host::RejectedToolCall::ordinary(
+                call.clone(),
+                json!({"status":"rejected","retryable":false,"error_kind":"work_policy_denied"})
+                    .to_string(),
+            )],
+        );
+        settle_non_retryable_tool_rejections(&mut state, &[call], 0, false, true, true);
+        assert!(state.hooks.completion_settlement.work_settlement_only);
+        assert!(!state.hooks.completion_settlement.text_only);
     }
 
     #[test]

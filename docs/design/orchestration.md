@@ -44,6 +44,16 @@ neither a one-slot nor a multi-slot fanout proposal, valid or malformed, can
 start work or authorize sibling calls before the `start_work` receipt. An
 already-bound WorkItem retains its own execution authority.
 
+An ordinary child running, waiting, or asking its parent a question does not
+assign a canonical WorkItem attempt. `settle_work_item` is admitted only for a
+runtime-assigned primary or delegated WorkItem attempt; an unassigned call is
+rejected before settlement storage is accessed. The database remains the
+authority for valid attempt settlement and replay.
+Rejecting an invalid call does not close the parent's existing communication
+authority while its own child result or correlated reply is still pending;
+the invalid call remains non-retryable, and normal deadline, cancellation,
+budget, and tool admission still apply.
+
 Required fields:
 
 ```text

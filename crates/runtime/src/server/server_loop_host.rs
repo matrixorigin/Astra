@@ -11579,6 +11579,10 @@ impl ServerAgenticLoopHost {
                     "canonical_work_establishment_required",
                     "This turn requires canonical Work. Establish its task list with start_work before root exploration or task execution; the server will then route task execution through run_next_work_item.",
                 )),
+                "settle_work_item" => Some((
+                    "canonical_work_attempt_required",
+                    "No canonical WorkItem attempt is assigned to this run. Waiting for an ordinary child agent is not a blocked WorkItem; continue the child handoff without repeating this settlement.",
+                )),
                 "run_next_work_item"
                     if !run_next_work_authorized && !work_is_established_in_batch =>
                 {
@@ -11674,6 +11678,7 @@ impl ServerAgenticLoopHost {
                 let retryable = !matches!(
                     error_kind,
                     "canonical_work_required"
+                        | "canonical_work_attempt_required"
                         | "canonical_work_task_execution_required"
                         | "canonical_work_parallel_execution_not_allowed"
                         | "canonical_work_settlement_parallel_execution_not_allowed"
@@ -32435,6 +32440,86 @@ mod tests {
             "the typed Work entrypoint remains usable"
         );
         assert!(admission.rejected.is_empty());
+    }
+
+    #[test]
+    fn ordinary_child_wait_cannot_settle_an_unassigned_work_attempt() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-unbound-settle".to_string(),
+            "s-unbound-settle".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        let mut state = create_test_state();
+        let settle = json!({
+            "id": "settle-while-child-runs",
+            "type": "function",
+            "function": {
+                "name": "settle_work_item",
+                "arguments": r#"{"outcome":"blocked","summary":"waiting for child","blocker_kind":"dependency_blocked"}"#
+            }
+        });
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: ordinary_admitted([settle.clone()]),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert!(admission.admitted.is_empty());
+        let result: Value = serde_json::from_str(&admission.rejected[0].result)
+            .expect("typed rejection before settlement storage");
+        assert_eq!(result["error_kind"], "canonical_work_attempt_required");
+        assert_eq!(result["retryable"], false);
+        assert!(result["error"].as_str().unwrap().contains("ordinary child"));
+        crate::turn::agentic::tool_interception::record_pre_execution_rejections(
+            &mut state,
+            admission.rejected,
+        );
+        crate::turn::agentic_loop::tool_phase::settle_non_retryable_tool_rejections(
+            &mut state,
+            &[settle],
+            0,
+            false,
+            false,
+            false,
+        );
+        assert!(
+            state.hooks.completion_settlement.text_only,
+            "without an outstanding run dependency the ordinary non-retryable boundary remains"
+        );
+
+        let carrier = json!({
+            "id": "settle-carrier-while-child-runs",
+            "type": "function",
+            "function": {
+                "name": "invoke_tool",
+                "arguments": r#"{"name":"settle_work_item","arguments":{"outcome":"blocked","summary":"waiting for child","blocker_kind":"dependency_blocked"}}"#
+            }
+        });
+        let logical = astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::runtime_control_from_carrier(
+            &carrier,
+            astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::WorkSettlement,
+        )
+        .expect("valid carrier")
+        .expect("settlement target");
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![logical],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert!(admission.admitted.is_empty());
+        let result: Value = serde_json::from_str(&admission.rejected[0].result)
+            .expect("carrier target receives the same typed rejection");
+        assert_eq!(result["error_kind"], "canonical_work_attempt_required");
     }
 
     #[test]
