@@ -779,11 +779,11 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
         body.push_str(&format!(
             "         - `task` is an agent type, not a callable tool name. {surface_guidance}; use `start_work` for durable tracked outcomes. Never invent `task(...)` or use background task controls as the Work graph.\n"
         ));
-        body.push_str(
-            "         - Delegated model selection uses authorized catalog admission. A `model_catalog` page with `coverage=complete` lists all active Chat models for this principal; workspace files cannot verify or extend it. Do not inspect local configuration or credentials for model availability.\n",
-        );
     }
     if agent_visible {
+        body.push_str(
+            "         - For an ordinary independent child with a user-named model, call visible `agent` spawn directly and omit `requested_model_policy`; runtime admission resolves the authorized model. Use `agent_fanout` when group-wide preflight is required. `model_catalog` is for availability, comparison, or ambiguity, not a spawn prerequisite. Never inspect workspace configuration or credentials to identify or verify a delegated model, or silently substitute an unavailable or prohibited model.\n",
+        );
         body.push_str(
             "         - After `agent.spawn`, continue only independent parent work needed for the user's request. If none remains, propose the final answer without polling or shell sleep: when this run owns pending direct children and continuation is available, the runtime waits for terminal results and gives another synthesis round. A `get_result` still-running snapshot is not a child failure.\n",
         );
@@ -1707,14 +1707,20 @@ mod tests {
         assert!(
             agent_surface.contains("only independent parent work needed for the user's request")
         );
-        assert!(agent_surface.contains("`coverage=complete` lists all active Chat models"));
-        assert!(agent_surface.contains("workspace files cannot verify or extend it"));
+        assert!(agent_surface.contains("call visible `agent` spawn directly"));
+        assert!(agent_surface.contains("not a spawn prerequisite"));
+        assert!(agent_surface.contains("silently substitute an unavailable or prohibited model"));
         let fanout_surface = build_main_system_prompt(&["agent_fanout"], "");
-        assert!(fanout_surface.contains("workspace files cannot verify or extend it"));
+        assert!(!fanout_surface.contains("call visible `agent` spawn directly"));
         assert!(
             fanout_surface.contains("Use visible `agent_fanout` with `defaults.agent_type=task`")
         );
         assert!(!fanout_surface.contains("Use visible `agent` with action=spawn"));
+        let combined_surface = build_main_system_prompt(&["agent", "agent_fanout"], "");
+        assert!(combined_surface.contains("call visible `agent` spawn directly"));
+        assert!(
+            combined_surface.contains("Use `agent_fanout` when group-wide preflight is required")
+        );
 
         let stable_work_surface = build_main_system_prompt(
             &[
@@ -2237,6 +2243,19 @@ mod tests {
             "ordinary capability guidance uses {} bytes; keep it below 3 KiB",
             resident.len()
         );
+        let with_agent = tool_conditional_section(&[
+            "agent",
+            "bash",
+            "glob",
+            "grep",
+            "read_file",
+            "tool_search",
+        ]);
+        assert!(
+            with_agent.len() <= 4_000,
+            "agent capability guidance uses {} bytes; keep it below 4 KiB",
+            with_agent.len()
+        );
 
         let work = tool_conditional_section(&[
             "bash",
@@ -2284,6 +2303,8 @@ mod tests {
 
         let discoverable = tool_conditional_section(&["agent", "tool_search"]);
         assert!(discoverable.contains("tool_search select:agent"));
+        assert!(discoverable.contains("call visible `agent` spawn directly"));
+        assert!(discoverable.contains("not a spawn prerequisite"));
     }
 
     #[test]

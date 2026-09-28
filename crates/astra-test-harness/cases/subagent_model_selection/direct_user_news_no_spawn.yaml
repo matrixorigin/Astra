@@ -17,6 +17,7 @@ criteria:
   - type: journal_tool_call_count
     name: web_fetch
     min: 1
+    max: 20
   - type: text_contains
     needle: sina.com.cn
   - type: journal_tool_call_count
