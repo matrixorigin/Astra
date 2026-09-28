@@ -1805,13 +1805,22 @@ esac
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn model_probe_timeout_reaps_its_child() {
+        fn process_identity(stat: &str) -> Option<(&str, &str, &str)> {
+            let (pid_and_comm, fields) = stat.rsplit_once(") ")?;
+            let (pid, _) = pid_and_comm.split_once(" (")?;
+            let state = fields.split_whitespace().next()?;
+            // /proc/<pid>/stat field 22 is starttime; fields begins at field 3.
+            let starttime = fields.split_whitespace().nth(19)?;
+            Some((pid, state, starttime))
+        }
+
         let workspace = tempfile::tempdir().unwrap();
         let pid_file = workspace.path().join("probe.pid");
         let descendant_file = workspace.path().join("descendant.pid");
         let mut command = tokio::process::Command::new("sh");
         command.args([
             "-c",
-            "printf '%s' $$ > \"$1\"; sleep 5 & printf '%s' $! > \"$2\"; wait",
+            "IFS= read -r stat < /proc/$$/stat; printf '%s\n' \"$stat\" > \"$1\"; sleep 5 & IFS= read -r stat < /proc/$!/stat; printf '%s\n' \"$stat\" > \"$2\"; wait",
             "sh",
             pid_file.to_str().unwrap(),
             descendant_file.to_str().unwrap(),
@@ -1827,20 +1836,24 @@ esac
         .unwrap_err();
         assert!(error.contains("timed out"), "{error}");
         for file in [pid_file, descendant_file] {
-            let pid = std::fs::read_to_string(file).unwrap();
+            let original_stat = std::fs::read_to_string(file).unwrap();
+            let (pid, _, starttime) = process_identity(&original_stat).unwrap();
             let proc_path = format!("/proc/{pid}/stat");
-            for _ in 0..40 {
-                let inactive = std::fs::read_to_string(&proc_path)
-                    .map(|stat| stat.split_whitespace().nth(2) == Some("Z"))
-                    .unwrap_or(true);
-                if inactive {
+            let mut active = false;
+            for attempt in 0..=40 {
+                active = std::fs::read_to_string(&proc_path)
+                    .map(|stat| {
+                        process_identity(&stat).is_some_and(|(_, state, current_starttime)| {
+                            // A reaped PID may be reused while the test is polling.
+                            current_starttime == starttime && !matches!(state, "Z" | "X" | "x")
+                        })
+                    })
+                    .unwrap_or(false);
+                if !active || attempt == 40 {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            let active = std::fs::read_to_string(&proc_path)
-                .map(|stat| stat.split_whitespace().nth(2) != Some("Z"))
-                .unwrap_or(false);
             assert!(!active, "timed-out model probe process {pid} stayed active");
         }
     }
