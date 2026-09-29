@@ -447,12 +447,19 @@ truncation and cannot satisfy the shadow promotion gate when truncated.
 Admin-reviewed terminal-run outcomes reference a versioned acceptance rubric and
 evidence, with separately optional correctness, correction, full-episode cost and
 latency. They append idempotently to the existing run ledger with reviewer/time
-provenance. Unknown quality and prices remain unknown; cost per acceptable task
-is null unless all session representatives have quality and complete prices.
+provenance, including for terminal delegated runs. Sequential and concurrent
+identical submissions preserve the first accepted reviewer/time envelope;
+conflicting reports cannot change deployment state or its audit. Unknown quality
+and prices remain unknown; cost per acceptable task is null unless all session
+representatives have quality and complete prices.
 These operational comparisons are descriptive, not a powered online qualification
 or proof that unchosen models would succeed. A reported critical access/safety
-violation rolls back the same deployment under its database row lock before
-acknowledgment, even if its revision advanced concurrently. Other quality, cost,
+violation is accepted in the run ledger before it rolls back the same deployment
+under its database row lock. Acknowledgment requires that stop, even if its
+revision advanced concurrently; an identical retry finishes the stop if the
+previous request was interrupted after acceptance. Under the deployment lock,
+critical reports against an already stopped deployment preserve the winning stop
+reason, revision and audit. Other quality, cost,
 correction and latency regressions require operator review and rollback; the API
 does not continuously inspect production traces or invent missing labels.
 

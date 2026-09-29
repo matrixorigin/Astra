@@ -1,7 +1,7 @@
 //! Operator-controlled deployment boundary. All paths use existing admin auth;
 //! none trusts a saved offline approval or reads server-local evidence files.
 use super::*;
-use astra_services::runs::RunStateStore;
+use astra_services::runs::{RunStateStore, durable_run_status_is_terminal};
 use astra_services::tuning::rollout::*;
 use astra_turn_core::model_routing::rollout::{
     RouterPublishRequest, deployment_candidate, prepare_shadow,
@@ -214,7 +214,7 @@ pub(super) async fn outcome(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| bad("Unknown owner/run"))?;
-    if !matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
+    if !durable_run_status_is_terminal(&run.status) {
         return Err(bad("Outcome requires a terminal run"));
     }
     let event = runs
@@ -236,9 +236,62 @@ pub(super) async fn outcome(
     if outcome.rubric_version != pinned.rubric_version {
         return Err(bad("Outcome rubric differs from the pinned deployment"));
     }
-    // Historical reports remain valid. Only stop the exact deployment that
-    // produced the run; publication may race this check but cannot be stopped.
-    if outcome.critical_violation {
+    let record = ReviewedOutcomeRecord {
+        deployment_id: pinned.deployment_id.clone(),
+        reviewed_by: admin.user_id.clone(),
+        reviewed_at: Utc::now(),
+        outcome,
+    };
+    let event =
+        serde_json::json!({"event_type":OUTCOME_EVENT,"idempotency_key":OUTCOME_KEY,"data":record});
+    // Resolve immutable acceptance before applying any report's safety stop.
+    // Reviewer/time belong to the first accepted envelope, not the retry.
+    let matches_saved = |saved: &serde_json::Value| {
+        saved["data"]["deployment_id"] == event["data"]["deployment_id"]
+            && saved["data"]["outcome"] == event["data"]["outcome"]
+    };
+    let status = if let Some(saved) = runs
+        .load_run_event_by_idempotency_key(&owner, &run_id, OUTCOME_EVENT, OUTCOME_KEY)
+        .await
+        .map_err(internal_error)?
+    {
+        if !matches_saved(&saved) {
+            return Err(conflict("A different reviewed outcome is already recorded"));
+        }
+        StatusCode::OK
+    } else {
+        match runs
+            .append_events_if_current_generation_and_status(
+                &owner,
+                &run.session_id,
+                &run_id,
+                run.run_generation,
+                &[run.status.as_str()],
+                std::slice::from_ref(&event),
+            )
+            .await
+        {
+            Ok(true) => StatusCode::CREATED,
+            Ok(false) => return Err(conflict("Run changed during outcome recording")),
+            Err(error) => {
+                // A concurrent identical report can win with a different
+                // server-owned envelope. Reconcile against the durable winner
+                // without relaxing the canonical writer's immutable check.
+                let saved = runs
+                    .load_run_event_by_idempotency_key(&owner, &run_id, OUTCOME_EVENT, OUTCOME_KEY)
+                    .await
+                    .map_err(internal_error)?;
+                if !saved.as_ref().is_some_and(matches_saved) {
+                    return Err(conflict(error));
+                }
+                StatusCode::OK
+            }
+        }
+    };
+    // An accepted critical report must stop its deployment before acknowledgment.
+    // Retries also finish this step if an earlier attempt stopped after append.
+    // Historical reports never stop a replacement deployment.
+    if record.outcome.critical_violation {
         let current = registry.load(&owner).await.map_err(internal_error)?;
         if current.deployment.as_ref().is_some_and(|d| {
             d.deployment_id == pinned.deployment_id && d.mode != RolloutMode::RolledBack
@@ -254,47 +307,12 @@ pub(super) async fn outcome(
             .await
         {
             let latest = registry.load(&owner).await.map_err(internal_error)?;
-            if latest
-                .deployment
-                .as_ref()
-                .is_some_and(|d| d.deployment_id == pinned.deployment_id)
-            {
+            if latest.deployment.as_ref().is_some_and(|d| {
+                d.deployment_id == pinned.deployment_id && d.mode != RolloutMode::RolledBack
+            }) {
                 return Err(conflict(error));
             }
         }
     }
-    let record = ReviewedOutcomeRecord {
-        deployment_id: pinned.deployment_id.clone(),
-        reviewed_by: admin.user_id,
-        reviewed_at: Utc::now(),
-        outcome,
-    };
-    let event =
-        serde_json::json!({"event_type":OUTCOME_EVENT,"idempotency_key":OUTCOME_KEY,"data":record});
-    // Timestamp is server-owned; retry the same reviewed payload idempotently.
-    if let Some(saved) = runs
-        .load_run_event_by_idempotency_key(&owner, &run_id, OUTCOME_EVENT, OUTCOME_KEY)
-        .await
-        .map_err(internal_error)?
-    {
-        if saved["data"]["outcome"] == event["data"]["outcome"] {
-            return Ok(StatusCode::OK);
-        }
-        return Err(conflict("A different reviewed outcome is already recorded"));
-    }
-    let written = runs
-        .append_events_if_current_generation_and_status(
-            &owner,
-            &run.session_id,
-            &run_id,
-            run.run_generation,
-            &[run.status.as_str()],
-            &[event],
-        )
-        .await
-        .map_err(conflict)?;
-    if !written {
-        return Err(conflict("Run changed during outcome recording"));
-    }
-    Ok(StatusCode::CREATED)
+    Ok(status)
 }

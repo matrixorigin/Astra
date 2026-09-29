@@ -290,6 +290,17 @@ impl RouterRolloutStore for DatabaseRouterRolloutStore {
         if previous.revision != actual_revision {
             return Err("Corrupt rollout revision".into());
         }
+        // A handler's preflight may race another stop. Resolve this under the
+        // deployment lock so retries preserve the winning revision and audit.
+        if let RolloutChange::CriticalViolation { deployment_id } = &change
+            && previous.deployment.as_ref().is_some_and(|d| {
+                d.deployment_id == *deployment_id && d.mode == RolloutMode::RolledBack
+            })
+        {
+            tx.rollback().await.map_err(|e| e.to_string())?;
+            connection.release();
+            return Ok(previous);
+        }
         let operation = match &change {
             RolloutChange::Publish(d) => {
                 serde_json::json!({"type":"publish_shadow", "candidate_sha256":d.tuning.candidate_sha256, "protocol_sha256":d.tuning.protocol_sha256, "review":d.review})

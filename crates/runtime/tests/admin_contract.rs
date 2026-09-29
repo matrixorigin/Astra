@@ -721,6 +721,8 @@ mod isolated_router_database;
 mod rollout_db_common;
 #[path = "../../services/tests/common/router_deployment.rs"]
 mod rollout_db_fixture;
+#[path = "admin_contract/router_outcomes.rs"]
+mod router_outcomes;
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1 and explicitly isolated ASTRA_TEST_DATABASE"]

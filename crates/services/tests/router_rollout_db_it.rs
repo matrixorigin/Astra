@@ -131,6 +131,8 @@ async fn router_rollout_transactions_are_atomic_audited_and_owner_scoped() {
     );
     // Safety stops target the deployment under lock, even if another operation
     // advanced its revision after the reviewer loaded it.
+    let before_stop = store.load(&owner).await.unwrap();
+    let already_stopped = before_stop.deployment.as_ref().unwrap().mode == RolloutMode::RolledBack;
     let stopped = store
         .change(
             &owner,
@@ -142,14 +144,18 @@ async fn router_rollout_transactions_are_atomic_audited_and_owner_scoped() {
         )
         .await
         .unwrap();
-    assert_eq!(stopped.revision, 3);
+    assert_eq!(stopped.revision, 2 + u64::from(!already_stopped));
     assert_eq!(
         stopped.deployment.as_ref().unwrap().mode,
         RolloutMode::RolledBack
     );
     assert_eq!(
         stopped.deployment.as_ref().unwrap().stop_reason.as_deref(),
-        Some("critical_violation")
+        Some(if already_stopped {
+            "operator_stop"
+        } else {
+            "critical_violation"
+        })
     );
     assert!(
         store
@@ -164,10 +170,27 @@ async fn router_rollout_transactions_are_atomic_audited_and_owner_scoped() {
             .await
             .is_err()
     );
+    // Repeated safety stops with stale revisions preserve the winning state,
+    // including a manual stop reason. A mismatched deployment still conflicts.
+    let replay = store
+        .change(
+            &owner,
+            1,
+            &actor,
+            RolloutChange::CriticalViolation {
+                deployment_id: d.deployment_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&replay).unwrap(),
+        serde_json::to_value(&stopped).unwrap()
+    );
     let revoked = store
         .change(
             &owner,
-            3,
+            stopped.revision,
             &actor,
             RolloutChange::Revoke {
                 source_ids: vec!["source-1".into()],
@@ -183,7 +206,7 @@ async fn router_rollout_transactions_are_atomic_audited_and_owner_scoped() {
         store
             .change(
                 &owner,
-                4,
+                revoked.revision,
                 &actor,
                 RolloutChange::Publish(Box::new(d.clone()))
             )
@@ -209,10 +232,10 @@ async fn router_rollout_transactions_are_atomic_audited_and_owner_scoped() {
     .await
     .unwrap();
     assert_eq!(
-        audits, 4,
-        "failed CAS/validation must not commit audit or state"
+        audits, revoked.revision as i64,
+        "failed mutations and stop replays must not commit extra audits"
     );
-    assert_eq!(store.load(&owner).await.unwrap().revision, 4);
+    assert_eq!(store.load(&owner).await.unwrap().revision, revoked.revision);
     let (runs, truncated) = store.runs(&owner, &revoked).await.unwrap();
     assert!(runs.is_empty() && !truncated);
     sqlx::query("DELETE FROM model_router_deployments WHERE user_id = ?")
