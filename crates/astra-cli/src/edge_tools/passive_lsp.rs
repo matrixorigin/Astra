@@ -5,14 +5,13 @@
 //! - Rust env overrides: `ASTRA_LSP_RUST`, `ASTRA_RUST_ANALYZER_CMD`
 //! - TS env overrides: `ASTRA_LSP_TYPESCRIPT`, `ASTRA_TYPESCRIPT_SERVER_CMD`
 //!
-//! Drain order: rust LSP, then TypeScript LSP (before `cargo` / `tsc` in the payload).
+//! Published snapshots support explicit LSP queries, not automatic chat injection.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::time::sleep;
 
 use super::lsp_stdio_session::{LanguageIdPolicy, LspSpawnSpec, LspStdioSession, path_to_uri};
 
@@ -252,7 +251,6 @@ fn rust_spawn_spec(project_root: &Path) -> LspSpawnSpec {
         command: resolved.command,
         args: resolved.args,
         diagnostic_title: "rust-analyzer",
-        attachment_source: "rust_analyzer_lsp",
         language_policy: LanguageIdPolicy::Fixed("rust"),
         initialization_options: Some(configuration.clone()),
         configuration_section: Some("rust-analyzer"),
@@ -293,7 +291,6 @@ fn typescript_spawn_spec(project_root: &Path) -> LspSpawnSpec {
         command: resolved.command,
         args: resolved.args,
         diagnostic_title: "typescript-language-server",
-        attachment_source: "typescript_lsp",
         language_policy: LanguageIdPolicy::TypeScript,
         initialization_options: None,
         configuration_section: None,
@@ -675,39 +672,15 @@ impl PassiveLspManager {
             }
         })
     }
-
-    pub async fn take_diagnostic_messages(&self, tool_results_nonempty: bool) -> Vec<Value> {
-        if !tool_results_nonempty {
-            return Vec::new();
-        }
-        sleep(Duration::from_millis(POST_SYNC_DRAIN_MS)).await;
-        let mut out = Vec::new();
-        if let Ok(g) = self.rust.lock()
-            && let Some(s) = g.as_ref()
-        {
-            out.extend(s.take_formatted_diagnostic_messages());
-        }
-        if let Ok(g) = self.typescript.lock()
-            && let Some(s) = g.as_ref()
-        {
-            out.extend(s.take_formatted_diagnostic_messages());
-        }
-        out
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::LspStdioSession;
     use super::{
-        ASTRA_LSP_CONFIG_FILE, PassiveLspManager, rust_lsp_config, rust_spawn_spec,
-        should_use_rust_lsp, should_use_typescript_lsp, typescript_lsp_config,
-        typescript_spawn_spec,
+        ASTRA_LSP_CONFIG_FILE, PassiveLspManager, rust_lsp_config, should_use_rust_lsp,
+        should_use_typescript_lsp,
     };
     use std::path::Path;
-    use std::process::{Command, Stdio};
-    use std::time::Duration;
-    use tokio::time::sleep;
 
     struct EnvGuard {
         key: &'static str,
@@ -821,93 +794,5 @@ mod tests {
                 .unwrap_or("")
                 .contains(ASTRA_LSP_CONFIG_FILE)
         );
-    }
-
-    #[tokio::test]
-    async fn no_sessions_take_empty() {
-        let m = PassiveLspManager::new();
-        let v = m.take_diagnostic_messages(true).await;
-        assert!(v.is_empty());
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn rust_spawn_sync_smoke() {
-        let _g = EnvGuard::set("ASTRA_LSP_RUST", "1");
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let Ok(status) = Command::new(rust_lsp_config(&root).command)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        else {
-            return;
-        };
-        if !status.success() {
-            return;
-        }
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname=\"ra_smoke\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/lib.rs"), "pub fn f() -> i32 { 1 }\n").unwrap();
-
-        let sess = match LspStdioSession::try_spawn(root.clone(), rust_spawn_spec(&root)) {
-            Ok(Some(s)) => s,
-            Ok(None) | Err(_) => return,
-        };
-        sess.sync_document_from_disk(&root.join("src/lib.rs"))
-            .expect("sync");
-        sleep(Duration::from_millis(500)).await;
-        let msgs = sess.take_formatted_diagnostic_messages();
-        for m in msgs {
-            assert!(m["content"].as_str().unwrap().contains("rust-analyzer"));
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn typescript_server_spawn_sync_smoke() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let cmd = typescript_lsp_config(&root).command;
-        let Ok(status) = Command::new(&cmd)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        else {
-            return;
-        };
-        if !status.success() {
-            return;
-        }
-        std::fs::write(
-            root.join("tsconfig.json"),
-            r#"{"compilerOptions":{"strict":true},"include":["*.ts"]}"#,
-        )
-        .unwrap();
-        std::fs::write(root.join("ok.ts"), "export const x = 1;\n").unwrap();
-
-        let sess = match LspStdioSession::try_spawn(root.clone(), typescript_spawn_spec(&root)) {
-            Ok(Some(s)) => s,
-            Ok(None) | Err(_) => return,
-        };
-        sess.sync_document_from_disk(&root.join("ok.ts"))
-            .expect("sync");
-        sleep(Duration::from_millis(400)).await;
-        let msgs = sess.take_formatted_diagnostic_messages();
-        for m in msgs {
-            assert!(
-                m["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("typescript-language-server")
-            );
-        }
     }
 }
