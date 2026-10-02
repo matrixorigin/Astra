@@ -2,9 +2,10 @@ use serde_json::{Map, Value};
 
 use astra_core::work_unit::{WORK_UNIT_OBSERVATION_FIELD, WorkUnitObservation};
 use astra_turn_core::orchestration::agent_result_wire::{
-    AGENT_RESULT_CLASS_AGENT_INCOMPLETE, AgentToolResultStatusKind, DecodedAgentToolResult,
-    agent_fanout_result_looks_like, agent_fanout_structured_result_class,
-    agent_tool_structured_result_class, decode_agent_tool_result,
+    AGENT_RESULT_CLASS_AGENT_INCOMPLETE, AgentFanoutControlReceiptKind, AgentToolResultStatusKind,
+    DecodedAgentToolResult, agent_fanout_control_receipt_kind,
+    agent_fanout_structured_result_class, agent_tool_structured_result_class,
+    decode_agent_tool_result,
 };
 
 use super::tool_transport_metadata::{
@@ -138,13 +139,24 @@ fn execution_boundary_wait_error_kind(reason: &str) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn agent_tool_result_from_output(output: String) -> astra_tools::ToolResult {
+pub(crate) fn agent_tool_result_from_output(
+    tool_name: &str,
+    output: String,
+) -> astra_tools::ToolResult {
     let parsed = serde_json::from_str::<Value>(&output).ok();
     let result_class = match parsed.as_ref() {
         None => Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE),
         Some(value) => {
-            if value.get("result_family").is_none() && agent_fanout_result_looks_like(value) {
-                agent_fanout_structured_result_class(value)
+            if tool_name == "agent_fanout" {
+                agent_fanout_structured_result_class(value).or_else(|| {
+                    // Acceptance is not a failed child result. The canonical
+                    // control parser owns the receipt identity; child settlement
+                    // remains enforced by the direct-child completion barrier.
+                    let accepted = value["status"] == "started"
+                        && agent_fanout_control_receipt_kind(&output)
+                            == Some(AgentFanoutControlReceiptKind::Group);
+                    (!accepted).then_some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE)
+                })
             } else {
                 agent_tool_structured_result_class(value)
             }
@@ -391,6 +403,7 @@ mod tests {
     fn blocked_agent_result_preserves_work_observation_metadata() {
         for status in ["waiting", "paused"] {
             let result = agent_tool_result_from_output(
+                "agent",
                 serde_json::json!({
                     "result_family": "child_result",
                     "status": status,
@@ -427,7 +440,7 @@ mod tests {
 
     #[test]
     fn control_receipt_metadata_is_neutral_and_malformed_receipts_fail_closed() {
-        let opaque = agent_tool_result_from_output("opaque executor failure".into());
+        let opaque = agent_tool_result_from_output("agent", "opaque executor failure".into());
         assert_eq!(
             result_metadata_str(&opaque, "result_class"),
             Some("agent_incomplete")
@@ -444,7 +457,7 @@ mod tests {
                 "message_id":"m", "target":"parent", "message_type":"text", "recipients":null
             }),
         ] {
-            let result = agent_tool_result_from_output(receipt.to_string());
+            let result = agent_tool_result_from_output("agent", receipt.to_string());
             assert!(!result.is_error);
             assert_eq!(result_metadata_str(&result, "result_class"), None);
             for (field, invalid) in [
@@ -460,7 +473,7 @@ mod tests {
                 invalid_receipt[field] = invalid;
                 invalid_receipt["group_id"] = serde_json::json!("group");
                 invalid_receipt["results"] = serde_json::json!([]);
-                let result = agent_tool_result_from_output(invalid_receipt.to_string());
+                let result = agent_tool_result_from_output("agent", invalid_receipt.to_string());
                 assert_eq!(
                     result_metadata_str(&result, "result_class"),
                     Some("agent_incomplete")
@@ -468,7 +481,43 @@ mod tests {
             }
             let mut missing_status = receipt;
             missing_status.as_object_mut().unwrap().remove("status");
-            let result = agent_tool_result_from_output(missing_status.to_string());
+            let result = agent_tool_result_from_output("agent", missing_status.to_string());
+            assert_eq!(
+                result_metadata_str(&result, "result_class"),
+                Some("agent_incomplete")
+            );
+        }
+    }
+
+    #[test]
+    fn fanout_acceptance_is_not_a_failed_child_result() {
+        let receipt = serde_json::json!({
+            "status": "started",
+            "group_id": "group",
+            "target_count": 1,
+            "agents": [{"agent_id": "child", "run_id": "run", "status": "launched"}]
+        });
+        let result = agent_tool_result_from_output("agent_fanout", receipt.to_string());
+        assert!(!result.is_error);
+        assert_eq!(result_metadata_str(&result, "result_class"), None);
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.output).unwrap(),
+            receipt
+        );
+
+        // The same envelope is not an agent child result. Dispatch identity,
+        // not a coincidental field in the payload, selects the wire contract.
+        let wrong_tool = agent_tool_result_from_output("agent", receipt.to_string());
+        assert_eq!(
+            result_metadata_str(&wrong_tool, "result_class"),
+            Some("agent_incomplete")
+        );
+        for malformed in [
+            serde_json::json!({"status": "started"}),
+            serde_json::json!({"status": "started", "group_id": ""}),
+            serde_json::json!({"status": "unknown", "executed": null}),
+        ] {
+            let result = agent_tool_result_from_output("agent_fanout", malformed.to_string());
             assert_eq!(
                 result_metadata_str(&result, "result_class"),
                 Some("agent_incomplete")
@@ -479,6 +528,7 @@ mod tests {
     #[test]
     fn fanout_partial_completion_retains_typed_result_class() {
         let result = agent_tool_result_from_output(
+            "agent_fanout",
             serde_json::json!({
                 "status": "completed_with_issues",
                 "group_id": "fanout-1",
@@ -504,6 +554,7 @@ mod tests {
     #[test]
     fn fanout_rejection_preserves_not_executed_fact_for_the_journal() {
         let result = agent_tool_result_from_output(
+            "agent_fanout",
             serde_json::json!({
                 "status": "failed",
                 "error_kind": "fanout_group_already_started",
@@ -529,6 +580,7 @@ mod tests {
     #[test]
     fn fanout_unknown_execution_fact_does_not_become_rejection() {
         let result = agent_tool_result_from_output(
+            "agent_fanout",
             serde_json::json!({
                 "status": "unknown",
                 "error_kind": "action_outcome_unknown",

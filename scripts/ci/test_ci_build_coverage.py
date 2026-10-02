@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+import textwrap
 import tomllib
 import unittest
 
@@ -18,6 +19,90 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class BuildCoverageTests(unittest.TestCase):
+    def test_rust_setup_disk_guard_uses_workspace_free_space_without_real_cleanup(self):
+        action = (ROOT / ".github/actions/rust-setup/action.yml").read_text()
+        section = action.split("\n    - name: Guard workspace disk space\n", 1)[1]
+        run_block = section.split("\n    - name:", 1)[0]
+        script = textwrap.dedent(run_block.split("\n      run: |\n", 1)[1])
+        threshold_kib = 30 * 1024 * 1024
+        cleanup = [
+            "rm -rf /usr/share/dotnet",
+            "rm -rf /usr/local/lib/android",
+            "rm -rf /opt/ghc",
+            "rm -rf /opt/hostedtoolcache/CodeQL",
+            "docker image prune -af",
+        ]
+
+        for mode, available_kib, should_skip in (
+            ("above", threshold_kib + 1, True),
+            ("equal", threshold_kib, True),
+            ("below", threshold_kib - 1, False),
+            ("invalid", "not-a-number", False),
+            ("failure", None, False),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                mock_bin = root / "mock-bin"
+                mock_bin.mkdir()
+                workspace = root / "workspace"
+                workspace.mkdir()
+                sudo_log = root / "sudo.log"
+
+                (mock_bin / "df").write_text(
+                    """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == *"-Pk"* ]]; then
+  case "${MOCK_DF_MODE}" in
+    above|equal|below|invalid)
+      printf '%s\\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on'
+      printf 'mock 100 10 %s 1%% /workspace\\n' "${MOCK_DF_AVAILABLE_KIB}"
+      ;;
+    failure)
+      printf '%s\\n' 'mock df failure' >&2
+      exit 7
+      ;;
+  esac
+else
+  printf '%s\\n' 'Filesystem Size Used Avail Capacity Mounted on'
+  printf '%s\\n' 'mock 100G 1G 99G 1% /workspace'
+fi
+"""
+                )
+                (mock_bin / "sudo").write_text(
+                    """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "${MOCK_SUDO_LOG}"
+"""
+                )
+                for command in (mock_bin / "df", mock_bin / "sudo"):
+                    command.chmod(0o755)
+
+                environment = {
+                    **os.environ,
+                    "GITHUB_WORKSPACE": str(workspace),
+                    "MOCK_DF_MODE": mode,
+                    "MOCK_DF_AVAILABLE_KIB": str(available_kib or ""),
+                    "MOCK_SUDO_LOG": str(sudo_log),
+                    "PATH": f"{mock_bin}{os.pathsep}{os.environ['PATH']}",
+                }
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                output = result.stdout + result.stderr
+                decision = "skip cleanup" if should_skip else "run cleanup"
+                self.assertIn(f"Disk guard decision: {decision}", output)
+                self.assertIn(
+                    f"threshold={threshold_kib} KiB (30 GiB)",
+                    output,
+                )
+
+                invocations = sudo_log.read_text().splitlines() if sudo_log.exists() else []
+                self.assertEqual(invocations, [] if should_skip else cleanup)
+
     def test_make_lint_preserves_restored_artifacts_and_checks_all_targets(self):
         result = subprocess.run(
             ["make", "--no-print-directory", "-n", "lint", "CARGO=cargo"],

@@ -26,18 +26,41 @@ inputs:
 runs:
   using: "composite"
   steps:
-    # ubuntu-latest has ~14GB free; parallel shards each restore a multi-GB
-    # rust-cache target/ dir. Only the build job used to run this cleanup.
-    - name: Free disk space
+    # Avoid paying for cleanup when the filesystem containing the workspace has
+    # enough room. Keep the cleanup fallback for low or unreadable disk space.
+    - name: Guard workspace disk space
       shell: bash
       run: |
         set -euxo pipefail
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /usr/local/lib/android
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
-        sudo docker image prune -af 2>/dev/null || true
-        df -h /
+        disk_guard_workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE must be set}"
+        disk_guard_threshold_kib=$((30 * 1024 * 1024))
+        disk_guard_available_kib=""
+        disk_guard_measurement="invalid"
+
+        if disk_guard_available_kib="$(
+          df -Pk "${disk_guard_workspace}" |
+            awk 'NR == 2 { print $4; exit }'
+        )"; then
+          if [[ "${disk_guard_available_kib}" =~ ^[0-9]+$ ]]; then
+            disk_guard_measurement="valid"
+          fi
+        else
+          disk_guard_measurement="failed"
+        fi
+
+        if [[ "${disk_guard_measurement}" == "valid" ]] &&
+          (( disk_guard_available_kib >= disk_guard_threshold_kib )); then
+          echo "Disk guard decision: skip cleanup; workspace filesystem free=${disk_guard_available_kib} KiB; threshold=${disk_guard_threshold_kib} KiB (30 GiB)."
+        else
+          echo "Disk guard decision: run cleanup; measurement=${disk_guard_measurement}; workspace filesystem free=${disk_guard_available_kib:-unavailable} KiB; threshold=${disk_guard_threshold_kib} KiB (30 GiB)."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af 2>/dev/null || true
+        fi
+
+        df -h "${disk_guard_workspace}"
 
     - name: Install pinned Rust toolchain
       # The repository toolchain also owns test-created Cargo fixtures.

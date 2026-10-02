@@ -8471,6 +8471,7 @@ pub(crate) mod tests {
     #[test]
     fn agent_waiting_output_becomes_execution_boundary_blocked_result() {
         let result = agent_tool_result_from_output(
+            "agent",
             json!({
                 "result_family": "child_result",
                 "status": "waiting",
@@ -8492,6 +8493,7 @@ pub(crate) mod tests {
     #[test]
     fn generic_agent_waiting_output_stays_structured_but_not_execution_boundary() {
         let result = agent_tool_result_from_output(
+            "agent",
             json!({
                 "result_family": "child_result",
                 "status": "waiting",

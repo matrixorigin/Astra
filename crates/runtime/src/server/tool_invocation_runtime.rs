@@ -2895,6 +2895,7 @@ mod tests {
     #[test]
     fn control_execution_fact_reaches_canonical_terminal_classification() {
         let result = crate::server::tool_execution_result::agent_tool_result_from_output(
+            "agent_fanout",
             json!({
                 "status": "failed",
                 "error_kind": "fanout_group_already_started",
@@ -2926,6 +2927,7 @@ mod tests {
                 .unwrap(),
         );
         let rejected_result = crate::server::tool_execution_result::agent_tool_result_from_output(
+            "agent_fanout",
             json!({
                 "status": "failed",
                 "error_kind": "fanout_group_already_started",
@@ -2964,6 +2966,7 @@ mod tests {
                 .unwrap(),
         );
         let unknown_result = crate::server::tool_execution_result::agent_tool_result_from_output(
+            "agent_fanout",
             json!({
                 "status": "unknown",
                 "error_kind": "action_outcome_unknown",

@@ -195,6 +195,16 @@ struct FanoutStreamEvidence {
     child_run_ids: Vec<String>,
 }
 
+fn fanout_scripted_rounds(mut prefix: Vec<Value>, reply: &str, target_count: usize) -> Vec<Value> {
+    // Each terminal-child batch can supersede an in-flight response. Supply
+    // bounded text candidates, not repeated tools or an exhausted-script fallback.
+    prefix.extend(std::iter::repeat_n(
+        json!({"full_text": reply}),
+        target_count + 1,
+    ));
+    prefix
+}
+
 fn concurrent_fanout_payload(
     ctx: &super::harness::MatrixE2eCtx,
     case: &ConcurrentFanoutCase,
@@ -226,7 +236,7 @@ fn concurrent_fanout_payload(
                 "execution_topology": "parallel_subruns",
                 "required_capabilities": ["agent_spawner"],
             },
-            "test_llm_rounds": [
+            "test_llm_rounds": fanout_scripted_rounds(vec![
                 deferred_tool_search_round(&format!("{}-tool-search", case.name), "agent_fanout"),
                 deferred_tool_invoke_round(
                     &call_id,
@@ -260,8 +270,7 @@ fn concurrent_fanout_payload(
                     &format!("{}-fanout-results", case.name), "agent_fanout",
                     json!({"action": "get_results", "group_id": shared_group_id}),
                 ),
-                {"full_text": case.final_reply}
-            ],
+            ], &case.final_reply, 2),
             "test_spawn_child_llm_rounds": [child_round]
         }
     })
@@ -273,31 +282,40 @@ async fn captured_synthesis_children(
     session_id: &str,
     root_run_id: &str,
     final_reply: &str,
+    events: &[Value],
 ) -> Vec<Value> {
+    let completed_rounds = events
+        .iter()
+        .find(|event| event["type"] == "turn_complete")
+        .and_then(|event| event["llm_rounds"].as_u64())
+        .and_then(|rounds| rounds.checked_sub(1))
+        .expect("accepted final provider round");
     let captures = sqlx::query_scalar::<_, String>(
         "SELECT content_json FROM session_artifacts \
          WHERE user_id = ? AND session_id = ? AND turn = 1 \
            AND artifact_kind = 'llm_capture' AND source = 'server_loop_host' \
-         ORDER BY round ASC LIMIT 64",
+           AND round = ? LIMIT 2",
     )
     .bind(user_id)
     .bind(session_id)
+    .bind(completed_rounds)
     .fetch_all(pool)
     .await
     .expect("actual provider exchanges");
-    let exchanges = captures
-        .iter()
-        .map(|capture| serde_json::from_str::<Value>(capture).unwrap())
-        .filter(|capture| {
-            capture["response"]["full_text"] == final_reply
-                && capture["response"]["tool_calls"]
-                    .as_array()
-                    .is_none_or(Vec::is_empty)
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(exchanges.len(), 1, "one captured final synthesis exchange");
+    assert_eq!(
+        captures.len(),
+        1,
+        "one capture for the accepted final round"
+    );
+    let exchange: Value = serde_json::from_str(&captures[0]).unwrap();
+    assert_eq!(exchange["response"]["full_text"], final_reply);
+    assert!(
+        exchange["response"]["tool_calls"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
     let mut children = Vec::new();
-    for message in exchanges[0]["request"]["messages"].as_array().unwrap() {
+    for message in exchange["request"]["messages"].as_array().unwrap() {
         let Some(payload) = message["content"]
             .as_str()
             .and_then(|content| content.strip_prefix("<runtime-required-context>\n"))
@@ -375,14 +393,24 @@ async fn assert_concurrent_fanout_stream(
         "{}: parent synthesis preceded a child terminal: {raw_sse}",
         case.name
     );
+    let terminal_events = events
+        .iter()
+        .filter(|event| event["type"].as_str() == Some("turn_complete"))
+        .collect::<Vec<_>>();
     assert_eq!(
-        events
-            .iter()
-            .filter(|event| event["type"].as_str() == Some("turn_complete"))
-            .count(),
+        terminal_events.len(),
         1,
         "{}: one user turn must expose one terminal boundary",
         case.name
+    );
+    let root_terminal = events.iter().find(|event| {
+        event["type"] == "run_finished" && event["run_id"].as_str() == Some(root_run_id.as_str())
+    });
+    assert_eq!(
+        root_terminal.and_then(|event| event["status"].as_str()),
+        Some("completed"),
+        "{}: parent synthesis must finish successfully, including when children fail: {root_terminal:?}",
+        case.name,
     );
 
     let call_id = format!("{}-fanout-start", case.name);
@@ -415,6 +443,7 @@ async fn assert_concurrent_fanout_stream(
         &case.session_id,
         &root_run_id,
         &case.final_reply,
+        &events,
     )
     .await;
     assert_eq!(results.len(), 2, "{}: {results:?}", case.name);
@@ -893,14 +922,13 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
                 "execution_topology": "parallel_subruns",
                 "required_capabilities": ["agent_spawner"],
             },
-            "test_llm_rounds": [
+            "test_llm_rounds": fanout_scripted_rounds(vec![
                 deferred_tool_search_round("online-fanout-search", "agent_fanout"),
                 deferred_tool_invoke_round("online-fanout-start", "agent_fanout", fanout_args),
                 deferred_tool_invoke_round(
                     "online-fanout-wait", "agent", json!({"action": "wait", "timeout_ms": 10000}),
                 ),
-                {"full_text": final_reply}
-            ],
+            ], final_reply, 3),
             "test_spawn_child_llm_rounds": [
                 {"full_text": "durable child review result"}
             ]
@@ -2150,7 +2178,7 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
                     "execution_topology": "parallel_subruns",
                     "required_capabilities": ["agent_spawner"],
                 },
-                "test_llm_rounds": [
+                "test_llm_rounds": fanout_scripted_rounds(vec![
                     deferred_tool_search_round("online-failed-fanout-search", "agent_fanout"),
                     deferred_tool_invoke_round(
                         "online-failed-fanout-start",
@@ -2171,8 +2199,7 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
                     deferred_tool_invoke_round(
                         "online-failed-fanout-wait", "agent", json!({"action": "wait", "timeout_ms": 10000}),
                     ),
-                    {"full_text": final_reply}
-                ],
+                ], final_reply, 3),
                 "test_spawn_child_llm_rounds": [{
                     "error": {
                         "message": "online child provider failed with preserved cause",
@@ -2266,8 +2293,15 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
             .collect::<Vec<_>>(),
         vec![0, 1, 2]
     );
-    let children =
-        captured_synthesis_children(pool, user_id, &session_id, &root_run_id, final_reply).await;
+    let children = captured_synthesis_children(
+        pool,
+        user_id,
+        &session_id,
+        &root_run_id,
+        final_reply,
+        &events,
+    )
+    .await;
     assert_eq!(children.len(), 3);
     assert!(children.iter().all(|child| child["status"] == "failed"));
     assert_eq!(

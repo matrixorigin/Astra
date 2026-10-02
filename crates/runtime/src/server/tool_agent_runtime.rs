@@ -24,12 +24,13 @@ pub(crate) async fn execute_agent_tool(
     let correlated_args = correlated_agent_arguments(args, tool_call_id);
     if has_malformed_tool_args(args) {
         return agent_tool_result_from_output(
+            "agent",
             crate::orchestration::handle_agent_tool(&correlated_args, agent_tool_context).await,
         );
     }
     let action = match agent_action_from_args(args) {
         Ok(action) => action,
-        Err(error) => return agent_tool_result_from_output(render_agent_error(error)),
+        Err(error) => return agent_tool_result_from_output("agent", render_agent_error(error)),
     };
     if agent_tool_context.is_none()
         && !astra_turn_core::tool::registry::meta::tool_allows_validation_without_runtime_binding(
@@ -38,6 +39,7 @@ pub(crate) async fn execute_agent_tool(
         )
     {
         return agent_tool_result_from_output(
+            "agent",
             crate::orchestration::render_agent_runtime_binding_error("agent", action.as_str()),
         );
     }
@@ -48,6 +50,7 @@ pub(crate) async fn execute_agent_tool(
         | AgentAction::GetResult
         | AgentAction::Wait
         | AgentAction::SendMessage => agent_tool_result_from_output(
+            "agent",
             crate::orchestration::handle_agent_tool(&correlated_args, agent_tool_context).await,
         ),
     }
@@ -88,16 +91,20 @@ pub(crate) async fn execute_agent_fanout_tool(
     let correlated_args = correlated_agent_arguments(args, tool_call_id);
     if has_malformed_tool_args(args) {
         return agent_tool_result_from_output(
+            "agent_fanout",
             crate::orchestration::handle_agent_fanout_tool(&correlated_args, agent_tool_context)
                 .await,
         );
     }
     let action = match agent_fanout_action_from_args(args) {
         Ok(action) => action,
-        Err(error) => return agent_tool_result_from_output(render_agent_error(error)),
+        Err(error) => {
+            return agent_tool_result_from_output("agent_fanout", render_agent_error(error));
+        }
     };
     if agent_tool_context.is_none() {
         return agent_tool_result_from_output(
+            "agent_fanout",
             crate::orchestration::render_agent_runtime_binding_error(
                 "agent_fanout",
                 action.as_str(),
@@ -105,6 +112,7 @@ pub(crate) async fn execute_agent_fanout_tool(
         );
     }
     agent_tool_result_from_output(
+        "agent_fanout",
         crate::orchestration::handle_agent_fanout_tool(&correlated_args, agent_tool_context).await,
     )
     .with_source_bounded_model_projection()

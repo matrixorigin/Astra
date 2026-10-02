@@ -4640,6 +4640,7 @@ mod tests {
                 &identity,
                 &owner,
                 crate::server::tool_execution_result::agent_tool_result_from_output(
+                    "agent_fanout",
                     json!({
                         "status": "failed",
                         "error_kind": "fanout_group_already_started",
