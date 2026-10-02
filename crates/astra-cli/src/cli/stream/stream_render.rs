@@ -2646,7 +2646,6 @@ impl<'a> CliSseStreamHost<'a> {
                     | "str_replace"
                     | "multi_edit"
                     | "rename_symbol"
-                    | "notebook_edit"
                     | "mo_query"
             )
     }
@@ -8358,18 +8357,8 @@ pub(crate) fn style_tool_description(tool: &str, description: &str) -> String {
                 return s;
             }
         }
-        "notebook_edit" => {
-            if let Some(s) = style_first_matching_prefix(description, &["Notebook edit: "]) {
-                return s;
-            }
-        }
         "reflect" => {
             if let Some(s) = style_first_matching_prefix(description, &["Reflecting: "]) {
-                return s;
-            }
-        }
-        "context_analysis" => {
-            if let Some(s) = style_first_matching_prefix(description, &["Context analysis: "]) {
                 return s;
             }
         }
@@ -8710,18 +8699,11 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "introspect" => "Introspecting…".to_string(),
         "get_agent_info" => format!("Getting agent info: {preview}"),
         "reflect" => format!("Reflecting: \"{preview}\""),
-        "context_analysis" => format!("Context analysis: {preview}"),
         "run_chain" => format!("Running chain: {preview}"),
         "rollback_file_edits" => format!("Revert file edits: {preview}"),
         "rollback_database_snapshots" => format!("Revert DB snapshots: {preview}"),
         "send_message" => format!("Send message: {preview}"),
-        "diagnose" => format!("Diagnose: {preview}"),
         "env" => format!("Env: {preview}"),
-        "notebook_edit" => format!("Notebook edit: {preview}"),
-        "config" => format!("Config: {preview}"),
-        "brief" => format!("Brief: {preview}"),
-        "share_context" => format!("Share context: {preview}"),
-        "query_context" => format!("Query context: {preview}"),
         "adjust_config" => format!("Adjust config: {preview}"),
         "compress_context" => format!("Compress context: {preview}"),
         "rollback_session_state" => format!("Rollback session state: {preview}"),
@@ -14241,14 +14223,6 @@ mod tests {
             format_tool_display_from_preview("env", Some("get PATH")),
             "Env: get PATH"
         );
-        assert_eq!(
-            format_tool_display_from_preview("notebook_edit", Some("replace analysis.ipynb")),
-            "Notebook edit: replace analysis.ipynb"
-        );
-        assert_eq!(
-            format_tool_display_from_preview("query_context", Some("auth/")),
-            "Query context: auth/"
-        );
         // memory
         assert_eq!(
             format_tool_display_from_preview("memory", Some("action=purge topic=...")),
@@ -14276,10 +14250,6 @@ mod tests {
         assert_eq!(
             format_tool_display_from_preview("reflect", Some("why did the tool fail?")),
             "Reflecting: \"why did the tool fail?\""
-        );
-        assert_eq!(
-            format_tool_display_from_preview("context_analysis", Some("compare 3 vs 7")),
-            "Context analysis: compare 3 vs 7"
         );
         assert_eq!(
             format_tool_display_from_preview("run_chain", Some("search-and-read")),
@@ -15458,118 +15428,6 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&victim).expect("restored file"),
             "hello\n"
-        );
-        assert_eq!(
-            rollback_fields["transaction_rollback"]["files"]["reverted"]
-                .as_array()
-                .map(|entries| entries.len()),
-            Some(1)
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn transactional_batch_restores_notebook_edit_on_failure() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        let notebook = temp.path().join("analysis.ipynb");
-        std::fs::write(
-            &notebook,
-            r#"{"cells":[{"cell_type":"code","id":"cell-1","source":"x=1","metadata":{},"outputs":[],"execution_count":null}],"metadata":{"language_info":{"name":"python"}},"nbformat":4,"nbformat_minor":5}"#,
-        )
-        .expect("seed notebook");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(6, std::sync::atomic::Ordering::Relaxed);
-        let _ = executor.read_file(&serde_json::json!({"path": "analysis.ipynb"}));
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                skill_continuation: false,
-                turn_rollback_on_failure: false,
-                tool_cache: &mut tool_cache,
-                observability_hub: None,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let results = host
-            .execute_tools_batch(vec![
-                ToolBatchRequest {
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tr-1".to_string(),
-                    execution_timeout_ms: 300_000,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "notebook_edit".to_string(),
-                    args: serde_json::json!({
-                        "notebook_path": "analysis.ipynb",
-                        "edit_mode": "replace",
-                        "cell_id": "cell-1",
-                        "new_source": "x=2",
-                        "transaction_id": "tx-nb",
-                        "rollback_on_failure": true,
-                    }),
-                },
-                ToolBatchRequest {
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tr-2".to_string(),
-                    execution_timeout_ms: 300_000,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "read_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "missing.txt",
-                        "transaction_id": "tx-nb",
-                        "rollback_on_failure": true,
-                    }),
-                },
-            ])
-            .await;
-
-        assert_eq!(results.len(), 2);
-        let rollback_fields = results[1]
-            .tool_result_fields
-            .as_ref()
-            .expect("rollback fields");
-        assert_eq!(
-            rollback_fields["transaction_state"].as_str(),
-            Some("rolled_back")
-        );
-        let restored = std::fs::read_to_string(&notebook).expect("restored notebook");
-        assert!(
-            restored.contains("\"x=1\""),
-            "restored notebook: {restored}"
-        );
-        assert!(
-            !restored.contains("\"x=2\""),
-            "restored notebook: {restored}"
         );
         assert_eq!(
             rollback_fields["transaction_rollback"]["files"]["reverted"]

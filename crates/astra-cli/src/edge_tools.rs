@@ -79,8 +79,6 @@ pub mod agent_spawning;
 use astra_tools::build_test;
 pub use astra_tools::code_intel;
 use astra_tools::truncate_output;
-#[path = "edge_tools/context_sharing.rs"]
-pub mod context_sharing;
 #[path = "edge_tools/fs.rs"]
 mod fs_tools;
 pub(crate) use astra_tools::fuzzy_replacer;
@@ -102,10 +100,6 @@ pub use env_tools::apply_overlay as apply_env_overlay;
 pub(crate) use shell::shell_escape;
 #[path = "edge_tools/code_analysis.rs"]
 mod code_analysis;
-#[path = "edge_tools/config_tool.rs"]
-mod config_tool;
-#[path = "edge_tools/context_tools.rs"]
-mod context_tools;
 
 pub fn all_tool_schemas() -> Vec<Value> {
     let mut schemas = full_tool_schemas();
@@ -120,13 +114,9 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "agent",
     "agent_fanout",
     "ask_user",
-    "brief",
     "call_graph",
     "compress_context",
-    "config",
-    "context_analysis",
     "dead_code",
-    "diagnose",
     "enter_plan_mode",
     "env",
     "exit_plan_mode",
@@ -139,16 +129,13 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "model_catalog",
     "lsp",
     "mo_query",
-    "notebook_edit",
     "notify",
-    "query_context",
     "reflect",
     "rename_symbol",
     "rollback_database_snapshots",
     "rollback_file_edits",
     "rollback_session_state",
     "session",
-    "share_context",
     "symbol_search",
     "task_list",
     "task_output",
@@ -222,14 +209,10 @@ pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
     astra_turn_core::plan_mode_policy::is_plan_mode_blocked_tool(tool, args)
 }
 
-#[path = "edge_tools/diagnose.rs"]
-mod diagnose;
 #[path = "edge_tools/file_state.rs"]
 mod file_state;
 #[path = "edge_tools/lsp_tools.rs"]
 mod lsp_tools;
-#[path = "edge_tools/notebook_edit.rs"]
-mod notebook_edit;
 #[path = "edge_tools/self_mod_tools.rs"]
 mod self_mod_tools;
 #[path = "edge_tools/session_state.rs"]
@@ -290,8 +273,6 @@ use astra_tools::memoria::parse_memory_search_contents;
 #[path = "edge_tools/ask_user.rs"]
 mod ask_user;
 pub(crate) use ask_user::parse_ask_user_prompt;
-#[path = "edge_tools/context_analysis.rs"]
-mod context_analysis;
 #[path = "edge_tools/mcp_dispatch.rs"]
 mod mcp_dispatch;
 #[path = "edge_tools/tool_search.rs"]
@@ -1436,14 +1417,9 @@ pub struct ToolExecutor {
     /// bounded snapshot is copied into each child admission context.
     parent_model_reasoning:
         std::sync::Mutex<Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>>,
-    /// Optional shared context cache for cross-agent knowledge sharing.
-    /// Used by share_context and query_context tools.
-    pub context_cache: Option<std::sync::Arc<astra_runtime::orchestration::SharedContextCache>>,
-    /// Agent ID for context sharing attribution.
-    pub agent_id: Option<String>,
     /// Optional messaging context for the `send_message` tool.
     pub send_message_context: std::sync::Mutex<Option<agent_messaging::SendMessageRuntimeContext>>,
-    /// Optional observability session for context analysis tools.
+    /// Optional canonical observability session for introspection.
     /// Provides access to per-turn context assembly traces, timing data,
     /// drift detection, and decision explanations.
     pub observability_session: Option<
@@ -1609,8 +1585,6 @@ impl ToolExecutor {
             delegation_requires_admission: false,
             read_only_execution: false,
             parent_model_reasoning: std::sync::Mutex::new(None),
-            context_cache: None,
-            agent_id: None,
             send_message_context: std::sync::Mutex::new(None),
             observability_session: None,
             introspect_snapshot: std::sync::Arc::new(std::sync::RwLock::new(None)),
@@ -2298,17 +2272,6 @@ impl ToolExecutor {
 
     pub(super) fn mcp_runtime_snapshot(&self, label: &str) -> EdgeMcpRuntimeSnapshot {
         rwlock_read_clone_or_default(&self.mcp_runtime, label)
-    }
-
-    /// Set the shared context cache for cross-agent knowledge sharing.
-    pub fn with_context_cache(
-        mut self,
-        cache: std::sync::Arc<astra_runtime::orchestration::SharedContextCache>,
-        agent_id: impl Into<String>,
-    ) -> Self {
-        self.context_cache = Some(cache);
-        self.agent_id = Some(agent_id.into());
-        self
     }
 
     /// Set or clear the messaging context for inter-agent communication.
@@ -4609,10 +4572,7 @@ impl ToolExecutor {
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> EdgeToolRun {
-        let argument_validation = if astra_runtime_env::ToolRegistry::builtins()
-            .get(name)
-            .is_none()
-        {
+        let argument_validation = if runtime_env_builtin_registry().get(name).is_none() {
             self.provider_owned_schemas_snapshot("provider_owned_schema_argument_validation")
                 .into_iter()
                 .find(|schema| {
@@ -5501,8 +5461,6 @@ impl ToolExecutor {
                         .to_string()
                     }
                 }
-                "share_context" => self.share_context(args),
-                "query_context" => self.query_context(args),
                 "introspect" => self.handle_introspect(args),
                 "model_catalog" => {
                     use astra_turn_core::model_catalog::{
@@ -5514,13 +5472,8 @@ impl ToolExecutor {
                         .unwrap_or(CatalogError::Unsupported);
                     unavailable_page(error, "unbound").to_json()
                 }
-                "diagnose" => self.diagnose(args).await,
                 "lsp" => self.lsp(args),
                 "env" => self.env_tool(args),
-                "notebook_edit" => self.notebook_edit(args),
-                "config" => self.config_tool(args),
-                "brief" => self.brief(args).await,
-                "context_analysis" => self.context_analysis(args),
                 _ if astra_runtime_env::is_mcp_namespaced_tool_name(name) => {
                     let outcome = if let Some((manager, prepared)) = mcp_prepared.as_ref() {
                         self.execute_prepared_mcp_tool(manager, name, prepared, args)
@@ -10939,16 +10892,12 @@ mod tests {
     mod code_intel_enhancement_tests;
     mod code_intel_integration_tests;
     mod code_intel_tests;
-    mod config_tests;
-    mod context_analysis_tests;
     mod cross_file_caller_tests;
-    mod diagnose_tests;
     mod env_tests;
     mod executor_core_tests;
 
     mod lsp_tests;
     mod memoria_tests;
-    mod notebook_tests;
     mod sandbox_tests;
     mod schema_tests;
     mod self_mod_tests;

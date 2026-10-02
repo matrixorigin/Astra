@@ -2973,9 +2973,6 @@ fn destructive_powershell_warning(command: &str) -> Option<&'static str> {
 /// Maximum output size before truncation (30K chars).
 const MAX_OUTPUT_CHARS: usize = 30_000;
 
-/// Size watchdog poll interval for backgrounded tasks.
-const SIZE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
-
 /// Production default for bash's post-exit pipe read timeout. After bash
 /// exits, we wait this long to drain stdout/stderr before giving up on
 /// orphaned background descendants keeping the pipes open.
@@ -3923,152 +3920,6 @@ fn final_drain_stderr(
     }
 }
 
-/// Execute a command with streaming output and optional auto-backgrounding on timeout.
-///
-/// - Streams stdout/stderr incrementally via `on_output` callback
-/// - On timeout: backgrounds the process instead of killing it (if `allow_background` is true)
-/// - Watchdog kills backgrounded processes after 30 minutes
-///
-/// Returns (output_text, exit_code, was_backgrounded).
-fn run_command_streaming(
-    cmd: &mut Command,
-    timeout_secs: f64,
-    allow_background: bool,
-    on_output: Option<&dyn Fn(&str)>,
-) -> Result<StreamingResult, String> {
-    use std::io::Read;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().map_err(|e| format!("Error: {e}"))?;
-
-    let mut stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
-    let mut stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
-
-    // Read output in a separate thread to avoid blocking.
-    let (tx, rx) = std::sync::mpsc::channel::<OutputChunk>();
-    let tx2 = tx.clone();
-
-    let stdout_thread = std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdout.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let s = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    let _ = tx.send(OutputChunk::Stdout(s));
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let stderr_thread = std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match stderr.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let s = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    let _ = tx2.send(OutputChunk::Stderr(s));
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let mut output = String::new();
-    let mut truncated = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout_secs);
-
-    loop {
-        // Drain available output chunks.
-        while let Ok(chunk) = rx.try_recv() {
-            let text = match &chunk {
-                OutputChunk::Stdout(s) | OutputChunk::Stderr(s) => s.as_str(),
-            };
-            if !truncated {
-                append_capped_output(&mut output, text, MAX_OUTPUT_CHARS, &mut truncated);
-            }
-            if let Some(cb) = on_output {
-                cb(text);
-            }
-        }
-
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Process exited — drain remaining output.
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                while let Ok(chunk) = rx.try_recv() {
-                    let text = match &chunk {
-                        OutputChunk::Stdout(s) | OutputChunk::Stderr(s) => s.as_str(),
-                    };
-                    append_capped_output(&mut output, text, MAX_OUTPUT_CHARS, &mut truncated);
-                    if let Some(cb) = on_output {
-                        cb(text);
-                    }
-                }
-                finalize_raw_streaming_capture(&mut output, false, truncated);
-                return Ok(StreamingResult {
-                    output,
-                    exit_code: status.code().unwrap_or(-1),
-                    backgrounded: false,
-                });
-            }
-            Ok(None) => {
-                if std::time::Instant::now() > deadline {
-                    if allow_background {
-                        // Auto-background: detach and start size watchdog.
-                        let pid = child.id();
-                        finalize_raw_streaming_capture(&mut output, true, truncated);
-                        output.push_str(&format!(
-                            "\n[Command timed out after {timeout_secs}s — backgrounded as PID {pid}]"
-                        ));
-                        // Spawn watchdog thread to kill if output grows too large.
-                        std::thread::spawn(move || {
-                            size_watchdog(child, stdout_thread, stderr_thread);
-                        });
-                        return Ok(StreamingResult {
-                            output,
-                            exit_code: -1,
-                            backgrounded: true,
-                        });
-                    } else {
-                        // Hard kill.
-                        sync_sigkill_process_group(&mut child);
-                        let _ = child.wait();
-                        let _ = stdout_thread.join();
-                        let _ = stderr_thread.join();
-                        finalize_raw_streaming_capture(&mut output, true, truncated);
-                        output
-                            .push_str(&format!("\nError: command timed out after {timeout_secs}s"));
-                        return Ok(StreamingResult {
-                            output,
-                            exit_code: 143, // SIGTERM
-                            backgrounded: false,
-                        });
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                sync_sigkill_process_group(&mut child);
-                let _ = child.wait();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                return Err(format!("Error: {e}"));
-            }
-        }
-    }
-}
-
 /// Finalize a raw stream before credential redaction. A cap or an interrupted
 /// process can leave an incomplete line; a credential split at that boundary
 /// may no longer match any redaction pattern, so discard that line first.
@@ -4104,63 +3955,13 @@ fn append_capped_output(output: &mut String, text: &str, cap: usize, capped: &mu
     *capped = true;
 }
 
-/// Result from streaming command execution.
-struct StreamingResult {
-    output: String,
-    exit_code: i32,
-    backgrounded: bool,
-}
-
-enum OutputChunk {
-    Stdout(String),
-    Stderr(String),
-}
-
-/// Time-limit watchdog for backgrounded processes.
-/// Kills the process after 30 minutes to prevent indefinite resource consumption.
-fn size_watchdog(
-    mut child: std::process::Child,
-    stdout_thread: std::thread::JoinHandle<()>,
-    stderr_thread: std::thread::JoinHandle<()>,
-) {
-    let start = std::time::Instant::now();
-    // Give backgrounded process up to 30 minutes.
-    let max_duration = Duration::from_secs(30 * 60);
-
-    loop {
-        std::thread::sleep(SIZE_WATCHDOG_INTERVAL);
-
-        // Check if process has exited.
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {}
-            Err(_) => {
-                sync_sigkill_process_group(&mut child);
-                let _ = child.wait();
-                break;
-            }
-        }
-
-        // Kill if running too long.
-        if start.elapsed() > max_duration {
-            sync_sigkill_process_group(&mut child);
-            let _ = child.wait();
-            break;
-        }
-    }
-
-    // Clean up threads.
-    let _ = stdout_thread.join();
-    let _ = stderr_thread.join();
-}
-
 /// Default cap on grep result lines when no explicit limit is given.
 /// Prevents unbounded output from broad patterns on large repos.
 /// The LLM can pass `head_limit=0` to override.
 const GREP_DEFAULT_HEAD_LIMIT: usize = 100;
 
 /// Run a read-only command (grep/glob) with timeout, capturing only stdout.
-/// Unlike `run_command_streaming`, stderr is captured separately and not mixed
+/// Stderr is captured separately and not mixed
 /// into the output — the caller gets clean stdout content plus stderr for errors.
 /// Returns `(stdout, stderr, exit_code, timed_out)`.
 fn run_readonly_command_with_partial(
@@ -4301,66 +4102,6 @@ fn append_default_grep_excludes(cmd: &mut Command) {
     for dir in DEFAULT_SEARCH_EXCLUDE_DIRS {
         cmd.arg("--exclude-dir").arg(dir);
     }
-}
-
-/// SSRF protection: check if a URL targets internal/private networks.
-/// Returns Some(reason) if blocked, None if safe.
-fn is_ssrf_target(url: &str) -> Option<&'static str> {
-    // Extract host from URL (simple parsing, handles http://host:port/path)
-    let after_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let authority = after_scheme.split('/').next()?;
-    // Handle userinfo@ prefix
-    let host_port = authority.split('@').next_back()?;
-    // Handle IPv6 brackets: [::1]:port → extract [::1]
-    let host = if host_port.starts_with('[') {
-        // IPv6: take everything up to and including the closing bracket
-        host_port
-            .split(']')
-            .next()
-            .map(|s| format!("{s}]"))
-            .unwrap_or_default()
-    } else {
-        host_port.split(':').next().unwrap_or("").to_string()
-    };
-    let lower = host.to_ascii_lowercase();
-
-    // Block localhost variants
-    if lower == "localhost"
-        || lower == "127.0.0.1"
-        || lower == "0.0.0.0"
-        || lower == "::1"
-        || lower == "[::1]"
-        || lower.ends_with(".localhost")
-    {
-        return Some("localhost access blocked");
-    }
-    // Block AWS/cloud metadata endpoints
-    if lower == "169.254.169.254" || lower == "metadata.google.internal" {
-        return Some("cloud metadata endpoint blocked");
-    }
-    // Block private IP ranges (RFC 1918 + link-local)
-    if lower.starts_with("10.")
-        || lower.starts_with("192.168.")
-        || lower.starts_with("172.") && is_private_172(&lower)
-        || lower.starts_with("169.254.")
-        || lower.starts_with("fc")
-        || lower.starts_with("fd")
-    {
-        return Some("private network access blocked");
-    }
-    None
-}
-
-/// Check if a 172.x.x.x address is in the private range 172.16-31.x.x
-fn is_private_172(host: &str) -> bool {
-    if let Some(second) = host.strip_prefix("172.").and_then(|r| r.split('.').next())
-        && let Ok(n) = second.parse::<u8>()
-    {
-        return (16..=31).contains(&n);
-    }
-    false
 }
 
 impl ToolExecutor {
@@ -6220,142 +5961,6 @@ fn annotate_grep_with_scope(grep_output: &str, project_root: &std::path::Path) -
     result
 }
 
-/// Detect HTML content by checking for common HTML markers.
-fn looks_like_html(s: &str) -> bool {
-    let trimmed = s.trim_start();
-    trimmed.starts_with("<!DOCTYPE")
-        || trimmed.starts_with("<!doctype")
-        || trimmed.starts_with("<html")
-        || trimmed.starts_with("<HTML")
-        // Partial HTML without doctype (common in API error pages)
-        || (trimmed.starts_with('<')
-            && (trimmed.contains("</head>") || trimmed.contains("</body>")))
-}
-
-/// Lightweight HTML → text conversion without external dependencies.
-/// Strips tags, decodes common entities, collapses whitespace.
-fn html_to_text(html: &str) -> String {
-    let mut s = html.to_string();
-
-    // 1. Remove <script> and <style> blocks (case-insensitive via manual lowering)
-    for tag in &["script", "style", "noscript", "svg"] {
-        loop {
-            let lower = s.to_lowercase();
-            let open = format!("<{}", tag);
-            let close = format!("</{}>", tag);
-            if let Some(start) = lower.find(&open)
-                && let Some(end_rel) = lower[start..].find(&close)
-            {
-                let end = start + end_rel + close.len();
-                s.replace_range(start..end, " ");
-                continue;
-            }
-            break;
-        }
-    }
-
-    // 2. Insert newlines for block elements
-    for tag in &[
-        "<br>", "<br/>", "<br />", "<BR>", "</p>", "</P>", "</div>", "</DIV>", "</li>", "</LI>",
-        "</tr>", "</TR>", "</h1>", "</h2>", "</h3>", "</h4>", "</h5>", "</h6>", "</H1>", "</H2>",
-        "</H3>", "</H4>", "</H5>", "</H6>",
-    ] {
-        s = s.replace(tag, &format!("\n{}", tag));
-    }
-
-    // 3. Strip all remaining HTML tags
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' if in_tag => {
-                in_tag = false;
-                out.push(' ');
-            }
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-
-    // 4. Decode common HTML entities
-    out = out
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
-        .replace("&#x27;", "'")
-        .replace("&#x2F;", "/");
-
-    // Decode numeric character references &#NNN;
-    let mut decoded = String::with_capacity(out.len());
-    let mut chars = out.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '&' && chars.peek() == Some(&'#') {
-            chars.next(); // consume '#'
-            let mut num_str = String::new();
-            while let Some(&d) = chars.peek() {
-                if d == ';' {
-                    chars.next();
-                    break;
-                }
-                if d.is_ascii_digit() && num_str.len() < 7 {
-                    num_str.push(d);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            if let Ok(code) = num_str.parse::<u32>()
-                && let Some(decoded_char) = char::from_u32(code)
-            {
-                decoded.push(decoded_char);
-                continue;
-            }
-            decoded.push('&');
-            decoded.push('#');
-            decoded.push_str(&num_str);
-        } else {
-            decoded.push(ch);
-        }
-    }
-
-    // 5. Collapse whitespace: runs of spaces/tabs → single space, 3+ newlines → 2
-    let mut result = String::with_capacity(decoded.len());
-    let mut last_was_newline = false;
-    let mut consecutive_newlines = 0u32;
-    let mut last_was_space = false;
-
-    for ch in decoded.chars() {
-        if ch == '\n' || ch == '\r' {
-            if ch == '\r' {
-                continue;
-            }
-            consecutive_newlines += 1;
-            last_was_space = false;
-            if consecutive_newlines <= 2 {
-                result.push('\n');
-            }
-            last_was_newline = true;
-        } else if ch == ' ' || ch == '\t' {
-            if !last_was_space && !last_was_newline {
-                result.push(' ');
-            }
-            last_was_space = true;
-        } else {
-            result.push(ch);
-            last_was_newline = false;
-            last_was_space = false;
-            consecutive_newlines = 0;
-        }
-    }
-
-    result.trim().to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::ToolExecutor;
@@ -6364,7 +5969,6 @@ mod tests {
         check_bash_path_boundary_with_oldpwd, check_dangerous_command,
         check_powershell_path_boundary, default_bash_timeout_secs, destructive_command_warning,
         destructive_powershell_warning, find_powershell_program, forbidden_name_based_process_kill,
-        html_to_text, is_ssrf_target, looks_like_html,
     };
     use std::time::Duration;
 
@@ -9735,41 +9339,6 @@ mod tests {
         );
     }
 
-    // ── SSRF protection ─────────────────────────────────────────────────────
-
-    #[test]
-    fn ssrf_blocks_localhost() {
-        assert!(is_ssrf_target("http://127.0.0.1:8080/secret").is_some());
-        assert!(is_ssrf_target("http://localhost/admin").is_some());
-        assert!(is_ssrf_target("http://0.0.0.0:3000").is_some());
-        assert!(is_ssrf_target("http://[::1]/api").is_some());
-    }
-
-    #[test]
-    fn ssrf_blocks_private_networks() {
-        assert!(is_ssrf_target("http://10.0.0.1/internal").is_some());
-        assert!(is_ssrf_target("http://192.168.1.1/router").is_some());
-        assert!(is_ssrf_target("http://172.16.0.1/service").is_some());
-        assert!(is_ssrf_target("http://172.31.255.1/db").is_some());
-        // 172.15 and 172.32 are NOT private
-        assert!(is_ssrf_target("http://172.15.0.1/ok").is_none());
-        assert!(is_ssrf_target("http://172.32.0.1/ok").is_none());
-    }
-
-    #[test]
-    fn ssrf_blocks_cloud_metadata() {
-        assert!(is_ssrf_target("http://169.254.169.254/latest/meta-data/").is_some());
-        assert!(is_ssrf_target("http://metadata.google.internal/computeMetadata/v1/").is_some());
-    }
-
-    #[test]
-    fn ssrf_allows_public_urls() {
-        assert!(is_ssrf_target("https://github.com/matrixorigin/matrixone").is_none());
-        assert!(is_ssrf_target("https://api.github.com/repos").is_none());
-        assert!(is_ssrf_target("http://example.com").is_none());
-        assert!(is_ssrf_target("https://docs.rs/tokio/latest").is_none());
-    }
-
     // ── grep extended regex ──────────────────────────────────────────────────
 
     #[test]
@@ -9801,81 +9370,6 @@ mod tests {
         }));
         // Simple non-regex pattern should still work
         assert!(!result.is_empty());
-    }
-
-    // ── HTML detection ──────────────────────────────────────────────────────
-
-    #[test]
-    fn looks_like_html_classification() {
-        let positive: &[&str] = &[
-            "<!DOCTYPE html><html><body>hello</body></html>",
-            "<!doctype html>\n<html>",
-            "<html lang=\"en\"><head></head></html>",
-            "<HTML><BODY>hi</BODY></HTML>",
-        ];
-        let negative: &[&str] = &[
-            "Hello world, this is plain text.",
-            "{\"key\": \"value\"}",
-            "# Markdown heading\n\nSome text.",
-            "<root><item>data</item></root>",
-            r#"{"name": "test", "value": 42}"#,
-            "This is just plain text\nwith some newlines.",
-        ];
-        for s in positive {
-            assert!(looks_like_html(s), "should detect HTML: {s}");
-        }
-        for s in negative {
-            assert!(!looks_like_html(s), "should reject non-HTML: {s}");
-        }
-    }
-
-    // ── HTML-to-text conversion ─────────────────────────────────────────────
-
-    #[test]
-    fn html_to_text_handles_real_page() {
-        let html = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Example</title>
-  <style>body { margin: 0; }</style>
-  <script>window.ga=function(){}</script>
-</head>
-<body>
-  <div id="main">
-    <h1>Welcome</h1>
-    <p>This is a <a href="/about">test page</a> with links &amp; entities &lt;&gt;.</p>
-    <p>&#65;&#66;&#67; numeric</p>
-    <ul>
-      <li>Item 1 &quot;quoted&quot;</li>
-      <li>Item 2&apos;s</li>
-    </ul>
-  </div>
-  <script src="analytics.js"></script>
-</body>
-</html>"#;
-        let text = html_to_text(html);
-        // tag stripping
-        assert!(text.contains("Welcome"), "missing heading: {text}");
-        assert!(text.contains("test page"), "missing link text: {text}");
-        assert!(text.contains("Item 1"), "missing list item: {text}");
-        assert!(!text.contains("<p>"), "HTML tags not stripped: {text}");
-        assert!(!text.contains("<h1>"), "HTML tags not stripped: {text}");
-        assert!(!text.contains("<div"), "HTML tags not stripped: {text}");
-        // script/style removal
-        assert!(!text.contains("window.ga"), "script not removed: {text}");
-        assert!(!text.contains("margin: 0"), "style not removed: {text}");
-        // entity decoding (named and numeric)
-        assert!(text.contains("&"), "named entity not decoded: {text}");
-        assert!(text.contains("<"), "lt entity not decoded: {text}");
-        assert!(text.contains("ABC"), "numeric entity not decoded: {text}");
-        assert!(
-            text.contains("\"quoted\""),
-            "quot entity not decoded: {text}"
-        );
-        assert!(text.contains("Item 2's"), "apos entity not decoded: {text}");
-        // whitespace collapse: no triple newlines
-        assert!(!text.contains("\n\n\n"), "excessive newlines: {text}");
     }
 
     // ── grep context_lines and max_matches ───────────────────────────────────

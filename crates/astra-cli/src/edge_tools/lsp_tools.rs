@@ -1825,29 +1825,33 @@ impl ToolExecutor {
                             }
                         }
                         Ok(None) => {
-                            if let Some(sym) = symbol {
+                            if symbol.is_some()
+                                && args.get("dry_run").and_then(Value::as_bool) == Some(true)
+                            {
                                 self.rename_symbol(&json!({
-                                    "symbol": sym,
+                                    "symbol": symbol,
                                     "new_name": next_name,
-                                    "dry_run": dry_run
+                                    "dry_run": true
                                 }))
                             } else {
                                 json!({
-                                    "error": "rename requires an active LSP backend for position-based preview, or 'symbol' for fallback rename_symbol behavior"
+                                    "error": "rename requires an active semantic LSP backend; explicit dry_run=true with symbol permits a non-semantic text preview only"
                                 }).to_string()
                             }
                         }
                         Err(error) => json!({ "error": error }).to_string(),
                     }
-                } else if let Some(sym) = symbol {
+                } else if symbol.is_some()
+                    && args.get("dry_run").and_then(Value::as_bool) == Some(true)
+                {
                     self.rename_symbol(&json!({
-                        "symbol": sym,
+                        "symbol": symbol,
                         "new_name": next_name,
-                        "dry_run": dry_run
+                        "dry_run": true
                     }))
                 } else {
                     json!({
-                        "error": "rename requires either 'file'+'line'+'column'+'new_name' or 'symbol'+'new_name'"
+                        "error": "semantic rename requires an active LSP backend and file, line, column, new_name; explicit dry_run=true with symbol permits a non-semantic text preview only"
                     }).to_string()
                 }
             }

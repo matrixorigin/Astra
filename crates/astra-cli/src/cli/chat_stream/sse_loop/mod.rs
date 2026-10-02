@@ -468,7 +468,7 @@ pub(crate) async fn stream_chat_sse(
     executor.set_current_model(selected_model.to_string());
     executor.set_current_context_window_tokens(u64::from(context_window_tokens));
     executor.set_current_effective_input_budget_tokens(effective_max_turn_input_tokens);
-    // Wire observability session for context_analysis tool
+    // Wire the canonical observability session for introspection.
     if let Some(ref obs) = p.observability_session {
         executor.observability_session = Some(obs.clone());
     }

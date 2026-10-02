@@ -2,23 +2,29 @@ use super::ToolExecutor;
 use serde_json::json;
 
 #[tokio::test]
-async fn retired_run_build_test_is_rejected_without_execution() {
+async fn retired_tools_are_rejected_without_execution() {
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
-    assert!(
-        !executor
-            .tool_names()
-            .iter()
-            .any(|name| name == "run_build_test")
-    );
-    let result = executor
-        .execute(
-            "run_build_test",
-            &json!({"command": "touch retired-tool-ran", "auto_fix": true}),
-        )
-        .await;
-    assert!(result.starts_with("Error:"), "{result}");
-    assert!(!dir.path().join("retired-tool-ran").exists());
+    for name in [
+        "run_build_test",
+        "context_analysis",
+        "diagnose",
+        "brief",
+        "share_context",
+        "query_context",
+        "notebook_edit",
+        "config",
+    ] {
+        assert!(!executor.tool_names().iter().any(|tool| tool == name));
+        let result = executor
+            .execute(
+                name,
+                &json!({"command": "touch retired-tool-ran", "auto_fix": true}),
+            )
+            .await;
+        assert!(result.starts_with("Error:"), "{name}: {result}");
+        assert!(!dir.path().join("retired-tool-ran").exists());
+    }
 }
 
 #[tokio::test]

@@ -316,249 +316,82 @@ async fn find_references_with_validate_false_skips_ast() {
 // ---- rename_symbol tests ----
 
 #[tokio::test]
-async fn rename_symbol_dry_run_shows_preview() {
+async fn rename_symbol_requires_explicit_non_semantic_preview() {
     let dir = tempfile::tempdir().unwrap();
-    let code = "fn target_fn() { 42 }\nfn caller() { target_fn(); }\n";
-    std::fs::write(dir.path().join("main.rs"), code).unwrap();
-
+    let code = "fn target() {}\r\nfn caller() { target(); let s = \"target\"; } // target\r\nmod other { fn target() {} }\r\n";
+    let path = dir.path().join("main.rs");
+    std::fs::write(&path, code).unwrap();
     let executor = ToolExecutor::new(dir.path());
-    let result = executor
-        .execute(
-            "rename_symbol",
-            &json!({
-                "symbol": "target_fn",
-                "new_name": "renamed_fn"
-            }),
-        )
-        .await;
 
-    assert!(result.contains("preview"), "default is dry run: {result}");
-    assert!(result.contains("target_fn"), "shows old name: {result}");
-    assert!(result.contains("renamed_fn"), "shows new name: {result}");
-    assert!(result.contains("dry_run=false"), "hints to apply: {result}");
-    // File should NOT be modified
-    let content = std::fs::read_to_string(dir.path().join("main.rs")).unwrap();
-    assert!(content.contains("target_fn"), "file untouched in dry run");
+    for dry_run in [None, Some(false), Some(true)] {
+        let mut args = json!({"symbol": "target", "new_name": "renamed"});
+        if let Some(value) = dry_run {
+            args["dry_run"] = json!(value);
+        }
+        let result = executor.execute("rename_symbol", &args).await;
+        if dry_run == Some(true) {
+            assert!(result.contains("Non-semantic text preview"), "{result}");
+            assert!(result.contains("unrelated scopes"), "{result}");
+            assert!(result.contains("No files are modified"), "{result}");
+        } else {
+            assert!(result.starts_with("Error:"), "{result}");
+            assert!(result.contains("semantic LSP backend"), "{result}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), code.as_bytes());
+    }
 }
 
 #[tokio::test]
-async fn rename_symbol_applies_changes() {
+async fn rename_symbol_preview_across_files_is_read_only() {
     let dir = tempfile::tempdir().unwrap();
-    let code = "fn old_name() -> i32 { 42 }\nfn caller() { old_name(); }\n";
-    std::fs::write(dir.path().join("lib.rs"), code).unwrap();
-
+    let code = "fn target() { target(); }\n";
+    for file in ["lib.rs", "main.rs"] {
+        std::fs::write(dir.path().join(file), code).unwrap();
+    }
     let executor = ToolExecutor::new(dir.path());
     let result = executor
         .execute(
             "rename_symbol",
             &json!({
-                "symbol": "old_name",
-                "new_name": "new_name",
-                "dry_run": false
+                "symbol": "target", "new_name": "renamed", "dry_run": true
             }),
         )
         .await;
-
-    assert!(result.contains("Renaming"), "shows applied: {result}");
-    assert!(
-        result.contains("2 replacement"),
-        "both occurrences renamed: {result}"
-    );
-    let content = std::fs::read_to_string(dir.path().join("lib.rs")).unwrap();
-    assert!(content.contains("fn new_name()"), "definition renamed");
-    assert!(content.contains("new_name();"), "call site renamed");
-    assert!(!content.contains("old_name"), "old name fully gone");
-}
-
-#[tokio::test]
-async fn rename_symbol_skips_comments_and_strings() {
-    let dir = tempfile::tempdir().unwrap();
-    let code = r#"fn target() -> i32 { 42 }
-// target is a good function
-fn caller() {
-    let s = "target in string";
-    target();
-}
-"#;
-    std::fs::write(dir.path().join("test.rs"), code).unwrap();
-
-    let executor = ToolExecutor::new(dir.path());
-    let result = executor
-        .execute(
-            "rename_symbol",
-            &json!({
-                "symbol": "target",
-                "new_name": "renamed",
-                "dry_run": false
-            }),
-        )
-        .await;
-
-    let content = std::fs::read_to_string(dir.path().join("test.rs")).unwrap();
-    // Real code references should be renamed
-    assert!(
-        content.contains("fn renamed()"),
-        "definition renamed: {}",
-        content
-    );
-    assert!(content.contains("renamed();"), "call renamed: {}", content);
-    // Comment and string should be preserved
-    assert!(
-        content.contains("// target is a good function"),
-        "comment preserved: {}",
-        content
-    );
-    assert!(
-        content.contains("\"target in string\""),
-        "string preserved: {}",
-        content
-    );
-    // Should report filtered matches
-    assert!(result.contains("skipped"), "mentions filtered: {result}");
-}
-
-#[tokio::test]
-async fn rename_symbol_across_files() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn shared_fn() -> i32 { 42 }\n",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.path().join("src/main.rs"),
-        "fn main() { shared_fn(); }\n",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.path().join("src/test.rs"),
-        "fn test_it() { assert_eq!(shared_fn(), 42); }\n",
-    )
-    .unwrap();
-
-    let executor = ToolExecutor::new(dir.path());
-    let result = executor
-        .execute(
-            "rename_symbol",
-            &json!({
-                "symbol": "shared_fn",
-                "new_name": "common_fn",
-                "dry_run": false
-            }),
-        )
-        .await;
-
-    assert!(result.contains("3 file"), "changed 3 files: {result}");
-    for file in &["src/lib.rs", "src/main.rs", "src/test.rs"] {
-        let content = std::fs::read_to_string(dir.path().join(file)).unwrap();
-        assert!(
-            content.contains("common_fn"),
-            "{} should have new name: {}",
-            file,
-            content
-        );
-        assert!(
-            !content.contains("shared_fn"),
-            "{} should not have old name: {}",
-            file,
-            content
+    assert!(result.contains("2 file"), "{result}");
+    for file in ["lib.rs", "main.rs"] {
+        assert_eq!(
+            std::fs::read(dir.path().join(file)).unwrap(),
+            code.as_bytes()
         );
     }
 }
 
 #[tokio::test]
-async fn rename_symbol_changes_can_be_rolled_back_by_turn() {
+async fn rename_symbol_preview_with_include_filter() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join("src")).unwrap();
-    std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn shared_fn() -> i32 { 42 }\n",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.path().join("src/main.rs"),
-        "fn main() { shared_fn(); }\n",
-    )
-    .unwrap();
-
-    let executor = ToolExecutor::new(dir.path());
-    executor
-        .journal_turn_index
-        .store(12, std::sync::atomic::Ordering::Relaxed);
-    let result = executor
-        .execute(
-            "rename_symbol",
-            &json!({
-                "symbol": "shared_fn",
-                "new_name": "common_fn",
-                "dry_run": false
-            }),
-        )
-        .await;
-
-    assert!(
-        result.contains("2 file"),
-        "rename should touch both files: {result}"
-    );
-    let rollback = executor
-        .rollback_recorded_turn_mutations(&json!({"scope": "current_turn"}))
-        .await;
-    let rollback_json: serde_json::Value =
-        serde_json::from_str(&rollback).expect("recorded turn rollback json");
-    assert_eq!(
-        rollback_json["success"].as_bool(),
-        Some(true),
-        "got: {rollback}"
-    );
-    assert_eq!(
-        rollback_json["reverted_files"].as_array().map(Vec::len),
-        Some(2)
-    );
-
-    let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
-    let main = std::fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
-    assert!(lib.contains("shared_fn"), "lib should be restored: {lib}");
-    assert!(
-        main.contains("shared_fn"),
-        "main should be restored: {main}"
-    );
-    assert!(
-        !lib.contains("common_fn"),
-        "lib should not keep rename: {lib}"
-    );
-    assert!(
-        !main.contains("common_fn"),
-        "main should not keep rename: {main}"
-    );
-}
-
-#[tokio::test]
-async fn rename_symbol_word_boundary_safe() {
-    let dir = tempfile::tempdir().unwrap();
-    let code = "fn foo() { 1 }\nfn foobar() { foo() + 2 }\nfn foo_baz() { foo() }\n";
-    std::fs::write(dir.path().join("test.rs"), code).unwrap();
-
+    let rust = "pub fn target() {}\n";
+    let python = "def target(): pass\ntarget()\n";
+    std::fs::write(dir.path().join("lib.rs"), rust).unwrap();
+    std::fs::write(dir.path().join("main.py"), python).unwrap();
     let executor = ToolExecutor::new(dir.path());
     let result = executor
         .execute(
             "rename_symbol",
             &json!({
-                "symbol": "foo",
-                "new_name": "bar",
-                "dry_run": false
+                "symbol": "target", "new_name": "renamed", "include": "*.rs", "dry_run": true
             }),
         )
         .await;
-
-    let content = std::fs::read_to_string(dir.path().join("test.rs")).unwrap();
-    assert!(content.contains("fn bar()"), "foo renamed to bar");
-    assert!(
-        content.contains("foobar"),
-        "foobar NOT renamed (word boundary)"
+    assert!(result.contains("1 file"), "{result}");
+    assert!(!result.contains("main.py"), "{result}");
+    assert_eq!(
+        std::fs::read(dir.path().join("lib.rs")).unwrap(),
+        rust.as_bytes()
     );
-    assert!(content.contains("bar() + 2"), "call in foobar line renamed");
-    assert!(result.contains("replacement"), "has replacements: {result}");
+    assert_eq!(
+        std::fs::read(dir.path().join("main.py")).unwrap(),
+        python.as_bytes()
+    );
 }
 
 #[tokio::test]
@@ -609,59 +442,19 @@ async fn rename_symbol_errors_on_invalid_name() {
 }
 
 #[tokio::test]
-async fn rename_symbol_no_matches() {
+async fn rename_symbol_preview_no_matches() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("test.rs"), "fn bar() {}\n").unwrap();
-
     let executor = ToolExecutor::new(dir.path());
     let result = executor
         .execute(
             "rename_symbol",
             &json!({
-                "symbol": "nonexistent_symbol_xyz",
-                "new_name": "new_name"
+                "symbol": "nonexistent_symbol_xyz", "new_name": "renamed", "dry_run": true
             }),
         )
         .await;
-    assert!(
-        result.contains("No references"),
-        "reports no matches: {result}"
-    );
-}
-
-#[tokio::test]
-async fn rename_symbol_with_include_filter() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("lib.rs"), "pub fn target() { 1 }\n").unwrap();
-    std::fs::write(dir.path().join("main.py"), "def target(): pass\ntarget()\n").unwrap();
-
-    let executor = ToolExecutor::new(dir.path());
-    let result = executor
-        .execute(
-            "rename_symbol",
-            &json!({
-                "symbol": "target",
-                "new_name": "renamed",
-                "include": "*.rs",
-                "dry_run": false
-            }),
-        )
-        .await;
-
-    // Only .rs file should be modified
-    let rs_content = std::fs::read_to_string(dir.path().join("lib.rs")).unwrap();
-    let py_content = std::fs::read_to_string(dir.path().join("main.py")).unwrap();
-    assert!(
-        rs_content.contains("renamed"),
-        "rs file renamed: {}",
-        rs_content
-    );
-    assert!(
-        py_content.contains("target"),
-        "py file untouched: {}",
-        py_content
-    );
-    assert!(result.contains("1 file"), "only 1 file changed: {result}");
+    assert!(result.contains("No references"), "{result}");
 }
 
 // ---- dead_code tests ----

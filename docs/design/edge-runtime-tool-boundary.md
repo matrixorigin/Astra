@@ -58,6 +58,16 @@ Edge/CLI local runtime may expose local capabilities only within declared author
 
 Path authority must be checked before execution. A model-provided path is not authority by itself.
 
+### Rename authority
+
+The CLI may modify symbol references only through an active semantic LSP backend
+with a position-based rename request. A text search cannot prove symbol identity
+across scopes, comments, or strings and must not authorize file modifications.
+An explicit `dry_run=true` request may produce a clearly labeled non-semantic
+text preview; it never applies edits or claims semantic reference coverage.
+Missing or failed semantic backends return an actionable error, not a text-based
+mutation fallback.
+
 ## Cloud workspace boundary
 
 A cloud workspace runtime is not the same as the Astra server process. It requires explicit provider binding and isolation metadata.

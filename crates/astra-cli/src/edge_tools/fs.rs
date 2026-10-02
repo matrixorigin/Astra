@@ -140,40 +140,8 @@ impl From<String> for FsLeafError {
     }
 }
 
-// NOTE on removed `is_dangerous_write_target`:
-//
-// An earlier version of this file maintained a hard-block list of
-// "dangerous" filenames (`.env`, `.bashrc`, `.aws/credentials`, …) and
-// refused write_file/str_replace/notebook_edit to any matching path,
-// telling the model "use bash to bypass". That guard was deleted on
-// 2026-05-15 because:
-//
-//   1. It's bypassable in one tool-call. The model just routes through
-//      bash. The error message even told it how. So it stops zero
-//      malicious or buggy paths.
-//   2. It has a high false-positive rate. `.env.example` (a public
-//      template, the opposite of a secret) was flagged identically to
-//      `.env`, refusing the standard `cp .env.example .env` workflow.
-//   3. It's filename-based, never content-based. It cannot detect a
-//      secret pasted into `notes.txt` and it wrongly flags an empty
-//      `.env`.
-//   4. The real protections are elsewhere and still in force:
-//        - `validate_path` (sandbox) blocks paths outside the project.
-//        - `permission_redact::matches_sensitive_path` redacts secret
-//          *display* in approval cards.
-//        - `safety_middleware::redact_credentials_in_text` runs on
-//          tool *output* before it reaches the LLM, masking real
-//          API keys / tokens / PEMs by content pattern.
-//
-// reference-agent follows the same philosophy (`tools/FileWriteTool` has
-// no filename-based block; the only content guard is
-// `checkTeamMemSecrets`, which is path-and-content-scoped to a
-// shared team-memory directory we don't have).
-//
-// If a content-based scan ever lands here, it should match
-// the reference agent's shape: scan content, not name; warn or redact, not
-// hard-block; and only when writing to a path that's actually
-// shared/synced.
+// Path access belongs to sandbox authorization. Approval display and tool-output
+// redaction protect secrets without adding a parallel filename-based write policy.
 
 impl ToolExecutor {
     fn read_file_model_output_limit(&self) -> usize {

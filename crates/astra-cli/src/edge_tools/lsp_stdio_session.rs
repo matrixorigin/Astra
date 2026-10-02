@@ -60,7 +60,6 @@ type StdinShared = Arc<Mutex<BufWriter<std::process::ChildStdin>>>;
 #[derive(Clone, Debug)]
 struct SyncedDocumentState {
     version: i32,
-    last_mtime_ms: u128,
     last_text_hash: u64,
 }
 
@@ -128,15 +127,6 @@ fn workspace_uri(root: &Path) -> String {
         .ok()
         .map(|u| u.as_str().to_string())
         .unwrap_or_else(|| format!("file://{}", abs.display()))
-}
-
-fn file_mtime_ms(path: &Path) -> u128 {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
 }
 
 fn text_hash(text: &str) -> u64 {
@@ -367,13 +357,11 @@ fn render_diagnostic_messages(
     })]
 }
 
-fn sync_existing_document(doc: &mut SyncedDocumentState, mtime_ms: u128, hash: u64) -> Option<i32> {
+fn sync_existing_document(doc: &mut SyncedDocumentState, hash: u64) -> Option<i32> {
     if doc.last_text_hash == hash {
-        doc.last_mtime_ms = mtime_ms;
         return None;
     }
     doc.version += 1;
-    doc.last_mtime_ms = mtime_ms;
     doc.last_text_hash = hash;
     Some(doc.version)
 }
@@ -743,7 +731,7 @@ impl LspStdioSession {
         }
     }
 
-    fn sync_document(&self, path: &Path, text: &str, mtime_ms: u128) -> io::Result<()> {
+    fn sync_document(&self, path: &Path, text: &str) -> io::Result<()> {
         let Some(lang) = self.language_policy.language_id(path) else {
             return Ok(());
         };
@@ -771,7 +759,7 @@ impl LspStdioSession {
             match documents.get(&uri).cloned() {
                 Some(doc) => {
                     let mut next_state = doc.clone();
-                    match sync_existing_document(&mut next_state, mtime_ms, hash) {
+                    match sync_existing_document(&mut next_state, hash) {
                         Some(version) => SyncAction::Change {
                             version,
                             next_state,
@@ -785,7 +773,6 @@ impl LspStdioSession {
                 None => {
                     let next_state = SyncedDocumentState {
                         version: 1,
-                        last_mtime_ms: mtime_ms,
                         last_text_hash: hash,
                     };
                     SyncAction::Open {
@@ -849,12 +836,12 @@ impl LspStdioSession {
     }
 
     pub fn sync_document_text(&self, path: &Path, text: &str) -> io::Result<()> {
-        self.sync_document(path, text, file_mtime_ms(path))
+        self.sync_document(path, text)
     }
 
     pub fn sync_document_from_disk(&self, path: &Path) -> io::Result<()> {
         let text = std::fs::read_to_string(path)?;
-        self.sync_document(path, &text, file_mtime_ms(path))
+        self.sync_document(path, &text)
     }
 
     pub fn latest_diagnostics_for_path(&self, path: &Path) -> io::Result<Value> {
@@ -1035,34 +1022,30 @@ mod tests {
     }
 
     #[test]
-    fn lsp_sync_existing_document_resyncs_when_hash_changes_but_mtime_does_not() {
+    fn lsp_sync_existing_document_resyncs_when_content_changes() {
         let mut doc = SyncedDocumentState {
             version: 1,
-            last_mtime_ms: 1000,
             last_text_hash: 11,
         };
 
-        let result = sync_existing_document(&mut doc, 1000, 22);
+        let result = sync_existing_document(&mut doc, 22);
 
         assert_eq!(result, Some(2));
         assert_eq!(doc.version, 2);
-        assert_eq!(doc.last_mtime_ms, 1000);
         assert_eq!(doc.last_text_hash, 22);
     }
 
     #[test]
-    fn lsp_sync_existing_document_skips_resync_when_hash_matches_even_if_mtime_changes() {
+    fn lsp_sync_existing_document_skips_resync_when_content_matches() {
         let mut doc = SyncedDocumentState {
             version: 3,
-            last_mtime_ms: 1000,
             last_text_hash: 33,
         };
 
-        let result = sync_existing_document(&mut doc, 2000, 33);
+        let result = sync_existing_document(&mut doc, 33);
 
         assert_eq!(result, None);
         assert_eq!(doc.version, 3);
-        assert_eq!(doc.last_mtime_ms, 2000);
         assert_eq!(doc.last_text_hash, 33);
     }
 }

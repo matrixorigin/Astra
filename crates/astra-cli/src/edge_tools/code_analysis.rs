@@ -1109,7 +1109,7 @@ impl ToolExecutor {
         }
     }
 
-    /// Smart rename: find all AST-validated references to a symbol and replace them.
+    /// Explicit non-semantic text preview; only a semantic LSP backend may rename.
     pub(super) fn rename_symbol(&self, args: &Value) -> String {
         let symbol = match args.get("symbol").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => s,
@@ -1133,13 +1133,18 @@ impl ToolExecutor {
             return format!("Error: '{}' is not a valid identifier", new_name);
         }
 
-        let dry_run = args.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
+        if args.get("dry_run").and_then(Value::as_bool) != Some(true) {
+            return "Error: rename mutations require a semantic LSP backend. Use lsp rename with file, line, column and new_name; dry_run=true explicitly requests a non-semantic text preview only.".into();
+        }
 
-        // Step 1: Find all references using AST-validated find_references
+        // Step 1: Find text candidates; this does not resolve symbol identity.
         let search_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
         let include = args.get("include").and_then(Value::as_str);
 
-        let search_dir = self.project_root.join(search_path);
+        let search_dir = match self.resolve_checked(search_path) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
         if !search_dir.exists() {
             return format!("Error: path '{}' not found", search_path);
         }
@@ -1182,7 +1187,10 @@ impl ToolExecutor {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         if stdout.trim().is_empty() {
-            return format!("No references to '{}' found", symbol);
+            return format!(
+                "Non-semantic text preview: No references to '{}' found; no files modified",
+                symbol
+            );
         }
 
         let lines: Vec<&str> = stdout.lines().collect();
@@ -1194,7 +1202,7 @@ impl ToolExecutor {
 
         if validated.is_empty() {
             return format!(
-                "No code references to '{}' found (all {} matches were in comments/strings)",
+                "Non-semantic text preview: No candidate lines for '{}' after filtering {} matches; no files modified",
                 symbol, total_grep
             );
         }
@@ -1208,19 +1216,14 @@ impl ToolExecutor {
             }
         }
 
-        // Step 4: Apply or preview replacements
+        // Step 4: Preview text candidates, not semantic symbol references.
         let mut output = String::new();
         let mut total_replacements = 0usize;
         let mut files_changed = 0usize;
-        let turn_idx = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
-
-        if dry_run {
-            output.push_str(&format!("🔍 Rename preview: {} → {}\n", symbol, new_name));
-        } else {
-            output.push_str(&format!("✏️  Renaming: {} → {}\n", symbol, new_name));
-        }
+        output.push_str(&format!(
+            "Non-semantic text preview: {} → {}\nNot a semantic rename: candidates may include same-line strings/comments and unrelated scopes. No files are modified.\n",
+            symbol, new_name
+        ));
 
         for (rel_path, line_nums) in &by_file {
             let abs_path = search_dir.join(rel_path);
@@ -1234,9 +1237,8 @@ impl ToolExecutor {
 
             let content_lines: Vec<&str> = content.lines().collect();
             let mut replacements_in_file = 0;
-            let mut new_lines: Vec<String> = content_lines.iter().map(|l| l.to_string()).collect();
 
-            // Build word-boundary regex for precise replacement
+            // Word boundaries limit text candidates, not semantic references.
             let pattern = format!(r"\b{}\b", regex::escape(symbol));
             let re = match regex::Regex::new(&pattern) {
                 Ok(r) => r,
@@ -1248,20 +1250,17 @@ impl ToolExecutor {
 
             for &line_num in line_nums {
                 let idx = line_num.saturating_sub(1);
-                if idx >= new_lines.len() {
+                if idx >= content_lines.len() {
                     continue;
                 }
 
-                // Check this specific occurrence via AST validation before replacing
-                let old_line = &new_lines[idx];
+                // Line-level filtering does not resolve individual occurrences or scopes.
+                let old_line = content_lines[idx];
                 let replaced = re.replace_all(old_line, new_name).to_string();
-                if replaced != *old_line {
-                    if dry_run {
-                        output.push_str(&format!("  {}:{}:\n", rel_path, line_num));
-                        output.push_str(&format!("    - {}\n", old_line.trim()));
-                        output.push_str(&format!("    + {}\n", replaced.trim()));
-                    }
-                    new_lines[idx] = replaced;
+                if replaced != old_line {
+                    output.push_str(&format!("  {}:{}:\n", rel_path, line_num));
+                    output.push_str(&format!("    - {}\n", old_line.trim()));
+                    output.push_str(&format!("    + {}\n", replaced.trim()));
                     replacements_in_file += 1;
                 }
             }
@@ -1269,55 +1268,11 @@ impl ToolExecutor {
             if replacements_in_file > 0 {
                 files_changed += 1;
                 total_replacements += replacements_in_file;
-
-                if !dry_run {
-                    // Reconstruct file content preserving original line endings
-                    let has_trailing_newline = content.ends_with('\n');
-                    let mut new_content = new_lines.join("\n");
-                    if has_trailing_newline {
-                        new_content.push('\n');
-                    }
-
-                    let journal_call_id = format!("rename_symbol:{}", abs_path.display());
-                    match self.file_journal.lock() {
-                        Ok(mut journal) => {
-                            journal.record_before(&abs_path, &journal_call_id, turn_idx)
-                        }
-                        Err(poisoned) => poisoned.into_inner().record_before(
-                            &abs_path,
-                            &journal_call_id,
-                            turn_idx,
-                        ),
-                    }
-                    if let Err(e) = fs::write(&abs_path, &new_content) {
-                        output.push_str(&format!("  ⚠ {}: write error: {}\n", rel_path, e));
-                        continue;
-                    }
-                    self.record_write_with_content(&abs_path, &new_content);
-                    match self.file_journal.lock() {
-                        Ok(mut journal) => journal.record_after(
-                            &abs_path,
-                            &journal_call_id,
-                            new_content.as_bytes(),
-                        ),
-                        Err(poisoned) => poisoned.into_inner().record_after(
-                            &abs_path,
-                            &journal_call_id,
-                            new_content.as_bytes(),
-                        ),
-                    }
-                    output.push_str(&format!(
-                        "  ✓ {} ({} replacement{})\n",
-                        rel_path,
-                        replacements_in_file,
-                        if replacements_in_file == 1 { "" } else { "s" }
-                    ));
-                }
             }
         }
 
         output.push_str(&format!(
-            "\n{} replacement{} in {} file{}",
+            "\n{} candidate replacement line{} in {} file{}",
             total_replacements,
             if total_replacements == 1 { "" } else { "s" },
             files_changed,
@@ -1325,15 +1280,10 @@ impl ToolExecutor {
         ));
 
         if filtered_count > 0 {
-            output.push_str(&format!(
-                " ({} comment/string matches skipped)",
-                filtered_count
-            ));
+            output.push_str(&format!(" ({} candidate lines filtered)", filtered_count));
         }
 
-        if dry_run {
-            output.push_str("\n\n💡 This is a dry run. Set dry_run=false to apply changes.");
-        }
+        output.push_str("\n\nPreview only. Mutations require a semantic LSP backend.");
 
         output
     }

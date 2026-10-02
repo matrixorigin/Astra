@@ -2906,7 +2906,7 @@ fn lsp_code_actions_apply_selected_item_with_real_typescript_language_server() {
 #[cfg(unix)]
 #[test]
 #[serial_test::serial]
-fn lsp_rename_falls_back_to_rename_symbol() {
+fn lsp_rename_explicit_non_semantic_preview_is_read_only() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("main.rs"), "fn hello() { hello(); }\n").unwrap();
     let exe = ToolExecutor::new(dir.path());
@@ -2918,7 +2918,117 @@ fn lsp_rename_falls_back_to_rename_symbol() {
         "dry_run": true
     }));
 
-    assert!(result.contains("Rename preview"));
+    assert!(result.contains("Non-semantic text preview"));
     assert!(result.contains("hello"));
     assert!(result.contains("goodbye"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+        "fn hello() { hello(); }\n"
+    );
+}
+
+#[test]
+fn lsp_rename_without_position_rejects_implicit_preview_and_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let code =
+        "fn target() { target(); let s = \"target\"; } // target\nmod other { fn target() {} }\n";
+    let path = dir.path().join("main.rs");
+    std::fs::write(&path, code).unwrap();
+    let exe = ToolExecutor::new(dir.path());
+    for dry_run in [None, Some(false)] {
+        let mut args = json!({"operation": "rename", "symbol": "target", "new_name": "renamed"});
+        if let Some(value) = dry_run {
+            args["dry_run"] = json!(value);
+        }
+        let result: serde_json::Value = serde_json::from_str(&exe.lsp(&args)).unwrap();
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("active LSP backend")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), code.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn lsp_rename_preview_cannot_select_an_external_search_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(project.join("main.rs"), "fn target() { let inside = 1; }\n").unwrap();
+    std::fs::write(
+        outside.join("private.rs"),
+        "fn target() { let outside_read_sentinel = 1; }\n",
+    )
+    .unwrap();
+    let exe = ToolExecutor::new(&project);
+    exe.set_current_tool_surface(&crate::edge_tools::all_tool_schemas(), Default::default());
+    exe.sandbox_policy
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .allowed_paths
+        .clear();
+
+    for path in [
+        "../outside".to_string(),
+        outside.to_string_lossy().into_owned(),
+    ] {
+        let args = json!({
+            "operation": "rename", "symbol": "target", "new_name": "renamed",
+            "dry_run": true, "path": path
+        });
+        let result = exe.execute("lsp", &args).await;
+        assert!(result.contains("Non-semantic text preview"), "{result}");
+        assert!(result.contains("inside"), "{result}");
+        assert!(!result.contains("outside_read_sentinel"), "{result}");
+
+        // The shared preview owner must enforce authorization too, independently
+        // of the public LSP adapter's intentionally narrow argument projection.
+        let direct = exe.rename_symbol(&args);
+        assert!(
+            direct.contains(super::super::SANDBOX_DENIED_PREFIX),
+            "{direct}"
+        );
+        assert!(!direct.contains("outside_read_sentinel"), "{direct}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_rename_without_backend_never_mutates_text_candidates() {
+    let _enabled_guard = EnvGuard::set("ASTRA_LSP_RUST", "0");
+    let dir = tempfile::tempdir().unwrap();
+    let code =
+        "fn target() { target(); let s = \"target\"; } // target\nmod other { fn target() {} }\n";
+    let path = dir.path().join("main.rs");
+    std::fs::write(&path, code).unwrap();
+    let exe = ToolExecutor::new(dir.path());
+    for dry_run in [None, Some(false), Some(true)] {
+        let mut args = json!({
+            "operation": "rename", "file": "main.rs", "line": 1, "column": 4,
+            "symbol": "target", "new_name": "renamed"
+        });
+        if let Some(value) = dry_run {
+            args["dry_run"] = json!(value);
+        }
+        let result = exe.lsp(&args);
+        if dry_run == Some(true) {
+            assert!(result.contains("Non-semantic text preview"), "{result}");
+        } else {
+            let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert!(
+                parsed["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("semantic LSP backend")
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), code.as_bytes());
+    }
 }

@@ -60,10 +60,6 @@ pub(crate) fn explicit_file_tool_path_args<'a>(tool: &str, args: &'a Value) -> V
         | "grep" | "apply_patch" => {
             push_explicit_arg_path(&mut paths, args, "path");
         }
-        "notebook_edit" => {
-            push_explicit_arg_path(&mut paths, args, "notebook_path");
-            push_explicit_arg_path(&mut paths, args, "path");
-        }
         "glob" => {
             push_explicit_arg_path(&mut paths, args, "path");
             if paths.is_empty()
