@@ -7,9 +7,10 @@ use super::{
 };
 use astra_runtime::tool_sandbox::validate_path;
 use astra_tools::fs_ops::{
-    check_anchor_vs_replacement_size, normalize_read_file_line_range, read_to_string_lossy,
-    str_replace_fail, unified_diff_raw, validate_read_file_args,
+    PreparedWriteFile, check_anchor_vs_replacement_size, normalize_read_file_line_range,
+    read_to_string_lossy, str_replace_fail, unified_diff_raw, validate_read_file_args,
 };
+use astra_turn_core::file_edit_journal::EditType;
 use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
 use serde_json::{Value, json};
 
@@ -72,7 +73,7 @@ fn edit_type_label(edit_type: astra_turn_core::file_edit_journal::EditType) -> &
 }
 
 #[derive(Debug)]
-enum FsLeafError {
+pub(super) enum FsLeafError {
     SandboxDenied(String),
     NoEffect {
         output: String,
@@ -125,7 +126,7 @@ impl FsLeafError {
         }
     }
 
-    fn into_string_output(self) -> String {
+    pub(super) fn into_string_output(self) -> String {
         match self {
             Self::SandboxDenied(message) => format!("{SANDBOX_DENIED_PREFIX}{message}"),
             Self::NoEffect { output, .. } => output,
@@ -235,6 +236,94 @@ impl ToolExecutor {
     pub(crate) fn resolve_checked(&self, path: &str) -> Result<PathBuf, String> {
         self.resolve_checked_result(path)
             .map_err(FsLeafError::into_string_output)
+    }
+
+    /// Bind the already-authorized spelling to its actual publication target.
+    /// Atomic rename must replace the referent, not a symlink directory entry.
+    pub(super) fn bind_file_mutation_target(&self, path: &Path) -> Result<PathBuf, FsLeafError> {
+        let target = match path.canonicalize() {
+            Ok(target) => target,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_symlink()) {
+                    return Err(
+                        format!("Error: Cannot bind dangling symlink {}", path.display()).into(),
+                    );
+                }
+                astra_sandbox::canonicalize_parent_and_append(path)
+                    .map_err(|error| format!("Error: Cannot bind file target: {error}"))?
+            }
+            Err(error) => {
+                return Err(
+                    format!("Error: Cannot bind file target {}: {error}", path.display()).into(),
+                );
+            }
+        };
+        if !self.is_within_sandbox_boundary(&target) {
+            return Err(FsLeafError::sandbox_denied(format!(
+                "Path '{}' resolves outside the approved sandbox boundary",
+                path.display()
+            )));
+        }
+        Ok(target)
+    }
+
+    pub(super) fn verify_file_mutation_binding(
+        &self,
+        path: &Path,
+        target: &Path,
+    ) -> Result<(), FsLeafError> {
+        if self.bind_file_mutation_target(path)? != target {
+            return Err(format!(
+                "Error: File target binding changed for {}; re-read the file before editing",
+                path.display()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn record_committed_file_edit(
+        &self,
+        path: &Path,
+        call_id: &str,
+        before: Option<&[u8]>,
+        after: &[u8],
+        edit_type: EditType,
+    ) {
+        let turn = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.file_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_committed(path, call_id, turn, before, after, edit_type);
+        self.record_write_with_content(
+            path,
+            std::str::from_utf8(after).expect("prepared text publication is UTF-8"),
+        );
+    }
+
+    pub(super) fn apply_prepared_file_edit(
+        &self,
+        prepared: &PreparedWriteFile,
+        call_id: &str,
+        edit_type: EditType,
+    ) -> astra_tools::ToolResult {
+        let result = prepared.apply();
+        if !result.is_error && !prepared.is_already_desired() {
+            self.record_committed_file_edit(
+                prepared.path(),
+                call_id,
+                prepared.original_content_bytes(),
+                prepared.content_bytes(),
+                if prepared.original_content_bytes().is_none() {
+                    EditType::Create
+                } else {
+                    edit_type
+                },
+            );
+        }
+        result
     }
 
     pub(crate) fn read_file(&self, args: &Value) -> String {
@@ -811,14 +900,28 @@ impl ToolExecutor {
             Err(e) => return json!({ "success": false, "error": e }).to_string(),
         };
         let content = match args.get("content").and_then(Value::as_str) {
-            // Normalize from the caller's logical path spelling.  The path
-            // has already been resolved and sandbox-authorized above; using
-            // that resolved path here would make the owner outcome diverge
-            // from the shared convergence contract for explicitly allowed
-            // absolute paths or symlink aliases.
-            Some(c) => astra_tools::fs_ops::normalize_content_before_write(Path::new(path_arg), c),
+            Some(c) => c,
             None => return json!({ "success": false, "error": "missing 'content'" }).to_string(),
         };
+
+        let target = match self.bind_file_mutation_target(&path) {
+            Ok(target) => target,
+            Err(error) => {
+                return json!({"success": false, "error": error.into_string_output()}).to_string();
+            }
+        };
+        let prior_bytes = match fs::read(&target) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return json!({"success": false, "error": format!("Error reading file: {error}")})
+                    .to_string();
+            }
+        };
+        let prepared =
+            PreparedWriteFile::from_authorized_preimage(target, path_arg, content, prior_bytes);
+        let content = std::str::from_utf8(prepared.content_bytes())
+            .expect("prepared text publication is UTF-8");
 
         // Content size guard — prevent writing extremely large files that
         // could exhaust disk space.  10 MB is generous for source files.
@@ -833,37 +936,28 @@ impl ToolExecutor {
             }).to_string();
         }
 
-        // Exact full-state convergence is safe to establish before the
-        // read-before-overwrite policy: it performs no overwrite. The outer
-        // executor holds the exclusive bound-workspace lease; repeat the read
-        // and binding check immediately before returning so an uncoordinated
-        // external writer cannot lend us a stale equality result.
-        let mut prior_bytes = if path.exists() {
-            fs::read(&path).ok()
-        } else {
-            None
-        };
-        if prior_bytes.as_deref() == Some(content.as_bytes()) {
-            let binding_safe = path
-                .canonicalize()
-                .ok()
-                .is_some_and(|canonical| self.is_within_sandbox_boundary(&canonical));
-            let confirmed = binding_safe.then(|| fs::read(&path).ok()).flatten();
-            if confirmed.as_deref() == Some(content.as_bytes()) {
-                *already_desired = true;
-                return json!({
-                    "success": true,
-                    "state": "already_desired",
-                    "bytes_written": 0,
-                    "path": path.to_string_lossy().to_string(),
-                })
-                .to_string();
+        // The shared owner verifies the captured preimage even for an exact
+        // no-op, before any journal entry or read-before-overwrite requirement.
+        if prepared.is_already_desired() {
+            if let Err(error) = self.verify_file_mutation_binding(&path, prepared.path()) {
+                return json!({"success": false, "error": error.into_string_output()}).to_string();
             }
-            prior_bytes = confirmed;
+            let result = prepared.apply();
+            if result.is_error {
+                return json!({"success": false, "error": result.output}).to_string();
+            }
+            *already_desired = true;
+            return json!({
+                "success": true,
+                "state": "already_desired",
+                "bytes_written": 0,
+                "path": path.to_string_lossy().to_string(),
+            })
+            .to_string();
         }
 
         // Staleness check: if file exists, it must have been read first and not modified since
-        if path.exists() {
+        if prepared.original_content_bytes().is_some() {
             if let Err(e) = self.check_staleness(&path) {
                 return json!({ "success": false, "error": e }).to_string();
             }
@@ -881,77 +975,34 @@ impl ToolExecutor {
             }
         }
 
-        if let Some(parent) = path.parent()
-            && let Err(e) = fs::create_dir_all(parent)
-        {
-            return json!({
-                "success": false,
-                "error": format!("failed to create parent directory {}: {e}", parent.display())
-            })
-            .to_string();
-        }
-        let prior_for_diff = prior_bytes
-            .as_deref()
+        let prior_for_diff = prepared
+            .original_content_bytes()
             .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
 
-        // Defense-in-depth: re-check staleness right before writing to catch
-        // race conditions between the initial validation and the actual write
-        // (e.g. a linter or user modified the file in between).
-        if path.exists() {
-            if let Err(e) = self.check_staleness(&path) {
-                return json!({ "success": false, "error": format!("Pre-write staleness check failed: {e}") }).to_string();
-            }
+        if let Err(error) = self.verify_file_mutation_binding(&path, prepared.path()) {
+            return json!({"success": false, "error": error.into_string_output()}).to_string();
         }
 
-        // Defense-in-depth: re-canonicalize immediately before write to detect
-        // symlink swaps (TOCTOU) between the initial resolve_checked and now.
-        if path.exists() {
-            if let Ok(canonical) = path.canonicalize() {
-                if !self.is_within_sandbox_boundary(&canonical) {
-                    return json!({
-                        "success": false,
-                        "error": format!(
-                            "Security: path '{}' was replaced with a symlink pointing outside the approved sandbox boundary",
-                            path.display()
-                        )
-                    }).to_string();
-                }
-            }
-        }
-
-        // Journal: snapshot before-state for undo
-        let turn_idx = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
         let journal_call_id = format!("write_file:{}", path.display());
-        if let Ok(mut journal) = self.file_journal.lock() {
-            journal.record_before(&path, &journal_call_id, turn_idx);
-        }
-
-        match fs::write(&path, &content) {
-            Ok(_) => {
-                *applied = prior_bytes.as_deref() != Some(content.as_bytes());
-                // Record write state so subsequent reads/edits know the mtime
-                self.record_write_with_content(&path, &content);
-                // Journal: record after-state
-                if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_after(&path, &journal_call_id, content.as_bytes());
-                }
-                let old_slice = prior_for_diff.as_deref().unwrap_or("");
-                let cli_diff = cap_cli_unified_diff(unified_diff_raw(old_slice, &content, &path));
-                let lsp_diag = self.inline_lsp_diagnostics(&path);
-                let mut obj = json!({
-                    "success": true,
-                    "bytes_written": content.len(),
-                    "path": path.to_string_lossy().to_string(),
-                    "_cli_unified_diff": cli_diff,
-                });
-                if let Some(diag) = lsp_diag {
-                    obj["lsp_diagnostics"] = Value::String(diag);
-                }
-                obj.to_string()
+        let publication =
+            self.apply_prepared_file_edit(&prepared, &journal_call_id, EditType::Overwrite);
+        if !publication.is_error {
+            *applied = true;
+            let old_slice = prior_for_diff.as_deref().unwrap_or("");
+            let cli_diff = cap_cli_unified_diff(unified_diff_raw(old_slice, content, &path));
+            let lsp_diag = self.inline_lsp_diagnostics(&path);
+            let mut obj = json!({
+                "success": true,
+                "bytes_written": content.len(),
+                "path": path.to_string_lossy().to_string(),
+                "_cli_unified_diff": cli_diff,
+            });
+            if let Some(diag) = lsp_diag {
+                obj["lsp_diagnostics"] = Value::String(diag);
             }
-            Err(e) => json!({ "success": false, "error": e.to_string() }).to_string(),
+            obj.to_string()
+        } else {
+            json!({ "success": false, "error": publication.output }).to_string()
         }
     }
 
@@ -970,10 +1021,11 @@ impl ToolExecutor {
     }
 
     fn str_replace_impl(&self, args: &Value, applied: &mut bool) -> Result<String, FsLeafError> {
-        let path = match args.get("path").and_then(Value::as_str) {
-            Some(p) => self.resolve_checked_result(p)?,
+        let path_arg = match args.get("path").and_then(Value::as_str) {
+            Some(p) => p,
             None => return Err("Error: missing 'path'".to_string().into()),
         };
+        let path = self.resolve_checked_result(path_arg)?;
         let old_str = match args.get("old_str").and_then(Value::as_str) {
             Some(s) => s,
             None => return Err("Error: missing 'old_str'".to_string().into()),
@@ -1008,8 +1060,13 @@ impl ToolExecutor {
             return Err(err.into());
         }
 
-        let content =
-            read_to_string_lossy(&path).map_err(|e| format!("Error reading file: {e}"))?;
+        let target = self.bind_file_mutation_target(&path)?;
+        let original_bytes = fs::read(&target).map_err(|e| format!("Error reading file: {e}"))?;
+        let content = std::str::from_utf8(&original_bytes)
+            .map_err(|_| {
+                "Error: File is not valid UTF-8; text edits cannot preserve its bytes".to_owned()
+            })?
+            .to_owned();
         let redaction_reference = astra_tools::credential_redaction::resolve_redacted_anchor(
             &content,
             old_str,
@@ -1117,22 +1174,38 @@ impl ToolExecutor {
                 vec![astra_core::ToolRecoveryAction::CorrectArguments],
             ));
         }
+        let prepared = PreparedWriteFile::from_authorized_preimage(
+            target,
+            path_arg,
+            &new_content,
+            Some(original_bytes),
+        );
+        if prepared.is_already_desired() {
+            return Err(FsLeafError::caller_correctable_no_effect(
+                str_replace_fail(
+                    "the normalized replacement would not change the file.",
+                    "Deterministic normalization returns the exact original bytes.",
+                    "Choose a replacement that changes the normalized file, or skip this edit.",
+                ),
+                vec![astra_core::ToolRecoveryAction::CorrectArguments],
+            ));
+        }
+        let new_content = std::str::from_utf8(prepared.content_bytes())
+            .expect("prepared text publication is UTF-8");
 
         // A matched anchor authorizes this localized edit, not a full-file read.
-        self.record_read_cached(&path, true, content.clone());
+        self.record_read_cached(prepared.path(), true, content.clone());
         if dry_run {
             self.record_fuzzy_match_event(
                 &path,
                 strategy,
                 astra_runtime::observability::FuzzyMatchOutcome::Matched,
             );
-            return Ok(unified_diff(&content, &new_content, &path));
+            return Ok(unified_diff(&content, new_content, &path));
         }
         self.check_staleness(&path)
             .map_err(|e| format!("Error: Pre-write staleness check failed: {e}"))?;
-        let turn_idx = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
+        self.verify_file_mutation_binding(&path, prepared.path())?;
         let journal_prefix = if strategy == "exact" {
             "str_replace"
         } else if strategy == astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED {
@@ -1141,20 +1214,12 @@ impl ToolExecutor {
             "str_replace_fuzzy"
         };
         let journal_call_id = format!("{journal_prefix}:{}", path.display());
-        if let Ok(mut journal) = self.file_journal.lock() {
-            journal.record_before_patch(&path, &journal_call_id, turn_idx);
+        let publication =
+            self.apply_prepared_file_edit(&prepared, &journal_call_id, EditType::Patch);
+        if publication.is_error {
+            return Err(publication.output.into());
         }
-        fs::write(&path, &new_content).map_err(|e| format!("Error writing file: {e}"))?;
         *applied = true;
-        self.record_write_with_content(&path, &new_content);
-        if let Ok(mut journal) = self.file_journal.lock() {
-            journal.record_after(&path, &journal_call_id, new_content.as_bytes());
-        }
-        let format_result = auto_format_file(&path, &self.project_root);
-        if format_result.is_some() {
-            self.record_write(&path);
-        }
-
         let old_lines: Vec<&str> = actual.lines().collect();
         let new_lines: Vec<&str> = replacement.lines().collect();
         let small_edit = old_lines.len().max(new_lines.len()) <= 10;
@@ -1179,9 +1244,6 @@ impl ToolExecutor {
                 result.push_str(&format!("+ {line}\n"));
             }
         }
-        if let Some(note) = format_result {
-            result.push_str(&format!("\n{note}"));
-        }
         if strategy == "exact" {
             if replace_all && count > 1 {
                 result = format!("Replaced {count} occurrences\n{result}");
@@ -1191,13 +1253,13 @@ impl ToolExecutor {
                     .matches('\n')
                     .count()
                     + 1;
-                let scope = code_intel::scope_at_line(&new_content, lang, edit_line);
+                let scope = code_intel::scope_at_line(new_content, lang, edit_line);
                 if !scope.breadcrumbs.is_empty() {
                     result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
                 }
             }
         }
-        append_str_replace_cli_unified_diff(&mut result, &content, &new_content, &path);
+        append_str_replace_cli_unified_diff(&mut result, &content, new_content, &path);
         if let Some(diag) = self.inline_lsp_diagnostics(&path) {
             result.push_str(&diag);
         }
@@ -1899,10 +1961,8 @@ impl ToolExecutor {
         }
     }
 
-    /// Execute a multi-file replacement while preserving the structured
-    /// owner result.  The string-only wrapper below is kept for the older
-    /// in-process tests/callers, but the live edge dispatch must carry partial
-    /// commit metadata into the headless ledger.
+    /// Project each committed file into CLI undo/cache state, including the
+    /// committed prefix when a later file fails publication.
     pub(crate) fn str_replace_batch_result(&self, args: &Value) -> astra_tools::ToolResult {
         let top_path = args.get("path").and_then(Value::as_str);
         let edits = match args.get("edits").and_then(Value::as_array) {
@@ -1932,40 +1992,41 @@ impl ToolExecutor {
             Err(e) => return astra_tools::ToolResult::error(e),
         };
 
-        // Sandbox-validate every path BEFORE touching disk.
-        // The core two-phase commit in multi_path_edit guarantees atomicity:
-        // all files are staged first, then rename() commits them atomically.
-        // No journal checkpoint, no preimage capture, no dual rollback.
+        // Authorize the whole group before preparation. Check read evidence
+        // after capturing preimages, then let publication revalidate them;
+        // intervening edits cannot become an unchecked new baseline.
         for (path, _) in &groups {
             if let Err(error) = self.resolve_checked_result(path) {
                 return error.into_tool_result();
             }
         }
 
-        // Build the delegated args: top-level dry_run + per-edit paths.
-        // The core's str_replace routes to multi_path_edit for multi-file batches.
-        let dry_run = args
-            .get("dry_run")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-
-        let mut delegated = serde_json::Map::new();
-        delegated.insert(
-            "edits".to_string(),
-            args.get("edits").cloned().unwrap_or(Value::Null),
-        );
-        if dry_run {
-            delegated.insert("dry_run".to_string(), Value::Bool(true));
+        let prepared = match astra_tools::fs_ops::prepare_multi_path_edit(&self.project_root, args)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => return error,
+        };
+        for ((spelling, _), edit) in groups.iter().zip(prepared.prepared_edits()) {
+            let path = match self.resolve_checked_result(spelling) {
+                Ok(path) => path,
+                Err(error) => return error.into_tool_result(),
+            };
+            if let Err(error) = self.check_staleness(&path) {
+                return astra_tools::ToolResult::error(error);
+            }
+            if let Err(error) = self.verify_file_mutation_binding(&path, edit.path()) {
+                return error.into_tool_result();
+            }
         }
-        if let Some(allow) = args.get("allow_structural_change") {
-            delegated.insert("allow_structural_change".to_string(), allow.clone());
-        }
-
-        astra_tools::fs_ops::str_replace(&self.project_root, &Value::Object(delegated))
-    }
-
-    pub(crate) fn str_replace_batch(&self, args: &Value) -> String {
-        self.str_replace_batch_result(args).output
+        prepared.apply_with_committed(|edit| {
+            self.record_committed_file_edit(
+                edit.path(),
+                &format!("batch_edit:{}", edit.path().display()),
+                Some(edit.original_content_bytes()),
+                edit.new_content_bytes(),
+                EditType::Patch,
+            );
+        })
     }
 
     pub(crate) fn multi_edit(&self, args: &Value) -> String {
@@ -1982,10 +2043,11 @@ impl ToolExecutor {
     }
 
     fn multi_edit_impl(&self, args: &Value, applied: &mut bool) -> Result<String, FsLeafError> {
-        let path = match args.get("path").and_then(Value::as_str) {
-            Some(p) => self.resolve_checked_result(p)?,
+        let path_arg = match args.get("path").and_then(Value::as_str) {
+            Some(p) => p,
             None => return Err("Error: missing 'path'".to_string().into()),
         };
+        let path = self.resolve_checked_result(path_arg)?;
         let edits = match args.get("edits").and_then(Value::as_array) {
             Some(e) => e,
             None => return Err("Error: missing 'edits' array".to_string().into()),
@@ -1998,12 +2060,16 @@ impl ToolExecutor {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        // Staleness check
+        let target = self.bind_file_mutation_target(&path)?;
+        let original_bytes = fs::read(&target).map_err(|e| format!("Error reading file: {e}"))?;
+        let content = std::str::from_utf8(&original_bytes)
+            .map_err(|_| {
+                "Error: File is not valid UTF-8; text edits cannot preserve its bytes".to_owned()
+            })?
+            .to_owned();
+
         self.check_staleness(&path)
             .map_err(|e| format!("Error: {e}"))?;
-
-        let content =
-            read_to_string_lossy(&path).map_err(|e| format!("Error reading file: {e}"))?;
 
         // Validate + apply all edits atomically (all or nothing).
         //
@@ -2146,72 +2212,69 @@ impl ToolExecutor {
             working = working.replacen(old_str, new_str, 1);
         }
 
-        // Dry run: show diff
+        let prepared = PreparedWriteFile::from_authorized_preimage(
+            target,
+            path_arg,
+            &working,
+            Some(original_bytes),
+        );
+        if prepared.is_already_desired() {
+            return Err(FsLeafError::caller_correctable_no_effect(
+                str_replace_fail(
+                    "the normalized edits would not change the file.",
+                    "The completed batch returns the exact original bytes after normalization.",
+                    "Remove cancelling/no-op edits or choose a batch that changes the normalized file.",
+                ),
+                vec![astra_core::ToolRecoveryAction::CorrectArguments],
+            ));
+        }
+        let working = std::str::from_utf8(prepared.content_bytes())
+            .expect("prepared text publication is UTF-8");
+
+        // Dry run: show the same normalized candidate used by publication.
         if dry_run {
-            return Ok(unified_diff(&content, &working, &path));
+            return Ok(unified_diff(&content, working, &path));
         }
 
-        // Defense-in-depth: re-check staleness right before writing.
-        self.check_staleness(&path)
-            .map_err(|e| format!("Error: Pre-write staleness check failed: {e}"))?;
+        self.verify_file_mutation_binding(&path, prepared.path())?;
 
-        // Journal: snapshot before-state for undo
-        let turn_idx = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
         let journal_call_id = format!("batch_edit:{}", path.display());
-        if let Ok(mut journal) = self.file_journal.lock() {
-            journal.record_before_patch(&path, &journal_call_id, turn_idx);
-        }
-
-        // Apply
-        match fs::write(&path, &working) {
-            Ok(_) => {
-                // Owner-side commit boundary. This exact write succeeded with
-                // a buffer that validation proved differs from the preimage;
-                // transport must not reconstruct that fact from prose or a
-                // bounded whole-workspace fingerprint.
-                *applied = true;
-                self.record_write_with_content(&path, &working);
-                // Journal: record after-state
-                if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_after(&path, &journal_call_id, working.as_bytes());
+        let publication =
+            self.apply_prepared_file_edit(&prepared, &journal_call_id, EditType::Patch);
+        if !publication.is_error {
+            // Owner-side commit boundary. This exact write succeeded with
+            // a buffer that validation proved differs from the preimage;
+            // transport must not reconstruct that fact from prose or a
+            // bounded whole-workspace fingerprint.
+            *applied = true;
+            let mut result = format!("Applied {} edit(s) successfully", edits.len());
+            // Disclose any edits that required fuzzy matching so
+            // the caller sees the old_str wasn't byte-exact.
+            // Format: one bullet per fuzzy edit, tagged with the
+            // strategy name (whitespace-normalized, line-trimmed,
+            // etc.) and the 1-based edit index.
+            if !fuzzy_applications.is_empty() {
+                result.push_str("\n⚠ fuzzy match used (old_str did not match byte-exactly):");
+                for (idx, strategy) in &fuzzy_applications {
+                    result.push_str(&format!("\n  edit[{idx}]: {strategy}"));
                 }
-                let format_result = auto_format_file(&path, &self.project_root);
-                if format_result.is_some() {
-                    self.record_write(&path);
-                }
-                let mut result = format!("Applied {} edit(s) successfully", edits.len());
-                if let Some(fmt_note) = format_result {
-                    result.push_str(&format!("\n{fmt_note}"));
-                }
-                // Disclose any edits that required fuzzy matching so
-                // the caller sees the old_str wasn't byte-exact.
-                // Format: one bullet per fuzzy edit, tagged with the
-                // strategy name (whitespace-normalized, line-trimmed,
-                // etc.) and the 1-based edit index.
-                if !fuzzy_applications.is_empty() {
-                    result.push_str("\n⚠ fuzzy match used (old_str did not match byte-exactly):");
-                    for (idx, strategy) in &fuzzy_applications {
-                        result.push_str(&format!("\n  edit[{idx}]: {strategy}"));
-                    }
-                }
-
-                // Scope context for the first edit location
-                if let Some(lang) = code_intel::detect_language(&path)
-                    && let Some(first_edit_start) = first_edit_start_byte
-                {
-                    let edit_line = content[..first_edit_start].matches('\n').count() + 1;
-                    let scope = code_intel::scope_at_line(&working, lang, edit_line);
-                    if !scope.breadcrumbs.is_empty() {
-                        result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
-                    }
-                }
-
-                append_str_replace_cli_unified_diff(&mut result, &content, &working, &path);
-                Ok(result)
             }
-            Err(e) => Err(format!("Error writing file: {e}").into()),
+
+            // Scope context for the first edit location
+            if let Some(lang) = code_intel::detect_language(&path)
+                && let Some(first_edit_start) = first_edit_start_byte
+            {
+                let edit_line = content[..first_edit_start].matches('\n').count() + 1;
+                let scope = code_intel::scope_at_line(working, lang, edit_line);
+                if !scope.breadcrumbs.is_empty() {
+                    result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
+                }
+            }
+
+            append_str_replace_cli_unified_diff(&mut result, &content, working, &path);
+            Ok(result)
+        } else {
+            Err(publication.output.into())
         }
     }
 
@@ -2733,64 +2796,6 @@ fn is_generic_def(line: &str) -> bool {
         || line.starts_with("func ")
 }
 
-// ─── Auto-format after edit ────────────────────────────────────────────────
-
-/// Detect project formatter and run it on the edited file.
-/// Returns Some(note) if formatter ran, None otherwise.
-fn auto_format_file(file_path: &Path, project_root: &Path) -> Option<String> {
-    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-    let (cmd, args): (&str, Vec<&str>) = match ext {
-        "rs" => {
-            // Only format if Cargo.toml exists (we're in a Rust project)
-            if !project_root.join("Cargo.toml").exists()
-                && !project_root.join("Cargo.toml").exists()
-            {
-                return None;
-            }
-            ("rustfmt", vec!["--edition", "2021"])
-        }
-        "py" => {
-            // Only if pyproject.toml or .black config exists
-            if !project_root.join("pyproject.toml").exists()
-                && !project_root.join("setup.cfg").exists()
-            {
-                return None;
-            }
-            ("black", vec!["--quiet"])
-        }
-        "go" => ("gofmt", vec!["-w"]),
-        "ts" | "tsx" | "js" | "jsx" | "json" | "css" | "scss" | "html" | "md" | "yaml" | "yml" => {
-            // Only if prettier config or package.json exists
-            if !project_root.join("package.json").exists()
-                && !project_root.join(".prettierrc").exists()
-                && !project_root.join(".prettierrc.json").exists()
-            {
-                return None;
-            }
-            ("npx", vec!["prettier", "--write"])
-        }
-        _ => return None,
-    };
-
-    let file_str = file_path.to_string_lossy();
-    let mut full_args: Vec<&str> = args;
-    full_args.push(&file_str);
-
-    let result = std::process::Command::new(cmd)
-        .args(&full_args)
-        .current_dir(project_root)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output();
-
-    match result {
-        Ok(out) if out.status.success() => Some(format!("✓ Auto-formatted with {cmd}")),
-        Ok(_) => None,  // Formatter failed silently — don't report
-        Err(_) => None, // Formatter not available — don't report
-    }
-}
-
 // ─── unified diff generation ────────────────────────────────────────────────
 
 const CLI_UNIFIED_DIFF_MAX_LINES: usize = 400;
@@ -2980,8 +2985,8 @@ fn push_suffix_if_fits(output: &mut String, suffix: &str, max_chars: usize) {
 mod tests {
     use super::super::ToolExecutor;
     use super::{
-        Language, add_line_numbers, auto_format_file, detect_language, extract_outline,
-        is_unc_path, similarity_score, str_replace_ambiguous_hint, str_replace_not_found_hint,
+        Language, add_line_numbers, detect_language, extract_outline, is_unc_path,
+        similarity_score, str_replace_ambiguous_hint, str_replace_not_found_hint,
     };
     use astra_text_utils::str_preview::truncate_str;
     use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
@@ -3662,7 +3667,7 @@ type Handler interface {
         );
         // Verify actual file content
         let actual = std::fs::read_to_string(&file_path).unwrap();
-        assert_eq!(actual, "let x = \"world\";");
+        assert_eq!(actual, "let x = \"world\";\n");
     }
 
     #[test]
@@ -3683,7 +3688,7 @@ type Handler interface {
             "should mention normalization: {result}"
         );
         let actual = std::fs::read_to_string(&file_path).unwrap();
-        assert_eq!(actual, "let x = \u{201C}world\u{201D};");
+        assert_eq!(actual, "let x = \u{201C}world\u{201D};\n");
     }
 
     #[test]
@@ -4644,48 +4649,308 @@ type Handler interface {
         assert!(with_ext > without_ext, "same ext should score higher");
     }
 
-    // ── auto_format_file tests ──────────────────────────────────────────────
-
     #[test]
-    fn auto_format_skips_without_project_config() {
-        // Unknown extension
-        let tmpdir = tempfile::tempdir().unwrap();
-        let file = tmpdir.path().join("data.xyz");
-        std::fs::write(&file, "content").unwrap();
-        assert!(auto_format_file(&file, tmpdir.path()).is_none());
+    fn file_edits_preserve_candidates_in_formatter_configured_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"edit-fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let path = dir.path().join("main.rs");
+        let exe = test_executor_in(dir.path());
+        let created = "fn   main( ){let   value=1;}\n";
+        let (write, applied, already_desired) = exe.write_file_with_applied(&json!({
+            "path": "main.rs",
+            "content": "fn   main( ){let   value=1;}\r\n"
+        }));
+        let write: Value = serde_json::from_str(&write).unwrap();
+        assert_eq!(write["success"], true);
+        assert!(applied);
+        assert!(!already_desired);
+        // Deterministic LF normalization stays; project-configured formatters
+        // must not rewrite whitespace outside the requested candidate.
+        assert_eq!(std::fs::read(&path).unwrap(), created.as_bytes());
+        assert!(
+            write["_cli_unified_diff"]
+                .as_str()
+                .unwrap()
+                .contains(created.trim_end())
+        );
 
-        // .rs without Cargo.toml
-        let file = tmpdir.path().join("main.rs");
-        std::fs::write(&file, "fn main() {}").unwrap();
-        assert!(auto_format_file(&file, tmpdir.path()).is_none());
+        let (replace, applied) = exe.str_replace_with_applied(&json!({
+            "path": "main.rs", "old_str": "value=1", "new_str": "value=2"
+        }));
+        let replaced = "fn   main( ){let   value=2;}\n";
+        assert!(!replace.is_error, "{}", replace.output);
+        assert!(applied);
+        assert_eq!(std::fs::read(&path).unwrap(), replaced.as_bytes());
+        assert!(replace.output.contains(replaced.trim_end()));
 
-        // .py without pyproject.toml
-        let file = tmpdir.path().join("main.py");
-        std::fs::write(&file, "print('hello')").unwrap();
-        assert!(auto_format_file(&file, tmpdir.path()).is_none());
+        let (batch, applied) = exe.multi_edit_with_applied(&json!({
+            "path": "main.rs",
+            "edits": [
+                {"old_str": "value=2", "new_str": "value=3"},
+                {"old_str": "main", "new_str": "entry"}
+            ]
+        }));
+        let batched = "fn   entry( ){let   value=3;}\n";
+        assert!(!batch.is_error, "{}", batch.output);
+        assert!(applied);
+        assert_eq!(std::fs::read(&path).unwrap(), batched.as_bytes());
+        assert!(batch.output.contains(batched.trim_end()));
 
-        // .ts without package.json
-        let file = tmpdir.path().join("app.ts");
-        std::fs::write(&file, "const x = 1;").unwrap();
-        assert!(auto_format_file(&file, tmpdir.path()).is_none());
+        let journal = exe.file_journal.lock().unwrap();
+        let entries: Vec<_> = journal.entries().collect();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].before_content, None);
+        assert_eq!(entries[0].after_content, created.as_bytes());
+        assert_eq!(
+            entries[1].before_content.as_deref(),
+            Some(created.as_bytes())
+        );
+        assert_eq!(entries[1].after_content, replaced.as_bytes());
+        assert_eq!(
+            entries[2].before_content.as_deref(),
+            Some(replaced.as_bytes())
+        );
+        assert_eq!(entries[2].after_content, batched.as_bytes());
+        journal.undo_turn_transactional(0).unwrap();
+        assert!(!path.exists());
+        journal.restore_turn_transactional(0).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), batched.as_bytes());
     }
 
     #[test]
-    fn auto_format_rs_with_cargo_toml_tries_rustfmt() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        // Create Cargo.toml so the guard passes
+    fn cli_prepared_publication_respects_explicit_external_authorization() {
+        let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let project = base.path().join("project");
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let path = outside.join("edit.txt");
+        let exe = test_executor_in(&project);
+        exe.sandbox_policy
+            .write()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .allowed_paths
+            .clear();
+        let args = json!({"path": path, "content": "alpha\r\n"});
+        let (denied, applied, converged) = exe.write_file_with_applied(&args);
+        assert_eq!(
+            serde_json::from_str::<Value>(&denied).unwrap()["success"],
+            false
+        );
+        assert!(!applied && !converged);
+        assert!(!path.exists());
+        exe.expand_sandbox_path(outside).unwrap();
+        let (write, applied, converged) = exe.write_file_with_applied(&args);
+        assert_eq!(
+            serde_json::from_str::<Value>(&write).unwrap()["success"],
+            true
+        );
+        assert!(applied && !converged);
+        let (replace, applied) = exe.str_replace_with_applied(&json!({
+            "path": path, "old_str": "alpha", "new_str": "beta"
+        }));
+        assert!(!replace.is_error && applied, "{}", replace.output);
+        let (batch, applied) = exe.multi_edit_with_applied(&json!({
+            "path": path, "edits": [{"old_str": "beta", "new_str": "gamma"}]
+        }));
+        assert!(!batch.is_error && applied, "{}", batch.output);
+        assert_eq!(std::fs::read(path).unwrap(), b"gamma\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_prepared_publication_updates_symlink_referent_without_replacing_alias() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.data");
+        let alias = dir.path().join("edit.rs");
+        std::fs::write(&target, b"old\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, &alias).unwrap();
+        let exe = test_executor_in(dir.path());
+        *exe.sandbox_policy.write().unwrap() = Some(
+            astra_runtime::tool_sandbox::SandboxPolicy::permissive(dir.path()),
+        );
+        exe.read_file(&json!({"path": "edit.rs"}));
+        let (write, applied, converged) = exe.write_file_with_applied(&json!({
+            "path": "edit.rs", "content": "alpha\r\n"
+        }));
+        assert_eq!(
+            serde_json::from_str::<Value>(&write).unwrap()["success"],
+            true
+        );
+        assert!(applied && !converged);
+        assert_eq!(std::fs::read(&target).unwrap(), b"alpha\n");
+        let (replace, applied) = exe.str_replace_with_applied(&json!({
+            "path": "edit.rs", "old_str": "alpha", "new_str": "beta"
+        }));
+        assert!(!replace.is_error && applied, "{}", replace.output);
+        let (batch, applied) = exe.multi_edit_with_applied(&json!({
+            "path": "edit.rs", "edits": [{"old_str": "beta", "new_str": "gamma"}]
+        }));
+        assert!(!batch.is_error && applied, "{}", batch.output);
+        assert_eq!(std::fs::read(&target).unwrap(), b"gamma\n");
+        assert_eq!(std::fs::read_link(&alias).unwrap(), target);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let bound = exe.bind_file_mutation_target(&alias).unwrap();
+        exe.file_journal.lock().unwrap().undo_file(&bound).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"beta\n");
+        assert_eq!(std::fs::read_link(&alias).unwrap(), target);
+        let other = dir.path().join("other.data");
+        std::fs::write(&other, b"untouched").unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&other, &alias).unwrap();
+        assert!(exe.verify_file_mutation_binding(&alias, &bound).is_err());
+        assert_eq!(std::fs::read(other).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn cli_text_edits_reject_invalid_utf8_without_changing_bytes_or_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.txt");
+        let raw = b"alpha \xff\n";
+        std::fs::write(&path, raw).unwrap();
+        let exe = test_executor_in(dir.path());
+        exe.read_file(&json!({"path": "edit.txt"}));
+        let checkpoint = exe.file_journal_checkpoint();
+        for dry_run in [false, true] {
+            let results = [
+                exe.str_replace_with_applied(&json!({
+                    "path": "edit.txt", "old_str": "alpha", "new_str": "beta",
+                    "dry_run": dry_run
+                })),
+                exe.multi_edit_with_applied(&json!({
+                    "path": "edit.txt", "edits": [{"old_str": "alpha", "new_str": "gamma"}],
+                    "dry_run": dry_run
+                })),
+            ];
+            for (result, applied) in results {
+                assert!(result.is_error && !applied, "{}", result.output);
+                assert!(result.output.contains("not valid UTF-8"));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), raw);
+            assert_eq!(exe.file_journal_checkpoint(), checkpoint);
+        }
+    }
+
+    #[test]
+    fn cli_prepared_write_does_not_treat_read_error_as_missing_preimage() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+        let checkpoint = exe.file_journal_checkpoint();
+        let (result, applied, converged) = exe.write_file_with_applied(&json!({
+            "path": ".", "content": "replacement"
+        }));
+        assert_eq!(
+            serde_json::from_str::<Value>(&result).unwrap()["success"],
+            false
+        );
+        assert!(!applied && !converged);
+        assert_eq!(exe.file_journal_checkpoint(), checkpoint);
+        assert!(dir.path().is_dir());
+    }
+
+    #[test]
+    fn rejected_prepared_publication_cannot_create_an_undo_of_external_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+        for (name, before) in [
+            ("existing.txt", Some(b"original".to_vec())),
+            ("new.txt", None),
+        ] {
+            let path = dir.path().join(name);
+            if let Some(bytes) = &before {
+                std::fs::write(&path, bytes).unwrap();
+            }
+            let prepared = astra_tools::fs_ops::PreparedWriteFile::from_authorized_preimage(
+                path.clone(),
+                name,
+                "candidate",
+                before,
+            );
+            let checkpoint = exe.file_journal_checkpoint();
+            std::fs::write(&path, b"external owner").unwrap();
+            let result = exe.apply_prepared_file_edit(
+                &prepared,
+                "rejected-edit",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
+            assert!(result.is_error, "{}", result.output);
+            assert_eq!(exe.file_journal_checkpoint(), checkpoint);
+            exe.file_journal
+                .lock()
+                .unwrap()
+                .undo_turn_since(0, checkpoint);
+            assert_eq!(std::fs::read(&path).unwrap(), b"external owner");
+        }
+    }
+
+    #[test]
+    fn file_edit_preview_and_noop_preserve_formatter_configured_preimage() {
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            tmpdir.path().join("Cargo.toml"),
-            "[package]\nname = \"test\"",
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"edit-fixture\"\n",
         )
         .unwrap();
-        let file = tmpdir.path().join("main.rs");
-        std::fs::write(&file, "fn   main  (  )  {  }").unwrap();
-        let result = auto_format_file(&file, tmpdir.path());
-        // rustfmt may or may not be installed — either formatted or None is ok
-        if let Some(r) = &result {
-            assert!(r.contains("rustfmt"), "should mention rustfmt: {r}");
-        }
+        let path = dir.path().join("main.rs");
+        let source = "fn   main( ){let   value=1;}\n";
+        std::fs::write(&path, source).unwrap();
+        let exe = test_executor_in(dir.path());
+        let checkpoint = exe.file_journal_checkpoint();
+
+        let (write, applied, already_desired) = exe.write_file_with_applied(&json!({
+            "path": "main.rs", "content": source
+        }));
+        let write: Value = serde_json::from_str(&write).unwrap();
+        assert_eq!(write["state"], "already_desired");
+        assert!(!applied);
+        assert!(already_desired);
+        exe.read_file(&json!({"path": "main.rs"}));
+        let (preview, applied) = exe.str_replace_with_applied(&json!({
+            "path": "main.rs", "old_str": "value=1", "new_str": "value=2", "dry_run": true
+        }));
+        assert!(!preview.is_error, "{}", preview.output);
+        assert!(!applied);
+        assert!(preview.output.contains("[DRY RUN]"));
+        assert!(preview.output.contains("fn   main( ){let   value=2;}"));
+        let (preview, applied) = exe.multi_edit_with_applied(&json!({
+            "path": "main.rs", "dry_run": true,
+            "edits": [{"old_str": "value=1", "new_str": "value=2"}]
+        }));
+        assert!(!preview.is_error, "{}", preview.output);
+        assert!(!applied);
+        assert!(preview.output.contains("[DRY RUN]"));
+        let (noop, applied) = exe.str_replace_with_applied(&json!({
+            "path": "main.rs", "old_str": "value=1", "new_str": "value=1"
+        }));
+        assert!(noop.is_error);
+        assert!(!applied);
+        let (normalized_noop, applied) = exe.str_replace_with_applied(&json!({
+            "path": "main.rs", "old_str": "\n", "new_str": "\r\n"
+        }));
+        assert!(normalized_noop.is_error);
+        assert!(!applied);
+        let (cancelled_batch, applied) = exe.multi_edit_with_applied(&json!({
+            "path": "main.rs",
+            "edits": [
+                {"old_str": "value=1", "new_str": "value=2"},
+                {"old_str": "value=2", "new_str": "value=1"}
+            ]
+        }));
+        assert!(cancelled_batch.is_error);
+        assert!(!applied);
+        assert_eq!(std::fs::read(path).unwrap(), source.as_bytes());
+        assert_eq!(exe.file_journal_checkpoint(), checkpoint);
     }
 
     // ─── dry_run / diff preview tests ───────────────────────────────────────
@@ -4986,15 +5251,27 @@ type Handler interface {
         std::fs::write(&a, "alpha beta").unwrap();
         std::fs::write(&b, "gamma delta").unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
-        exe.read_file(&json!({"path": "a.txt"}));
-        exe.read_file(&json!({"path": "b.txt"}));
-
-        let result = exe.str_replace_batch(&json!({
+        let args = json!({
             "edits": [
                 {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
                 {"path": "b.txt", "old_str": "delta", "new_str": "DELTA"}
             ]
-        }));
+        });
+        let checkpoint = exe.file_journal_checkpoint();
+        let unread = exe.str_replace_batch_result(&args);
+        assert!(unread.is_error && unread.output.contains("has not been read"));
+        exe.read_file(&json!({"path": "a.txt"}));
+        exe.read_file(&json!({"path": "b.txt"}));
+        std::fs::write(&b, "external delta").unwrap();
+        let stale = exe.str_replace_batch_result(&args);
+        assert!(stale.is_error && stale.output.contains("modified since last read"));
+        assert_eq!(std::fs::read(&a).unwrap(), b"alpha beta");
+        assert_eq!(std::fs::read(&b).unwrap(), b"external delta");
+        assert_eq!(exe.file_journal_checkpoint(), checkpoint);
+        std::fs::write(&b, "gamma delta").unwrap();
+        exe.read_file(&json!({"path": "b.txt"}));
+
+        let result = exe.str_replace_batch_result(&args).output;
 
         assert!(
             result.contains("Successfully applied edits to 2 file(s)"),
@@ -5002,6 +5279,16 @@ type Handler interface {
         );
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "ALPHA beta\n");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "gamma DELTA\n");
+        assert_eq!(exe.get_cached_content(&a).as_deref(), Some("ALPHA beta\n"));
+        assert_eq!(exe.get_cached_content(&b).as_deref(), Some("gamma DELTA\n"));
+        let journal = exe.file_journal.lock().unwrap();
+        assert_eq!(journal.entries().count(), 2);
+        journal.undo_turn_transactional(0).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"alpha beta");
+        assert_eq!(std::fs::read(&b).unwrap(), b"gamma delta");
+        journal.restore_turn_transactional(0).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"ALPHA beta\n");
+        assert_eq!(std::fs::read(&b).unwrap(), b"gamma DELTA\n");
     }
 
     #[test]
@@ -5015,12 +5302,14 @@ type Handler interface {
         exe.read_file(&json!({"path": "a.txt"}));
         exe.read_file(&json!({"path": "b.txt"}));
 
-        let result = exe.str_replace_batch(&json!({
-            "edits": [
-                {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
-                {"path": "b.txt", "old_str": "missing", "new_str": "MISSING"}
-            ]
-        }));
+        let result = exe
+            .str_replace_batch_result(&json!({
+                "edits": [
+                    {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
+                    {"path": "b.txt", "old_str": "missing", "new_str": "MISSING"}
+                ]
+            }))
+            .output;
 
         assert!(
             result.contains("old_str not found"),
@@ -5048,12 +5337,14 @@ type Handler interface {
         readonly.set_mode(0o444);
         std::fs::set_permissions(&b, readonly).unwrap();
 
-        let _result = exe.str_replace_batch(&json!({
-            "edits": [
-                {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
-                {"path": "b.txt", "old_str": "gamma", "new_str": "GAMMA"}
-            ]
-        }));
+        let _result = exe
+            .str_replace_batch_result(&json!({
+                "edits": [
+                    {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
+                    {"path": "b.txt", "old_str": "gamma", "new_str": "GAMMA"}
+                ]
+            }))
+            .output;
 
         let mut writable = std::fs::metadata(&b).unwrap().permissions();
         writable.set_mode(0o644);
@@ -5070,11 +5361,13 @@ type Handler interface {
         let tmpdir = tempfile::tempdir().unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
 
-        let result = exe.str_replace_batch(&json!({
-            "edits": [
-                {"old_str": "alpha", "new_str": "ALPHA"}
-            ]
-        }));
+        let result = exe
+            .str_replace_batch_result(&json!({
+                "edits": [
+                    {"old_str": "alpha", "new_str": "ALPHA"}
+                ]
+            }))
+            .output;
 
         assert!(
             result.contains("top-level path") && result.contains("path inside every edit"),
@@ -5238,7 +5531,7 @@ type Handler interface {
         }));
         assert!(result.contains("Applied 2 edit(s)"), "result: {result}");
         let content = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(content, "AB gamma");
+        assert_eq!(content, "AB gamma\n");
     }
 
     // ─── unified_diff tests ─────────────────────────────────────────────────
@@ -5429,7 +5722,7 @@ type Handler interface {
             "should report count: {result}"
         );
         let content = std::fs::read_to_string(&test_file).unwrap();
-        assert_eq!(content, "qux bar qux baz qux");
+        assert_eq!(content, "qux bar qux baz qux\n");
     }
 
     #[test]
@@ -5660,7 +5953,7 @@ type Handler interface {
         );
 
         let on_disk = std::fs::read_to_string(dir.path().join("chain.txt")).unwrap();
-        assert_eq!(on_disk, "AAA BBB ccc");
+        assert_eq!(on_disk, "AAA BBB ccc\n");
     }
 
     /// Scenario from session 1e627e9a Turn 2: LLM sends str_replace with

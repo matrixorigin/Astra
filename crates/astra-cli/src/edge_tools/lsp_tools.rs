@@ -4,12 +4,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use astra_turn_core::file_edit_journal::EditType;
 use serde_json::{Value, json};
 use url::Url;
 
 use super::lsp_stdio_session::path_to_uri;
 use super::shell::shell_escape;
-use super::{MAX_LSP_FILE_SIZE, ToolExecutor, utf16_col_to_char_idx};
+use super::{MAX_LSP_FILE_SIZE, ToolExecutionFacts, ToolExecutor, utf16_col_to_char_idx};
 
 /// (start_line, start_char, end_line, end_char, new_text)
 type LspTextEdit = (usize, usize, usize, usize, String);
@@ -41,12 +42,16 @@ impl ToolExecutor {
             .map_err(|e| format!("Invalid file URI in WorkspaceEdit: {uri}: {e}"))?
             .to_file_path()
             .map_err(|_| format!("WorkspaceEdit URI is not a local file path: {uri}"))?;
-        let project_root = self
-            .project_root
-            .canonicalize()
-            .unwrap_or_else(|_| self.project_root.clone());
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-        if !canonical.starts_with(&project_root) && !path.starts_with(&project_root) {
+        let project_root = self.project_root.canonicalize().map_err(|error| {
+            format!(
+                "WorkspaceEdit cannot resolve project root {}: {error}",
+                self.project_root.display()
+            )
+        })?;
+        let bound_path = self
+            .bind_file_mutation_target(&path)
+            .map_err(|error| error.into_string_output())?;
+        if !bound_path.starts_with(&project_root) {
             return Err(format!(
                 "WorkspaceEdit attempted to modify a file outside the project: {}",
                 path.display()
@@ -201,45 +206,91 @@ impl ToolExecutor {
         operation: &str,
         method: &str,
         workspace_edit: &Value,
-    ) -> Result<String, String> {
-        let edits_by_path = self.collect_workspace_edit_changes(workspace_edit)?;
+    ) -> astra_tools::ToolResult {
+        let edits_by_path = match self.collect_workspace_edit_changes(workspace_edit) {
+            Ok(edits_by_path) => edits_by_path,
+            Err(error) => return Self::workspace_edit_error(error, &[]),
+        };
         if edits_by_path.is_empty() {
-            return Ok(json!({
-                "backend": "lsp",
-                "operation": operation,
-                "method": method,
-                "applied": true,
-                "files_changed": 0,
-                "edits_applied": 0,
-            })
-            .to_string());
+            return astra_tools::ToolResult::text(
+                json!({
+                    "backend": "lsp",
+                    "operation": operation,
+                    "method": method,
+                    "applied": true,
+                    "files_changed": 0,
+                    "edits_applied": 0,
+                })
+                .to_string(),
+            )
+            .with_workspace_mutation_not_applied();
         }
 
-        let turn_idx = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
         let mut files_changed = 0usize;
         let mut edits_applied = 0usize;
         let mut updated_files = Vec::new();
+        let mut prepared_edits = Vec::with_capacity(edits_by_path.len());
+        let mut committed_paths = Vec::new();
 
         for (path, edits) in edits_by_path {
-            let mut content = std::fs::read_to_string(&path).map_err(|e| {
-                format!(
-                    "Failed to read {} for WorkspaceEdit apply: {e}",
-                    path.display()
-                )
-            })?;
+            let bound_path = match self.bind_file_mutation_target(&path) {
+                Ok(bound_path) => bound_path,
+                Err(error) => {
+                    return Self::workspace_edit_error(
+                        error.into_string_output(),
+                        &committed_paths,
+                    );
+                }
+            };
+            let original_bytes = match std::fs::read(&bound_path) {
+                Ok(original_bytes) => original_bytes,
+                Err(error) => {
+                    return Self::workspace_edit_error(
+                        format!(
+                            "Failed to read {} for WorkspaceEdit apply: {error}",
+                            path.display()
+                        ),
+                        &committed_paths,
+                    );
+                }
+            };
+            let mut content = match String::from_utf8(original_bytes.clone()) {
+                Ok(content) => content,
+                Err(error) => {
+                    return Self::workspace_edit_error(
+                        format!(
+                            "Failed to read {} for WorkspaceEdit apply: {error}",
+                            path.display()
+                        ),
+                        &committed_paths,
+                    );
+                }
+            };
             let mut resolved = Vec::new();
             for (start_line, start_char, end_line, end_char, new_text) in edits {
-                let start = Self::lsp_position_to_byte_offset(&content, start_line, start_char)?;
-                let end = Self::lsp_position_to_byte_offset(&content, end_line, end_char)?;
+                let start =
+                    match Self::lsp_position_to_byte_offset(&content, start_line, start_char) {
+                        Ok(start) => start,
+                        Err(error) => {
+                            return Self::workspace_edit_error(error, &committed_paths);
+                        }
+                    };
+                let end = match Self::lsp_position_to_byte_offset(&content, end_line, end_char) {
+                    Ok(end) => end,
+                    Err(error) => {
+                        return Self::workspace_edit_error(error, &committed_paths);
+                    }
+                };
                 if start > end {
-                    return Err(format!(
-                        "WorkspaceEdit produced an invalid range for {}: start {} > end {}",
-                        path.display(),
-                        start,
-                        end
-                    ));
+                    return Self::workspace_edit_error(
+                        format!(
+                            "WorkspaceEdit produced an invalid range for {}: start {} > end {}",
+                            path.display(),
+                            start,
+                            end
+                        ),
+                        &committed_paths,
+                    );
                 }
                 resolved.push((start, end, new_text));
             }
@@ -247,49 +298,103 @@ impl ToolExecutor {
             let mut last_start = usize::MAX;
             for (start, end, replacement) in &resolved {
                 if *end > last_start {
-                    return Err(format!(
-                        "WorkspaceEdit contains overlapping edits for {}",
-                        path.display()
-                    ));
+                    return Self::workspace_edit_error(
+                        format!(
+                            "WorkspaceEdit contains overlapping edits for {}",
+                            path.display()
+                        ),
+                        &committed_paths,
+                    );
                 }
                 content.replace_range(*start..*end, replacement);
                 last_start = *start;
             }
 
-            let journal_call_id = format!("lsp_workspace_edit:{}", path.display());
-            if let Ok(mut journal) = self.file_journal.lock() {
-                journal.record_before(&path, &journal_call_id, turn_idx);
-            }
-            std::fs::write(&path, &content).map_err(|e| {
-                format!(
-                    "Failed to write {} for WorkspaceEdit apply: {e}",
-                    path.display()
-                )
-            })?;
-            self.record_write_with_content(&path, &content);
-            if let Ok(mut journal) = self.file_journal.lock() {
-                journal.record_after(&path, &journal_call_id, content.as_bytes());
-            }
-            files_changed += 1;
-            edits_applied += resolved.len();
-            updated_files.push(
-                path.strip_prefix(&self.project_root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string(),
+            let logical_path = path.to_string_lossy().into_owned();
+            let edit_count = resolved.len();
+            let prepared = astra_tools::fs_ops::PreparedWriteFile::from_authorized_exact_candidate(
+                bound_path.clone(),
+                &logical_path,
+                content,
+                Some(original_bytes),
             );
+            prepared_edits.push((path, bound_path, prepared, edit_count));
         }
 
-        Ok(json!({
-            "backend": "lsp",
-            "operation": operation,
-            "method": method,
-            "applied": true,
-            "files_changed": files_changed,
-            "edits_applied": edits_applied,
-            "updated_files": updated_files,
-        })
-        .to_string())
+        for (path, bound_path, prepared, edit_count) in prepared_edits {
+            if let Err(error) = self.verify_file_mutation_binding(&path, &bound_path) {
+                return Self::workspace_edit_error(error.into_string_output(), &committed_paths);
+            }
+            let journal_call_id = format!("lsp_workspace_edit:{}", path.display());
+            let result =
+                self.apply_prepared_file_edit(&prepared, &journal_call_id, EditType::Patch);
+            if result.is_error {
+                return Self::workspace_edit_result_with_commit_state(result, &committed_paths);
+            }
+            let committed = result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            if committed {
+                committed_paths.push(bound_path.display().to_string());
+                files_changed += 1;
+                updated_files.push(
+                    path.strip_prefix(&self.project_root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+            edits_applied += edit_count;
+        }
+
+        let result = astra_tools::ToolResult::text(
+            json!({
+                "backend": "lsp",
+                "operation": operation,
+                "method": method,
+                "applied": true,
+                "files_changed": files_changed,
+                "edits_applied": edits_applied,
+                "updated_files": updated_files,
+            })
+            .to_string(),
+        );
+        if committed_paths.is_empty() {
+            result.with_workspace_mutation_not_applied()
+        } else {
+            result.with_workspace_mutation_applied()
+        }
+    }
+
+    fn workspace_edit_result_with_commit_state(
+        result: astra_tools::ToolResult,
+        committed_paths: &[String],
+    ) -> astra_tools::ToolResult {
+        if committed_paths.is_empty() {
+            result.with_workspace_mutation_not_applied()
+        } else {
+            result.with_workspace_mutation_partial(committed_paths.to_vec())
+        }
+    }
+
+    fn workspace_edit_error(error: String, committed_paths: &[String]) -> astra_tools::ToolResult {
+        Self::workspace_edit_result_with_commit_state(
+            astra_tools::ToolResult::error(error),
+            committed_paths,
+        )
+    }
+
+    fn apply_lsp_workspace_edit_for_dispatch(
+        &self,
+        facts: &mut ToolExecutionFacts,
+        operation: &str,
+        method: &str,
+        workspace_edit: &Value,
+    ) -> String {
+        facts.absorb_tool_result(self.apply_lsp_workspace_edit(operation, method, workspace_edit))
     }
 
     fn active_lsp_response(operation: &str, method: &str, result: Value) -> String {
@@ -1420,6 +1525,11 @@ impl ToolExecutor {
     /// Prefers a real stdio LSP backend when one is available for the workspace/file,
     /// then falls back to the existing symbol/AST-based implementations.
     pub(crate) fn lsp(&self, args: &Value) -> String {
+        let mut facts = ToolExecutionFacts::default();
+        self.lsp_with_facts(args, &mut facts)
+    }
+
+    pub(super) fn lsp_with_facts(&self, args: &Value, facts: &mut ToolExecutionFacts) -> String {
         if self.read_only_execution {
             return json!({
                 "error": "LSP execution is unavailable in a read-only child; use typed read tools instead"
@@ -1815,14 +1925,12 @@ impl ToolExecutor {
                             Self::active_lsp_response(operation, "textDocument/rename", result)
                         }
                         Ok(Some(result)) => {
-                            match self.apply_lsp_workspace_edit(
+                            self.apply_lsp_workspace_edit_for_dispatch(
+                                facts,
                                 "rename",
                                 "textDocument/rename",
                                 &result,
-                            ) {
-                                Ok(applied) => applied,
-                                Err(error) => json!({ "error": error }).to_string(),
-                            }
+                            )
                         }
                         Ok(None) => {
                             if symbol.is_some()
@@ -1893,14 +2001,12 @@ impl ToolExecutor {
                                 action.clone()
                             };
                             if let Some(workspace_edit) = resolved_action.get("edit") {
-                                match self.apply_lsp_workspace_edit(
+                                self.apply_lsp_workspace_edit_for_dispatch(
+                                    facts,
                                     "code_actions",
                                     "textDocument/codeAction",
                                     workspace_edit,
-                                ) {
-                                    Ok(applied) => applied,
-                                    Err(error) => json!({ "error": error }).to_string(),
-                                }
+                                )
                             } else if let Some(command) = resolved_action.get("command") {
                                 match self.execute_lsp_command("code_actions", command) {
                                     Ok(executed) => executed,
@@ -1970,14 +2076,12 @@ impl ToolExecutor {
                                 } else {
                                     match self.completion_item_to_workspace_edit(f, &selected_item)
                                     {
-                                        Ok(workspace_edit) => match self.apply_lsp_workspace_edit(
+                                        Ok(workspace_edit) => self.apply_lsp_workspace_edit_for_dispatch(
+                                            facts,
                                             "completions",
                                             method,
                                             &workspace_edit,
-                                        ) {
-                                            Ok(applied) => applied,
-                                            Err(error) => json!({ "error": error }).to_string(),
-                                        },
+                                        ),
                                         Err(error) => json!({ "error": error }).to_string(),
                                     }
                                 }
@@ -2300,16 +2404,15 @@ impl ToolExecutor {
                             )
                         }
                         Ok(Some(result)) => match self.ensure_lsp_file_ready(f) {
-                            Ok((_, uri)) => match Self::lsp_text_edits_to_workspace_edit(&uri, result)
-                            {
-                                Ok(workspace_edit) => self.apply_lsp_workspace_edit(
+                            Ok((_, uri)) => match Self::lsp_text_edits_to_workspace_edit(&uri, result) {
+                                Ok(workspace_edit) => self.apply_lsp_workspace_edit_for_dispatch(
+                                    facts,
                                     "format_document",
                                     "textDocument/formatting",
                                     &workspace_edit,
                                 ),
-                                Err(error) => Err(error),
-                            }
-                            .unwrap_or_else(|error| json!({ "error": error }).to_string()),
+                                Err(error) => json!({ "error": error }).to_string(),
+                            },
                             Err(error) => json!({ "error": error }).to_string(),
                         },
                         Ok(None) => json!({
@@ -2339,14 +2442,14 @@ impl ToolExecutor {
                         Ok(Some(result)) => match self.ensure_lsp_file_ready(f) {
                             Ok((_, uri)) => {
                                 match Self::lsp_text_edits_to_workspace_edit(&uri, result) {
-                                    Ok(workspace_edit) => self.apply_lsp_workspace_edit(
+                                    Ok(workspace_edit) => self.apply_lsp_workspace_edit_for_dispatch(
+                                        facts,
                                         "format_range",
                                         "textDocument/rangeFormatting",
                                         &workspace_edit,
                                     ),
-                                    Err(error) => Err(error),
+                                    Err(error) => json!({ "error": error }).to_string(),
                                 }
-                                .unwrap_or_else(|error| json!({ "error": error }).to_string())
                             }
                             Err(error) => json!({ "error": error }).to_string(),
                         },
@@ -2375,14 +2478,14 @@ impl ToolExecutor {
                         Ok(Some(result)) => match self.ensure_lsp_file_ready(f) {
                             Ok((_, uri)) => {
                                 match Self::lsp_text_edits_to_workspace_edit(&uri, result) {
-                                    Ok(workspace_edit) => self.apply_lsp_workspace_edit(
+                                    Ok(workspace_edit) => self.apply_lsp_workspace_edit_for_dispatch(
+                                        facts,
                                         "format_on_type",
                                         "textDocument/onTypeFormatting",
                                         &workspace_edit,
                                     ),
-                                    Err(error) => Err(error),
+                                    Err(error) => json!({ "error": error }).to_string(),
                                 }
-                                .unwrap_or_else(|error| json!({ "error": error }).to_string())
                             }
                             Err(error) => json!({ "error": error }).to_string(),
                         },
@@ -2562,5 +2665,291 @@ impl ToolExecutor {
     /// Check if a character can be part of a symbol name.
     fn is_symbol_char(c: char) -> bool {
         c.is_alphanumeric() || c == '_'
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn workspace_edit_rejects_in_project_symlink_to_external_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let external_target = outside.join("target.rs");
+        std::fs::write(&external_target, "fn target() {}\n").unwrap();
+        let link = project.join("linked.rs");
+        symlink(&external_target, &link).unwrap();
+
+        let executor = ToolExecutor::new(&project);
+        let uri = Url::from_file_path(&link).unwrap().to_string();
+        let mut changes = serde_json::Map::new();
+        changes.insert(
+            uri,
+            json!([{
+                "range": {
+                    "start": {"line": 0, "character": 3},
+                    "end": {"line": 0, "character": 9}
+                },
+                "newText": "renamed"
+            }]),
+        );
+        let edit = json!({
+            "changes": changes
+        });
+
+        let result = executor.apply_lsp_workspace_edit("rename", "textDocument/rename", &edit);
+        assert!(result.is_error, "external symlink target must be rejected");
+        assert!(
+            result.output.contains("outside the project"),
+            "{}",
+            result.output
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            std::fs::read_to_string(external_target).unwrap(),
+            "fn target() {}\n"
+        );
+    }
+
+    #[test]
+    fn workspace_edit_prevalidates_all_targets_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let first = project.join("a.rs");
+        let second = project.join("b.rs");
+        std::fs::write(&first, "fn first() {}\n").unwrap();
+        std::fs::write(&second, "fn second() {}\n").unwrap();
+
+        let executor = ToolExecutor::new(&project);
+        let checkpoint = executor.file_journal_checkpoint();
+        let mut changes = serde_json::Map::new();
+        changes.insert(
+            Url::from_file_path(&first).unwrap().to_string(),
+            json!([{
+                "range": {
+                    "start": {"line": 0, "character": 3},
+                    "end": {"line": 0, "character": 8}
+                },
+                "newText": "updated"
+            }]),
+        );
+        changes.insert(
+            Url::from_file_path(&second).unwrap().to_string(),
+            json!([{
+                "range": {
+                    "start": {"line": 2, "character": 0},
+                    "end": {"line": 2, "character": 6}
+                },
+                "newText": "invalid"
+            }]),
+        );
+
+        let result = executor.apply_lsp_workspace_edit(
+            "rename",
+            "textDocument/rename",
+            &json!({"changes": changes}),
+        );
+
+        assert!(result.is_error, "invalid later preparation must fail");
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_partial")),
+            None
+        );
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "fn first() {}\n");
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "fn second() {}\n"
+        );
+        assert_eq!(executor.file_journal_checkpoint(), checkpoint);
+        assert!(executor.shared_file_state().lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn workspace_edit_empty_and_noop_are_not_reported_as_applied() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join("main.rs");
+        let original = b"fn target() {}\r\nfn other() {}";
+        std::fs::write(&path, original).unwrap();
+        let executor = ToolExecutor::new(&project);
+        let checkpoint = executor.file_journal_checkpoint();
+
+        let empty = executor.apply_lsp_workspace_edit(
+            "rename",
+            "textDocument/rename",
+            &json!({"changes": {}}),
+        );
+        assert!(!empty.is_error, "{}", empty.output);
+        assert_eq!(
+            empty
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let uri = Url::from_file_path(&path).unwrap().to_string();
+        let noop = executor.apply_lsp_workspace_edit(
+            "rename",
+            "textDocument/rename",
+            &json!({
+                "changes": {
+                    uri.as_str(): [{
+                        "range": {
+                            "start": {"line": 0, "character": 3},
+                            "end": {"line": 0, "character": 9}
+                        },
+                        "newText": "target"
+                    }]
+                }
+            }),
+        );
+        assert!(!noop.is_error, "{}", noop.output);
+        assert_eq!(
+            noop.metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(executor.file_journal_checkpoint(), checkpoint);
+        assert!(executor.shared_file_state().lock().unwrap().is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        let rename = executor.apply_lsp_workspace_edit(
+            "rename",
+            "textDocument/rename",
+            &json!({
+                "changes": {
+                    uri: [{
+                        "range": {
+                            "start": {"line": 0, "character": 3},
+                            "end": {"line": 0, "character": 9}
+                        },
+                        "newText": "renamed"
+                    }]
+                }
+            }),
+        );
+        assert!(!rename.is_error, "{}", rename.output);
+        assert_eq!(
+            rename
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"fn renamed() {}\r\nfn other() {}"
+        );
+        assert_eq!(executor.file_journal_checkpoint(), checkpoint + 1);
+        assert_eq!(
+            executor.get_cached_content(&path).as_deref(),
+            Some("fn renamed() {}\r\nfn other() {}")
+        );
+    }
+
+    #[test]
+    fn workspace_edit_partial_publication_reports_only_committed_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let first = project.join("a.rs");
+        let alias = project.join("z.rs");
+        std::fs::write(&first, "fn target() {}\n").unwrap();
+        symlink(&first, &alias).unwrap();
+
+        let executor = ToolExecutor::new(&project);
+        let checkpoint = executor.file_journal_checkpoint();
+        let mut changes = serde_json::Map::new();
+        for (path, new_text) in [(&first, "first"), (&alias, "second")] {
+            changes.insert(
+                Url::from_file_path(path).unwrap().to_string(),
+                json!([{
+                    "range": {
+                        "start": {"line": 0, "character": 3},
+                        "end": {"line": 0, "character": 9}
+                    },
+                    "newText": new_text
+                }]),
+            );
+        }
+
+        let result = executor.apply_lsp_workspace_edit(
+            "rename",
+            "textDocument/rename",
+            &json!({"changes": changes}),
+        );
+
+        assert!(
+            result.is_error,
+            "the aliased second publication must be stale"
+        );
+        let fields = result.metadata.as_ref().expect("partial metadata");
+        assert_eq!(
+            fields.get("workspace_mutation_partial"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            fields
+                .get("workspace_mutation_partial_paths")
+                .and_then(Value::as_array),
+            Some(&vec![Value::String(first.display().to_string())])
+        );
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "fn first() {}\n");
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), "fn first() {}\n");
+        assert_eq!(executor.file_journal_checkpoint(), checkpoint + 1);
+        assert_eq!(
+            executor.file_journal.lock().unwrap().summary(),
+            vec![(first.clone(), 0, EditType::Patch)]
+        );
+        assert_eq!(executor.shared_file_state().lock().unwrap().len(), 1);
+
+        executor.rollback_files_since_checkpoint(0, checkpoint);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "fn target() {}\n");
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), "fn target() {}\n");
+        assert_eq!(executor.file_journal_checkpoint(), checkpoint + 1);
+        assert_eq!(
+            executor.get_cached_content(&first).as_deref(),
+            Some("fn target() {}\n")
+        );
+        assert_eq!(
+            executor.get_cached_content(&alias).as_deref(),
+            Some("fn target() {}\n")
+        );
+        assert_eq!(executor.shared_file_state().lock().unwrap().len(), 1);
+        assert_eq!(
+            executor.file_journal.lock().unwrap().summary(),
+            vec![(first, 0, EditType::Patch)]
+        );
     }
 }

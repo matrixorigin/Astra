@@ -68,6 +68,30 @@ text preview; it never applies edits or claims semantic reference coverage.
 Missing or failed semantic backends return an actionable error, not a text-based
 mutation fallback.
 
+### File-edit publication
+
+File-edit tools commit the prepared bytes. Write and replacement requests use
+the shared deterministic line-ending and trailing-newline normalization;
+LSP edits publish their computed candidate exactly, preserving bytes outside
+the selected ranges. They do not implicitly launch formatters. Formatting and build checks are explicit tool calls through the
+existing owned shell lifecycle, with its approval, deadline and cancellation
+boundaries. A successful `write_file` proves publication, not syntax validity;
+replacement tools retain their independent parser-based structural checks and
+explicit `allow_structural_change` control.
+Text replacements reject invalid UTF-8 before changing file bytes or recording
+journal entries, rather than silently replacing unrelated bytes during decoding.
+
+The shared `fs_ops::Prepared*` owner stages files using exclusive sibling
+creation and checks the captured preimage immediately before publication.
+New files use no-clobber publication. The workspace lease coordinates Astra
+writers; preimage checks are not an OS compare-and-swap against external editors.
+Multi-file edits prepare and validate all candidates before publishing;
+`PreparedMultiPathEdit` also stages the complete group first. Publication is
+atomic per file, not across the group. A partial failure must identify the
+already committed paths through the typed tool receipt, including LSP edits.
+Journal after-state, read evidence and displayed diffs
+must describe the bytes actually committed, not an implicit later rewrite.
+
 ## Cloud workspace boundary
 
 A cloud workspace runtime is not the same as the Astra server process. It requires explicit provider binding and isolation metadata.

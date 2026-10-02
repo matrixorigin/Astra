@@ -652,18 +652,27 @@ pub(crate) fn execute_server_write_file(
         Err(error) => return error,
     };
 
-    let already_desired = prepared.is_already_desired();
-    if !already_desired {
-        with_file_journal_mut(file_journal, "server_write_file:record_before", |journal| {
-            journal.record_before(prepared.path(), "server-write", turn_index);
-        });
-    }
-
     let result = prepared.apply();
-    if !result.is_error && !already_desired {
-        with_file_journal_mut(file_journal, "server_write_file:record_after", |journal| {
-            journal.record_after(prepared.path(), "server-write", prepared.content_bytes());
-        });
+    if !result.is_error && !prepared.is_already_desired() {
+        let edit_type = if prepared.original_content_bytes().is_none() {
+            EditType::Create
+        } else {
+            EditType::Overwrite
+        };
+        with_file_journal_mut(
+            file_journal,
+            "server_write_file:record_committed",
+            |journal| {
+                journal.record_committed(
+                    prepared.path(),
+                    "server-write",
+                    turn_index,
+                    prepared.original_content_bytes(),
+                    prepared.content_bytes(),
+                    edit_type,
+                );
+            },
+        );
     }
     result
 }
@@ -683,21 +692,22 @@ pub(crate) fn execute_server_str_replace(
         return prepared.apply();
     }
 
-    let path = prepared.path().to_owned();
-    let new_content_bytes = prepared.new_content_bytes().to_vec();
-    with_file_journal_mut(
-        file_journal,
-        "server_str_replace:record_before",
-        |journal| {
-            journal.record_before_patch(&path, "server-str-replace", turn_index);
-        },
-    );
-
     let result = prepared.apply();
     if !result.is_error {
-        with_file_journal_mut(file_journal, "server_str_replace:record_after", |journal| {
-            journal.record_after(&path, "server-str-replace", &new_content_bytes);
-        });
+        with_file_journal_mut(
+            file_journal,
+            "server_str_replace:record_committed",
+            |journal| {
+                journal.record_committed(
+                    prepared.path(),
+                    "server-str-replace",
+                    turn_index,
+                    Some(prepared.original_content_bytes()),
+                    prepared.new_content_bytes(),
+                    EditType::Patch,
+                );
+            },
+        );
     }
     result
 }
@@ -723,32 +733,22 @@ pub(crate) fn execute_server_multi_edit(
             Ok(prepared) => prepared,
             Err(error) => return error,
         };
-        let dry_run = args
-            .get("dry_run")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !dry_run {
-            for edit in prepared.prepared_edits() {
-                with_file_journal_mut(file_journal, "server_multi_path:record_before", |journal| {
-                    journal.record_before_patch(edit.path(), "server-multi-path", turn_index);
-                });
-            }
-        }
-        let result = prepared.apply();
-        if !result.is_error && !dry_run {
-            for edit in prepared.prepared_edits() {
-                with_file_journal_mut(file_journal, "server_multi_path:record_after", |journal| {
-                    journal.record_after(
+        return prepared.apply_with_committed(|edit| {
+            with_file_journal_mut(
+                file_journal,
+                "server_multi_path:record_committed",
+                |journal| {
+                    journal.record_committed(
                         edit.path(),
                         "server-multi-path",
+                        turn_index,
+                        Some(edit.original_content_bytes()),
                         edit.new_content_bytes(),
+                        EditType::Patch,
                     );
-                });
-            }
-        } else if result.is_error && !dry_run {
-            record_partial_mutation_journal(&result, prepared.prepared_edits(), file_journal);
-        }
-        return result;
+                },
+            );
+        });
     }
     let prepared = match astra_tools::fs_ops::prepare_multi_edit(workspace_root, args) {
         Ok(prepared) => prepared,
@@ -759,49 +759,24 @@ pub(crate) fn execute_server_multi_edit(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    if !dry_run {
-        with_file_journal_mut(file_journal, "server_multi_edit:record_before", |journal| {
-            journal.record_before_patch(prepared.path(), "server-multi-edit", turn_index);
-        });
-    }
-
     let result = prepared.apply();
     if !result.is_error && !dry_run {
-        with_file_journal_mut(file_journal, "server_multi_edit:record_after", |journal| {
-            journal.record_after(
-                prepared.path(),
-                "server-multi-edit",
-                prepared.new_content_bytes(),
-            );
-        });
-    }
-    result
-}
-
-fn record_partial_mutation_journal(
-    result: &astra_tools::ToolResult,
-    prepared: &[astra_tools::fs_ops::PreparedMultiEdit],
-    file_journal: &Mutex<FileEditJournal>,
-) {
-    if !result.is_error {
-        return;
-    }
-    for edit in prepared {
-        let path = edit.path();
-        let Ok(content) = std::fs::read(path) else {
-            continue;
-        };
         with_file_journal_mut(
             file_journal,
-            "server_multi_path:record_partial_after",
+            "server_multi_edit:record_committed",
             |journal| {
-                // Match the before-entry key exactly.  Record every prepared
-                // target, including the untouched suffix, so rollback restores
-                // both the committed prefix and the uncommitted original bytes.
-                journal.record_after(path, "server-multi-path", &content);
+                journal.record_committed(
+                    prepared.path(),
+                    "server-multi-edit",
+                    turn_index,
+                    Some(prepared.original_content_bytes()),
+                    prepared.new_content_bytes(),
+                    EditType::Patch,
+                );
             },
         );
     }
+    result
 }
 
 pub(crate) fn execute_server_delete_file(
@@ -930,9 +905,8 @@ mod tests {
         let path = dir.path().join("created.txt");
         let missing_alias = dir.path().join("missing.txt");
         let mut journal = FileEditJournal::new(10);
-        journal.record_before(&path, "test", 1);
         std::fs::write(&path, "created").expect("write created file");
-        journal.record_after(&path, "test", b"created");
+        journal.record_committed(&path, "test", 1, None, b"created", EditType::Create);
 
         let result = undo_file_with_candidates(&journal, &[missing_alias, path.clone()])
             .expect("undo should not fail")

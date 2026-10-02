@@ -8364,7 +8364,7 @@ pub(crate) fn record_has_weak_workspace_mutation_receipt(
 fn record_has_trusted_partial_workspace_mutation_receipt(
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
-    record.name == "str_replace"
+    matches!(record.name.as_str(), "str_replace" | "lsp")
         && record.was_executed()
         && !record.ok
         && record.workspace_mutation_partial == Some(true)
@@ -14192,7 +14192,45 @@ mod tests {
             "ownership": astra_tools::workspace_observation::TYPED_MULTI_PATH_WRITER_OWNERSHIP,
             "paths": ["/workspace/a"],
         });
+        for name in ["str_replace", "lsp"] {
+            let mut state = make_state();
+            let record = ToolCallRecord {
+                name: name.into(),
+                ok: false,
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                workspace_mutation_partial: Some(true),
+                workspace_mutation_partial_paths: Some(vec!["/workspace/a".into()]),
+                workspace_mutation_receipt: Some(typed_receipt.clone()),
+                ..ToolCallRecord::default()
+            };
+            assert!(apply_workspace_observation_quarantine_transition(
+                &mut state,
+                &[record],
+            ));
+            assert!(workspace_observation_is_quarantined(&state));
+        }
         for (name, ok, disposition, paths, receipt) in [
+            (
+                "lsp",
+                true,
+                astra_services::session_journal::ToolCallDisposition::Executed,
+                Some(vec!["/workspace/a".to_string()]),
+                Some(typed_receipt.clone()),
+            ),
+            (
+                "lsp",
+                false,
+                astra_services::session_journal::ToolCallDisposition::Rejected,
+                Some(vec!["/workspace/a".to_string()]),
+                Some(typed_receipt.clone()),
+            ),
+            (
+                "lsp",
+                false,
+                astra_services::session_journal::ToolCallDisposition::Executed,
+                Some(vec!["/workspace/a".to_string()]),
+                None,
+            ),
             (
                 "mcp__example__write",
                 false,

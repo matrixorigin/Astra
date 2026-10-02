@@ -1,0 +1,57 @@
+name: file_edit_prepared_bytes
+description: |
+  Run in an empty disposable workspace. Exercise creation, a localized edit,
+  and read-back through the shipped file tools in a formatter-configured Rust
+  project. Durable tool outcomes prove the control path; teardown compares the
+  actual file with the expected prepared bytes. No build, formatter, shell,
+  or delegated task is needed from the agent.
+prompt: |
+  Create probe.rs using write_file with this content, including its final newline:
+  fn   keep( ){let   value=1;}
+  fn change(){let n=7;}
+
+  Then use str_replace to change only `let n=7;` to `let n=8;`.
+  Use read_file to verify the final file. Preserve all other spacing and content.
+  Do not run shell commands, formatters, builds, or subagents.
+  When the edit and read-back have succeeded, reply only DONE.
+capability: tool_use
+timeout_seconds: 120
+debug_log: true
+setup_cmd: |
+  set -euC
+  command -v rustfmt >/dev/null
+  test ! -e probe.rs && test ! -L probe.rs
+  printf '[package]\nname = "edit-fixture"\nversion = "0.1.0"\n[lib]\npath = "probe.rs"\n' > Cargo.toml
+teardown_cmd: |
+  set -eu
+  test -f probe.rs && test ! -L probe.rs
+  printf 'fn   keep( ){let   value=1;}\nfn change(){let n=8;}\n' | cmp - probe.rs
+  printf '[package]\nname = "edit-fixture"\nversion = "0.1.0"\n[lib]\npath = "probe.rs"\n' | cmp - Cargo.toml
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_outcome_count
+    name: write_file
+    ok: true
+    min: 1
+    max: 1
+  - type: journal_tool_outcome_count
+    name: str_replace
+    ok: true
+    min: 1
+    max: 1
+  - type: journal_tool_outcome_count
+    name: read_file
+    ok: true
+    min: 1
+    max: 2
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
+  - type: text_equals
+    expected: DONE

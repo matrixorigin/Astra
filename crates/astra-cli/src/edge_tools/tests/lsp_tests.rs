@@ -2357,24 +2357,38 @@ fn lsp_rename_uses_real_lsp_preview_when_available() {
 }
 
 #[cfg(unix)]
-#[test]
+#[tokio::test]
 #[serial_test::serial]
-fn lsp_rename_applies_real_lsp_workspace_edit_when_dry_run_false() {
+async fn lsp_rename_applies_real_lsp_workspace_edit_when_dry_run_false() {
     let (_dir, exe, _guard, file_path) =
         setup_lsp_workspace_with_file("pub fn hello_from_lsp() {}\\n");
 
-    let result = exe.lsp(&json!({
-        "operation": "rename",
-        "file": "src/lib.rs",
-        "line": 1,
-        "column": 8,
-        "new_name": "renamed_from_lsp",
-        "dry_run": false
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let outcome = exe
+        .execute_with_metadata(
+            "lsp",
+            &json!({
+            "operation": "rename",
+            "file": "src/lib.rs",
+            "line": 1,
+            "column": 8,
+            "new_name": "renamed_from_lsp",
+            "dry_run": false
+                }),
+        )
+        .await;
+    assert!(!outcome.is_error, "{}", outcome.output);
+    let parsed: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
 
     assert_eq!(parsed["applied"].as_bool(), Some(true));
     assert_eq!(parsed["files_changed"].as_u64(), Some(1));
+    assert_eq!(
+        outcome
+            .tool_result_fields
+            .as_ref()
+            .and_then(|fields| fields.get("workspace_mutation_applied"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
     assert!(
         std::fs::read_to_string(file_path)
             .unwrap()

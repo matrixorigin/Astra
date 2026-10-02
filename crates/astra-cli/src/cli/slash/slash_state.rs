@@ -1948,9 +1948,15 @@ mod state_command_tests {
         {
             let mut journal = state.file_journal.lock_recover();
             std::fs::write(&file_path, b"before").unwrap();
-            journal.record_before(&file_path, "tool-1", 1);
             std::fs::write(&file_path, b"after").unwrap();
-            journal.record_after(&file_path, "tool-1", b"after");
+            journal.record_committed(
+                &file_path,
+                "tool-1",
+                1,
+                Some(b"before"),
+                b"after",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
         }
 
         let error = handle_state_command(

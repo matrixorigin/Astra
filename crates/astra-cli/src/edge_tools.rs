@@ -452,6 +452,14 @@ struct ToolExecutionFacts {
     is_error: Option<bool>,
 }
 
+impl ToolExecutionFacts {
+    fn absorb_tool_result(&mut self, result: astra_tools::ToolResult) -> String {
+        self.fields = result.metadata;
+        self.is_error = Some(result.is_error);
+        result.output
+    }
+}
+
 struct EdgeToolRun {
     output: String,
     is_error: bool,
@@ -5483,7 +5491,7 @@ impl ToolExecutor {
                         .unwrap_or(CatalogError::Unsupported);
                     unavailable_page(error, "unbound").to_json()
                 }
-                "lsp" => self.lsp(args),
+                "lsp" => self.lsp_with_facts(args, facts),
                 "env" => self.env_tool(args),
                 _ if astra_runtime_env::is_mcp_namespaced_tool_name(name) => {
                     let outcome = if let Some((manager, prepared)) = mcp_prepared.as_ref() {
@@ -5505,7 +5513,7 @@ impl ToolExecutor {
             // Feedback must follow the executor's terminal fact, not prose
             // that can contain error examples or conceal a failed execution.
             // Legacy handlers without a typed outcome supply no success proof.
-            && *source_is_error == Some(false)
+            && facts.is_error == Some(false)
             && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
         {
             let producer_id = self
@@ -10584,8 +10592,14 @@ mod tests {
         std::fs::write(&file, b"v0").unwrap();
         {
             let mut j = shared.lock_recover();
-            j.record_before(&file, "pre", 0);
-            j.record_after(&file, "pre", b"v1");
+            j.record_committed(
+                &file,
+                "pre",
+                0,
+                Some(b"v0"),
+                b"v1",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
         }
 
         let executor = test_executor()
@@ -10636,8 +10650,14 @@ mod tests {
         ));
         {
             let mut j = shared.lock_recover();
-            j.record_before(&file, "early-call", 0);
-            j.record_after(&file, "early-call", b"after");
+            j.record_committed(
+                &file,
+                "early-call",
+                0,
+                Some(b"before"),
+                b"after",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
         }
         assert_eq!(shared.lock_recover().len(), 1);
 
@@ -10739,8 +10759,14 @@ mod tests {
         ));
         {
             let mut j = shared.lock_recover();
-            j.record_before(&pre_file, "pre-session", 0);
-            j.record_after(&pre_file, "pre-session", b"v1");
+            j.record_committed(
+                &pre_file,
+                "pre-session",
+                0,
+                Some(b"v0"),
+                b"v1",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
         }
 
         // Bind session — triggers the merge path.
@@ -10790,8 +10816,14 @@ mod tests {
         let executor = test_executor().with_active_session_id("session-g");
         {
             let mut j = executor.file_journal.lock_recover();
-            j.record_before(&file, "call", 0);
-            j.record_after(&file, "call", b"v1");
+            j.record_committed(
+                &file,
+                "call",
+                0,
+                Some(b"v0"),
+                b"v1",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
         }
 
         let before_len = executor.file_journal.lock_recover().len();
@@ -10822,8 +10854,14 @@ mod tests {
         let executor = test_executor().with_active_session_id("session-h1");
         {
             let mut j = executor.file_journal.lock_recover();
-            j.record_before(&file, "call-h1", 0);
-            j.record_after(&file, "call-h1", b"v1");
+            j.record_committed(
+                &file,
+                "call-h1",
+                0,
+                Some(b"v0"),
+                b"v1",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
         }
         let h1_dir = tmp.path().join("session-h1").join("file_checkpoints");
         let h1_count_before = std::fs::read_dir(&h1_dir).unwrap().count();
@@ -10870,8 +10908,14 @@ mod tests {
         let executor = test_executor().with_active_session_id("session-i1");
         {
             let mut j = executor.file_journal.lock_recover();
-            j.record_before(&file, "call-i1", 0);
-            j.record_after(&file, "call-i1", b"v1");
+            j.record_committed(
+                &file,
+                "call-i1",
+                0,
+                Some(b"v0"),
+                b"v1",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
         }
         // Confirm sid1 has an entry in memory.
         assert_eq!(executor.file_journal.lock_recover().len(), 1);

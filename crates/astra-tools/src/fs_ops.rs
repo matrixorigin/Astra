@@ -3,12 +3,10 @@
 //! All operations are sandboxed to a workspace root directory. Path traversal
 //! via `..` is normalized before the boundary check to prevent escapes.
 
-use std::io::Read;
+use std::io::{Read, Write};
 #[cfg(test)]
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
 
 use base64::Engine;
 use serde_json::Value;
@@ -24,8 +22,6 @@ const READ_FILE_SIZE_LIMIT: usize = 80 * 1024;
 /// Hard ceiling: files above this size are never read into memory for preview.
 const READ_FILE_HARD_LIMIT: usize = 10 * 1024 * 1024;
 
-#[cfg(test)]
-static MULTI_PATH_RENAME_FAILURE_INDEX: AtomicIsize = AtomicIsize::new(-1);
 /// Format file size in MB with one decimal place, avoiding integer division truncation.
 fn format_file_size_mb(size_bytes: u64) -> String {
     format!("{:.1} MB", size_bytes as f64 / (1024.0 * 1024.0))
@@ -985,6 +981,7 @@ pub struct PreparedWriteFile {
     /// SHA-256 hex digest of the file content as it was read (None for new files).
     /// Verified before commit to detect concurrent modifications.
     original_content_hash: Option<String>,
+    original_content: Option<Vec<u8>>,
     /// Exact complete-state no-op established before any staging file,
     /// journal entry, cache invalidation, or workspace generation change.
     already_desired: bool,
@@ -992,12 +989,82 @@ pub struct PreparedWriteFile {
 }
 
 impl PreparedWriteFile {
+    fn from_authorized_candidate(
+        path: PathBuf,
+        logical_path: &str,
+        content: String,
+        original_bytes: Option<Vec<u8>>,
+        requested_content_state: crate::workspace_observation::WorkspaceFileStateIdentity,
+    ) -> Self {
+        Self {
+            path,
+            path_str: logical_path.to_string(),
+            already_desired: original_bytes.as_deref() == Some(content.as_bytes()),
+            original_content_hash: original_bytes
+                .as_deref()
+                .map(|bytes| format!("{:x}", Sha256::digest(bytes))),
+            original_content: original_bytes,
+            content,
+            requested_content_state,
+        }
+    }
+
+    /// Prepare a publication from bytes captured by an authorized adapter.
+    /// The caller owns path authorization, read evidence and the workspace
+    /// lease; `path` must be the bound mutation target, not a symlink alias.
+    /// `None` means confirmed absence, never an unreadable existing file.
+    /// This constructor performs no I/O, preserves that exact preimage, and
+    /// applies the normal write-file content normalization to the request.
+    pub fn from_authorized_preimage(
+        path: PathBuf,
+        logical_path: &str,
+        content: &str,
+        original_bytes: Option<Vec<u8>>,
+    ) -> Self {
+        let requested_content_state =
+            crate::workspace_observation::workspace_file_state_identity(content.as_bytes());
+        let content = normalize_content_before_write(Path::new(logical_path), content);
+        Self::from_authorized_candidate(
+            path,
+            logical_path,
+            content,
+            original_bytes,
+            requested_content_state,
+        )
+    }
+
+    /// Prepare a publication from an authorized, already-resolved candidate.
+    /// Unlike [`Self::from_authorized_preimage`], this constructor does not
+    /// normalize line endings or add a trailing newline: `content` is the
+    /// exact UTF-8 candidate that the caller intends to publish. This is used
+    /// for localized LSP edits so unrelated bytes remain untouched.
+    pub fn from_authorized_exact_candidate(
+        path: PathBuf,
+        logical_path: &str,
+        content: String,
+        original_bytes: Option<Vec<u8>>,
+    ) -> Self {
+        let requested_content_state =
+            crate::workspace_observation::workspace_file_state_identity(content.as_bytes());
+        Self::from_authorized_candidate(
+            path,
+            logical_path,
+            content,
+            original_bytes,
+            requested_content_state,
+        )
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     pub fn content_bytes(&self) -> &[u8] {
         self.content.as_bytes()
+    }
+
+    pub fn original_content_bytes(&self) -> Option<&[u8]> {
+        self.original_content.as_deref()
     }
 
     /// Owner-derived outcome from the prepared full-state comparison. This is
@@ -1032,21 +1099,17 @@ impl PreparedWriteFile {
             return ToolResult::error(format!("Error: Cannot create directories: {e}"));
         }
 
-        match write_file_atomic_with_format(
+        match write_file_atomic(
             &self.path,
             self.content.as_bytes(),
-            false,
             self.original_content_hash.as_deref(),
         ) {
-            Ok(warning) => {
-                let mut message = format!(
+            Ok(()) => {
+                let message = format!(
                     "Successfully wrote {} bytes to {}",
                     self.content.len(),
                     self.path_str
                 );
-                if let Some(warning) = warning {
-                    message.push_str(&format!("\nWarning: {warning}"));
-                }
                 ToolResult::text(message).with_workspace_mutation_applied()
             }
             Err(e) => ToolResult::error(e),
@@ -1087,29 +1150,26 @@ pub fn prepare_write_file(
         }
     };
     let path = resolve_write_target_path(workspace_root, path_str, "write_file")?;
-    let requested_content_state =
-        crate::workspace_observation::workspace_file_state_identity(content.as_bytes());
     // Content normalization is part of the invocation contract.  Base it on
     // the path spelling the caller supplied, not on a second canonical path
     // resolution.  The owner has already resolved and authorized `path`; a
     // later receipt check must not silently apply a different sandbox policy
     // (for example for an explicitly allowed absolute path).
-    let content = normalize_content_before_write(Path::new(path_str), content);
-
-    let existing_bytes = std::fs::read(&path).ok();
-    let already_desired = existing_bytes.as_deref() == Some(content.as_bytes());
-    let original_content_hash = existing_bytes
-        .as_deref()
-        .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
-
-    Ok(PreparedWriteFile {
+    let existing_bytes = match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(ToolResult::error(format!(
+                "Error: Cannot read file before write: {error}"
+            )));
+        }
+    };
+    Ok(PreparedWriteFile::from_authorized_preimage(
         path,
-        path_str: path_str.to_string(),
+        path_str,
         content,
-        original_content_hash,
-        already_desired,
-        requested_content_state,
-    })
+        existing_bytes,
+    ))
 }
 
 pub fn write_file(workspace_root: &Path, args: &Value) -> ToolResult {
@@ -1124,11 +1184,11 @@ pub struct PreparedStrReplace {
     path: PathBuf,
     new_content: String,
     dry_run: bool,
-    allow_structural_change: bool,
     success_message: String,
     /// SHA-256 hex digest of the file content as it was read.
     /// Verified before commit to detect concurrent modifications.
     original_content_hash: Option<String>,
+    original_content: Vec<u8>,
 }
 
 impl PreparedStrReplace {
@@ -1144,22 +1204,21 @@ impl PreparedStrReplace {
         self.dry_run
     }
 
-    pub fn apply(self) -> ToolResult {
+    pub fn original_content_bytes(&self) -> &[u8] {
+        &self.original_content
+    }
+
+    pub fn apply(&self) -> ToolResult {
         if self.dry_run {
-            return ToolResult::text(self.success_message);
+            return ToolResult::text(self.success_message.clone());
         }
-        match write_file_atomic_with_format(
+        match write_file_atomic(
             &self.path,
             self.new_content.as_bytes(),
-            self.allow_structural_change,
             self.original_content_hash.as_deref(),
         ) {
-            Ok(warning) => {
-                let mut message = self.success_message;
-                if let Some(warning) = warning {
-                    message.push_str(&format!("\nWarning: {warning}"));
-                }
-                ToolResult::text(message).with_workspace_mutation_applied()
+            Ok(()) => {
+                ToolResult::text(self.success_message.clone()).with_workspace_mutation_applied()
             }
             Err(e) => ToolResult::error(e),
         }
@@ -1315,9 +1374,9 @@ pub fn prepare_str_replace(
                 path,
                 new_content,
                 dry_run,
-                allow_structural_change,
                 success_message,
                 original_content_hash: Some(original_hash),
+                original_content: content.into_bytes(),
             });
         }
 
@@ -1383,9 +1442,9 @@ pub fn prepare_str_replace(
         path,
         new_content,
         dry_run,
-        allow_structural_change,
         success_message,
         original_content_hash: Some(original_hash),
+        original_content: content.into_bytes(),
     })
 }
 
@@ -1410,13 +1469,10 @@ pub struct PreparedMultiEdit {
     new_content: String,
     edit_count: usize,
     dry_run: bool,
-    allow_structural_change: bool,
-    /// Formatter warning captured during the staging phase (if any).
-    /// Carried through to the commit message.
-    warning: Option<String>,
     /// SHA-256 hex digest of the file content as it was read.
     /// Verified before commit to detect concurrent modifications.
     original_content_hash: Option<String>,
+    original_content: Vec<u8>,
 }
 
 impl PreparedMultiEdit {
@@ -1428,6 +1484,10 @@ impl PreparedMultiEdit {
         self.new_content.as_bytes()
     }
 
+    pub fn original_content_bytes(&self) -> &[u8] {
+        &self.original_content
+    }
+
     pub fn apply(&self) -> ToolResult {
         if self.dry_run {
             return ToolResult::text(format!(
@@ -1436,20 +1496,16 @@ impl PreparedMultiEdit {
             ));
         }
 
-        match write_file_atomic_with_format(
+        match write_file_atomic(
             &self.path,
             self.new_content.as_bytes(),
-            self.allow_structural_change,
             self.original_content_hash.as_deref(),
         ) {
-            Ok(warning) => {
-                let mut message = format!(
+            Ok(()) => {
+                let message = format!(
                     "Successfully applied {} edit(s) to {}",
                     self.edit_count, self.path_str
                 );
-                if let Some(warning) = warning {
-                    message.push_str(&format!("\nWarning: {warning}"));
-                }
                 ToolResult::text(message).with_workspace_mutation_applied()
             }
             Err(e) => ToolResult::error(e),
@@ -1584,7 +1640,7 @@ fn prepare_multi_edit_inner(
         ));
     }
 
-    let original_content_hash = sha256_digest_of_existing_file(&path);
+    let original_content_hash = Some(content_hash(&original_content));
 
     Ok(PreparedMultiEdit {
         path,
@@ -1592,9 +1648,8 @@ fn prepare_multi_edit_inner(
         new_content: working,
         edit_count: edits.len(),
         dry_run,
-        allow_structural_change,
-        warning: None,
         original_content_hash,
+        original_content: original_content.into_bytes(),
     })
 }
 
@@ -1665,7 +1720,7 @@ pub fn prepare_delete_file(
         }
     };
 
-    let before_content_hash = sha256_digest_of_existing_file(&path);
+    let before_content_hash = Some(format!("{:x}", Sha256::digest(&before_content)));
 
     Ok(PreparedDeleteFile {
         path,
@@ -1775,6 +1830,8 @@ pub fn multi_edit(workspace_root: &Path, args: &Value) -> ToolResult {
 #[derive(Debug)]
 pub struct PreparedMultiPathEdit {
     prepared: Vec<PreparedMultiEdit>,
+    #[cfg(test)]
+    rename_failure_index: Option<usize>,
 }
 
 impl PreparedMultiPathEdit {
@@ -1783,6 +1840,13 @@ impl PreparedMultiPathEdit {
     }
 
     pub fn apply(&self) -> ToolResult {
+        self.apply_with_committed(|_| {})
+    }
+
+    pub fn apply_with_committed(
+        &self,
+        mut on_committed: impl FnMut(&PreparedMultiEdit),
+    ) -> ToolResult {
         if self.prepared.iter().all(|prepared| prepared.dry_run) {
             let messages: Vec<String> = self
                 .prepared
@@ -1805,28 +1869,10 @@ impl PreparedMultiPathEdit {
             });
         }
 
-        for prepared in &self.prepared {
-            if let Err(error) = verify_expected_original_hash(
-                &prepared.path,
-                prepared.original_content_hash.as_deref(),
-            ) {
-                return ToolResult::error(error);
-            }
-        }
-
-        // ── Two-phase atomic commit ────────────────────────────────────────
-        // Phase 1: Write every file to a staging path next to the target.
-        //          If any stage fails, no target file is touched.
-        // Phase 2: If all stages succeeded, atomically rename every staging
-        //          file to its target.  POSIX rename() is atomic on the same
-        //          filesystem, so each file transitions from old → new
-        //          without a window of partial content.
-        //
-        // This eliminates the dual journal+preimage rollback path entirely:
-        // there is nothing to roll back because no target is modified until
-        // every staging write has succeeded.
-        let mut staging_entries: Vec<(PathBuf, PathBuf, PreparedMultiEdit)> =
-            Vec::with_capacity(self.prepared.len());
+        // Stage every file before publication. Each publication is atomic;
+        // this is not an all-or-nothing transaction across multiple files.
+        // Owned staging files clean themselves up on every failure path.
+        let mut staging_entries = Vec::with_capacity(self.prepared.len());
 
         // Phase 1: Stage all files.
         for prepared in &self.prepared {
@@ -1834,62 +1880,21 @@ impl PreparedMultiPathEdit {
                 // Dry-run batches are handled before reaching this point.
                 continue;
             }
-            let staging_path = staging_tmp_path(&prepared.path);
-            // Best-effort cleanup of a stale staging file from a prior crash.
-            let _ = std::fs::remove_file(&staging_path);
-
-            if let Err(e) = std::fs::write(&staging_path, &prepared.new_content) {
-                // Clean up any already-staged files before returning.
-                for (_, staging, _) in &staging_entries {
-                    let _ = std::fs::remove_file(staging);
-                }
-                let _ = std::fs::remove_file(&staging_path);
-                return ToolResult::error(format!(
-                    "Error: Cannot stage write for {}: {e}",
-                    prepared.path_str
-                ));
-            }
-
-            // Format the staging file (best-effort, same as single-file path).
-            let formatter_outcome = format_file_in_place_best_effort(&staging_path);
-            let warning = match formatter_outcome {
-                FormatterOutcome::Success | FormatterOutcome::NotFound => None,
-                FormatterOutcome::Warning(w) => Some(w),
-                FormatterOutcome::SyntaxError(error) => {
-                    if prepared.allow_structural_change {
-                        Some(error)
-                    } else {
-                        // Clean up all staged files.
-                        for (_, staging, _) in &staging_entries {
-                            let _ = std::fs::remove_file(staging);
-                        }
-                        let _ = std::fs::remove_file(&staging_path);
-                        return ToolResult::error(error);
-                    }
-                }
+            let staging = match stage_file(&prepared.path, prepared.new_content.as_bytes()) {
+                Ok(staging) => staging,
+                Err(error) => return ToolResult::error(error),
             };
-
-            staging_entries.push((
-                prepared.path.clone(),
-                staging_path,
-                PreparedMultiEdit {
-                    warning: warning.clone(),
-                    ..prepared.clone()
-                },
-            ));
+            staging_entries.push((staging, prepared));
         }
 
         // Re-check all targets immediately before the first rename. This
-        // catches edits made while staging/formatting without leaving a partial
+        // catches edits made while staging without leaving a partial
         // multi-file commit behind.
-        for (_, _, prepared) in &staging_entries {
+        for (_, prepared) in &staging_entries {
             if let Err(error) = verify_expected_original_hash(
                 &prepared.path,
                 prepared.original_content_hash.as_deref(),
             ) {
-                for (_, staging, _) in &staging_entries {
-                    let _ = std::fs::remove_file(staging);
-                }
                 return ToolResult::error(error);
             }
         }
@@ -1897,11 +1902,9 @@ impl PreparedMultiPathEdit {
         // Phase 2: Commit all staged files via atomic rename.
         let mut messages = Vec::with_capacity(staging_entries.len());
         let mut committed_paths = Vec::new();
-        for (target, staging, prepared) in &staging_entries {
+        for (staging, prepared) in staging_entries {
             #[cfg(test)]
-            if MULTI_PATH_RENAME_FAILURE_INDEX.load(AtomicOrdering::SeqCst)
-                == committed_paths.len() as isize
-            {
+            if self.rename_failure_index == Some(committed_paths.len()) {
                 let committed_paths = committed_paths.clone();
                 let error = ToolResult::error(format!(
                     "Error: injected multi-path commit failure for {}",
@@ -1913,35 +1916,24 @@ impl PreparedMultiPathEdit {
                     error.with_workspace_mutation_partial(committed_paths)
                 };
             }
-            if let Err(e) = std::fs::rename(staging, target) {
-                // Rename failed — files already renamed before this point
-                // are committed (same-fs rename is atomic per-file).  Files
-                // not yet renamed have their staging artifacts still on disk;
-                // attempt cleanup but don't fail the overall result — the
-                // model already has error context.
-                for (_, remaining_staging, _) in
-                    staging_entries.iter().skip_while(|(t, _, _)| t != target)
-                {
-                    let _ = std::fs::remove_file(remaining_staging);
-                }
-                let error = ToolResult::error(format!(
-                    "Error: Cannot commit write for {} (rename failed): {e}",
-                    prepared.path_str
-                ));
+            if let Err(error) = publish_staged_file(
+                staging,
+                &prepared.path,
+                prepared.original_content_hash.as_deref(),
+            ) {
+                let error = ToolResult::error(error);
                 return if committed_paths.is_empty() {
                     error
                 } else {
                     error.with_workspace_mutation_partial(committed_paths)
                 };
             }
-            committed_paths.push(target.display().to_string());
-            let mut message = format!(
+            committed_paths.push(prepared.path.display().to_string());
+            on_committed(prepared);
+            let message = format!(
                 "Successfully applied {} edit(s) to {}",
                 prepared.edit_count, prepared.path_str
             );
-            if let Some(ref warning) = prepared.warning {
-                message.push_str(&format!("\nWarning: {warning}"));
-            }
             messages.push(message);
         }
 
@@ -2044,7 +2036,11 @@ pub fn prepare_multi_path_edit(
         prepared.push(prepare_multi_edit(workspace_root, &Value::Object(scoped))?);
     }
 
-    Ok(PreparedMultiPathEdit { prepared })
+    Ok(PreparedMultiPathEdit {
+        prepared,
+        #[cfg(test)]
+        rename_failure_index: None,
+    })
 }
 
 pub fn normalize_str_replace_args(args: &Value) -> Result<Value, String> {
@@ -2261,37 +2257,6 @@ fn normalize_line_endings_to_lf(s: &str) -> String {
     out
 }
 
-enum FormatterOutcome {
-    Success,
-    NotFound,
-    Warning(String),
-    SyntaxError(String),
-}
-
-fn format_file_in_place_best_effort(path: &Path) -> FormatterOutcome {
-    match extension_lower(path).as_deref() {
-        Some("rs") => run_formatter(path, "rustfmt", &["--emit=files"]),
-        Some("py") => run_formatter(path, "ruff", &["format", "--quiet"]),
-        Some("ts" | "tsx" | "js" | "jsx" | "json" | "md" | "yaml" | "yml") => {
-            run_formatter(path, "prettier", &["--write", "--log-level=warn"])
-        }
-        _ => FormatterOutcome::NotFound,
-    }
-}
-
-/// Atomic write pipeline for edits + formatter: stage content in a
-/// sibling tmp file, run the best-effort formatter on the tmp, then
-/// rename tmp over the real path. The real path never observes a
-/// half-written or half-formatted state.
-///
-/// Returns a formatter warning string when the formatter reported a
-/// non-fatal error. Syntax-level formatter failures abort the write:
-/// returning success while writing syntactically broken code gives the
-/// caller a false signal that the edit is valid.
-///
-/// Pre-commit hooks / editors watching the target via inotify see
-/// **one** `MODIFY` event (the rename), not `CREATE` + partial
-/// writes during formatting.
 fn sha256_digest_of_existing_file(path: &Path) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let meta = file.metadata().ok()?;
@@ -2315,7 +2280,17 @@ fn verify_expected_original_hash(
     expected_original_hash: Option<&str>,
 ) -> Result<(), String> {
     let Some(expected) = expected_original_hash else {
-        return Ok(());
+        return match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(format!(
+                "Error: File {} appeared after preparation. Re-read the file and retry.",
+                path.display()
+            )),
+            Err(error) => Err(format!(
+                "Error: Cannot verify missing file {} before commit: {error}",
+                path.display()
+            )),
+        };
     };
     let Some(current) = sha256_digest_of_existing_file(path) else {
         return Err(format!(
@@ -2333,141 +2308,63 @@ fn verify_expected_original_hash(
     Ok(())
 }
 
-fn write_file_atomic_with_format(
-    path: &Path,
-    content: &[u8],
-    allow_formatter_syntax_error: bool,
-    expected_original_hash: Option<&str>,
-) -> Result<Option<String>, String> {
-    // Verify the file hasn't been modified since we read it.
-    verify_expected_original_hash(path, expected_original_hash)?;
-
-    // Staging file lives next to the target — POSIX rename() is
-    // only atomic within the same filesystem. Using a /tmp staging
-    // file would break across mount points.
-    let tmp = staging_tmp_path(path);
-
-    // Best-effort cleanup of a stale tmp from a prior crashed write.
-    let _ = std::fs::remove_file(&tmp);
-
-    if let Err(e) = std::fs::write(&tmp, content) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("Error: Cannot stage write: {e}"));
+/// Stage exact prepared bytes beside the target using exclusive creation.
+/// Preserve existing permissions; new files use the normal creation mode/umask.
+fn stage_file(path: &Path, content: &[u8]) -> Result<tempfile::NamedTempFile, String> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".astra-tmp.");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
     }
-
-    let formatter_outcome = format_file_in_place_best_effort(&tmp);
-    let warning = match formatter_outcome {
-        FormatterOutcome::Success | FormatterOutcome::NotFound => None,
-        FormatterOutcome::Warning(warning) => Some(warning),
-        FormatterOutcome::SyntaxError(error) => {
-            if allow_formatter_syntax_error {
-                Some(error)
-            } else {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(error);
-            }
-        }
-    };
-
-    // Formatters are part of the write contract. They may normalize the
-    // staged candidate back to the exact bytes already on disk; do not rename
-    // such a candidate or report a mutation merely because the pre-format
-    // string differed.
-    match (std::fs::read(&tmp), std::fs::read(path)) {
-        (Ok(staged), Ok(current)) if staged == current => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(
-                "Error: the final formatted content is unchanged; no bytes were written."
-                    .to_string(),
-            );
-        }
-        (Err(error), _) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("Error: Cannot verify staged write: {error}"));
-        }
-        (_, Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
-            let _ = std::fs::remove_file(&tmp);
+    let mut staging = builder
+        .tempfile_in(path.parent().unwrap_or_else(|| Path::new(".")))
+        .map_err(|error| format!("Error: Cannot stage write for {}: {error}", path.display()))?;
+    match std::fs::metadata(path) {
+        Ok(metadata) => staging
+            .as_file()
+            .set_permissions(metadata.permissions())
+            .map_err(|error| format!("Error: Cannot preserve file permissions: {error}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
             return Err(format!(
-                "Error: Cannot verify existing content before commit: {error}"
+                "Error: Cannot inspect target before staging: {error}"
             ));
         }
-        _ => {}
     }
-
-    // Atomic rename commits the final state. Only here does the
-    // target path change.
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("Error: Cannot commit write (rename failed): {e}"));
-    }
-
-    Ok(warning)
+    staging
+        .write_all(content)
+        .map_err(|error| format!("Error: Cannot stage write for {}: {error}", path.display()))?;
+    Ok(staging)
 }
 
-fn staging_tmp_path(target: &Path) -> PathBuf {
-    let pid = std::process::id();
-    // Timestamp via nanos reduces the chance of collision when
-    // multiple writers race on the same path in the same pid (e.g.
-    // tests).
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut tmp = target.to_path_buf();
-    let base = target
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("astra_write");
-    // Preserve the original EXTENSION at the tail so external
-    // formatters (rustfmt, prettier, ruff) recognize the staged file
-    // as the right language. Pattern: `.astra-tmp.<pid>.<nanos>.<basename>`.
-    // The leading dot keeps it hidden; the original extension at
-    // tail drives formatter detection.
-    tmp.set_file_name(format!(".astra-tmp.{pid}.{nanos}.{base}"));
-    tmp
+/// Revalidate immediately before publication, within the caller's workspace
+/// lease. This is not a filesystem compare-and-swap against external writers.
+/// A new target uses no-clobber publication even if it appears after the check.
+fn publish_staged_file(
+    staging: tempfile::NamedTempFile,
+    path: &Path,
+    expected_original_hash: Option<&str>,
+) -> Result<(), String> {
+    verify_expected_original_hash(path, expected_original_hash)?;
+    let publication = if expected_original_hash.is_some() {
+        staging.persist(path)
+    } else {
+        staging.persist_noclobber(path)
+    };
+    publication
+        .map(|_| ())
+        .map_err(|error| format!("Error: Cannot commit write for {}: {error}", path.display()))
 }
 
-fn run_formatter(path: &Path, program: &str, args: &[&str]) -> FormatterOutcome {
-    let mut command = std::process::Command::new(program);
-    command.args(args).arg(path);
-    match command.output() {
-        Ok(output) if output.status.success() => FormatterOutcome::Success,
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let diagnostic = format!(
-                "{program} failed for {}: {}{}",
-                path.display(),
-                stdout.trim(),
-                stderr.trim()
-            );
-            if formatter_failure_is_syntax_error(&diagnostic) {
-                FormatterOutcome::SyntaxError(format!("Error: SYNTAX ERROR: {diagnostic}"))
-            } else {
-                FormatterOutcome::Warning(diagnostic)
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FormatterOutcome::NotFound,
-        Err(e) => {
-            FormatterOutcome::Warning(format!("{program} failed for {}: {e}", path.display()))
-        }
-    }
-}
-
-fn formatter_failure_is_syntax_error(diagnostic: &str) -> bool {
-    let lower = diagnostic.to_ascii_lowercase();
-    [
-        "syntax",
-        "parse error",
-        "failed to parse",
-        "unterminated",
-        "unclosed",
-        "mismatched",
-        "unexpected",
-        "expected",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+fn write_file_atomic(
+    path: &Path,
+    content: &[u8],
+    expected_original_hash: Option<&str>,
+) -> Result<(), String> {
+    verify_expected_original_hash(path, expected_original_hash)?;
+    publish_staged_file(stage_file(path, content)?, path, expected_original_hash)
 }
 
 fn validate_structural_edit(
@@ -3271,7 +3168,7 @@ mod tests {
     }
 
     #[test]
-    fn write_file_rust_runs_rustfmt_best_effort() {
+    fn write_file_commits_prepared_bytes_without_implicit_formatting() {
         let tmp = TempDir::new().unwrap();
         let args =
             serde_json::json!({"path": "main.rs", "content": "fn main(){println!(\"hi\");}"});
@@ -3280,11 +3177,11 @@ mod tests {
 
         assert!(!result.is_error, "got error: {}", result.output);
         let content = std::fs::read_to_string(tmp.path().join("main.rs")).unwrap();
-        assert_eq!(content, "fn main() {\n    println!(\"hi\");\n}\n");
+        assert_eq!(content, "fn main(){println!(\"hi\");}\n");
     }
 
     #[test]
-    fn write_file_rust_syntax_formatter_failure_is_error_and_preserves_target() {
+    fn write_file_success_proves_commit_not_syntax_validation() {
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("main.rs");
         std::fs::write(&target, "fn main() {}\n").unwrap();
@@ -3295,18 +3192,27 @@ mod tests {
 
         let result = write_file(tmp.path(), &args);
 
-        assert!(
-            result.is_error,
-            "syntax failure must be an error: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("SYNTAX ERROR"),
-            "syntax failure must be prominent: {}",
-            result.output
-        );
+        assert!(!result.is_error, "commit failed: {}", result.output);
         let content = std::fs::read_to_string(target).unwrap();
-        assert_eq!(content, "fn main() {}\n");
+        assert_eq!(content, "fn main(){ println!(\"hi); }\n");
+    }
+
+    #[test]
+    fn str_replace_preserves_unrelated_formatting_in_single_and_batch_edits() {
+        let root = TempDir::new().unwrap();
+        let source = "fn   keep( ){let   value=1;}\nfn change(){let n=2;}\n";
+        for args in [
+            serde_json::json!({"path":"main.rs", "old_str":"let n=2;", "new_str":"let n=3;"}),
+            serde_json::json!({"path":"main.rs", "edits":[{"old_str":"let n=2;", "new_str":"let n=3;"}]}),
+        ] {
+            std::fs::write(root.path().join("main.rs"), source).unwrap();
+            let result = str_replace(root.path(), &args);
+            assert!(!result.is_error, "{}", result.output);
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("main.rs")).unwrap(),
+                "fn   keep( ){let   value=1;}\nfn change(){let n=3;}\n"
+            );
+        }
     }
 
     #[test]
@@ -3703,7 +3609,7 @@ mod tests {
         let prepared = prepare_multi_path_edit(tmp.path(), &args).expect("prepared");
         std::fs::write(&b, "external change").unwrap();
 
-        let result = prepared.apply();
+        let result = prepared.apply_with_committed(|_| panic!("stale preparation cannot publish"));
 
         assert!(result.is_error, "stale target must fail: {}", result.output);
         assert!(
@@ -3728,12 +3634,22 @@ mod tests {
                 {"path": "b.txt", "old_str": "gamma", "new_str": "GAMMA"}
             ]
         });
-        let prepared = prepare_multi_path_edit(tmp.path(), &args).expect("prepared");
-        MULTI_PATH_RENAME_FAILURE_INDEX.store(1, AtomicOrdering::SeqCst);
-        let result = prepared.apply();
-        MULTI_PATH_RENAME_FAILURE_INDEX.store(-1, AtomicOrdering::SeqCst);
+        let mut prepared = prepare_multi_path_edit(tmp.path(), &args).expect("prepared");
+        prepared.rename_failure_index = Some(1);
+        let mut committed = Vec::new();
+        let result = prepared.apply_with_committed(|edit| {
+            assert_eq!(
+                std::fs::read(edit.path()).unwrap(),
+                edit.new_content_bytes()
+            );
+            committed.push((
+                edit.path().to_path_buf(),
+                edit.original_content_bytes().to_vec(),
+            ));
+        });
 
         assert!(result.is_error, "injected rename must fail");
+        assert_eq!(committed, vec![(a.clone(), b"alpha beta".to_vec())]);
         assert_eq!(
             result
                 .metadata
@@ -5017,30 +4933,53 @@ mod tests {
 
     #[test]
     fn atomic_write_staging_path_is_sibling_not_target() {
-        // Rename is only atomic within the same filesystem, so the
-        // staging tmp MUST sit in the target's parent directory.
-        let target = PathBuf::from("/workspace/project/src/lib.rs");
-        let tmp = staging_tmp_path(&target);
+        let root = TempDir::new().unwrap();
+        let target = root.path().join("lib.rs");
+        let staging = stage_file(&target, b"candidate\n").unwrap();
         assert_eq!(
-            tmp.parent(),
+            staging.path().parent(),
             target.parent(),
             "staging tmp must live beside the target, not in /tmp"
         );
         // And must not equal the target.
-        assert_ne!(tmp.file_name(), target.file_name());
+        assert_ne!(staging.path().file_name(), target.file_name());
+        let second = stage_file(&target, b"other\n").unwrap();
+        assert_ne!(staging.path(), second.path());
+        assert_eq!(std::fs::read(staging.path()).unwrap(), b"candidate\n");
     }
 
     #[test]
-    fn atomic_write_preserves_extension_for_formatters() {
-        // rustfmt / prettier / ruff detect the file's language by
-        // extension. The staging path MUST end in the original
-        // extension so the formatter treats it as the right kind.
-        let target = PathBuf::from("/workspace/proj/src/lib.rs");
-        let tmp = staging_tmp_path(&target);
-        let tmp_name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+    fn atomic_write_revalidates_after_staging_and_cleans_up_on_conflict() {
+        let root = TempDir::new().unwrap();
+        let target = root.path().join("file.txt");
+        std::fs::write(&target, "original\n").unwrap();
+        let hash = content_hash("original\n");
+        let staged = stage_file(&target, b"candidate\n").unwrap();
+        let staging_path = staged.path().to_path_buf();
+        std::fs::write(&target, "external\n").unwrap();
+        assert!(publish_staged_file(staged, &target, Some(&hash)).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"external\n");
+        assert!(!staging_path.exists());
+    }
+
+    #[test]
+    fn prepared_write_rejects_new_target_race_and_non_file_preimage() {
+        let root = TempDir::new().unwrap();
+        let prepared = prepare_write_file(
+            root.path(),
+            &serde_json::json!({"path":"file.txt", "content":"candidate"}),
+        )
+        .unwrap();
+        std::fs::write(prepared.path(), "external").unwrap();
+        assert!(prepared.apply().is_error);
+        assert_eq!(std::fs::read(prepared.path()).unwrap(), b"external");
+        std::fs::create_dir(root.path().join("directory")).unwrap();
         assert!(
-            tmp_name.ends_with(".rs"),
-            "staging path must end in .rs so rustfmt recognizes it; got {tmp_name}"
+            prepare_write_file(
+                root.path(),
+                &serde_json::json!({"path":"directory", "content":"candidate"}),
+            )
+            .is_err()
         );
     }
 
@@ -5053,8 +4992,8 @@ mod tests {
         let target = tmp.path().join("lib.rs");
         std::fs::write(&target, "original\n").unwrap();
 
-        let _warning =
-            write_file_atomic_with_format(&target, b"pub fn new_body() {}\n", false, None).unwrap();
+        let hash = content_hash("original\n");
+        write_file_atomic(&target, b"pub fn new_body() {}\n", Some(&hash)).unwrap();
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "pub fn new_body() {}\n",
@@ -5079,9 +5018,34 @@ mod tests {
         // End-to-end: write, check content lands.
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("hello.txt");
-        let result = write_file_atomic_with_format(&target, b"hello world\n", false, None);
+        let result = write_file_atomic(&target, b"hello world\n", None);
         assert!(result.is_ok(), "atomic write must succeed: {result:?}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello world\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_write_preserves_existing_executable_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempDir::new().unwrap();
+        let target = root.path().join("script.sh");
+        std::fs::write(&target, "#!/bin/sh\necho old\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let result = write_file(
+            root.path(),
+            &serde_json::json!({
+                "path":"script.sh", "content":"#!/bin/sh\necho new\n"
+            }),
+        );
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "#!/bin/sh\necho new\n"
+        );
     }
 
     #[test]
@@ -5104,7 +5068,8 @@ mod tests {
             ro.set_mode(0o500); // r-x only, no write for owner
             std::fs::set_permissions(tmp.path(), ro).unwrap();
 
-            let result = write_file_atomic_with_format(&target, b"NEW\n", false, None);
+            let hash = content_hash("ORIGINAL\n");
+            let result = write_file_atomic(&target, b"NEW\n", Some(&hash));
 
             // Restore perms before asserting so tempdir drop works.
             std::fs::set_permissions(tmp.path(), orig_perm).unwrap();

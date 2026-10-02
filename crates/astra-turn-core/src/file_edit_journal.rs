@@ -8,11 +8,16 @@
 //! ```text
 //! let mut journal = FileEditJournal::new(500);
 //!
-//! // Before writing, snapshot the current content
-//! journal.record_before(&path, "call-001", 3);
-//!
-//! // After writing, record what was written
-//! journal.record_after(&path, "call-001", new_content.as_bytes());
+//! // After a successful publication, record the captured preimage and
+//! // committed bytes together.
+//! journal.record_committed(
+//!     &path,
+//!     "call-001",
+//!     3,
+//!     Some(original_content.as_bytes()),
+//!     new_content.as_bytes(),
+//!     EditType::Overwrite,
+//! );
 //!
 //! // Undo the last edit to a file
 //! journal.undo_file(&path)?;
@@ -120,7 +125,7 @@ impl FileEditJournal {
         }
     }
 
-    /// Turn on auto-persistence to `dir`. Each subsequent `push` writes
+    /// Turn on auto-persistence to `dir`. Each subsequent complete record writes
     /// the new entry atomically to `<dir>/<seq:06>.json`; each eviction
     /// removes the stale file.
     ///
@@ -157,65 +162,30 @@ impl FileEditJournal {
         self.persist_dir.as_deref()
     }
 
-    /// Record the before-state of a file that is about to be written.
+    /// Record one successfully committed file mutation.
     ///
-    /// Call this BEFORE `fs::write` / `str_replace`. If the file does not
-    /// exist yet, `before_content` is stored as `None` (Create).
-    pub fn record_before(&mut self, path: &Path, tool_call_id: &str, turn_index: u32) {
-        let before_content = std::fs::read(path).ok();
-        let edit_type = if before_content.is_none() {
-            EditType::Create
-        } else {
-            EditType::Overwrite
-        };
-
+    /// The caller supplies the preimage captured during preparation and the
+    /// exact bytes published by the successful commit. This method does not
+    /// reread the path, so a failed publication cannot leave an undo entry
+    /// that later restores an unrelated external change.
+    pub fn record_committed(
+        &mut self,
+        path: &Path,
+        tool_call_id: &str,
+        turn_index: u32,
+        before_content: Option<&[u8]>,
+        after_content: &[u8],
+        edit_type: EditType,
+    ) {
         self.push(FileEditEntry {
             sequence: 0,
             path: path.to_owned(),
             turn_index,
             timestamp: SystemTime::now(),
-            before_content,
-            after_content: Vec::new(), // filled by record_after
+            before_content: before_content.map(ToOwned::to_owned),
+            after_content: after_content.to_vec(),
             tool_call_id: tool_call_id.to_string(),
             edit_type,
-        });
-    }
-
-    /// Update the most recent entry for `path` with the after-state content
-    /// and optionally refine the edit type (e.g., to `Patch` for str_replace).
-    pub fn record_after(&mut self, path: &Path, tool_call_id: &str, content: &[u8]) {
-        // Walk backwards to find the matching entry
-        let mut updated_seq: Option<u64> = None;
-        for entry in self.entries.iter_mut().rev() {
-            if entry.path == path && entry.tool_call_id == tool_call_id {
-                entry.after_content = content.to_vec();
-                updated_seq = Some(entry.sequence);
-                break;
-            }
-        }
-        match updated_seq {
-            Some(seq) => self.persist_entry_by_sequence(seq),
-            None => astra_core::agent_warn!(
-                "file_edit",
-                "record_after: no matching entry for path={} tool_call_id={}",
-                path.display(),
-                tool_call_id
-            ),
-        }
-    }
-
-    /// Convenience: record before-state with `Patch` edit type (for str_replace).
-    pub fn record_before_patch(&mut self, path: &Path, tool_call_id: &str, turn_index: u32) {
-        let before_content = std::fs::read(path).ok();
-        self.push(FileEditEntry {
-            sequence: 0,
-            path: path.to_owned(),
-            turn_index,
-            timestamp: SystemTime::now(),
-            before_content,
-            after_content: Vec::new(),
-            tool_call_id: tool_call_id.to_string(),
-            edit_type: EditType::Patch,
         });
     }
 
@@ -227,16 +197,14 @@ impl FileEditJournal {
         turn_index: u32,
         before_content: Vec<u8>,
     ) {
-        self.push(FileEditEntry {
-            sequence: 0,
-            path: path.to_owned(),
+        self.record_committed(
+            path,
+            tool_call_id,
             turn_index,
-            timestamp: SystemTime::now(),
-            before_content: Some(before_content),
-            after_content: Vec::new(),
-            tool_call_id: tool_call_id.to_string(),
-            edit_type: EditType::Delete,
-        });
+            Some(&before_content),
+            &[],
+            EditType::Delete,
+        );
     }
 
     /// Revert the most recent edit to a specific file.
@@ -679,36 +647,6 @@ impl FileEditJournal {
         }
     }
 
-    /// Re-persist a specific entry (identified by its monotonic sequence)
-    /// without touching any other on-disk entry. Used by `record_after`
-    /// to overwrite the pre-state entry with its completed after-state.
-    fn persist_entry_by_sequence(&self, seq: u64) {
-        let Some(dir) = self.persist_dir.as_ref() else {
-            return;
-        };
-        let Some(entry) = self.entries.iter().find(|e| e.sequence == seq) else {
-            return;
-        };
-        let dest = dir.join(format!("{:06}.json", seq));
-        let tmp = dir.join(format!(".{:06}.tmp", seq));
-        match serde_json::to_vec(entry) {
-            Ok(bytes) => {
-                if let Err(e) =
-                    std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &dest))
-                {
-                    astra_core::agent_warn!(
-                        "file_edit_journal",
-                        "re-persist entry seq={seq} failed: {e}"
-                    );
-                }
-            }
-            Err(e) => astra_core::agent_warn!(
-                "file_edit_journal",
-                "serialize entry seq={seq} failed: {e}"
-            ),
-        }
-    }
-
     fn apply_revert(entry: &FileEditEntry) -> io::Result<()> {
         match &entry.before_content {
             Some(content) => {
@@ -823,19 +761,13 @@ mod tests {
 
         // Older journal: two entries with sequences 0 and 1.
         let mut older = FileEditJournal::new(100);
-        std::fs::write(&file_a, b"a0").unwrap();
-        older.record_before(&file_a, "A", 0);
-        older.record_after(&file_a, "A", b"a1");
-        std::fs::write(&file_b, b"b0").unwrap();
-        older.record_before(&file_b, "B", 0);
-        older.record_after(&file_b, "B", b"b1");
+        older.record_committed(&file_a, "A", 0, Some(b"a0"), b"a1", EditType::Overwrite);
+        older.record_committed(&file_b, "B", 0, Some(b"b0"), b"b1", EditType::Overwrite);
         assert_eq!(older.len(), 2);
 
         // Self: one entry at sequence 0.
         let mut j = FileEditJournal::new(100);
-        std::fs::write(&file_x, b"x0").unwrap();
-        j.record_before(&file_x, "X", 1);
-        j.record_after(&file_x, "X", b"x1");
+        j.record_committed(&file_x, "X", 1, Some(b"x0"), b"x1", EditType::Overwrite);
         assert_eq!(j.len(), 1);
 
         j.merge_older_entries(older);
@@ -859,8 +791,7 @@ mod tests {
 
         // Subsequent record gets a sequence past all three.
         let max_existing = *seqs.iter().max().unwrap();
-        std::fs::write(&file_x, b"x1").unwrap();
-        j.record_before(&file_x, "Y", 2);
+        j.record_committed(&file_x, "Y", 2, Some(b"x1"), b"y", EditType::Overwrite);
         let new_seq = j.entries_for_test().last().unwrap().sequence;
         assert!(
             new_seq > max_existing,
@@ -876,13 +807,18 @@ mod tests {
         std::fs::write(&existing, b"before").unwrap();
 
         let mut journal = FileEditJournal::new(100);
-        journal.record_before(&existing, "overwrite", 7);
         std::fs::write(&existing, b"after").unwrap();
-        journal.record_after(&existing, "overwrite", b"after");
+        journal.record_committed(
+            &existing,
+            "overwrite",
+            7,
+            Some(b"before"),
+            b"after",
+            EditType::Overwrite,
+        );
 
-        journal.record_before(&created, "create", 7);
         std::fs::write(&created, b"brand-new").unwrap();
-        journal.record_after(&created, "create", b"brand-new");
+        journal.record_committed(&created, "create", 7, None, b"brand-new", EditType::Create);
 
         let reverted = journal.undo_turn_transactional(7).unwrap();
         assert_eq!(reverted.len(), 2);
@@ -902,9 +838,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mk_entry = |j: &mut FileEditJournal, tag: &str| {
             let f = tmp.path().join(tag);
-            std::fs::write(&f, b"x").unwrap();
-            j.record_before(&f, tag, 0);
-            j.record_after(&f, tag, b"y");
+            j.record_committed(&f, tag, 0, Some(b"x"), b"y", EditType::Overwrite);
         };
 
         // Self with cap=3 and 2 entries.
@@ -941,9 +875,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mk = |j: &mut FileEditJournal, tag: &str| {
             let f = tmp.path().join(tag);
-            std::fs::write(&f, b"x").unwrap();
-            j.record_before(&f, tag, 0);
-            j.record_after(&f, tag, b"y");
+            j.record_committed(&f, tag, 0, Some(b"x"), b"y", EditType::Overwrite);
         };
 
         // Self has cap=3, empty. Older has 5 entries (its own cap=10).
@@ -975,8 +907,7 @@ mod tests {
         std::fs::write(&file, b"a").unwrap();
 
         let mut j = FileEditJournal::new(100);
-        j.record_before(&file, "A", 0);
-        j.record_after(&file, "A", b"b");
+        j.record_committed(&file, "A", 0, Some(b"a"), b"b", EditType::Overwrite);
 
         let before_len = j.len();
         let before_seq = j.checkpoint();
@@ -1041,10 +972,8 @@ mod tests {
         std::fs::write(&file_b, "B0").unwrap();
 
         let mut j = FileEditJournal::new(100);
-        j.record_before(&file_a, "c-a", 0);
-        j.record_after(&file_a, "c-a", b"A1");
-        j.record_before(&file_b, "c-b", 0);
-        j.record_after(&file_b, "c-b", b"B1");
+        j.record_committed(&file_a, "c-a", 0, Some(b"A0"), b"A1", EditType::Overwrite);
+        j.record_committed(&file_b, "c-b", 0, Some(b"B0"), b"B1", EditType::Overwrite);
 
         let persist_dir = tmp.path().join("persist");
         j.save_to_dir(&persist_dir).expect("save");
@@ -1097,9 +1026,15 @@ mod tests {
         {
             let mut j1 = FileEditJournal::new(100);
             j1.enable_persistence(persist.clone());
-            j1.record_before(&file, "call-1", 0);
             std::fs::write(&file, b"modified").unwrap();
-            j1.record_after(&file, "call-1", b"modified");
+            j1.record_committed(
+                &file,
+                "call-1",
+                0,
+                Some(b"original"),
+                b"modified",
+                EditType::Overwrite,
+            );
         } // j1 dropped — simulates CLI exit.
 
         // Verify the on-disk state has a complete entry.
@@ -1108,6 +1043,13 @@ mod tests {
         // Session 2: reload journal and undo.
         let j2 = FileEditJournal::load_from_dir(&persist, 100).unwrap();
         assert_eq!(j2.len(), 1, "one persisted entry must survive restart");
+        let entry = j2.entries().next().expect("persisted entry");
+        assert_eq!(
+            entry.before_content.as_deref(),
+            Some(b"original".as_slice())
+        );
+        assert_eq!(entry.after_content, b"modified");
+        assert_eq!(entry.edit_type, EditType::Overwrite);
 
         let result = j2.undo_file(&file).unwrap();
         assert_eq!(result, Some(EditType::Overwrite));
@@ -1128,13 +1070,18 @@ mod tests {
         j.enable_persistence(persist.clone());
         for i in 0..5 {
             let p = tmp.path().join(format!("f{i}.txt"));
-            std::fs::write(&p, b"x").unwrap();
-            j.record_before(&p, &format!("c{i}"), 0);
-            j.record_after(&p, &format!("c{i}"), b"y");
+            j.record_committed(
+                &p,
+                &format!("c{i}"),
+                0,
+                Some(b"x"),
+                b"y",
+                EditType::Overwrite,
+            );
         }
 
-        // Only 2 JSON files should remain (seqs 8 and 9: each record_before
-        // takes one seq, record_after re-persists the same seq).
+        // Only 2 JSON files should remain after the bounded journal evicts
+        // the first three complete records.
         let files: Vec<_> = std::fs::read_dir(&persist)
             .unwrap()
             .flatten()
@@ -1182,11 +1129,16 @@ mod tests {
         std::fs::write(&file, "original").unwrap();
 
         let mut journal = FileEditJournal::new(100);
-        journal.record_before(&file, "call-1", 0);
-
         // Simulate write
         std::fs::write(&file, "modified").unwrap();
-        journal.record_after(&file, "call-1", b"modified");
+        journal.record_committed(
+            &file,
+            "call-1",
+            0,
+            Some(b"original"),
+            b"modified",
+            EditType::Overwrite,
+        );
 
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "modified");
 
@@ -1202,11 +1154,9 @@ mod tests {
         let file = tmp.path().join("new.txt");
 
         let mut journal = FileEditJournal::new(100);
-        journal.record_before(&file, "call-1", 0);
-
         // Simulate create
         std::fs::write(&file, "new content").unwrap();
-        journal.record_after(&file, "call-1", b"new content");
+        journal.record_committed(&file, "call-1", 0, None, b"new content", EditType::Create);
 
         assert!(file.exists());
 
@@ -1227,13 +1177,25 @@ mod tests {
         let mut journal = FileEditJournal::new(100);
 
         // Turn 5: edit both files
-        journal.record_before(&file_a, "call-1", 5);
         std::fs::write(&file_a, "A modified").unwrap();
-        journal.record_after(&file_a, "call-1", b"A modified");
+        journal.record_committed(
+            &file_a,
+            "call-1",
+            5,
+            Some(b"A original"),
+            b"A modified",
+            EditType::Overwrite,
+        );
 
-        journal.record_before(&file_b, "call-2", 5);
         std::fs::write(&file_b, "B modified").unwrap();
-        journal.record_after(&file_b, "call-2", b"B modified");
+        journal.record_committed(
+            &file_b,
+            "call-2",
+            5,
+            Some(b"B original"),
+            b"B modified",
+            EditType::Overwrite,
+        );
 
         let result = journal.undo_turn(5);
         assert_eq!(result.reverted.len(), 2);
@@ -1294,13 +1256,20 @@ mod tests {
     }
 
     #[test]
-    fn record_before_patch() {
+    fn record_committed_patch() {
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("patched.txt");
         std::fs::write(&file, "line1\nline2\nline3\n").unwrap();
 
         let mut journal = FileEditJournal::new(100);
-        journal.record_before_patch(&file, "call-p", 0);
+        journal.record_committed(
+            &file,
+            "call-p",
+            0,
+            Some(b"line1\nline2\nline3\n"),
+            b"line1\nchanged\nline3\n",
+            EditType::Patch,
+        );
 
         assert_eq!(journal.entries.back().unwrap().edit_type, EditType::Patch);
     }
@@ -1330,15 +1299,27 @@ mod tests {
         std::fs::write(&file, "original").unwrap();
 
         let mut journal = FileEditJournal::new(100);
-        journal.record_before(&file, "call-1", 4);
         std::fs::write(&file, "first").unwrap();
-        journal.record_after(&file, "call-1", b"first");
+        journal.record_committed(
+            &file,
+            "call-1",
+            4,
+            Some(b"original"),
+            b"first",
+            EditType::Overwrite,
+        );
 
         let checkpoint = journal.checkpoint();
 
-        journal.record_before(&file, "call-2", 4);
         std::fs::write(&file, "second").unwrap();
-        journal.record_after(&file, "call-2", b"second");
+        journal.record_committed(
+            &file,
+            "call-2",
+            4,
+            Some(b"first"),
+            b"second",
+            EditType::Overwrite,
+        );
 
         let result = journal.undo_turn_since(4, checkpoint);
         assert_eq!(result.reverted.len(), 1);
@@ -1356,8 +1337,7 @@ mod tests {
         let mk = |j: &mut FileEditJournal, tag: &str| {
             let f = tmp.path().join(tag);
             std::fs::write(&f, b"x").unwrap();
-            j.record_before(&f, tag, 0);
-            j.record_after(&f, tag, b"y");
+            j.record_committed(&f, tag, 0, Some(b"x"), b"y", EditType::Overwrite);
         };
 
         // Simulate a prior run with 4 entries on disk.
