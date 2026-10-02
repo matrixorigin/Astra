@@ -6578,6 +6578,9 @@ pub(crate) mod tests {
         execution_time_budget_remaining: Option<Duration>,
         pub(crate) direct_child_owner: Option<Arc<crate::orchestration::FanoutParentAdmission>>,
         pub(crate) child_wait_started: Option<Arc<tokio::sync::Notify>>,
+        pub(crate) capacity_readmission_gate:
+            Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        pub(crate) execution_capacity_releases: usize,
         pub(crate) child_boundary_outcomes: Vec<String>,
     }
 
@@ -6634,6 +6637,8 @@ pub(crate) mod tests {
                 execution_time_budget_remaining: None,
                 direct_child_owner: None,
                 child_wait_started: None,
+                capacity_readmission_gate: None,
+                execution_capacity_releases: 0,
                 child_boundary_outcomes: Vec::new(),
             }
         }
@@ -6743,6 +6748,20 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl AgenticLoopHost for MockHost {
+        fn release_execution_capacity_for_wait(&mut self) {
+            self.execution_capacity_releases += 1;
+        }
+
+        async fn reacquire_execution_capacity_after_wait(
+            &mut self,
+        ) -> Result<(), astra_core::ClassifiedError> {
+            if let Some((started, grant)) = &self.capacity_readmission_gate {
+                started.notify_one();
+                grant.notified().await;
+            }
+            Ok(())
+        }
+
         fn direct_child_completion_owner(
             &self,
             state: &AgenticLoopState,

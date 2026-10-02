@@ -258,6 +258,7 @@ impl LocalAgentSnapshot {
                     && (matches!(
                         agent.status,
                         astra_turn_core::orchestration_types::AgentStatus::Waiting { .. }
+                            | astra_turn_core::orchestration_types::AgentStatus::Paused { .. }
                     ) || agent.status.is_terminal())
             })
             .filter(|agent| {
@@ -282,6 +283,9 @@ impl LocalAgentSnapshot {
                     } => ("cancelled", reason.as_str()),
                     astra_turn_core::orchestration_types::AgentStatus::Waiting { reason } => {
                         ("needs_input", reason.as_str())
+                    }
+                    astra_turn_core::orchestration_types::AgentStatus::Paused { reason } => {
+                        ("paused", reason.as_str())
                     }
                     _ => unreachable!("filtered to attention-worthy states"),
                 };

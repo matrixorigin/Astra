@@ -20132,6 +20132,7 @@ mod tests {
                 "decisions": 1
             },
             "summary": "The server observed a recoverable timeout.",
+            "model_requests": astra_services::reflect::ModelRequestCapture::default(),
             "observations": [],
             "evidence": [],
             "action_hints": [],

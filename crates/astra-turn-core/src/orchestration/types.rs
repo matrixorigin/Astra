@@ -73,6 +73,11 @@ pub enum AgentStatus {
     Waiting {
         reason: String,
     },
+    /// A committed, resumable execution block. Unlike Waiting, this is an
+    /// authoritative dependency pause, not active work or a remote wake hint.
+    Paused {
+        reason: String,
+    },
     Cancelled {
         /// Whether the cancellation was triggered by the user (Ctrl+C
         /// / Ctrl+G x) as opposed to a system condition (parent
@@ -179,7 +184,7 @@ pub fn project_agent_status_to_fanout_slot(status: &AgentStatus) -> AgentFanoutS
                 (AgentFanoutSlotStatus::CancelledByRuntime, reason)
             }
         }
-        AgentStatus::Waiting { reason } => (
+        AgentStatus::Waiting { reason } | AgentStatus::Paused { reason } => (
             AgentFanoutSlotStatus::WaitingForInput,
             (!reason.trim().is_empty()).then(|| reason.clone()),
         ),
@@ -236,6 +241,21 @@ pub fn random_edge_executor_instance_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paused_is_a_nonterminal_waiting_presentation_not_interrupted() {
+        let paused = AgentStatus::Paused {
+            reason: "executor_offline".into(),
+        };
+        assert!(!paused.is_terminal());
+        let projection = project_agent_status_to_fanout_slot(&paused);
+        assert_eq!(projection.status, AgentFanoutSlotStatus::WaitingForInput);
+        assert!(!projection.status.is_terminal());
+        assert_eq!(
+            projection.terminal_reason.as_deref(),
+            Some("executor_offline")
+        );
+    }
 
     #[test]
     fn finish_reason_classification_is_shared() {

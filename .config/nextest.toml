@@ -27,12 +27,16 @@ test-threads = 2
 # Tighten later when known contention such as the `session_sync_log` prune hot
 # path is fixed — ideally back toward 1–2s per case.
 [profile.ci]
+archive.include = [{ path = "debug/mock_mcp_server", relative-to = "target", on-missing = "error" }]
 fail-fast = false
 slow-timeout = { period = "30s", terminate-after = 1 }
 failure-output = "immediate"
 # Hosted runners are intentionally small. Shards provide workflow-level
 # parallelism, so keep each runner's test process fan-out bounded.
 test-threads = 2
+
+[profile.ci.junit]
+path = "junit.xml"
 
 [profile.strict]
 fail-fast = false

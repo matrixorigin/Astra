@@ -446,6 +446,12 @@ fn embedded_work_unit_observation(output: &str) -> Option<WorkUnitObservation> {
         .filter(WorkUnitObservation::is_valid)
 }
 
+#[derive(Default)]
+struct ToolExecutionFacts {
+    fields: Option<serde_json::Map<String, Value>>,
+    is_error: Option<bool>,
+}
+
 struct EdgeToolRun {
     output: String,
     is_error: bool,
@@ -4727,19 +4733,21 @@ impl ToolExecutor {
         } else {
             None
         };
-        let mut tool_result_fields = None;
-        let mut source_is_error = None;
+        let mut facts = ToolExecutionFacts::default();
         let mut output = self
             .execute_raw(
                 name,
                 args,
                 invocation,
                 cancel_token,
-                &mut tool_result_fields,
-                &mut source_is_error,
+                &mut facts,
                 mcp_prepared,
             )
             .await;
+        let ToolExecutionFacts {
+            fields: mut tool_result_fields,
+            is_error: mut source_is_error,
+        } = facts;
         if matches!(
             mcp_workspace_effect,
             Some(astra_turn_types::ResolvedToolEffect::Mutating)
@@ -4949,13 +4957,16 @@ impl ToolExecutor {
         args: &Value,
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
-        tool_result_fields: &mut Option<serde_json::Map<String, Value>>,
-        source_is_error: &mut Option<bool>,
+        facts: &mut ToolExecutionFacts,
         mcp_prepared: Option<(
             std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>,
             astra_mcp::PreparedMcpToolCall,
         )>,
     ) -> String {
+        let ToolExecutionFacts {
+            fields: tool_result_fields,
+            is_error: source_is_error,
+        } = facts;
         let output = if let Err(error) =
             crate::tool_safety_guard::ToolSafetyGuard::check_dispatch(name, args)
         {
@@ -6413,6 +6424,7 @@ mod tests {
             Ok(astra_runtime::orchestration::SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: astra_runtime::orchestration::CancellationOrigin::Unverified,
@@ -6444,6 +6456,7 @@ mod tests {
             Ok(astra_runtime::orchestration::SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: astra_runtime::orchestration::CancellationOrigin::Unverified,
@@ -6569,7 +6582,9 @@ mod tests {
             .await;
         assert!(!result_lookup.contains("inherited model requirements cannot be bound"));
 
-        let unconstrained = test_executor().with_spawn_context(fanout_test_context(test_spawner()));
+        let unconstrained_spawner = test_spawner();
+        let unconstrained =
+            test_executor().with_spawn_context(fanout_test_context(unconstrained_spawner.clone()));
         let allowed = unconstrained
             .execute(
                 "agent",
@@ -6579,9 +6594,17 @@ mod tests {
             )
             .await;
         assert!(!allowed.contains("inherited model requirements cannot be bound"));
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&allowed).unwrap()["status"],
-            "completed"
+        let launched: serde_json::Value = serde_json::from_str(&allowed).unwrap();
+        assert_eq!(launched["status"], "launched", "{allowed}");
+        let status = unconstrained_spawner
+            .wait_for_agent(
+                launched["agent_id"].as_str().unwrap(),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("the admitted child must complete");
+        assert!(
+            matches!(status, astra_runtime::orchestration::AgentStatus::Completed { result, .. } if result == "child result")
         );
     }
 
@@ -7801,7 +7824,8 @@ mod tests {
     async fn task_output_projects_fanout_group_when_registry_does_not_answer() {
         let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let spawner = test_spawner();
-        let ctx = fanout_test_context(spawner);
+        let ctx = fanout_test_context(spawner.clone());
+        let parent = ctx.fanout_admission.clone();
         let executor = test_executor()
             .with_spawn_context(ctx)
             .with_bg_task_commands(commands);
@@ -7822,11 +7846,19 @@ mod tests {
             )
             .await;
         let completed_value: serde_json::Value = serde_json::from_str(&completed).unwrap();
-        assert_eq!(completed_value["status"], "completed", "{completed}");
-        assert_eq!(
-            completed_value["fanout"]["status"], "finished",
-            "{completed}"
-        );
+        assert_eq!(completed_value["status"], "started", "{completed}");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            spawner.wait_for_direct_children(&parent),
+        )
+        .await
+        .expect("fanout children must settle before reading terminal output");
+        let group = spawner
+            .fanout_group_for_parent_run_and_id("run-parent", "review-fanout")
+            .await
+            .expect("parent-owned fanout");
+        assert_eq!(group.summary().completed, 1);
+        assert_eq!(group.summary().active, 0);
 
         let mut result_fields = None;
         let result = executor
@@ -7997,26 +8029,23 @@ mod tests {
                 .await
         });
 
-        let child_id = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if let Some(child_id) = spawner
-                    .list_fanout_groups()
-                    .await
-                    .into_iter()
-                    .find(|group| group.group_id == "live-review-fanout")
-                    .and_then(|group| {
-                        (group.summary().active > 0)
-                            .then(|| group.slots.iter().find_map(|slot| slot.agent_id.clone()))
-                            .flatten()
-                    })
-                {
-                    break child_id;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("fanout must publish a live child identity before it settles");
+        let launched = tokio::time::timeout(std::time::Duration::from_secs(2), launch)
+            .await
+            .expect("fanout admission must return without waiting for child completion")
+            .expect("fanout launch task");
+        let launched: serde_json::Value =
+            serde_json::from_str(&launched).expect("fanout launch JSON");
+        assert_eq!(launched["status"], "started", "{launched}");
+        let group = spawner
+            .fanout_group_for_parent_run_and_id("run-parent", "live-review-fanout")
+            .await
+            .expect("launch must publish the parent-owned fanout");
+        assert_eq!(group.summary().active, 3);
+        let child_id = group
+            .slots
+            .iter()
+            .find_map(|slot| slot.agent_id.clone())
+            .expect("launch must publish a live child identity");
 
         for _ in 0..2 {
             let mut fields = None;
@@ -8037,16 +8066,25 @@ mod tests {
         }
 
         release.add_permits(3);
-        let completed = launch.await.expect("fanout launch task");
-        let completed: serde_json::Value =
-            serde_json::from_str(&completed).expect("fanout result JSON");
-        assert_eq!(completed["status"], "completed", "{completed}");
+        let parent = spawner.fanout_parent("run-parent");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            spawner.wait_for_direct_children(&parent),
+        )
+        .await
+        .expect("released children must actually complete");
+        let group = spawner
+            .fanout_group_for_parent_run_and_id("run-parent", "live-review-fanout")
+            .await
+            .expect("parent-owned fanout");
+        assert_eq!(group.summary().completed, 3);
+        assert_eq!(group.summary().active, 0);
     }
 
     #[tokio::test]
     async fn bound_agent_spawn_executes_through_runtime_context() {
         let spawner = test_spawner();
-        let ctx = fanout_test_context(spawner);
+        let ctx = fanout_test_context(spawner.clone());
         let executor = test_executor().with_spawn_context(ctx);
 
         let result = executor
@@ -8063,8 +8101,7 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&result).expect("agent spawn result must be structured JSON");
 
-        assert_eq!(parsed["status"], "completed", "{result}");
-        assert_eq!(parsed["result"], "child result", "{result}");
+        assert_eq!(parsed["status"], "launched", "{result}");
         assert!(
             parsed["run_id"]
                 .as_str()
@@ -8081,12 +8118,23 @@ mod tests {
             !result.contains("multi-agent runtime is not connected"),
             "bound spawn context must not be treated as missing: {result}"
         );
+        let status = spawner
+            .wait_for_agent(
+                parsed["agent_id"].as_str().unwrap(),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("launched child must complete");
+        assert!(
+            matches!(status, astra_runtime::orchestration::AgentStatus::Completed { result, .. } if result == "child result")
+        );
     }
 
     #[tokio::test]
     async fn task_list_bg_surfaces_recoverable_fanout_results_without_background_runner() {
         let spawner = test_spawner();
-        let ctx = fanout_test_context(spawner);
+        let ctx = fanout_test_context(spawner.clone());
+        let parent = ctx.fanout_admission.clone();
         let executor = test_executor().with_spawn_context(ctx);
 
         let completed = executor
@@ -8105,11 +8153,19 @@ mod tests {
             )
             .await;
         let completed_value: serde_json::Value = serde_json::from_str(&completed).unwrap();
-        assert_eq!(completed_value["status"], "completed", "{completed}");
-        assert_eq!(
-            completed_value["fanout"]["status"], "finished",
-            "{completed}"
-        );
+        assert_eq!(completed_value["status"], "started", "{completed}");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            spawner.wait_for_direct_children(&parent),
+        )
+        .await
+        .expect("fanout children must settle before listing recoverable results");
+        let group = spawner
+            .fanout_group_for_parent_run_and_id("run-parent", "review-fanout")
+            .await
+            .expect("parent-owned fanout");
+        assert_eq!(group.summary().completed, 1);
+        assert_eq!(group.summary().active, 0);
 
         let result = executor.task_list_bg().await;
 
@@ -9415,18 +9471,23 @@ mod tests {
             serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
         ]);
 
-        let out = executor
-            .execute(
+        let outcome = executor
+            .execute_with_metadata(
                 "run_build_test",
                 &serde_json::json!({"command": "echo should-not-run"}),
             )
             .await;
 
-        assert!(out.contains("not available in this turn"), "{out}");
-        assert!(!out.contains("select:run_build_test"), "{out}");
+        assert!(outcome.is_error, "{outcome:?}");
+        let fields = outcome
+            .tool_result_fields
+            .as_ref()
+            .expect("typed admission denial");
+        assert_eq!(fields["disposition"], "rejected");
+        assert_eq!(fields["recovery_evidence"]["kind"], "tool_binding");
         assert!(
-            !out.contains("should-not-run"),
-            "internal handler must not execute when the tool was not visible or activated; got: {out}"
+            !outcome.output.contains("should-not-run"),
+            "internal handler must not execute when the tool was not visible or activated; got: {outcome:?}"
         );
     }
 

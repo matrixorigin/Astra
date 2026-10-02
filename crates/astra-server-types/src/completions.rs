@@ -369,23 +369,19 @@ mod tests {
     #[test]
     fn delegation_completion_identity_is_server_namespaced_and_command_scoped() {
         let command_id = "eb1b8c4a-4fc0-4a56-86e8-c1fc36d0d21a";
-        for (operation, prefix) in [(
-            CompletionOperation::DelegationIntentExtraction,
-            "delegation_intent",
-        )] {
-            let request = CompletionRequest::new(operation, "session-1", 0, 0, 0, vec![])
-                .with_command_intent_id(command_id);
-            request.validate().expect("valid direct-command identity");
-            assert_eq!(
-                request.invocation_scope().operation_id(),
-                format!("{prefix}:{command_id}")
-            );
-            assert_eq!(
-                request.purpose(),
-                astra_turn_types::InferencePurpose::Introspection
-            );
-            assert!(!operation.is_typed_judgment());
-        }
+        let operation = CompletionOperation::DelegationIntentExtraction;
+        let request = CompletionRequest::new(operation, "session-1", 0, 0, 0, vec![])
+            .with_command_intent_id(command_id);
+        request.validate().expect("valid direct-command identity");
+        assert_eq!(
+            request.invocation_scope().operation_id(),
+            format!("delegation_intent:{command_id}")
+        );
+        assert_eq!(
+            request.purpose(),
+            astra_turn_types::InferencePurpose::Introspection
+        );
+        assert!(!operation.is_typed_judgment());
     }
 
     #[test]

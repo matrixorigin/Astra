@@ -148,7 +148,7 @@ mod tests {
         assert_eq!(metadata["action"], "run_chain");
         assert_eq!(
             metadata["available_actions"],
-            serde_json::json!(["spawn", "get_result", "send_message"])
+            serde_json::json!(["spawn", "list", "get_result", "send_message"])
         );
     }
 }

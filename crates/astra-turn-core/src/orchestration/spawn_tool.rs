@@ -515,6 +515,14 @@ pub enum SpawnAgentOutput {
         tool_calls: u32,
         duration_ms: u64,
     },
+    /// Agent has a committed, resumable execution block.
+    Paused {
+        agent_id: String,
+        run_id: String,
+        reason: String,
+        tool_calls: u32,
+        duration_ms: u64,
+    },
     /// Agent launched in background.
     Launched {
         agent_id: String,

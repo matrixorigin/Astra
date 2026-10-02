@@ -4637,7 +4637,7 @@ impl ToolExecutor {
             );
         };
         let after = astra_tools::workspace_observation::WorkspaceFingerprint::capture(&root);
-        self.finish_bash_workspace_observation(
+        Self::finish_bash_workspace_observation(
             &root,
             outcome,
             before,
@@ -4686,7 +4686,7 @@ impl ToolExecutor {
         .await
         .ok()
         .flatten();
-        self.finish_bash_workspace_observation(
+        Self::finish_bash_workspace_observation(
             &quarantine_root,
             outcome,
             before,
@@ -4698,7 +4698,6 @@ impl ToolExecutor {
     }
 
     fn finish_bash_workspace_observation(
-        &self,
         root: &std::path::Path,
         mut outcome: super::ToolExecutionOutcome,
         before: astra_tools::workspace_observation::WorkspaceFingerprint,
@@ -7024,12 +7023,15 @@ mod tests {
         );
 
         assert!(outcome.is_error, "{outcome:?}");
-        assert!(
-            outcome.output.contains("workspace coordination lock")
-                && outcome.output.contains("no bash command was run")
-                && outcome.output.contains("permissions"),
-            "failure must be explicit and actionable: {outcome:?}"
-        );
+        let fields = outcome
+            .tool_result_fields
+            .as_ref()
+            .expect("typed admission denial");
+        assert_eq!(fields["error_kind"], "workspace_unavailable");
+        assert_eq!(fields["disposition"], "rejected");
+        assert_eq!(fields["execution_fact"], "not_executed");
+        assert_eq!(fields["execution_started"], false);
+        assert_eq!(fields["retryable"], true);
         assert!(!marker.exists(), "shell must not run without coordination");
         assert_eq!(
             astra_tools::workspace_observation::workspace_ownership_is_unsettled(dir.path()),
@@ -9593,14 +9595,21 @@ mod tests {
 
     #[test]
     fn grep_head_limit_zero_means_unlimited() {
-        let dir = tempfile::tempdir().unwrap();
+        // Keep filename bytes below the independent output budget so this
+        // fixture exercises the line limit, not an arbitrary TMPDIR length.
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        std::fs::create_dir_all(&target).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("grep-")
+            .tempdir_in(&target)
+            .unwrap();
         let executor = super::ToolExecutor::new(dir.path());
-        let content: String = (0..150).map(|i| format!("needle line {i}\n")).collect();
+        let content = "needle\n".repeat(150);
         std::fs::write(dir.path().join("big.txt"), &content).unwrap();
 
         let result = executor.grep(&serde_json::json!({
             "pattern": "needle",
-            "path": ".",
+            "path": "big.txt",
             "head_limit": 0
         }));
         // Should NOT have the "Results limited" message
@@ -9609,24 +9618,29 @@ mod tests {
             "head_limit=0 should be unlimited, got: {result}"
         );
         let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
-        assert!(
-            match_lines.len() > 100,
-            "should have all lines, got {}",
-            match_lines.len()
+        assert_eq!(
+            match_lines.len(),
+            150,
+            "all matching lines must be retained"
         );
     }
 
     #[test]
     fn grep_default_head_limit_applies() {
-        let dir = tempfile::tempdir().unwrap();
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        std::fs::create_dir_all(&target).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("grep-")
+            .tempdir_in(&target)
+            .unwrap();
         let executor = super::ToolExecutor::new(dir.path());
         // Create more than GREP_DEFAULT_HEAD_LIMIT (100) matching lines
-        let content: String = (0..150).map(|i| format!("needle line {i}\n")).collect();
+        let content = "needle\n".repeat(150);
         std::fs::write(dir.path().join("big.txt"), &content).unwrap();
 
         let result = executor.grep(&serde_json::json!({
             "pattern": "needle",
-            "path": "."
+            "path": "big.txt"
         }));
         let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
         assert_eq!(

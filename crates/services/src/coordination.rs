@@ -1616,7 +1616,6 @@ mod tests {
             agent_ids: vec!["a1".into(), "a2".into(), "a3".into()],
             has_dependencies: true,
             timeout_sec: 30,
-            ..Default::default()
         };
         let pattern = suggest_pattern(&hints);
         assert!(

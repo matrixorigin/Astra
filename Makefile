@@ -1700,7 +1700,9 @@ toolchain-check:
 	fi
 
 .PHONY: lint
-lint: toolchain-check sweep
+# Cache retention is independent of correctness. CI restores reusable artifacts;
+# age-based cleanup belongs to an explicit `make sweep`, not this gate.
+lint: toolchain-check
 	@echo "Running clippy..."
 	@$(CARGO) clippy $(CARGO_MANIFEST_FLAG) --all-targets -- -D warnings
 

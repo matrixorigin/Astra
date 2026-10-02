@@ -88,8 +88,8 @@ pub fn work_admission_classification_request(ctx: &TurnIntentJudgeContext) -> Ju
             id,
             JudgmentQuestion::Noul {
                 criteria: Some(NoulCriteria {
-                    yes: format!("Under state.policy, the latest request explicitly satisfies: {proposition} For categorical questions this is the single applicable category."),
-                    no: format!("Under state.policy, the latest request does not satisfy: {proposition} For categorical questions another category applies. Lack of confidence is uncertainty, not false."),
+                    yes: format!("Under state.policy, latest request explicitly satisfies: {proposition} Categorical: single applicable category."),
+                    no: format!("Under state.policy, latest request does not satisfy: {proposition} Categorical: another category applies. Uncertainty is not false."),
                 }),
                 instructions: proposition,
             },

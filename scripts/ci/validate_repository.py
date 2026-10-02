@@ -449,9 +449,8 @@ def main() -> None:
         errors.append("Dockerfile: release builds must not update Cargo.lock resolution")
 
     runtime_versions = {
-        Path("crates/astra-cli/src/cli/slash/slash_info.rs"): 'format!("  astra version {} (Rust)", env!("CARGO_PKG_VERSION"))',
+        Path("crates/astra-cli/src/cli/cli_config/cli_args.rs"): '#[command(name = "astra", version)]',
         Path("crates/runtime/src/app_state.rs"): 'const DEFAULT_VERSION: &str = env!("CARGO_PKG_VERSION")',
-        Path("crates/runtime/src/server/runtime_tool_executor.rs"): 'concat!("astra-server/", env!("CARGO_PKG_VERSION"))',
     }
     for source, required in runtime_versions.items():
         if required not in source.read_text(encoding="utf-8"):

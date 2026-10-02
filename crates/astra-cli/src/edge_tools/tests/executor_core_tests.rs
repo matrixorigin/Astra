@@ -1104,7 +1104,7 @@ async fn execute_reflect_uses_local_surface_with_session() {
                 "facet": "trace",
                 "depth": "forensic",
                 "horizon": "cross_session",
-                "source_policy": "cloud_only",
+                "source_policy": "local_only",
                 "include_context": true,
                 "last_n": 100
             }),
@@ -1116,7 +1116,7 @@ async fn execute_reflect_uses_local_surface_with_session() {
     assert_eq!(value["facet"], "trace");
     assert_eq!(value["depth"], "forensic");
     assert_eq!(value["horizon"], "cross_session");
-    assert_eq!(value["source_policy"], "cloud_only");
+    assert_eq!(value["source_policy"], "local_only");
     assert_eq!(value["include_context"], true);
     assert_eq!(value["analysis_view"], "execution_trace");
     assert!(value.get("last_n").is_none());
@@ -1127,11 +1127,7 @@ async fn execute_reflect_uses_local_surface_with_session() {
     assert_eq!(value["data_coverage"]["events"], 2);
     assert_eq!(
         value["data_coverage"]["providers"]["local_journal"]["status"],
-        "fresh"
-    );
-    assert_eq!(
-        value["data_coverage"]["providers"]["cloud_events"]["status"],
-        "unavailable"
+        "partial"
     );
     assert_eq!(
         value["data_coverage"]["providers"]["visible_context"]["status"],
@@ -1145,12 +1141,6 @@ async fn execute_reflect_uses_local_surface_with_session() {
             .as_str()
             .is_some_and(|text| text.contains("cross_session"))),
         "cross-session local reflect requests must report partial coverage: {warnings:?}"
-    );
-    assert!(
-        warnings.iter().any(|warning| warning
-            .as_str()
-            .is_some_and(|text| text.contains("cloud_only"))),
-        "cloud-only local reflect requests must report partial coverage: {warnings:?}"
     );
     let observations = value["observations"]
         .as_array()

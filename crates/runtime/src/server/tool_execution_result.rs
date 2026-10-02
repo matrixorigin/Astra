@@ -155,23 +155,18 @@ pub(crate) fn agent_tool_result_from_output(output: String) -> astra_tools::Tool
         else {
             return None;
         };
-        let status = match status {
-            AgentToolResultStatusKind::Waiting => "waiting",
-            AgentToolResultStatusKind::Interrupted => "interrupted",
+        let (reason_field, default_reason) = match status {
+            AgentToolResultStatusKind::Waiting | AgentToolResultStatusKind::Paused => {
+                ("reason", status.as_str())
+            }
+            AgentToolResultStatusKind::Interrupted => ("finish_reason", "interrupted"),
             _ => return None,
         };
-        let reason = match status {
-            "waiting" => value
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("waiting"),
-            "interrupted" => value
-                .get("finish_reason")
-                .and_then(Value::as_str)
-                .unwrap_or("interrupted"),
-            _ => unreachable!("status is constrained above"),
-        };
-        Some((status, reason))
+        let reason = value
+            .get(reason_field)
+            .and_then(Value::as_str)
+            .unwrap_or(default_reason);
+        Some((status.as_str(), reason))
     });
 
     let Some((agent_status, reason)) = interrupted_agent else {
@@ -210,7 +205,7 @@ pub(crate) fn agent_tool_result_from_output(output: String) -> astra_tools::Tool
     {
         metadata.insert("agent_id".to_string(), Value::String(agent_id.to_string()));
     }
-    // Waiting/interrupted agent results take a specialized metadata path, but
+    // Blocked/interrupted agent results take a specialized metadata path, but
     // their producer-owned execution fact must still reach the canonical
     // invocation ledger. In particular, `executed=null` remains outcome
     // unknown and `executed=false` remains a pre-dispatch rejection.
@@ -394,33 +389,40 @@ mod tests {
 
     #[test]
     fn blocked_agent_result_preserves_work_observation_metadata() {
-        let result = agent_tool_result_from_output(
-            serde_json::json!({
-                "result_family": "child_result",
-                "status": "waiting",
-                "agent_id": "future-agent-1",
-                "reason": "executor_offline",
-                "work_unit_observation": {
-                    "id": "future-agent-1",
-                    "kind": "future_capability",
-                    "status": "waiting_for_input",
-                    "revision": 10,
-                    "mode": "wait",
-                    "wake_policy": "on_attention_or_terminal"
-                }
-            })
-            .to_string(),
-        );
+        for status in ["waiting", "paused"] {
+            let result = agent_tool_result_from_output(
+                serde_json::json!({
+                    "result_family": "child_result",
+                    "status": status,
+                    "agent_id": "future-agent-1",
+                    "reason": "executor_offline",
+                    "work_unit_observation": {
+                        "id": "future-agent-1",
+                        "kind": "future_capability",
+                        "status": "waiting_for_input",
+                        "revision": 10,
+                        "mode": "wait",
+                        "wake_policy": "on_attention_or_terminal"
+                    }
+                })
+                .to_string(),
+            );
 
-        assert!(result.is_error);
-        let observation = result
-            .metadata
-            .as_ref()
-            .and_then(WorkUnitObservation::from_fields)
-            .expect("specialized waiting metadata must retain the generic observation");
-        assert_eq!(observation.id, "future-agent-1");
-        assert_eq!(observation.status, WorkUnitStatus::WaitingForInput);
-        assert_eq!(observation.mode, WorkUnitObservationMode::Wait);
+            assert!(result.is_error);
+            assert_eq!(result_metadata_str(&result, "agent_status"), Some(status));
+            assert_eq!(
+                result_metadata_str(&result, "error_kind"),
+                Some("executor_offline")
+            );
+            let observation = result
+                .metadata
+                .as_ref()
+                .and_then(WorkUnitObservation::from_fields)
+                .expect("specialized waiting metadata must retain the generic observation");
+            assert_eq!(observation.id, "future-agent-1");
+            assert_eq!(observation.status, WorkUnitStatus::WaitingForInput);
+            assert_eq!(observation.mode, WorkUnitObservationMode::Wait);
+        }
     }
 
     #[test]

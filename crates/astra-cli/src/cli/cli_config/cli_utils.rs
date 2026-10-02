@@ -2242,6 +2242,8 @@ mod tests {
     #[test]
     fn git_snapshot_with_non_git_dir_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
+        // TMPDIR may be inside the checkout: stop Git's ancestor discovery.
+        std::fs::write(tmp.path().join(".git"), "gitdir: absent-repository\n").unwrap();
         let (head, branch) = git_snapshot(Some(tmp.path().to_str().unwrap()));
         assert!(
             head.is_none(),

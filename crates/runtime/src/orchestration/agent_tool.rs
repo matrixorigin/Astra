@@ -211,7 +211,7 @@ fn render_spawn_agent_output(
     ) {
         let work_status = match status.as_str() {
             "launched" => WorkUnitStatus::Running,
-            "waiting" => WorkUnitStatus::WaitingForInput,
+            "waiting" | "paused" => WorkUnitStatus::WaitingForInput,
             "completed" => WorkUnitStatus::Completed,
             "interrupted" => WorkUnitStatus::Interrupted,
             "cancelled" => WorkUnitStatus::Cancelled,
@@ -638,6 +638,7 @@ pub async fn handle_agent_list_action(args: &Value, ctx: Option<&AgentToolContex
                 AgentStatus::Running { activity } => ("running", Some(activity.as_str())),
                 AgentStatus::Idle => ("idle", None),
                 AgentStatus::Waiting { reason } => ("waiting", Some(reason.as_str())),
+                AgentStatus::Paused { reason } => ("paused", Some(reason.as_str())),
                 AgentStatus::Completed { .. } => ("completed", None),
                 AgentStatus::Interrupted { .. } => ("interrupted", None),
                 AgentStatus::Failed { .. } => ("failed", None),
@@ -4087,6 +4088,7 @@ mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4150,6 +4152,7 @@ mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4175,6 +4178,7 @@ mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "interrupted".into(),
                 finish_reason: "budget_exhausted".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4215,6 +4219,7 @@ mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "interrupted".into(),
                 finish_reason: "budget_exhausted".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4260,6 +4265,7 @@ mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "interrupted".into(),
                 finish_reason: "execution_incomplete".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4285,6 +4291,7 @@ mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "failed".into(),
                 finish_reason: "error".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4310,6 +4317,7 @@ mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "interrupted".into(),
                 finish_reason: "empty_completion".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4335,6 +4343,7 @@ mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "failed".into(),
                 finish_reason: "executor_dropped".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -4404,6 +4413,7 @@ mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: CancellationOrigin::Unverified,

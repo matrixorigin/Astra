@@ -8210,7 +8210,7 @@ mod tests {
                     assert_eq!(body["presence_penalty"], 0.1);
                 }
                 if thinking.is_enabled() && protocol == ThinkingProtocol::Unknown {
-                    assert_eq!(body["reasoning_effort"], "medium");
+                    assert_eq!(body["reasoning_effort"], "high");
                 } else if protocol == ThinkingProtocol::ReasoningEffort {
                     assert!(
                         body.get("temperature").is_none(),

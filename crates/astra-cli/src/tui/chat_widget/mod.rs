@@ -1345,7 +1345,9 @@ fn local_agent_run_status(
     match status {
         AgentStatus::Initializing => AgentRunStatus::Starting,
         AgentStatus::Running { .. } => AgentRunStatus::Running,
-        AgentStatus::Idle | AgentStatus::Waiting { .. } => AgentRunStatus::Waiting,
+        AgentStatus::Idle | AgentStatus::Waiting { .. } | AgentStatus::Paused { .. } => {
+            AgentRunStatus::Waiting
+        }
         AgentStatus::Completed { .. } => AgentRunStatus::Completed,
         AgentStatus::Interrupted { .. } => AgentRunStatus::Interrupted,
         AgentStatus::Failed { .. } => AgentRunStatus::Failed,
@@ -1627,7 +1629,7 @@ fn apply_local_agent_status(
         AgentStatus::Idle => {
             projection.set_attention_summary(Some("Waiting for input".into()));
         }
-        AgentStatus::Waiting { reason } => {
+        AgentStatus::Waiting { reason } | AgentStatus::Paused { reason } => {
             projection.set_attention_summary((!reason.trim().is_empty()).then(|| reason.clone()));
         }
         AgentStatus::Completed { result, .. } => {

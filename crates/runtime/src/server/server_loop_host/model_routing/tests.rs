@@ -68,6 +68,7 @@ async fn auto_entrypoint_reuses_builtin_judge_and_dispatches_the_selected_model(
             "router-session".into(),
         )
         .with_admitted_model_execution(Some(baseline))
+        .with_model_service(Some(catalog.clone()))
         .with_test_inference_ledger(ledger.clone())
         .with_test_judgment_clients([
             Box::new(classification_client)
@@ -660,17 +661,9 @@ async fn auto_children_inherit_the_committed_model_instead_of_cached_baseline() 
             None,
             None,
             None,
-            crate::server::run::engine::RunStartContext {
-                model_selection: Some(astra_turn_types::ModelSelection {
-                    offering_id: inherited.offering_id.clone(),
-                }),
-                resolved_model_selection: Some(astra_services::runs::ResolvedModelSelection {
-                    offering_id: inherited.offering_id.clone(),
-                    model_name: inherited.model_name.clone(),
-                    source_identity: None,
-                }),
-                ..Default::default()
-            },
+            // Let the existing child-admission owner inherit the committed
+            // parent identity; this fixture must not forge admission authority.
+            Default::default(),
         )
         .await
         .unwrap();

@@ -1323,6 +1323,14 @@ impl AgentBindingMcpRuntime {
         self.tool_names_by_public_name.contains_key(public_name)
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_workspace_effect(mut self, effect: ResolvedToolEffect) -> Self {
+        for value in Arc::make_mut(&mut self.workspace_effects_by_public_name).values_mut() {
+            *value = effect;
+        }
+        self
+    }
+
     pub(crate) fn workspace_effect_for_public_name(
         &self,
         public_name: &str,

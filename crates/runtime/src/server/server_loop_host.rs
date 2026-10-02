@@ -5987,7 +5987,7 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e-hooks"))]
     pub(crate) fn with_test_inference_ledger(
         mut self,
         persistence: crate::turn::llm::durable::TestInferenceLedgerPersistence,
@@ -46779,7 +46779,7 @@ mod tests {
             .expect("start process-local durable run");
         let invocation_ledger =
             crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
-                run_engine,
+                run_engine.clone(),
             )
             .expect("process-local invocation ledger");
 
@@ -46905,9 +46905,21 @@ mod tests {
         );
         assert!(complete_tool_pairs(&committed_messages));
 
+        // A second user turn is a new execution, not same-run custody recovery.
+        // Settle the original run and obtain the new owner through RunEngine.
+        assert!(run_engine
+            .persist_status(USER_ID, SESSION_ID, RUN_ID, "completed", None, None)
+            .await
+            .expect("settle original run"));
+        let warm_start_run_id = format!("{RUN_ID}-warm-start");
+        let warm_start_authority = run_engine
+            .start_run(&warm_start_run_id, USER_ID, SESSION_ID)
+            .await
+            .expect("start next-turn execution");
         let mut restored_state = create_durable_execution_test_state(SESSION_ID);
+        restored_state.current_run_id = Some(warm_start_run_id);
         restored_state.skills.request_constraints.allowed_tools = Some(["glob".to_string(), "tool_search".to_string()].into_iter().collect());
-        restored_state.current_run_owner_generation = Some(run_authority.owner_generation);
+        restored_state.current_run_owner_generation = Some(warm_start_authority.owner_generation);
         restored_state.messages = committed_messages;
         crate::server::run::lifecycle::restore_step_checkpoint_runtime_state(
             restored,
@@ -48133,8 +48145,11 @@ mod tests {
                 vec![validation.clone()]
             );
         }
-        let admission =
-            AgenticLoopHost::admit_tool_calls(&mut host, &[delivered.clone()], Some("tool_calls"));
+        let admission = AgenticLoopHost::admit_tool_calls(
+            &mut host,
+            std::slice::from_ref(&delivered),
+            Some("tool_calls"),
+        );
         let rejected = admission.rejected.first().expect("settlement is deferred");
         let result: Value = serde_json::from_str(&rejected.result).expect("typed rejection");
         assert_eq!(result["error_kind"], "work_validation_pending");

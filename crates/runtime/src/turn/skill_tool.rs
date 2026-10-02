@@ -2295,7 +2295,7 @@ mod tests {
         let hook = HookAction::Shell {
             command: format!("touch '{}'", marker.display()),
         };
-        run_hooks(&[hook.clone()], true);
+        run_hooks(std::slice::from_ref(&hook), true);
         assert!(!marker.exists());
         run_hooks(&[hook], false);
         assert!(marker.exists());

@@ -231,7 +231,7 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
             Some("Agent is waiting for input.".to_string()),
             None,
         ),
-        AgentStatus::Waiting { reason } => (
+        AgentStatus::Waiting { reason } | AgentStatus::Paused { reason } => (
             BackgroundTaskStatus::WaitingForInput,
             Some(format!("Agent is waiting: {reason}")),
             None,

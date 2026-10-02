@@ -1651,6 +1651,7 @@ impl CliSpawnAgentExecutor {
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
+                    committed_frontier: None,
                     status: "delegated".to_string(),
                     finish_reason: "delegated".to_string(),
                     cancellation_origin: CancellationOrigin::Unverified,
@@ -1678,6 +1679,7 @@ impl CliSpawnAgentExecutor {
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
+                    committed_frontier: None,
                     status: "failed".to_string(),
                     finish_reason: "terminal_control_rejected".to_string(),
                     cancellation_origin: CancellationOrigin::Unverified,
@@ -1737,6 +1739,7 @@ impl CliSpawnAgentExecutor {
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
+                    committed_frontier: None,
                     status: spawn_completion_status_from_finish_reason(
                         finish_reason_from_state.as_deref(),
                     )
@@ -1781,6 +1784,7 @@ impl CliSpawnAgentExecutor {
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
+                    committed_frontier: None,
                     status: projection.status.to_string(),
                     finish_reason: finish_reason_from_state
                         .unwrap_or_else(|| projection.finish_reason.to_string()),
@@ -1813,6 +1817,7 @@ impl CliSpawnAgentExecutor {
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
+                    committed_frontier: None,
                     status: "failed".to_string(),
                     finish_reason: finish_reason_from_state.unwrap_or_else(|| "failed".to_string()),
                     cancellation_origin: CancellationOrigin::Unverified,
@@ -1846,6 +1851,7 @@ impl CliSpawnAgentExecutor {
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
+                    committed_frontier: None,
                     status: projection.status.to_string(),
                     finish_reason: finish_reason_from_state
                         .unwrap_or_else(|| projection.finish_reason.to_string()),
@@ -1877,6 +1883,7 @@ impl CliSpawnAgentExecutor {
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
+                    committed_frontier: None,
                     status: projection.status.to_string(),
                     finish_reason: finish_reason_from_state
                         .unwrap_or_else(|| projection.finish_reason.to_string()),

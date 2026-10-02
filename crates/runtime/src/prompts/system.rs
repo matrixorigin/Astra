@@ -658,7 +658,7 @@ fn planning_section() -> &'static str {
      8. **Converge on evidence**: once targeted reads establish the affected set, and the task requires and authorizes a change, make the smallest safe mutation; for read-only work, summarize or change approach when reads add no new evidence.\n\
      9. **Acceptance**: preserve quantifiers/positions; don't infer order; test named items independently; no partial claims; derive checks from each requirement and its negation; assert required effects and forbidden effects across relevant boundary partitions, plus one proportionate adversarial probe. Existence, compilation, or import is structural evidence only; exercise every explicitly required component. A smoke test proves only its exact assertions; contradictory output is a failure.\n\
      10. **Reproducible external facts**: exact results derived from versioned datasets require an identified revision and toolchain. Honor lockfiles; never silently treat a floating latest dependency as reproducible. Record the effective versions/revisions or state the missing boundary.\n\
-     11. **Executable acceptance**: reproduce that contract end-to-end for the user-named workflow; Acceptance matrix: run the complete unmodified harness from a fresh process after the final mutation (the authorized post-mutation acceptance run). Do not substitute a different interface or assume component smoke checks prove the composed workflow. A nonzero acceptance run, failed assertion, or error remains unresolved unless exempted or a before-change baseline proves it outside the affected acceptance scope; otherwise fix and rerun or report the outcome as incomplete, never relabel it pre-existing or unrelated without that evidence. A baseline that cannot execute the same acceptance surface is not proof. Cover queued/cancelled/error paths; apply the official measurement to the exact projection of an artifact and check its derivation. For cancellation, exercise applicable user-named lifecycle states; assert bounded completion of the process, task, or request as applicable, no post-interrupt work where a queue contract exists, and owned cleanup. For reviews, inspect retained boundary evidence and state unverified scope. A self-authored check is provisional; keep the task open while any predicate disagrees.\n\
+     11. **Executable acceptance**: run the complete unmodified harness for the user-named workflow from a fresh process after the final mutation. Smoke checks do not prove the composed workflow. Fix and rerun failures or report incomplete; claim pre-existing/unrelated only with an equivalent before-change baseline or explicit exemption. Cover queued/cancelled/error paths; check artifact derivation and the official measurement. Cancellation must finish within a bound, stop later queued work, and clean up owned resources. Reviews retain boundary evidence and disclose unverified scope. Self-authored checks are provisional; keep the task open until every acceptance predicate agrees.\n\
      12. **Performance outcomes**: correctness is necessary but not sufficient for optimization. Benchmark materially different correct candidates when practical and retain the best verified one. Being faster than the starting point is not evidence that the requested optimization is complete.\n"
 }
 
@@ -754,7 +754,7 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
     );
     if tool_visible(tool_names, "tool_search") {
         body.push_str(
-            "         - For a deferred tool, select its contract with `tool_search(query=\"select:NAME\")`, then use `invoke_tool`. Reuse selected contracts across turns; the runtime revalidates access. Fields absent from a resident tool's current schema also require selection and `invoke_tool`. Selection never adds schemas to `tools[]`.\n",
+            "         - Select deferred tools or absent resident fields with `tool_search(query=\"select:NAME\")`, then `invoke_tool`. Reuse contracts across turns; runtime revalidates access. Selection never adds schemas to `tools[]`.\n",
         );
     } else {
         body.push_str(
@@ -786,10 +786,10 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
     }
     if agent_visible {
         body.push_str(
-"         - Delegation fast path: when `agent` is visible and the user asks for a child, the first native call is `agent(action=\"spawn\", ...)`. Do not call `tool_search`, `invoke_tool`, `model_catalog`, `agent_fanout`, or `get_agent_info` first just to discover this path. An omitted `agent_type` uses the bounded read-only `explore` persona; choose `code-review` for review, and choose `task` or `general-purpose` only when the child must mutate or use the full capability surface. For any model name originating in the user's request—including natural-language variations in spelling, spacing, or component order—omit `requested_model_policy`; the runtime's one candidate-aware admission resolves it against the authorized catalog. Use `requested_model_policy` only for an explicit programmatic fixed selector such as an Offering ID, never to normalize a user name. `model_catalog` is for availability/comparison when the user asks, not a spawn prerequisite. Never use workspace configuration or credentials for delegated model selection, or silently substitute unavailable/prohibited models.\n",
+"         - Delegation fast path: when the user asks for a child, the first native call is `agent(action=\"spawn\", ...)`. Do not call `tool_search`, `invoke_tool`, `model_catalog` or other discovery tools first. Default `agent_type` is bounded read-only `explore`; use `code-review` for review, `task`/`general-purpose` for mutation/full capabilities. For all user-originated model names, omit `requested_model_policy`: runtime admission resolves the authorized catalog. That field is only for programmatic fixed selectors, never user-name normalization. `model_catalog` serves requested availability/comparison, not a spawn prerequisite. Never select from workspace configuration/credentials or silently substitute unavailable/prohibited models.\n",
         );
         body.push_str(
-            "         - Launch the child before tools for its assigned objective: resource checks and evidence gathering belong to the child; do not pre-run or duplicate its work. One objective normally needs one child; use fanout for group control, not speculative duplication.\n",
+            "         - Launch before tools for the assigned objective: resource/evidence checks belong to the child, not parent preflight. One objective normally needs one child; use fanout for group control, not speculative duplication.\n",
         );
         body.push_str(
             "         - After spawn, continue only independent parent work needed for the user's request. Otherwise propose final without polling or shell sleep: the runtime waits for terminal results; synthesize when continuation is available. A get_result still-running snapshot is not failure.\n",
@@ -911,11 +911,9 @@ fn search_strategy_section(tool_names: &[&str]) -> String {
     // the authority; this invariant procedure survives an edge/server merge
     // without changing the cacheable guidance bytes.
     "\n## Search Strategy\n\
-     - Start with visible layout/discovery tools, narrow the path and term, then use targeted outline/range reads.\n\
-     - Rank by signal density: API entry points → core logic → types; inspect changed/adjacent code first.\n\
-     - Skip generated, vendor, build, coverage, fixtures, *.example.*, and bulky files unless targeted.\n\
-     - Discovery identifies candidates, not behavior: read relevant definitions/callers and complete that evidence chain instead of stopping at candidates.\n\
-     - If results are noisy, tighten scope or the literal term; do not repeat an unchanged search.\n"
+     - Narrow paths/terms, then read relevant definitions/callers with outline/range reads; discovery alone is not behavior evidence.\n\
+     - Prioritize changed/adjacent code: API entry points → core logic → types. Skip generated/vendor/build/fixtures and bulky files unless targeted.\n\
+     - Tighten noisy searches; do not repeat them unchanged.\n"
     .to_string()
 }
 
@@ -932,12 +930,12 @@ fn self_diagnosis_section(tool_names: &[&str]) -> String {
         s.push_str("- Use ordinary `introspect` for current runtime state, and use its explicit Server Explain selector (`explain={target:run,run_id}` or `target=previous`) for identified historical execution evidence. Do not treat an ordinary live snapshot as history. For current-state claims, facet=overview (summary/current_turn defaults); snapshot totals exclude later calls. Select absent fields before use; depth=hint for quick checks, diagnostic depth only for a concrete gap or requested audit.\n");
         s.push_str("- Conversation history is not runtime telemetry. Current live-state claims without Introspect are conversation-only.\n");
     } else if can_activate {
-        s.push_str("- Current state: select `introspect` with `tool_search(query=\"select:introspect\")` only when listed in `<deferred-tools>`; else claims are conversation-only.\n");
+        s.push_str("- Current state: select `introspect` with `tool_search(query=\"select:introspect\")` only if listed; otherwise claims are conversation-only.\n");
     }
     if has_reflect {
         s.push_str("- For session-level prior execution, use resident `reflect` directly with one concrete question (overview/summary/session); it is session-scoped, has no exact run/turn selector, and does not require live `introspect`. For one exact historical run, use Server Explain with its explicit run selector instead. Do not present session aggregates as facts about one run. Select advanced fields (depth=diagnostic|forensic) only for a gap or requested audit. Wait duration is not child runtime.\n");
     } else if can_activate {
-        s.push_str("- Prior session execution: select `reflect` with `tool_search(query=\"select:reflect\")` only when listed in `<deferred-tools>`; it is session-scoped and has no live prerequisite. Use Server Explain for an exact run when available. Do not label reflect aggregates as one exact run; if unavailable, say so.\n");
+        s.push_str("- Prior execution: select `reflect` with `tool_search(query=\"select:reflect\")` only if listed; it is session-scoped and has no live prerequisite. For an exact run, use Server Explain, never session aggregates; if unavailable, say so.\n");
     }
     s.push_str(
         "Reuse evidence; verify acceptance gaps or counter-evidence, not merely because work was delegated.\n",
@@ -1828,39 +1826,16 @@ mod tests {
         assert!(prompt.contains("exact results derived from versioned datasets"));
         assert!(prompt.contains("never silently treat a floating latest dependency"));
         assert!(prompt.contains("Record the effective versions/revisions"));
-        assert!(prompt.contains("reproduce that contract end-to-end"));
-        assert!(prompt.contains("Do not substitute a different interface"));
-        assert!(prompt.contains("component smoke checks prove the composed workflow"));
-        assert!(
-            prompt.contains(
-                "A nonzero acceptance run, failed assertion, or error remains unresolved"
-            )
-        );
-        assert!(
-            prompt.contains(
-                "a before-change baseline proves it outside the affected acceptance scope"
-            )
-        );
-        assert!(
-            prompt.contains("never relabel it pre-existing or unrelated without that evidence")
-        );
-        assert!(prompt.contains("A baseline that cannot execute the same acceptance surface"));
-        assert!(prompt.contains("report the outcome as incomplete"));
+        assert!(prompt.contains("Smoke checks do not prove the composed workflow"));
+        assert!(prompt.contains("equivalent before-change baseline or explicit exemption"));
+        assert!(prompt.contains("Fix and rerun failures or report incomplete"));
         assert!(prompt.contains("contradictory output is a failure"));
-        assert!(prompt.contains("Acceptance matrix"));
         assert!(prompt.contains("complete unmodified harness"));
         assert!(prompt.contains("fresh process after the final mutation"));
         assert!(prompt.contains("queued/cancelled/error paths"));
-        assert!(prompt.contains("retained boundary evidence"));
-        assert!(prompt.contains("authorized post-mutation acceptance run"));
-        assert!(prompt.contains("A self-authored check is provisional"));
-        assert!(prompt.contains("projection of an artifact"));
-        assert!(prompt.contains("exact projection"));
-        assert!(prompt.contains("bounded completion of the process"));
-        assert!(prompt.contains("applicable user-named lifecycle states"));
-        assert!(prompt.contains("process, task, or request as applicable"));
-        assert!(prompt.contains("queue contract exists"));
-        assert!(prompt.contains("keep the task open while any predicate disagrees"));
+        assert!(prompt.contains("Reviews retain boundary evidence and disclose unverified scope"));
+        assert!(prompt.contains("Cancellation must finish within a bound, stop later queued work"));
+        assert!(prompt.contains("keep the task open until every acceptance predicate agrees"));
         assert!(prompt.contains("Performance outcomes"));
         assert!(prompt.contains("correctness is necessary but not sufficient"));
         assert!(prompt.contains("materially different correct candidates"));
@@ -1879,14 +1854,13 @@ mod tests {
     fn named_child_model_does_not_require_parent_preflight() {
         let prompt =
             build_main_system_prompt(&["agent", "tool_search", "model_catalog", "bash"], "");
-        assert!(
-            prompt.contains(
-                "one candidate-aware admission resolves it against the authorized catalog"
-            )
-        );
+        assert!(prompt.contains("runtime admission resolves the authorized catalog"));
         assert!(prompt.contains("the first native call is `agent(action=\"spawn\", ...)`"));
-        assert!(prompt.contains("Launch the child before tools for its assigned objective"));
-        assert!(prompt.contains("resource checks and evidence gathering belong to the child"));
+        assert!(prompt.contains("when the user asks for a child"));
+        assert!(prompt.contains("Launch before tools for the assigned objective"));
+        assert!(
+            prompt.contains("resource/evidence checks belong to the child, not parent preflight")
+        );
     }
 
     #[test]
@@ -1973,15 +1947,11 @@ mod tests {
         // Search strategy → present with search tools
         let p_search = build_main_system_prompt(&["glob", "grep", "read_file"], "");
         assert!(p_search.contains("Search Strategy"));
-        assert!(p_search.contains("Start with visible layout/discovery tools"));
-        assert!(p_search.contains("Rank by signal density"));
+        assert!(p_search.contains("Narrow paths/terms"));
         assert!(p_search.contains("API entry points"));
-        assert!(p_search.contains("*.example.*"));
         assert!(p_search.contains("outline/range reads"));
-        assert!(p_search.contains("identifies candidates, not behavior"));
         assert!(p_search.contains("read relevant definitions/callers"));
-        assert!(p_search.contains("complete that evidence chain"));
-        assert!(p_search.contains("instead of stopping at candidates"));
+        assert!(p_search.contains("discovery alone is not behavior evidence"));
 
         // Search strategy → absent without search tools
         let p_no_search = build_main_system_prompt(&["bash"], "");
@@ -1993,8 +1963,8 @@ mod tests {
             p_read.contains("Search Strategy"),
             "read_file alone should trigger search strategy"
         );
-        assert!(p_read.contains("identifies candidates, not behavior"));
-        assert!(p_read.contains("complete that evidence chain"));
+        assert!(p_read.contains("discovery alone is not behavior evidence"));
+        assert!(p_read.contains("read relevant definitions/callers"));
 
         // Legacy code-nav tools with no schema must not leak into the prompt.
         let p_nav = build_main_system_prompt(&["glob", "grep", "read_file"], "");
@@ -2351,12 +2321,8 @@ mod tests {
         let discoverable = tool_conditional_section(&["agent", "tool_search"]);
         assert!(discoverable.contains("ordinary spawn, status, child messages, and results"));
         assert!(discoverable.contains("the first native call is `agent(action=\"spawn\", ...)`"));
-        assert!(
-            discoverable.contains(
-                "one candidate-aware admission resolves it against the authorized catalog"
-            )
-        );
-        assert!(discoverable.contains("model_catalog` is for availability/comparison"));
+        assert!(discoverable.contains("runtime admission resolves the authorized catalog"));
+        assert!(discoverable.contains("model_catalog` serves requested availability/comparison"));
     }
 
     #[test]

@@ -729,10 +729,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            evidence["summary"]["candidate_snapshot_digest"].is_string(),
-            true
-        );
+        assert!(evidence["summary"]["candidate_snapshot_digest"].is_string());
         assert_eq!(
             evidence["summary"]["selections"][0]["candidate_id"],
             "offering-flash"

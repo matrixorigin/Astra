@@ -50,6 +50,81 @@ pub const SPAWN_STATUS_INTERRUPTED: &str = "interrupted";
 pub const SPAWN_STATUS_CANCELLED: &str = "cancelled";
 pub const SPAWN_STATUS_FAILED: &str = "failed";
 pub const SPAWN_STATUS_WAITING: &str = "waiting";
+pub const SPAWN_STATUS_PAUSED: &str = "paused";
+
+/// Exact durable provenance of a producer-owned lifecycle observation.
+/// An acknowledged generation without an event frontier cannot prove a
+/// same-generation resume; it remains a conservative pause fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnRunFrontier {
+    pub run_id: String,
+    pub run_generation: u64,
+    pub last_event_idx: Option<i64>,
+}
+
+impl SpawnRunFrontier {
+    pub(crate) fn from_durable(run: &astra_services::runs::DurableRunRecord) -> Self {
+        Self {
+            run_id: run.run_id.clone(),
+            run_generation: run.run_generation,
+            last_event_idx: Some(run.last_event_idx),
+        }
+    }
+
+    fn strictly_after(&self, previous: &Self) -> bool {
+        self.run_id == previous.run_id
+            && (self.run_generation > previous.run_generation
+                || (self.run_generation == previous.run_generation
+                    && self
+                        .last_event_idx
+                        .zip(previous.last_event_idx)
+                        .is_some_and(|(next, prior)| next > prior)))
+    }
+}
+
+fn child_observation_can_replace(
+    current: &AgentStatus,
+    current_frontier: Option<&SpawnRunFrontier>,
+    incoming: &AgentStatus,
+    incoming_frontier: Option<&SpawnRunFrontier>,
+) -> bool {
+    if let (Some(prior), Some(next)) = (current_frontier, incoming_frontier)
+        && (prior.run_id != next.run_id
+            || next.run_generation < prior.run_generation
+            || (next.run_generation == prior.run_generation
+                && prior.last_event_idx.is_some()
+                && next.last_event_idx.is_none())
+            || (next.run_generation == prior.run_generation
+                && next
+                    .last_event_idx
+                    .zip(prior.last_event_idx)
+                    .is_some_and(|(next, prior)| next < prior)))
+    {
+        return false;
+    }
+    if matches!(current, AgentStatus::Paused { .. }) {
+        if incoming.is_terminal() {
+            return true;
+        }
+        if matches!(incoming, AgentStatus::Paused { .. }) {
+            // A same-generation cached pause can precede this acknowledged
+            // local pause too. Its index must not turn an unknown watermark
+            // into false proof that a later cached active row is a resume.
+            if let (Some(prior), Some(next)) = (current_frontier, incoming_frontier)
+                && prior.run_generation == next.run_generation
+                && prior.last_event_idx.is_none()
+                && next.last_event_idx.is_some()
+            {
+                return false;
+            }
+            return current_frontier.is_none() || incoming_frontier.is_some();
+        }
+        return incoming_frontier
+            .zip(current_frontier)
+            .is_some_and(|(next, prior)| next.strictly_after(prior));
+    }
+    true
+}
 const AGENT_FINISH_REASON_DURABLE_RESULT_UNAVAILABLE: &str = "durable_result_unavailable";
 pub const CANCELLATION_ORIGIN_UNVERIFIED: &str = "cancellation_origin_unverified";
 /// Durable cancellation is best-effort control-plane reconciliation. It must
@@ -260,6 +335,7 @@ pub enum SpawnRunStatusKind {
     Cancelled,
     Failed,
     Waiting,
+    Paused,
     Other,
 }
 
@@ -270,6 +346,7 @@ pub fn spawn_run_status_kind(status: &str) -> SpawnRunStatusKind {
         SPAWN_STATUS_CANCELLED => SpawnRunStatusKind::Cancelled,
         SPAWN_STATUS_FAILED => SpawnRunStatusKind::Failed,
         SPAWN_STATUS_WAITING => SpawnRunStatusKind::Waiting,
+        SPAWN_STATUS_PAUSED => SpawnRunStatusKind::Paused,
         _ => SpawnRunStatusKind::Other,
     }
 }
@@ -298,7 +375,7 @@ pub fn project_subrun_status_to_spawn(
         astra_core::STATUS_WAITING => (SPAWN_STATUS_WAITING, "waiting", false),
         astra_core::STATUS_CANCELLED => (SPAWN_STATUS_CANCELLED, "cancelled", false),
         astra_core::STATUS_FAILED => (SPAWN_STATUS_FAILED, "failed", false),
-        astra_core::STATUS_PAUSED => (SPAWN_STATUS_INTERRUPTED, "paused", true),
+        astra_core::STATUS_PAUSED => (SPAWN_STATUS_PAUSED, "paused", true),
         astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL => {
             (SPAWN_STATUS_INTERRUPTED, "partial", true)
         }
@@ -371,6 +448,13 @@ fn spawn_run_result_to_agent_status(run_result: &SpawnRunResult) -> AgentStatus 
         },
         SpawnRunStatusKind::Waiting => AgentStatus::Waiting {
             reason: run_result.output.clone().unwrap_or_default(),
+        },
+        SpawnRunStatusKind::Paused => AgentStatus::Paused {
+            reason: run_result
+                .output
+                .clone()
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or_else(|| run_result.finish_reason.clone()),
         },
         SpawnRunStatusKind::Completed => {
             let result = run_result.output.clone().unwrap_or_default();
@@ -461,6 +545,16 @@ fn spawn_run_result_to_sync_output(
             agent_id,
             run_id,
             reason: run_result.output.unwrap_or_default(),
+            tool_calls: run_result.tool_calls,
+            duration_ms,
+        },
+        SpawnRunStatusKind::Paused => SpawnAgentOutput::Paused {
+            agent_id,
+            run_id,
+            reason: run_result
+                .output
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or(run_result.finish_reason),
             tool_calls: run_result.tool_calls,
             duration_ms,
         },
@@ -802,6 +896,29 @@ struct FanoutDurableOwner {
     session_id: String,
 }
 
+#[derive(Clone, Copy)]
+enum DirectChildWait {
+    AllSettled,
+    AnyUpdate,
+    Paused,
+}
+
+impl DirectChildWait {
+    fn ready<'a>(self, statuses: impl Iterator<Item = &'a AgentStatus>) -> bool {
+        let mut statuses = statuses.peekable();
+        match self {
+            Self::AllSettled => statuses.all(AgentStatus::is_terminal),
+            Self::AnyUpdate => {
+                statuses.peek().is_none()
+                    || statuses.any(|status| {
+                        status.is_terminal() || matches!(status, AgentStatus::Paused { .. })
+                    })
+            }
+            Self::Paused => statuses.any(|status| matches!(status, AgentStatus::Paused { .. })),
+        }
+    }
+}
+
 /// Execution-owned admission history. The session index is weak; a live
 /// parent and its outstanding tool calls retain the fence after eviction.
 #[derive(Debug)]
@@ -833,6 +950,7 @@ enum DirectChildSlot {
     Pending {
         child: DirectChildCompletion,
         authoritative: bool,
+        committed_frontier: Option<SpawnRunFrontier>,
     },
     Consumed {
         run_id: String,
@@ -859,6 +977,7 @@ fn direct_child_status_fingerprint(status: &AgentStatus) -> String {
             finish_reason,
         } => serde_json::json!(["failed", error, finish_reason]),
         AgentStatus::Waiting { reason } => serde_json::json!(["waiting", reason]),
+        AgentStatus::Paused { reason } => serde_json::json!(["paused", reason]),
         AgentStatus::Cancelled { by_user, reason } => {
             serde_json::json!(["cancelled", by_user, reason])
         }
@@ -873,9 +992,9 @@ impl serde::Serialize for DirectChildCompletion {
             AgentStatus::Completed { result, .. } => result.as_str(),
             AgentStatus::Interrupted { partial_result, .. } => partial_result.as_str(),
             AgentStatus::Failed { error, .. } => error.as_str(),
-            AgentStatus::Cancelled { reason, .. } | AgentStatus::Waiting { reason } => {
-                reason.as_str()
-            }
+            AgentStatus::Cancelled { reason, .. }
+            | AgentStatus::Waiting { reason }
+            | AgentStatus::Paused { reason } => reason.as_str(),
             _ => "",
         };
         let end = result
@@ -1045,6 +1164,7 @@ impl FanoutParentAdmission {
             DirectChildSlot::Pending {
                 child,
                 authoritative: false,
+                committed_frontier: None,
             },
         );
         self.direct_child_changed.notify_waiters();
@@ -1103,6 +1223,23 @@ impl FanoutParentAdmission {
             .any(|slot| matches!(slot, DirectChildSlot::Pending { .. }))
     }
 
+    /// Borrow the owner-held pause without cloning pending child outputs.
+    pub fn paused_direct_child_reason(&self) -> Option<String> {
+        astra_core::sync_poison::recover_mutex_lock(&self.direct_children)
+            .values()
+            .find_map(|slot| match slot {
+                DirectChildSlot::Pending {
+                    child:
+                        DirectChildCompletion {
+                            status: AgentStatus::Paused { reason },
+                            ..
+                        },
+                    ..
+                } => Some(reason.clone()),
+                _ => None,
+            })
+    }
+
     pub fn retained_direct_child_result(&self, agent_id: &str) -> Option<DirectChildCompletion> {
         let children = astra_core::sync_poison::recover_mutex_lock(&self.direct_children);
         match children.get(agent_id)? {
@@ -1140,32 +1277,35 @@ impl FanoutParentAdmission {
     }
 
     pub async fn wait_for_direct_children(&self) {
-        loop {
-            let notified = self.direct_child_changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if astra_core::sync_poison::recover_mutex_lock(&self.direct_children)
-                .values()
-                .all(|slot| match slot {
-                    DirectChildSlot::Pending { child, .. } => child.status.is_terminal(),
-                    DirectChildSlot::Consumed { .. } => true,
-                })
-            {
-                return;
-            }
-            notified.await;
-        }
+        self.wait_for_direct_child_condition(DirectChildWait::AllSettled)
+            .await;
     }
 
-    /// Wake a waiting execution when any child has a terminal fact to consume;
+    /// Wake when a child has a terminal fact or an authoritative pause;
     /// final settlement still requires every child obligation to be resolved.
     pub async fn wait_for_direct_child_update(&self) {
+        self.wait_for_direct_child_condition(DirectChildWait::AnyUpdate)
+            .await;
+    }
+
+    pub async fn wait_for_direct_child_pause(&self) {
+        self.wait_for_direct_child_condition(DirectChildWait::Paused)
+            .await;
+    }
+
+    async fn wait_for_direct_child_condition(&self, condition: DirectChildWait) {
         loop {
             let notified = self.direct_child_changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let children = self.pending_direct_children();
-            if children.is_empty() || children.iter().any(|child| child.status.is_terminal()) {
+            let ready = {
+                let children = astra_core::sync_poison::recover_mutex_lock(&self.direct_children);
+                condition.ready(children.values().filter_map(|slot| match slot {
+                    DirectChildSlot::Pending { child, .. } => Some(&child.status),
+                    DirectChildSlot::Consumed { .. } => None,
+                }))
+            };
+            if ready {
                 return;
             }
             notified.await;
@@ -1176,15 +1316,22 @@ impl FanoutParentAdmission {
         if !state.run_in_background || state.parent_run_id != self.parent_run_id {
             return;
         }
-        self.register_direct_child_completion(DirectChildCompletion {
-            agent_id: state.agent_id.clone(),
-            run_id: state.run_id.clone(),
-            parent_agent_id: state.parent_agent_id.clone(),
-            status: state.status.clone(),
-        });
+        self.register_direct_child_completion(
+            DirectChildCompletion {
+                agent_id: state.agent_id.clone(),
+                run_id: state.run_id.clone(),
+                parent_agent_id: state.parent_agent_id.clone(),
+                status: state.status.clone(),
+            },
+            state.committed_frontier.clone(),
+        );
     }
 
-    fn register_direct_child_completion(&self, child: DirectChildCompletion) {
+    fn register_direct_child_completion(
+        &self,
+        child: DirectChildCompletion,
+        committed_frontier: Option<SpawnRunFrontier>,
+    ) {
         // Recovery can replay a page after publication or consumption. Retain
         // both newer live state and consumed tombstones until this owner ends.
         let mut children = astra_core::sync_poison::recover_mutex_lock(&self.direct_children);
@@ -1200,14 +1347,28 @@ impl FanoutParentAdmission {
             entry.insert(DirectChildSlot::Pending {
                 child,
                 authoritative: false,
+                committed_frontier,
             });
             self.direct_child_changed.notify_waiters();
         }
     }
 
     fn publish_direct_child(&self, state: &SpawnedAgentState, authoritative_correction: bool) {
-        let authoritative_correction =
-            authoritative_correction && durable_child_terminal_is_authoritative(&state.status);
+        if state
+            .committed_frontier
+            .as_ref()
+            .is_some_and(|frontier| frontier.run_id != state.run_id)
+        {
+            return;
+        }
+        // A presentation callback or live waiting signal cannot manufacture
+        // a dependency pause. Only the fenced producer or durable row may.
+        if matches!(state.status, AgentStatus::Paused { .. }) && !authoritative_correction {
+            return;
+        }
+        let authoritative_correction = authoritative_correction
+            && (!state.status.is_terminal()
+                || durable_child_terminal_is_authoritative(&state.status));
         let mut children = astra_core::sync_poison::recover_mutex_lock(&self.direct_children);
         if self
             .direct_child_finalized
@@ -1220,20 +1381,41 @@ impl FanoutParentAdmission {
                 DirectChildSlot::Pending {
                     child,
                     authoritative,
+                    committed_frontier,
                 } if child.run_id == state.run_id
+                    && (!child.status.is_terminal() || state.status.is_terminal())
                     && (!*authoritative || authoritative_correction) =>
                 {
+                    if !child_observation_can_replace(
+                        &child.status,
+                        committed_frontier.as_ref(),
+                        &state.status,
+                        state.committed_frontier.as_ref(),
+                    ) {
+                        return;
+                    }
                     if child.status != state.status {
                         child.status = state.status.clone();
                         self.direct_child_changed.notify_waiters();
                     }
-                    *authoritative |= authoritative_correction;
+                    if authoritative_correction {
+                        if state.committed_frontier.is_some() {
+                            *committed_frontier = state.committed_frontier.clone();
+                        }
+                        // A durable resume releases pause protection. The
+                        // newly active producer can then publish ordinary
+                        // progress/completion; a presentation-only update
+                        // cannot release a committed pause by itself.
+                        *authoritative = state.status.is_terminal()
+                            || matches!(state.status, AgentStatus::Paused { .. });
+                    }
                 }
                 DirectChildSlot::Consumed {
                     run_id,
                     status_fingerprint,
                     ..
                 } if authoritative_correction
+                    && state.status.is_terminal()
                     && *run_id == state.run_id
                     && *status_fingerprint != direct_child_status_fingerprint(&state.status) =>
                 {
@@ -1245,6 +1427,7 @@ impl FanoutParentAdmission {
                             status: state.status.clone(),
                         },
                         authoritative: true,
+                        committed_frontier: state.committed_frontier.clone(),
                     };
                     self.direct_child_changed.notify_waiters();
                 }
@@ -1453,6 +1636,7 @@ fn durable_pre_durable_child_terminals(
                     agent_id: agent_id.to_string(),
                     run_id: child_run_id.to_string(),
                     cancellation_binding_id: Some(binding_id.to_string()),
+                    committed_frontier: None,
                     parent_run_id: parent.run_id.clone(),
                     agent_type: event
                         .pointer("/data/agent_type")
@@ -1594,7 +1778,7 @@ pub(crate) fn durable_agent_status(run: &astra_services::runs::DurableRunRecord)
             partial_result: output,
             finish_reason: astra_core::STATUS_DELEGATED.into(),
         },
-        astra_core::STATUS_PAUSED => AgentStatus::Waiting {
+        astra_core::STATUS_PAUSED => AgentStatus::Paused {
             reason: run
                 .waiting_for
                 .clone()
@@ -1722,9 +1906,11 @@ pub(crate) fn agent_status_to_progress_event(
         AgentStatus::Failed { error, .. } => Some(ProgressEventType::Failed {
             error: error.clone(),
         }),
-        AgentStatus::Waiting { reason } => Some(ProgressEventType::Waiting {
-            reason: reason.clone(),
-        }),
+        AgentStatus::Waiting { reason } | AgentStatus::Paused { reason } => {
+            Some(ProgressEventType::Waiting {
+                reason: reason.clone(),
+            })
+        }
         AgentStatus::Cancelled { by_user, reason } => Some(ProgressEventType::Cancelled {
             reason: if reason.is_empty() {
                 if *by_user {
@@ -2009,6 +2195,7 @@ pub struct SpawnedAgentState {
     pub agent_type: String,
     pub description: String,
     pub status: AgentStatus,
+    pub committed_frontier: Option<SpawnRunFrontier>,
     /// Producer-owned monotonic lifecycle revision for this agent work unit.
     pub work_revision: u64,
     /// Stable mailbox lifetime and this execution's exact attachment token.
@@ -2307,6 +2494,7 @@ pub struct SpawnRunResult {
     pub agent_id: String,
     /// Run ID.
     pub run_id: String,
+    pub committed_frontier: Option<SpawnRunFrontier>,
     /// Final status (`"completed"` / `"interrupted"` / `"cancelled"` /
     /// `"failed"` / `"waiting"`).
     pub status: String,
@@ -3277,9 +3465,9 @@ impl DynamicAgentSpawner {
         }
         let restored = self.restore_durable_agent_runs(&runs).await;
         let spawned = durable_agent_spawn_metadata(&runs);
-        let observed = self.durable_observed_agent_ids.read().await.clone();
         let mut changed = Vec::new();
         {
+            let active = self.active_agents.read().await;
             let mut completed = self.completed_agents.write().await;
             for run in runs.iter().filter(|run| run.depth > 0) {
                 let Some(agent_id) = run.agent_id.as_deref().or_else(|| {
@@ -3291,12 +3479,10 @@ impl DynamicAgentSpawner {
                 };
                 // Locally executing children remain owned by their executor
                 // and are intentionally absent from this archived collection.
-                // Once a local child has yielded a non-terminal archived
-                // projection, however, an ancestor or another pod can move
-                // its durable run to a terminal state. Terminal durable truth
-                // is monotonic and must settle that stale local observation
-                // even when the child was not originally restored as remote.
-                if !observed.contains(agent_id) && !durable_run_is_terminal(&run.status) {
+                // An archived local pause may resume on another executor.
+                // Observe that authoritative active state too, but never
+                // overwrite this process's still-live execution ownership.
+                if active.contains_key(agent_id) && !durable_run_is_terminal(&run.status) {
                     continue;
                 }
                 let Some(state) = completed
@@ -3305,11 +3491,26 @@ impl DynamicAgentSpawner {
                 else {
                     continue;
                 };
+                if state.run_id != run.run_id
+                    || (state.status.is_terminal() && !durable_run_is_terminal(&run.status))
+                {
+                    continue;
+                }
                 let status = reconciled_durable_agent_status(&state.status, run);
-                if state.status == status {
+                let frontier = SpawnRunFrontier::from_durable(run);
+                if !child_observation_can_replace(
+                    &state.status,
+                    state.committed_frontier.as_ref(),
+                    &status,
+                    Some(&frontier),
+                ) {
+                    continue;
+                }
+                if state.status == status && state.committed_frontier.as_ref() == Some(&frontier) {
                     continue;
                 }
                 state.status = status;
+                state.committed_frontier = Some(frontier);
                 state.work_revision = state.work_revision.saturating_add(1);
                 state.ended_at = durable_run_is_terminal(&run.status).then(SystemTime::now);
                 state.metrics.tool_calls = run.total_tool_calls;
@@ -3319,10 +3520,10 @@ impl DynamicAgentSpawner {
             }
         }
         for state in &changed {
-            self.publish_background_agent_with_authority(state, state.status.is_terminal());
+            self.publish_background_agent_with_authority(state, true);
+            self.record_fanout_terminal_state_with_authority(state, true)
+                .await;
             if agent_status_is_terminal(&state.status) {
-                self.record_fanout_terminal_state_with_authority(state, true)
-                    .await;
                 self.notify_completion(&state.agent_id).await;
             }
         }
@@ -3332,17 +3533,24 @@ impl DynamicAgentSpawner {
     /// Local children notify in memory; remote children use one process-wide
     /// batched observer. A hint only triggers exact durable reconciliation.
     pub async fn wait_for_direct_children(&self, parent: &FanoutParentAdmission) {
-        self.wait_for_direct_children_inner(parent, false).await;
+        self.wait_for_direct_children_inner(parent, DirectChildWait::AllSettled)
+            .await;
     }
 
     pub async fn wait_for_direct_child_update(&self, parent: &FanoutParentAdmission) {
-        self.wait_for_direct_children_inner(parent, true).await;
+        self.wait_for_direct_children_inner(parent, DirectChildWait::AnyUpdate)
+            .await;
+    }
+
+    pub async fn wait_for_direct_child_pause(&self, parent: &FanoutParentAdmission) {
+        self.wait_for_direct_children_inner(parent, DirectChildWait::Paused)
+            .await;
     }
 
     async fn wait_for_direct_children_inner(
         &self,
         parent: &FanoutParentAdmission,
-        on_update: bool,
+        condition: DirectChildWait,
     ) {
         let mut failures = 0u32;
         loop {
@@ -3350,9 +3558,7 @@ impl DynamicAgentSpawner {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let pending = parent.pending_direct_children();
-            if pending.iter().all(|child| child.status.is_terminal())
-                || (on_update && pending.iter().any(|child| child.status.is_terminal()))
-            {
+            if condition.ready(pending.iter().map(|child| &child.status)) {
                 return;
             }
             let active = self.active_agents.read().await;
@@ -4231,6 +4437,7 @@ impl DynamicAgentSpawner {
             let state = SpawnedAgentState {
                 agent_id: projection.id.clone(),
                 run_id: projection.run_id.clone(),
+                committed_frontier: None,
                 cancellation_binding_id: None,
                 parent_run_id: projection.parent_run_id.clone(),
                 agent_type: "restored".into(),
@@ -4309,6 +4516,7 @@ impl DynamicAgentSpawner {
             let state = SpawnedAgentState {
                 agent_id: agent_id.to_string(),
                 run_id: run.run_id.clone(),
+                committed_frontier: Some(SpawnRunFrontier::from_durable(run)),
                 cancellation_binding_id: None,
                 parent_run_id: run
                     .parent_run_id
@@ -4358,6 +4566,7 @@ impl DynamicAgentSpawner {
                     if durable_child_terminal_is_authoritative(&merged) {
                         let mut corrected = existing.clone();
                         corrected.status = merged;
+                        corrected.committed_frontier = Some(SpawnRunFrontier::from_durable(run));
                         self.publish_background_agent_with_authority(&corrected, true);
                     }
                     recovered.push(existing);
@@ -4370,7 +4579,8 @@ impl DynamicAgentSpawner {
                 .write()
                 .await
                 .insert(state.agent_id.clone());
-            let authoritative = durable_child_terminal_is_authoritative(&state.status);
+            let authoritative = !state.status.is_terminal()
+                || durable_child_terminal_is_authoritative(&state.status);
             self.publish_background_agent_with_authority(&state, authoritative);
             self.archive_state(state).await;
             restored += 1;
@@ -4450,6 +4660,7 @@ impl DynamicAgentSpawner {
             let state = SpawnedAgentState {
                 agent_id: spawn.agent_id.clone(),
                 run_id: run_id.clone(),
+                committed_frontier: None,
                 cancellation_binding_id: None,
                 parent_run_id: parent_run_id.to_string(),
                 agent_type: spawn.agent_type.clone(),
@@ -4757,7 +4968,9 @@ impl DynamicAgentSpawner {
         let status = match &state.status {
             AgentStatus::Initializing => WorkUnitStatus::Pending,
             AgentStatus::Running { .. } | AgentStatus::Idle => WorkUnitStatus::Running,
-            AgentStatus::Waiting { .. } => WorkUnitStatus::WaitingForInput,
+            AgentStatus::Waiting { .. } | AgentStatus::Paused { .. } => {
+                WorkUnitStatus::WaitingForInput
+            }
             AgentStatus::Completed { .. } => WorkUnitStatus::Completed,
             AgentStatus::Interrupted { .. } => WorkUnitStatus::Interrupted,
             AgentStatus::Failed { .. } => WorkUnitStatus::Failed,
@@ -6988,6 +7201,7 @@ impl DynamicAgentSpawner {
             agent_id: agent_id.clone(),
             run_id: run_id.clone(),
             cancellation_binding_id: Some(cancellation_binding_id.clone()),
+            committed_frontier: None,
             parent_run_id: context.parent_run_id.clone(),
             agent_type: input.agent_type.clone(),
             description: input.description.clone(),
@@ -8860,9 +9074,14 @@ impl DynamicAgentSpawner {
         }
     }
 
-    async fn publish_seized_agent_projection(&self, state: &SpawnedAgentState, agent_id: &str) {
+    async fn publish_seized_agent_projection(
+        &self,
+        state: &SpawnedAgentState,
+        agent_id: &str,
+        authoritative: bool,
+    ) {
         self.record_fanout_terminal_state(state).await;
-        self.publish_background_agent_with_authority(state, state.status.is_terminal());
+        self.publish_background_agent_with_authority(state, authoritative);
         if let Some(event_type) =
             agent_status_to_progress_event(&state.status, &state.metrics, state.started_at)
         {
@@ -8890,12 +9109,15 @@ impl DynamicAgentSpawner {
         state: &mut SpawnedAgentState,
         agent_id: &str,
     ) {
-        state.status = AgentStatus::Waiting {
-            reason: "durable cancellation reconciliation pending".to_string(),
-        };
+        if !matches!(state.status, AgentStatus::Paused { .. }) {
+            state.status = AgentStatus::Waiting {
+                reason: "durable cancellation reconciliation pending".to_string(),
+            };
+        }
         state.work_revision = state.work_revision.saturating_add(1);
         state.ended_at = None;
-        self.publish_seized_agent_projection(state, agent_id).await;
+        self.publish_seized_agent_projection(state, agent_id, false)
+            .await;
     }
 
     /// Release this process's obsolete execution resources after the durable
@@ -8912,13 +9134,23 @@ impl DynamicAgentSpawner {
             .write()
             .await
             .remove(agent_id);
-        state.status = status;
+        // A control result without its winning frontier cannot clear a
+        // committed pause. Release obsolete local custody, but leave that
+        // obligation intact until the existing reconciler observes proof.
+        if child_observation_can_replace(
+            &state.status,
+            state.committed_frontier.as_ref(),
+            &status,
+            None,
+        ) {
+            state.status = status;
+        }
         state.work_revision = state.work_revision.saturating_add(1);
         state.ended_at = None;
         let messaging_address = state.messaging_address.take();
         let worktree_path = state.worktree_path.take();
         let projected = state.clone();
-        self.publish_seized_agent_projection(&projected, agent_id)
+        self.publish_seized_agent_projection(&projected, agent_id, true)
             .await;
 
         let spawner = self.clone_for_task();
@@ -9004,7 +9236,8 @@ impl DynamicAgentSpawner {
             AgentStatus::Initializing
             | AgentStatus::Running { .. }
             | AgentStatus::Idle
-            | AgentStatus::Waiting { .. } => {
+            | AgentStatus::Waiting { .. }
+            | AgentStatus::Paused { .. } => {
                 debug_assert!(false, "authoritative finalizer requires terminal status");
                 return false;
             }
@@ -9017,7 +9250,7 @@ impl DynamicAgentSpawner {
         let worktree_path = state.worktree_path.take();
         let settled_state = state.clone();
         let suppress_parent_mailbox = self.direct_child_result_is_parent_owned(&settled_state);
-        self.publish_seized_agent_projection(&settled_state, agent_id)
+        self.publish_seized_agent_projection(&settled_state, agent_id, true)
             .await;
         self.notify_completion(agent_id).await;
 
@@ -9142,6 +9375,10 @@ impl DynamicAgentSpawner {
                 return false;
             };
             if let Some(run_result) = run_result {
+                state.committed_frontier =
+                    run_result.committed_frontier.clone().filter(|frontier| {
+                        frontier.run_id == state.run_id && run_result.run_id == state.run_id
+                    });
                 state.metrics.turns_completed = run_result.turns_completed;
                 state.metrics.tool_calls = run_result.tool_calls;
                 state.metrics.prompt_tokens = run_result.prompt_tokens;
@@ -9156,7 +9393,7 @@ impl DynamicAgentSpawner {
             }
             state.status = status;
             state.work_revision = state.work_revision.saturating_add(1);
-            state.ended_at = Some(SystemTime::now());
+            state.ended_at = state.status.is_terminal().then(SystemTime::now);
             // Waiting remains resumable: the archive must retain the original
             // subscription so a later authoritative terminal can retire this
             // exact mailbox. Only a terminal transition transfers ownership
@@ -9171,7 +9408,12 @@ impl DynamicAgentSpawner {
 
         let suppress_parent_mailbox = self.direct_child_result_is_parent_owned(&state);
         self.record_fanout_terminal_state(&state).await;
-        self.publish_background_agent(&state);
+        self.publish_background_agent_with_authority(
+            &state,
+            run_result.is_some_and(|result| {
+                spawn_run_status_kind(&result.status) == SpawnRunStatusKind::Paused
+            }),
+        );
         if let Some(event_type) =
             agent_status_to_progress_event(&state.status, &state.metrics, state.started_at)
         {
@@ -9324,7 +9566,7 @@ impl DynamicAgentSpawner {
                     error: format!("cancelled: {reason}"),
                 })
             }
-            AgentStatus::Waiting { reason } => {
+            AgentStatus::Waiting { reason } | AgentStatus::Paused { reason } => {
                 MessagePayload::Signal(astra_messaging::AgentSignal::Waiting {
                     reason: reason.clone(),
                 })
@@ -9475,6 +9717,7 @@ impl DynamicAgentSpawner {
             AgentStatus::Running { .. } => "running",
             AgentStatus::Idle => "idle",
             AgentStatus::Waiting { .. } => "waiting",
+            AgentStatus::Paused { .. } => "paused",
             AgentStatus::Completed { .. } => "completed",
             AgentStatus::Interrupted { .. } => "interrupted",
             AgentStatus::Failed { .. } => "failed",
@@ -9989,7 +10232,7 @@ impl DynamicAgentSpawner {
                     AgentStatus::Cancelled { reason, .. } => {
                         format!("Agent cancelled: {reason}")
                     }
-                    AgentStatus::Waiting { reason } => {
+                    AgentStatus::Waiting { reason } | AgentStatus::Paused { reason } => {
                         format!("Agent needs input or cannot continue: {reason}")
                     }
                     AgentStatus::Initializing | AgentStatus::Running { .. } | AgentStatus::Idle => {
@@ -10227,6 +10470,10 @@ impl DynamicAgentSpawner {
 
     /// Update agent status.
     pub async fn update_status(&self, agent_id: &str, status: AgentStatus) {
+        // Progress callbacks carry no fenced lifecycle authority.
+        if matches!(status, AgentStatus::Paused { .. }) {
+            return;
+        }
         let _activity = self.begin_lifecycle_activity();
         if let Some(state) = self.active_agents.write().await.get_mut(agent_id) {
             if state.status == status {
@@ -10708,6 +10955,210 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn paused_direct_child_wakes_without_consuming_its_obligation() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let parent = spawner.fanout_parent("root");
+        let mut child = completed_test_state(999);
+        child.parent_run_id = "root".into();
+        child.status = AgentStatus::Running {
+            activity: "working".into(),
+        };
+        child.ended_at = None;
+        parent.register_direct_child(&child);
+
+        let waiter = parent.wait_for_direct_child_update();
+        tokio::pin!(waiter);
+        assert!(futures_util::poll!(&mut waiter).is_pending());
+        child.status = AgentStatus::Paused {
+            reason: "executor_offline".into(),
+        };
+        let mut foreign_run = child.clone();
+        foreign_run.run_id = "another-child-run".into();
+        parent.publish_direct_child(&foreign_run, true);
+        assert!(matches!(
+            parent.pending_direct_children()[0].status,
+            AgentStatus::Running { .. }
+        ));
+        parent.publish_direct_child(&child, true);
+        tokio::time::timeout(Duration::from_secs(1), &mut waiter)
+            .await
+            .unwrap();
+        // Publication before registration must also be visible: Notify is
+        // enabled before reading, and the pause itself remains retained.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            parent.wait_for_direct_child_update(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            spawner.wait_for_direct_child_update(&parent),
+        )
+        .await
+        .unwrap();
+        assert!(parent.has_pending_direct_children());
+        assert!(parent.take_completed_direct_children().is_empty());
+        assert!(!parent.finalize_direct_children_if_settled());
+        assert_eq!(parent.pending_direct_children()[0].status, child.status);
+        child.status = AgentStatus::Waiting {
+            reason: "presentation-only remote wake".into(),
+        };
+        parent.publish_direct_child(&child, false);
+        assert!(matches!(
+            parent.pending_direct_children()[0].status,
+            AgentStatus::Paused { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn progress_waiting_cannot_forge_a_committed_dependency_pause() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let parent = spawner.fanout_parent("root");
+        let mut child = completed_test_state(999);
+        child.parent_run_id = "root".into();
+        child.status = AgentStatus::Running {
+            activity: "working".into(),
+        };
+        parent.register_direct_child(&child);
+        spawner
+            .active_agents
+            .write()
+            .await
+            .insert(child.agent_id.clone(), child.clone());
+        let mut progress = spawner.subscribe_progress();
+        let paused = AgentStatus::Paused {
+            reason: "executor_offline".into(),
+        };
+        spawner.update_status(&child.agent_id, paused.clone()).await;
+        assert!(matches!(
+            progress.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            spawner
+                .get_agent_state_any(&child.agent_id)
+                .await
+                .unwrap()
+                .status,
+            child.status
+        );
+        child.status = paused;
+        parent.publish_direct_child(&child, false);
+        assert!(matches!(
+            parent.pending_direct_children()[0].status,
+            AgentStatus::Running { .. }
+        ));
+
+        spawner
+            .update_status(
+                &child.agent_id,
+                AgentStatus::Waiting {
+                    reason: "executor_offline".into(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            parent.pending_direct_children()[0].status,
+            AgentStatus::Waiting { .. }
+        ));
+        let waiter = parent.wait_for_direct_child_update();
+        tokio::pin!(waiter);
+        assert!(futures_util::poll!(&mut waiter).is_pending());
+        assert!(parent.take_completed_direct_children().is_empty());
+    }
+
+    #[tokio::test]
+    async fn authoritative_resume_clears_archived_local_pause_without_settling_child() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let parent = spawner.fanout_parent("root");
+        let mut child = completed_test_state(999);
+        child.parent_run_id = "root".into();
+        child.status = AgentStatus::Running {
+            activity: "working".into(),
+        };
+        parent.register_direct_child(&child);
+        child.status = AgentStatus::Paused {
+            reason: "executor_offline".into(),
+        };
+        child.committed_frontier = Some(SpawnRunFrontier {
+            run_id: child.run_id.clone(),
+            run_generation: 1,
+            last_event_idx: Some(10),
+        });
+        parent.publish_direct_child(&child, true);
+        // This is a locally yielded archive, not a remote-restored entry.
+        spawner.archive_state(child.clone()).await;
+        assert!(
+            !spawner
+                .durable_observed_agent_ids
+                .read()
+                .await
+                .contains(&child.agent_id)
+        );
+        let mut active = durable_run(&child.run_id, 1, astra_core::STATUS_RUNNING);
+        active.run_generation = 1;
+        active.last_event_idx = 11;
+        active.agent_id = Some(child.agent_id.clone());
+        active.parent_run_id = Some(child.parent_run_id.clone());
+        spawner
+            .set_durable_agent_reconciler(Arc::new(StaticDurableReconciler {
+                runs: vec![active.clone()],
+            }))
+            .await;
+        assert_eq!(spawner.reconcile_durable_agent_runs().await.unwrap(), 1);
+        assert!(matches!(
+            spawner
+                .get_agent_state_any(&child.agent_id)
+                .await
+                .unwrap()
+                .status,
+            AgentStatus::Waiting { .. }
+        ));
+        assert!(matches!(
+            parent.pending_direct_children()[0].status,
+            AgentStatus::Waiting { .. }
+        ));
+        let waiter = parent.wait_for_direct_child_update();
+        tokio::pin!(waiter);
+        assert!(futures_util::poll!(&mut waiter).is_pending());
+        assert!(parent.has_pending_direct_children());
+        assert!(parent.take_completed_direct_children().is_empty());
+
+        active.status = astra_core::STATUS_PAUSED.into();
+        active.last_event_idx = 12;
+        active.waiting_for = Some("executor_offline".into());
+        spawner
+            .set_durable_agent_reconciler(Arc::new(StaticDurableReconciler { runs: vec![active] }))
+            .await;
+        assert_eq!(spawner.reconcile_durable_agent_runs().await.unwrap(), 1);
+        tokio::time::timeout(Duration::from_secs(1), &mut waiter)
+            .await
+            .unwrap();
+        assert!(matches!(
+            parent.pending_direct_children()[0].status,
+            AgentStatus::Paused { .. }
+        ));
+        assert!(parent.take_completed_direct_children().is_empty());
+
+        let mut resumed = child;
+        resumed.committed_frontier.as_mut().unwrap().last_event_idx = Some(13);
+        resumed.status = AgentStatus::Running {
+            activity: "resumed locally".into(),
+        };
+        parent.publish_direct_child(&resumed, true);
+        resumed.status = AgentStatus::Completed {
+            result: "real resumed result".into(),
+            finish_reason: None,
+        };
+        parent.publish_direct_child(&resumed, false);
+        assert_eq!(
+            parent.take_completed_direct_children()[0].status,
+            resumed.status
+        );
+    }
+
+    #[tokio::test]
     async fn evicted_child_archive_does_not_hide_durable_terminal_correction() {
         let spawner = DynamicAgentSpawner::new(mock_router());
         let parent = spawner.fanout_parent("root-run");
@@ -10734,6 +11185,196 @@ pub(crate) mod tests {
             &corrected[0].status,
             AgentStatus::Failed { error, .. } if error == "durable failure"
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_running_snapshot_cannot_clear_committed_local_pause() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let parent = spawner.fanout_parent("root");
+        let mut child = completed_test_state(999);
+        child.status = AgentStatus::Running {
+            activity: "working".into(),
+        };
+        child.ended_at = None;
+        parent.register_direct_child(&child);
+        child.status = AgentStatus::Paused {
+            reason: "arbitrary pause: review requested".into(),
+        };
+        child.committed_frontier = Some(SpawnRunFrontier {
+            run_id: child.run_id.clone(),
+            run_generation: 4,
+            last_event_idx: Some(20),
+        });
+        parent.publish_direct_child(&child, true);
+        spawner.archive_state(child.clone()).await;
+        let mut snapshot = durable_run(&child.run_id, 1, astra_core::STATUS_RUNNING);
+        snapshot.agent_id = Some(child.agent_id.clone());
+        snapshot.parent_run_id = Some(child.parent_run_id.clone());
+        snapshot.run_generation = 4;
+        snapshot.last_event_idx = 19;
+        spawner
+            .set_durable_agent_reconciler(Arc::new(StaticDurableReconciler {
+                runs: vec![snapshot.clone()],
+            }))
+            .await;
+        assert_eq!(spawner.reconcile_durable_agent_runs().await.unwrap(), 0);
+        assert_eq!(
+            parent.paused_direct_child_reason().as_deref(),
+            Some("arbitrary pause: review requested")
+        );
+        assert_eq!(
+            spawner
+                .get_agent_state_any(&child.agent_id)
+                .await
+                .unwrap()
+                .committed_frontier,
+            child.committed_frontier
+        );
+        assert!(parent.has_pending_direct_children());
+        assert!(parent.take_completed_direct_children().is_empty());
+
+        // Same status still advances the acknowledged frontier. An older
+        // active row must not clear this second committed pause either.
+        snapshot.status = astra_core::STATUS_PAUSED.into();
+        snapshot.waiting_for = Some("arbitrary pause: review requested".into());
+        snapshot.last_event_idx = 22;
+        spawner
+            .set_durable_agent_reconciler(Arc::new(StaticDurableReconciler {
+                runs: vec![snapshot.clone()],
+            }))
+            .await;
+        assert_eq!(spawner.reconcile_durable_agent_runs().await.unwrap(), 1);
+        assert_eq!(
+            spawner
+                .get_agent_state_any(&child.agent_id)
+                .await
+                .unwrap()
+                .committed_frontier
+                .unwrap()
+                .last_event_idx,
+            Some(22)
+        );
+        snapshot.status = astra_core::STATUS_RUNNING.into();
+        snapshot.last_event_idx = 21;
+        spawner
+            .set_durable_agent_reconciler(Arc::new(StaticDurableReconciler {
+                runs: vec![snapshot.clone()],
+            }))
+            .await;
+        assert_eq!(spawner.reconcile_durable_agent_runs().await.unwrap(), 0);
+        assert!(parent.paused_direct_child_reason().is_some());
+
+        snapshot.run_generation = 5;
+        snapshot.last_event_idx = 0;
+        spawner
+            .set_durable_agent_reconciler(Arc::new(StaticDurableReconciler {
+                runs: vec![snapshot],
+            }))
+            .await;
+        assert_eq!(spawner.reconcile_durable_agent_runs().await.unwrap(), 1);
+        assert!(parent.paused_direct_child_reason().is_none());
+        assert!(parent.has_pending_direct_children());
+    }
+
+    #[test]
+    fn unknown_pause_and_foreign_frontier_never_invent_resume_authority() {
+        let pause = AgentStatus::Paused {
+            reason: "arbitrary pause: user review".into(),
+        };
+        let active = AgentStatus::Waiting {
+            reason: "remote executor".into(),
+        };
+        let mut frontier = SpawnRunFrontier {
+            run_id: "child".into(),
+            run_generation: 4,
+            last_event_idx: Some(20),
+        };
+        assert!(!child_observation_can_replace(
+            &pause,
+            None,
+            &active,
+            Some(&frontier)
+        ));
+        let generation_only = SpawnRunFrontier {
+            last_event_idx: None,
+            ..frontier.clone()
+        };
+        assert!(!child_observation_can_replace(
+            &pause,
+            Some(&generation_only),
+            &active,
+            Some(&frontier)
+        ));
+        assert!(!child_observation_can_replace(
+            &pause,
+            Some(&generation_only),
+            &pause,
+            Some(&frontier)
+        ));
+        assert!(!child_observation_can_replace(
+            &pause,
+            Some(&frontier),
+            &active,
+            None
+        ));
+        frontier.run_generation = 5;
+        assert!(child_observation_can_replace(
+            &pause,
+            Some(&generation_only),
+            &active,
+            Some(&frontier)
+        ));
+        frontier.run_id = "another-child".into();
+        assert!(!child_observation_can_replace(
+            &pause,
+            Some(&generation_only),
+            &active,
+            Some(&frontier)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unproven_control_observations_preserve_committed_pause() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let parent = spawner.fanout_parent("root");
+        let mut child = completed_test_state(998);
+        child.status = AgentStatus::Paused {
+            reason: "arbitrary pause: user review".into(),
+        };
+        child.ended_at = None;
+        child.committed_frontier = Some(SpawnRunFrontier {
+            run_id: child.run_id.clone(),
+            run_generation: 4,
+            last_event_idx: Some(20),
+        });
+        parent.register_direct_child(&child);
+        parent.publish_direct_child(&child, true);
+        let agent_id = child.agent_id.clone();
+        let status = child.status.clone();
+        let frontier = child.committed_frontier.clone();
+        spawner
+            .archive_pending_seized_agent_projection(&mut child, &agent_id)
+            .await;
+        assert_eq!(child.status, status);
+        assert!(
+            spawner
+                .release_seized_agent_projection(
+                    &mut child,
+                    &agent_id,
+                    AgentStatus::Waiting {
+                        reason: "remote executor".into(),
+                    },
+                )
+                .await
+        );
+        assert_eq!(child.status, status);
+        assert_eq!(child.committed_frontier, frontier);
+        assert_eq!(
+            parent.paused_direct_child_reason().as_deref(),
+            Some("arbitrary pause: user review")
+        );
+        assert!(parent.has_pending_direct_children());
+        assert!(parent.take_completed_direct_children().is_empty());
     }
 
     #[tokio::test]
@@ -10792,7 +11433,7 @@ pub(crate) mod tests {
             reason: "user cancelled".into(),
         };
         spawner
-            .publish_seized_agent_projection(&child, &child.agent_id)
+            .publish_seized_agent_projection(&child, &child.agent_id, true)
             .await;
         assert!(matches!(
             parent.take_completed_direct_children()[0].status,
@@ -14438,6 +15079,7 @@ pub(crate) mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -14463,6 +15105,7 @@ pub(crate) mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -14490,6 +15133,7 @@ pub(crate) mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -14513,6 +15157,7 @@ pub(crate) mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -14734,6 +15379,7 @@ pub(crate) mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: self.status.into(),
                 finish_reason: self.finish_reason.into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -14759,6 +15405,7 @@ pub(crate) mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -14791,6 +15438,7 @@ pub(crate) mod tests {
         let interrupted = SpawnRunResult {
             agent_id: "a1".into(),
             run_id: "r1".into(),
+            committed_frontier: None,
             status: SPAWN_STATUS_INTERRUPTED.into(),
             finish_reason: "budget_exhausted".into(),
             cancellation_origin: CancellationOrigin::Unverified,
@@ -14874,6 +15522,7 @@ pub(crate) mod tests {
         let cancelled = SpawnRunResult {
             agent_id: "a1".into(),
             run_id: "r1".into(),
+            committed_frontier: None,
             status: SPAWN_STATUS_CANCELLED.into(),
             finish_reason: "cancelled".into(),
             cancellation_origin: CancellationOrigin::User,
@@ -15051,6 +15700,7 @@ pub(crate) mod tests {
         let status = spawn_run_result_to_agent_status(&SpawnRunResult {
             agent_id: "agent-1".into(),
             run_id: "run-1".into(),
+            committed_frontier: None,
             status: SPAWN_STATUS_COMPLETED.into(),
             finish_reason: astra_turn_core::response_guard::RESPONSE_GUARD_REDACTED_FINISH_REASON
                 .into(),
@@ -15088,9 +15738,55 @@ pub(crate) mod tests {
     #[test]
     fn subrun_status_projection_maps_interruption_cancel_and_unknown_via_spawn_owner() {
         let paused = project_subrun_status_to_spawn(astra_core::STATUS_PAUSED, None);
-        assert_eq!(paused.status, SPAWN_STATUS_INTERRUPTED);
+        assert_eq!(paused.status, SPAWN_STATUS_PAUSED);
         assert_eq!(paused.finish_reason, "paused");
         assert!(paused.error.is_none());
+
+        let blocked = project_subrun_status_to_spawn(
+            astra_core::STATUS_PAUSED,
+            Some("executor_offline".into()),
+        );
+        let run_result = SpawnRunResult {
+            agent_id: "paused-child".into(),
+            run_id: "paused-run".into(),
+            committed_frontier: None,
+            status: blocked.status.into(),
+            finish_reason: blocked.finish_reason,
+            cancellation_origin: CancellationOrigin::Unverified,
+            output: None,
+            error: blocked.error,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+            turns_completed: 0,
+            permission_summary: None,
+            permission_requests: 0,
+            permission_requests_approved: 0,
+            tools_blocked: 0,
+        };
+        let status = spawn_run_result_to_agent_status(&run_result);
+        assert_eq!(
+            status,
+            AgentStatus::Paused {
+                reason: "executor_offline".into()
+            }
+        );
+        assert!(!status.is_terminal());
+        let waiting_output = SpawnRunResult {
+            finish_reason: "paused".into(),
+            output: Some("transport_disconnected".into()),
+            ..run_result.clone()
+        };
+        assert_eq!(
+            spawn_run_result_to_agent_status(&waiting_output),
+            AgentStatus::Paused {
+                reason: "transport_disconnected".into()
+            }
+        );
+        assert!(matches!(
+            spawn_run_result_to_sync_output("paused-child".into(), "paused-run".into(), run_result, 0),
+            SpawnAgentOutput::Paused { reason, .. } if reason == "executor_offline"
+        ));
 
         let partial = project_subrun_status_to_spawn(
             astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL,
@@ -17348,6 +18044,7 @@ pub(crate) mod tests {
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
+                committed_frontier: None,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
                 cancellation_origin: CancellationOrigin::Unverified,
@@ -17854,6 +18551,7 @@ pub(crate) mod tests {
             agent_id: format!("agent-{index}"),
             run_id: format!("run-{index}"),
             cancellation_binding_id: None,
+            committed_frontier: None,
             parent_run_id: "root".to_string(),
             agent_type: "explore".to_string(),
             description: format!("archived {index}"),

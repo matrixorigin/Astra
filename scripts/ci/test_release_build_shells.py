@@ -336,7 +336,14 @@ esac
             )
             crane.chmod(0o755)
             common_env = {
-                **os.environ,
+                # The real urllib helper must reach this fixture's loopback
+                # server, not an inherited developer/CI network proxy.
+                **{key: value for key, value in os.environ.items()
+                   if key.lower() not in {
+                       "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+                   }},
+                "NO_PROXY": "127.0.0.1,localhost,::1",
+                "no_proxy": "127.0.0.1,localhost,::1",
                 "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
                 "ASTRA_TEST_CALLS": str(calls),
                 "ASTRA_TEST_STATE_DIR": str(fixture),
@@ -407,11 +414,14 @@ esac
                 ],
             )
 
-            for state in ("unauthorized", "forbidden", "server_error"):
+            for state, status in (("unauthorized", 401), ("forbidden", 403),
+                                  ("server_error", 503)):
                 with self.subTest(state=state):
-                    failed, failed_calls, _ = run(state)
+                    failed, failed_calls, failed_paths = run(state)
                     self.assertNotEqual(failed.returncode, 0)
                     self.assertIn("could not safely inspect", failed.stderr)
+                    self.assertIn(f"HTTP {status}", failed.stderr)
+                    self.assertEqual(failed_paths, [HarborHandler.expected_path])
                     self.assertNotIn("copy ", failed_calls)
 
             HarborHandler.state = "malformed_not_found"

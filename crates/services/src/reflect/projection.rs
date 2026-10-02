@@ -241,7 +241,7 @@ mod tests {
                     "result_preview":"PRIVATE-OUTPUT","args_preview":"PRIVATE-INPUT"})),
                 ..Default::default()
             };
-            let wire = serde_json::to_value(project_events(&[event.clone()])).unwrap();
+            let wire = serde_json::to_value(project_events(std::slice::from_ref(&event))).unwrap();
             let spine = &wire["graph_slice"]["nodes"][0]["metadata"]["execution_spine"];
             let fact = &spine["facts"][0];
             assert_eq!(spine["run_id"], "parent-run");

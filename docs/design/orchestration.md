@@ -250,6 +250,18 @@ control through route defaults, convergence, or settlement heuristics.
   Observation timeouts do not cancel children. Completion waiting uses the
   host's authorized execution deadline, if present, rather than inventing a
   deadline; cancellation and user guidance remain active while parked.
+- A committed child `paused` status is nonterminal, unlike an interrupted
+  partial result. At either an explicit wait or the final-answer barrier, the
+  parent yields a resumable waiting outcome without another model request or
+  cancelling siblings. Available terminal sibling results remain staged and
+  unresolved child/question obligations remain pending. A presentation-only
+  `waiting` signal cannot establish this authority; durable resume clears it.
+  Clearing a pause requires newer committed evidence for the same child run:
+  a later event frontier within its generation, or a newer execution generation.
+  A cached running snapshot or absent local executor is not resume authority.
+  This propagation does not by itself provide cross-process parent recovery
+  or durable capacity parking; those remain owned by the run continuation and
+  admission contracts.
 - Cancellation propagates according to delegation policy.
 - Missing `action` or malformed delegation calls should produce targeted diagnostics and retry guidance.
 

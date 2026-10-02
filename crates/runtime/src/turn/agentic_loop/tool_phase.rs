@@ -3259,10 +3259,13 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .await
         .map_err(|error| error.to_string())?;
         try_write_heavy_checkpoint(state);
-        return Ok(if continue_after_reply.should_continue() {
-            TurnToolPhaseControl::ContinueLoop
-        } else {
-            TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed)
+        return Ok(match continue_after_reply {
+            super::execution_phase::RuntimeActivityOutcome::ExecutionPaused(reason) => {
+                finalize_turn_trace(state).await;
+                TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(reason))
+            }
+            outcome if outcome.should_continue() => TurnToolPhaseControl::ContinueLoop,
+            _ => TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed),
         });
     }
     Ok(TurnToolPhaseControl::ContinueLoop)

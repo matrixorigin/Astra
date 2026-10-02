@@ -4855,6 +4855,8 @@ mod tests {
     #[test]
     fn git_root_from_returns_none_outside_repository() {
         let dir = tempfile::TempDir::new().unwrap();
+        // TMPDIR may be inside the checkout: stop Git's ancestor discovery.
+        std::fs::write(dir.path().join(".git"), "gitdir: absent-repository\n").unwrap();
         assert!(git_root_from(dir.path()).is_none());
     }
 }

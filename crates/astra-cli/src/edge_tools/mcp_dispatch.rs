@@ -216,12 +216,24 @@ mod tests {
     #[tokio::test]
     async fn dispatch_tool_not_found() {
         let executor = executor_empty_mcp();
+        let manager = executor
+            .mcp_runtime_snapshot("test_missing_mcp_tool")
+            .manager
+            .unwrap();
+        let error = manager
+            .read()
+            .await
+            .prepare_tool_call_by_mcp_name("mcp_nonexistent_tool")
+            .err()
+            .expect("an empty manager must reject the missing tool before dispatch");
+        assert!(
+            matches!(&error, astra_mcp::McpError::ToolNotFound(name) if name == "mcp_nonexistent_tool")
+        );
         let result = executor
             .execute_mcp_tool("mcp_nonexistent_tool", &serde_json::Value::Null)
             .await;
         assert!(result.is_error);
-        assert!(result.output.contains("not found on any connected server"));
-        assert!(result.output.contains("mcp_nonexistent_tool"));
+        assert_eq!(result.output, format!("Error: {error}"));
     }
 
     #[tokio::test]
@@ -261,7 +273,7 @@ mod tests {
         assert_eq!(metadata["side_effects_maybe"], true);
         assert_eq!(metadata["retryable"], false);
         assert_eq!(metadata["dispatch_certainty"], "unknown");
-        assert_eq!(metadata["error_kind"], "workspace_effect_unsettled");
+        assert_eq!(metadata["error_kind"], "tool_outcome_unknown");
         assert_eq!(metadata["mcp_call_dispatched"], true);
         assert_eq!(metadata["workspace_effect_settled"], false);
         assert_eq!(

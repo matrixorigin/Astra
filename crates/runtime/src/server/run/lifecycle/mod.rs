@@ -5448,7 +5448,7 @@ pub struct AgenticRunLifecycleService {
     /// children; database executors share the same durable table instead.
     invocation_ledger: Option<crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger>,
     invocation_composition_error: Option<Arc<str>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e-hooks"))]
     test_inference_ledger: Option<crate::turn::llm::durable::TestInferenceLedgerPersistence>,
     /// Optional delegation engine for multi-agent coordination.
     delegation_engine: Option<Arc<crate::server::delegation::engine::DelegationEngine>>,
@@ -5594,7 +5594,7 @@ impl AgenticRunLifecycleService {
             run_engine,
             invocation_ledger,
             invocation_composition_error,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "e2e-hooks"))]
             test_inference_ledger: None,
             delegation_engine: None,
             fork_prefix_store: Arc::new(
@@ -6350,6 +6350,15 @@ impl AgenticRunLifecycleService {
 
     pub fn with_model_service(mut self, service: Arc<dyn ModelService>) -> Self {
         self.model_service = service;
+        self
+    }
+
+    /// Opt into the existing in-memory inference ledger for offline E2E
+    /// fixtures. Provider calls still use canonical admission and settlement;
+    /// this does not inject a model judgment or grant delegation authority.
+    #[cfg(feature = "e2e-hooks")]
+    pub fn with_e2e_inference_ledger(mut self) -> Self {
+        self.test_inference_ledger = Some(Default::default());
         self
     }
 
@@ -11966,7 +11975,7 @@ impl AgenticRunLifecycleService {
             builder = builder.with_canonical_work_context_binding(binding.context_binding());
         }
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "e2e-hooks"))]
         if let Some(ledger) = self.test_inference_ledger.as_ref() {
             builder = builder.with_test_inference_ledger(ledger.clone());
         }
@@ -16654,7 +16663,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
     /// Stream chat (incremental SSE mode): spawns the agentic loop in a
     /// background task and returns an event channel for incremental streaming.
     /// Post-loop cleanup (persistence, learning state) runs inside the task.
-
     async fn stream_chat(
         &self,
         user_id: String,
@@ -21114,7 +21122,8 @@ fn server_subrun_live_termination(
         Ok(AgenticLoopOutcome::Completed) => {
             match server_subrun_completed_agent_status(loop_state) {
                 STATUS_COMPLETED => Some(AgentLiveTermination::Completed),
-                STATUS_PAUSED | astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL => {
+                STATUS_PAUSED => None,
+                astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL => {
                     Some(AgentLiveTermination::Interrupted)
                 }
                 _ => Some(AgentLiveTermination::Failed),
@@ -21162,7 +21171,7 @@ fn server_subrun_outcome_status(
         Ok(AgenticLoopOutcome::Delegated) => STATUS_DELEGATED,
         Ok(AgenticLoopOutcome::Cancelled) => STATUS_CANCELLED,
         Err(error) if error.kind == astra_core::ErrorKind::Cancelled => STATUS_CANCELLED,
-        Ok(AgenticLoopOutcome::Waiting(_)) => STATUS_WAITING,
+        Ok(AgenticLoopOutcome::Waiting(_)) => STATUS_PAUSED,
         Ok(AgenticLoopOutcome::Error(_) | AgenticLoopOutcome::ControlRejected(_)) | Err(_) => {
             STATUS_FAILED
         }
@@ -21304,10 +21313,11 @@ enum DurableSubrunControlAuthority {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DurableSubrunToolTerminalCommit {
     authority: Option<DurableSubrunControlAuthority>,
     committed: bool,
+    committed_frontier: Option<crate::orchestration::spawner::SpawnRunFrontier>,
 }
 
 fn durable_subrun_terminal_events_match(
@@ -21354,13 +21364,6 @@ impl DurableSubrunControlAuthority {
 
     fn agent_status(self) -> &'static str {
         self.status()
-    }
-
-    fn live_termination(self) -> AgentLiveTermination {
-        match self {
-            Self::Paused => AgentLiveTermination::Interrupted,
-            Self::Cancelled => AgentLiveTermination::Cancelled,
-        }
     }
 }
 
@@ -22118,10 +22121,10 @@ impl ServerSpawnAgentExecutor {
         } else {
             executor
         };
-        let execution = AssertUnwindSafe(executor.execute(subrun))
+        let execution = AssertUnwindSafe(executor.execute_with_frontier(subrun))
             .catch_unwind()
             .await;
-        let result = match execution {
+        let (result, committed_frontier) = match execution {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => {
                 self.remove_runtime_context(&config.run_id, Some(&config.cancellation_binding_id))
@@ -22186,6 +22189,7 @@ impl ServerSpawnAgentExecutor {
         Ok(SpawnRunResult {
             agent_id: result.agent_id,
             run_id: result.run_id,
+            committed_frontier,
             status: projection.status.to_string(),
             finish_reason: projection.finish_reason,
             cancellation_origin,
@@ -22853,7 +22857,13 @@ impl ServerSubRunExecutor {
         user_id: &str,
         run_id: &str,
         execution_owner_generation: u64,
-    ) -> Result<Option<DurableSubrunControlAuthority>, String> {
+    ) -> Result<
+        (
+            Option<DurableSubrunControlAuthority>,
+            crate::orchestration::spawner::SpawnRunFrontier,
+        ),
+        String,
+    > {
         let durable = run_engine
             .load_run(user_id, run_id)
             .await?
@@ -22864,10 +22874,11 @@ impl ServerSubRunExecutor {
                 durable.run_generation
             ));
         }
+        let frontier = crate::orchestration::spawner::SpawnRunFrontier::from_durable(&durable);
         match durable.status.as_str() {
-            STATUS_PAUSED => Ok(Some(DurableSubrunControlAuthority::Paused)),
-            STATUS_CANCELLED => Ok(Some(DurableSubrunControlAuthority::Cancelled)),
-            STATUS_RUNNING | STATUS_WAITING => Ok(None),
+            STATUS_PAUSED => Ok((Some(DurableSubrunControlAuthority::Paused), frontier)),
+            STATUS_CANCELLED => Ok((Some(DurableSubrunControlAuthority::Cancelled), frontier)),
+            STATUS_RUNNING | STATUS_WAITING => Ok((None, frontier)),
             status => Err(format!(
                 "durable sub-run {run_id} settlement was superseded by terminal status {status}"
             )),
@@ -22883,7 +22894,7 @@ impl ServerSubRunExecutor {
         events: &[Value],
     ) -> Result<DurableSubrunToolTerminalCommit, String> {
         if events.is_empty() {
-            let authority = Self::exact_durable_subrun_control_authority(
+            let (authority, frontier) = Self::exact_durable_subrun_control_authority(
                 run_engine,
                 user_id,
                 run_id,
@@ -22893,6 +22904,7 @@ impl ServerSubRunExecutor {
             return Ok(DurableSubrunToolTerminalCommit {
                 authority,
                 committed: true,
+                committed_frontier: Some(frontier),
             });
         }
 
@@ -22915,7 +22927,7 @@ impl ServerSubRunExecutor {
                 .await
             {
                 Ok(true) => {
-                    let authority = Self::exact_durable_subrun_control_authority(
+                    let (authority, frontier) = Self::exact_durable_subrun_control_authority(
                         run_engine,
                         user_id,
                         run_id,
@@ -22925,6 +22937,7 @@ impl ServerSubRunExecutor {
                     return Ok(DurableSubrunToolTerminalCommit {
                         authority,
                         committed: true,
+                        committed_frontier: Some(frontier),
                     });
                 }
                 Ok(false) => {
@@ -22940,7 +22953,7 @@ impl ServerSubRunExecutor {
                         ));
                     }
                     if durable_subrun_terminal_events_match(&durable.events, events)? {
-                        let authority = Self::exact_durable_subrun_control_authority(
+                        let (authority, frontier) = Self::exact_durable_subrun_control_authority(
                             run_engine,
                             user_id,
                             run_id,
@@ -22950,6 +22963,7 @@ impl ServerSubRunExecutor {
                         return Ok(DurableSubrunToolTerminalCommit {
                             authority,
                             committed: true,
+                            committed_frontier: Some(frontier),
                         });
                     }
                     // `false` can be a transient last_event_idx CAS loss while
@@ -22980,7 +22994,7 @@ impl ServerSubRunExecutor {
         if durable.run_generation == execution_owner_generation
             && durable_subrun_terminal_events_match(&durable.events, events)?
         {
-            let authority = Self::exact_durable_subrun_control_authority(
+            let (authority, frontier) = Self::exact_durable_subrun_control_authority(
                 run_engine,
                 user_id,
                 run_id,
@@ -22990,6 +23004,7 @@ impl ServerSubRunExecutor {
             return Ok(DurableSubrunToolTerminalCommit {
                 authority,
                 committed: true,
+                committed_frontier: Some(frontier),
             });
         }
         Err(format!(
@@ -23058,9 +23073,9 @@ impl ServerSubRunExecutor {
         error_message: Option<&str>,
         cancellation_origin: Option<CancellationOrigin>,
         final_text: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<crate::orchestration::spawner::SpawnRunFrontier>, String> {
         let Some(run_engine) = self.durable_run_engine() else {
-            return Ok(());
+            return Ok(None);
         };
         let execution_owner_generation = execution_owner_generation.ok_or_else(|| {
             "durable sub-run status persistence is missing execution-owner authority".to_string()
@@ -23117,7 +23132,9 @@ impl ServerSubRunExecutor {
                 )
                 .await?
             {
-                TerminalTransitionOutcome::Committed(_) => Ok(true),
+                TerminalTransitionOutcome::Committed(durable) => Ok(Some(
+                    crate::orchestration::spawner::SpawnRunFrontier::from_durable(&durable),
+                )),
                 TerminalTransitionOutcome::Superseded(durable) => Err(format!(
                     "durable subrun terminal transition to {status} was superseded by {}",
                     durable.status
@@ -23142,10 +23159,20 @@ impl ServerSubRunExecutor {
                     &events,
                 )
                 .await
+                .map(|applied| {
+                    applied.then(|| crate::orchestration::spawner::SpawnRunFrontier {
+                        run_id: run_id.to_string(),
+                        run_generation: execution_owner_generation,
+                        // The status CAS acknowledges this generation, but
+                        // its boolean receipt does not expose an event index.
+                        // Do not invent a same-generation resume watermark.
+                        last_event_idx: None,
+                    })
+                })
         };
         match persisted {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(format!(
+            Ok(Some(frontier)) => Ok(Some(frontier)),
+            Ok(None) => Err(format!(
                 "durable subrun status transition to {status} lost its running-state compare-and-set"
             )),
             Err(error) => {
@@ -23324,6 +23351,7 @@ fn activation_agent_result_from_durable_winner(
         crate::orchestration::AgentStatus::Waiting { reason } => {
             (STATUS_WAITING, Some(reason), None)
         }
+        crate::orchestration::AgentStatus::Paused { reason } => (STATUS_PAUSED, Some(reason), None),
         crate::orchestration::AgentStatus::Cancelled { reason, .. } => (
             STATUS_CANCELLED,
             None,
@@ -23352,7 +23380,10 @@ async fn settle_subrun_activation_cancellation(
     dynamic_agent_spawner: Option<&DynamicAgentSpawner>,
     config: &SubRunConfig,
     execution_owner_generation: u64,
-) -> astra_services::coordination::AgentResult {
+) -> (
+    astra_services::coordination::AgentResult,
+    Option<crate::orchestration::spawner::SpawnRunFrontier>,
+) {
     let cancellation_origin = match engine
         .cancellation_origin_in_lineage(&config.user_id, &config.run_id)
         .await
@@ -23411,10 +23442,13 @@ async fn settle_subrun_activation_cancellation(
         .await;
     let agent_id = config.agent_profile.agent_id.clone();
     let run_id = config.run_id.clone();
+    let mut committed_frontier = None;
     let (result, user_terminal_winner) = match transition {
-        Ok(TerminalTransitionOutcome::Committed(_))
+        Ok(TerminalTransitionOutcome::Committed(durable))
             if cancellation_origin != CancellationOrigin::Unverified =>
         {
+            committed_frontier =
+                Some(crate::orchestration::spawner::SpawnRunFrontier::from_durable(&durable));
             (
                 activation_agent_result_from_durable_winner(
                     agent_id,
@@ -23433,10 +23467,14 @@ async fn settle_subrun_activation_cancellation(
                 cancellation_origin == CancellationOrigin::User,
             )
         }
-        Ok(TerminalTransitionOutcome::Committed(_)) => {
+        Ok(TerminalTransitionOutcome::Committed(durable)) => {
+            committed_frontier =
+                Some(crate::orchestration::spawner::SpawnRunFrontier::from_durable(&durable));
             (activation_interrupted_agent_result(agent_id, run_id), false)
         }
         Ok(TerminalTransitionOutcome::Superseded(durable)) => {
+            committed_frontier =
+                Some(crate::orchestration::spawner::SpawnRunFrontier::from_durable(&durable));
             let status = crate::orchestration::spawner::durable_agent_status(&durable);
             let user_terminal_winner = matches!(
                 &status,
@@ -23456,6 +23494,8 @@ async fn settle_subrun_activation_cancellation(
                 if durable_run_status_is_terminal(&durable.status)
                     || durable.status == STATUS_PAUSED =>
             {
+                committed_frontier =
+                    Some(crate::orchestration::spawner::SpawnRunFrontier::from_durable(&durable));
                 let status = crate::orchestration::spawner::durable_agent_status(&durable);
                 let user_terminal_winner = matches!(
                     &status,
@@ -23497,7 +23537,7 @@ async fn settle_subrun_activation_cancellation(
             true,
         );
     }
-    result
+    (result, committed_frontier)
 }
 
 #[async_trait]
@@ -23630,8 +23670,25 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
     async fn execute(
         &self,
-        mut config: SubRunConfig,
+        config: SubRunConfig,
     ) -> Result<astra_services::coordination::AgentResult, String> {
+        self.execute_with_frontier(config)
+            .await
+            .map(|(result, _)| result)
+    }
+}
+
+impl ServerSubRunExecutor {
+    async fn execute_with_frontier(
+        &self,
+        mut config: SubRunConfig,
+    ) -> Result<
+        (
+            astra_services::coordination::AgentResult,
+            Option<crate::orchestration::spawner::SpawnRunFrontier>,
+        ),
+        String,
+    > {
         let runtime_ceiling = astra_config::RuntimeConfig::cached()
             .runtime_limits
             .resolve_turn_ceiling(
@@ -23773,6 +23830,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let durable_run_id = config.run_id.clone();
         let mut durable_terminal_committed = false;
         let mut atomic_terminal_attempted = false;
+        let mut committed_frontier = None;
         let execution = AssertUnwindSafe(async {
             let durable_run = match self.durable_run_engine() {
                 Some(engine) => Some(
@@ -24485,9 +24543,13 @@ impl SubRunExecutor for ServerSubRunExecutor {
             DurableSubrunToolTerminalCommit {
                 authority: None,
                 committed: false,
+                committed_frontier: None,
             }
         };
         let mut control_authority = tool_terminal_commit.authority;
+        if control_authority.is_some() {
+            committed_frontier = tool_terminal_commit.committed_frontier;
+        }
         let tool_terminals_precommitted = tool_terminal_commit.committed;
 
         // Root and delegated loops share one canonical append transaction.
@@ -24626,12 +24688,15 @@ impl SubRunExecutor for ServerSubRunExecutor {
                         )
                         .await
                         .ok()
-                        .flatten()
+                        .and_then(|(authority, frontier)| {
+                            authority.map(|authority| (authority, frontier))
+                        })
                     } else {
                         None
                     };
-                    if let Some(authority) = reconciled_control {
+                    if let Some((authority, frontier)) = reconciled_control {
                         control_authority = Some(authority);
+                        committed_frontier = Some(frontier);
                         if let Some(generation) = execution_owner_generation {
                             self.persist_subrun_trace_after_control_authority(
                                 &config.user_id,
@@ -24714,7 +24779,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 )
                 .await;
             match durable_status_result {
-                Ok(()) => {
+                Ok(frontier) => {
+                    committed_frontier = frontier;
                     durable_terminal_committed = durable_run_status_is_terminal(durable_status);
                 }
                 Err(error) => {
@@ -24729,12 +24795,15 @@ impl SubRunExecutor for ServerSubRunExecutor {
                         )
                         .await
                         .ok()
-                        .flatten()
+                        .and_then(|(authority, frontier)| {
+                            authority.map(|authority| (authority, frontier))
+                        })
                     } else {
                         None
                     };
-                    if let Some(authority) = reconciled_control {
+                    if let Some((authority, frontier)) = reconciled_control {
                         control_authority = Some(authority);
+                        committed_frontier = Some(frontier);
                         tracing::info!(
                             target: "astra_runtime::subrun",
                             run_id = %durable_run_id,
@@ -24887,36 +24956,34 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 loop_state.final_text_model_item_id.clone(),
             );
         }
-        if let Some(authority) = control_authority {
+        if control_authority == Some(DurableSubrunControlAuthority::Cancelled) {
             emit_server_subrun_agent_terminated(
                 config.live_event_sink.as_ref(),
                 &config.run_id,
                 &live_agent_id,
                 live_started_at,
-                authority.live_termination(),
-                Some(authority.status().to_string()),
+                AgentLiveTermination::Cancelled,
+                Some(STATUS_CANCELLED.to_string()),
             );
-        } else {
-        match &outcome {
-            Ok(AgenticLoopOutcome::Waiting(reason)) => emit_server_subrun_execution_waiting(
+        } else if let Some(reason) = waiting_for.or_else(|| {
+            (control_authority == Some(DurableSubrunControlAuthority::Paused))
+                .then_some(STATUS_PAUSED)
+        }) {
+            emit_server_subrun_execution_waiting(
                 config.live_event_sink.as_ref(),
                 &config.run_id,
                 &live_agent_id,
-                reason.clone(),
-            ),
-            _ => {
-                if let Some(termination) = server_subrun_live_termination(&outcome, &loop_state) {
-                    emit_server_subrun_agent_terminated(
-                        config.live_event_sink.as_ref(),
-                        &config.run_id,
-                        &live_agent_id,
-                        live_started_at,
-                        termination,
-                        server_subrun_live_reason(&outcome, &loop_state),
-                    );
-                }
-            }
-        }
+                reason.to_string(),
+            );
+        } else if let Some(termination) = server_subrun_live_termination(&outcome, &loop_state) {
+            emit_server_subrun_agent_terminated(
+                config.live_event_sink.as_ref(),
+                &config.run_id,
+                &live_agent_id,
+                live_started_at,
+                termination,
+                server_subrun_live_reason(&outcome, &loop_state),
+            );
         }
         if let Some(authority) = control_authority {
             return Ok(astra_services::coordination::AgentResult {
@@ -24993,7 +25060,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 Ok(astra_services::coordination::AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
-                    status: STATUS_WAITING.to_string(),
+                    status: STATUS_PAUSED.to_string(),
                     output: Some(reason),
                     error: None,
                     prompt_tokens,
@@ -25077,7 +25144,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 .await;
         }
         drop(owner_lease_heartbeat.take());
-        execution_result
+        execution_result.map(|result| (result, committed_frontier))
     }
 }
 

@@ -3087,11 +3087,13 @@ mod context_cache_contract_tests {
             "required control policy must reach the strict-history provider wire: {wire:#?}"
         );
         assert!(
-            wire.iter().any(|message| message
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|text| text
-                    .contains("For a user-named model, call visible `agent` spawn directly"))),
+            wire.iter().any(
+                |message| message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text
+                        .contains("the first native call is `agent(action=\"spawn\", ...)`"))
+            ),
             "ordinary delegation guidance must survive strict-history wire assembly"
         );
         assert_eq!(

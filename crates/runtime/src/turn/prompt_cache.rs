@@ -1008,7 +1008,7 @@ mod tests {
         let mut tools = vec![
             json!({"type": "function", "function": {"name": "bash"}}),
             json!({"type": "function", "function": {"name": "read_file"}}),
-            json!({"type": "function", "function": {"name": "skill"}}),
+            json!({"type": "function", "function": {"name": "agent"}}),
         ];
         let prefix_len = tools.len();
         tools.push(json!({"type": "function", "function": {"name": "web_fetch"}}));
@@ -1017,7 +1017,7 @@ mod tests {
         let always_load = default_test_always_load_tool_names();
         assert!(always_load.contains("bash"));
         assert!(always_load.contains("read_file"));
-        assert!(always_load.contains("skill"));
+        assert!(always_load.contains("agent"));
 
         annotate_test_tool_schemas_for_caching(
             &mut tools,
@@ -2525,6 +2525,7 @@ mod cache_stability_regression {
             "grep",
             "tool_search",
             "introspect",
+            "agent",
             "memory",
             "start_work",
             "run_next_work_item",
@@ -2539,19 +2540,12 @@ mod cache_stability_regression {
             !always_load.contains("glob"),
             "specialized glob navigation must remain deferred from the default prefix"
         );
-        for name in ["agent", "agent_fanout", "worktree"] {
+        for name in ["skill", "agent_fanout", "worktree"] {
             assert!(
                 !always_load.contains(name),
                 "{name} must load on demand instead of extending the default cache prefix"
             );
         }
-        // Runtime-injected, not in TOOL_CATALOG, but structurally part of the
-        // resolved default surface when skills are available.
-        let name = "skill";
-        assert!(
-            always_load.contains(name),
-            "{name} is auto-always_load at runtime; default set must mirror that"
-        );
     }
 
     #[test]

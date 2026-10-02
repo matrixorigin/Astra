@@ -91,6 +91,11 @@ pub(crate) fn local_agent_status_projection(
             Some(format!("Agent is waiting: {reason}")),
             None,
         ),
+        AgentStatus::Paused { reason } => (
+            "waiting_for_input",
+            Some(format!("Agent is paused: {reason}")),
+            None,
+        ),
         AgentStatus::Completed {
             result,
             finish_reason,
@@ -580,7 +585,7 @@ pub(crate) fn background_task_output_snapshot_for_local_agent(
             crate::edge_tools::BgTaskOutputStatus::WaitingForInput,
             "Agent is waiting for input.".to_string(),
         ),
-        AgentStatus::Waiting { reason } => (
+        AgentStatus::Waiting { reason } | AgentStatus::Paused { reason } => (
             crate::edge_tools::BgTaskOutputStatus::WaitingForInput,
             format!("Agent is waiting: {reason}"),
         ),

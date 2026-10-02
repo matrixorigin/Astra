@@ -306,29 +306,60 @@ pub(crate) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
 
 /// Wait at a proposed final answer or an explicit agent question; ordinary
 /// tool/model work stays concurrent until one of those synchronization edges.
-/// Return true to enter one normal, accounted synthesis boundary.
+/// Return the synchronization outcome without collapsing a recoverable pause
+/// into permission to synthesize or finalize.
 pub(crate) async fn await_direct_children_before_completion<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
     continuation: ContinuationAuthority,
-) -> Result<bool, astra_core::ClassifiedError> {
-    await_runtime_activity(host, state, continuation, None)
-        .await
-        .map(|outcome| outcome == RuntimeActivityOutcome::InputReady)
+) -> Result<RuntimeActivityOutcome, astra_core::ClassifiedError> {
+    await_runtime_activity(host, state, continuation, None).await
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeActivityOutcome {
     InputReady,
     ObservationTimedOut,
     NoPendingWork,
     Incomplete,
+    ExecutionPaused(String),
 }
 
 impl RuntimeActivityOutcome {
-    pub(crate) fn should_continue(self) -> bool {
+    pub(crate) fn should_continue(&self) -> bool {
         matches!(self, Self::InputReady | Self::ObservationTimedOut)
     }
+}
+
+fn paused_direct_child_outcome<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    owner: Option<&crate::orchestration::FanoutParentAdmission>,
+    started: Instant,
+    observation_request: Option<&astra_tools::agent_tool_contract::AgentWaitReceipt>,
+) -> Option<RuntimeActivityOutcome> {
+    let owner = owner?;
+    let reason = owner.paused_direct_child_reason()?;
+    // Retain terminal siblings, but neither consume paused obligations nor
+    // buy a synthesis turn just to yield an authoritative execution block.
+    host.release_execution_capacity_for_wait();
+    stage_direct_child_results(host, state);
+    state.hooks.completion_settlement.latest_provider_text = None;
+    state.hooks.completion_settlement.deferred_candidate_text = None;
+    state.final_text_model_item_id = None;
+    state.final_text.clear();
+    state.final_text_streamed = false;
+    let run_id = state.current_run_id.clone().unwrap_or_default();
+    record_direct_child_barrier(
+        host,
+        state,
+        &run_id,
+        "child_execution_paused",
+        &serde_json::json!(owner.pending_direct_children()),
+        started,
+        observation_request.map(|request| request.tool_call_id.as_str()),
+    );
+    Some(RuntimeActivityOutcome::ExecutionPaused(reason))
 }
 
 /// Both synchronization edges use the same input/capacity machinery. An
@@ -358,6 +389,23 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
     let started = Instant::now();
     let remaining = host.execution_time_budget_remaining();
     let authority_deadline = remaining.map(|remaining| tokio::time::Instant::now() + remaining);
+    // Yielding a committed pause spends no synthesis allowance. Hard cancel
+    // and actual execution authority still precede that nonterminal outcome.
+    tokio::select! {
+        biased;
+        _ = direct_child_parent_cancelled(&state.cancellation) => {
+            return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::Cancelled,
+                "parent cancelled before waiting for direct children"));
+        }
+        _ = std::future::ready(()) => {}
+    }
+    if continuation == ContinuationAuthority::Runtime
+        && remaining.is_none_or(|remaining| !remaining.is_zero())
+        && let Some(outcome) =
+            paused_direct_child_outcome(host, state, owner.as_deref(), started, observation_request)
+    {
+        return Ok(outcome);
+    }
     let slice_exhausted =
         state.remaining_turns == 0 || state.current_round_index as usize + 1 >= state.max_turns;
     let no_synthesis_budget = (slice_exhausted
@@ -462,7 +510,22 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                     } => ReadySource::Mailbox(message),
                 };
                 let boundary = match source {
-                    ReadySource::Child => RuntimeInputBoundary::ChildReady,
+                    ReadySource::Child => {
+                        // A committed child pause is not a terminal result.
+                        // Preserve every pending obligation and available
+                        // sibling result without buying another provider turn
+                        // or reacquiring execution capacity just to yield.
+                        if let Some(outcome) = paused_direct_child_outcome(
+                            host,
+                            state,
+                            owner.as_deref(),
+                            started,
+                            observation_request,
+                        ) {
+                            return Ok(outcome);
+                        }
+                        RuntimeInputBoundary::ChildReady
+                    }
                     ReadySource::Intent(Some(index)) => {
                         checked_watermark = checked_watermark.max(index);
                         if index
@@ -483,15 +546,25 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                         continue;
                     }
                 };
-                let readmission = tokio::select! {
-                    biased;
-                    _ = direct_child_parent_cancelled(&cancellation) => {
-                        record_direct_child_barrier(host, state, &run_id, "cancelled", &children, started, observation_request.map(|request| request.tool_call_id.as_str()));
-                        return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::Cancelled,
-                            "parent cancelled while waiting for execution capacity"));
-                    }
-                    _ = wait_for_runtime_deadline(deadline) => break 'waiting "deadline",
-                    result = host.reacquire_execution_capacity_after_wait() => result,
+                let readmission = loop {
+                    break tokio::select! {
+                        biased;
+                        _ = direct_child_parent_cancelled(&cancellation) => {
+                            record_direct_child_barrier(host, state, &run_id, "cancelled", &children, started, observation_request.map(|request| request.tool_call_id.as_str()));
+                            return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::Cancelled,
+                                "parent cancelled while waiting for execution capacity"));
+                        }
+                        _ = wait_for_runtime_deadline(deadline) => break 'waiting "deadline",
+                        _ = wait_for_paused_direct_child(owner.as_deref(), executor.as_deref()) => {
+                            if let Some(outcome) = paused_direct_child_outcome(
+                                host, state, owner.as_deref(), started, observation_request,
+                            ) {
+                                return Ok(outcome);
+                            }
+                            continue;
+                        }
+                        result = host.reacquire_execution_capacity_after_wait() => result,
+                    };
                 };
                 if let Err(error) = readmission {
                     record_direct_child_barrier(
@@ -504,6 +577,15 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                         observation_request.map(|request| request.tool_call_id.as_str()),
                     );
                     return Err(error);
+                }
+                if let Some(outcome) = paused_direct_child_outcome(
+                    host,
+                    state,
+                    owner.as_deref(),
+                    started,
+                    observation_request,
+                ) {
+                    return Ok(outcome);
                 }
                 // The whole input transaction, including DB ACK/poll I/O, is
                 // inside the same absolute deadline and hard-cancel boundary.
@@ -527,6 +609,15 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
                         }
                     },
                 };
+                if let Some(outcome) = paused_direct_child_outcome(
+                    host,
+                    state,
+                    owner.as_deref(),
+                    started,
+                    observation_request,
+                ) {
+                    return Ok(outcome);
+                }
                 if observed.model_context_changed
                     || matches!(source, ReadySource::Child)
                         && !owner
@@ -548,6 +639,26 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
             }
         }
     };
+    if outcome == "deadline"
+        && authority_deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline)
+    {
+        // A synthesis reserve/observation cutoff is not expiry of execution
+        // authority. A concurrently committed pause needs neither synthesis
+        // nor readmission, and must not fall through to child cancellation.
+        tokio::select! {
+            biased;
+            _ = direct_child_parent_cancelled(&state.cancellation) => {
+                return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::Cancelled,
+                    "parent cancelled at the direct-child wait cutoff"));
+            }
+            _ = std::future::ready(()) => {}
+        }
+        if let Some(outcome) =
+            paused_direct_child_outcome(host, state, owner.as_deref(), started, observation_request)
+        {
+            return Ok(outcome);
+        }
+    }
     let outcome = if observation_request.is_some()
         && outcome == "deadline"
         && authority_deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline)
@@ -576,17 +687,32 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
         return Ok(RuntimeActivityOutcome::InputReady);
     }
     if outcome == "observation_timed_out" {
-        tokio::select! {
-            biased;
-            _ = direct_child_parent_cancelled(&state.cancellation) => {
-                return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::Cancelled,
-                    "execution cancelled while readmitting an observation wait"));
+        loop {
+            tokio::select! {
+                biased;
+                _ = direct_child_parent_cancelled(&state.cancellation) => {
+                    return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::Cancelled,
+                        "execution cancelled while readmitting an observation wait"));
+                }
+                _ = wait_for_runtime_deadline(authority_deadline) => {
+                    return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::BudgetExhausted,
+                        "execution authority expired while readmitting an observation wait"));
+                }
+                _ = wait_for_paused_direct_child(owner.as_deref(), state.runtime_tool_executor.as_deref()) => {
+                    if let Some(outcome) = paused_direct_child_outcome(
+                        host, state, owner.as_deref(), started, observation_request,
+                    ) {
+                        return Ok(outcome);
+                    }
+                    continue;
+                }
+                result = host.reacquire_execution_capacity_after_wait() => { result?; break; },
             }
-            _ = wait_for_runtime_deadline(authority_deadline) => {
-                return Err(astra_core::ClassifiedError::new(astra_core::ErrorKind::BudgetExhausted,
-                    "execution authority expired while readmitting an observation wait"));
-            }
-            result = host.reacquire_execution_capacity_after_wait() => result?,
+        }
+        if let Some(outcome) =
+            paused_direct_child_outcome(host, state, owner.as_deref(), started, observation_request)
+        {
+            return Ok(outcome);
         }
         state.push_volatile_payload(
             super::host::VolatileKind::RuntimeInputBoundary,
@@ -610,6 +736,17 @@ async fn wait_for_runtime_deadline(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending::<()>().await,
+    }
+}
+
+async fn wait_for_paused_direct_child(
+    owner: Option<&crate::orchestration::FanoutParentAdmission>,
+    executor: Option<&crate::server::runtime_tool_executor::RuntimeToolExecutor>,
+) {
+    match (owner, executor) {
+        (Some(owner), Some(executor)) => executor.wait_for_direct_child_pause(owner).await,
+        (Some(owner), None) => owner.wait_for_direct_child_pause().await,
+        (None, _) => std::future::pending::<()>().await,
     }
 }
 
@@ -6768,13 +6905,19 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     await_direct_children_before_completion(host, state, continuation_authority)
                         .await;
                 state.step_recorder.end_turn(false);
+                if matches!(
+                    &child_barrier,
+                    Ok(RuntimeActivityOutcome::ExecutionPaused(_))
+                ) {
+                    finalize_turn_trace(state).await;
+                }
                 try_write_heavy_checkpoint(state);
-                return child_barrier.map(|continue_loop| {
-                    if continue_loop {
-                        TurnExecutionControl::ContinueLoop
-                    } else {
-                        TurnExecutionControl::Return(AgenticLoopOutcome::Completed)
+                return child_barrier.map(|outcome| match outcome {
+                    RuntimeActivityOutcome::ExecutionPaused(reason) => {
+                        TurnExecutionControl::Return(AgenticLoopOutcome::Waiting(reason))
                     }
+                    RuntimeActivityOutcome::InputReady => TurnExecutionControl::ContinueLoop,
+                    _ => TurnExecutionControl::Return(AgenticLoopOutcome::Completed),
                 });
             }
 
@@ -10309,6 +10452,270 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paused_dependency_yields_both_wait_edges_without_settling_siblings() {
+        for observation in [
+            None,
+            Some(astra_tools::agent_tool_contract::AgentWaitReceipt {
+                parent_run_id: "parent-run".into(),
+                tool_call_id: "wait-call".into(),
+                timeout_ms: 10_000,
+            }),
+        ] {
+            for exhausted in [false, true] {
+                for cancelled in [false, true] {
+                    let owner =
+                        crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+                            "parent-run",
+                            "paused-child",
+                        );
+                    for (agent_id, status) in [
+                        (
+                            "paused-child",
+                            crate::orchestration::AgentStatus::Paused {
+                                reason: "arbitrary prerequisite".into(),
+                            },
+                        ),
+                        (
+                            "active-child",
+                            crate::orchestration::AgentStatus::Running {
+                                activity: "working".into(),
+                            },
+                        ),
+                        (
+                            "terminal-child",
+                            crate::orchestration::AgentStatus::Completed {
+                                result: "retained sibling result".into(),
+                                finish_reason: None,
+                            },
+                        ),
+                    ] {
+                        owner.set_direct_child_for_test(
+                            crate::orchestration::spawner::DirectChildCompletion {
+                                agent_id: agent_id.into(),
+                                run_id: format!("{agent_id}-run"),
+                                parent_agent_id: "parent-agent".into(),
+                                status,
+                            },
+                        );
+                    }
+                    let mut host = MockHost::new(vec![]);
+                    host.direct_child_owner = Some(Arc::clone(&owner));
+                    let mut state = make_state();
+                    state.current_run_id = Some("parent-run".into());
+                    state.final_text = "unsettled candidate".into();
+                    if exhausted {
+                        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(1);
+                        state.llm_rounds_completed = 1;
+                    }
+                    let token = tokio_util::sync::CancellationToken::new();
+                    if cancelled {
+                        token.cancel();
+                    }
+                    state.cancellation.token = Some(Arc::new(token));
+                    let outcome = tokio::time::timeout(
+                        Duration::from_millis(200),
+                        await_runtime_activity(
+                            &mut host,
+                            &mut state,
+                            ContinuationAuthority::Runtime,
+                            observation.as_ref(),
+                        ),
+                    )
+                    .await
+                    .expect("a paused dependency must not consume the observation timeout");
+                    if cancelled {
+                        assert_eq!(outcome.unwrap_err().kind, astra_core::ErrorKind::Cancelled);
+                        assert_eq!(owner.pending_direct_children().len(), 3);
+                        continue;
+                    }
+                    assert_eq!(
+                        outcome.unwrap(),
+                        RuntimeActivityOutcome::ExecutionPaused("arbitrary prerequisite".into())
+                    );
+                    assert!(state.final_text.is_empty());
+                    assert!(
+                        state.interruption.is_none(),
+                        "a resumable pause is not failed work"
+                    );
+                    assert_eq!(owner.pending_direct_children().len(), 2);
+                    assert!(owner.pending_direct_children().iter().any(|child| matches!(
+                        child.status,
+                        crate::orchestration::AgentStatus::Paused { .. }
+                    )));
+                    assert!(owner.has_retained_direct_child_result("terminal-child"));
+                    assert!(
+                        serde_json::to_string(&state.volatile_pending)
+                            .unwrap()
+                            .contains("retained sibling result")
+                    );
+                    assert!(!owner.finalize_direct_children_if_settled());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_during_capacity_readmission_retains_sibling_without_provider_continuation() {
+        for observation in [
+            None,
+            Some(astra_tools::agent_tool_contract::AgentWaitReceipt {
+                parent_run_id: "parent-run".into(),
+                tool_call_id: "wait-call".into(),
+                timeout_ms: 10_000,
+            }),
+        ] {
+            for cancelled in [false, true] {
+                let owner =
+                    crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+                        "parent-run",
+                        "blocked-child",
+                    );
+                for (agent_id, status) in [
+                    (
+                        "blocked-child",
+                        crate::orchestration::AgentStatus::Running {
+                            activity: "working".into(),
+                        },
+                    ),
+                    (
+                        "completed-sibling",
+                        crate::orchestration::AgentStatus::Completed {
+                            result: "sibling evidence".into(),
+                            finish_reason: None,
+                        },
+                    ),
+                ] {
+                    owner.set_direct_child_for_test(
+                        crate::orchestration::spawner::DirectChildCompletion {
+                            agent_id: agent_id.into(),
+                            run_id: format!("{agent_id}-run"),
+                            parent_agent_id: "parent-agent".into(),
+                            status,
+                        },
+                    );
+                }
+                let started = Arc::new(tokio::sync::Notify::new());
+                let grant = Arc::new(tokio::sync::Notify::new());
+                let mut host = MockHost::new(vec![]);
+                host.direct_child_owner = Some(Arc::clone(&owner));
+                host.capacity_readmission_gate = Some((Arc::clone(&started), Arc::clone(&grant)));
+                let mut state = make_state();
+                state.current_run_id = Some("parent-run".into());
+                let cancellation = Arc::new(tokio_util::sync::CancellationToken::new());
+                state.cancellation.token = Some(Arc::clone(&cancellation));
+                let observation = observation.clone();
+                let task = tokio::spawn(async move {
+                    let outcome = await_runtime_activity(
+                        &mut host,
+                        &mut state,
+                        ContinuationAuthority::Runtime,
+                        observation.as_ref(),
+                    )
+                    .await;
+                    (host, state, outcome)
+                });
+                tokio::time::timeout(Duration::from_secs(1), started.notified())
+                    .await
+                    .expect("terminal sibling must reach real readmission boundary");
+                if cancelled {
+                    cancellation.cancel();
+                }
+                owner.set_direct_child_for_test(
+                    crate::orchestration::spawner::DirectChildCompletion {
+                        agent_id: "blocked-child".into(),
+                        run_id: "blocked-child-run".into(),
+                        parent_agent_id: "parent-agent".into(),
+                        status: crate::orchestration::AgentStatus::Paused {
+                            reason: "unclassified dependency pause".into(),
+                        },
+                    },
+                );
+                // Capacity is deliberately never granted. A terminal sibling must
+                // not hide a new pause or force the parent to keep an admission wait.
+                let (host, state, outcome) = tokio::time::timeout(Duration::from_millis(200), task)
+                    .await
+                    .expect("committed pause must interrupt readmission")
+                    .unwrap();
+                if cancelled {
+                    assert_eq!(outcome.unwrap_err().kind, astra_core::ErrorKind::Cancelled);
+                    assert!(host.executed_messages.is_empty());
+                    assert_eq!(owner.pending_direct_children().len(), 2);
+                    continue;
+                }
+                assert_eq!(
+                    outcome.unwrap(),
+                    RuntimeActivityOutcome::ExecutionPaused("unclassified dependency pause".into())
+                );
+                assert!(host.executed_messages.is_empty());
+                assert!(host.execution_capacity_releases >= 2);
+                assert_eq!(owner.pending_direct_children().len(), 1);
+                assert!(owner.has_retained_direct_child_result("completed-sibling"));
+                assert!(
+                    serde_json::to_string(&state.volatile_pending)
+                        .unwrap()
+                        .contains("sibling evidence")
+                );
+                assert!(state.final_text.is_empty());
+                assert!(!owner.finalize_direct_children_if_settled());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_dependency_at_soft_cutoff_preserves_live_execution_authority() {
+        tokio::time::pause();
+        let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "parent-run",
+            "child-agent",
+        );
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            agent_id: "child-agent".into(),
+            run_id: "child-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            status: crate::orchestration::AgentStatus::Running {
+                activity: "working".into(),
+            },
+        });
+        let wait_started = Arc::new(tokio::sync::Notify::new());
+        let mut host =
+            MockHost::new(vec![]).with_execution_time_budget_remaining(Duration::from_secs(45));
+        host.direct_child_owner = Some(Arc::clone(&owner));
+        host.child_wait_started = Some(Arc::clone(&wait_started));
+        let mut state = make_state();
+        state.current_run_id = Some("parent-run".into());
+        let task = tokio::spawn(async move {
+            let outcome = await_direct_children_before_completion(
+                &mut host,
+                &mut state,
+                ContinuationAuthority::Runtime,
+            )
+            .await;
+            (host, state, outcome)
+        });
+        wait_started.notified().await;
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            agent_id: "child-agent".into(),
+            run_id: "child-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            status: crate::orchestration::AgentStatus::Paused {
+                reason: "awaiting continuation".into(),
+            },
+        });
+        // Both the 15s synthesis cutoff and pause are ready when the parent
+        // next polls; its actual 45s execution authority is still live.
+        tokio::time::advance(Duration::from_secs(16)).await;
+        let (host, state, outcome) = task.await.unwrap();
+        assert_eq!(
+            outcome.unwrap(),
+            RuntimeActivityOutcome::ExecutionPaused("awaiting continuation".into())
+        );
+        assert!(host.executed_messages.is_empty());
+        assert!(state.interruption.is_none());
+        assert!(owner.has_pending_direct_children());
+        assert!(!owner.finalize_direct_children_if_settled());
+    }
+
+    #[tokio::test]
     async fn completion_wait_preserves_authorized_budget_beyond_observation_cap() {
         tokio::time::pause();
         for remaining in [Some(Duration::from_secs(900)), None] {
@@ -10357,7 +10764,11 @@ mod tests {
                     finish_reason: None,
                 },
             });
-            assert!(task.await.unwrap().unwrap(), "budget {remaining:?}");
+            assert_eq!(
+                task.await.unwrap().unwrap(),
+                RuntimeActivityOutcome::InputReady,
+                "budget {remaining:?}"
+            );
         }
     }
 
@@ -10461,7 +10872,7 @@ mod tests {
             .await
             .expect("guidance must wake parent")
             .unwrap();
-        assert!(outcome.unwrap());
+        assert_eq!(outcome.unwrap(), RuntimeActivityOutcome::InputReady);
         assert_eq!(host.user_intent_applied_indices, vec![0]);
         assert_eq!(state.message, "Use GLM for review.");
         assert_eq!(provider.poll_call_count().await, 1);
@@ -10701,7 +11112,7 @@ mod tests {
             .await
             .expect("first child must wake execution")
             .unwrap();
-        assert!(result.unwrap());
+        assert_eq!(result.unwrap(), RuntimeActivityOutcome::InputReady);
         assert!(
             serde_json::to_string(&state.volatile_pending)
                 .unwrap()

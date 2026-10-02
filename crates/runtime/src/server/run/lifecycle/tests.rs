@@ -1090,6 +1090,12 @@ async fn exercise_primary_continuation_entry(
                 .iter()
                 .any(|tool| tool["function"]["name"] == "settle_work_item")
         });
+        let observer_selected = request["messages"].as_array().is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == "continuation-observer-schema"
+            })
+        });
         let evidence = request["messages"]
             .as_array()
             .and_then(|messages| {
@@ -1118,8 +1124,10 @@ async fn exercise_primary_continuation_entry(
                 );
                 json!({"scope":value["scope"],"data_coverage":value["data_coverage"],"projection_budget":value["projection_budget"],"source_budget":value["source_budget"]})
             });
-        let message = if row.1 == "running" && evidence.is_none() {
-            json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-overview","type":"function","function":{"name":"introspect","arguments":json!({"facet":"overview","depth":"summary","format":"json"}).to_string()}}]})
+        let message = if row.1 == "running" && evidence.is_none() && !observer_selected {
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-observer-schema","type":"function","function":{"name":"tool_search","arguments":json!({"query":"select:introspect"}).to_string()}}]})
+        } else if row.1 == "running" && evidence.is_none() {
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-overview","type":"function","function":{"name":"invoke_tool","arguments":json!({"name":"introspect","arguments":{"facet":"overview","depth":"summary","format":"json"}}).to_string()}}]})
         } else if row.1 == "running" && can_settle {
             probe
                 .settlements
@@ -3888,6 +3896,7 @@ impl SpawnAgentExecutor for ImmediateLifecycleExecutor {
         Ok(SpawnRunResult {
             agent_id: config.agent_id,
             run_id: config.run_id,
+            committed_frontier: None,
             status: "completed".to_string(),
             finish_reason: "normal".to_string(),
             cancellation_origin: CancellationOrigin::Unverified,
@@ -3913,6 +3922,7 @@ impl SpawnAgentExecutor for WaitingLifecycleExecutor {
         Ok(SpawnRunResult {
             agent_id: config.agent_id,
             run_id: config.run_id,
+            committed_frontier: None,
             status: "waiting".to_string(),
             finish_reason: "waiting".to_string(),
             cancellation_origin: CancellationOrigin::Unverified,
@@ -8047,7 +8057,11 @@ fn server_subrun_waiting_is_recoverable_and_not_terminated() {
     );
     assert_eq!(
         server_subrun_outcome_status(&outcome, &state),
-        STATUS_WAITING
+        STATUS_PAUSED
+    );
+    assert_eq!(
+        server_subrun_durable_status(&outcome, &state),
+        STATUS_PAUSED
     );
 }
 
@@ -8316,6 +8330,16 @@ fn server_subrun_provider_failure_remains_failed() {
 
 #[test]
 fn activation_cas_loser_projects_exact_durable_winner() {
+    let paused = activation_agent_result_from_durable_winner(
+        "agent-1".to_string(),
+        "run-1".to_string(),
+        crate::orchestration::AgentStatus::Paused {
+            reason: "executor_offline".to_string(),
+        },
+    );
+    assert_eq!(paused.status, STATUS_PAUSED);
+    assert_eq!(paused.output.as_deref(), Some("executor_offline"));
+    assert!(paused.error.is_none());
     let completed = activation_agent_result_from_durable_winner(
         "agent-1".to_string(),
         "run-1".to_string(),
@@ -8395,9 +8419,11 @@ fn server_subrun_requires_intervention_from_typed_interruption() {
         server_subrun_durable_status(&outcome, &state),
         STATUS_PAUSED
     );
+    assert_eq!(server_subrun_live_termination(&outcome, &state), None);
+    let reason = server_subrun_interruption_reason(&state);
     assert_eq!(
-        server_subrun_live_termination(&outcome, &state),
-        Some(astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted)
+        server_subrun_waiting_for(&outcome, STATUS_PAUSED, reason.as_deref()),
+        Some("empty_completion: paused task needs direction")
     );
     assert_eq!(
         server_subrun_live_reason(&outcome, &state).as_deref(),
@@ -13753,7 +13779,7 @@ async fn activation_user_winner_converges_recovered_subrun_grandchildren() {
         .map(|claim| claim.run.run_generation)
         .expect("recovered subrun generation");
 
-    let result = settle_subrun_activation_cancellation(
+    let (result, committed_frontier) = settle_subrun_activation_cancellation(
         &run_engine,
         None,
         &config,
@@ -13762,6 +13788,13 @@ async fn activation_user_winner_converges_recovered_subrun_grandchildren() {
     .await;
 
     assert_eq!(result.status, STATUS_CANCELLED);
+    let committed_frontier = committed_frontier.expect("winning cancellation provenance");
+    assert_eq!(committed_frontier.run_id, config.run_id);
+    assert_eq!(
+        committed_frontier.run_generation,
+        recovered_subrun_generation
+    );
+    assert!(committed_frontier.last_event_idx.is_some());
     for run_id in [
         "activation-recovered-subrun",
         "activation-child",
@@ -13910,7 +13943,7 @@ async fn activation_cancellation_cas_cannot_terminalize_a_rotated_generation() {
             && claim.run.run_generation > authority.owner_generation
     }));
 
-    let result = settlement.await.expect("settlement task");
+    let (result, committed_frontier) = settlement.await.expect("settlement task");
     assert_eq!(
         result.status,
         astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL
@@ -13921,6 +13954,11 @@ async fn activation_cancellation_cas_cannot_terminalize_a_rotated_generation() {
         .unwrap()
         .unwrap();
     assert!(durable.run_generation > authority.owner_generation);
+    assert_eq!(
+        committed_frontier,
+        Some(crate::orchestration::spawner::SpawnRunFrontier::from_durable(&durable)),
+        "result provenance is the winning row, not the acquired generation"
+    );
     assert_eq!(durable.status, STATUS_RUNNING);
     assert!(durable.events.iter().all(|event| {
         event.pointer("/data/status").and_then(Value::as_str) != Some(STATUS_CANCELLED)
@@ -14337,6 +14375,63 @@ async fn server_subrun_rejects_work_item_without_parent_work_before_child_insert
 }
 
 #[tokio::test]
+async fn server_subrun_pause_receipt_is_acknowledged_generation_not_invented_frontier() {
+    let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    let authority = run_engine
+        .start_run("receipt-child", "user-1", "session-1")
+        .await
+        .unwrap();
+    let executor = ServerSubRunExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    )
+    .with_run_engine(run_engine.clone());
+
+    let receipt = executor
+        .persist_durable_subrun_status(
+            "user-1",
+            "session-1",
+            "receipt-child",
+            Some(authority.owner_generation),
+            STATUS_PAUSED,
+            Some("arbitrary pause: review requested"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("fenced pause succeeds")
+        .expect("acknowledged owner generation");
+    assert_eq!(receipt.run_id, "receipt-child");
+    assert_eq!(receipt.run_generation, authority.owner_generation);
+    assert_eq!(receipt.last_event_idx, None);
+    let durable = run_engine
+        .load_run("user-1", "receipt-child")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_PAUSED);
+    assert_eq!(
+        durable.waiting_for.as_deref(),
+        Some("arbitrary pause: review requested")
+    );
+    let (_, observed) = ServerSubRunExecutor::exact_durable_subrun_control_authority(
+        &run_engine,
+        "user-1",
+        "receipt-child",
+        authority.owner_generation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        observed,
+        crate::orchestration::spawner::SpawnRunFrontier::from_durable(&durable)
+    );
+}
+
+#[tokio::test]
 async fn server_subrun_partial_status_persists_typed_error_code() {
     let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
     let authority = run_engine
@@ -14482,6 +14577,15 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
             DurableSubrunToolTerminalCommit {
                 authority: Some(DurableSubrunControlAuthority::Paused),
                 committed: true,
+                committed_frontier: Some(
+                    crate::orchestration::spawner::SpawnRunFrontier::from_durable(
+                        &run_engine
+                            .load_run("user-1", "paused-child")
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    ),
+                ),
             }
         );
     }
@@ -14557,6 +14661,15 @@ async fn delegated_subrun_waiting_settlement_orders_tool_terminal_before_partial
         DurableSubrunToolTerminalCommit {
             authority: None,
             committed: true,
+            committed_frontier: Some(
+                crate::orchestration::spawner::SpawnRunFrontier::from_durable(
+                    &run_engine
+                        .load_run("user-1", "waiting-child")
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                ),
+            ),
         }
     );
     let executor = ServerSubRunExecutor::new(
@@ -14633,6 +14746,15 @@ async fn delegated_subrun_retries_active_event_index_cas_loss_without_dropping_t
         DurableSubrunToolTerminalCommit {
             authority: None,
             committed: true,
+            committed_frontier: Some(
+                crate::orchestration::spawner::SpawnRunFrontier::from_durable(
+                    &run_engine
+                        .load_run("user-1", "cas-loss-child")
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                ),
+            ),
         }
     );
     let durable = run_engine
@@ -14703,6 +14825,15 @@ async fn delegated_subrun_cancel_wins_generation_fenced_terminal_append() {
         DurableSubrunToolTerminalCommit {
             authority: Some(DurableSubrunControlAuthority::Cancelled),
             committed: true,
+            committed_frontier: Some(
+                crate::orchestration::spawner::SpawnRunFrontier::from_durable(
+                    &run_engine
+                        .load_run("user-1", run_id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                ),
+            ),
         }
     );
     let durable = run_engine
@@ -26835,11 +26966,12 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
     let (first, fetches) =
         crate::server::explain_analyze_artifact::count_explain_artifact_fetches(executor.execute(
             "introspect",
-            &json!({"explain": {"target": "previous"}, "max_bytes": 128}),
+            &json!({"explain": {"target": "previous"}, "max_bytes": 4096}),
         ))
         .await;
-    assert!(first.contains(&handle), "{first}");
-    assert!(first.contains("Capture status: complete"), "{first}");
+    let summary: Value = serde_json::from_str(&first).expect("structured Explain summary");
+    assert_eq!(summary["artifact"], handle);
+    assert_eq!(summary["capture_status"], "complete");
     assert!(
         !first.contains(&current),
         "current Explain root must be excluded"
@@ -26995,10 +27127,8 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
     assert_eq!(recovery_fetches.discovery, 2);
     assert_eq!(recovery_fetches.recovery, 1);
     assert!(recovered.contains(&handle), "{recovered}");
-    assert!(
-        recovered.contains("Capture status: complete"),
-        "{recovered}"
-    );
+    let recovered: Value = serde_json::from_str(&recovered).expect("recovered Explain JSON");
+    assert_eq!(recovered["capture_status"], "complete");
     cleanup_lifecycle_run_fixture(&pool, user, &current).await;
 
     cleanup_lifecycle_run_fixture(&pool, user, &run).await;
@@ -27114,8 +27244,9 @@ async fn db_pause_resume_promotes_buffered_completed_terminal_explain_publicatio
             &json!({"explain": {"target": "run", "run_id": run_id}}),
         ))
         .await;
-    assert!(read.contains(handle), "{read}");
-    assert!(read.contains("Capture status: complete"), "{read}");
+    let summary: Value = serde_json::from_str(&read).expect("structured Explain summary");
+    assert_eq!(summary["artifact"], handle);
+    assert_eq!(summary["capture_status"], "complete");
     assert_eq!(fetches.recovery, 0, "resume must already have published");
     let store = astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
         .with_pool(pool.clone());

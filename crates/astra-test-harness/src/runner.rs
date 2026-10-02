@@ -151,7 +151,7 @@ pub struct StreamCapture {
 pub enum StreamCaptureRecord {
     AgentLive {
         stream_index: u64,
-        event: astra_turn_core::agent_live_event::AgentLiveEvent,
+        event: Box<astra_turn_core::agent_live_event::AgentLiveEvent>,
     },
     AgentLiveGap {
         stream_index: u64,
@@ -191,7 +191,7 @@ impl StreamCapture {
                 }
                 StreamCaptureRecord::AgentLive {
                     stream_index,
-                    event,
+                    event: Box::new(event),
                 }
             }
             Some("agent_live_gap") => {

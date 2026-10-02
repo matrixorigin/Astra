@@ -22,6 +22,7 @@ pub enum AgentToolResultStatusKind {
     Cancelled,
     Interrupted,
     Waiting,
+    Paused,
     StillRunning,
     Launched,
     /// Catch-all for unknown wire statuses.
@@ -39,6 +40,7 @@ impl AgentToolResultStatusKind {
             Self::Cancelled => "cancelled",
             Self::Interrupted => "interrupted",
             Self::Waiting => "waiting",
+            Self::Paused => "paused",
             Self::StillRunning => "still_running",
             Self::Launched => "launched",
             Self::Other => "other",
@@ -72,6 +74,7 @@ impl FromStr for AgentToolResultStatusKind {
             "cancelled" => Ok(Self::Cancelled),
             "interrupted" => Ok(Self::Interrupted),
             "waiting" => Ok(Self::Waiting),
+            "paused" => Ok(Self::Paused),
             "still_running" => Ok(Self::StillRunning),
             "launched" => Ok(Self::Launched),
             "other" => Ok(Self::Other),
@@ -92,6 +95,7 @@ pub fn agent_tool_status_needs_recovery(status: AgentToolResultStatusKind) -> bo
             | AgentToolResultStatusKind::Cancelled
             | AgentToolResultStatusKind::Interrupted
             | AgentToolResultStatusKind::Waiting
+            | AgentToolResultStatusKind::Paused
             | AgentToolResultStatusKind::StillRunning
             | AgentToolResultStatusKind::Launched
             | AgentToolResultStatusKind::Other
@@ -550,6 +554,7 @@ pub fn project_agent_tool_wire<'a>(
         }
         Some(DecodedAgentToolResult::ChildResult(
             AgentToolResultStatusKind::Waiting
+            | AgentToolResultStatusKind::Paused
             | AgentToolResultStatusKind::StillRunning
             | AgentToolResultStatusKind::Launched,
         )) => AgentToolWireOutcomeKind::Running,
@@ -652,13 +657,15 @@ pub fn agent_tool_incomplete_reason(parsed: &Value) -> Option<String> {
                 .unwrap_or("child result retrieval failed")
                 .to_string(),
         ),
-        Some(AgentToolResultStatusKind::Waiting) => Some(format!(
-            "child agent is waiting ({})",
-            parsed
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("waiting")
-        )),
+        Some(AgentToolResultStatusKind::Waiting | AgentToolResultStatusKind::Paused) => {
+            Some(format!(
+                "child agent is waiting ({})",
+                parsed
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("waiting")
+            ))
+        }
         Some(AgentToolResultStatusKind::Cancelled) => Some(
             parsed
                 .get("reason")
@@ -829,6 +836,13 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
                 reason.clone()
             },
             "hint": "The child agent is waiting for external input or executor recovery. Do not fabricate its result.",
+        }),
+        AgentStatus::Paused { reason } => json!({
+            "status": AgentToolResultStatusKind::Paused.as_str(),
+            "agent_id": agent_id,
+            "reason": reason,
+            "resumable": true,
+            "hint": "The child agent has a committed execution pause. Preserve its run and resume it when the blocker is resolved; do not fabricate completion.",
         }),
         AgentStatus::Cancelled { by_user, reason } => {
             let mut payload = json!({
@@ -1302,6 +1316,31 @@ mod tests {
                 .as_str()
                 .is_some_and(|hint| hint.contains("Do not fabricate"))
         );
+    }
+
+    #[test]
+    fn paused_child_wire_preserves_machine_status_without_terminal_success() {
+        let rendered = render_wait_for_agent_status(
+            "paused-child",
+            &AgentStatus::Paused {
+                reason: "executor_offline".into(),
+            },
+        );
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["status"], "paused");
+        assert_eq!(parsed["reason"], "executor_offline");
+        assert_eq!(parsed["resumable"], true);
+        assert_eq!(
+            decode_agent_tool_result(&parsed),
+            Some(DecodedAgentToolResult::ChildResult(
+                AgentToolResultStatusKind::Paused
+            ))
+        );
+        assert!(agent_tool_result_needs_recovery(&parsed));
+        let wire = project_agent_tool_wire("get_result", true, Some(&parsed));
+        assert!(!wire.child_terminal);
+        assert!(!wire.has_result);
+        assert_eq!(wire.outcome, AgentToolWireOutcomeKind::Running);
     }
 
     #[test]

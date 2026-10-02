@@ -491,10 +491,25 @@ pub fn workspace_effect_unsettled_tool_result(name: &str, mut result: ToolResult
     };
     result.is_error = true;
     let metadata = result.metadata.get_or_insert_with(Map::new);
+    // Quarantine is an additional workspace fact, not a replacement for a
+    // provider's unknown outcome. Keep that typed cause so every consumer
+    // retains the non-replay/reconciliation guidance.
+    let outcome_unknown = metadata
+        .get("error_kind")
+        .and_then(Value::as_str)
+        .and_then(astra_core::ErrorKind::parse_tag)
+        == Some(astra_core::ErrorKind::ToolOutcomeUnknown);
     metadata.extend(Map::from_iter([
         (
             "error_kind".to_string(),
-            Value::String(TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED.to_string()),
+            Value::String(
+                if outcome_unknown {
+                    astra_core::ErrorKind::ToolOutcomeUnknown.as_str()
+                } else {
+                    TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED
+                }
+                .to_string(),
+            ),
         ),
         ("execution_started".to_string(), Value::Bool(true)),
         ("side_effects_maybe".to_string(), Value::Bool(true)),

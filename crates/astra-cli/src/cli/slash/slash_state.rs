@@ -1756,6 +1756,7 @@ mod state_command_tests {
                 "decisions": 0
             },
             "summary": summary,
+            "model_requests": astra_services::reflect::ModelRequestCapture::default(),
             "observations": [],
             "evidence": [],
             "action_hints": [],
@@ -2307,6 +2308,7 @@ mod tests {
                 "decisions": 2
             },
             "summary": "One repeated failure is supported by local evidence.",
+            "model_requests": astra_services::reflect::ModelRequestCapture::default(),
             "observations": [{
                 "ref_id": "urn:astra:observation:local:reflect:session:diagnosis:0",
                 "topic": "execution",

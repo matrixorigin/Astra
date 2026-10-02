@@ -925,7 +925,7 @@ mod tests {
         let server_agent = agent_schema(&server);
         assert_eq!(
             actions(server_agent),
-            vec!["spawn", "get_result", "send_message"]
+            vec!["spawn", "list", "get_result", "wait", "send_message"]
         );
         assert!(
             server_agent
@@ -952,7 +952,14 @@ mod tests {
         let local_agent = agent_schema(&local);
         assert_eq!(
             actions(local_agent),
-            vec!["spawn", "get_result", "run_chain", "send_message"]
+            vec![
+                "spawn",
+                "list",
+                "get_result",
+                "wait",
+                "run_chain",
+                "send_message"
+            ]
         );
         assert!(
             local_agent

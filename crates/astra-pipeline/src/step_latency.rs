@@ -249,25 +249,26 @@ mod tests {
 
     #[test]
     fn step_latency_breakdown_handles_no_tool_terminal_step() {
-        let mut events = Vec::new();
-        events.push(make_step_event(
-            "e1",
-            "s1",
-            StepEventType::StepStarted,
-            1_000,
-            None,
-            &[],
-            None,
-        ));
-        events.push(make_step_event(
-            "e2",
-            "s1",
-            StepEventType::StepCompleted,
-            1_250,
-            None,
-            &["e1"],
-            None,
-        ));
+        let events = vec![
+            make_step_event(
+                "e1",
+                "s1",
+                StepEventType::StepStarted,
+                1_000,
+                None,
+                &[],
+                None,
+            ),
+            make_step_event(
+                "e2",
+                "s1",
+                StepEventType::StepCompleted,
+                1_250,
+                None,
+                &["e1"],
+                None,
+            ),
+        ];
 
         let breakdown = step_latency_breakdown_from_events(&events);
 

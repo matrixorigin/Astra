@@ -4,6 +4,7 @@
 from pathlib import Path
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import tomllib
@@ -17,20 +18,58 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class BuildCoverageTests(unittest.TestCase):
+    def test_make_lint_preserves_restored_artifacts_and_checks_all_targets(self):
+        result = subprocess.run(
+            ["make", "--no-print-directory", "-n", "lint", "CARGO=cargo"],
+            cwd=ROOT,
+            env={**os.environ, "MAKEFLAGS": "", "MFLAGS": ""},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        commands = result.stdout
+        clippy = next(
+            shlex.split(line) for line in commands.splitlines()
+            if line.startswith("cargo clippy ")
+        )
+        self.assertIn("--all-targets", clippy)
+        self.assertEqual(clippy[clippy.index("--") + 1:], ["-D", "warnings"])
+        self.assertNotRegex(
+            commands,
+            r"(?i)\bsweep\b|\bfind\b[^\n]*(?:-mmin|-mtime|-delete)|\bcargo\s+clean\b",
+            "Lint must not age-delete restored build artifacts before checking",
+        )
+
     def test_every_workspace_crate_has_an_offline_test_shard(self):
         workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
         assigned = set()
-        for shard in ("a", "b", "c", "d"):
-            section = workflow.split(f"\n  shard-{shard}:\n", 1)[1]
+        for job in ("cli-test-build", "shard-b", "shard-c", "shard-d"):
+            section = workflow.split(f"\n  {job}:\n", 1)[1]
             section = re.split(r"\n  [a-z][a-z-]*:\n", section, maxsplit=1)[0]
-            for command in re.findall(r"cargo nextest run\b(.*?)(?=\n      -|\Z)", section, re.S):
+            for command in re.findall(r"cargo nextest (?:run|archive)\b(.*?)(?=\n      -|\Z)", section, re.S):
                 assigned.update(re.findall(r"-p\s+([\w-]+)", command))
         packages = {
             tomllib.loads((ROOT / member / "Cargo.toml").read_text())["package"]["name"]
             for member in workspace["members"]
         }
         self.assertEqual(packages - assigned, set(), "Workspace crates missing from CI test shards")
+
+    def test_cli_archive_includes_required_standalone_mcp_fixture(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        producer = workflow.split("\n  cli-test-build:\n", 1)[1].split("\n  shard-a:\n", 1)[0]
+        self.assertIn("cargo build --locked -p astra-cli --bin mock_mcp_server", producer)
+        archive_command = re.search(r"run: (cargo nextest archive[^\n]+)", producer).group(1)
+        args = shlex.split(archive_command)
+        self.assertEqual(args[args.index("-p") + 1], "astra-cli")
+        self.assertTrue({"--locked", "--lib", "--bins"}.issubset(args))
+        self.assertNotIn("-E", args, "Producer must archive the complete CLI inventory")
+        self.assertEqual(args[args.index("--profile") + 1], "ci")
+        config = tomllib.loads((ROOT / ".config/nextest.toml").read_text())
+        includes = config["profile"]["ci"]["archive"]["include"]
+        fixture = next(item for item in includes if item["path"] == "debug/mock_mcp_server")
+        self.assertEqual(fixture["relative-to"], "target")
+        self.assertEqual(fixture["on-missing"], "error")
 
     def test_vendored_terminal_units_are_locked_and_pty_tests_run_both_readers(self):
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
@@ -60,6 +99,23 @@ class BuildCoverageTests(unittest.TestCase):
         self.assertIn("cargo build --locked -p astra-cli --bin astra", commands)
         self.assertIn("npm ci --ignore-scripts --prefix scripts/tui-reflow", commands)
         self.assertIn('ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow', commands)
+
+    def test_macos_cli_bash_reuses_default_reader_without_losing_coordination_contracts(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        terminal = workflow.split("\n  terminal-pty-shards:\n", 1)[1].split("\n  macos-workspace-coordination:\n", 1)[0]
+        self.assertEqual(workflow.count("- name: Test macOS CLI Bash execution"), 1)
+        bash = terminal.split("      - name: Test macOS CLI Bash execution\n", 1)[1].split("      - ", 1)[0]
+        self.assertIn("if: matrix.os == 'macos-15' && matrix.segment == 'default-reader'", bash)
+        self.assertIn("--lib edge_tools::shell::tests::bash_echo_returns_output -- --exact", bash)
+        self.assertLess(terminal.index("Test default terminal reader through PTYs"), terminal.index("Initialize system Git for macOS CLI observation"))
+        self.assertLess(terminal.index("Initialize system Git for macOS CLI observation"), terminal.index("Test macOS CLI Bash execution"))
+        contracts = workflow.split("\n  macos-workspace-coordination-tests:\n", 1)[1].split("\n  test-online-core:", 1)[0]
+        self.assertIn('install-nextest: "false"', contracts)
+        self.assertIn("-p astra-tools", contracts)
+        self.assertIn("--all-targets -- -D warnings", contracts)
+        self.assertIn("workspace_observation::tests:: -- --test-threads=1", contracts)
+        self.assertIn("/usr/bin/git", contracts)
+        self.assertNotIn("-p astra-cli", contracts, "Do not compile the same CLI test executable twice on macOS")
 
     def test_ci_resolves_the_actual_builder_base_not_only_the_planner(self):
         dockerfile = (ROOT / "Dockerfile").read_text()

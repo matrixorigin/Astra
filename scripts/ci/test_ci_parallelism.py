@@ -2,7 +2,9 @@
 """Exercise CI gates and the real Makefile's online shard dispatch offline."""
 
 import json
+from itertools import product
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -20,18 +22,135 @@ SHARDS = {
 }
 
 
+class CliArchiveTests(unittest.TestCase):
+    def setUp(self):
+        self.workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        self.producer = self.workflow.split("\n  cli-test-build:\n", 1)[1].split("\n  shard-a:\n", 1)[0]
+        self.consumer = self.workflow.split("\n  shard-a:\n", 1)[1].split("\n  shard-b:\n", 1)[0]
+
+    def test_required_labels_have_one_shell_and_four_complementary_partitions(self):
+        matrix = self.consumer.split("        include:\n", 1)[1].split("    steps:\n", 1)[0]
+        rows = re.findall(
+            r'- segment: ([\w-]+)\n\s+filter: "([^"]+)"\n\s+partition: ([^\n]+)', matrix
+        )
+        self.assertEqual(len(rows), 5)
+        self.assertEqual({row[0] for row in rows}, {
+            "non-edge", "edge-shell", "edge-fs-tools", "edge-git-gix", "edge-rest",
+        })
+        shell = [row for row in rows if row[0] == "edge-shell"]
+        self.assertEqual(shell, [("edge-shell", "test(/edge_tools::shell::/)", '""')])
+        others = [row for row in rows if row[0] != "edge-shell"]
+        self.assertEqual({row[1] for row in others}, {"not test(/edge_tools::shell::/)"})
+        self.assertEqual(sorted(row[2] for row in others), [f"hash:{i}/4" for i in range(1, 5)])
+        self.assertIn('name: "Test: astra-cli (${{ matrix.segment }})"', self.consumer)
+
+    def test_failed_producer_is_rejected_before_archive_execution(self):
+        gate = self.consumer.split("      - name: Require shared CLI build\n", 1)[1].split("      - ", 1)[0]
+        self.assertIn("if: env.RUN_TESTS == 'true'", gate)
+        self.assertIn("BUILD_RESULT: ${{ needs.cli-test-build.result }}", gate)
+        script = gate.split("        run: ", 1)[1].strip()
+        for status in ("success", "failure", "cancelled", "skipped", ""):
+            with self.subTest(status=status):
+                result = subprocess.run(["bash", "-c", script],
+                    env={**os.environ, "BUILD_RESULT": status}, capture_output=True)
+                self.assertEqual(result.returncode == 0, status == "success")
+        self.assertLess(self.consumer.index("Require shared CLI build"), self.consumer.index("actions/download-artifact@"))
+        self.assertIn("needs: [scope, cli-test-build]", self.consumer)
+        self.assertIn("if: ${{ !cancelled() }}", self.consumer)
+        for section in (self.producer, self.consumer):
+            self.assertIn("needs.scope.result != 'success'", section)
+            self.assertIn("needs.scope.outputs.test_cli == 'true'", section)
+        for job in ("shard-b", "shard-c", "shard-d"):
+            header = self.workflow.split(f"\n  {job}:\n", 1)[1].split("    steps:\n", 1)[0]
+            self.assertIn("needs: scope", header)
+            self.assertNotIn("cli-test-build", header)
+
+    def test_archive_handoff_is_revision_bound_and_consumers_do_not_build(self):
+        identity = "name: cli-tests-${{ github.sha }}-${{ github.run_id }}"
+        self.assertEqual(self.producer.count(identity), 1)
+        self.assertEqual(self.consumer.count(identity), 1)
+        self.assertIn("if-no-files-found: error", self.producer)
+        self.assertIn("overwrite: true", self.producer)
+        self.assertNotIn("overwrite:", self.consumer)
+        self.assertIn("retention-days: 1", self.producer)
+        self.assertIn('build-tools: "false"', self.consumer)
+        self.assertNotRegex(self.consumer, r"cargo\s+(?:build|test|nextest\s+archive)\b")
+        download = self.consumer.split("      - uses: actions/download-artifact@", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("if: env.RUN_TESTS == 'true'", download)
+        self.assertNotIn("continue-on-error", download)
+        self.assertNotIn("run-id:", download)
+        self.assertIn("cancel-in-progress: true", self.workflow)
+        setup = (ROOT / ".github/actions/rust-setup/action.yml").read_text()
+        for marker in ("- name: Free disk space",
+                       "- name: Install mold linker", "- name: Install sccache",
+                       "- uses: Swatinem/rust-cache@"):
+            block = setup.split(marker, 1)[1].split("\n    - ", 1)[0]
+            self.assertIn("inputs.build-tools == 'true'", block)
+        self.assertRegex(setup, r"tool: cargo-nextest@\d+\.\d+\.\d+")
+
+    def test_consumer_shell_preserves_partition_remap_and_fails_without_fallback(self):
+        script = workflow_run_script(".github/workflows/test.yml", '"Test astra-cli (${{ matrix.segment }})"')
+        for partition in ("", "hash:1/4", "hash:2/4", "hash:3/4", "hash:4/4"):
+            for archive_present, failed_run in ((True, False), (False, False), (True, True)):
+                with self.subTest(partition=partition, archive=archive_present, failed=failed_run), tempfile.TemporaryDirectory() as directory:
+                    fixture = Path(directory)
+                    (fixture / "target").mkdir()
+                    if archive_present:
+                        (fixture / "target/astra-cli-tests.tar.zst").touch()
+                    stub = fixture / "cargo-nextest"
+                    stub.write_text(f"#!{sys.executable}\n" + '''
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with open("calls.jsonl", "a") as output:
+    output.write(json.dumps(args) + "\\n")
+if args[:2] != ["nextest", "run"] or "--archive-file" not in args:
+    sys.exit(99)
+if not Path(args[args.index("--archive-file") + 1]).is_file():
+    sys.exit(44)
+sys.exit(45 if os.environ["FAIL_RUN"] == "1" else 0)
+''')
+                    stub.chmod(0o755)
+                    # Never let a regression invoke the host's real Cargo.
+                    cargo_guard = fixture / "cargo"
+                    cargo_guard.write_text(stub.read_text())
+                    cargo_guard.chmod(0o755)
+                    result = subprocess.run(["bash", "-c", script], cwd=fixture, env={
+                        **os.environ, "PATH": f"{fixture}{os.pathsep}{os.environ['PATH']}",
+                        "NEXTEST_PARTITION": partition, "NEXTEST_FILTER": "test(/edge_tools::shell::/)" if not partition else "not test(/edge_tools::shell::/)",
+                        "COMMAND_TIMEOUT": "5s", "GITHUB_WORKSPACE": str(fixture / "workspace with spaces"),
+                        "FAIL_RUN": "1" if failed_run else "0",
+                    }, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0 if archive_present and not failed_run else (45 if failed_run else 44), result.stderr)
+                    calls = [json.loads(line) for line in (fixture / "calls.jsonl").read_text().splitlines()]
+                    self.assertEqual(len(calls), 1, "Archive errors must not trigger fallback builds/runs")
+                    args = calls[0]
+                    self.assertEqual(args[args.index("--workspace-remap") + 1], str(fixture / "workspace with spaces"))
+                    self.assertEqual(args[args.index("--extract-to") + 1], "target/cli-test-extract")
+                    self.assertEqual(args[args.index("--profile") + 1], "ci")
+                    self.assertEqual(args[args.index("-E") + 1], "test(/edge_tools::shell::/)" if not partition else "not test(/edge_tools::shell::/)")
+                    if partition:
+                        self.assertEqual(args[args.index("--partition") + 1], partition)
+                    else:
+                        self.assertNotIn("--partition", args)
+
+
 class ParallelGateTests(unittest.TestCase):
-    def test_terminal_gate_rejects_failure_cancellation_and_unexpected_skip(self):
-        script = workflow_run_script(".github/workflows/test.yml", "Require terminal PTY shards")
-        for required in (True, False):
-            for status in ("success", "failure", "cancelled", "skipped", ""):
-                with self.subTest(required=required, status=status):
-                    result = subprocess.run(["bash", "-c", script], env={
-                        **os.environ, "SHARDS_REQUIRED": str(required).lower(),
-                        "SHARDS_RESULT": status,
-                    }, capture_output=True, text=True)
-                    expected = status == "success" or (not required and status == "skipped")
-                    self.assertEqual(result.returncode == 0, expected)
+    def test_shard_gates_reject_failure_cancellation_and_unexpected_skip(self):
+        for step, variables in (
+            ("Require terminal PTY shards", ("SHARDS_RESULT",)),
+            ("Require macOS coordination and CLI execution", ("COORDINATION_RESULT", "TERMINAL_RESULT")),
+        ):
+            script = workflow_run_script(".github/workflows/test.yml", step)
+            for required in (True, False):
+                for statuses in product(("success", "failure", "cancelled", "skipped", ""), repeat=len(variables)):
+                    with self.subTest(step=step, required=required, statuses=statuses):
+                        result = subprocess.run(["bash", "-c", script], env={
+                            **os.environ, "SHARDS_REQUIRED": str(required).lower(),
+                            **dict(zip(variables, statuses)),
+                        }, capture_output=True, text=True)
+                        expected = all(status == "success" or (not required and status == "skipped") for status in statuses)
+                        self.assertEqual(result.returncode == 0, expected)
 
     def test_online_gate_requires_all_matrix_jobs_to_succeed(self):
         script = workflow_run_script(".github/workflows/test.yml", "Require online shards")
@@ -56,6 +175,14 @@ class ParallelGateTests(unittest.TestCase):
         self.assertIn("needs.scope.outputs.test_core == 'true'", terminal)
         self.assertIn("needs.terminal-pty-shards.result", terminal)
         self.assertIn("if: ${{ !cancelled() }}", terminal)
+        coordination = workflow.split("\n  macos-workspace-coordination:\n", 1)[1].split("\n  macos-workspace-coordination-tests:", 1)[0]
+        self.assertIn('name: "Test: macOS workspace coordination"', coordination)
+        self.assertIn("needs: [scope, macos-workspace-coordination-tests, terminal-pty-shards]", coordination)
+        self.assertIn("needs.scope.result != 'success'", coordination)
+        self.assertIn("if: ${{ !cancelled() }}", coordination)
+        contracts = workflow.split("\n  macos-workspace-coordination-tests:\n", 1)[1].split("    steps:\n", 1)[0]
+        self.assertIn("needs: scope", contracts)
+        self.assertNotIn("terminal-pty-shards", contracts, "Tools contracts must not wait for the CLI build")
         online = workflow.split("\n  test-online:\n", 1)[1]
         self.assertIn("lane: [core-runtime, core-turn-core, core-services, integration]", online)
         self.assertIn("matrix.lane != 'integration' && needs.scope.outputs.online_core == 'true'", online)

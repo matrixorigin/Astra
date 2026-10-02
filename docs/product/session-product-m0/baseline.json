@@ -320,7 +320,7 @@
       "offline_archive": "archive legacy verifier inputs/results without treating them as current acceptance",
       "drop": "inline mutable check lists as completion authority",
       "replacement": "Work CheckRun and explicit AcceptanceDecision",
-      "sources": ["crates/astra-plan/src/execution.rs", "crates/services/src/work/evidence.rs", "crates/services/src/work/acceptance.rs"]
+      "sources": ["crates/services/src/work/evidence.rs", "crates/services/src/work/acceptance.rs"]
     }
   ],
   "topologies": [

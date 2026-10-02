@@ -990,7 +990,7 @@ mod tests {
         assert!(
             tool_section
                 .text
-                .contains("Call a structured tool only if it is visible")
+                .contains("Native calls must use current `tools[]`")
         );
         assert!(
             tool_section
@@ -1711,7 +1711,7 @@ mod tests {
         assert!(
             section
                 .text
-                .contains("Call a structured tool only if it is visible")
+                .contains("Native calls must use current `tools[]`")
         );
     }
 

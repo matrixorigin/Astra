@@ -2935,6 +2935,17 @@ impl RuntimeToolExecutor {
         }
     }
 
+    pub async fn wait_for_direct_child_pause(
+        &self,
+        owner: &crate::orchestration::FanoutParentAdmission,
+    ) {
+        if let Some(context) = self.agent_tool_context_snapshot() {
+            context.spawner.wait_for_direct_child_pause(owner).await;
+        } else {
+            owner.wait_for_direct_child_pause().await;
+        }
+    }
+
     /// Publish the root semantic effect boundary to the already-wired dynamic
     /// agent context before a spawn/fanout call can execute.
     pub fn set_workspace_mutation_intent(
@@ -8461,6 +8472,7 @@ pub(crate) mod tests {
     fn agent_waiting_output_becomes_execution_boundary_blocked_result() {
         let result = agent_tool_result_from_output(
             json!({
+                "result_family": "child_result",
                 "status": "waiting",
                 "agent_id": "reviewer-1",
                 "reason": "executor_offline"
@@ -8481,6 +8493,7 @@ pub(crate) mod tests {
     fn generic_agent_waiting_output_stays_structured_but_not_execution_boundary() {
         let result = agent_tool_result_from_output(
             json!({
+                "result_family": "child_result",
                 "status": "waiting",
                 "agent_id": "reviewer-1",
                 "reason": "tool_approval"
@@ -12895,7 +12908,8 @@ esac
             crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
                 "calculator",
                 &["mcp__calculator"],
-            ),
+            )
+            .with_test_workspace_effect(astra_turn_types::ResolvedToolEffect::ReadOnly),
         ));
         let mut request = exec.tool_execution_request("mcp__calculator", &json!({"expr": "1+1"}));
         request.tool_call_id = " \t".to_string();
@@ -12999,7 +13013,8 @@ esac
                 "mail",
                 &["mcp__mail__send"],
                 &endpoint,
-            ),
+            )
+            .with_test_workspace_effect(astra_turn_types::ResolvedToolEffect::ReadOnly),
         ));
         exec.set_provider_interaction_gate(Arc::new(FixedProviderInteractionGate {
             calls: Arc::clone(&gate_calls),

@@ -301,6 +301,14 @@ pub(crate) async fn render_reflect_surface_for_session_with_profile(
     } else {
         None
     };
+    if window
+        .as_ref()
+        .is_some_and(|window| window.events.is_empty() && window.local_read_error)
+    {
+        return Err(
+            "failed to read session journal: no readable authorized observation source".into(),
+        );
+    }
     let semantic_judgments = semantic_judgment_facet_enabled(request.facet).then(|| {
         if let Some(window) = &window {
             window.semantic_judgments(session_id, request.depth)

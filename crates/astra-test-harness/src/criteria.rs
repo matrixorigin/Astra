@@ -5769,8 +5769,12 @@ mod tests {
         let mut outcome = outcome_with_tools(&["agent"]);
         outcome.run_id = Some("root-run".into());
         assert!(
-            evaluate_deterministic_with_session(&[criterion.clone()], &outcome, Some(&session))[0]
-                .passed
+            evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&session)
+            )[0]
+            .passed
         );
         let unknown = mk_session(&[(
             "turn",
@@ -5779,8 +5783,12 @@ mod tests {
             }),
         )]);
         assert!(
-            !evaluate_deterministic_with_session(&[criterion.clone()], &outcome, Some(&unknown))[0]
-                .passed
+            !evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&unknown)
+            )[0]
+            .passed
         );
         outcome.run_id = None;
         assert!(
@@ -6023,13 +6031,19 @@ mod tests {
         };
         let outcome = outcome_with_tools(&[]);
         let check = |capture: &SessionCapture| {
-            evaluate_deterministic_with_session(&[criterion.clone()], &outcome, Some(capture))[0]
-                .passed
+            evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(capture),
+            )[0]
+            .passed
         };
         assert!(check(&session));
         assert!(!check(&mk_session(&[])));
         assert!(
-            !evaluate_deterministic_with_session(&[criterion.clone()], &outcome, None)[0].passed
+            !evaluate_deterministic_with_session(std::slice::from_ref(&criterion), &outcome, None)
+                [0]
+            .passed
         );
         assert!(!child_result_adoption_proven(
             &session,
@@ -7469,7 +7483,7 @@ mod tests {
         let explicit_null = session_with_args(r#"{"action":null,"requested_model_policy":null}"#);
         assert!(
             evaluate_deterministic_with_session(
-                &[null_filter.clone()],
+                std::slice::from_ref(&null_filter),
                 &outcome,
                 Some(&explicit_null)
             )[0]

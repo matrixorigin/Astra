@@ -1839,7 +1839,7 @@ fn lsp_code_lenses_execute_rust_analyzer_runnable_fallback_when_dry_run_false() 
     );
     std::fs::write(
         dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[workspace]\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -1867,7 +1867,7 @@ fn lsp_code_lenses_execute_rust_analyzer_runnable_fallback_when_dry_run_false() 
         Some("textDocument/codeLens")
     );
     assert_eq!(parsed["source"].as_str(), Some("rust-analyzer-runnables"));
-    assert_eq!(parsed["executed"].as_bool(), Some(true));
+    assert_eq!(parsed["executed"].as_bool(), Some(true), "{parsed}");
     assert_eq!(parsed["command"].as_str(), Some("cargo"));
     assert_eq!(parsed["cwd"].as_str(), Some(dir.path().to_str().unwrap()));
     let expected_command_line = format!(
@@ -2205,7 +2205,7 @@ fn lsp_code_lenses_execute_native_rust_analyzer_code_lens_when_dry_run_false() {
     );
     std::fs::write(
         dir.path().join("Cargo.toml"),
-        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[workspace]\n",
     )
     .unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -2229,7 +2229,7 @@ fn lsp_code_lenses_execute_native_rust_analyzer_code_lens_when_dry_run_false() {
 
     assert_eq!(parsed["method"].as_str(), Some("textDocument/codeLens"));
     assert_eq!(parsed["source"].as_str(), Some("rust-analyzer-runnables"));
-    assert_eq!(parsed["executed"].as_bool(), Some(true));
+    assert_eq!(parsed["executed"].as_bool(), Some(true), "{parsed}");
     assert!(
         parsed["stdout"]
             .as_str()

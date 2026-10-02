@@ -7335,6 +7335,7 @@ mod tests {
 
     struct FlakyBatchTransitionStore {
         inner: InMemoryRunStateStore,
+        hide_embedded_checkpoint_in_recovery_claims: bool,
         fail_remaining: AtomicUsize,
         cancellation_lookup_failures: AtomicUsize,
         load_run_control_failures: AtomicUsize,
@@ -7385,6 +7386,7 @@ mod tests {
         fn new(failures: usize, mode: BatchTransitionFailureMode) -> Self {
             Self {
                 inner: InMemoryRunStateStore::new(),
+                hide_embedded_checkpoint_in_recovery_claims: false,
                 fail_remaining: AtomicUsize::new(failures),
                 cancellation_lookup_failures: AtomicUsize::new(0),
                 load_run_control_failures: AtomicUsize::new(0),
@@ -8003,7 +8005,14 @@ mod tests {
             if consume_failure(&self.recovery_claim_failures) {
                 return Err("store unavailable".into());
             }
-            self.inner.claim_recoverable_active_runs(limit).await
+            let mut claims = self.inner.claim_recoverable_active_runs(limit).await?;
+            if self.hide_embedded_checkpoint_in_recovery_claims {
+                for claim in &mut claims {
+                    claim.run.checkpoint_version = None;
+                    claim.run.checkpoint_json = None;
+                }
+            }
+            Ok(claims)
         }
 
         async fn claim_expired_recoverable_active_runs(
@@ -11894,7 +11903,12 @@ mod tests {
 
     #[tokio::test]
     async fn recover_active_runs_uses_canonical_history_when_embedded_head_is_missing() {
-        let store = Arc::new(InMemoryRunStateStore::new());
+        // Model a missing embedded projection at the recovery read boundary;
+        // canonical checkpoint history remains owned by the real memory store.
+        let mut store =
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite);
+        store.hide_embedded_checkpoint_in_recovery_claims = true;
+        let store = Arc::new(store);
         let engine = RunEngine::new(store.clone());
         engine
             .start_run("run-history-only", "user-1", "sess-history-only")
@@ -11909,15 +11923,6 @@ mod tests {
             )
             .await
             .unwrap();
-
-        let mut run = store
-            .load_run("user-1", "run-history-only")
-            .await
-            .unwrap()
-            .unwrap();
-        run.checkpoint_version = None;
-        run.checkpoint_json = None;
-        store.insert_run(run).await.unwrap();
 
         let recovered = engine.recover_active_runs().await.unwrap();
         let resumed = recovered
@@ -11950,7 +11955,11 @@ mod tests {
             r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"legacy-only"}"#
                 .to_string(),
         );
+        // Seed an embedded-only legacy row once into a fresh store; insert_run
+        // is deliberately not an update API and must reject duplicates.
+        let store = Arc::new(InMemoryRunStateStore::new());
         store.insert_run(run).await.unwrap();
+        let engine = RunEngine::new(store);
 
         let recovered = engine.recover_active_runs().await.unwrap();
         let failed = recovered

@@ -2134,22 +2134,23 @@ pub(crate) async fn drain_provider_settlement_coordinator(_timeout: std::time::D
     true
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e-hooks"))]
 #[derive(Clone, Default)]
 pub(crate) struct TestInferenceLedgerPersistence {
     state: Arc<std::sync::Mutex<TestInferenceLedgerState>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e-hooks"))]
 #[derive(Default)]
 struct TestInferenceLedgerState {
     invocations: BTreeMap<String, TestInvocationState>,
+    logical_attempt_pairs: BTreeMap<String, BTreeMap<u32, BTreeSet<String>>>,
     attempts: BTreeMap<String, TestProviderAttemptState>,
     owner_lease_lost: bool,
     owner_renewals: u32,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e-hooks"))]
 #[derive(Default)]
 struct TestInvocationState {
     settlement: Option<astra_services::InferenceInvocationTerminal>,
@@ -2158,14 +2159,15 @@ struct TestInvocationState {
     terminal: Option<astra_services::InferenceInvocationTerminal>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e-hooks"))]
 struct TestProviderAttemptState {
     invocation_id: String,
+    #[cfg(test)]
     canonical_transition_hash: Option<String>,
     terminal: Option<astra_services::InferenceInvocationTerminal>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e-hooks"))]
 impl TestInferenceLedgerPersistence {
     fn lock(&self) -> std::sync::MutexGuard<'_, TestInferenceLedgerState> {
         self.state
@@ -2173,6 +2175,7 @@ impl TestInferenceLedgerPersistence {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[cfg(test)]
     pub(crate) fn assert_quiescent(&self) {
         let state = self.lock();
         assert!(
@@ -2191,6 +2194,7 @@ impl TestInferenceLedgerPersistence {
         );
     }
 
+    #[cfg(test)]
     fn is_quiescent(&self) -> bool {
         let state = self.lock();
         state
@@ -2203,6 +2207,7 @@ impl TestInferenceLedgerPersistence {
                 .all(|attempt| attempt.terminal.is_some())
     }
 
+    #[cfg(test)]
     fn logical_terminal_statuses(&self) -> Vec<astra_services::InferenceTerminalStatus> {
         self.lock()
             .invocations
@@ -2211,6 +2216,7 @@ impl TestInferenceLedgerPersistence {
             .collect()
     }
 
+    #[cfg(test)]
     fn has_explicit_settlement_debt(&self) -> bool {
         self.lock()
             .invocations
@@ -2218,6 +2224,7 @@ impl TestInferenceLedgerPersistence {
             .any(|invocation| invocation.settlement.is_some())
     }
 
+    #[cfg(test)]
     fn fence_owner_lease(&self) {
         self.lock().owner_lease_lost = true;
     }
@@ -2261,9 +2268,63 @@ impl TestInferenceLedgerPersistence {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e-hooks"))]
 #[async_trait]
 impl InferenceLedgerPersistence for TestInferenceLedgerPersistence {
+    async fn next_logical_attempt_pair_base(
+        &self,
+        input: &astra_services::InferenceInvocationInput,
+    ) -> astra_services::ServiceResult<u32> {
+        // Match the durable cursor's owner/scope/purpose boundary, not its
+        // model route. Only admitted invocation identities consume a pair;
+        // repeated reads before admission must return the same base.
+        astra_services::plan_inference_invocation(input.clone())?;
+        let key = serde_json::to_string(&(
+            &input.user_id,
+            input.scope.with_logical_attempt(0),
+            input.purpose.as_str(),
+        ))
+        .map_err(|error| astra_services::ServiceError::invalid(error.to_string()))?;
+        let mut state = self.lock();
+        let highest = state.logical_attempt_pairs.get(&key).and_then(|pairs| {
+            pairs
+                .iter()
+                .filter_map(|(base, identities)| {
+                    identities
+                        .iter()
+                        .any(|id| state.invocations.contains_key(id))
+                        .then_some(*base)
+                })
+                .max()
+        });
+        let base = match highest {
+            None => 0,
+            Some(base) => base.checked_add(2).ok_or_else(|| {
+                astra_services::ServiceError::conflict(
+                    "test inference logical-attempt pair space is exhausted",
+                )
+            })?,
+        };
+        let mut identities = BTreeSet::new();
+        for logical_attempt in [base, base + 1] {
+            let mut candidate = input.clone();
+            candidate.scope = input.scope.with_logical_attempt(logical_attempt);
+            identities.insert(
+                astra_services::plan_inference_invocation(candidate)?
+                    .invocation_id()
+                    .to_string(),
+            );
+        }
+        state
+            .logical_attempt_pairs
+            .entry(key)
+            .or_default()
+            .entry(base)
+            .or_default()
+            .extend(identities);
+        Ok(base)
+    }
+
     async fn renew_invocation_owner(
         &self,
         plan: &astra_services::InferenceInvocationPlan,
@@ -2486,6 +2547,7 @@ impl InferenceLedgerPersistence for TestInferenceLedgerPersistence {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(TestProviderAttemptState {
                     invocation_id: attempt.invocation_id().to_string(),
+                    #[cfg(test)]
                     canonical_transition_hash: attempt
                         .canonical_transition_hash()
                         .map(str::to_string),
@@ -4862,6 +4924,80 @@ mod tests {
             operation_id: operation_id.to_string(),
             logical_attempt: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn test_ledger_cursor_advances_only_admitted_pairs_with_exact_scope() {
+        let (ledger, persistence) = test_ledger("http://127.0.0.1:1");
+        let input = ledger.invocation_input(
+            test_scope("cursor"),
+            astra_turn_types::InferencePurpose::Introspection,
+            "test-model",
+            "test-model",
+            "openai",
+        );
+        assert_eq!(
+            persistence
+                .next_logical_attempt_pair_base(&input)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            persistence
+                .next_logical_attempt_pair_base(&input)
+                .await
+                .unwrap(),
+            0
+        );
+        let mut fallback = input.clone();
+        fallback.scope = fallback.scope.with_logical_attempt(1);
+        let plan = astra_services::plan_inference_invocation(fallback).unwrap();
+        persistence.admit_invocation(&plan).await.unwrap();
+        assert!(persistence.admit_invocation(&plan).await.is_err());
+        assert_eq!(
+            persistence
+                .next_logical_attempt_pair_base(&input)
+                .await
+                .unwrap(),
+            2
+        );
+        let mut rerouted = input.clone();
+        rerouted.resolved_model_name = "other-model".into();
+        assert_eq!(
+            persistence
+                .next_logical_attempt_pair_base(&rerouted)
+                .await
+                .unwrap(),
+            2
+        );
+        let mut other_owner = input.clone();
+        other_owner.user_id = "other-user".into();
+        assert_eq!(
+            persistence
+                .next_logical_attempt_pair_base(&other_owner)
+                .await
+                .unwrap(),
+            0
+        );
+        let mut other_purpose = input.clone();
+        other_purpose.purpose = astra_turn_types::InferencePurpose::SubAgent;
+        assert_eq!(
+            persistence
+                .next_logical_attempt_pair_base(&other_purpose)
+                .await
+                .unwrap(),
+            0
+        );
+        let mut other_scope = input;
+        other_scope.scope = test_scope("other-operation");
+        assert_eq!(
+            persistence
+                .next_logical_attempt_pair_base(&other_scope)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     fn test_call<'a>(base_url: &'a str, messages: &'a [serde_json::Value]) -> LlmCall<'a> {

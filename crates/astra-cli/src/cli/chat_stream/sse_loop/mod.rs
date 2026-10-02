@@ -1697,7 +1697,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_child_attach_after_recovery_is_exact_parent_and_excludes_fanout() {
+    async fn child_attach_after_recovery_is_exact_parent_and_includes_fanout_obligations() {
         use astra_services::session_workspace::{
             BackgroundLocalAgentFanoutProjection, BackgroundLocalAgentTaskProjection,
         };
@@ -1736,8 +1736,14 @@ mod tests {
         );
         let parent = spawner.attach_fanout_parent("root").await;
         let children = parent.pending_direct_children();
-        assert_eq!(children.len(), 1);
-        assert_eq!(children[0].agent_id, "direct");
+        let ids: std::collections::HashSet<_> = children
+            .iter()
+            .map(|child| child.agent_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from(["direct", "group-slot"])
+        );
         let unrelated = spawner.attach_fanout_parent("new-turn").await;
         assert!(!unrelated.has_direct_child_completion_history());
         let sibling = spawner.attach_fanout_parent("other-root").await;

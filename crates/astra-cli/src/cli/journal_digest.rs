@@ -1008,21 +1008,20 @@ fn merge_attached_events(
     conflicts.len()
 }
 
+struct LinkedDigestJournals {
+    events: Vec<session_journal::JournalEvent>,
+    non_empty: usize,
+    malformed: usize,
+    primary_path: String,
+    supplemental_paths: Vec<String>,
+    conflicting_round_count: usize,
+}
+
 fn read_linked_digest_journals(
     session_id: &str,
     local_owner: &astra_services::OwnerScope,
     account_owner: Option<&astra_services::OwnerScope>,
-) -> Result<
-    (
-        Vec<session_journal::JournalEvent>,
-        usize,
-        usize,
-        String,
-        Vec<String>,
-        usize,
-    ),
-    String,
-> {
+) -> Result<LinkedDigestJournals, String> {
     let primary_path = session_journal::journal_file_path_for_user(local_owner.id(), session_id)
         .map_err(|error| error.to_string())?;
     let (mut events, mut non_empty, mut malformed) =
@@ -1072,14 +1071,14 @@ fn read_linked_digest_journals(
         merge_attached_events(&mut events, owner_events, contributes_runtime_digest_detail);
     non_empty = non_empty.saturating_add(owner_non_empty);
     malformed = malformed.saturating_add(owner_malformed);
-    Ok((
+    Ok(LinkedDigestJournals {
         events,
         non_empty,
         malformed,
-        primary_path_text,
+        primary_path: primary_path_text,
         supplemental_paths,
         conflicting_round_count,
-    ))
+    })
 }
 
 pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDigest, String> {
@@ -1094,14 +1093,14 @@ fn build_digest_with_owners(
     local_owner: &astra_services::OwnerScope,
     account_owner: Option<&astra_services::OwnerScope>,
 ) -> Result<JournalDigest, String> {
-    let (
+    let LinkedDigestJournals {
         events,
-        journal_lines_non_empty,
-        journal_lines_malformed,
-        journal_file,
-        supplemental_journal_files,
+        non_empty: journal_lines_non_empty,
+        malformed: journal_lines_malformed,
+        primary_path: journal_file,
+        supplemental_paths: supplemental_journal_files,
         conflicting_round_count,
-    ) = read_linked_digest_journals(session_id, local_owner, account_owner)?;
+    } = read_linked_digest_journals(session_id, local_owner, account_owner)?;
 
     let mut turns_out: Vec<TurnRow> = Vec::new();
     let mut compaction_events = Vec::new();

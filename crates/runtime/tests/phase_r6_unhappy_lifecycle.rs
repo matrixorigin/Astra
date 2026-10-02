@@ -226,15 +226,8 @@ async fn unhappy_tool_call_to_unknown_tool_name() {
 
 // ── (C) Ambiguous: final text AND tool_call in the same round ──────────────
 //
-// Pin current behavior: the mock pipeline faithfully records BOTH the
-// `full_text` and the `tool_calls`. The `has_tool_calls` flag becomes
-// true (because `!tool_calls.is_empty()`), which causes the surrounding
-// agentic loop to treat this as a tool-executing round — the final text
-// is NOT discarded, but tool execution takes precedence (i.e. the loop
-// will continue to the next turn rather than stop on the text).
-//
-// This is the documented resolution. Any future change that silently
-// drops the full_text or stops on text would flip this assertion.
+// Preserve both raw signals, but tool calls keep the round nonterminal.
+// Text accompanying a tool call must not become the delivered final answer.
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
@@ -276,11 +269,9 @@ async fn unhappy_assistant_final_then_extra_tool_calls() {
          regardless of full_text presence (this is the documented precedence: \
          tools-win, loop continues)"
     );
-    // state.final_text is also populated by execute_mock_turn so the text
-    // isn't lost — a subsequent final round or finalization can render it.
-    assert_eq!(
-        state.final_text, "Here is my final answer.",
-        "state.final_text must carry the ambiguous text forward"
+    assert!(
+        state.final_text.is_empty(),
+        "a tool-producing round must not publish a terminal answer"
     );
     assert_eq!(state.llm_rounds_completed, 1);
 }

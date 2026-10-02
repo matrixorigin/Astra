@@ -4660,7 +4660,29 @@ mod tests {
             error: error.map(str::to_string),
             args_preview: Some(action.to_string()),
             args_full: Some(args.to_string()),
-            result_full: result.map(|value| value.to_string()),
+            result_full: result.map(|mut value| {
+                if action == "spawn" && value["status"] == "launched" {
+                    let id = value["agent_id"]
+                        .as_str()
+                        .expect("fixture child identity")
+                        .to_string();
+                    value["result_family"] = json!("control_receipt");
+                    value["action"] = json!("spawn");
+                    value["success"] = json!(true);
+                    value["parent_run_id"] = json!("fixture-parent");
+                    value["run_id"] = json!(format!("run-{id}"));
+                } else {
+                    value["result_family"] = json!("child_result");
+                }
+                assert!(
+                    astra_turn_core::orchestration::agent_result_wire::decode_agent_tool_result(
+                        &value
+                    )
+                    .is_some(),
+                    "invalid fixture receipt: {value}"
+                );
+                value.to_string()
+            }),
             ..Default::default()
         }
     }
@@ -7339,6 +7361,8 @@ mod tests {
                 result_full: Some(
                     json!({
                         "status":"launched",
+                        "result_family":"control_receipt", "action":"spawn", "success":true,
+                        "agent_id":"agent-a", "run_id":"run-agent-a", "parent_run_id":"fixture-parent",
                         "description":"Review architecture"
                     })
                     .to_string(),
@@ -7359,6 +7383,7 @@ mod tests {
                 result_full: Some(
                     json!({
                         "status":"interrupted",
+                        "result_family":"child_result", "agent_id":"agent-a",
                         "result":"Partial architecture findings.",
                         "finish_reason":"budget_exhausted"
                     })
@@ -7381,6 +7406,8 @@ mod tests {
                 result_full: Some(
                     json!({
                         "status":"launched",
+                        "result_family":"control_receipt", "action":"spawn", "success":true,
+                        "agent_id":"agent-b", "run_id":"run-agent-b", "parent_run_id":"fixture-parent",
                         "description":"Review security"
                     })
                     .to_string(),
@@ -7400,7 +7427,7 @@ mod tests {
                 ),
                 result_full: Some(
                     json!({
-                        "status":"launched"
+                        "status":"launched", "result_family":"child_result", "agent_id":"agent-b"
                     })
                     .to_string(),
                 ),

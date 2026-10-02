@@ -68,40 +68,25 @@ fn agent_event_fixture_payload_hash(payload: serde_json::Value) -> String {
     )
 }
 
-fn model_request_fixture_event(
+fn model_request_fixture_accepted_event(
     user_id: &str,
     session_id: &str,
     request_id: &str,
     run_id: &str,
     parent_run_id: Option<&str>,
     agent_id: &str,
-    model: &str,
-    purpose: &str,
-    terminal_status: Option<&str>,
-    provider_response_id: Option<&str>,
 ) -> astra_services::ModelRequestContextEvent {
     use astra_services::{
         ModelRequestContextEvent, ModelRequestEventStage, ModelRequestIdentity,
-        ModelRequestTopology, ModelRequestUsage,
+        ModelRequestTopology,
     };
 
-    let terminal = terminal_status.is_some();
-    let usage = terminal_status
-        .filter(|status| *status != "delivery_unknown")
-        .map(|_| ModelRequestUsage {
-            input: astra_turn_types::NormalizedPromptCacheUsage::new(8, 32, 0),
-            output_tokens: 4,
-        });
     ModelRequestContextEvent {
         schema: astra_services::MODEL_REQUEST_CONTEXT_SCHEMA.into(),
-        stage: if terminal {
-            ModelRequestEventStage::Terminal
-        } else {
-            ModelRequestEventStage::Accepted
-        },
+        stage: ModelRequestEventStage::Accepted,
         identity: ModelRequestIdentity {
             request_id: request_id.into(),
-            provider_response_id: provider_response_id.map(str::to_owned),
+            provider_response_id: None,
             owner_scope: user_id.into(),
             session_id: Some(session_id.into()),
             run_id: Some(run_id.into()),
@@ -121,9 +106,9 @@ fn model_request_fixture_event(
             loop_owner: "server".into(),
             execution_binding: "server".into(),
             provider: "fixture-provider".into(),
-            model: model.into(),
-            offering_id: format!("{model}-offering"),
-            inference_purpose: purpose.into(),
+            model: "glm-5.2".into(),
+            offering_id: "glm-5.2-offering".into(),
+            inference_purpose: "agent_turn".into(),
             operation_id: "agent_turn".into(),
             provider_protocol: "openai_compatible".into(),
             provider_wire_hash: "fixture-wire-hash".into(),
@@ -132,20 +117,14 @@ fn model_request_fixture_event(
         route: None,
         lineage: Default::default(),
         budget: Default::default(),
-        usage,
+        usage: None,
         composition: Default::default(),
         wire_composition: Default::default(),
         tool_result_projections: Vec::new(),
         cache: Default::default(),
         compaction: Default::default(),
-        terminal_status: terminal_status.map(str::to_owned),
-        usage_status: terminal.then(|| {
-            if terminal_status == Some("delivery_unknown") {
-                "unavailable".to_string()
-            } else {
-                "provider_exact".to_string()
-            }
-        }),
+        terminal_status: None,
+        usage_status: None,
         error_kind: None,
     }
 }
@@ -7513,41 +7492,40 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             "2026-06-01 10:00:30.000000",
         ),
     ] {
-        if include_accepted {
-            let accepted = model_request_fixture_event(
-                user_id,
-                &session_id,
-                attempt_id,
-                run_id,
-                parent_run_id,
-                agent_id,
-                "glm-5.2",
-                "agent_turn",
-                None,
-                None,
-            );
-            insert_model_request_fixture(
-                &pool,
-                user_id,
-                &session_id,
-                attempt_id,
-                &accepted,
-                "2026-06-01 10:00:19.000000",
-            )
-            .await;
-        }
-        let event = model_request_fixture_event(
+        let mut event = model_request_fixture_accepted_event(
             user_id,
             &session_id,
             attempt_id,
             run_id,
             parent_run_id,
             agent_id,
-            "glm-5.2",
-            "agent_turn",
-            status,
-            response_id,
         );
+        if include_accepted {
+            insert_model_request_fixture(
+                &pool,
+                user_id,
+                &session_id,
+                attempt_id,
+                &event,
+                "2026-06-01 10:00:19.000000",
+            )
+            .await;
+        }
+        if let Some(status) = status {
+            event.stage = astra_services::ModelRequestEventStage::Terminal;
+            event.terminal_status = Some(status.into());
+            event.usage_status = Some(if status == "delivery_unknown" {
+                "unavailable".into()
+            } else {
+                "provider_exact".into()
+            });
+            event.usage =
+                (status != "delivery_unknown").then(|| astra_services::ModelRequestUsage {
+                    input: astra_turn_types::NormalizedPromptCacheUsage::new(8, 32, 0),
+                    output_tokens: 4,
+                });
+        }
+        event.identity.provider_response_id = response_id.map(str::to_owned);
         insert_model_request_fixture(&pool, user_id, &session_id, attempt_id, &event, created_at)
             .await;
     }

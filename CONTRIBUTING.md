@@ -87,6 +87,24 @@ Required check names remain present when their heavy work is skipped, so this
 routing is compatible with branch protection and the merge queue. The routing
 contract and its tests live in [`scripts/ci/`](scripts/ci/).
 
+CLI tests compile once into a nextest archive, including the standalone mock
+MCP server. Five protected check labels consume that same-revision/workflow-run
+artifact: one shell lane and four complementary native hash partitions, not
+module-specific lanes. Consumers do not rebuild application tests or restore
+build caches; the pinned compiler remains available for test-owned Cargo
+fixtures. Missing artifacts or failed required producers fail closed. Producer caches
+retain existing trust boundaries, and fork PRs run without privileged access.
+JUnit timings are retained to assess partition balance and total CI cost;
+balanced counts alone do not establish a wall-time improvement.
+On macOS, the default terminal-reader lane also runs the CLI Bash regression
+using its existing default-feature test executable. Tools lint and serial
+workspace-coordination tests remain parallel; the protected coordination check
+requires both paths to succeed. Feature-specific terminal tests remain separate.
+The lint gate retains restored artifacts; age-based cleanup is not a lint prerequisite.
+Failed-job reruns reuse that exact archive until its one-day expiry; only a
+producer rerun may replace it. Missing or expired artifacts require rerunning
+the producer, never fallback compilation in a consumer.
+
 For fork pull requests, an update may require maintainer approval before the
 replacement test run can enter the normal concurrency group. A separate
 trusted-workflow-revision controller cancels active runs for earlier heads
