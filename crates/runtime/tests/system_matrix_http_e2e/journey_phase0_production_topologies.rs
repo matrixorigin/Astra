@@ -22,7 +22,7 @@ use astra_core::history_work_baseline::{
 };
 use astra_core::{AppSettings, SharedPool};
 use astra_runtime_env::ASTRA_LOCAL_STATE_ROOT_ENV;
-use astra_services::models::{PricingData, QuirksData};
+use astra_services::models::QuirksData;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use reqwest::{Client, StatusCode};
@@ -187,7 +187,6 @@ struct SourceModel {
     input_modalities: Vec<String>,
     output_modalities: Vec<String>,
     supported_parameters: Vec<String>,
-    pricing: PricingData,
     architecture: Option<String>,
     tags: Vec<String>,
     quirks: QuirksData,
@@ -210,8 +209,6 @@ struct SourceModelWire {
     output_modalities: Vec<String>,
     #[serde(default)]
     supported_parameters: Vec<String>,
-    #[serde(default)]
-    pricing: PricingData,
     #[serde(default)]
     architecture: Option<String>,
     #[serde(default)]
@@ -273,7 +270,6 @@ fn load_source_model(path: &Path, exact_name: &str) -> AnyResult<SourceModel> {
         input_modalities: wire.input_modalities,
         output_modalities: wire.output_modalities,
         supported_parameters: wire.supported_parameters,
-        pricing: wire.pricing,
         architecture: wire.architecture,
         tags: wire.tags,
         quirks,

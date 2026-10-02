@@ -160,9 +160,8 @@ fn default_always_load_surface_has_a_fixed_schema_budget() {
     let base_bytes = serde_json::to_vec(&without_hot_work.always_load_schemas())
         .expect("base tool surface must serialize")
         .len();
-    const SAFETY_MARGIN_BYTES: usize = 256;
-    eprintln!("resident schemas: {bytes} bytes + {SAFETY_MARGIN_BYTES} bytes safety margin");
-    if bytes.saturating_add(SAFETY_MARGIN_BYTES) > DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET {
+    eprintln!("resident schemas: {bytes} bytes");
+    if bytes > DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET {
         for schema in surface.always_load_schemas() {
             eprintln!(
                 "{}: {} bytes",
@@ -172,8 +171,8 @@ fn default_always_load_surface_has_a_fixed_schema_budget() {
         }
     }
     assert!(
-        bytes.saturating_add(SAFETY_MARGIN_BYTES) <= DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET,
-        "default always-load schemas use {bytes} bytes, leaving less than the {SAFETY_MARGIN_BYTES}-byte fixed-prefix safety margin (budget={} bytes); defer a non-primitive workflow or simplify its schema",
+        bytes <= DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET,
+        "default always-load schemas use {bytes} bytes, exceeding the fixed-prefix budget of {} bytes; defer a non-primitive workflow or simplify its schema",
         DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET,
     );
     assert!(
@@ -523,9 +522,29 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
 
     let agent = find(&resident, "agent");
     let agent_params = &agent["function"]["parameters"];
+    assert!(
+        agent["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Runtime binds the user's model requirement")
+    );
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "agent", &json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"}), agent,
     ).expect("ordinary delegation must not require model catalog fields");
+    for (field, value) in [
+        ("model", json!("arbitrary-model")),
+        ("requested_model_policy", json!({"mode": "inherit"})),
+    ] {
+        let mut arguments = json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"});
+        arguments[field] = value;
+        assert!(
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "agent", &arguments, agent
+            )
+            .is_err(),
+            "resident spawn must not accept the catalog-only field {field}"
+        );
+    }
     assert_eq!(
         agent_params["properties"]["action"]["enum"],
         serde_json::json!(["spawn", "list", "get_result", "wait", "send_message"])

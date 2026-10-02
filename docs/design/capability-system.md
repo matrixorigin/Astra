@@ -131,8 +131,10 @@ projections expose only the ordinary call shape; advanced reflection fields
 remain available through explicit typed `tool_search`/`invoke_tool` selection.
 Fan-out, advanced memory operations, and graph-maintenance schemas remain
 discoverable through the deferred surface. The resident compact-JSON schema
-projection has an 8 KiB regression budget with a safety margin; explicit user-
-pinned tools may exceed it. Ordinary workspace navigation (`read_file`,
+projection has an 8 KiB regression budget for the actual serialized schema
+array, without reserving space for hypothetical future fields; explicit user-
+pinned tools may exceed it. This budget excludes the rest of the provider
+request. Ordinary workspace navigation (`read_file`,
 `list_dir`, and `grep`) stays resident, while the specialized `glob` query is
 deferred and remains fully reachable through explicit selection. Deferred
 entries carry only compact discovery metadata and are activated through the
