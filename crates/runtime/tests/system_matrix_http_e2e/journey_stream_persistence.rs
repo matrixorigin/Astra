@@ -25,8 +25,8 @@ use tower::util::ServiceExt;
 use uuid::Uuid;
 
 use super::harness::{
-    E2E_PASSWORD, bootstrap, cleanup_session_data, delete_json, get_json, parse_sse_events,
-    post_json, seeded_model_selection, sse_first_data_json_with_type,
+    E2E_PASSWORD, bootstrap, bootstrap_with_delegation_judgment, cleanup_session_data, delete_json,
+    get_json, parse_sse_events, post_json, seeded_model_selection, sse_first_data_json_with_type,
     try_claim_interrupted_matrix_e2e_fixture,
 };
 
@@ -253,6 +253,13 @@ fn concurrent_fanout_payload(
                         "defaults": {"agent_type": "general-purpose"}
                     }),
                 ),
+                deferred_tool_invoke_round(
+                    "isolated-fanout-wait", "agent", json!({"action": "wait", "timeout_ms": 10000}),
+                ),
+                deferred_tool_invoke_round(
+                    &format!("{}-fanout-results", case.name), "agent_fanout",
+                    json!({"action": "get_results", "group_id": shared_group_id}),
+                ),
                 {"full_text": case.final_reply}
             ],
             "test_spawn_child_llm_rounds": [child_round]
@@ -260,7 +267,65 @@ fn concurrent_fanout_payload(
     })
 }
 
-fn assert_concurrent_fanout_stream(
+async fn captured_synthesis_children(
+    pool: &sqlx::MySqlPool,
+    user_id: &str,
+    session_id: &str,
+    root_run_id: &str,
+    final_reply: &str,
+) -> Vec<Value> {
+    let captures = sqlx::query_scalar::<_, String>(
+        "SELECT content_json FROM session_artifacts \
+         WHERE user_id = ? AND session_id = ? AND turn = 1 \
+           AND artifact_kind = 'llm_capture' AND source = 'server_loop_host' \
+         ORDER BY round ASC LIMIT 64",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .expect("actual provider exchanges");
+    let exchanges = captures
+        .iter()
+        .map(|capture| serde_json::from_str::<Value>(capture).unwrap())
+        .filter(|capture| {
+            capture["response"]["full_text"] == final_reply
+                && capture["response"]["tool_calls"]
+                    .as_array()
+                    .is_none_or(Vec::is_empty)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(exchanges.len(), 1, "one captured final synthesis exchange");
+    let mut children = Vec::new();
+    for message in exchanges[0]["request"]["messages"].as_array().unwrap() {
+        let Some(payload) = message["content"]
+            .as_str()
+            .and_then(|content| content.strip_prefix("<runtime-required-context>\n"))
+            .and_then(|content| content.strip_suffix("\n</runtime-required-context>"))
+            .and_then(|content| serde_json::from_str::<Value>(content).ok())
+        else {
+            continue;
+        };
+        if payload["context"]["schema"] != "direct_child_completion.v1" {
+            continue;
+        }
+        assert_eq!(payload["kind"], "background_task_notification");
+        let payload = &payload["context"];
+        assert_eq!(payload["parent_run_id"], root_run_id);
+        children.extend(payload["children"].as_array().unwrap().iter().cloned());
+    }
+    for child in &children {
+        let result = child["result"]
+            .as_str()
+            .expect("authoritative child payload");
+        assert_eq!(child["result_truncated"], false);
+        assert_eq!(child["result_bytes"], result.len());
+    }
+    children
+}
+
+async fn assert_concurrent_fanout_stream(
+    pool: &sqlx::MySqlPool,
     case: &ConcurrentFanoutCase,
     shared_group_id: &str,
     all_child_provenances: &[String],
@@ -332,40 +397,61 @@ fn assert_concurrent_fanout_stream(
         .unwrap_or_else(|| panic!("{}: missing canonical fanout result: {raw_sse}", case.name));
     assert_eq!(aggregate["group_id"].as_str(), Some(shared_group_id));
     assert_eq!(aggregate["target_count"].as_u64(), Some(2));
-    assert_eq!(aggregate["terminal"].as_u64(), Some(2));
-    assert_eq!(aggregate["active"].as_u64(), Some(0));
-    assert_eq!(
-        aggregate["completed"].as_u64(),
-        Some(if case.terminal == OnlineFanoutTerminal::Completed {
-            2
-        } else {
-            0
-        }),
-        "{}: {aggregate}",
-        case.name
-    );
-    assert_eq!(
-        aggregate["failed"].as_u64(),
-        Some(if case.terminal == OnlineFanoutTerminal::Failed {
-            2
-        } else {
-            0
-        }),
-        "{}: {aggregate}",
-        case.name
-    );
-    let results = aggregate["results"]
+    assert_eq!(aggregate["status"], "started");
+    let launched = aggregate["agents"]
         .as_array()
-        .unwrap_or_else(|| panic!("{}: canonical results missing: {aggregate}", case.name));
-    assert_eq!(results.len(), 2, "{}: {aggregate}", case.name);
+        .expect("accepted launch identities");
+    assert_eq!(launched.len(), 2);
+    assert_eq!(
+        launched
+            .iter()
+            .map(|child| child["slot_index"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    let results = captured_synthesis_children(
+        pool,
+        &case.user_id,
+        &case.session_id,
+        &root_run_id,
+        &case.final_reply,
+    )
+    .await;
+    assert_eq!(results.len(), 2, "{}: {results:?}", case.name);
     assert!(
         results
             .iter()
-            .all(|result| result.to_string().contains(&case.child_provenance)),
+            .all(|result| result["status"] == case.terminal.child_run_status())
+    );
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| (
+                result["agent_id"].as_str().unwrap(),
+                result["run_id"].as_str().unwrap()
+            ))
+            .collect::<std::collections::HashSet<_>>(),
+        launched
+            .iter()
+            .map(|child| (
+                child["agent_id"].as_str().unwrap(),
+                child["run_id"].as_str().unwrap()
+            ))
+            .collect::<std::collections::HashSet<_>>()
+    );
+    assert!(
+        results.iter().all(|result| {
+            let payload = result["result"].as_str().unwrap();
+            if case.terminal == OnlineFanoutTerminal::Completed {
+                payload == case.child_provenance
+            } else {
+                payload.contains(&case.child_provenance)
+            }
+        }),
         "{}: every fixed slot must retain its own payload provenance: {aggregate}",
         case.name
     );
-    let aggregate_text = aggregate.to_string();
+    let aggregate_text = json!(results).to_string();
     assert!(
         all_child_provenances
             .iter()
@@ -374,16 +460,7 @@ fn assert_concurrent_fanout_stream(
         "{}: foreign user/session payload leaked into its fanout aggregate: {aggregate}",
         case.name
     );
-    assert_eq!(
-        results
-            .iter()
-            .filter_map(|result| result["slot_index"].as_u64())
-            .collect::<Vec<_>>(),
-        vec![0, 1],
-        "{}: slots must remain exact and ordered: {aggregate}",
-        case.name
-    );
-    let child_run_ids = results
+    let child_run_ids = launched
         .iter()
         .map(|result| {
             result["run_id"]
@@ -755,7 +832,7 @@ pub async fn run_stream_session_and_run_status() {
 /// without fabricating a detached reconciliation turn or orphan transcript
 /// ownership.
 pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_tree() {
-    let b = bootstrap().await;
+    let b = bootstrap_with_delegation_judgment().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = &b.auth_header;
@@ -819,6 +896,9 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
             "test_llm_rounds": [
                 deferred_tool_search_round("online-fanout-search", "agent_fanout"),
                 deferred_tool_invoke_round("online-fanout-start", "agent_fanout", fanout_args),
+                deferred_tool_invoke_round(
+                    "online-fanout-wait", "agent", json!({"action": "wait", "timeout_ms": 10000}),
+                ),
                 {"full_text": final_reply}
             ],
             "test_spawn_child_llm_rounds": [
@@ -828,6 +908,27 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
     });
     let (status, raw_sse) = stream_chat_full(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {raw_sse}");
+    b.delegation_judgment
+        .as_ref()
+        .unwrap()
+        .assert_request_count(1);
+    b.assert_delegation_judgment(
+        "Run three reviews as one structured work group.",
+        &[
+            (
+                "Online storage review",
+                "Inspect storage behavior and return one finding.",
+            ),
+            (
+                "Online runtime review",
+                "Inspect runtime behavior and return one finding.",
+            ),
+            (
+                "Online journey review",
+                "Inspect the user journey and return one finding.",
+            ),
+        ],
+    );
     let events = parse_sse_events(&raw_sse);
     let session_info = events
         .iter()
@@ -1036,7 +1137,7 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
 /// durable tree must remain scoped by ownership rather than by presentation
 /// identifiers while successful and provider-deadline groups settle together.
 pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids() {
-    let b = bootstrap().await;
+    let b = bootstrap_with_delegation_judgment().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
     let pool = &ctx.pool;
@@ -1047,7 +1148,7 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
         Some(b.auth_header.as_str()),
         json!({
             "title": "fanout isolation A second session",
-            "metadata": {"suite": "fanout_concurrent_isolation"}
+            "metadata": {"suite": "fanout_concurrent_isolation", "full_llm_capture": true}
         }),
     )
     .await;
@@ -1094,7 +1195,7 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
             Some(b_auth.as_str()),
             json!({
                 "title": format!("fanout isolation B session {ordinal}"),
-                "metadata": {"suite": "fanout_concurrent_isolation"}
+                "metadata": {"suite": "fanout_concurrent_isolation", "full_llm_capture": true}
             }),
         )
         .await;
@@ -1165,6 +1266,26 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
         "four bounded fanouts exceeded the online concurrency budget"
     );
 
+    b.delegation_judgment
+        .as_ref()
+        .unwrap()
+        .assert_request_count(cases.len());
+    for case in &cases {
+        b.assert_delegation_judgment(
+            &format!("Run the isolated fanout scenario {}.", case.name),
+            &[
+                (
+                    "First isolated child",
+                    "Return the first independent finding.",
+                ),
+                (
+                    "Second isolated child",
+                    "Return the second independent finding.",
+                ),
+            ],
+        );
+    }
+
     let all_child_provenances = cases
         .iter()
         .map(|case| case.child_provenance.clone())
@@ -1172,12 +1293,16 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
     let mut evidence = Vec::with_capacity(cases.len());
     for (case, (status, raw_sse)) in cases.iter().zip(responses) {
         assert_eq!(status, StatusCode::OK, "{}: {raw_sse}", case.name);
-        evidence.push(assert_concurrent_fanout_stream(
-            case,
-            shared_group_id,
-            &all_child_provenances,
-            &raw_sse,
-        ));
+        evidence.push(
+            assert_concurrent_fanout_stream(
+                pool,
+                case,
+                shared_group_id,
+                &all_child_provenances,
+                &raw_sse,
+            )
+            .await,
+        );
     }
     let all_run_ids = evidence
         .iter()
@@ -1225,7 +1350,7 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
 /// must settle the already-accepted fixed group once. No delayed child may
 /// publish success and the cancelled root must never advance to synthesis.
 pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis() {
-    let b = bootstrap().await;
+    let b = bootstrap_with_delegation_judgment().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = b.auth_header.clone();
@@ -1350,6 +1475,18 @@ pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis()
     .expect("count provider-entered slow fanout children");
     assert_eq!(child_count, 3);
     assert_eq!(provider_child_ids.len(), 3);
+    b.delegation_judgment
+        .as_ref()
+        .unwrap()
+        .assert_request_count(1);
+    b.assert_delegation_judgment(
+        "Start three slow reviews; the user will cancel the live root.",
+        &[
+            ("Slow child one", "Return finding one."),
+            ("Slow child two", "Return finding two."),
+            ("Slow child three", "Return finding three."),
+        ],
+    );
 
     let (cancel_status, cancel_body) = tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -1976,7 +2113,7 @@ pub async fn run_stream_deferred_work_does_not_start_an_attempt() {
 /// every child remains one fixed-size terminal group: no replacement agents,
 /// no per-child parent analysis, and one synthesis over the preserved causes.
 pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() {
-    let b = bootstrap().await;
+    let b = bootstrap_with_delegation_judgment().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = &b.auth_header;
@@ -1989,7 +2126,7 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
         Some(auth.as_str()),
         json!({
             "title": "failed structured fan-in online gate",
-            "metadata": {"suite": "structured_fanout_failure_online"}
+            "metadata": {"suite": "structured_fanout_failure_online", "full_llm_capture": true}
         }),
     )
     .await;
@@ -2031,6 +2168,9 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
                             "defaults": {"agent_type": "general-purpose"}
                         }),
                     ),
+                    deferred_tool_invoke_round(
+                        "online-failed-fanout-wait", "agent", json!({"action": "wait", "timeout_ms": 10000}),
+                    ),
                     {"full_text": final_reply}
                 ],
                 "test_spawn_child_llm_rounds": [{
@@ -2044,6 +2184,18 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
     )
     .await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {raw_sse}");
+    b.delegation_judgment
+        .as_ref()
+        .unwrap()
+        .assert_request_count(1);
+    b.assert_delegation_judgment(
+        "Run three reviews and preserve every failure cause.",
+        &[
+            ("Failed storage review", "Inspect storage."),
+            ("Failed runtime review", "Inspect runtime."),
+            ("Failed journey review", "Inspect journey."),
+        ],
+    );
     let events = parse_sse_events(&raw_sse);
     let root_run_id = events
         .iter()
@@ -2104,13 +2256,42 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
         .unwrap_or_else(|| panic!("missing failed fanout aggregate: {raw_sse}"));
     assert_eq!(aggregate["target_count"], 3, "{aggregate}");
-    assert_eq!(aggregate["completed"], 0, "{aggregate}");
-    assert_eq!(aggregate["failed"], 3, "{aggregate}");
+    assert_eq!(aggregate["status"], "started");
+    let launched = aggregate["agents"].as_array().unwrap();
+    assert_eq!(launched.len(), 3);
+    assert_eq!(
+        launched
+            .iter()
+            .map(|child| child["slot_index"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    let children =
+        captured_synthesis_children(pool, user_id, &session_id, &root_run_id, final_reply).await;
+    assert_eq!(children.len(), 3);
+    assert!(children.iter().all(|child| child["status"] == "failed"));
+    assert_eq!(
+        children
+            .iter()
+            .map(|child| (
+                child["agent_id"].as_str().unwrap(),
+                child["run_id"].as_str().unwrap()
+            ))
+            .collect::<std::collections::HashSet<_>>(),
+        launched
+            .iter()
+            .map(|child| (
+                child["agent_id"].as_str().unwrap(),
+                child["run_id"].as_str().unwrap()
+            ))
+            .collect::<std::collections::HashSet<_>>()
+    );
     assert!(
-        aggregate
-            .to_string()
-            .contains("online child provider failed with preserved cause"),
-        "failure provenance was lost: {aggregate}"
+        children.iter().all(|child| child["result"]
+            .as_str()
+            .unwrap()
+            .contains("online child provider failed with preserved cause")),
+        "failure provenance was lost: {children:?}"
     );
 
     let durable_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);

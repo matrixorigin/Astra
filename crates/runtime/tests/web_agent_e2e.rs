@@ -49,7 +49,8 @@ use serde_json::{Map, Value, json};
 use tower::util::ServiceExt;
 
 use crate::test_support::{
-    parse_sse_events, test_fernet_encryptor, test_run_lifecycle, tool_call, tool_schema,
+    DelegationJudgmentProvider, parse_sse_events, test_fernet_encryptor, test_run_lifecycle,
+    tool_call, tool_schema,
 };
 
 // ── Env setup ────────────────────────────────────────────────────────────────
@@ -736,108 +737,34 @@ fn build_test_app_with_agent_bindings(
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Exercises real HTTP judgment decoding, admission and settlement against the
-/// existing in-memory ledger. This is not DB durability or model-quality proof.
-struct DelegationJudgmentProvider {
-    requests: Arc<std::sync::Mutex<Vec<Value>>>,
-    server: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for DelegationJudgmentProvider {
-    fn drop(&mut self) {
-        self.server.abort();
-    }
-}
-
-impl DelegationJudgmentProvider {
-    fn assert_request(&self, user_text: &str, slots: &[(&str, &str)]) {
-        let requests = self.requests.lock().unwrap();
-        assert!(
-            requests.iter().all(|request| request["stream"] == true),
-            "canonical judgment uses the real streaming provider path"
-        );
-        let inputs: Vec<Value> = requests
-            .iter()
-            .filter_map(|request| {
-                request["messages"].as_array()?.iter().find_map(|message| {
-                    let input: Value = serde_json::from_str(message["content"].as_str()?).ok()?;
-                    input.get("user_text").is_some().then_some(input)
-                })
-            })
-            .collect();
-        assert_eq!(
-            inputs.len(),
-            1,
-            "one canonical candidate judgment per root batch"
-        );
-        let input = &inputs[0];
-        assert_eq!(input["user_text"], user_text);
-        let candidates = input["candidates"]
-            .as_array()
-            .expect("authorized candidates");
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0]["offering_id"], DEFAULT_MODEL_OFFERING_ID);
-        assert_eq!(candidates[0]["model_name"], "test-model");
-        assert_eq!(candidates[0]["provider"], "openai");
-        let actual_slots = input["slots"].as_array().expect("canonical task slots");
-        assert_eq!(actual_slots.len(), slots.len());
-        for (index, (description, prompt)) in slots.iter().enumerate() {
-            assert_eq!(actual_slots[index]["index"], index);
-            assert_eq!(actual_slots[index]["description"], *description);
-            assert_eq!(actual_slots[index]["prompt"], *prompt);
-        }
-    }
-}
-
 async fn build_test_app_with_delegation_judgment() -> (Router, DelegationJudgmentProvider) {
-    let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
-    async fn judgment(
-        axum::extract::State(requests): axum::extract::State<Arc<std::sync::Mutex<Vec<Value>>>>,
-        Json(request): Json<Value>,
-    ) -> Response {
-        assert_eq!(request["model"], "test-model");
-        assert_eq!(request["stream"], true);
-        requests.lock().unwrap().push(request);
-        // These fixture requests assign tasks, not model/reasoning controls.
-        // The real parser binds this response to authenticated source evidence.
-        let mut wire = String::new();
-        for content in ["{\"disposition\":", "\"not_applicable\"}"] {
-            let chunk = json!({
-                "id": "offline-delegation-judgment", "object": "chat.completion.chunk",
-                "model": "test-model",
-                "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}]
-            });
-            wire.push_str(&format!("data: {chunk}\n\n"));
-        }
-        let terminal = json!({
-            "id": "offline-delegation-judgment", "object": "chat.completion.chunk",
-            "model": "test-model",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 32, "completion_tokens": 8, "total_tokens": 40}
-        });
-        wire.push_str(&format!("data: {terminal}\n\ndata: [DONE]\n\n"));
-        Response::builder()
-            .header("content-type", "text/event-stream")
-            .body(Body::from(wire))
-            .unwrap()
-    }
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let gateway = Router::new()
-        .route("/v1/chat/completions", post(judgment))
-        .with_state(requests.clone());
-    let server = tokio::spawn(async move {
-        axum::serve(listener, gateway)
-            .await
-            .expect("serve offline judgment provider");
-    });
+    let judgment = DelegationJudgmentProvider::start().await;
     let (app, _) = build_test_app_with_models(
         Arc::new(TestModelService {
-            judgment_base_url: Some(format!("http://{address}/v1")),
+            judgment_base_url: Some(judgment.base_url().to_owned()),
         }),
         true,
     );
-    (app, DelegationJudgmentProvider { requests, server })
+    (app, judgment)
+}
+
+fn assert_delegation_judgment(
+    judgment: &DelegationJudgmentProvider,
+    user_text: &str,
+    slots: &[(&str, &str)],
+) {
+    judgment.assert_request_count(1);
+    assert_eq!(
+        judgment.assert_request(
+            user_text,
+            DEFAULT_MODEL_OFFERING_ID,
+            "test-model",
+            slots,
+            true
+        ),
+        1,
+        "single-model fixture authorized catalog"
+    );
 }
 
 fn assert_child_joined_before_parent(
@@ -1622,7 +1549,8 @@ async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthes
         }),
     )
     .await;
-    judgment.assert_request(
+    assert_delegation_judgment(
+        &judgment,
         "Use a child agent to review the code.",
         &[(
             "structured child review",
@@ -1803,7 +1731,8 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
         }),
     )
     .await;
-    judgment.assert_request(
+    assert_delegation_judgment(
+        &judgment,
         "Use two independent child agents and combine their findings.",
         &[
             ("parallel child A", "Review one independent concern."),
@@ -2006,7 +1935,8 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
         .await
         .expect("edge child stream timed out")
         .expect("edge child stream reader failed");
-    judgment.assert_request(
+    assert_delegation_judgment(
+        &judgment,
         "Use a child agent to review the edge workspace.",
         &[(
             "edge child review",
@@ -2762,7 +2692,8 @@ async fn edge_executor_offline_child_returns_actionable_wait_to_structured_paren
         .await
         .expect("offline-child reader did not finish within the observation deadline")
         .expect("offline-child stream reader failed");
-    judgment.assert_request(
+    assert_delegation_judgment(
+        &judgment,
         "Use a child agent in my edge workspace",
         &[(
             "edge child command",

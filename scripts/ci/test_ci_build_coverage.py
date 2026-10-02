@@ -47,7 +47,7 @@ class BuildCoverageTests(unittest.TestCase):
         for job in ("cli-test-build", "shard-b", "shard-c", "shard-d"):
             section = workflow.split(f"\n  {job}:\n", 1)[1]
             section = re.split(r"\n  [a-z][a-z-]*:\n", section, maxsplit=1)[0]
-            for command in re.findall(r"cargo nextest (?:run|archive)\b(.*?)(?=\n      -|\Z)", section, re.S):
+            for command in re.findall(r"cargo nextest run\b(.*?)(?=\n      -|\Z)", section, re.S):
                 assigned.update(re.findall(r"-p\s+([\w-]+)", command))
         packages = {
             tomllib.loads((ROOT / member / "Cargo.toml").read_text())["package"]["name"]
@@ -55,21 +55,18 @@ class BuildCoverageTests(unittest.TestCase):
         }
         self.assertEqual(packages - assigned, set(), "Workspace crates missing from CI test shards")
 
-    def test_cli_archive_includes_required_standalone_mcp_fixture(self):
+    def test_complete_cli_run_prebuilds_required_standalone_mcp_fixture(self):
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
         producer = workflow.split("\n  cli-test-build:\n", 1)[1].split("\n  shard-a:\n", 1)[0]
         self.assertIn("cargo build --locked -p astra-cli --bin mock_mcp_server", producer)
-        archive_command = re.search(r"run: (cargo nextest archive[^\n]+)", producer).group(1)
-        args = shlex.split(archive_command)
+        test_command = re.search(r"run: (cargo nextest run[^\n]+)", producer).group(1)
+        args = shlex.split(test_command)
         self.assertEqual(args[args.index("-p") + 1], "astra-cli")
         self.assertTrue({"--locked", "--lib", "--bins"}.issubset(args))
-        self.assertNotIn("-E", args, "Producer must archive the complete CLI inventory")
+        self.assertNotIn("-E", args, "Run the complete CLI inventory")
+        self.assertNotIn("--partition", args)
         self.assertEqual(args[args.index("--profile") + 1], "ci")
-        config = tomllib.loads((ROOT / ".config/nextest.toml").read_text())
-        includes = config["profile"]["ci"]["archive"]["include"]
-        fixture = next(item for item in includes if item["path"] == "debug/mock_mcp_server")
-        self.assertEqual(fixture["relative-to"], "target")
-        self.assertEqual(fixture["on-missing"], "error")
+        self.assertLess(producer.index("Prebuild mock MCP server"), producer.index(test_command))
 
     def test_vendored_terminal_units_are_locked_and_pty_tests_run_both_readers(self):
         workflow = (ROOT / ".github/workflows/test.yml").read_text()

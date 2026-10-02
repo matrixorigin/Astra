@@ -40,10 +40,10 @@ jobs:
         id: scope
         run: python3 scripts/ci/ci_scope.py
 
-  # Package groups remain parallel. CLI consumers share actual executables,
-  # not a rust-cache target directory that strips workspace binaries on save.
-  # Shell stays isolated; four native hash partitions cover its complement.
-  # Their protected check labels remain stable, not module-level selections.
+  # Package groups remain parallel. CLI builds and executes its full inventory
+  # once; stable protected labels require that same completed test result.
+  # Short CLI partitions are not the workflow critical path, so separate
+  # artifact consumers only repeat setup, download and extraction work.
   #
   # Runtime profile guardrails are intentionally covered across these shards
   # instead of running `make test-runtime-profiles` as a separate CI job. That
@@ -54,7 +54,7 @@ jobs:
   # protected without repeating the same Rust/Web tests in an extra job.
 
   cli-test-build:
-    name: "Build: shared CLI tests"
+    name: "Test: shared CLI executables"
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true') }}
     runs-on: ubuntu-latest
@@ -69,100 +69,39 @@ jobs:
           save-cache: ${{ github.event_name == 'push' }}
       - name: Prebuild mock MCP server
         run: cargo build --locked -p astra-cli --bin mock_mcp_server
-      - name: Archive CLI tests
-        run: cargo nextest archive --locked -p astra-cli --lib --bins --profile ci --archive-file target/astra-cli-tests.tar.zst
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Test complete CLI inventory
+        run: cargo nextest run --locked -p astra-cli --lib --bins --profile ci
+      - name: Retain CLI test timings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: cli-tests-${{ github.sha }}-${{ github.run_id }}
-          path: target/astra-cli-tests.tar.zst
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
-          overwrite: true
+          name: cli-timings-${{ github.run_attempt }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 3
 
   shard-a:
     name: "Test: astra-cli (${{ matrix.segment }})"
     needs: [scope, cli-test-build]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 5
     env:
       RUN_TESTS: ${{ needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - segment: non-edge
-            filter: "not test(/edge_tools::shell::/)"
-            partition: hash:1/4
-            command_timeout: 25m
-          - segment: edge-shell
-            filter: "test(/edge_tools::shell::/)"
-            partition: ""
-            command_timeout: 30m
-          - segment: edge-fs-tools
-            filter: "not test(/edge_tools::shell::/)"
-            partition: hash:2/4
-            command_timeout: 25m
-          - segment: edge-git-gix
-            filter: "not test(/edge_tools::shell::/)"
-            partition: hash:3/4
-            command_timeout: 25m
-          - segment: edge-rest
-            filter: "not test(/edge_tools::shell::/)"
-            partition: hash:4/4
-            command_timeout: 25m
+        segment: [non-edge, edge-shell, edge-fs-tools, edge-git-gix, edge-rest]
 
     steps:
       - name: Skip unaffected test segment
         if: env.RUN_TESTS != 'true'
         run: echo "No astra-cli test impact detected."
-      - name: Require shared CLI build
+      - name: Require complete CLI test result
         if: env.RUN_TESTS == 'true'
         env:
-          BUILD_RESULT: ${{ needs.cli-test-build.result }}
-        run: test "$BUILD_RESULT" = success
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        if: env.RUN_TESTS == 'true'
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/rust-setup
-        if: env.RUN_TESTS == 'true'
-        with:
-          build-tools: "false"
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        if: env.RUN_TESTS == 'true'
-        with:
-          name: cli-tests-${{ github.sha }}-${{ github.run_id }}
-          path: target
-      - name: "Test astra-cli (${{ matrix.segment }})"
-        if: env.RUN_TESTS == 'true'
-        env:
-          NEXTEST_FILTER: ${{ matrix.filter }}
-          NEXTEST_PARTITION: ${{ matrix.partition }}
-          COMMAND_TIMEOUT: ${{ matrix.command_timeout }}
-        run: |
-          set -euo pipefail
-          partition=()
-          if [[ -n "$NEXTEST_PARTITION" ]]; then
-            partition=(--partition "$NEXTEST_PARTITION")
-          fi
-          mkdir -p target/cli-test-extract
-          timeout "$COMMAND_TIMEOUT" cargo-nextest nextest run \
-            --archive-file target/astra-cli-tests.tar.zst \
-            --extract-to target/cli-test-extract --workspace-remap "$GITHUB_WORKSPACE" \
-            --profile ci -E "$NEXTEST_FILTER" "${partition[@]}"
-      - name: Retain CLI test timings
-        if: ${{ always() && env.RUN_TESTS == 'true' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: cli-timings-${{ matrix.segment }}-${{ github.run_attempt }}
-          path: target/**/nextest/ci/junit.xml
-          if-no-files-found: warn
-          retention-days: 3
-      - name: Dump processes on failure
-        if: failure() && env.RUN_TESTS == 'true'
-        run: pgrep -af 'cargo|nextest|astra|bash|sleep' || true
+          TEST_RESULT: ${{ needs.cli-test-build.result }}
+        run: test "$TEST_RESULT" = success
 
   shard-b:
     name: "Test: astra-runtime"

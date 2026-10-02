@@ -23679,159 +23679,166 @@ impl SubRunExecutor for ServerSubRunExecutor {
 }
 
 impl ServerSubRunExecutor {
-    async fn execute_with_frontier(
+    fn execute_with_frontier(
         &self,
         mut config: SubRunConfig,
-    ) -> Result<
-        (
-            astra_services::coordination::AgentResult,
-            Option<crate::orchestration::spawner::SpawnRunFrontier>,
-        ),
-        String,
-    > {
-        let runtime_ceiling = astra_config::RuntimeConfig::cached()
-            .runtime_limits
-            .resolve_turn_ceiling(
-                astra_turn_core::stop_hooks_yaml::is_plan_subtask_from_delegation_context(
-                    &config.context,
-                ),
-            )?;
-        if config.max_turns == Some(0) {
-            return Err("max_turns must be positive".to_string());
-        }
-        use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
-        use astra_turn_core::stop_hooks_yaml::{
-            detect_turn_hook_sets, is_plan_subtask_from_delegation_context,
-            project_root_from_delegation_context,
-        };
-        // Install the process-local cancellation surface before any durable
-        // activation I/O. A stalled authority renewal must remain bounded and
-        // cancellation-responsive, and no provider/tool side effect is
-        // allowed until it succeeds.
-        let local_cancel_flag = Arc::new(AtomicBool::new(false));
-        let local_pause_flag = config
-            .pause_flag
-            .clone()
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        let local_cancel_token = config
-            .cancel_token
-            .clone()
-            .unwrap_or_else(|| Arc::new(CancellationToken::new()));
-        let local_execution_lease_lost = Arc::new(AtomicBool::new(false));
-
-        let selected_execution = self.select_subrun_execution(&config).await?;
-        let durable_admission = self
-            .ensure_durable_subrun_started(&config, selected_execution.as_ref())
-            .await?;
-        let execution_authority = durable_admission.as_ref().map(|admission| {
-            crate::server::run::engine::RunExecutionAuthority {
-                owner_generation: admission.owner_generation,
-            }
-        });
-        let durable_run_engine = self.durable_run_engine();
-        config.bind_execution_authority(durable_run_engine.is_some(), execution_authority)?;
-        if let (Some(sink), Some(authority)) = (
-            config.execution_owner_generation_sink.as_ref(),
-            execution_authority,
-        ) {
-            sink.publish(authority.owner_generation);
-        }
-        let confirmed_execution_authority = if let (Some(engine), Some(authority)) =
-            (durable_run_engine.as_ref(), execution_authority)
-        {
-            let confirmed = match engine
-                .confirm_execution_authority(
-                    &config.user_id,
-                    &config.session_id,
-                    &config.run_id,
-                    authority.owner_generation,
-                    local_cancel_token.as_ref(),
-                )
-                .await
-            {
-                Ok(ExecutionAuthorityConfirmation::Confirmed(confirmed)) => confirmed,
-                Ok(ExecutionAuthorityConfirmation::Superseded) => {
-                    let exact_cancellation = engine
-                        .load_run_control(&config.user_id, &config.run_id)
-                        .await?
-                        .is_some_and(|control| {
-                            control.run_generation == authority.owner_generation
-                                && (control.cancellation_requested
-                                    || control.status == STATUS_CANCELLED)
-                        });
-                    if exact_cancellation {
-                        return Ok(settle_subrun_activation_cancellation(
-                            engine,
-                            self.dynamic_agent_spawner.as_deref(),
-                            &config,
-                            authority.owner_generation,
-                        )
-                        .await);
-                    }
-                    return Err(format!(
-                        "durable sub-run execution authority is expired or superseded at generation {}",
-                        authority.owner_generation
-                    ));
-                }
-                Err(error) => {
-                    // Cancellation can win while the child is still proving
-                    // its first execution lease. Preserve that typed control
-                    // outcome instead of collapsing it into an executor
-                    // failure merely because no loop state exists yet. The
-                    // token alone is not sufficient (lease fencing and
-                    // shutdown also stop local work), so require the durable
-                    // child/ancestor control plane to agree.
-                    if local_cancel_token.is_cancelled() {
-                        return Ok(settle_subrun_activation_cancellation(
-                            engine,
-                            self.dynamic_agent_spawner.as_deref(),
-                            &config,
-                            authority.owner_generation,
-                        )
-                        .await);
-                    }
-                    // Activation is deliberately fail-closed: no provider or
-                    // tool has run yet. Do not follow a timed-out renewal with
-                    // another unbounded terminal write against the same store.
-                    // The exact durable Running row remains owned by the
-                    // lease/recovery protocol and will be reconciled after its
-                    // TTL; the scheduler only rereads that authority.
-                    return Err(format!(
-                        "failed to confirm durable sub-run execution authority: {error}"
-                    ));
-                }
-            };
-            Some(confirmed)
-        } else {
-            None
-        };
-        // Start lease fencing immediately after durable activation. Model
-        // selection, binding materialization, and queueing must not create a
-        // window in which recovery can supersede this child before its
-        // heartbeat exists.
-        let mut owner_lease_heartbeat = match (
-            durable_run_engine.as_ref(),
-            execution_authority,
-            confirmed_execution_authority,
-        ) {
-            (Some(engine), Some(authority), Some(confirmed)) => engine.start_owner_lease_heartbeat(
-                config.user_id.clone(),
-                config.session_id.clone(),
-                config.run_id.clone(),
-                authority.owner_generation,
-                confirmed,
-                local_execution_lease_lost.clone(),
-                local_cancel_token.clone(),
+    ) -> impl std::future::Future<
+        Output = Result<
+            (
+                astra_services::coordination::AgentResult,
+                Option<crate::orchestration::spawner::SpawnRunFrontier>,
             ),
-            _ => None,
-        };
-        let durable_user_id = config.user_id.clone();
-        let durable_session_id = config.session_id.clone();
-        let durable_run_id = config.run_id.clone();
-        let mut durable_terminal_committed = false;
-        let mut atomic_terminal_attempted = false;
-        let mut committed_frontier = None;
-        let execution = AssertUnwindSafe(async {
+            String,
+        >,
+    > + Send
+    + '_ {
+        // Both direct and trait callers share the same boxed execution body.
+        // Do not embed this large lifecycle future in every caller's stack.
+        Box::pin(async move {
+            let runtime_ceiling = astra_config::RuntimeConfig::cached()
+                .runtime_limits
+                .resolve_turn_ceiling(
+                    astra_turn_core::stop_hooks_yaml::is_plan_subtask_from_delegation_context(
+                        &config.context,
+                    ),
+                )?;
+            if config.max_turns == Some(0) {
+                return Err("max_turns must be positive".to_string());
+            }
+            use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
+            use astra_turn_core::stop_hooks_yaml::{
+                detect_turn_hook_sets, is_plan_subtask_from_delegation_context,
+                project_root_from_delegation_context,
+            };
+            // Install the process-local cancellation surface before any durable
+            // activation I/O. A stalled authority renewal must remain bounded and
+            // cancellation-responsive, and no provider/tool side effect is
+            // allowed until it succeeds.
+            let local_cancel_flag = Arc::new(AtomicBool::new(false));
+            let local_pause_flag = config
+                .pause_flag
+                .clone()
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+            let local_cancel_token = config
+                .cancel_token
+                .clone()
+                .unwrap_or_else(|| Arc::new(CancellationToken::new()));
+            let local_execution_lease_lost = Arc::new(AtomicBool::new(false));
+
+            let selected_execution = self.select_subrun_execution(&config).await?;
+            let durable_admission = self
+                .ensure_durable_subrun_started(&config, selected_execution.as_ref())
+                .await?;
+            let execution_authority = durable_admission.as_ref().map(|admission| {
+                crate::server::run::engine::RunExecutionAuthority {
+                    owner_generation: admission.owner_generation,
+                }
+            });
+            let durable_run_engine = self.durable_run_engine();
+            config.bind_execution_authority(durable_run_engine.is_some(), execution_authority)?;
+            if let (Some(sink), Some(authority)) = (
+                config.execution_owner_generation_sink.as_ref(),
+                execution_authority,
+            ) {
+                sink.publish(authority.owner_generation);
+            }
+            let confirmed_execution_authority = if let (Some(engine), Some(authority)) =
+                (durable_run_engine.as_ref(), execution_authority)
+            {
+                let confirmed = match engine
+                    .confirm_execution_authority(
+                        &config.user_id,
+                        &config.session_id,
+                        &config.run_id,
+                        authority.owner_generation,
+                        local_cancel_token.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(ExecutionAuthorityConfirmation::Confirmed(confirmed)) => confirmed,
+                    Ok(ExecutionAuthorityConfirmation::Superseded) => {
+                        let exact_cancellation = engine
+                            .load_run_control(&config.user_id, &config.run_id)
+                            .await?
+                            .is_some_and(|control| {
+                                control.run_generation == authority.owner_generation
+                                    && (control.cancellation_requested
+                                        || control.status == STATUS_CANCELLED)
+                            });
+                        if exact_cancellation {
+                            return Ok(settle_subrun_activation_cancellation(
+                                engine,
+                                self.dynamic_agent_spawner.as_deref(),
+                                &config,
+                                authority.owner_generation,
+                            )
+                            .await);
+                        }
+                        return Err(format!(
+                            "durable sub-run execution authority is expired or superseded at generation {}",
+                            authority.owner_generation
+                        ));
+                    }
+                    Err(error) => {
+                        // Cancellation can win while the child is still proving
+                        // its first execution lease. Preserve that typed control
+                        // outcome instead of collapsing it into an executor
+                        // failure merely because no loop state exists yet. The
+                        // token alone is not sufficient (lease fencing and
+                        // shutdown also stop local work), so require the durable
+                        // child/ancestor control plane to agree.
+                        if local_cancel_token.is_cancelled() {
+                            return Ok(settle_subrun_activation_cancellation(
+                                engine,
+                                self.dynamic_agent_spawner.as_deref(),
+                                &config,
+                                authority.owner_generation,
+                            )
+                            .await);
+                        }
+                        // Activation is deliberately fail-closed: no provider or
+                        // tool has run yet. Do not follow a timed-out renewal with
+                        // another unbounded terminal write against the same store.
+                        // The exact durable Running row remains owned by the
+                        // lease/recovery protocol and will be reconciled after its
+                        // TTL; the scheduler only rereads that authority.
+                        return Err(format!(
+                            "failed to confirm durable sub-run execution authority: {error}"
+                        ));
+                    }
+                };
+                Some(confirmed)
+            } else {
+                None
+            };
+            // Start lease fencing immediately after durable activation. Model
+            // selection, binding materialization, and queueing must not create a
+            // window in which recovery can supersede this child before its
+            // heartbeat exists.
+            let mut owner_lease_heartbeat = match (
+                durable_run_engine.as_ref(),
+                execution_authority,
+                confirmed_execution_authority,
+            ) {
+                (Some(engine), Some(authority), Some(confirmed)) => engine
+                    .start_owner_lease_heartbeat(
+                        config.user_id.clone(),
+                        config.session_id.clone(),
+                        config.run_id.clone(),
+                        authority.owner_generation,
+                        confirmed,
+                        local_execution_lease_lost.clone(),
+                        local_cancel_token.clone(),
+                    ),
+                _ => None,
+            };
+            let durable_user_id = config.user_id.clone();
+            let durable_session_id = config.session_id.clone();
+            let durable_run_id = config.run_id.clone();
+            let mut durable_terminal_committed = false;
+            let mut atomic_terminal_attempted = false;
+            let mut committed_frontier = None;
+            let execution = AssertUnwindSafe(async {
             let durable_run = match self.durable_run_engine() {
                 Some(engine) => Some(
                     engine
@@ -25108,43 +25115,44 @@ impl ServerSubRunExecutor {
         })
         .catch_unwind()
         .await;
-        let execution_result = match execution {
-            Ok(result) => result,
-            Err(payload) => Err(format!(
-                "server sub-run executor panicked: {}",
-                panic_payload_message(payload.as_ref())
-            )),
-        };
+            let execution_result = match execution {
+                Ok(result) => result,
+                Err(payload) => Err(format!(
+                    "server sub-run executor panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                )),
+            };
 
-        if let Err(error) = execution_result.as_ref()
-            && !durable_terminal_committed
-            && !atomic_terminal_attempted
-            && !local_execution_lease_lost.load(Ordering::Acquire)
-            && let Some(authority) = execution_authority
-        {
-            // The production executor is the sole terminal owner. Any ordinary
-            // error or caught panic after durable admission must therefore
-            // settle (or explicitly lose) that exact generation before the
-            // scheduler projects the result. Recovery remains the fallback for
-            // an unavailable database; the outer delegation layer never writes
-            // an unfenced replacement terminal.
-            let _ = self
-                .persist_durable_subrun_status(
-                    &durable_user_id,
-                    &durable_session_id,
-                    &durable_run_id,
-                    Some(authority.owner_generation),
-                    STATUS_FAILED,
-                    None,
-                    Some("executor_failed_before_terminal"),
-                    Some(error),
-                    None,
-                    None,
-                )
-                .await;
-        }
-        drop(owner_lease_heartbeat.take());
-        execution_result.map(|result| (result, committed_frontier))
+            if let Err(error) = execution_result.as_ref()
+                && !durable_terminal_committed
+                && !atomic_terminal_attempted
+                && !local_execution_lease_lost.load(Ordering::Acquire)
+                && let Some(authority) = execution_authority
+            {
+                // The production executor is the sole terminal owner. Any ordinary
+                // error or caught panic after durable admission must therefore
+                // settle (or explicitly lose) that exact generation before the
+                // scheduler projects the result. Recovery remains the fallback for
+                // an unavailable database; the outer delegation layer never writes
+                // an unfenced replacement terminal.
+                let _ = self
+                    .persist_durable_subrun_status(
+                        &durable_user_id,
+                        &durable_session_id,
+                        &durable_run_id,
+                        Some(authority.owner_generation),
+                        STATUS_FAILED,
+                        None,
+                        Some("executor_failed_before_terminal"),
+                        Some(error),
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+            drop(owner_lease_heartbeat.take());
+            execution_result.map(|result| (result, committed_frontier))
+        })
     }
 }
 

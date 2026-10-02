@@ -46,6 +46,8 @@ mod journey_team_data_fidelity_matrix;
 mod journey_team_http_negatives_matrix;
 mod journey_team_isolation_matrix;
 mod journey_team_snapshots_matrix;
+#[path = "../test_support.rs"]
+mod test_support;
 
 use harness::require_system_e2e_env;
 

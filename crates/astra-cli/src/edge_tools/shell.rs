@@ -9604,8 +9604,16 @@ mod tests {
             .tempdir_in(&target)
             .unwrap();
         let executor = super::ToolExecutor::new(dir.path());
-        let content = "needle\n".repeat(150);
-        std::fs::write(dir.path().join("big.txt"), &content).unwrap();
+        let match_count = super::GREP_DEFAULT_HEAD_LIMIT + 1;
+        let file = dir.path().join("big.txt");
+        let expected_output_bytes: usize = (1..=match_count)
+            .map(|line| format!("{}:{line}:needle\n", file.display()).len())
+            .sum();
+        assert!(
+            expected_output_bytes < super::super::per_tool_output_limit("grep"),
+            "line-limit fixture must fit the independent byte budget"
+        );
+        std::fs::write(&file, "needle\n".repeat(match_count)).unwrap();
 
         let result = executor.grep(&serde_json::json!({
             "pattern": "needle",
@@ -9620,7 +9628,7 @@ mod tests {
         let match_lines: Vec<&str> = result.lines().filter(|l| l.contains("needle")).collect();
         assert_eq!(
             match_lines.len(),
-            150,
+            match_count,
             "all matching lines must be retained"
         );
     }
