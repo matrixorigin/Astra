@@ -393,6 +393,10 @@ pub struct ToolBatchRequest {
     pub run_id: String,
     pub turn_chain_id: String,
     pub request_id: String,
+    /// Immutable server-issued read-only execution ceiling for this request.
+    /// Keep it on the request so batching cannot lose the authority when the
+    /// host advances to another SSE exchange.
+    pub read_only_execution: bool,
     /// Immutable execution budget issued by the server for this invocation.
     pub execution_timeout_ms: u64,
     /// Immutable absolute server deadline retained until this exact invocation starts.
@@ -466,18 +470,6 @@ pub trait SseStreamHost: Send {
     /// CLI: prints text deltas, starts/stops thinking spinner.
     /// Headless: no-op.
     async fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>);
-
-    /// Called when a complete tool_call entry has been accumulated from the
-    /// SSE stream. Default: no-op.
-    ///
-    /// CLI host uses this to kick speculative read-only tool execution
-    /// (see [`crate::streaming_tool_exec::StreamingToolExecutor`]), overlapping
-    /// tool I/O with the remaining LLM stream. Gated behind
-    /// `ASTRA_STREAMING_TOOL_EXEC=1` for rollout safety.
-    ///
-    /// `index` is the position in `accum.tool_calls`; `tool_call` is the
-    /// normalized OpenAI-shaped call object (`{id, type, function: {name, arguments}}`).
-    async fn on_tool_call_complete(&mut self, _index: usize, _tool_call: &Value) {}
 
     /// Called when the SSE stream ends. Host should clean up any active UI state.
     fn on_stream_complete(&mut self);
@@ -1335,7 +1327,6 @@ async fn process_sse_event_block<H: SseStreamHost>(
         *first_sse_frame_seen = true;
         host.on_first_sse_frame();
     }
-    let tc_len_before = accum.tool_calls.len();
     let pending_len_before = pending.len();
     for event in &parsed.events {
         match event.get("type").and_then(Value::as_str) {
@@ -1389,16 +1380,6 @@ async fn process_sse_event_block<H: SseStreamHost>(
     }
     host.on_accum_update(accum);
     host.on_render_effects(effects).await;
-    if accum.tool_calls.len() > tc_len_before {
-        let new_calls: Vec<(usize, Value)> = accum.tool_calls[tc_len_before..]
-            .iter()
-            .enumerate()
-            .map(|(off, v)| (tc_len_before + off, v.clone()))
-            .collect();
-        for (idx, tc) in new_calls {
-            host.on_tool_call_complete(idx, &tc).await;
-        }
-    }
     for event in &parsed.events {
         host.on_accepted_sse_event(event).await?;
     }
@@ -1552,6 +1533,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 turn_chain_id,
                 request_id,
                 schema_admitted_by_server,
+                read_only_execution,
                 execution_deadline_unix_ms,
                 execution_timeout_ms,
                 tool,
@@ -1595,6 +1577,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                     request_id,
                     execution_timeout_ms,
                     execution_deadline_unix_ms,
+                    read_only_execution,
                     tool,
                     args,
                 });
@@ -3719,6 +3702,7 @@ mod tests {
             turn_chain_id: "c1".to_string(),
             request_id: format!("req-{tool}"),
             schema_admitted_by_server: true,
+            read_only_execution: false,
             execution_deadline_unix_ms: 4_102_444_800_000,
             execution_timeout_ms: 300_000,
             tool: tool.to_string(),

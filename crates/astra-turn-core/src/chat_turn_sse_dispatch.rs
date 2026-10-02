@@ -311,6 +311,16 @@ pub struct StreamAppliedUserIntent {
 }
 
 impl ChatTurnSseAccum {
+    /// Enforce terminal evidence for a Server-owned admission without losing
+    /// observed execution facts or replacing an existing failure.
+    pub fn require_server_terminal_evidence(&mut self) {
+        if !self.server_loop_terminal && self.error_message.is_none() && self.error_kind.is_none() {
+            self.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+            self.error_message =
+                Some("Server admission stream ended without terminal execution evidence".into());
+        }
+    }
+
     /// Context occupancy is independent of complete billing evidence.
     pub fn measured_request_input_tokens(&self) -> Option<u64> {
         let partition = (|| {
@@ -523,6 +533,11 @@ pub enum ChatTurnEdgePending {
         turn_chain_id: String,
         request_id: String,
         schema_admitted_by_server: bool,
+        /// Server-issued read-only execution ceiling carried with this exact
+        /// request through batching. It must not live in host-wide state,
+        /// because a later exchange can otherwise clear or replace it before
+        /// this request executes.
+        read_only_execution: bool,
         /// Absolute UTC deadline issued by the server.  This remains stable
         /// across batching, local queueing, and SSE replay.
         execution_deadline_unix_ms: u64,
@@ -1058,6 +1073,10 @@ fn apply_one_event(
                         .to_string(),
                     request_id,
                     schema_admitted_by_server,
+                    read_only_execution: event
+                        .get("read_only_execution")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                     execution_deadline_unix_ms,
                     execution_timeout_ms,
                     tool,

@@ -58,6 +58,19 @@ Edge/CLI local runtime may expose local capabilities only within declared author
 
 Path authority must be checked before execution. A model-provided path is not authority by itself.
 
+### Server-owned execution
+
+The CLI admits one Server-owned loop; local tools execute only through the
+Server's authenticated callback requests. Missing terminal execution evidence
+does not transfer continuation authority to the CLI. The adapter preserves
+observed results and usage, reports a typed protocol failure, and uses the
+existing physical-run cleanup path for an unsettled owner. It must not replay
+tools or open another admission to complete an incomplete stream.
+
+A Server-issued read-only ceiling belongs to its exact tool request and travels
+through parsing, batching and execution. Stream completion cannot clear that
+ceiling while the request remains pending. Local approval cannot widen it.
+
 ### Rename authority
 
 The CLI may modify symbol references only through an active semantic LSP backend

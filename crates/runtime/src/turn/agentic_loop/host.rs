@@ -632,10 +632,11 @@ pub trait AgenticLoopHost: Send {
 
     /// Return the authority that owns any continuation after `result`.
     ///
-    /// Runtime and embedded hosts use the default. Remote admission hosts must
-    /// opt into `RemoteServer` only from a typed terminal protocol event; URL,
-    /// topology labels, response text, and error strings are not admissible
-    /// evidence.
+    /// Runtime and embedded hosts use the default. A Server-only admission
+    /// host retains `RemoteServer` authority even when terminal evidence is
+    /// missing; it reports that protocol failure without gaining local
+    /// continuation rights. Response text and error strings cannot grant
+    /// execution authority.
     fn continuation_authority(&self, _result: &HostTurnResult) -> ContinuationAuthority {
         ContinuationAuthority::Runtime
     }
@@ -6534,6 +6535,7 @@ pub(crate) mod tests {
         turn_results: Vec<HostTurnResult>,
         current_turn: usize,
         pub(crate) provider_call_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
+        provider_response_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         pub(crate) valid_tools: HashSet<String>,
         pub(crate) emitted_lines: Vec<String>,
         pub(crate) compaction_events: Vec<CompactionEvent>,
@@ -6610,6 +6612,7 @@ pub(crate) mod tests {
                 executed_messages: Vec::new(),
                 executed_model_item_ids: Vec::new(),
                 provider_call_counter: None,
+                provider_response_gate: None,
                 executed_volatile: Vec::new(),
                 text_only_turns: Vec::new(),
                 turn_intent: None,
@@ -6845,6 +6848,10 @@ pub(crate) mod tests {
                     astra_core::ErrorKind::BudgetExhausted,
                     "no more turns",
                 ));
+            }
+            if let Some((started, release)) = self.provider_response_gate.take() {
+                started.notify_one();
+                release.notified().await;
             }
             self.executed_messages.push(state.messages.clone());
             self.executed_model_item_ids
@@ -8218,15 +8225,39 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn remote_server_terminal_never_starts_client_settlement_round() {
+    async fn remote_server_terminal_retains_late_input_without_client_settlement_round() {
         let mut terminal = text_result("", 15, 0, Some(30));
         terminal.accum.server_loop_terminal = true;
         terminal.edge_tool_round = vec![make_edge_tool("bash", "already executed by Edge")];
         let mut host = MockHost::new(vec![terminal, text_result("must not run", 15, 5, Some(30))])
             .with_remote_server_continuation();
         let mut state = make_state();
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+            Arc::new(astra_messaging::InProcessTransport::new()),
+            Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
+        ));
+        let recipient = astra_messaging::AgentAddress::new("remote-terminal-run", "root");
+        state.messaging.mailbox = Some(router.register(recipient.clone(), None).await.unwrap());
+        let message = astra_messaging::AgentMessage::new(
+            astra_messaging::AgentAddress::new("sender-run", "sender"),
+            astra_messaging::MessageTarget::Direct { address: recipient },
+            astra_messaging::MessagePayload::Text {
+                content: "Late task information".into(),
+                summary: None,
+            },
+        );
+        let message_id = message.id.clone();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        host.provider_response_gate = Some((started.clone(), release.clone()));
+        let delivery = tokio::spawn(async move {
+            started.notified().await;
+            router.send(message).await.unwrap();
+            release.notify_one();
+        });
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        delivery.await.unwrap();
 
         assert!(
             outcome.is_ok(),
@@ -8234,6 +8265,18 @@ pub(crate) mod tests {
         );
         assert_eq!(host.turn_count(), 1, "the client gets one Server admission");
         assert_eq!(host.text_only_turns, vec![false]);
+        assert_eq!(
+            state
+                .messaging
+                .mailbox
+                .as_mut()
+                .unwrap()
+                .try_recv()
+                .unwrap()
+                .id,
+            message_id,
+            "late input must remain queued, not consumed to reopen admission"
+        );
         assert!(
             state
                 .volatile_pending
@@ -8271,8 +8314,10 @@ pub(crate) mod tests {
         assert!(host.admitted_tool_call_batches.is_empty());
         assert_eq!(
             state.total_tool_calls, 0,
-            "invalid work must not reach ingest"
+            "unexecuted requests must not become executed-tool counts"
         );
+        assert_eq!(state.total_prompt, 15, "physical usage survives rejection");
+        assert_eq!(state.total_completion, 1);
     }
 
     #[tokio::test]

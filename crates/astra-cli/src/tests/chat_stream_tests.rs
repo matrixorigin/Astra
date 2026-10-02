@@ -1073,8 +1073,8 @@ async fn stream_chat_sse_api_error_propagated() {
 }
 
 #[tokio::test]
-async fn stream_chat_sse_with_tool_call_loop() {
-    // Mock server: first call returns a tool call, second call returns text.
+async fn stream_chat_sse_rejects_client_tool_continuation() {
+    // A malformed Server stream must never authorize another admission.
     let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cc = call_count.clone();
     let app = Router::new().route(
@@ -1082,18 +1082,13 @@ async fn stream_chat_sse_with_tool_call_loop() {
             post(move || {
                 let cc = cc.clone();
                 async move {
-                    let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let body = if n == 0 {
-                        // First turn: return a tool call for bash
+                    cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body =
                         "data: {\"type\":\"session_info\",\"session_id\":\"sess-tc\",\"run_id\":\"run-sess-tc\"}\n\n\
                          data: {\"type\":\"tool_call\",\"id\":\"tc-1\",\"name\":\"bash\",\"arguments\":{\"command\":\"echo hi\"}}\n\n\
                          data: {\"type\":\"turn_complete\",\"has_tool_calls\":true}\n\n\
                          data: [DONE]\n\n"
-                            .to_string()
-                    } else {
-                        // Second turn: return text
-                        sse_text_response("Done!", "sess-tc")
-                    };
+                            .to_string();
                     (
                         TEST_SSE_HEADERS,
                         body,
@@ -1188,14 +1183,9 @@ async fn stream_chat_sse_with_tool_call_loop() {
         benchmark_profile: None,
     })
     .await
-    .unwrap();
-    assert!(
-        result.full_text.starts_with("Done!"),
-        "unexpected full_text: {:?}",
-        result.full_text
-    );
-    assert!(result.tool_calls_count > 0);
-    assert!(call_count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    .expect_err("Server-owned streams cannot delegate continuation to the CLI");
+    assert!(result.error.contains("terminal execution evidence"));
+    assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1218,26 +1208,21 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
             "/chat/stream",
             post({
                 let state = state.clone();
-                move |axum::Json(request): axum::Json<serde_json::Value>| {
+                move || {
                     let state = state.clone();
                     async move {
-                        let n = state
+                        state
                             .call_count
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let body = if n == 0 {
-                            let turn_chain_id = request
-                                .get("turn_chain_id")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("chain-tx-e2e");
-                            format!(
+                        let body = format!(
                                 "data: {{\"type\":\"session_info\",\"session_id\":\"sess-tx-e2e\",\"run_id\":\"run-sess-tx-e2e\"}}\n\n\
                                  data: {}\n\n\
-                                 data: [DONE]\n\n",
+                                 {}",
                                 serde_json::json!({
                                     "type": "tool_request",
                                     "session_id": "sess-tx-e2e",
                                     "run_id": "run-sess-tx-e2e",
-                                    "turn_chain_id": turn_chain_id,
+                                    "turn_chain_id": "chain-tx-e2e",
                                     "request_id": "tr-tx-1",
                                     "schema_admitted_by_server": true,
                                     "execution_timeout_ms": 300_000,
@@ -1248,11 +1233,11 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
                                         "transaction_id": "tx-e2e",
                                         "rollback_on_failure": true
                                     }
-                                })
-                            )
-                        } else {
-                            sse_text_response("Done!", "sess-tx-e2e")
-                        };
+                                }),
+                                sse_text_response_with_execution_summary(
+                                    "Done!", "sess-tx-e2e", 1, 0, &["bash"], 1,
+                                ),
+                            );
                         (TEST_SSE_HEADERS, body)
                     }
                 }
@@ -1366,6 +1351,10 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         result.full_text
     );
     assert!(result.tool_calls_count > 0);
+    assert_eq!(
+        state.call_count.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
 
     let tool_results = state.tool_results.lock().await;
     assert_eq!(tool_results.len(), 1);
@@ -1706,7 +1695,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
 // ── Phase 3C: Chat stream MCP integration tests ──────────────────────────────
 
 #[tokio::test]
-async fn stream_chat_sse_dispatches_mcp_tool_call() {
+async fn stream_chat_sse_mcp_requires_server_owned_callback() {
     let mock_server_bin = mock_mcp_server_binary();
 
     // Connect McpClientManager to mock server via stdio
@@ -1737,137 +1726,171 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         tool_names
     );
 
-    // Tool name as it will appear in SSE: mcp_{server}_{tool}
-    let mcp_tool_name = crate::mcp_client::sanitize_tool_name("mcp_mock_echo");
+    let mcp_tool_name = manager
+        .all_tool_schemas()
+        .into_iter()
+        .filter_map(|schema| schema["function"]["name"].as_str().map(str::to_owned))
+        .find(|name| manager.find_tool_by_mcp_name(name) == Some(("mock", "echo")))
+        .expect("discovery must expose the public echo identity");
+    let mcp_arc = std::sync::Arc::new(tokio::sync::RwLock::new(manager));
 
-    // HTTP mock: first call returns MCP tool_call, second returns text
-    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let cc = call_count.clone();
-    let tool_name_clone = mcp_tool_name.clone();
-    let app = axum::Router::new().route(
+    // Exercise the public entrypoint with both a genuine callback request
+    // and an unauthorized client-continuation response, using one fixture.
+    for callback_admitted in [false, true] {
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let callbacks = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured_callbacks = callbacks.clone();
+        let cc = call_count.clone();
+        let tool_name_clone = mcp_tool_name.clone();
+        let app = axum::Router::new().route(
         "/chat/stream",
         axum::routing::post(move || {
             let cc = cc.clone();
             let tn = tool_name_clone.clone();
             async move {
-                let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let body = if n == 0 {
+                cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = if callback_admitted {
+                    let request = serde_json::json!({
+                        "type": "tool_request", "session_id": "sess-mcp",
+                        "run_id": "run-sess-mcp", "turn_chain_id": "chain-mcp",
+                        "request_id": "mcp-1", "schema_admitted_by_server": true,
+                        "execution_timeout_ms": 300000,
+                        "execution_deadline_unix_ms": 4102444800000u64,
+                        "tool": tn, "args": {"message": "hello from test"}
+                    });
                     format!(
+                        "data: {{\"type\":\"session_info\",\"session_id\":\"sess-mcp\",\"run_id\":\"run-sess-mcp\"}}\n\ndata: {request}\n\n{}",
+                        sse_text_response_with_execution_summary(
+                            "MCP done!", "sess-mcp", 1, 1, &[&tn], 1,
+                        ),
+                    )
+                } else { format!(
                         "data: {{\"type\":\"session_info\",\"session_id\":\"sess-mcp\",\"run_id\":\"run-sess-mcp\"}}\n\n\
                          data: {{\"type\":\"tool_call\",\"id\":\"mcp-1\",\"name\":\"{}\",\"arguments\":{{\"message\":\"hello from test\"}}}}\n\n\
                          data: {{\"type\":\"turn_complete\",\"has_tool_calls\":true}}\n\n\
                          data: [DONE]\n\n",
                         tn
-                    )
-                } else {
-                    sse_text_response("MCP done!", "sess-mcp")
-                };
+                    ) };
                 (TEST_SSE_HEADERS, body)
             }
         }),
-    );
-    let base = spawn_mock(app).await;
-    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    ).route("/tools/result", post(move |Json(body): Json<serde_json::Value>| {
+        let callbacks = captured_callbacks.clone();
+        async move {
+            callbacks.lock().await.push(body);
+            Json(serde_json::json!({"ok": true}))
+        }
+    }));
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
 
-    let mcp_arc = std::sync::Arc::new(tokio::sync::RwLock::new(manager));
-    let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+        let mut pm = PermissionManager::new(true);
+        let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
-    let result = stream_chat_sse(ChatTurnParams {
-        api: &api,
-        token: "fake-token",
-        auth_profile: None,
-        message: "call echo",
-        user_intent: "call echo",
-        input_runtime_required_texts: &[],
-        input_active_system_skills: &[],
-        input_runtime_volatile_texts: &[],
-        input_work_unit_observations: &[],
-        semantic_query_override: None,
-        session_id: None,
-        offering_id: None,
-        model: Some("test-model"),
-        provider: None,
-        explain: ExplainMode::Off,
-        explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
-        render_md: false,
-        history: &[],
-        perm_manager: &mut pm,
-        verbose_mode: false,
-        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
-        cli_context: None,
-        recent_tools: &[],
-        deferred_tool_activations: None,
-        resume_restricted_tools: &[],
-        tool_health_entries: &[],
-        workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
-        latest_skill_diagnosis: None,
-        latest_turn_quality_feedback: None,
-        unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
-        is_plan_subtask: false,
-        plan_subtask_id: None,
-        delegation_engine: None,
-        cancel_token: None,
-        execution_time_budget: None,
-        run_control: None,
-        incremental_state: None,
-        request_session_execution_lease: None,
-        plan_assemble_line_release: None,
-        stream_event_tx: None,
-        explain_analyze_terminal_degraded: None,
-        stream_json_emitter: None,
-        agent_live_event_sink: None,
-        approval_request_tx: None,
-        ask_user_request_tx: None,
-        plan_review_request_tx: None,
-        mcp_manager: Some(mcp_arc),
-        skill_quality_tracker: &mut skill_qt,
-        discovered_skills: None,
-        messaging_metrics: None,
-        agent_spawner: None,
-        root_agent_id: None,
-        root_mailbox_slot: None,
-        observability_hub: None,
-        observability_session: None,
-        file_journal: None,
-        file_state: None,
-        database_snapshot_journal: None,
+        let result = stream_chat_sse(ChatTurnParams {
+            api: &api,
+            token: "fake-token",
+            auth_profile: None,
+            message: "call echo",
+            user_intent: "call echo",
+            input_runtime_required_texts: &[],
+            input_active_system_skills: &[],
+            input_runtime_volatile_texts: &[],
+            input_work_unit_observations: &[],
+            semantic_query_override: None,
+            session_id: None,
+            offering_id: None,
+            model: Some("test-model"),
+            provider: None,
+            explain: ExplainMode::Off,
+            explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
+            render_md: false,
+            history: &[],
+            perm_manager: &mut pm,
+            verbose_mode: false,
+            render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
+            cli_context: None,
+            recent_tools: &[],
+            deferred_tool_activations: None,
+            resume_restricted_tools: &[],
+            tool_health_entries: &[],
+            workspace_observation_quarantine: None,
+            session_lessons: &[],
+            memory_selection_reports: &[],
+            latest_skill_diagnosis: None,
+            latest_turn_quality_feedback: None,
+            unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            delegation_engine: None,
+            cancel_token: None,
+            execution_time_budget: None,
+            run_control: None,
+            incremental_state: None,
+            request_session_execution_lease: None,
+            plan_assemble_line_release: None,
+            stream_event_tx: None,
+            explain_analyze_terminal_degraded: None,
+            stream_json_emitter: None,
+            agent_live_event_sink: None,
+            approval_request_tx: None,
+            ask_user_request_tx: None,
+            plan_review_request_tx: None,
+            mcp_manager: Some(mcp_arc.clone()),
+            skill_quality_tracker: &mut skill_qt,
+            discovered_skills: None,
+            messaging_metrics: None,
+            agent_spawner: None,
+            root_agent_id: None,
+            root_mailbox_slot: None,
+            observability_hub: None,
+            observability_session: None,
+            file_journal: None,
+            file_state: None,
+            database_snapshot_journal: None,
 
-        git_worktree_journal: None,
-        session_state_journal: None,
-        bg_task_commands: None,
-        bg_task_list_cache: None,
-        bash_detach_slot: None,
-        turn_index: DEFAULT_TURN_INDEX,
-        pipeline_state: None,
-        compaction_state: None,
-        consecutive_context_window_errors: 0,
-        idempotency_cache: None,
-        pre_loaded_messages: None,
-        append_system_prompt: None,
-        #[cfg(feature = "harness")]
-        harness_sink: None,
-        #[cfg(feature = "harness")]
-        harness_trace: None,
-        #[cfg(feature = "harness")]
-        benchmark_profile: None,
-    })
-    .await
-    .unwrap();
-
-    assert!(
-        result.full_text.starts_with("MCP done!"),
-        "unexpected full_text: {:?}",
-        result.full_text
-    );
-    assert!(
-        result.tool_calls_count > 0,
-        "expected at least one MCP tool call"
-    );
-    assert!(
-        call_count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-        "expected at least 2 HTTP rounds (tool_call + final text)"
-    );
+            git_worktree_journal: None,
+            session_state_journal: None,
+            bg_task_commands: None,
+            bg_task_list_cache: None,
+            bash_detach_slot: None,
+            turn_index: DEFAULT_TURN_INDEX,
+            pipeline_state: None,
+            compaction_state: None,
+            consecutive_context_window_errors: 0,
+            idempotency_cache: None,
+            pre_loaded_messages: None,
+            append_system_prompt: None,
+            #[cfg(feature = "harness")]
+            harness_sink: None,
+            #[cfg(feature = "harness")]
+            harness_trace: None,
+            #[cfg(feature = "harness")]
+            benchmark_profile: None,
+        })
+        .await;
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let callbacks = callbacks.lock().await;
+        if callback_admitted {
+            let result = result.expect("Server callback must execute the real MCP tool");
+            assert_eq!(result.full_text, "MCP done!");
+            assert_eq!(callbacks.len(), 1);
+            assert_eq!(callbacks[0]["request_id"], "mcp-1");
+            assert_eq!(callbacks[0]["status"], "completed");
+            assert!(
+                callbacks[0]["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("hello from test")
+            );
+        } else {
+            let error =
+                result.expect_err("MCP availability does not authorize client continuation");
+            assert!(error.error.contains("terminal execution evidence"));
+            assert!(
+                callbacks.is_empty(),
+                "unadmitted MCP calls must not execute"
+            );
+        }
+    }
 }

@@ -1235,10 +1235,6 @@ pub(crate) struct EdgeSseContext<'a> {
     pub turn_rollback_on_failure: bool,
     /// Cross-turn tool output cache (persists across turns via `CliAgenticLoopHost`).
     pub tool_cache: &'a mut EdgeToolCache,
-    /// Optional ObservabilityHub for recording streaming-speculation metrics.
-    /// `None` for tests and non-observable contexts; production supplies it
-    /// from `CliAgenticLoopHost`.
-    pub observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Incremental turn snapshot mirrored during SSE consumption so forced
     /// cancellation can recover partial text, ids, usage, and tool audit data.
     pub incremental_state:
@@ -1276,9 +1272,6 @@ struct CliSseStreamHost<'a> {
     render_policy: RenderPolicy,
     perm_manager: Option<&'a mut crate::cli::permission_manager::PermissionManager>,
     render: StreamRenderState,
-    /// Once this turn has emitted or requested tool work, hide any further prose
-    /// so we don't flash an intermediate draft that will be invalidated.
-    tool_work_detected: bool,
     /// Ordered tool executions from this SSE stream.
     pub edge_tool_round: Vec<EdgeToolExecResult>,
     /// Server-owned tool calls are already executed remotely.  Keep only the
@@ -1302,11 +1295,6 @@ struct CliSseStreamHost<'a> {
         std::collections::HashMap<String, ServerToolTerminalFingerprint>,
     server_tool_protocol_error: Option<String>,
     server_tool_sequence: u64,
-    // ── XML tag suppression ────────────────────────────────────────────
-    /// Text accumulated while inside an open `<think>`/`<reflect>` tag.
-    /// Flushed (after stripping the tags) once the closing tag arrives.
-    /// Empty when not inside a tag — text goes directly to the renderer.
-    xml_tag_buffer: String,
     /// Optional cancellation token to abort SSE stream on auth failure.
     cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     /// Optional channel for forwarding fine-grained stream events.
@@ -1361,10 +1349,11 @@ struct CliSseStreamHost<'a> {
     /// When a `tool_request` arrives with one of these IDs, the local permission
     /// check is skipped — the user has already approved the operation.
     cloud_pre_approved: std::collections::HashSet<String>,
-    /// Server-issued immutable execution ceilings, keyed by the exact request
-    /// identity. This is kept on the host rather than in model arguments so a
-    /// parent approval or replay cannot widen a read-only child request.
-    read_only_tool_requests: std::collections::HashSet<String>,
+    /// Server-issued read-only execution ceiling for the request currently
+    /// entering the local executor. The authoritative bit travels on each
+    /// `ToolBatchRequest`; this flag is only the short-lived bridge into the
+    /// existing `execute_tool` implementation.
+    active_read_only_execution: bool,
     /// Per-invocation server-approved deadline token. This is separate from
     /// parent turn cancellation so sibling tool calls cannot cancel each other.
     active_execution_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -1385,18 +1374,6 @@ struct CliSseStreamHost<'a> {
     turn_rollback_fired: Option<TurnRollbackFired>,
     /// Cross-turn tool output cache (shared with `CliAgenticLoopHost`).
     tool_cache: &'a mut EdgeToolCache,
-    /// Speculative streaming tool executor (D-9).
-    ///
-    /// When `ASTRA_STREAMING_TOOL_EXEC=1` is set, read-only tool_use blocks
-    /// that complete mid-stream are dispatched here via `on_tool_block` so
-    /// their I/O overlaps with the remaining LLM stream. After the stream
-    /// ends, results are harvested and merged so normal permission checks
-    /// and journal/observability events still fire exactly once in the
-    /// batch phase.
-    streaming_tool_exec:
-        Option<std::sync::Arc<astra_turn_core::streaming_tool_exec::StreamingToolExecutor>>,
-    /// Optional ObservabilityHub for streaming-speculation metric reporting.
-    observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Set when posting edge-side tool or approval results receives 401.
     auth_failure: bool,
     /// Terminal failure to acknowledge an edge control-plane callback after
@@ -1792,21 +1769,6 @@ impl<'a> CliSseStreamHost<'a> {
             worktree_checkpoint: ctx.executor.git_worktree_journal_checkpoint(),
             session_state_checkpoint: ctx.executor.session_state_journal_checkpoint(),
         });
-        // Always buffer text from the start.  Text is accumulated in
-        // `xml_tag_buffer` and only rendered one-shot at finalization when
-        // it turns out to be the final answer (no tool calls).  This avoids
-        // two classes of leakage that ANSI-based `discard_and_reset()` cannot
-        // reliably fix:
-        //   1. Non-TTY (piped/redirected) — cursor movement has no effect.
-        //   2. TTY with interleaved stderr — tool status lines push the
-        //      cursor further than TerminalRegion tracks, so MoveUp(rows)
-        //      falls short and the first few text lines persist in
-        //      scrollback even after the "clear".
-        // Trade-off: streaming text display is deferred to finalization.
-        // The thinking spinner and tool status lines still stream normally,
-        // so the terminal is never blank during generation.
-        let buffer_from_start = true;
-        let streaming_tool_exec = build_streaming_tool_exec(std::sync::Arc::clone(&ctx.executor));
         Self {
             last_permission_selection: None,
             api: ctx.api,
@@ -1818,7 +1780,6 @@ impl<'a> CliSseStreamHost<'a> {
             render_policy: ctx.render_policy,
             perm_manager: ctx.perm_manager,
             render: StreamRenderState::with_term_width(term_width, render_md, suppress_reasoning),
-            tool_work_detected: buffer_from_start,
             edge_tool_round: Vec::new(),
             server_tool_calls: std::collections::HashMap::new(),
             server_tool_completed_ids: std::collections::HashSet::new(),
@@ -1827,7 +1788,6 @@ impl<'a> CliSseStreamHost<'a> {
             server_tool_completed_terminals: std::collections::HashMap::new(),
             server_tool_protocol_error: None,
             server_tool_sequence: 0,
-            xml_tag_buffer: String::new(),
             cancel_token: ctx.cancel_token,
             stream_event_tx: ctx.stream_event_tx,
             explain_analyze_enabled: false,
@@ -1847,15 +1807,13 @@ impl<'a> CliSseStreamHost<'a> {
             skill_resolver: ctx.skill_resolver,
             skills_invoked: std::collections::HashSet::new(),
             cloud_pre_approved: std::collections::HashSet::new(),
-            read_only_tool_requests: std::collections::HashSet::new(),
+            active_read_only_execution: false,
             active_execution_cancel: None,
             tool_result_identities: std::collections::HashMap::new(),
             active_turn_rollback,
             turn_rollback_boundary_emitted: false,
             turn_rollback_fired: None,
             tool_cache: ctx.tool_cache,
-            streaming_tool_exec,
-            observability_hub: ctx.observability_hub,
             auth_failure: false,
             callback_failure: None,
             callback_failure_run_id: None,
@@ -1863,23 +1821,6 @@ impl<'a> CliSseStreamHost<'a> {
             hard_failure_before_output: false,
             incremental_state: ctx.incremental_state,
             request_session_execution_lease: ctx.request_session_execution_lease,
-        }
-    }
-
-    /// Push text to the active renderer (markdown or raw stdout).
-    fn render_text(&mut self, s: &str) {
-        // Track output bytes for live token estimation
-        self.render.output_bytes = self.render.output_bytes.saturating_add(s.len());
-        if let Some(pane) = self.render.thinking_pane.take() {
-            let summary = pane.summary_line();
-            self.render.clear_thinking_with_summary(pane, &summary);
-        }
-        if let Some(md) = &mut self.render.md {
-            md.push(s);
-        } else {
-            stdout_print!("{s}");
-            let _ = crate::cli::stream::output_sink::flush_stdout();
-            self.render.track_output(s);
         }
     }
 
@@ -2101,53 +2042,6 @@ impl<'a> CliSseStreamHost<'a> {
             }
 
             _ => None,
-        }
-    }
-
-    /// Accept a text delta, suppressing content inside XML thinking tags.
-    /// Text outside tags is rendered immediately (preserving streaming UX).
-    /// Handles tags split across SSE chunks by holding back partial `<…` tails.
-    fn push_text(&mut self, s: &str) {
-        self.xml_tag_buffer.push_str(s);
-
-        // Fast path: no tag markers at all.
-        if !self.xml_tag_buffer.contains('<') {
-            let buf = std::mem::take(&mut self.xml_tag_buffer);
-            self.render_text(&buf);
-            return;
-        }
-
-        // Check if there's an open thinking tag.
-        if streaming_md::has_open_xml_tag(&self.xml_tag_buffer) {
-            // Still inside a tag — keep buffering, don't render.
-            return;
-        }
-
-        // Check for a potential incomplete thinking tag at the end of the buffer.
-        // Only hold back if the tail could plausibly become one of our known tags.
-        if let Some(last_lt) = self.xml_tag_buffer.rfind('<') {
-            let tail = &self.xml_tag_buffer[last_lt..];
-            if !tail.contains('>') && streaming_md::could_become_suppressed_tag(tail) {
-                // Potential partial tag — split: flush before, hold tail.
-                let before = self.xml_tag_buffer[..last_lt].to_string();
-                let held = self.xml_tag_buffer[last_lt..].to_string();
-                self.xml_tag_buffer = held;
-                if !before.is_empty() {
-                    let mut buf = before;
-                    streaming_md::strip_xml_tags_inplace(&mut buf);
-                    if !buf.is_empty() {
-                        self.render_text(&buf);
-                    }
-                }
-                return;
-            }
-        }
-
-        // Tag is closed (or there was never one).  Strip and flush.
-        let mut buf = std::mem::take(&mut self.xml_tag_buffer);
-        streaming_md::strip_xml_tags_inplace(&mut buf);
-        if !buf.is_empty() {
-            self.render_text(&buf);
         }
     }
 
@@ -3401,28 +3295,6 @@ impl<'a> CliSseStreamHost<'a> {
 
 // `extract_first_absolute_path` moved to `crate::sandbox_retry`.
 
-/// D-9 correctness guard: decide whether a speculative result may be
-/// reused as-is in place of a real tool execution.
-///
-/// A speculative tool invocation returns `(output, success)`. A `success=false`
-/// outcome means the speculation **errored** (permission-denied mid-stream,
-/// tool panic surfaced as error string, bash non-zero exit, grep pattern not
-/// found reported as error, etc.). Silently substituting an errored output as
-/// if it were a successful tool_result causes the LLM to reason on an
-/// error-as-success and cascades into hallucinated next steps.
-///
-/// When `success=false`, callers must fall through to the normal execution
-/// path so the tool re-runs and the real outcome (success or genuine error)
-/// surfaces through the standard journal/observability pipeline.
-///
-/// Returns `Some(output)` only when the speculation was a genuine success.
-pub(crate) fn reusable_speculative_output(r: Option<(String, bool)>) -> Option<String> {
-    match r {
-        Some((output, true)) => Some(output),
-        _ => None,
-    }
-}
-
 impl CliSseStreamHost<'_> {
     fn effective_tool_cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
         self.active_execution_cancel
@@ -3992,72 +3864,6 @@ impl CliSseStreamHost<'_> {
         .await;
     }
 
-    /// D-9: Harvest speculative results for the upcoming concurrent batch.
-    ///
-    /// `wait_all()` is used so in-flight speculations finish before the
-    /// merge; the overall latency is still bounded by the stream itself
-    /// (the stream has already finished by the time this runs). Results
-    /// keyed by request_id are returned so the join_all closure can
-    /// short-circuit matching requests without re-executing.
-    async fn harvest_speculation_for_batch(
-        &self,
-        conc_reqs: &[(usize, &ToolBatchRequest)],
-    ) -> std::collections::HashMap<String, (String, bool)> {
-        let Some(exec) = self.streaming_tool_exec.as_ref() else {
-            return std::collections::HashMap::new();
-        };
-        // Use `merge_speculative` (not raw `wait_all`) so per-call-id hit
-        // counters and saved-ms metrics are updated for observability.
-        let ids: Vec<String> = conc_reqs
-            .iter()
-            .map(|(_, r)| r.request_id.clone())
-            .collect();
-        let (done, _needed) = exec.merge_speculative(&ids).await;
-        let mut out = std::collections::HashMap::new();
-        let mut reusable = 0usize;
-        let mut rejected_failure = 0usize;
-        for r in done {
-            if r.success {
-                reusable += 1;
-            } else {
-                // Speculation completed but failed — the reconciler will fall
-                // back to real execution (see `reusable_speculative_output`).
-                // Track this separately from `snapshot().wasted` so operators
-                // can distinguish "speculation errored" from "speculation
-                // never started" when diagnosing hit-rate drops.
-                rejected_failure += 1;
-            }
-            out.insert(r.call_id.clone(), (r.content.clone(), r.success));
-        }
-        // Per-batch reconciliation breakdown: complements the cumulative
-        // `astra::streaming_speculation::metrics` with this-batch counts so
-        // operators can correlate a specific turn's LLM-emitted batch against
-        // what actually came back from speculation. Target:
-        // `astra::streaming_speculation::batch`.
-        tracing::info!(
-            target: "astra::streaming_speculation::batch",
-            batch_size = conc_reqs.len(),
-            reusable = reusable,
-            rejected_failure = rejected_failure,
-            not_speculated = conc_reqs.len().saturating_sub(reusable + rejected_failure),
-            session_id = self.executor.active_session_id().as_deref().unwrap_or(""),
-            "speculation reconciliation for batch"
-        );
-        // Emit a structured metrics event once per batch merge so log
-        // aggregators / ObservabilityHub can track speculation effectiveness
-        // over time. Target: `astra::streaming_speculation::metrics`.
-        exec.emit_metrics_log(self.executor.active_session_id().as_deref())
-            .await;
-        if let Some(hub) = self.observability_hub.as_ref() {
-            let snap = exec.snapshot().await;
-            hub.record_streaming_speculation_metrics(&snap);
-            // Reset so each batch report is a delta; ObservabilityHub sums
-            // incoming reports additively.
-            exec.reset_metrics().await;
-        }
-        out
-    }
-
     fn pending_permission_selection(&self) -> bool {
         self.perm_manager.as_ref().is_some_and(|manager| {
             manager
@@ -4495,6 +4301,7 @@ async fn execute_server_budgeted(
         .map(tokio_util::sync::CancellationToken::child_token)
         .unwrap_or_default();
     host.active_execution_cancel = Some(cancellation.clone());
+    host.active_read_only_execution = request.read_only_execution;
     let result = {
         let execution = host.execute_tool(&request.request_id, &request.tool, args);
         tokio::pin!(execution);
@@ -4507,6 +4314,7 @@ async fn execute_server_budgeted(
         }
     };
     host.active_execution_cancel = None;
+    host.active_read_only_execution = false;
     result
 }
 
@@ -4562,13 +4370,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     return Err("tool_request read_only_execution must be a boolean".to_string());
                 }
             };
-            if read_only_execution {
-                let request_id = event
+            if read_only_execution
+                && event
                     .get("request_id")
                     .and_then(Value::as_str)
-                    .filter(|request_id| !request_id.is_empty())
-                    .ok_or_else(|| "read-only tool_request omitted request_id".to_string())?;
-                self.read_only_tool_requests.insert(request_id.to_string());
+                    .is_none_or(str::is_empty)
+            {
+                return Err("read-only tool_request omitted request_id".to_string());
             }
         }
         if event.get("type").and_then(Value::as_str) == Some("permission_mode_applied") {
@@ -4810,7 +4618,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.server_tool_completed_calls.clear();
             self.server_tool_client_owned_ids.clear();
             self.server_tool_completed_terminals.clear();
-            self.read_only_tool_requests.clear();
             self.server_tool_protocol_error = None;
         }
         result
@@ -5009,7 +4816,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     }
                     i += 1;
                 }
-                SseRenderEffect::StreamText { text: s, .. } => {
+                SseRenderEffect::StreamText { .. } => {
                     if policy == RenderPolicy::PlanDecompose {
                         // Plan decompose mode: don't show the raw JSON body in
                         // the thinking preview.  Only genuine <thinking> content
@@ -5017,15 +4824,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         i += 1;
                         continue;
                     }
-                    // When tool_work_detected, buffer text instead of discarding.
-                    // It will be rendered at stream completion if it's the final answer.
-                    if self.tool_work_detected {
-                        self.xml_tag_buffer.push_str(s);
-                        i += 1;
-                        continue;
-                    }
-                    self.push_text(s);
+                    // The accumulator is the authoritative final-text carrier.
+                    // StreamText is deliberately not rendered here: tool turns
+                    // may replace the draft and final answer publication is
+                    // owned by the outer turn loop.
                     i += 1;
+                    continue;
                 }
                 SseRenderEffect::StartThinkingSpinner => {
                     self.render.start_thinking();
@@ -5098,29 +4902,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             && self.callback_tool_belongs_to_foreground(request_id))
         .then(|| BashProgressGuard::install(&self.executor, tool, self.stream_event_tx.as_ref()));
 
-        // Clear text that was rendered or buffered BEFORE the first tool call
-        // (intermediate draft). After first tool, keep buffering new text.
-        if !self.tool_work_detected {
-            self.tool_work_detected = true;
-            // Discard any XML-tag-buffered text that was never rendered.
-            self.xml_tag_buffer.clear();
-
-            // Clear text that WAS already rendered (intermediate draft).
-            if let Some(md) = &mut self.render.md {
-                md.discard_and_reset();
-            } else if self.render.lines_written > 0 && io::stdout().is_terminal() {
-                let _ = crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
-                    execute!(
-                        stdout,
-                        cursor::MoveUp(self.render.lines_written as u16),
-                        cursor::MoveToColumn(0),
-                        terminal::Clear(terminal::ClearType::FromCursorDown)
-                    )
-                });
-                self.render.lines_written = 0;
-                self.render.col = 0;
-            }
-        }
         // `tool_request` does not emit StopThinking; clear the thinking stderr line so it does
         // not fight the running-tool spinner (`\r` on the same fd).
         self.render.stop_thinking();
@@ -5219,7 +5000,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // the cloud approval gate (approval_required → user approved → tool_request).
         // This eliminates the double-prompt issue where the same operation requires
         // both cloud approval and local approval.
-        let read_only_execution = self.read_only_tool_requests.contains(request_id);
+        let read_only_execution = self.active_read_only_execution;
         let cloud_approved = self.cloud_pre_approved.remove(request_id);
 
         let decision = if read_only_execution {
@@ -5578,10 +5359,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         dedup_key,
                     )
                 } else if let Some(resolver) = &self.skill_resolver {
-                    // D-9 dedup: discard any speculative execution tied to this call_id.
-                    if let Some(exec) = self.streaming_tool_exec.clone() {
-                        exec.discard(request_id).await;
-                    }
                     let skill_context = self
                         .perm_manager
                         .as_ref()
@@ -5636,9 +5413,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // Delegate calls must be intercepted by the agentic runtime.
                 // If a standalone delegate reaches edge execution, fail closed
                 // instead of manufacturing a success result.
-                if let Some(exec) = self.streaming_tool_exec.clone() {
-                    exec.discard(request_id).await;
-                }
                 "Error: delegate must be handled by the delegation runtime before \
                  local tool execution. Use agent(action='spawn', description='...', \
                  prompt='...', run_in_background=true) for direct agent spawning."
@@ -6369,7 +6143,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Read-only tools hit the fast-path in check_nonblocking (SideEffect::Read → Allow).
         let mut all_allowed = true;
         for (_, req) in &conc_reqs {
-            let decision = if self.read_only_tool_requests.contains(&req.request_id) {
+            let decision = if req.read_only_execution {
                 match self.perm_manager.as_mut() {
                     Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_read_only_request(
                         Some(&mut **pm),
@@ -6447,25 +6221,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 })
                 .await;
             }
-            // First-tool clearing (once per turn).
-            if !self.tool_work_detected {
-                self.tool_work_detected = true;
-                self.xml_tag_buffer.clear();
-                if let Some(md) = &mut self.render.md {
-                    md.discard_and_reset();
-                } else if self.render.lines_written > 0 && io::stdout().is_terminal() {
-                    let _ = crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
-                        execute!(
-                            stdout,
-                            cursor::MoveUp(self.render.lines_written as u16),
-                            cursor::MoveToColumn(0),
-                            terminal::Clear(terminal::ClearType::FromCursorDown)
-                        )
-                    });
-                    self.render.lines_written = 0;
-                    self.render.col = 0;
-                }
-            }
             self.render.stop_thinking();
 
             // In grouped mode, only start spinner once for all parallel tools.
@@ -6502,15 +6257,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // process — previously each batch constructed its own `Semaphore::new(10)`,
         // which allowed 10·N concurrent tools when N batches overlapped.
         let sem = astra_turn_core::parallel_tool_exec::shared_tool_semaphore();
-        // D-9: harvest speculative results from mid-stream execution.
-        // Matching request_ids skip the normal dispatch and reuse the
-        // speculative output. Journal/observability still fire exactly
-        // once from the post-execution pass below.
-        // A server-owned `tool_request` is the authority that binds an
-        // immutable deadline. Speculation begins before that authority exists,
-        // so it must not execute this batch.
-        let speculative_by_id: std::collections::HashMap<String, (String, bool)> =
-            std::collections::HashMap::new();
         // Explicit-path sandbox expansion may require an interactive approval.
         // It therefore runs only through the per-invocation retry path below,
         // after that invocation's immutable deadline has been armed.
@@ -6549,7 +6295,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             deadline_cancellation.cancel();
                         });
                     }
-                    let speculative = speculative_by_id.get(&req.request_id).cloned();
                     async move {
                         if expired_before_start {
                             return (
@@ -6565,16 +6310,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 crate::edge_tools::ToolExecutionOutcome::error(
                                     "Cancelled before tool execution started".to_string(),
                                 ),
-                                0u64,
-                            );
-                        }
-                        if let Some(output) = reusable_speculative_output(speculative) {
-                            return (
-                                crate::edge_tools::ToolExecutionOutcome {
-                                    output,
-                                    tool_result_fields: None,
-                                    is_error: false,
-                                },
                                 0u64,
                             );
                         }
@@ -6951,134 +6686,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             .map(|r| r.expect("all tool result slots filled"))
             .collect()
     }
-
-    /// D-9: Harvest speculative results for the upcoming concurrent batch.
-    ///
-    /// `wait_all()` is used so in-flight speculations finish before the
-    /// merge; the overall latency is still bounded by the stream itself
-    /// (the stream has already finished by the time this runs). Results
-    /// keyed by request_id are returned so the join_all closure can
-    /// short-circuit matching requests without re-executing.
-    async fn on_tool_call_complete(&mut self, index: usize, tool_call: &Value) {
-        // D-9 speculative streaming hook.
-        //
-        // When `ASTRA_STREAMING_TOOL_EXEC=1` is set, a read-only tool_use
-        // block that completes mid-stream is dispatched to the shared
-        // `StreamingToolExecutor` so its I/O overlaps with the remaining
-        // SSE stream. Results are later harvested in `execute_tools_batch`
-        // and replace the normal dispatch for matching request_ids;
-        // permission / journal / observability events still fire exactly
-        // once from the batch phase.
-        let Some(exec) = self.streaming_tool_exec.clone() else {
-            return;
-        };
-        let Some(tool_name) = tool_call
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|n| n.as_str())
-            .and_then(astra_core::canonical_names::normalize_name)
-        else {
-            return;
-        };
-        let tool_name = tool_name.to_string();
-        // Shell execution owns a workspace lease and a post-execution
-        // fingerprint.  Streaming speculation may be discarded by the
-        // renderer, which would otherwise abort the async wrapper while its
-        // blocking child keeps running.  Keep shell calls on the normal
-        // lifecycle-owned path; pure typed/read tools may still speculate.
-        if matches!(tool_name.as_str(), "bash" | "powershell") {
-            return;
-        }
-        let call_id = tool_call
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if call_id.is_empty() {
-            return;
-        }
-        let args = astra_turn_core::parallel_tool_exec::parse_tool_args(tool_call);
-        if !astra_turn_core::streaming_tool_exec::should_speculate(&tool_name, args.as_ref(), None)
-        {
-            return;
-        }
-        tracing::debug!(
-            target = "astra_cli::streaming_tool_exec",
-            tool = %tool_name,
-            call_id = %call_id,
-            "dispatching speculative execution"
-        );
-        let _ = exec
-            .on_tool_block(call_id, tool_name, tool_call.clone(), index)
-            .await;
-    }
-}
-
-/// Build the speculative streaming tool executor when enabled via env.
-///
-/// The returned executor is a background dispatcher that drives the
-/// shared `Arc<ToolExecutor>` off-thread. Each speculative task invokes
-/// `execute_with_metadata(tool_name, args)` and returns the output +
-/// error flag, matching the `ToolExecutorFn` signature used in
-/// `parallel_tool_exec`.
-fn build_streaming_tool_exec(
-    executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
-) -> Option<std::sync::Arc<astra_turn_core::streaming_tool_exec::StreamingToolExecutor>> {
-    // `tool_call` arrives before the server's durable `tool_request` lease.
-    // Executing it here would let an optional local latency optimization bypass
-    // deadline, approval, and callback authority.  Re-enable only when the
-    // speculative protocol carries the same immutable server lease.
-    if !astra_turn_core::streaming_tool_exec::streaming_tool_exec_enabled()
-        || !server_leased_speculation_supported()
-    {
-        return None;
-    }
-    let fn_exec: astra_turn_core::parallel_tool_exec::ToolExecutorFn =
-        std::sync::Arc::new(move |tc: Value| {
-            let executor = std::sync::Arc::clone(&executor);
-            Box::pin(async move {
-                let call_id = tc
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let tool_name = tc
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let args: Value = tc
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .map(|a| match a {
-                        Value::String(s) => {
-                            serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({}))
-                        }
-                        other => other.clone(),
-                    })
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let outcome = execute_with_invocation_metadata_responsive(
-                    executor,
-                    tool_name.clone(),
-                    args,
-                    astra_tools::tool_engine::ToolInvocationMetadata {
-                        tool_call_id: Some(&call_id),
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .await;
-                (call_id, tool_name, outcome.output, true)
-            })
-        });
-    Some(std::sync::Arc::new(
-        astra_turn_core::streaming_tool_exec::StreamingToolExecutor::new(fn_exec),
-    ))
-}
-
-fn server_leased_speculation_supported() -> bool {
-    false
 }
 
 // ─── Turn result from one /chat/stream SSE stream ───────────────────────────────
@@ -8814,7 +8421,6 @@ pub(crate) async fn consume_turn_sse(
         host_edge_tool_round,
         mut md_renderer,
         lines_written,
-        _pending_xml_buffer,
         auth_failure,
         callback_failure,
         callback_failure_run_id,
@@ -8869,7 +8475,6 @@ pub(crate) async fn consume_turn_sse(
         }
         let lw = host.render.lines_written;
         let md = host.render.md.take();
-        let pending = std::mem::take(&mut host.xml_tag_buffer);
         let auth_failure = host.auth_failure;
         let callback_failure = host.callback_failure.clone();
         let callback_failure_run_id = host.callback_failure_run_id.clone();
@@ -8891,7 +8496,6 @@ pub(crate) async fn consume_turn_sse(
             host.edge_tool_round,
             md,
             lw,
-            pending,
             auth_failure,
             callback_failure,
             callback_failure_run_id,
@@ -8926,7 +8530,6 @@ pub(crate) async fn consume_turn_sse(
             Vec::new(),
             md,
             lw,
-            String::new(),
             false,
             None,
             None,
@@ -8975,10 +8578,7 @@ pub(crate) async fn consume_turn_sse(
     }
 
     // ─── Finalize incremental markdown ───────────────────────────────────
-    // With buffer_from_start=true, ALL text went to `xml_tag_buffer` during
-    // SSE consumption. No incremental text was rendered to stdout.
-    //
-    // Text rendering is now DEFERRED to the agentic loop via
+    // Text rendering is deferred to the agentic loop via
     // `host.render_final_text()`. This prevents text leakage when stop-hooks
     // or factual retries cause the loop to continue after a text-only turn.
     //
@@ -9161,11 +8761,10 @@ mod tests {
         extract_cli_diff_block, file_content_sha256, finalize_cli_skill_execution,
         format_terminal_tool_summary, format_tool_display_from_preview, is_edge_auth_failure,
         merge_edge_tool_rounds, normalize_sandbox_denied_outcome, path_mtime_ms,
-        recorded_approval_decision, request_token_usage_from_accum, reusable_speculative_output,
-        sanitize_final_stream_text, server_context_window_policy_from_accum,
-        server_tool_completion_id, server_tool_completion_is_authoritative,
-        server_tool_completion_output, server_tool_completion_status,
-        server_tool_event_is_client_owned, server_tool_event_owner,
+        recorded_approval_decision, request_token_usage_from_accum, sanitize_final_stream_text,
+        server_context_window_policy_from_accum, server_tool_completion_id,
+        server_tool_completion_is_authoritative, server_tool_completion_output,
+        server_tool_completion_status, server_tool_event_is_client_owned, server_tool_event_owner,
         server_tool_event_requires_provenance, server_tool_start_fields, style_tool_description,
         sync_incremental_accum_state, sync_incremental_tool_result_state,
         terminal_output_failure_for_event, theme, tool_completion_icon,
@@ -9200,9 +8799,17 @@ mod tests {
     #[tokio::test]
     async fn server_read_only_tool_request_binds_an_immutable_local_ceiling() {
         let temp = tempfile::tempdir().unwrap();
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
         let mut cache = EdgeToolCache::new(2);
+        let mut permissions = crate::cli::permission_manager::PermissionManager::new(true);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -9210,7 +8817,7 @@ mod tests {
                 executor_id: "edge-test",
                 executor,
                 render_policy: RenderPolicy::Silent,
-                perm_manager: None,
+                perm_manager: Some(&mut permissions),
                 cancel_token: None,
                 stream_event_tx: None,
                 stream_event_sink: None,
@@ -9220,7 +8827,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -9228,16 +8834,39 @@ mod tests {
             false,
         );
 
-        host.on_accepted_sse_event(&serde_json::json!({
-            "type": "tool_request",
-            "request_id": "child-write",
-            "read_only_execution": true,
-            "tool": "write_file",
-            "args": {"path": "marker", "content": "blocked"}
-        }))
-        .await
-        .expect("valid server authority event");
-        assert!(host.read_only_tool_requests.contains("child-write"));
+        // Both requests and DONE share a network chunk. The second exchange
+        // proves ordinary permission still works, rather than all writes being
+        // denied by a broken fixture or a leaked host-wide ceiling.
+        for read_only in [true, false] {
+            let marker = temp.path().join(format!("marker-{read_only}"));
+            let event = serde_json::json!({
+                "type": "tool_request", "session_id": "readonly-session",
+                "run_id": "readonly-run", "turn_chain_id": "readonly-chain",
+                "request_id": format!("readonly-write-{read_only}"),
+                "schema_admitted_by_server": true, "read_only_execution": read_only,
+                "execution_timeout_ms": 300000, "execution_deadline_unix_ms": 4102444800000u64,
+                "tool": "write_file", "args": {"path": marker, "content": "published"}
+            });
+            let wire = format!(
+                "data: {{\"type\":\"session_info\",\"session_id\":\"readonly-session\",\"run_id\":\"readonly-run\"}}\n\ndata: {event}\n\ndata: [DONE]\n\n"
+            );
+            let mut chunks = futures_util::stream::iter(vec![Ok::<_, String>(wire.into_bytes())]);
+            let (result, abort) = super::consume_sse_stream_cancellable(
+                &mut chunks,
+                &mut host,
+                std::time::Duration::from_secs(1),
+                None,
+                None,
+            )
+            .await;
+            assert!(abort.is_none(), "unexpected abort: {abort:?}");
+            assert_eq!(result.tool_results.len(), 1);
+            assert_eq!(marker.exists(), !read_only);
+            assert_eq!(
+                result.tool_results[0].status,
+                if read_only { "failed" } else { "completed" }
+            );
+        }
 
         let malformed = serde_json::json!({
             "type": "tool_request",
@@ -9285,7 +8914,6 @@ mod tests {
                     skill_continuation: false,
                     turn_rollback_on_failure: false,
                     tool_cache: &mut tool_cache,
-                    observability_hub: None,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -9506,7 +9134,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -9602,7 +9229,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -9831,7 +9457,6 @@ mod tests {
             skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
-            observability_hub: None,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -10519,7 +10144,6 @@ mod tests {
             skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
-            observability_hub: None,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -10780,7 +10404,6 @@ mod tests {
         )
         .await
         .expect("full TUI queue must not block final text capture");
-        assert_eq!(host.xml_tag_buffer, "answer");
     }
 
     #[test]
@@ -11275,14 +10898,6 @@ mod tests {
         );
     }
 
-    // ── D-9 regression: speculative success flag must gate reuse ──
-    //
-    // Guards against the cascade bug where a speculative tool execution that
-    // failed (semaphore saturated, permission denied mid-stream, tool errored
-    // with non-empty error message) was silently reused as a successful
-    // tool_result because the consumer discarded `success` with `_ok`.
-    // See `reusable_speculative_output` for the fix rationale.
-
     #[test]
     fn edge_post_auth_failure() {
         // auth failure overrides "Cancelled by user"
@@ -11435,7 +11050,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -11865,7 +11479,6 @@ mod tests {
                         skill_continuation: false,
                         turn_rollback_on_failure: false,
                         tool_cache: &mut tool_cache,
-                        observability_hub: None,
                         incremental_state: None,
                         request_session_execution_lease: None,
                     },
@@ -11940,7 +11553,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -12033,7 +11645,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -12108,7 +11719,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -12180,7 +11790,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -12247,7 +11856,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -12369,7 +11977,6 @@ mod tests {
                     skill_continuation: false,
                     turn_rollback_on_failure: false,
                     tool_cache: cache,
-                    observability_hub: None,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -12446,6 +12053,7 @@ mod tests {
             run_id: format!("batch-run-{id}"),
             turn_chain_id: format!("batch-chain-{id}"),
             request_id: id.to_owned(),
+            read_only_execution: false,
             execution_timeout_ms: 30_000,
             execution_deadline_unix_ms: u64::MAX,
             tool: tool.to_owned(),
@@ -12775,7 +12383,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -12795,6 +12402,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "pf-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
@@ -12805,6 +12413,7 @@ mod tests {
                     run_id: "child-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "pf-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
@@ -12847,6 +12456,7 @@ mod tests {
                     run_id: run_id.into(),
                     turn_chain_id: "test-chain".into(),
                     request_id: request_id.into(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "list_dir".into(),
@@ -12887,6 +12497,7 @@ mod tests {
                 run_id: "child-run".into(),
                 turn_chain_id: "test-chain".into(),
                 request_id: "child-synthetic".into(),
+                read_only_execution: false,
                 execution_timeout_ms: 300_000,
                 execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "read_file".into(),
@@ -12957,7 +12568,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -12980,6 +12590,7 @@ mod tests {
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
                 request_id: "expired-1".to_string(),
+                read_only_execution: false,
                 execution_timeout_ms: 300_000,
                 execution_deadline_unix_ms: 1,
                 tool: "read_file".to_string(),
@@ -13039,7 +12650,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -13054,6 +12664,7 @@ mod tests {
                     run_id: "test-run".into(),
                     turn_chain_id: "test-chain".into(),
                     request_id: "callback-1".into(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".into(),
@@ -13064,6 +12675,7 @@ mod tests {
                     run_id: "test-run".into(),
                     turn_chain_id: "test-chain".into(),
                     request_id: "callback-2".into(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".into(),
@@ -13117,7 +12729,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: Some(request_lease.clone()),
             },
@@ -13200,7 +12811,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -13252,7 +12862,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: Some(incremental_state.clone()),
                 request_session_execution_lease: None,
             },
@@ -13340,7 +12949,6 @@ mod tests {
                     skill_continuation: false,
                     turn_rollback_on_failure: false,
                     tool_cache: &mut tool_cache,
-                    observability_hub: None,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -13416,7 +13024,6 @@ mod tests {
                     skill_continuation: false,
                     turn_rollback_on_failure: false,
                     tool_cache: &mut tool_cache,
-                    observability_hub: None,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -13504,7 +13111,6 @@ mod tests {
                     skill_continuation: false,
                     turn_rollback_on_failure: false,
                     tool_cache: &mut tool_cache,
-                    observability_hub: None,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -13656,7 +13262,6 @@ mod tests {
             skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
-            observability_hub: None,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -13739,7 +13344,6 @@ mod tests {
             skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
-            observability_hub: None,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -13766,29 +13370,6 @@ mod tests {
         assert_eq!(err, PostToolResultError::AuthRefreshFailed);
         assert!(err.is_terminal_auth());
         assert!(host.auth_failure);
-    }
-
-    #[test]
-    fn test_reusable_speculative_output() {
-        // accepts successful result
-        let out = reusable_speculative_output(Some(("real grep hit: line 42".to_string(), true)));
-        assert_eq!(out, Some("real grep hit: line 42".to_string()));
-
-        // rejects failed result even with content
-        let out2 = reusable_speculative_output(Some((
-            "Error: permission denied on /etc/shadow".to_string(),
-            false,
-        )));
-        assert_eq!(out2, None);
-
-        // rejects None
-        assert_eq!(reusable_speculative_output(None), None);
-
-        // rejects failed empty content (semaphore saturation)
-        assert_eq!(
-            reusable_speculative_output(Some((String::new(), false))),
-            None
-        );
     }
 
     fn boundary_events(session_id: &str) -> Vec<JournalEvent> {
@@ -14610,60 +14191,6 @@ mod tests {
         assert_eq!(s.text, "Query OK, 1 row affected (0.02 sec)");
     }
 
-    // ── Text buffering contract ─────────────────────────────────────────
-    //
-    // These tests verify that text is ALWAYS buffered from the start
-    // (buffer_from_start=true), preventing the two classes of leakage:
-    //   1. Non-TTY: ANSI cursor movement has no effect on pipes.
-    //   2. TTY with stderr interleave: MoveUp(rows) falls short because
-    //      TerminalRegion doesn't track stderr rows from tool spinners.
-    //
-    // The invariant: buffer_from_start=true → tool_work_detected=true
-    // from the start → StreamText goes to xml_tag_buffer, never to the
-    // renderer during streaming.  At finalization, tool turns discard
-    // the buffer; non-tool turns render it one-shot.
-
-    #[test]
-    fn buffer_and_text_rendering_contract() {
-        // buffer_from_start must always be true to prevent text leakage
-        let buffer_from_start = true; // mirrors stream_render.rs:176
-        assert!(
-            buffer_from_start,
-            "buffer_from_start must be true to prevent TTY/scrollback text leakage"
-        );
-
-        // tool turn: buffer is discarded (not rendered)
-        let pending_xml_buffer = "╔══════ draft review text ══════╗".to_string();
-        let has_any_tool_work = true;
-        if has_any_tool_work {
-            drop(pending_xml_buffer);
-        } else {
-            panic!("Tool turn should discard text");
-        }
-
-        // final answer: buffer is rendered (no tools)
-        let pending_xml_buffer = "Here is my final answer".to_string();
-        let has_any_tool_work = false;
-        let rendered = if has_any_tool_work {
-            panic!("Non-tool turn should render text");
-        } else {
-            let mut buf = pending_xml_buffer;
-            streaming_md::strip_xml_tags_inplace(&mut buf);
-            streaming_md::strip_leading_narration(&mut buf);
-            buf
-        };
-        assert_eq!(rendered, "Here is my final answer");
-
-        // tool_turn_discards_text_buffer: when tools present, text discarded
-        let mut result = TurnResult::new();
-        result.core.full_text = "Let me use a tool...".to_string();
-        result.core.has_tool_calls = true;
-        assert!(
-            result.core.has_tool_calls || !result.edge_tool_round.is_empty(),
-            "tool turn should flag tool work"
-        );
-    }
-
     #[test]
     fn text_xml_cleanup_and_deferred_render() {
         // xml tags stripped at finalization
@@ -15010,7 +14537,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15092,7 +14618,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15267,7 +14792,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15282,6 +14806,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
@@ -15297,6 +14822,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
@@ -15374,7 +14900,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15389,6 +14914,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
@@ -15404,6 +14930,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
@@ -15473,7 +15000,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15488,6 +15014,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
@@ -15503,6 +15030,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
@@ -15517,6 +15045,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-3".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
@@ -15586,7 +15115,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15600,6 +15128,7 @@ mod tests {
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
                 request_id: "tx-boundary-1".to_string(),
+                read_only_execution: false,
                 execution_timeout_ms: 300_000,
                 execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "write_file".to_string(),
@@ -15674,7 +15203,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15689,6 +15217,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-boundary-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
@@ -15704,6 +15233,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-boundary-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
@@ -15787,7 +15317,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15802,6 +15331,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
@@ -15815,6 +15345,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
@@ -15920,7 +15451,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15932,6 +15462,7 @@ mod tests {
             run_id: "test-run".to_string(),
             turn_chain_id: "test-chain".to_string(),
             request_id: request_id.to_string(),
+            read_only_execution: false,
             execution_timeout_ms: 300_000,
             execution_deadline_unix_ms: 4_102_444_800_000,
             tool: tool.to_string(),
@@ -16264,7 +15795,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16281,6 +15811,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
@@ -16294,6 +15825,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
@@ -16306,6 +15838,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-3".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
@@ -16380,7 +15913,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16489,7 +16021,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16508,6 +16039,7 @@ mod tests {
                 run_id: "cache-root".into(),
                 turn_chain_id: "cache-chain".into(),
                 request_id: "cache-read-hit".into(),
+                read_only_execution: false,
                 execution_timeout_ms: 300_000,
                 execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "read_file".into(),
@@ -16584,7 +16116,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16680,7 +16211,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16785,7 +16315,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16804,6 +16333,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-bash-0".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
@@ -16817,6 +16347,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-bash-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
@@ -16829,6 +16360,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-bash-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
@@ -16920,7 +16452,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -17034,7 +16565,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -17134,7 +16664,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -17152,6 +16681,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "ro-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
@@ -17165,6 +16695,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "ro-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
@@ -17177,6 +16708,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "ro-3".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
@@ -17249,7 +16781,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -17263,6 +16794,7 @@ mod tests {
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
                 request_id: "turn-boundary-1".to_string(),
+                read_only_execution: false,
                 execution_timeout_ms: 300_000,
                 execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "read_file".to_string(),
@@ -17334,7 +16866,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -17349,6 +16880,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-boundary-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
@@ -17362,6 +16894,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-boundary-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
@@ -17442,7 +16975,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -17457,6 +16989,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-bash-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
@@ -17472,6 +17005,7 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-bash-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
@@ -17544,7 +17078,6 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -17558,6 +17091,7 @@ mod tests {
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
                 request_id: "tx-bash-ro".to_string(),
+                read_only_execution: false,
                 execution_timeout_ms: 300_000,
                 execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "bash".to_string(),

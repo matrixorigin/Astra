@@ -28,7 +28,6 @@ use astra_runtime::{
         StallTrackingState, StopHookState, TelemetryState, runtime_manifest_for_model,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
-    turn::edge_prompt_context::detect_project_languages,
     turn::stop_hooks_yaml::detect_turn_hook_sets,
     turn::tool_health::ToolHealthTracker,
     turn::turn_guard::TurnGuard,
@@ -356,7 +355,6 @@ pub(crate) async fn stream_chat_sse(
     };
 
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let file_context = detect_project_languages(&project_root);
     let current_session_turn = p.turn_index;
     // Only callers that provide a durable session journal own checkpoint and
     // composite-snapshot side effects. Internal utility calls such as
@@ -753,7 +751,6 @@ pub(crate) async fn stream_chat_sse(
         executor: std::sync::Arc::new(executor),
         registry,
         all_schemas,
-        file_context,
         perm_manager: p.perm_manager,
         valid_tool_names: HashSet::new(),
         capabilities: cli_capabilities,

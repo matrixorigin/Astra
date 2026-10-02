@@ -120,36 +120,6 @@ impl ObservabilityHub {
         self.feedback_signals.record(signal);
     }
 
-    /// Record a batch of streaming speculative tool execution metrics.
-    ///
-    /// Forwards the cumulative counters into the feedback signal store so that
-    /// speculation hit rate can be observed across a session.
-    ///
-    /// Also emits a structured `tracing::info!` event on target
-    /// `astra::streaming_speculation::metrics` for downstream log consumers.
-    pub fn record_streaming_speculation_metrics(
-        &self,
-        metrics: &astra_turn_core::streaming_tool_exec::StreamingSpeculationMetrics,
-    ) {
-        self.feedback_signals.record_streaming_speculation(
-            metrics.started,
-            metrics.hit,
-            metrics.discarded,
-            metrics.total_saved_ms,
-        );
-        tracing::info!(
-            target: "astra::streaming_speculation::metrics",
-            started = metrics.started,
-            hit = metrics.hit,
-            discarded = metrics.discarded,
-            inflight = metrics.inflight,
-            wasted = metrics.wasted(),
-            total_saved_ms = metrics.total_saved_ms,
-            hit_rate = metrics.hit_rate(),
-            "hub.record_streaming_speculation_metrics"
-        );
-    }
-
     fn signal_with_session_context(
         &self,
         session_id: &str,

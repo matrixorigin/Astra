@@ -463,13 +463,9 @@ impl AgenticLoopHost for SubRunHost {
 
     fn continuation_authority(
         &self,
-        result: &HostTurnResult,
+        _result: &HostTurnResult,
     ) -> astra_runtime::turn::agentic_loop::host::ContinuationAuthority {
-        if result.accum.server_loop_terminal {
-            astra_runtime::turn::agentic_loop::host::ContinuationAuthority::RemoteServer
-        } else {
-            astra_runtime::turn::agentic_loop::host::ContinuationAuthority::Runtime
-        }
+        astra_runtime::turn::agentic_loop::host::ContinuationAuthority::RemoteServer
     }
 
     fn memory_recall_scope(&self, _state: &AgenticLoopState) -> Option<(String, String)> {
@@ -734,13 +730,12 @@ impl AgenticLoopHost for SubRunHost {
             skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut self.tool_cache,
-            observability_hub: None,
             incremental_state: None,
             request_session_execution_lease: None,
         };
 
         let prep_line = ChatTurnPrepLineGuard::maybe_start(false, None);
-        let turn = consume_turn_sse(
+        let mut turn = consume_turn_sse(
             prep_line,
             resp,
             false, // render_md
@@ -754,6 +749,9 @@ impl AgenticLoopHost for SubRunHost {
             None,                                           // stream_json_exchange
         )
         .await;
+        // Preserve observed facts while enforcing the Server-owned terminal
+        // boundary before the existing physical-owner cleanup decision.
+        turn.core.require_server_terminal_evidence();
         let unsettled_physical_owner_run_id =
             crate::cli::stream::streaming_types::unsettled_physical_owner_run_id(&turn.core);
         if turn.callback_delivery_failed || unsettled_physical_owner_run_id.is_some() {
@@ -2009,6 +2007,72 @@ mod tests {
         }
         assert_eq!(host.max_completion_tokens, Some(64000));
         assert_eq!(host.initial_output_limit, Some(32768));
+    }
+
+    #[tokio::test]
+    async fn subrun_missing_server_terminal_stops_public_loop_after_one_admission() {
+        use astra_runtime::turn::agentic_loop::host::make_test_loop_state;
+
+        let cases = [
+            (
+                crate::cli::mock_llm::MockScenario::TextOnly,
+                "answer directly",
+                75_u64,
+                50_u64,
+                "mock-run-textonly-1",
+                0_usize,
+            ),
+            (
+                crate::cli::mock_llm::MockScenario::ToolThenComplete,
+                "write the requested file",
+                150_u64,
+                50_u64,
+                "mock-run-tool",
+                1_usize,
+            ),
+        ];
+
+        for (scenario, message, prompt, completion, run_id, callback_count) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let mock = crate::cli::mock_llm::MockLlmServer::start(scenario)
+                .await
+                .unwrap();
+            let mut host = bare_subrun_host();
+            host.api = astra_thin_client::ThinClient::new(&mock.base_url, None).unwrap();
+            host.project_root = temp.path().to_path_buf();
+            host.executor = std::sync::Arc::new(edge_tools::ToolExecutor::new(temp.path()));
+            host.perm_manager = PermissionManager::with_project(true, temp.path());
+            let mut state = make_test_loop_state();
+            state.message = message.into();
+            state.user_intent = message.into();
+            state.messages = vec![json!({"role": "user", "content": message})];
+
+            let error =
+                astra_runtime::turn::agentic_loop::finalization::run_agentic_loop_with_host(
+                    &mut host, &mut state,
+                )
+                .await
+                .expect_err("missing server terminal must stop the public loop");
+
+            assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+            assert_eq!(
+                error.message,
+                "Server admission stream ended without terminal execution evidence"
+            );
+            assert_eq!(state.total_prompt, prompt);
+            assert_eq!(state.total_completion, completion);
+            assert_eq!(state.current_run_id.as_deref(), Some(run_id));
+            assert_eq!(
+                mock.received_requests().len(),
+                1,
+                "{scenario:?} must have one admission and no replay"
+            );
+            assert_eq!(
+                mock.tool_results().len(),
+                callback_count,
+                "{scenario:?} callback observations must remain exact"
+            );
+        }
     }
 
     fn bare_subrun_host() -> SubRunHost {

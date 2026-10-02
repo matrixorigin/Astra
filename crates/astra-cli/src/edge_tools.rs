@@ -8,7 +8,6 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
     time::Duration,
 };
 
@@ -86,12 +85,10 @@ pub(crate) use astra_tools::fuzzy_replacer;
 mod lsp_stdio_session;
 #[path = "edge_tools/mo_tools.rs"]
 mod mo_tools;
-use astra_tools::passive_cargo_check;
 pub(crate) use mo_tools::DatabaseSnapshotRollbackJournal;
 pub(crate) use session_state::SessionStateRollbackJournal;
 #[path = "edge_tools/passive_lsp.rs"]
 mod passive_lsp;
-use astra_tools::passive_tsc_check;
 #[path = "edge_tools/shell.rs"]
 mod shell;
 use astra_tools::env_tools;
@@ -1366,11 +1363,6 @@ pub struct ToolExecutor {
     /// `StreamEvent::ToolOutput` ticker.
     pub(crate) bash_progress_sink:
         std::sync::RwLock<Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>>,
-    /// After a `.rs` file is written under a Rust workspace, set so the next
-    /// `/chat` turn with `tool_results` can run passive `cargo check` and inject diagnostics.
-    passive_cargo_pending: AtomicBool,
-    /// After `.ts` / `.tsx` edits when `tsconfig.json` exists, run passive `tsc --noEmit`.
-    passive_tsc_pending: AtomicBool,
     /// Optional passive LSP sessions (rust-analyzer, typescript-language-server).
     passive_lsp: passive_lsp::PassiveLspManager,
     /// MCP routing snapshot. Manager and MCP schemas are installed together so
@@ -1573,8 +1565,6 @@ impl ToolExecutor {
             convergence_authority: uuid::Uuid::new_v4().to_string(),
             aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),
             bash_progress_sink: std::sync::RwLock::new(None),
-            passive_cargo_pending: AtomicBool::new(false),
-            passive_tsc_pending: AtomicBool::new(false),
             passive_lsp: passive_lsp::PassiveLspManager::new(),
             mcp_runtime: std::sync::RwLock::new(EdgeMcpRuntimeSnapshot::default()),
             file_journal: std::sync::Arc::new(std::sync::Mutex::new(
@@ -4325,36 +4315,6 @@ impl ToolExecutor {
             return Err(SandboxExpansionError::PolicyLockPoisoned);
         }
         Ok(dir)
-    }
-
-    /// Run passive workspace checks (optional **rust-analyzer LSP**, `cargo`, `tsc`) after
-    /// recent edits when this turn includes tool results; returns extra `messages` for the payload.
-    pub(crate) async fn take_passive_workspace_diagnostic_messages(
-        &self,
-        project_root: &Path,
-        tool_results_nonempty: bool,
-    ) -> Vec<Value> {
-        let mut out = self
-            .passive_lsp
-            .take_diagnostic_messages(tool_results_nonempty)
-            .await;
-        out.extend(
-            passive_cargo_check::take_passive_cargo_messages(
-                &self.passive_cargo_pending,
-                project_root,
-                tool_results_nonempty,
-            )
-            .await,
-        );
-        out.extend(
-            passive_tsc_check::take_passive_tsc_messages(
-                &self.passive_tsc_pending,
-                project_root,
-                tool_results_nonempty,
-            )
-            .await,
-        );
-        out
     }
 
     /// Set per-turn budget pressure before executing a batch of tool calls.

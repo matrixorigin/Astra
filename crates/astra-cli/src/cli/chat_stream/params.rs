@@ -327,12 +327,6 @@ pub trait StreamEventSink: Send + Sync + std::fmt::Debug {
 
 pub type SharedStreamEventSink = Arc<dyn StreamEventSink>;
 
-/// Mint a server-side `tool_use_id`. Prefix keeps it grep-distinguishable
-/// from session ids and approval request ids in logs/SSE payloads.
-pub fn new_tool_use_id() -> String {
-    format!("tu_{}", uuid::Uuid::now_v7().simple())
-}
-
 /// User's response to an approval prompt.
 ///
 /// Issue #326 P0 / R2 Minor 4: `AutoRunSession` was removed because

@@ -1,24 +1,19 @@
 //! Cross-system contract tests for args-aware tool classification.
 //!
-//! These tests verify that the classification → approval →
-//! speculation pipeline stays consistent when bash commands carry
-//! read-only vs mutating arguments. This is the cloud-edge advantage
-//! over the reference agent: `bash "git status"` runs in parallel without
-//! approval while `bash "rm -rf"` is serialized and gated.
+//! These tests verify that the classification → approval pipeline stays
+//! consistent when bash commands carry read-only vs mutating arguments.
 
 use astra_turn_core::cloud_approval_policy::{
     CloudGatedToolKind, cloud_gated_tool_kind_with_args, edge_tool_requires_cloud_approval,
     edge_tool_requires_cloud_approval_with_args,
 };
 use astra_turn_core::parallel_tool_exec::{is_read_only_tool, is_read_only_tool_with_args};
-use astra_turn_core::streaming_tool_exec::should_speculate;
 use astra_turn_core::tool_categories::{ToolCategory, classify, classify_name};
 use serde_json::json;
 
 // ── Scenario 1: Full pipeline consistency for read-only bash ────────────
 
-/// The entire pipeline must agree: classify, approval, and
-/// speculation all treat `bash "git status"` as read-only.
+/// The classification and approval pipeline treat `bash "git status"` as read-only.
 #[test]
 fn pipeline_consistency_bash_git_status() {
     let args = json!({"command": "git status"});
@@ -40,9 +35,6 @@ fn pipeline_consistency_bash_git_status() {
         Some(&args)
     ));
     assert_eq!(cloud_gated_tool_kind_with_args("bash", Some(&args)), None);
-
-    // 4. speculation says eligible
-    assert!(should_speculate("bash", Some(&args), None));
 }
 
 /// The entire pipeline must agree: `bash "rm -rf /"` is mutating.
@@ -65,7 +57,6 @@ fn pipeline_consistency_bash_rm() {
         cloud_gated_tool_kind_with_args("bash", Some(&args)),
         Some(CloudGatedToolKind::Execute)
     );
-    assert!(!should_speculate("bash", Some(&args), None));
 }
 
 /// bash without args: fail-closed across the entire pipeline.
@@ -78,7 +69,6 @@ fn pipeline_consistency_bash_no_args() {
 
     assert!(!is_read_only_tool("bash"));
     assert!(edge_tool_requires_cloud_approval("bash"));
-    assert!(!should_speculate("bash", None, None));
 }
 
 // ── Scenario 5: Cloud approval bypass savings ───────────────────────────

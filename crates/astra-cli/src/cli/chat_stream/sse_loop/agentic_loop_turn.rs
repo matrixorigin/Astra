@@ -33,7 +33,6 @@ use astra_runtime::{
         deferred_provider_schemas_for_names, read_git_branch_abbrev,
     },
     turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
-    turn::chat_turn_heuristics::extract_repos_from_memory,
     turn::chat_turn_payload::{
         ChatTurnBasePayloadInput, attach_turn_identity, chat_turn_base_payload,
         merge_active_skills_into_edge_profile, merge_edge_profile_extensions,
@@ -139,42 +138,6 @@ fn retained_history_messages(messages: &[Value]) -> &[Value] {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct CrossSessionMemoryProjection {
-    contents: Vec<String>,
-    ranked: Vec<(String, f64)>,
-    preferred_repos: Vec<String>,
-    feedback_ids: Vec<String>,
-}
-
-fn project_cross_session_memory_hits(
-    query: &str,
-    memory_hits: &[astra_tools::memoria::BoostSearchHit],
-) -> CrossSessionMemoryProjection {
-    let contents: Vec<String> = memory_hits.iter().map(|hit| hit.content.clone()).collect();
-    let ranked = if contents.is_empty() {
-        Vec::new()
-    } else {
-        astra_turn_core::retrieval::rank_memory_results(query, &contents)
-    };
-    let preferred_repos = contents
-        .iter()
-        .flat_map(|content| extract_repos_from_memory(content))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let feedback_ids = memory_hits
-        .iter()
-        .filter_map(|hit| hit.memory_id.clone())
-        .collect();
-    CrossSessionMemoryProjection {
-        contents,
-        ranked,
-        preferred_repos,
-        feedback_ids,
-    }
-}
-
 fn build_retained_history_turns(
     messages: &[Value],
 ) -> Vec<astra_turn_core::context_assembly_trace::TurnRetention> {
@@ -269,7 +232,6 @@ fn retained_turn_role_priority(role: &str) -> u8 {
 
 /// First-turn / cross-turn counters updated while building the payload.
 pub(crate) struct PrepareTurnTelemetry<'a> {
-    pub first_memoria_ms: &'a mut Option<u64>,
     pub first_selection_report: &'a mut Option<ToolSelectionReport>,
     pub first_budget_pressure: &'a mut f64,
     pub first_context_assembly_ms: &'a mut Option<u64>,
@@ -308,7 +270,6 @@ struct PrepareChatTurnRequest<'a> {
     restricted_tools: &'a mut HashSet<String>,
     widen_selection_pending: &'a mut bool,
     step_recorder: &'a mut StepRecorder,
-    file_context: &'a [String],
     assembly_start: Instant,
     telem: PrepareTurnTelemetry<'a>,
     is_plan_subtask: bool,
@@ -326,7 +287,6 @@ struct PrepareChatTurnRequest<'a> {
     /// Skill-scoped tool allowlist — tools the active skill declared as needed.
     /// After the tool surface includes tools, any allowed tools it missed are force-injected.
     skill_allowed_tools: Option<Vec<String>>,
-    previous_confidence_fallback: Option<astra_turn_core::confidence_contract::ConfidenceFallback>,
     /// Current agentic loop round (0-based). Sent to bridge for tool round directives.
     round_index: u32,
     /// Authoritative visible-turn number from the outer loop.
@@ -503,23 +463,6 @@ impl Deref for PreparedChatTurnPayload {
 /// contract. Conversation history, model rounds, tool results, and canonical
 /// turn identity deliberately do not cross this boundary: the Server restores
 /// and advances those authorities itself.
-#[cfg(test)]
-fn server_loop_admission_payload(
-    prepared: &Value,
-    message: &str,
-    explain: bool,
-    initial_output_limit: Option<u32>,
-) -> Result<Value, &'static str> {
-    let mut request =
-        server_loop_admission_payload_with_execution_time_budget(prepared, message, explain, None)?;
-    // Only an explicit first-round child cap crosses this boundary. Prepared
-    // max_tokens can instead be skill/catalog metadata; never infer a cap from it.
-    if let Some(limit) = initial_output_limit {
-        request["context"]["max_output_tokens"] = json!(limit);
-    }
-    Ok(request)
-}
-
 pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
     prepared: &Value,
     message: &str,
@@ -812,30 +755,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     // projection above crosses the trust boundary.
     merge_active_skills_into_edge_profile(&mut payload, ctx.active_system_skills);
 
-    touch_prep_ui_phase(&ctx.prep_ui_phase, "Reading workspace…");
-    let passive_msgs = ctx
-        .executor
-        .take_passive_workspace_diagnostic_messages(ctx.project_root, !ctx.tool_results.is_empty())
-        .await;
-    if !passive_msgs.is_empty()
-        && let Some(root) = payload.as_object_mut()
-        && let Some(messages) = root.get_mut("messages")
-        && let Some(arr) = messages.as_array_mut()
-    {
-        for m in passive_msgs {
-            arr.push(m);
-        }
-    }
-    log_chat_turn_timing_phase(timing, "base_payload_passive_workspace", &mut mark);
-
-    touch_prep_ui_phase(&ctx.prep_ui_phase, "Recalling memory…");
-
     let budget_pressure = chat_turn_budget_pressure(
         &prompt_messages,
         ctx.registry,
         ctx.effective_input_budget_tokens,
     );
-
     let memory_retrieval_decision =
         astra_turn_core::retrieval::decide_cross_session_memory_retrieval(
             ctx.message,
@@ -843,36 +767,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             !ctx.history.is_empty(),
         );
     let semantic_query_str = memory_retrieval_decision.query();
-    {
-        match memory_retrieval_decision {
-            astra_turn_core::retrieval::CrossSessionMemoryDecision::Skip { query, reason } => {
-                tracing::debug!(
-                    ?reason,
-                    "cross session memory retrieval skipped by structured decision"
-                );
-                if let Some(collector) = ctx.telem.trace_collector {
-                    collector.record_memory_retrieval(query, 0, &[], 0);
-                }
-            }
-            astra_turn_core::retrieval::CrossSessionMemoryDecision::Retrieve { query, top_k } => {
-                let mem_start = Instant::now();
-                let memory_hits = ctx.executor.memory_boost_search(query, top_k).await;
-                let mem_latency_ms = mem_start.elapsed().as_millis() as u64;
-                record_first_latency_ms_since(ctx.telem.first_memoria_ms, mem_start);
-
-                let projection = project_cross_session_memory_hits(query, &memory_hits);
-                if let Some(collector) = ctx.telem.trace_collector {
-                    collector.record_memory_retrieval(
-                        query,
-                        projection.contents.len() as u32,
-                        &projection.ranked,
-                        mem_latency_ms,
-                    );
-                }
-            }
-        }
-    }
-    log_chat_turn_timing_phase(timing, "memory_boost_search", &mut mark);
 
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Preparing tools…");
 
@@ -1349,7 +1243,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         .map(|m| prompts::estimate_str_tokens(&msg_content(m)) as u64)
         .sum();
     let history_tokens = trace_token_count_u32(history_tokens_u64, "history_tokens");
-    let turns_retained = build_retained_history_turns(history_messages);
     let user_message_tokens_u64 = prompts::estimate_str_tokens(ctx.message) as u64;
     let user_message_tokens = trace_token_count_u32(user_message_tokens_u64, "user_message_tokens");
     let memory_tokens_u64 = 0u64;
@@ -1363,6 +1256,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     );
 
     if let Some(collector) = ctx.telem.trace_collector {
+        let turns_retained = build_retained_history_turns(history_messages);
         collector.set_history_retained(&turns_retained);
 
         collector.record_token_budget_estimate(
@@ -1505,7 +1399,6 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub restricted_tools: &'a mut HashSet<String>,
     pub widen_selection_pending: &'a mut bool,
     pub step_recorder: &'a mut StepRecorder,
-    pub file_context: &'a [String],
     pub assembly_start: Instant,
     pub telem: PrepareTurnTelemetry<'a>,
     pub perm_manager: &'a mut PermissionManager,
@@ -1544,8 +1437,6 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// Cross-turn tool output cache retained by the CLI admission adapter.
     pub tool_cache: &'a mut crate::cli::stream::stream_render::EdgeToolCache,
     /// Fallback from previous turn's confidence diagnosis for broadening.
-    pub previous_confidence_fallback:
-        Option<astra_turn_core::confidence_contract::ConfidenceFallback>,
     /// Current agentic loop round (0-based). Sent to bridge for tool round directives.
     pub round_index: u32,
     pub session_turn: u32,
@@ -1780,7 +1671,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         restricted_tools,
         widen_selection_pending,
         step_recorder,
-        file_context,
         assembly_start,
         telem,
         perm_manager,
@@ -1801,7 +1691,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         skill_allowed_tools,
         skill_continuation,
         tool_cache,
-        previous_confidence_fallback,
         round_index,
         session_turn,
         turn_chain_id,
@@ -1878,7 +1767,6 @@ pub(crate) async fn fetch_chat_turn_sse(
                 restricted_tools,
                 widen_selection_pending,
                 step_recorder,
-                file_context,
                 assembly_start,
                 telem,
                 is_plan_subtask,
@@ -1890,7 +1778,6 @@ pub(crate) async fn fetch_chat_turn_sse(
                 interaction_mode,
                 turn_policy,
                 skill_allowed_tools,
-                previous_confidence_fallback,
                 round_index,
                 session_turn,
                 turn_chain_id,
@@ -1941,7 +1828,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         skill_continuation,
         turn_rollback_on_failure: is_plan_subtask,
         tool_cache,
-        observability_hub: observability_hub.cloned(),
         incremental_state: incremental_state.clone(),
         request_session_execution_lease,
     };
@@ -1983,9 +1869,9 @@ mod tests {
     use super::{
         PrepareChatTurnRequest, PrepareTurnTelemetry, attach_typed_edge_skill_catalog,
         build_retained_history_turns, chat_turn_budget_pressure, inject_runtime_turn_overrides,
-        msg_content, prepare_chat_turn_payload, project_cross_session_memory_hits,
-        retained_history_messages, runtime_filter_turn_schemas_and_report,
-        server_loop_admission_payload, server_loop_admission_payload_with_execution_time_budget,
+        msg_content, prepare_chat_turn_payload, retained_history_messages,
+        runtime_filter_turn_schemas_and_report,
+        server_loop_admission_payload_with_execution_time_budget,
         surface_report_from_visible_schemas, thinking_complexity_signals,
     };
     use astra_config::user_profile::{Scenario, TurnIntent, WorkspaceMutationIntent};
@@ -2055,8 +1941,13 @@ mod tests {
             "thinking": {"type": "enabled", "budget_tokens": 1024},
         });
 
-        let admitted = server_loop_admission_payload(&prepared, "current request", true, None)
-            .expect("Server loop admission");
+        let admitted = server_loop_admission_payload_with_execution_time_budget(
+            &prepared,
+            "current request",
+            true,
+            None,
+        )
+        .expect("Server loop admission");
         assert_eq!(admitted["message"], "current request");
         assert_eq!(
             admitted["context"]["edge_tools"][0]["function"]["name"],
@@ -2170,8 +2061,13 @@ mod tests {
             "context": context
         });
 
-        let admitted = server_loop_admission_payload(&prepared, "child request", false, None)
-            .expect("Server loop admission");
+        let admitted = server_loop_admission_payload_with_execution_time_budget(
+            &prepared,
+            "child request",
+            false,
+            None,
+        )
+        .expect("Server loop admission");
         assert_eq!(
             admitted["context"][astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY]["state"],
             "unconstrained"
@@ -2185,7 +2081,7 @@ mod tests {
 
     #[test]
     fn server_loop_admission_fails_closed_without_execution_binding() {
-        let error = server_loop_admission_payload(
+        let error = server_loop_admission_payload_with_execution_time_budget(
             &json!({
                 "model_selection": {"offering_id": "deepseek-flash"},
                 "capabilities": []
@@ -2202,28 +2098,8 @@ mod tests {
     }
 
     #[test]
-    fn server_loop_admission_bridges_only_explicit_child_output_limit() {
-        let prepared = json!({
-            "model_selection": {"offering_id": "offer-child"},
-            "edge_executor_id": "subrun", "capabilities": [],
-            "edge_profile": {"cwd": "/workspace"},
-            "max_tokens": 64000,
-            "max_completion_tokens": 128000,
-        });
-        for cap in [None, Some(8192)] {
-            let request =
-                server_loop_admission_payload(&prepared, "child task", false, cap).unwrap();
-            assert_eq!(
-                request["context"].get("max_output_tokens").cloned(),
-                cap.map(|cap| json!(cap))
-            );
-            assert!(request.get("max_tokens").is_none());
-        }
-    }
-
-    #[test]
     fn server_loop_admission_rejects_identity_without_workspace() {
-        let error = server_loop_admission_payload(
+        let error = server_loop_admission_payload_with_execution_time_budget(
             &json!({
                 "model_selection": {"offering_id": "deepseek-flash"},
                 "edge_executor_id": "edge-1",
@@ -2244,7 +2120,7 @@ mod tests {
 
     #[test]
     fn server_loop_admission_never_widens_invalid_workspace_authority() {
-        let error = server_loop_admission_payload(
+        let error = server_loop_admission_payload_with_execution_time_budget(
             &json!({
                 "model_selection": {"offering_id": "deepseek-flash"},
                 "edge_executor_id": "edge-1",
@@ -2396,14 +2272,12 @@ mod tests {
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
-        let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
@@ -2438,10 +2312,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -2457,7 +2329,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 1,
             turn_chain_id: None,
@@ -2635,14 +2506,12 @@ mod tests {
             let tool_results = Vec::new();
             let history: Vec<(String, String)> = Vec::new();
             let recent_tools: Vec<String> = Vec::new();
-            let file_context: Vec<String> = Vec::new();
             let mut restricted_tools = HashSet::new();
             let mut valid_tool_names = HashSet::new();
             let mut widen_selection_pending = false;
             let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
             let turn_guard = TurnGuard::default();
             let mut turn_policy = TurnInteractionPolicy::default();
-            let mut first_memoria_ms = None;
             let mut first_selection_report = None;
             let mut first_budget_pressure = 0.0;
             let mut first_context_assembly_ms = None;
@@ -2677,10 +2546,8 @@ mod tests {
                 restricted_tools: &mut restricted_tools,
                 widen_selection_pending: &mut widen_selection_pending,
                 step_recorder: &mut step_recorder,
-                file_context: &file_context,
                 assembly_start: Instant::now(),
                 telem: PrepareTurnTelemetry {
-                    first_memoria_ms: &mut first_memoria_ms,
                     first_selection_report: &mut first_selection_report,
                     first_budget_pressure: &mut first_budget_pressure,
                     first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -2696,7 +2563,6 @@ mod tests {
                 interaction_mode: TurnInteractionMode::NonInteractive,
                 turn_policy: &mut turn_policy,
                 skill_allowed_tools: None,
-                previous_confidence_fallback: None,
                 round_index: 0,
                 session_turn: 1,
                 turn_chain_id: None,
@@ -2961,44 +2827,6 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].role, "system");
         assert!(!turns[0].has_tool_calls);
-    }
-
-    #[test]
-    fn cross_session_memory_projection_preserves_hit_metadata_without_side_effects() {
-        let hits = vec![
-            astra_tools::memoria::BoostSearchHit {
-                memory_id: Some("mem-1".to_string()),
-                content: "runtime retrieval should use structured memory decisions".to_string(),
-                score: Some(0.92),
-            },
-            astra_tools::memoria::BoostSearchHit {
-                memory_id: None,
-                content: "other memory content".to_string(),
-                score: Some(0.74),
-            },
-        ];
-
-        let projection = project_cross_session_memory_hits("runtime retrieval", &hits);
-
-        assert_eq!(projection.contents.len(), 2);
-        assert_eq!(projection.feedback_ids, vec!["mem-1"]);
-        assert!(!projection.ranked.is_empty());
-        assert!(
-            projection
-                .ranked
-                .iter()
-                .any(|(content, _)| content.contains("structured memory decisions"))
-        );
-    }
-
-    #[test]
-    fn cross_session_memory_projection_handles_empty_hits() {
-        let projection = project_cross_session_memory_hits("runtime retrieval", &[]);
-
-        assert!(projection.contents.is_empty());
-        assert!(projection.ranked.is_empty());
-        assert!(projection.preferred_repos.is_empty());
-        assert!(projection.feedback_ids.is_empty());
     }
 
     #[test]
@@ -3396,14 +3224,12 @@ mod tests {
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
-        let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
@@ -3438,10 +3264,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -3457,7 +3281,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 1,
             turn_chain_id: None,
@@ -3577,14 +3400,12 @@ mod tests {
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
-        let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
@@ -3619,10 +3440,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -3638,7 +3457,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 1,
             turn_chain_id: None,
@@ -3725,7 +3543,6 @@ mod tests {
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
-        let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
@@ -3733,7 +3550,6 @@ mod tests {
             StepRecorder::new("test-user", "session-empty-selector", "task-empty-selector");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
@@ -3768,10 +3584,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -3787,7 +3601,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::Auto,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 1,
             turn_chain_id: None,
@@ -3860,7 +3673,6 @@ mod tests {
             "task-pending-activation",
         );
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
@@ -3895,10 +3707,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -3914,7 +3724,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::Auto,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 2,
             turn_chain_id: None,
@@ -3955,7 +3764,6 @@ mod tests {
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-empty", "task-empty");
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
@@ -3990,10 +3798,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -4009,7 +3815,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::Auto,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 1,
             turn_chain_id: None,
@@ -4070,14 +3875,12 @@ mod tests {
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
-        let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
@@ -4112,10 +3915,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -4131,7 +3932,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 1,
             turn_chain_id: None,
@@ -4212,7 +4012,6 @@ mod tests {
             "Need a fix.".to_string(),
         )];
         let recent_tools: Vec<String> = Vec::new();
-        let file_context: Vec<String> = Vec::new();
         let tool_results = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
@@ -4220,7 +4019,6 @@ mod tests {
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report =
             Some(astra_turn_core::tool_registry_report::ToolSelectionReport {
                 visible_tools: vec!["stale_first_round_tool".to_string()],
@@ -4264,10 +4062,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -4283,7 +4079,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 1,
             turn_chain_id: None,
@@ -4381,14 +4176,12 @@ mod tests {
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
-        let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
@@ -4423,10 +4216,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -4442,7 +4233,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 1,
             turn_chain_id: None,
@@ -4512,14 +4302,12 @@ mod tests {
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
-        let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
@@ -4554,10 +4342,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -4573,7 +4359,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 1,
             turn_chain_id: None,
@@ -4639,14 +4424,12 @@ mod tests {
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
-        let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
@@ -4681,10 +4464,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -4700,7 +4481,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 1,
             turn_chain_id: None,
@@ -4749,14 +4529,12 @@ mod tests {
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
-        let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
@@ -4791,10 +4569,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -4810,7 +4586,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 1,
             turn_chain_id: None,
@@ -4867,14 +4642,12 @@ mod tests {
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
-        let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
@@ -4909,10 +4682,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -4928,7 +4699,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 1,
             turn_chain_id: None,
@@ -4978,7 +4748,6 @@ mod tests {
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
-        let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = true;
@@ -4988,7 +4757,6 @@ mod tests {
         turn_guard.health.record_failure("write_file");
         turn_guard.health.record_failure("write_file");
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
@@ -5023,10 +4791,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -5042,7 +4808,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 1,
             turn_chain_id: None,
@@ -5094,10 +4859,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -5113,7 +4876,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 1,
             session_turn: 1,
             turn_chain_id: None,
@@ -5159,14 +4921,12 @@ mod tests {
         let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
-        let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_memoria_ms = None;
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
@@ -5201,10 +4961,8 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
-            file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut first_memoria_ms,
                 first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
@@ -5220,7 +4978,6 @@ mod tests {
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
             skill_allowed_tools: None,
-            previous_confidence_fallback: None,
             round_index: 0,
             session_turn: 1,
             turn_chain_id: None,

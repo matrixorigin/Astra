@@ -1,4 +1,4 @@
-use super::{memoria, parse_memory_search_contents, test_executor};
+use super::{memoria, parse_memory_search_contents};
 
 // ── parse_memory_search_contents: all JSON variants ──────────────────────
 
@@ -46,17 +46,6 @@ fn parse_memory_search_contents_all_formats() {
     // no content field
     let raw = r#"{"memories":[{"summary":"no content field"}]}"#;
     assert!(parse_memory_search_contents(raw).is_empty());
-}
-
-// ── memory_boost_search: edge cases ──────────────────────────────────────
-
-#[tokio::test]
-async fn memory_boost_search_edge_cases() {
-    let executor = test_executor();
-    assert!(executor.memory_boost_search("", 5).await.is_empty());
-    assert!(executor.memory_boost_search("   ", 5).await.is_empty());
-    // feedback on empty list should not panic
-    executor.memory_feedback_useful(vec![]);
 }
 
 // ── parse_memory_search_hits: all JSON variants ──────────────────────────

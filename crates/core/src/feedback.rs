@@ -145,32 +145,6 @@ pub struct AdaptationHint {
     pub severity: String,
 }
 
-/// Aggregate statistics for streaming speculative tool execution.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamingSpeculationStats {
-    /// Total speculations spawned across all reports.
-    pub started: u64,
-    /// Total hits merged back into real batches.
-    pub hit: u64,
-    /// Total discards.
-    pub discarded: u64,
-    /// Sum of per-hit overlap durations in ms.
-    pub total_saved_ms: u64,
-    /// Number of report batches merged into this aggregate.
-    pub reports: u64,
-}
-
-impl StreamingSpeculationStats {
-    /// Hit rate in [0.0, 1.0]. Returns 0.0 if no speculations started.
-    pub fn hit_rate(&self) -> f64 {
-        if self.started == 0 {
-            0.0
-        } else {
-            self.hit as f64 / self.started as f64
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct FeedbackBuffer {
     signals: VecDeque<FeedbackSignal>,
@@ -187,7 +161,6 @@ struct FeedbackBuffer {
 pub struct FeedbackSignalStore {
     buffer: RwLock<FeedbackBuffer>,
     max_signals: usize,
-    streaming_spec: RwLock<StreamingSpeculationStats>,
     storage_path: Option<PathBuf>,
     /// Number of signals recorded since last persist.
     dirty_count: RwLock<usize>,
@@ -209,7 +182,6 @@ impl FeedbackSignalStore {
         Self {
             buffer: RwLock::new(FeedbackBuffer::default()),
             max_signals: DEFAULT_MAX_SIGNALS,
-            streaming_spec: RwLock::new(StreamingSpeculationStats::default()),
             storage_path: None,
             dirty_count: RwLock::new(0),
         }
@@ -232,7 +204,6 @@ impl FeedbackSignalStore {
         Self {
             buffer: RwLock::new(buffer),
             max_signals: DEFAULT_MAX_SIGNALS,
-            streaming_spec: RwLock::new(StreamingSpeculationStats::default()),
             storage_path: Some(path),
             dirty_count: RwLock::new(0),
         }
@@ -260,33 +231,6 @@ impl FeedbackSignalStore {
     pub fn recent_signals(&self) -> Vec<FeedbackSignal> {
         let buffer = self.buffer.read().unwrap_or_else(|e| e.into_inner());
         buffer.signals.iter().cloned().collect()
-    }
-
-    /// Record one batch of streaming-speculation metrics.
-    pub fn record_streaming_speculation(
-        &self,
-        started: u64,
-        hit: u64,
-        discarded: u64,
-        total_saved_ms: u64,
-    ) {
-        let mut stats = self
-            .streaming_spec
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        stats.started = stats.started.saturating_add(started);
-        stats.hit = stats.hit.saturating_add(hit);
-        stats.discarded = stats.discarded.saturating_add(discarded);
-        stats.total_saved_ms = stats.total_saved_ms.saturating_add(total_saved_ms);
-        stats.reports = stats.reports.saturating_add(1);
-    }
-
-    /// Read aggregated streaming-speculation stats.
-    pub fn streaming_speculation_stats(&self) -> StreamingSpeculationStats {
-        self.streaming_spec
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
     }
 
     /// Analyze recent feedback signals and produce adaptation hints.
@@ -505,21 +449,5 @@ mod tests {
             signals[0].signal_type,
             SignalType::TaskFailure { ref reason } if reason == "bad output"
         ));
-    }
-
-    #[test]
-    fn streaming_speculation_metrics_are_observational_only() {
-        let store = FeedbackSignalStore::new();
-
-        store.record_streaming_speculation(10, 5, 1, 120);
-        store.record_streaming_speculation(4, 2, 0, 30);
-
-        let stats = store.streaming_speculation_stats();
-        assert_eq!(stats.started, 14);
-        assert_eq!(stats.hit, 7);
-        assert_eq!(stats.discarded, 1);
-        assert_eq!(stats.total_saved_ms, 150);
-        assert_eq!(stats.reports, 2);
-        assert!((stats.hit_rate() - 0.5).abs() < f64::EPSILON);
     }
 }

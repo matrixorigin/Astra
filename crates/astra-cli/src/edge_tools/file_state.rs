@@ -7,11 +7,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 
 use sha2::{Digest, Sha256};
 
-use super::{ToolExecutor, passive_cargo_check, passive_tsc_check};
+use super::ToolExecutor;
 
 /// Maximum number of entries in the file state cache. When exceeded, the
 /// entry with the oldest timestamp is evicted.
@@ -296,12 +295,6 @@ impl ToolExecutor {
     }
 
     fn record_write_impl(&self, path: &Path, content: Option<&str>) {
-        if passive_cargo_check::should_schedule_passive_cargo(&self.project_root, path) {
-            self.passive_cargo_pending.store(true, Ordering::SeqCst);
-        }
-        if passive_tsc_check::should_schedule_passive_tsc(&self.project_root, path) {
-            self.passive_tsc_pending.store(true, Ordering::SeqCst);
-        }
         match content {
             Some(text) => {
                 self.passive_lsp

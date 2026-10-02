@@ -320,7 +320,6 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     pub executor: Arc<ToolExecutor>,
     pub registry: ToolRegistry,
     pub all_schemas: Vec<Value>,
-    pub file_context: Vec<String>,
     pub perm_manager: &'a mut PermissionManager,
     pub valid_tool_names: HashSet<String>,
     pub capabilities: astra_turn_core::capability::CapabilitySet,
@@ -1015,12 +1014,8 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         )
     }
 
-    fn continuation_authority(&self, result: &HostTurnResult) -> ContinuationAuthority {
-        if result.accum.server_loop_terminal {
-            ContinuationAuthority::RemoteServer
-        } else {
-            ContinuationAuthority::Runtime
-        }
+    fn continuation_authority(&self, _result: &HostTurnResult) -> ContinuationAuthority {
+        ContinuationAuthority::RemoteServer
     }
 
     fn direct_child_completion_owner(
@@ -1187,17 +1182,6 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                 .extend(tool_names_from_schemas(&self.all_schemas));
         }
 
-        // Plan mode is a permission overlay, not a schema-pruning policy.
-        // This returns an empty set by design so plan/default transitions do
-        // not churn tool schemas or poison prompt-cache boundaries.
-        let plan_scoped_restrictions = plan_mode_restriction_names(
-            self.perm_manager.mode() == crate::cli::permission_manager::PermissionMode::Plan,
-            &self.all_schemas,
-        );
-        state
-            .restricted_tools
-            .extend(plan_scoped_restrictions.iter().cloned());
-
         // Propagate skill sandbox policy to the tool executor for this turn.
         // The guard restores the previous policy on drop — including on the
         // `?` early-return path below — so a turn that errored out cannot leak
@@ -1275,10 +1259,8 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                     restricted_tools: &mut state.restricted_tools,
                     widen_selection_pending: &mut state.widen_selection_pending,
                     step_recorder: &mut state.step_recorder,
-                    file_context: &self.file_context,
                     assembly_start,
                     telem: PrepareTurnTelemetry {
-                        first_memoria_ms: &mut state.telemetry.first_memoria_ms,
                         first_selection_report: &mut state.telemetry.first_selection_report,
                         first_budget_pressure: &mut state.telemetry.first_budget_pressure,
                         first_context_assembly_ms: &mut state.telemetry.first_context_assembly_ms,
@@ -1313,10 +1295,6 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                         .map(|s| s.iter().cloned().collect::<Vec<_>>()),
                     skill_continuation: state.skill_produced_output,
                     tool_cache: &mut self.tool_cache,
-                    previous_confidence_fallback: state
-                        .last_confidence_diagnosis
-                        .as_ref()
-                        .map(|d| d.fallback.clone()),
                     round_index: state.current_round_index,
                     session_turn: state.session_turn,
                     turn_chain_id: state.canonical_turn_chain_id.as_deref(),
@@ -1349,7 +1327,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         refresh_root_permission_context(&mut state.permission_context, self.perm_manager).await;
         state.approval_overrides = self.perm_manager.export_session_overrides();
 
-        let turn_result = turn_result?;
+        let mut turn_result = turn_result?;
 
         // Step events are collected before the HTTP admission response so the
         // live projection can render preparation phases.  Persist them only
@@ -1531,6 +1509,10 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             }
         }
 
+        // Missing protocol evidence cannot transfer execution authority back
+        // to the admission adapter. Preserve observed facts and existing errors
+        // so ordinary ingest and physical-owner cleanup remain authoritative.
+        turn_result.core.require_server_terminal_evidence();
         self.last_physical_run_id = turn_result.core.run_id.clone();
         self.last_error_code = turn_result.core.error_code.clone();
         self.last_error_metadata = turn_result.core.error_metadata.clone();
@@ -2274,19 +2256,6 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
     }
 }
 
-/// Plan mode is a permission overlay, not a schema-pruning pass.
-///
-/// Return no `restricted_tools` so the model sees the same capability surface
-/// before and during planning. Mutating invocations are blocked later by the
-/// args-aware plan-mode policy, which avoids prompt-cache churn and preserves
-/// read-only shell exploration.
-fn plan_mode_restriction_names(
-    _plan_active: bool,
-    _schemas: &[serde_json::Value],
-) -> HashSet<String> {
-    HashSet::new()
-}
-
 fn request_allowlist_restriction_names(
     schemas: &[serde_json::Value],
     request_allowed: Option<&HashSet<String>>,
@@ -2319,11 +2288,10 @@ mod tests {
         authoritative_provider_surface_report, derive_turn_interaction_mode,
         emit_final_output_ready, emit_ordered_control_event_with_backpressure,
         is_pre_admission_rejection, permission_mode_change_audit_event,
-        plan_mode_restriction_names, reconcile_terminal_stream_projection,
-        record_remote_applied_user_intents, recovered_agent_fanout_completion_event,
-        request_allowlist_restriction_names, retain_ordered_stream_event_in_queue,
-        server_terminal_requires_unverified, stream_event_requires_ordered_delivery,
-        user_intent_stream_event,
+        reconcile_terminal_stream_projection, record_remote_applied_user_intents,
+        recovered_agent_fanout_completion_event, request_allowlist_restriction_names,
+        retain_ordered_stream_event_in_queue, server_terminal_requires_unverified,
+        stream_event_requires_ordered_delivery, user_intent_stream_event,
     };
 
     #[test]
@@ -3388,30 +3356,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_restriction_names_do_not_hide_schema_in_plan_mode() {
-        let schemas = vec![
-            schema("read_file"),
-            schema("grep"),
-            schema("write_file"),
-            schema("str_replace"),
-            schema("bash"),
-            schema("exit_plan_mode"),
-            schema("enter_plan_mode"),
-        ];
-        let plan_off = plan_mode_restriction_names(false, &schemas);
-        assert!(
-            plan_off.is_empty(),
-            "plan-mode restrictions must be empty when plan mode is off"
-        );
-
-        let plan_on = plan_mode_restriction_names(true, &schemas);
-        assert!(
-            plan_on.is_empty(),
-            "plan mode must not hide tool schemas; args-aware preflight blocks mutating calls"
-        );
-    }
-
-    #[test]
     fn request_allowlist_restriction_names_hides_non_request_tools() {
         let schemas = vec![
             schema("git"),
@@ -3439,101 +3383,5 @@ mod tests {
         assert!(!restricted.contains("git"));
         assert!(!restricted.contains("read_file"));
         assert!(restricted.contains("str_replace"));
-    }
-
-    #[test]
-    fn plan_mode_restrictions_do_not_pollute_later_turns() {
-        let schemas = vec![
-            schema("read_file"),
-            schema("write_file"),
-            schema("bash"),
-            schema("exit_plan_mode"),
-        ];
-        let mut restricted: HashSet<String> = HashSet::new();
-
-        // Turn N: plan mode is active but does not mutate hard restrictions.
-        let plan_set = plan_mode_restriction_names(true, &schemas);
-        restricted.extend(plan_set.iter().cloned());
-        assert!(restricted.is_empty());
-
-        // Turn N ends — host removes the names it added.
-        for name in &plan_set {
-            restricted.remove(name);
-        }
-        assert!(
-            restricted.is_empty(),
-            "plan-mode schema policy must not leave stale hard restrictions (regression: session 19298aea)"
-        );
-
-        // Turn N+1: plan mode off after exit_plan_mode → no restrictions.
-        let plan_off = plan_mode_restriction_names(false, &schemas);
-        restricted.extend(plan_off.iter().cloned());
-        assert!(
-            !restricted.contains("write_file"),
-            "next turn after exit_plan_mode must let write_file through"
-        );
-        assert!(
-            !restricted.contains("bash"),
-            "next turn after exit_plan_mode must let bash through"
-        );
-    }
-
-    #[test]
-    fn plan_mode_restrictions_do_not_clobber_caller_existing_entries() {
-        // The host shares `restricted_tools` between several lifecycle
-        // owners (interaction-scoped, plan-scoped, stall-scoped, etc.).
-        // Removing plan-scoped names must leave entries that other
-        // owners added in place.
-        let schemas = vec![schema("write_file"), schema("bash"), schema("read_file")];
-        let mut restricted: HashSet<String> = HashSet::new();
-        // Pretend an unrelated subsystem already restricted `ask_user`.
-        restricted.insert("ask_user".to_string());
-
-        let plan_set = plan_mode_restriction_names(true, &schemas);
-        restricted.extend(plan_set.iter().cloned());
-        for name in &plan_set {
-            restricted.remove(name);
-        }
-
-        assert!(
-            restricted.contains("ask_user"),
-            "plan-mode cleanup must not delete entries it never owned"
-        );
-        assert_eq!(restricted.len(), 1);
-    }
-
-    #[test]
-    fn on_compaction_forwards_via_channel() {
-        // Verify that compaction events forwarded through the stream channel
-        // arrive with correct kind and summary.
-        use crate::cli::chat_stream::StreamEvent;
-        use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind};
-        let (tx, mut rx) = crate::cli::chat_stream::stream_event_channel();
-        let event = CompactionEvent {
-            kind: CompactionKind::ReactiveBudget,
-            pressure: 0.85,
-            tokens_freed: 12000,
-            tokens_before: 48000,
-            tokens_after: 36000,
-            max_tokens: 64000,
-            messages_removed: 8,
-            messages_after: 42,
-            layer_descriptions: vec!["old_turns: ~8000".into(), "tool_outputs: ~4000".into()],
-            summary: "reactive budget compaction".into(),
-        };
-
-        // Same pattern used by CliServerAdmissionHost::on_compaction:
-        tx.try_send(StreamEvent::Compaction(event)).unwrap();
-
-        let received = rx.try_recv().expect("must receive compaction event");
-        match received {
-            StreamEvent::Compaction(e) => {
-                assert_eq!(e.kind, CompactionKind::ReactiveBudget);
-                assert_eq!(e.pressure, 0.85);
-                assert_eq!(e.tokens_freed, 12000);
-                assert_eq!(e.summary, "reactive budget compaction");
-            }
-            other => panic!("expected Compaction event, got {other:?}"),
-        }
     }
 }

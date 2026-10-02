@@ -6106,7 +6106,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             return Err(error);
         }
     };
-    let action_fence = inject_polled_user_intents_before_action(host, state).await;
+    let continuation_authority = host.continuation_authority(&turn_result);
+    // The remote loop owns input reconciliation and continuation. A local
+    // action fence must not reopen an already-admitted Server execution.
+    let action_fence = match continuation_authority {
+        ContinuationAuthority::Runtime => {
+            inject_polled_user_intents_before_action(host, state).await
+        }
+        ContinuationAuthority::RemoteServer => Ok(false),
+    };
     if action_fence.as_ref().is_ok_and(|applied| *applied) || action_fence.is_err() {
         // Physical usage and round evidence remain true even though the
         // response no longer has conversational or execution authority.
@@ -6137,7 +6145,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         state.step_recorder.end_turn(false);
         return Ok(TurnExecutionControl::ContinueLoop);
     }
-    let continuation_authority = host.continuation_authority(&turn_result);
     if providerless_control_plane_turn {
         state.current_model_item_id = None;
         turn_result.accum.model_item_id = None;
@@ -6148,13 +6155,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
     if continuation_authority == ContinuationAuthority::RemoteServer
         && (turn_result.accum.has_tool_calls || !turn_result.accum.tool_calls.is_empty())
+        && turn_result.accum.error_message.is_none()
     {
-        state.last_request_usage = None;
-        state.last_measured_prompt_tokens = None;
-        return Err(astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::ContractViolation,
-            "remote Server declared terminal continuation ownership while returning pending client continuation work",
-        ));
+        // Reject through ingest, which preserves identity and physical usage
+        // before handling the failure. These calls never gain local authority.
+        turn_result.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+        turn_result.accum.error_kind = turn_result.error_kind;
+        turn_result.accum.error_message =
+            Some("remote Server returned pending client continuation work".into());
     }
     let collapsed_observation_calls =
         collapse_batched_observation_fanout(&mut turn_result.accum.tool_calls);
@@ -6171,15 +6179,23 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if let Some(ref mut sess) = state.pipeline_session {
         sess.recovery.reset_on_success();
     }
-    let snap = agentic_turn_stream_snapshot_with_kind(
+    let mut snap = agentic_turn_stream_snapshot_with_kind(
         &turn_result.accum,
         turn_result.ttft_ms,
         turn_result.error_kind,
     );
+    if continuation_authority == ContinuationAuthority::RemoteServer {
+        // Raw requested work is neither local authority nor an execution
+        // count. Keep it in the observed response for trace, but ingest only
+        // the Server's execution summary and physical usage.
+        snap.tool_calls = &[];
+    }
     state.last_request_usage = turn_result.accum.current_request_usage;
     update_turn_trace_collector(state, &turn_result);
 
-    if let Some(control_outcome) = host.take_terminal_control_outcome() {
+    if let Some(control_outcome) = host.take_terminal_control_outcome()
+        && turn_result.accum.error_message.is_none()
+    {
         state.set_terminal_execution_authority(match continuation_authority {
             ContinuationAuthority::RemoteServer => TerminalExecutionAuthority::RemoteServer,
             ContinuationAuthority::Runtime => TerminalExecutionAuthority::EdgeLedger,
@@ -6662,7 +6678,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     state.compaction_effectiveness.mark_insufficient();
                 }
             }
-            if is_context_overflow
+            if continuation_authority == ContinuationAuthority::Runtime
+                && is_context_overflow
                 && state.consecutive_context_window_errors
                     <= super::super::compaction_replay::MAX_COMPACT_RETRIES
             {
@@ -6931,7 +6948,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             // If authoritative guidance or another semantic runtime input
             // arrived, this response is intermediate and the same run makes
             // another normally accounted decision.
-            if inject_polled_user_intents_before_settlement(host, state).await? {
+            // Remote execution has already reconciled its input boundary.
+            // Leave late local input unobserved for its owner instead of
+            // draining it to authorize a second Server admission.
+            if continuation_authority == ContinuationAuthority::Runtime
+                && inject_polled_user_intents_before_settlement(host, state).await?
+            {
                 record_early_exit_llm_round(
                     state,
                     &turn_result,
