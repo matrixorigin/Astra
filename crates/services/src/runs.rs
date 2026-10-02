@@ -1400,6 +1400,18 @@ pub struct RemoteChildWakeKey {
 
 pub const REMOTE_CHILD_WAKE_BATCH_SIZE: usize = 128;
 
+const REMOTE_CHILD_WAKE_STATUSES: [&str; 5] = [
+    STATUS_PAUSED,
+    STATUS_COMPLETED,
+    STATUS_DELEGATED,
+    STATUS_FAILED,
+    STATUS_CANCELLED,
+];
+
+fn durable_run_status_is_remote_child_wake(status: &str) -> bool {
+    REMOTE_CHILD_WAKE_STATUSES.contains(&status)
+}
+
 #[must_use]
 pub fn validate_run_list_limit(limit: u32) -> u32 {
     limit.clamp(1, MAX_API_LIST_LIMIT)
@@ -5761,8 +5773,9 @@ pub trait RunStateStore: Send + Sync {
         Err("exact agent recovery is not supported by this store".to_string())
     }
 
-    /// Read only terminal hints, in cross-session batches. Never substitute a
-    /// per-child load here: idle waiter count must not determine SQL count.
+    /// Read only paused or terminal hints, in cross-session batches. Never
+    /// substitute a per-child load here: idle waiter count must not determine
+    /// SQL count.
     async fn load_remote_child_wakes(
         &self,
         _keys: &[RemoteChildWakeKey],
@@ -10229,7 +10242,7 @@ impl RunStateStore for InMemoryRunStateStore {
                 };
                 scoped(&key.run_id).is_some_and(|run| {
                     run.parent_run_id.as_ref() == Some(&key.parent_run_id)
-                        && durable_run_status_is_terminal(&run.status)
+                        && durable_run_status_is_remote_child_wake(&run.status)
                 }) || scoped(&key.parent_run_id).is_some_and(|run| {
                     run.events.iter().any(|event| {
                         extract_event_type(event) == PRE_DURABLE_CHILD_TERMINAL_EVENT_TYPE
@@ -23416,8 +23429,15 @@ impl RunStateStore for DatabaseRunStateStore {
             // The receipt lane covers children that never acquired a run row.
             let mut query = QueryBuilder::<MySql>::new(
                 "SELECT user_id, session_id, parent_run_id, run_id FROM agent_runs \
-                 WHERE status IN ('completed','delegated','failed','cancelled') AND (",
+                 WHERE status IN (",
             );
+            for (index, status) in REMOTE_CHILD_WAKE_STATUSES.iter().enumerate() {
+                if index != 0 {
+                    query.push(",");
+                }
+                query.push_bind(*status);
+            }
+            query.push(") AND (");
             for (index, key) in batch.iter().enumerate() {
                 if index != 0 {
                     query.push(" OR ");
@@ -27939,6 +27959,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_remote_child_wake_includes_paused_without_waking_active() {
+        let store = InMemoryRunStateStore::new();
+        let parent_id = "wake-parent";
+        let mut parent = durable_run_record(parent_id);
+        parent.status = STATUS_RUNNING.into();
+        store.insert_run(parent).await.unwrap();
+
+        let statuses = [
+            ("wake-running", STATUS_RUNNING),
+            ("wake-paused", STATUS_PAUSED),
+            ("wake-completed", STATUS_COMPLETED),
+        ];
+        for (run_id, status) in statuses {
+            let mut child = durable_run_record(run_id);
+            child.parent_run_id = Some(parent_id.into());
+            child.root_run_id = Some(parent_id.into());
+            child.ancestor_path = Some(format!("{parent_id}/{run_id}"));
+            child.depth = 1;
+            child.status = status.into();
+            store.insert_run(child).await.unwrap();
+        }
+
+        let keys = [
+            RemoteChildWakeKey {
+                user_id: "u1".into(),
+                session_id: "s1".into(),
+                parent_run_id: parent_id.into(),
+                run_id: "wake-running".into(),
+            },
+            RemoteChildWakeKey {
+                user_id: "u1".into(),
+                session_id: "s1".into(),
+                parent_run_id: parent_id.into(),
+                run_id: "wake-paused".into(),
+            },
+            RemoteChildWakeKey {
+                user_id: "u1".into(),
+                session_id: "s1".into(),
+                parent_run_id: parent_id.into(),
+                run_id: "wake-completed".into(),
+            },
+        ];
+        assert_eq!(
+            store.load_remote_child_wakes(&keys).await.unwrap(),
+            vec![keys[1].clone(), keys[2].clone()]
+        );
+    }
+
+    #[tokio::test]
     async fn exact_agent_recovery_preserves_missing_receipts_and_cancellation_authority() {
         let store = InMemoryRunStateStore::new();
         let mut parent = durable_run_record("parent");
@@ -31895,11 +31964,11 @@ mod tests {
             "1000 waiting sessions require eight SQL statements"
         );
 
-        // The selected terminal row is surrounded by >200 running rows.
+        // The selected paused row is surrounded by >200 running rows.
         sqlx::query(
             "UPDATE agent_runs SET status = ? WHERE user_id = ? AND session_id = ? AND run_id = ?",
         )
-        .bind(STATUS_COMPLETED)
+        .bind(STATUS_PAUSED)
         .bind(&keys[999].user_id)
         .bind(&keys[999].session_id)
         .bind(&keys[999].run_id)

@@ -326,8 +326,13 @@ impl ToolExecutor {
                 return Self::workspace_edit_error(error.into_string_output(), &committed_paths);
             }
             let journal_call_id = format!("lsp_workspace_edit:{}", path.display());
-            let result =
+            let mut result =
                 self.apply_prepared_file_edit(&prepared, &journal_call_id, EditType::Patch);
+            // LSP projects patch outcomes, not write_file convergence authority.
+            // Release any no-op marker before discarding the per-file metadata.
+            if let Some(fields) = result.metadata.as_mut() {
+                astra_tools::workspace_observation::discard_workspace_desired_state_convergence_marker(fields);
+            }
             if result.is_error {
                 return Self::workspace_edit_result_with_commit_state(result, &committed_paths);
             }
@@ -2876,6 +2881,55 @@ mod tests {
             executor.get_cached_content(&path).as_deref(),
             Some("fn renamed() {}\r\nfn other() {}")
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_noop_edits_release_transient_convergence_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("main.rs");
+        let content = "fn target() {}\n";
+        std::fs::write(&path, content).unwrap();
+        let executor = ToolExecutor::new(temp.path());
+        let uri = Url::from_file_path(&path).unwrap().to_string();
+        let edit = json!({"changes": {uri: [{
+            "range": {
+                "start": {"line": 0, "character": 3},
+                "end": {"line": 0, "character": 9}
+            },
+            "newText": "target"
+        }]}});
+        let args = json!({"path": "main.rs", "content": content});
+        // Exceed the process registry's 4,096 live-marker capacity. Exercise
+        // both metadata-discarding adapters, then verify public receipt issuance.
+        for iteration in 0..4_100 {
+            let lsp = executor.apply_lsp_workspace_edit("rename", "textDocument/rename", &edit);
+            assert!(!lsp.is_error, "iteration {iteration}: {}", lsp.output);
+            let displayed: Value = serde_json::from_str(&executor.write_file(&args)).unwrap();
+            assert_eq!(displayed["state"], "already_desired");
+        }
+        let result = executor
+            .execute_with_invocation_metadata(
+                "write_file",
+                &args,
+                astra_tools::tool_engine::ToolInvocationMetadata {
+                    run_id: Some("noop-registry-run"),
+                    turn_chain_id: Some("noop-registry-turn"),
+                    tool_call_id: Some("noop-registry-call"),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        let fields = result.tool_result_fields.as_ref().unwrap();
+        assert!(
+            !fields.contains_key(astra_tools::workspace_observation::DESIRED_STATE_CONVERGED_FIELD)
+        );
+        assert_eq!(
+            fields[astra_tools::workspace_observation::RECEIPT_FIELD]["schema"],
+            "workspace_desired_state_convergence_receipt.v1"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
+        assert_eq!(executor.file_journal_checkpoint(), 0);
     }
 
     #[test]

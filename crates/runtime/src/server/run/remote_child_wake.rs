@@ -249,6 +249,8 @@ impl RemoteChildWakeHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_core::STATUS_PAUSED;
+    use astra_services::runs::InMemoryRunStateStore;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn hub(
@@ -460,7 +462,7 @@ mod tests {
         assert_eq!(
             *rx.borrow(),
             1,
-            "terminal hints cannot induce permanent per-parent polling"
+            "one-shot hints cannot induce permanent per-parent polling"
         );
         // A consumer unable to recover the hinted result can resubscribe. The
         // new subscription is not silenced by a previous consumer's hint.
@@ -470,6 +472,69 @@ mod tests {
             .unwrap();
         observer.sweep().await;
         assert_eq!(*retry.borrow(), 1);
+    }
+
+    #[tokio::test]
+    async fn real_hub_wakes_cross_node_parent_when_child_pauses() {
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let writer = crate::server::run::engine::RunEngine::new(store.clone());
+        let observer = crate::server::run::engine::RunEngine::new(store.clone());
+        writer
+            .start_run("wake-parent", "wake-user", "wake-session")
+            .await
+            .unwrap();
+        writer
+            .start_run_ext(
+                "wake-child",
+                "wake-user",
+                "wake-session",
+                Some("wake-parent"),
+                Some("wake-delegation"),
+                Some("wake-agent"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Use the production hub/store adapter. The writer and observer are
+        // separate engines sharing only the durable store, as on two nodes.
+        let hub = RemoteChildWakeHub::new(observer.store().clone());
+        hub.state.lock().unwrap().running = true;
+        let mut receiver = hub
+            .subscribe(
+                "wake-user",
+                "wake-session",
+                "wake-parent",
+                &["wake-child".into()],
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!receiver.has_changed().unwrap());
+
+        writer
+            .persist_status(
+                "wake-user",
+                "wake-session",
+                "wake-child",
+                STATUS_PAUSED,
+                Some("user_resume"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hub.sweep().await, Some(false));
+        tokio::time::timeout(std::time::Duration::from_secs(1), receiver.changed())
+            .await
+            .expect("paused child wake must reach the remote parent")
+            .expect("remote wake receiver remains connected");
+
+        let observed = observer
+            .load_run("wake-user", "wake-child")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.status, STATUS_PAUSED);
+        assert_ne!(observed.status, astra_core::STATUS_CANCELLED);
     }
 
     #[tokio::test(start_paused = true)]

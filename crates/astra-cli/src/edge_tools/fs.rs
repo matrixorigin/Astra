@@ -942,7 +942,12 @@ impl ToolExecutor {
             if let Err(error) = self.verify_file_mutation_binding(&path, prepared.path()) {
                 return json!({"success": false, "error": error.into_string_output()}).to_string();
             }
-            let result = prepared.apply();
+            let mut result = prepared.apply();
+            // This display adapter returns only the no-op fact. The outer
+            // execution boundary mints its own invocation-bound marker.
+            if let Some(fields) = result.metadata.as_mut() {
+                astra_tools::workspace_observation::discard_workspace_desired_state_convergence_marker(fields);
+            }
             if result.is_error {
                 return json!({"success": false, "error": result.output}).to_string();
             }

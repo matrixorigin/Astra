@@ -1272,28 +1272,19 @@ async fn exercise_primary_continuation_entry(
             .await
             .expect("new turn entry");
         let settled = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let durable = service
-                    .run_engine
-                    .load_run(owner, &run.run_id)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                if matches!(
-                    durable.status.as_str(),
-                    "completed" | "failed" | "cancelled" | "interrupted" | "paused"
-                ) {
-                    assert_eq!(durable.status, "completed", "{durable:?}");
-                    // Terminal status precedes the canonical conversation
-                    // commit and writer release. Wait for this fixture's
-                    // lifecycle task before reusing the session or deleting
-                    // rows that post-loop persistence can still write.
-                    if service.background_task_count() == 0 {
-                        break;
-                    }
-                }
+            // Terminal status precedes conversation commit and writer release.
+            // Await this fixture's existing task accounting without repeatedly
+            // loading event history from the pool used by turn settlement.
+            while service.background_task_count() != 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            let durable = service
+                .run_engine
+                .load_run(owner, &run.run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(durable.status, "completed", "{durable:?}");
         })
         .await;
         if settled.is_err() {
