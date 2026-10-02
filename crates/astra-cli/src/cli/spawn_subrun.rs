@@ -3318,7 +3318,7 @@ mod tests {
     #[tokio::test]
     async fn spawned_llm_output_reaches_the_live_sink_end_to_end() {
         let mock = crate::cli::mock_llm::MockLlmServer::start(
-            crate::cli::mock_llm::MockScenario::TextOnly,
+            crate::cli::mock_llm::MockScenario::Complete,
         )
         .await
         .expect("mock LLM");
@@ -3356,6 +3356,11 @@ mod tests {
         assert_eq!(result.status, "completed");
         let requests = mock.received_requests();
         assert!(!requests.is_empty(), "child must send an actual request");
+        assert_eq!(
+            requests.len(),
+            1,
+            "a canonical Server terminal must not trigger client replay"
+        );
         assert_eq!(requests[0]["context"]["max_output_tokens"], 32768);
         assert_eq!(
             requests[0]["context"]["thinking"],

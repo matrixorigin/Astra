@@ -1085,6 +1085,8 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
                     cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let body =
                         "data: {\"type\":\"session_info\",\"session_id\":\"sess-tc\",\"run_id\":\"run-sess-tc\"}\n\n\
+                         data: {\"type\":\"text_delta\",\"content\":\"Observed partial response\"}\n\n\
+                         data: {\"type\":\"usage\",\"input_tokens\":10,\"output_tokens\":5}\n\n\
                          data: {\"type\":\"tool_call\",\"id\":\"tc-1\",\"name\":\"bash\",\"arguments\":{\"command\":\"echo hi\"}}\n\n\
                          data: {\"type\":\"turn_complete\",\"has_tool_calls\":true}\n\n\
                          data: [DONE]\n\n"
@@ -1185,6 +1187,10 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
     .await
     .expect_err("Server-owned streams cannot delegate continuation to the CLI");
     assert!(result.error.contains("terminal execution evidence"));
+    assert_eq!(result.partial.partial_text, "Observed partial response");
+    assert_eq!(result.partial.prompt_tokens, 10);
+    assert_eq!(result.partial.completion_tokens, 5);
+    assert_eq!(result.partial.tool_calls_count, 0);
     assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
@@ -1787,87 +1793,43 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
         let mut pm = PermissionManager::new(true);
         let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
-        let result = stream_chat_sse(ChatTurnParams {
+        let unified_skill_registry = astra_runtime::skills::empty_unified_registry().clone();
+        let context = BasicCliChatContext {
             api: &api,
-            token: "fake-token",
             auth_profile: None,
             message: "call echo",
-            user_intent: "call echo",
-            input_runtime_required_texts: &[],
-            input_active_system_skills: &[],
-            input_runtime_volatile_texts: &[],
-            input_work_unit_observations: &[],
-            semantic_query_override: None,
-            session_id: None,
             offering_id: None,
             model: Some("test-model"),
             provider: None,
             explain: ExplainMode::Off,
             explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
             render_md: false,
-            history: &[],
-            perm_manager: &mut pm,
             verbose_mode: false,
             render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
             cli_context: None,
-            recent_tools: &[],
-            deferred_tool_activations: None,
-            resume_restricted_tools: &[],
-            tool_health_entries: &[],
-            workspace_observation_quarantine: None,
-            session_lessons: &[],
-            memory_selection_reports: &[],
-            latest_skill_diagnosis: None,
-            latest_turn_quality_feedback: None,
-            unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
-            is_plan_subtask: false,
-            plan_subtask_id: None,
-            delegation_engine: None,
-            cancel_token: None,
-            execution_time_budget: None,
-            run_control: None,
-            incremental_state: None,
-            request_session_execution_lease: None,
-            plan_assemble_line_release: None,
+            unified_skill_registry: &unified_skill_registry,
             stream_event_tx: None,
-            explain_analyze_terminal_degraded: None,
             stream_json_emitter: None,
-            agent_live_event_sink: None,
-            approval_request_tx: None,
-            ask_user_request_tx: None,
-            plan_review_request_tx: None,
             mcp_manager: Some(mcp_arc.clone()),
-            skill_quality_tracker: &mut skill_qt,
-            discovered_skills: None,
-            messaging_metrics: None,
             agent_spawner: None,
             root_agent_id: None,
-            root_mailbox_slot: None,
-            observability_hub: None,
-            observability_session: None,
-            file_journal: None,
-            file_state: None,
-            database_snapshot_journal: None,
-
-            git_worktree_journal: None,
-            session_state_journal: None,
             bg_task_commands: None,
             bg_task_list_cache: None,
             bash_detach_slot: None,
-            turn_index: DEFAULT_TURN_INDEX,
-            pipeline_state: None,
-            compaction_state: None,
-            consecutive_context_window_errors: 0,
-            idempotency_cache: None,
-            pre_loaded_messages: None,
-            append_system_prompt: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
             #[cfg(feature = "harness")]
             harness_trace: None,
             #[cfg(feature = "harness")]
             benchmark_profile: None,
-        })
+        };
+        let result = Box::pin(stream_chat_sse(ChatTurnParams::basic_cli(
+            &context,
+            "fake-token",
+            None,
+            &mut pm,
+            &mut skill_qt,
+        )))
         .await;
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
         let callbacks = callbacks.lock().await;

@@ -31,7 +31,8 @@ use tokio::net::TcpListener;
 /// A named scenario that determines what SSE stream the mock server returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MockScenario {
-    /// Agent immediately outputs a completion message. No tool calls.
+    /// Agent immediately outputs a completion message with canonical Server
+    /// terminal evidence. No tool calls.
     Complete,
     /// Agent calls one edge tool (write_file), then completes.
     ToolThenComplete,
@@ -97,7 +98,7 @@ impl MockScenario {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Complete => "immediate completion (no tools)",
+            Self::Complete => "immediate Server-owned completion (no tools)",
             Self::ToolThenComplete => "one write_file tool call, then completion",
             Self::MultiTurn => "two LLM turns: think then complete",
             Self::Fail => "agent returns error",
@@ -119,7 +120,7 @@ impl MockScenario {
 
     pub fn all() -> &'static [(&'static str, &'static str)] {
         &[
-            ("complete", "immediate completion (no tools)"),
+            ("complete", "immediate Server-owned completion (no tools)"),
             (
                 "tool_then_complete",
                 "one write_file tool call, then completion",
@@ -264,6 +265,32 @@ fn done_event(tokens: u64) -> String {
     format!("{usage}{done}")
 }
 
+/// Emit the canonical terminal summary for a successful Server-owned run.
+///
+/// `TextOnly` deliberately does not call this helper: it models an
+/// inference-only response and remains a missing-terminal negative control.
+fn server_terminal_summary(run_id: &str, assistant_text: &str) -> String {
+    let receipt = astra_turn_core::tool_ledger_receipt::ToolLedgerReceipt::empty(run_id, 1);
+    sse_line(&serde_json::json!({
+        "type": "turn_complete",
+        "has_tool_calls": false,
+        "continuation_owner": "server",
+        "assistant_text": assistant_text,
+        "tool_calls_count": 0,
+        "observation_tool_calls_count": 0,
+        "tools_used": [],
+        "llm_rounds": 1,
+        "tool_ledger_receipt": receipt,
+        "token_usage_coverage": {
+            "scope": "logical_provider_calls",
+            "attempts": 1,
+            "provider_reported": 1,
+            "unavailable": 0,
+            "status": "complete"
+        }
+    }))
+}
+
 fn error_event(msg: &str) -> String {
     sse_line(&serde_json::json!({
         "type": "error",
@@ -276,14 +303,22 @@ fn error_event(msg: &str) -> String {
 // ─── Scenario bodies ─────────────────────────────────────────────────────────
 
 fn body_complete(agent_id: &str, turn: u32) -> String {
+    let run_id = format!("mock-run-{turn}");
     let msg = format!(
         "Task completed by {agent_id} (turn {turn}). \
          I have finished the assigned work successfully."
     );
     let mut s = String::new();
-    s.push_str(&session_info(&format!("mock-run-{turn}")));
+    s.push_str(&session_info(&run_id));
     s.push_str(&text_delta(&msg));
     s.push_str(&text_done(&msg));
+    s.push_str(&sse_line(&serde_json::json!({
+        "type": "run_finished",
+        "run_id": run_id,
+        "status": "completed",
+        "owner_generation": 1
+    })));
+    s.push_str(&server_terminal_summary(&run_id, &msg));
     s.push_str(&done_event(200));
     s
 }
@@ -854,10 +889,10 @@ fn body_rate_limited(turn: u32) -> String {
     .to_string()
 }
 
-/// Inference-only: text completion with NO tool_call_start events.
-/// Even if a caller passed tool schemas in the request, the model is free
-/// to answer with text. This pins that callers don't treat "no tool calls"
-/// as an error.
+/// Inference-only: text completion with NO tool_call_start or Server-owned
+/// terminal events. Even if a caller passed tool schemas in the request, the
+/// model is free to answer with text, but this response must not be admitted
+/// as a successful Server-owned execution.
 fn body_text_only(agent_id: &str, turn: u32) -> String {
     let msg = format!(
         "{agent_id}: answering directly without tools on turn {turn}. \
@@ -1465,6 +1500,10 @@ mod tests {
         assert!(body.contains("text_delta"));
         assert!(body.contains("text_done"));
         assert!(body.contains("\"type\":\"done\""));
+        assert!(body.contains("\"type\":\"run_finished\""));
+        assert!(body.contains("\"type\":\"turn_complete\""));
+        assert!(body.contains("\"continuation_owner\":\"server\""));
+        assert!(body.contains("\"tool_ledger_receipt\""));
         assert!(body.contains("test-agent"));
     }
 
@@ -1834,7 +1873,16 @@ mod tests {
             !body.contains("tool_result"),
             "text_only must not emit any tool_result events"
         );
-        // Yet must still have a complete turn shape.
+        assert!(
+            !body.contains("\"type\":\"turn_complete\""),
+            "text_only must remain a missing-terminal negative control"
+        );
+        assert!(
+            !body.contains("\"type\":\"run_finished\""),
+            "text_only must not fabricate durable Server completion"
+        );
+        // It still has a complete provider response shape for inference-only
+        // callers, but it is not a successful Server-owned turn.
         let events = parse_sse_events(&body);
         let kinds: Vec<String> = events
             .iter()

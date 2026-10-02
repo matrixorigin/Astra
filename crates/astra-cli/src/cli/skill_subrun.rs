@@ -2062,6 +2062,17 @@ mod tests {
             assert_eq!(state.total_prompt, prompt);
             assert_eq!(state.total_completion, completion);
             assert_eq!(state.current_run_id.as_deref(), Some(run_id));
+            if matches!(scenario, crate::cli::mock_llm::MockScenario::TextOnly) {
+                assert!(
+                    state
+                        .final_text
+                        .contains("answering directly without tools")
+                );
+                let partial = state.final_text.clone();
+                let failure = super::persist_failed_subrun(&mut state, &error.to_string());
+                assert!(failure.contains("[sub-run failed]"));
+                assert!(failure.ends_with(&partial));
+            }
             assert_eq!(
                 mock.received_requests().len(),
                 1,

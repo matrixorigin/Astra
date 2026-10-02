@@ -8299,11 +8299,15 @@ pub(crate) mod tests {
             Some(30),
         );
         terminal.accum.server_loop_terminal = true;
+        terminal.accum.full_text = "Current partial response".into();
+        terminal.accum.model_item_id = Some("current-response".into());
         let mut host = MockHost::new(vec![terminal])
             .with_remote_server_continuation()
             .with_valid_tools(&["bash"])
             .with_admission_hook();
         let mut state = make_state();
+        state.final_text = "Previous candidate".into();
+        state.final_text_model_item_id = Some("previous-response".into());
 
         let error = run_agentic_loop_with_host(&mut host, &mut state)
             .await
@@ -8318,6 +8322,11 @@ pub(crate) mod tests {
         );
         assert_eq!(state.total_prompt, 15, "physical usage survives rejection");
         assert_eq!(state.total_completion, 1);
+        assert_eq!(state.final_text, "Current partial response");
+        assert_eq!(
+            state.final_text_model_item_id.as_deref(),
+            Some("current-response")
+        );
     }
 
     #[tokio::test]

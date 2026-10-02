@@ -2054,7 +2054,7 @@ mod state_command_tests {
         astra_services::session_workspace::write_workspace(&ws).unwrap();
 
         let mock = crate::cli::mock_llm::MockLlmServer::start(
-            crate::cli::mock_llm::MockScenario::TextOnly,
+            crate::cli::mock_llm::MockScenario::Complete,
         )
         .await
         .unwrap();
@@ -2093,7 +2093,7 @@ mod state_command_tests {
         assert!(
             state.history[0]
                 .1
-                .contains("answering directly without tools on turn"),
+                .contains("I have finished the assigned work successfully."),
             "{}",
             state.history[0].1
         );
@@ -2119,7 +2119,7 @@ mod state_command_tests {
         make_owner_bound_step_checkpoint_path_invalid(&sid);
 
         let mock = crate::cli::mock_llm::MockLlmServer::start(
-            crate::cli::mock_llm::MockScenario::TextOnly,
+            crate::cli::mock_llm::MockScenario::Complete,
         )
         .await
         .unwrap();

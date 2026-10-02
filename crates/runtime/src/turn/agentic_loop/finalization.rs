@@ -512,7 +512,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     // Owned before the first await so task cancellation and panic unwinding
     // settle the same producer queue as normal and error returns.
     let _recall_run_boundary = UnattributedRecallRunBoundary::new(host.memory_recall_scope(state));
-    let result = run_agentic_loop_impl(host, state).await;
+    // Keep the shared loop's large suspended state out of every caller's
+    // future. This remains the same task and cancellation/drop boundary.
+    let result = Box::pin(run_agentic_loop_impl(host, state)).await;
     let cancellation_exit = matches!(result, Ok(AgenticLoopOutcome::Cancelled))
         || matches!(
             result,

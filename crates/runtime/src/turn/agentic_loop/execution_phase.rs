@@ -6823,6 +6823,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 ));
             }
 
+            // Fatal responses are partial observations, never successful
+            // completion. Preserve this response's bytes before returning the
+            // error; normal finalization does not run on the fatal path.
+            if !turn_result.accum.full_text.trim().is_empty() {
+                state.final_text.clone_from(&turn_result.accum.full_text);
+                state.final_text_model_item_id = turn_result.accum.model_item_id.clone();
+                state.final_text_streamed = false;
+            }
+
             // Catch-all: map ErrorKind to InterruptionRecord so the checkpoint
             // always carries resume guidance. Existing specific records (rate
             // limit, context overflow) take priority — only fill when still empty.

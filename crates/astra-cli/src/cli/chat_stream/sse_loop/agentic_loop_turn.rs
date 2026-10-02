@@ -4041,7 +4041,7 @@ mod tests {
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
-            offering_id: None,
+            offering_id: Some("test-offering"),
             model: None,
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
@@ -4098,7 +4098,15 @@ mod tests {
             Some(user_intent),
             "edge payload must preserve structured user_intent separately from prompt-facing message"
         );
-        assert_eq!(trace.memory.query, semantic_query_override);
+        let admission = server_loop_admission_payload_with_execution_time_budget(
+            &payload, message, false, None,
+        )
+        .expect("prepared request must project into the production admission contract");
+        assert_eq!(
+            admission["message"].as_str(),
+            Some(message),
+            "outbound request must preserve the raw prompt while client memory retrieval is absent"
+        );
         let edge_tool_names: Vec<String> = payload["edge_tools"]
             .as_array()
             .unwrap()
