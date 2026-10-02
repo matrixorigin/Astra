@@ -68,6 +68,143 @@ fn agent_event_fixture_payload_hash(payload: serde_json::Value) -> String {
     )
 }
 
+fn model_request_fixture_event(
+    user_id: &str,
+    session_id: &str,
+    request_id: &str,
+    run_id: &str,
+    parent_run_id: Option<&str>,
+    agent_id: &str,
+    model: &str,
+    purpose: &str,
+    terminal_status: Option<&str>,
+    provider_response_id: Option<&str>,
+) -> astra_services::ModelRequestContextEvent {
+    use astra_services::{
+        ModelRequestContextEvent, ModelRequestEventStage, ModelRequestIdentity,
+        ModelRequestTopology, ModelRequestUsage,
+    };
+
+    let terminal = terminal_status.is_some();
+    let usage = terminal_status
+        .filter(|status| *status != "delivery_unknown")
+        .map(|_| ModelRequestUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(8, 32, 0),
+            output_tokens: 4,
+        });
+    ModelRequestContextEvent {
+        schema: astra_services::MODEL_REQUEST_CONTEXT_SCHEMA.into(),
+        stage: if terminal {
+            ModelRequestEventStage::Terminal
+        } else {
+            ModelRequestEventStage::Accepted
+        },
+        identity: ModelRequestIdentity {
+            request_id: request_id.into(),
+            provider_response_id: provider_response_id.map(str::to_owned),
+            owner_scope: user_id.into(),
+            session_id: Some(session_id.into()),
+            run_id: Some(run_id.into()),
+            turn: Some(1),
+            round: Some(0),
+            logical_attempt: 0,
+            physical_attempt: 0,
+            actor_id: Some("fixture-actor".into()),
+            execution_principal: Some("server".into()),
+            billing_scope: Some(user_id.into()),
+            auth_session_id: None,
+            device_instance_id: None,
+            agent_id: Some(agent_id.into()),
+            parent_run_id: parent_run_id.map(str::to_owned),
+            topology: ModelRequestTopology::ServerOnly,
+            interaction_owner: "server".into(),
+            loop_owner: "server".into(),
+            execution_binding: "server".into(),
+            provider: "fixture-provider".into(),
+            model: model.into(),
+            offering_id: format!("{model}-offering"),
+            inference_purpose: purpose.into(),
+            operation_id: "agent_turn".into(),
+            provider_protocol: "openai_compatible".into(),
+            provider_wire_hash: "fixture-wire-hash".into(),
+            provider_wire_bytes: 100,
+        },
+        route: None,
+        lineage: Default::default(),
+        budget: Default::default(),
+        usage,
+        composition: Default::default(),
+        wire_composition: Default::default(),
+        tool_result_projections: Vec::new(),
+        cache: Default::default(),
+        compaction: Default::default(),
+        terminal_status: terminal_status.map(str::to_owned),
+        usage_status: terminal.then(|| {
+            if terminal_status == Some("delivery_unknown") {
+                "unavailable".to_string()
+            } else {
+                "provider_exact".to_string()
+            }
+        }),
+        error_kind: None,
+    }
+}
+
+async fn insert_model_request_fixture(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    attempt_id: &str,
+    event: &astra_services::ModelRequestContextEvent,
+    created_at: &str,
+) {
+    let usage = event.usage.as_ref();
+    sqlx::query(
+        "INSERT INTO model_request_context_events \
+         (user_id, session_id, event_id, attempt_id, invocation_id, event_stage, \
+          terminal_status, topology, provider, model_family, purpose, input_tokens, \
+          output_tokens, cache_read_tokens, cache_creation_tokens, event_json, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(Uuid::new_v4().to_string())
+    .bind(attempt_id)
+    .bind(format!("invocation-{attempt_id}"))
+    .bind(event.stage.as_str())
+    .bind(event.terminal_status.as_deref())
+    .bind(event.identity.topology.as_str())
+    .bind(&event.identity.provider)
+    .bind(&event.identity.model)
+    .bind(&event.identity.inference_purpose)
+    .bind(usage.map(|usage| usage.input.total_input_tokens() as i64))
+    .bind(usage.map(|usage| usage.output_tokens as i64))
+    .bind(usage.map(|usage| usage.input.cache_read_tokens as i64))
+    .bind(usage.map(|usage| usage.input.cache_creation_tokens as i64))
+    .bind(serde_json::to_string(event).expect("serialize model request fixture"))
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .expect("insert model request context fixture");
+}
+
+async fn cleanup_model_request_fixtures(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    attempt_ids: &[String],
+) {
+    for attempt_id in attempt_ids {
+        sqlx::query(
+            "DELETE FROM model_request_context_events WHERE user_id = ? AND attempt_id = ?",
+        )
+        .bind(user_id)
+        .bind(attempt_id)
+        .execute(pool)
+        .await
+        .expect("delete model request context fixture");
+    }
+}
+
 async fn setup_pool_and_settings() -> (SharedPool, MatrixOneSettings) {
     common::setup_pool_and_settings().await
 }
@@ -1804,34 +1941,12 @@ async fn cleanup_session_delete_fixture_for_owner(
     .await;
 
     for table in [
-        "harness_citations",
-        "harness_skill_rules",
-        "harness_skill_drafts",
-        "harness_items",
-    ] {
-        let sql = format!(
-            "DELETE FROM {table} \
-             WHERE harness_run_id IN (
-                 SELECT harness_run_id FROM harness_runs
-                 WHERE session_id = ? AND user_id = ?
-             )"
-        );
-        let _ = sqlx::query(&sql)
-            .bind(session_id)
-            .bind(user_id)
-            .execute(pool)
-            .await;
-    }
-
-    for table in [
         "ctx_decision_audits",
         "ctx_snapshots",
         "session_artifacts",
-        "eval_calibration_assessments",
         "conversation_log",
         "agent_event_edges",
         "agent_events",
-        "harness_runs",
         "agent_session_execution_slots",
         "agent_runs",
         "agent_sessions",
@@ -1852,82 +1967,6 @@ async fn cleanup_session_delete_fixture_for_owner(
             .execute(pool)
             .await;
     }
-}
-
-async fn insert_harness_run_fixture(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-    harness_run_id: &str,
-    marker: &str,
-) {
-    let item_id = format!("{harness_run_id}-item");
-    let draft_id = format!("{harness_run_id}-draft");
-    let rule_id = format!("{harness_run_id}-rule");
-    let citation_id = format!("{harness_run_id}-citation");
-
-    sqlx::query(
-        "INSERT INTO harness_runs \
-         (harness_run_id, harness_id, version_id, user_id, session_id, status, input_json, output_json) \
-         VALUES (?, ?, 'v1', ?, ?, 'running', '{}', '{}')",
-    )
-    .bind(harness_run_id)
-    .bind(format!("harness-{marker}"))
-    .bind(user_id)
-    .bind(session_id)
-    .execute(pool)
-    .await
-    .expect("insert harness run");
-
-    sqlx::query(
-        "INSERT INTO harness_items \
-         (item_id, harness_run_id, item_type, locator_json, input_json, proposed_output_json, final_output_json, status) \
-         VALUES (?, ?, 'case', '{}', '{}', '{}', '{}', 'pending')",
-    )
-    .bind(&item_id)
-    .bind(harness_run_id)
-    .execute(pool)
-    .await
-    .expect("insert harness item");
-
-    sqlx::query(
-        "INSERT INTO harness_skill_drafts \
-         (skill_draft_id, harness_run_id, candidate_name, description, target_scope, publish_visibility, content_markdown, source_summary_json, status) \
-         VALUES (?, ?, ?, 'session delete fixture', 'user', 'private', '# fixture', '{}', 'proposed')",
-    )
-    .bind(&draft_id)
-    .bind(harness_run_id)
-    .bind(format!("fixture-{marker}"))
-    .execute(pool)
-    .await
-    .expect("insert harness skill draft");
-
-    sqlx::query(
-        "INSERT INTO harness_skill_rules \
-         (skill_rule_id, skill_draft_id, harness_run_id, rule_type, statement, rationale, status) \
-         VALUES (?, ?, ?, 'requirement', 'delete session-owned harness children', 'fixture', 'proposed')",
-    )
-    .bind(&rule_id)
-    .bind(&draft_id)
-    .bind(harness_run_id)
-    .execute(pool)
-    .await
-    .expect("insert harness skill rule");
-
-    sqlx::query(
-        "INSERT INTO harness_citations \
-         (citation_id, harness_run_id, item_id, skill_draft_id, skill_rule_id, source_locator_json, source_content_hash) \
-         VALUES (?, ?, ?, ?, ?, '{}', ?)",
-    )
-    .bind(&citation_id)
-    .bind(harness_run_id)
-    .bind(&item_id)
-    .bind(&draft_id)
-    .bind(&rule_id)
-    .bind(format!("hash-{marker}"))
-    .execute(pool)
-    .await
-    .expect("insert harness citation");
 }
 
 fn create_owner_local_session_files(
@@ -4754,7 +4793,7 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_audit_does_not_price_unattributed_turn_usage() {
+async fn session_audit_usage_counts_physical_attempts_without_repricing_history() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
@@ -4777,7 +4816,7 @@ async fn session_audit_does_not_price_unattributed_turn_usage() {
     .bind(r#"["text"]"#)
     .bind("[]")
     .bind(
-        r#"{"prompt":0.000002,"completion":0.000008,"cache_read":0.0000005,"cache_write":0.0000015}"#,
+        r#"{"currency":"USD","unit":"per_token","prompt":0.000002,"completion":0.000008,"cache_read":0.0000005,"cache_write":0.0000015}"#,
     )
     .bind("[]")
     .bind("{}")
@@ -4834,15 +4873,88 @@ async fn session_audit_does_not_price_unattributed_turn_usage() {
     .await
     .expect("insert priced audit event");
 
+    let other_user = Uuid::new_v4().to_string();
+    let attempt_ids = [
+        Uuid::new_v4().to_string(),
+        Uuid::new_v4().to_string(),
+        Uuid::new_v4().to_string(),
+    ];
+    for (index, owner, status, coverage, counts) in [
+        (
+            0,
+            &user_id,
+            "succeeded",
+            "provider_exact",
+            [1_000_000, 500_000, 2_000_000, 1_000_000],
+        ),
+        (1, &user_id, "failed", "provider_partial", [30_000, 0, 0, 0]),
+        (
+            2,
+            &other_user,
+            "succeeded",
+            "provider_exact",
+            [99_000_000, 0, 0, 0],
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO inference_provider_attempts \
+             (attempt_id, invocation_id, user_id, session_id, attempt_index, provider, \
+              admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes, \
+              status, usage_status, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) \
+             VALUES (?, ?, ?, ?, 0, 'mock', ?, 'openai_compatible', ?, 1, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&attempt_ids[index])
+        .bind(Uuid::new_v4().to_string())
+        .bind(owner)
+        .bind(&session_id)
+        .bind("00000000000000000000000000000000")
+        .bind("0".repeat(64))
+        .bind(status)
+        .bind(coverage)
+        .bind(counts[0])
+        .bind(counts[1])
+        .bind(counts[2])
+        .bind(counts[3])
+        .execute(&pool)
+        .await
+        .expect("insert physical attempt");
+    }
+
     let audit = DatabaseSessionAuditService::new(settings).with_pool(shared);
     let summary = audit
         .get_summary(&user_id, &session_id)
         .await
-        .expect("get priced session summary");
-    assert_eq!(summary.cost.priced_turn_count, 0);
-    assert_eq!(summary.cost.unpriced_turn_count, 1);
+        .expect("get session summary");
+    assert_eq!(summary.request_usage.request_count, 2);
+    assert_eq!(
+        summary.request_usage.fresh_input_tokens.known_tokens,
+        Some(1_030_000)
+    );
+    assert_eq!(
+        summary.request_usage.fresh_input_tokens.observed_attempts,
+        2
+    );
+    assert_eq!(
+        summary.request_usage.output_tokens.known_tokens,
+        Some(500_000)
+    );
+    assert_eq!(summary.request_usage.output_tokens.observed_attempts, 1);
     assert_eq!(summary.cost.estimated_cost_usd, None);
-    assert!(summary.cost.per_model_cost_usd.is_empty());
+    assert_eq!(
+        summary.cost.unavailable_reason,
+        astra_services::session_audit::SessionCostUnavailableReason::HistoricalAttemptCoverageIncomplete
+    );
+
+    sqlx::query(
+        "DELETE FROM inference_provider_attempts WHERE session_id = ? AND attempt_id IN (?, ?, ?)",
+    )
+    .bind(&session_id)
+    .bind(&attempt_ids[0])
+    .bind(&attempt_ids[1])
+    .bind(&attempt_ids[2])
+    .execute(&pool)
+    .await
+    .expect("delete physical attempts");
 
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
@@ -5597,7 +5709,7 @@ async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_
         .expect("composite snapshot index path");
     assert!(
         !local_index_path.exists(),
-        "fixture should prove remote composite snapshot restore without local composite_snapshots.json"
+        "fixture should prove remote composite snapshot persistence without local composite_snapshots.json"
     );
 
     svc.push_session_state(
@@ -5718,11 +5830,8 @@ async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_
         .expect("remote composite snapshot artifact exists");
     assert_eq!(latest_artifact.artifact_id, expected_artifact.artifact_id);
 
-    let restore = HybridRestoreService::new(pool.clone());
-    let listed = restore
-        .list_composite_snapshots(&user_id, &session_id)
-        .await
-        .expect("list composite snapshots");
+    let listed: astra_services::CompositeSnapshotIndex =
+        serde_json::from_value(latest_artifact.content).expect("decode persisted composite index");
     assert_eq!(listed.snapshots.len(), expected_index.snapshots.len());
     assert_eq!(listed.current_version(), expected_index.current_version());
     let listed_snapshot = listed
@@ -5737,35 +5846,18 @@ async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_
     );
     assert_eq!(listed_snapshot.turn, expected_snapshot.turn);
 
-    let restored = restore
-        .restore_to_composite_snapshot(
-            &user_id,
-            &session_id,
-            &expected_snapshot.snapshot_id,
-            &astra_core::composite_snapshot::RestoreSelector::default(),
-        )
-        .await
-        .expect("restore composite snapshot")
-        .expect("composite snapshot restored");
-
-    assert_eq!(restored.snapshot.snapshot_id, expected_snapshot.snapshot_id);
-    assert!(
-        restored
-            .restored_dimensions
-            .iter()
-            .any(|dim| dim == "session"),
-        "remote composite snapshot restore should recover the session-state dimension"
-    );
+    assert_eq!(listed_snapshot.git_commit(), Some(expected_git));
     assert_eq!(
-        restored.git_commit_to_checkout.as_deref(),
-        Some(expected_git)
-    );
-    assert_eq!(
-        restored.data_snapshot_to_restore.as_ref(),
+        listed_snapshot.data_snapshot(),
         Some(expected_data_snapshot)
     );
 
-    let session = restored.session.expect("session restored from checkpoint");
+    let restore = HybridRestoreService::new(pool.clone());
+    let session = restore
+        .restore_to_checkpoint(&user_id, &session_id, 3)
+        .await
+        .expect("restore ordinary remote checkpoint")
+        .expect("session restored from checkpoint");
     assert_eq!(session.turn_count, 7);
     assert_eq!(session.total_tokens_in, 321);
     assert_eq!(session.checkpoint_count, 3);
@@ -7313,6 +7405,9 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     let owner_user_id = Uuid::new_v4().to_string();
     let other_user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
+    let owner_root_attempt = Uuid::new_v4().to_string();
+    let owner_child_attempt = Uuid::new_v4().to_string();
+    let other_attempt = Uuid::new_v4().to_string();
     let owner_query_event_id = Uuid::new_v4().to_string();
     let owner_llm_event_id = Uuid::new_v4().to_string();
     let owner_drift_assessment_event_id = Uuid::new_v4().to_string();
@@ -7324,6 +7419,8 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     let other_context_id = Uuid::new_v4().to_string();
     let owner_decision_id = Uuid::new_v4().to_string();
     let other_decision_id = Uuid::new_v4().to_string();
+    let owner_tool_event_id = Uuid::new_v4().to_string();
+    let owner_boundary_event_id = Uuid::new_v4().to_string();
 
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
@@ -7334,6 +7431,8 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             owner_llm_event_id.clone(),
             owner_drift_assessment_event_id.clone(),
             owner_legacy_drift_event_id.clone(),
+            owner_tool_event_id.clone(),
+            owner_boundary_event_id.clone(),
         ],
         std::slice::from_ref(&owner_decision_id),
     )
@@ -7350,16 +7449,108 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         std::slice::from_ref(&other_decision_id),
     )
     .await;
+    cleanup_model_request_fixtures(
+        &pool,
+        &owner_user_id,
+        &[owner_root_attempt.clone(), owner_child_attempt.clone()],
+    )
+    .await;
+    cleanup_model_request_fixtures(&pool, &other_user_id, std::slice::from_ref(&other_attempt))
+        .await;
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'mixed-owner-derived-it', 'active', 4)",
+         VALUES (?, ?, 'mixed-owner-derived-it', 'active', 6)",
     )
     .bind(&session_id)
     .bind(&owner_user_id)
     .execute(&pool)
     .await
     .expect("insert owner session");
+
+    for (
+        user_id,
+        attempt_id,
+        run_id,
+        parent_run_id,
+        agent_id,
+        include_accepted,
+        status,
+        response_id,
+        created_at,
+    ) in [
+        (
+            &owner_user_id,
+            &owner_root_attempt,
+            "root-run",
+            None,
+            "parent-agent",
+            false,
+            Some("succeeded"),
+            Some("root-provider-response"),
+            "2026-06-01 10:00:10.000000",
+        ),
+        (
+            &owner_user_id,
+            &owner_child_attempt,
+            "child-run",
+            Some("root-run"),
+            "child-agent",
+            true,
+            Some("delivery_unknown"),
+            None,
+            "2026-06-01 10:00:20.000000",
+        ),
+        (
+            &other_user_id,
+            &other_attempt,
+            "foreign-run",
+            None,
+            "foreign-agent",
+            false,
+            Some("succeeded"),
+            Some("foreign-provider-response"),
+            "2026-06-01 10:00:30.000000",
+        ),
+    ] {
+        if include_accepted {
+            let accepted = model_request_fixture_event(
+                user_id,
+                &session_id,
+                attempt_id,
+                run_id,
+                parent_run_id,
+                agent_id,
+                "glm-5.2",
+                "agent_turn",
+                None,
+                None,
+            );
+            insert_model_request_fixture(
+                &pool,
+                user_id,
+                &session_id,
+                attempt_id,
+                &accepted,
+                "2026-06-01 10:00:19.000000",
+            )
+            .await;
+        }
+        let event = model_request_fixture_event(
+            user_id,
+            &session_id,
+            attempt_id,
+            run_id,
+            parent_run_id,
+            agent_id,
+            "glm-5.2",
+            "agent_turn",
+            status,
+            response_id,
+        );
+        insert_model_request_fixture(&pool, user_id, &session_id, attempt_id, &event, created_at)
+            .await;
+    }
 
     for (event_id, user_id, event_type, content, skill_name, token_usage, created_at) in [
         (
@@ -7525,6 +7716,91 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         .expect("insert mixed owner drift assessment");
     }
 
+    let private_args = "PRIVATE-TOOL-ARGS";
+    let private_result = "PRIVATE-TOOL-RESULT";
+    let tool_metadata = serde_json::json!({
+        "ok": true,
+        "disposition": "executed",
+        "result_class": "success",
+        "exit_semantics": "success",
+        "args_preview": private_args,
+        "result_preview": private_result,
+    });
+    let tool_content = "command completed successfully";
+    let tool_created_at = "2026-06-01 10:01:30.000000";
+    sqlx::query(
+        "INSERT INTO agent_events \
+         (event_id, session_id, user_id, agent_id, event_type, content, run_id, parent_run_id, \
+          tool_call_id, meta_tool_name, metadata, payload_hash, ingestion_write_id, created_at) \
+         VALUES (?, ?, ?, ?, 'tool_call_completed', ?, ?, ?, ?, 'shell', CAST(? AS JSON), ?, ?, ?)",
+    )
+    .bind(&owner_tool_event_id)
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .bind("child-agent")
+    .bind(tool_content)
+    .bind("child-run")
+    .bind("root-run")
+    .bind("child-shell-call")
+    .bind(tool_metadata.to_string())
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &owner_tool_event_id,
+        "session_id": &session_id,
+        "user_id": &owner_user_id,
+        "agent_id": "child-agent",
+        "event_type": "tool_call_completed",
+        "content": tool_content,
+        "run_id": "child-run",
+        "parent_run_id": "root-run",
+        "tool_call_id": "child-shell-call",
+        "meta_tool_name": "shell",
+        "metadata": &tool_metadata,
+        "created_at": tool_created_at,
+    })))
+    .bind(Uuid::new_v4().to_string())
+    .bind(tool_created_at)
+    .execute(&pool)
+    .await
+    .expect("insert scoped tool terminal fixture");
+
+    let boundary_metadata = serde_json::json!({
+        "span_id": "dependency-boundary",
+        "name": "agent_dependency_boundary",
+        "trace_id": "root-run",
+        "attrs": {
+            "parent_run_id": "root-run",
+            "outcome": "results_adopted",
+            "tool_call_id": "wait-for-child",
+            "children": "[{\"agent_id\":\"child-agent\",\"run_id\":\"child-run\",\"status\":\"completed\"}]"
+        }
+    });
+    let boundary_created_at = "2026-06-01 10:01:35.000000";
+    sqlx::query(
+        "INSERT INTO agent_events \
+         (event_id, session_id, user_id, event_type, run_id, metadata, payload_hash, \
+          ingestion_write_id, created_at) \
+         VALUES (?, ?, ?, 'trace_span', ?, CAST(? AS JSON), ?, ?, ?)",
+    )
+    .bind(&owner_boundary_event_id)
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .bind("root-run")
+    .bind(boundary_metadata.to_string())
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &owner_boundary_event_id,
+        "session_id": &session_id,
+        "user_id": &owner_user_id,
+        "event_type": "trace_span",
+        "run_id": "root-run",
+        "metadata": &boundary_metadata,
+        "created_at": boundary_created_at,
+    })))
+    .bind(Uuid::new_v4().to_string())
+    .bind(boundary_created_at)
+    .execute(&pool)
+    .await
+    .expect("insert canonical dependency boundary fixture");
+
     for (
         context_id,
         user_id,
@@ -7632,12 +7908,38 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         )
         .await
         .expect("owner reflect report");
-    assert_eq!(report.data_coverage.events, 4);
+    assert_eq!(report.data_coverage.events, 6);
     assert_eq!(report.data_coverage.decisions, 1);
+    assert_eq!(report.model_requests.records_observed, 3);
+    assert_eq!(report.model_requests.accepted_records_observed, 1);
+    assert_eq!(
+        report.model_requests.coverage,
+        astra_services::reflect::ModelRequestCaptureCoverage::WindowObserved
+    );
+    let model_requests = report
+        .model_requests
+        .terminal
+        .as_ref()
+        .expect("owner terminal request evidence");
+    assert_eq!(model_requests.terminal_requests, 2);
+    assert_eq!(model_requests.terminal_statuses.succeeded, 1);
+    assert_eq!(model_requests.terminal_statuses.delivery_unknown, 1);
+    assert_eq!(model_requests.usage_coverage.exact, 1);
+    assert_eq!(model_requests.usage_coverage.unavailable, 1);
+    assert_eq!(model_requests.provider_response_id_observations, 1);
+    let child_request = model_requests
+        .groups
+        .iter()
+        .find(|group| group.run_id.as_deref() == Some("child-run"))
+        .expect("child request group");
+    assert_eq!(child_request.parent_run_id.as_deref(), Some("root-run"));
+    assert_eq!(child_request.agent_id.as_deref(), Some("child-agent"));
+    assert_eq!(child_request.terminal_statuses.delivery_unknown, 1);
+    assert_eq!(child_request.provider_response_id_observations, 0);
     let view = report.view.as_ref().expect("reflect report includes view");
     assert_eq!(view.topic, "overview");
     assert_eq!(view.facet, "overview");
-    assert_eq!(view.data_coverage.events, 4);
+    assert_eq!(view.data_coverage.events, 6);
     assert_eq!(view.data_coverage.decisions, 1);
     assert!(!report.summary.is_empty());
     assert!(
@@ -7683,7 +7985,35 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             .iter()
             .any(|evidence| evidence.summary.contains("other secret"))
     );
-    assert!(report.graph_slice.nodes.is_empty());
+    let execution_spine = report
+        .graph_slice
+        .nodes
+        .iter()
+        .find(|node| node.label == "execution_spine")
+        .expect("scoped tool event is visible in execution trace");
+    let facts = execution_spine.metadata.as_ref().unwrap()["execution_spine"]["facts"]
+        .as_array()
+        .expect("execution facts");
+    let tool_fact = facts
+        .iter()
+        .find(|fact| fact["event_id"] == owner_tool_event_id)
+        .expect("tool event fact");
+    assert_eq!(tool_fact["run_id"], "child-run");
+    assert_eq!(tool_fact["parent_run_id"], "root-run");
+    assert_eq!(tool_fact["tool_outcome"]["tool_name"], "shell");
+    assert_eq!(tool_fact["tool_outcome"]["disposition"], "executed");
+    assert_eq!(tool_fact["tool_outcome"]["result_class"], "success");
+    assert_eq!(tool_fact["tool_outcome"]["exit_semantics"], "success");
+    let boundary_fact = facts
+        .iter()
+        .find(|fact| fact["event_id"] == owner_boundary_event_id)
+        .expect("dependency boundary event fact");
+    assert_eq!(boundary_fact["kind"], "agent_dependency_boundary");
+    assert_eq!(boundary_fact["tool_call_id"], "wait-for-child");
+    let report_json = serde_json::to_string(&report).unwrap();
+    assert!(!report_json.contains(private_args));
+    assert!(!report_json.contains(private_result));
+    assert!(report.graph_slice.edges.is_empty());
     assert!(report.graph_slice.edges.is_empty());
 
     let introspection =
@@ -7762,6 +8092,8 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             owner_llm_event_id,
             owner_drift_assessment_event_id,
             owner_legacy_drift_event_id,
+            owner_tool_event_id,
+            owner_boundary_event_id,
         ],
         &[owner_decision_id],
     )
@@ -7778,6 +8110,13 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         &[other_decision_id],
     )
     .await;
+    cleanup_model_request_fixtures(
+        &pool,
+        &owner_user_id,
+        &[owner_root_attempt, owner_child_attempt],
+    )
+    .await;
+    cleanup_model_request_fixtures(&pool, &other_user_id, &[other_attempt]).await;
 }
 
 #[tokio::test]
@@ -7795,10 +8134,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     let foreign_context_capture_id = Uuid::new_v4().to_string();
     let owner_decision_id = Uuid::new_v4().to_string();
     let foreign_decision_id = Uuid::new_v4().to_string();
-    let owner_harness_run_id = Uuid::new_v4().to_string();
-    let foreign_harness_run_id = Uuid::new_v4().to_string();
-    let owner_calibration_id = Uuid::new_v4().to_string();
-    let foreign_calibration_id = Uuid::new_v4().to_string();
     let owner_run_id = Uuid::new_v4().to_string();
     let foreign_run_id = Uuid::new_v4().to_string();
     let owner_skill_eval_id = Uuid::new_v4().to_string();
@@ -7899,41 +8234,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .await
         .expect("insert conversation log");
     }
-
-    for (user_id, calibration_id, marker) in [
-        (&owner_user_id, &owner_calibration_id, "owner"),
-        (&other_user_id, &foreign_calibration_id, "foreign"),
-    ] {
-        sqlx::query(
-            "INSERT INTO eval_calibration_assessments \
-             (calibration_id, user_id, agent_id, session_id, confidence, quality_score) \
-             VALUES (?, ?, ?, ?, 0.5000, 0.8000)",
-        )
-        .bind(calibration_id)
-        .bind(user_id)
-        .bind(format!("agent-{marker}"))
-        .bind(&session_id)
-        .execute(&pool)
-        .await
-        .expect("insert eval calibration assessment");
-    }
-
-    insert_harness_run_fixture(
-        &pool,
-        &owner_user_id,
-        &session_id,
-        &owner_harness_run_id,
-        "owner",
-    )
-    .await;
-    insert_harness_run_fixture(
-        &pool,
-        &other_user_id,
-        &session_id,
-        &foreign_harness_run_id,
-        "foreign",
-    )
-    .await;
 
     for (user_id, run_id, evaluation_id, marker) in [
         (&owner_user_id, &owner_run_id, &owner_skill_eval_id, "owner"),
@@ -8214,7 +8514,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         1
     );
     assert_eq!(deleted_rows_for_table(&delete_audit, "agent_sessions"), 1);
-    assert_eq!(deleted_rows_for_table(&delete_audit, "harness_items"), 1);
     assert_eq!(
         deleted_rows_for_table(&delete_audit, "session_artifacts"),
         1
@@ -8237,11 +8536,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         ),
         ("conversation_log", "conversation_log"),
         ("session_artifacts", "session_artifacts"),
-        (
-            "eval_calibration_assessments",
-            "eval_calibration_assessments",
-        ),
-        ("harness_runs", "harness_runs"),
         ("ctx_snapshots", "ctx_snapshots"),
         ("ctx_decision_audits", "ctx_decision_audits"),
     ] {
@@ -8424,41 +8718,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         Some(session_id.as_str()),
         "owner delete must not clear foreign config version provenance"
     );
-
-    for table in [
-        "harness_citations",
-        "harness_skill_rules",
-        "harness_skill_drafts",
-        "harness_items",
-    ] {
-        let owner_remaining = sqlx::query(&format!(
-            "SELECT COUNT(*) AS c FROM {table} WHERE harness_run_id = ?"
-        ))
-        .bind(&owner_harness_run_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap_or_else(|error| panic!("count owner {table}: {error}"))
-        .try_get::<i64, _>("c")
-        .expect("decode owner harness child count");
-        assert_eq!(
-            owner_remaining, 0,
-            "{table} owner harness children must be deleted"
-        );
-
-        let foreign_remaining = sqlx::query(&format!(
-            "SELECT COUNT(*) AS c FROM {table} WHERE harness_run_id = ?"
-        ))
-        .bind(&foreign_harness_run_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap_or_else(|error| panic!("count foreign {table}: {error}"))
-        .try_get::<i64, _>("c")
-        .expect("decode foreign harness child count");
-        assert_eq!(
-            foreign_remaining, 1,
-            "{table} foreign harness children must not be touched by owner delete"
-        );
-    }
 
     cleanup_session_delete_fixture_for_owner(&pool, &other_user_id, &session_id).await;
     cleanup_session_delete_fixture_for_owner(&pool, &owner_user_id, &session_id).await;

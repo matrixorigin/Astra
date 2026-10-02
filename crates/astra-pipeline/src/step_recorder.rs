@@ -28,13 +28,17 @@
 //! let summary = recorder.finalize();
 //! ```
 
-use crate::event::clip_output_preview;
 use crate::step_checkpoint::FileBackedEventStore;
 use crate::step_protocol::*;
 use astra_turn_types::InferencePurpose;
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+
+/// Bound persisted previews by Unicode scalar count without splitting UTF-8.
+fn clip_output_preview(text: &str) -> String {
+    astra_text_utils::str_preview::truncate_str(text, 500)
+}
 
 /// Redact common credential patterns from tool output before persisting to disk.
 /// Returns (redacted_text, redaction_count).

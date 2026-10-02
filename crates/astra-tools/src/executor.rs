@@ -5,10 +5,8 @@
 //! (e.g., `ServerToolExecutor` adds resource governance and process isolation,
 //! `CliToolExecutor` adds terminal UI and MCP dispatch).
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -101,94 +99,8 @@ pub struct DefaultToolExecutor {
     approval_gate: Option<Arc<dyn ToolApprovalGate>>,
     progress_callback: Option<Arc<dyn ToolProgressCallback>>,
 
-    bash_cache: Arc<Mutex<HashMap<BashCacheKey, BashCacheEntry>>>,
-    workspace_generation: Arc<AtomicU64>,
     convergence_tracker: crate::workspace_observation::DesiredStateConvergenceTracker,
     convergence_authority: Arc<str>,
-    bash_cache_ttl: std::time::Duration,
-    filesystem_write_boundary: Option<Vec<std::path::PathBuf>>,
-}
-
-/// Key for the per-session bash dedup cache. Bumping ANY of these
-/// fields must invalidate prior entries — otherwise we'd return a
-/// result computed under a different precondition and the model would
-/// act on stale state.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct BashCacheKey {
-    workspace_root: String,
-    /// Canonical call-scoped execution directory. The same read-only command
-    /// may produce different output in different workspace directories.
-    workdir: String,
-    /// Monotonic counter bumped whenever a mutation tool succeeds. A
-    /// newly-created key after `write_file` will miss the cache, so
-    /// prior `ls` / `grep` results don't leak across edits made
-    /// through the tool pipeline.
-    workspace_generation: u64,
-    command: String,
-    /// Fingerprint of env vars that meaningfully change command
-    /// output (`PATH`, `HOME`, `LANG`, locale vars, `TZ`). We hash
-    /// them rather than storing raw — the classifier already filters
-    /// the command set down to read-only tools, but their output can
-    /// still depend on locale / user home.
-    env_fingerprint: u64,
-    /// Hash of `args.stdin` when present. A `cat` invocation whose
-    /// stdin differs between calls must NOT share a cache entry.
-    stdin_hash: u64,
-}
-
-/// Cache entry with insertion timestamp. We use a TTL on top of
-/// `workspace_generation` because non-tool filesystem mutations
-/// (user's editor, git pull, external script) don't bump the
-/// generation — so `git status` / `ls` results could otherwise go
-/// stale indefinitely. The TTL is a coarse-grained safety net; tests
-/// can swap it via `with_bash_cache_ttl`.
-#[derive(Debug, Clone)]
-struct BashCacheEntry {
-    result: ToolResult,
-    inserted_at: std::time::Instant,
-}
-
-/// Default: cached bash output goes stale after 30 seconds of
-/// wall-clock time. Long enough that a tight `ls`/`ls`/`ls` loop
-/// benefits; short enough that an external `git pull` becomes
-/// visible on the next read-only probe.
-pub const DEFAULT_BASH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Recover a poisoned `Mutex` while logging the recovery. A panic that
-/// poisoned the lock is a real bug — callers should not silently swallow it.
-/// We keep the recovery (continuing is better than propagating panic across
-/// an await boundary in a tool executor), but emit an `error!` so operators
-/// can correlate the root cause.
-///
-/// Also increments a global counter so monitoring systems can alert on
-/// mutex poisoning events without scraping logs.
-static POISONED_LOCK_RECOVERY_COUNT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-fn recover_poisoned_lock<'a, T>(
-    result: std::sync::LockResult<std::sync::MutexGuard<'a, T>>,
-    lock_name: &'static str,
-) -> std::sync::MutexGuard<'a, T> {
-    match result {
-        Ok(guard) => guard,
-        Err(poison) => {
-            let count =
-                POISONED_LOCK_RECOVERY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            tracing::error!(
-                lock = lock_name,
-                recovery_count = count,
-                "mutex poisoned by a panicking thread; recovering to keep tool executor available"
-            );
-            poison.into_inner()
-        }
-    }
-}
-
-/// Returns the number of times a poisoned mutex was recovered.
-/// Useful for monitoring and alerting.
-#[allow(dead_code)]
-pub fn poisoned_lock_recovery_count() -> u64 {
-    POISONED_LOCK_RECOVERY_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl DefaultToolExecutor {
@@ -198,87 +110,27 @@ impl DefaultToolExecutor {
             approval_gate: None,
             progress_callback: None,
 
-            bash_cache: Arc::new(Mutex::new(HashMap::new())),
-            workspace_generation: Arc::new(AtomicU64::new(0)),
             convergence_tracker: Default::default(),
             convergence_authority: Arc::from(uuid::Uuid::new_v4().to_string()),
-            bash_cache_ttl: DEFAULT_BASH_CACHE_TTL,
-            filesystem_write_boundary: None,
         }
-    }
-
-    /// Override the bash cache TTL. Intended for tests; production
-    /// code uses [`DEFAULT_BASH_CACHE_TTL`].
-    #[cfg(test)]
-    pub(crate) fn with_bash_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
-        self.bash_cache_ttl = ttl;
-        self
     }
 
     /// Build a ready-to-use executor from workspace parameters.
     ///
-    /// Handles the local/edge setup recipe: HTTP client, `ToolContext`,
-    /// and sandbox.
-    ///
-    /// If the HTTP client cannot be built, a warning is logged and the
-    /// executor is created without HTTP support (HTTP-dependent tools will
-    /// report errors rather than crashing the runtime).
+    /// This shared constructor never reads host credentials. Credential-backed
+    /// tools require an authenticated, owner-scoped capability binding.
     pub fn for_workspace(
         workspace: &Path,
         user_id: impl Into<String>,
         session_id: impl Into<String>,
-        user_agent: &str,
-        timeout: std::time::Duration,
     ) -> Self {
-        Self::for_workspace_inner(workspace, user_id, session_id, user_agent, timeout)
-    }
-
-    /// Build a multi-tenant Server executor without reading process-level or
-    /// host CLI credentials. Credential-backed tools must be installed later
-    /// from an authenticated, owner-scoped capability binding.
-    pub fn for_server_workspace(
-        workspace: &Path,
-        user_id: impl Into<String>,
-        session_id: impl Into<String>,
-        user_agent: &str,
-        timeout: std::time::Duration,
-    ) -> Self {
-        Self::for_workspace_inner(workspace, user_id, session_id, user_agent, timeout)
-    }
-
-    fn for_workspace_inner(
-        workspace: &Path,
-        user_id: impl Into<String>,
-        session_id: impl Into<String>,
-        user_agent: &str,
-        timeout: std::time::Duration,
-    ) -> Self {
-        let http_client = match reqwest::Client::builder()
-            .timeout(timeout)
-            .user_agent(user_agent.to_string())
-            .no_proxy()
-            .build()
-        {
-            Ok(client) => Some(client),
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "failed to build HTTP client for tool executor — HTTP-dependent tools will be unavailable"
-                );
-                None
-            }
-        };
-
         let ctx = crate::ToolContext {
             project_root: workspace.to_path_buf(),
             workspace_root: workspace.to_path_buf(),
             user_id: user_id.into(),
             session_id: session_id.into(),
             sandbox: crate::SandboxConfig::standard(workspace),
-            http_client,
-            logger: Arc::new(crate::TracingLogger),
             cancel_token: None,
-            detach_shell_handle: None,
         };
 
         Self::new(ctx)
@@ -287,31 +139,6 @@ impl DefaultToolExecutor {
     pub fn with_cancel_token(mut self, token: Option<Arc<CancellationToken>>) -> Self {
         self.ctx.cancel_token = token;
         self
-    }
-
-    /// Require bash subprocesses to see host-owned runtime lanes as read-only.
-    /// Only managed Edge requests install this request-scoped boundary.
-    pub fn with_filesystem_write_boundary(mut self, paths: Vec<std::path::PathBuf>) -> Self {
-        self.filesystem_write_boundary = Some(paths);
-        self
-    }
-
-    /// Install the host's detach slot so the bash runner can hand
-    /// off live children to the BackgroundTaskRegistry on Ctrl+B.
-    /// `None` is the default (no detach plumbing — bash runs through
-    /// the legacy reader). The slot itself is renewable: the host
-    /// refills it before each tool call so each bash invocation
-    /// gets a fresh one-shot.
-    pub fn with_detach_shell_slot(mut self, slot: Option<crate::detach::DetachShellSlot>) -> Self {
-        self.ctx.detach_shell_handle = slot;
-        self
-    }
-
-    /// Mutable setter for the detach slot. Used by the TUI/CLI host
-    /// when it constructs the executor first and wires the slot
-    /// later (after the BackgroundTaskRegistry is available).
-    pub fn set_detach_shell_slot(&mut self, slot: Option<crate::detach::DetachShellSlot>) {
-        self.ctx.detach_shell_handle = slot;
     }
 
     /// Access the underlying context.
@@ -373,15 +200,8 @@ impl ToolExecutor for DefaultToolExecutor {
             return crate::cancelled_tool_result(name, false);
         }
 
-        if let Some(protected) = &self.filesystem_write_boundary
-            && let Err(error) =
-                validate_host_owned_write_boundary(name, args, &self.ctx.workspace_root, protected)
-        {
-            return ToolResult::error(error);
-        }
-
         // Resolve once per invocation. The same canonical identity drives
-        // cache lookup, spawn, evidence, and cache insertion so a path alias
+        // spawn and evidence so a path alias
         // cannot be retargeted between those phases.
         let bash_workdir = if name == "bash" {
             match crate::shell_ops::resolve_bash_workdir(&self.ctx.workspace_root, args) {
@@ -391,53 +211,6 @@ impl ToolExecutor for DefaultToolExecutor {
         } else {
             None
         };
-
-        if name == "bash"
-            && !crate::workspace_observation::is_explicit_workspace_verification_request(name, args)
-            && !args.get("force").and_then(Value::as_bool).unwrap_or(false)
-            && let Some(key) = self.bash_cache_key(
-                args,
-                bash_workdir.as_ref().expect("bash workdir resolved above"),
-            )
-            && let Some(mut cached) = {
-                // Lookup + TTL check + stale eviction under one
-                // critical section. We clone the `ToolResult` out
-                // before returning so the lock is released before
-                // the progress callback runs.
-                let mut map = self
-                    .bash_cache
-                    .lock()
-                    .unwrap_or_else(|e| recover_poisoned_lock(Err(e), "bash_cache"));
-                let now = std::time::Instant::now();
-                let ttl = self.bash_cache_ttl;
-                match map.get(&key) {
-                    Some(entry) if now.duration_since(entry.inserted_at) < ttl => {
-                        Some(entry.result.clone())
-                    }
-                    Some(_) => {
-                        // Stale — evict so future lookups don't keep
-                        // re-hitting a dead entry and so the next
-                        // real execution gets cached fresh.
-                        map.remove(&key);
-                        None
-                    }
-                    None => None,
-                }
-            }
-        {
-            mark_result_cached(&mut cached);
-            crate::shell_ops::attach_bash_workdir_evidence(
-                &mut cached,
-                &self.ctx.workspace_root,
-                bash_workdir.as_ref().expect("bash workdir resolved above"),
-                args,
-            );
-            if let Some(cb) = &self.progress_callback {
-                cb.tool_completed(&call_id, &cached.output, !cached.is_error)
-                    .await;
-            }
-            return cached;
-        }
 
         // Direct workspace writers participate in the same per-root lease as
         // Bash observation windows. This prevents a typed write in another
@@ -483,9 +256,9 @@ impl ToolExecutor for DefaultToolExecutor {
                             .clear_authority(&self.convergence_authority);
                         return crate::cancelled_tool_result(name, false);
                     }
-                    return ToolResult::error(
-                        "workspace coordination lock was cancelled, contended, or the host temporary lock namespace is not trustworthy; no tool was run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions"
-                            .into(),
+                    return crate::workspace_lease_unavailable_tool_result_for_workspace(
+                        name,
+                        &self.ctx.workspace_root,
                     );
                 }
             }
@@ -512,9 +285,9 @@ impl ToolExecutor for DefaultToolExecutor {
             {
                 Some(guard) => Some(guard),
                 None => {
-                    return ToolResult::error(
-                        "workspace writer coordination was cancelled, contended, or the host temporary lock namespace is not trustworthy; run_script was not run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions"
-                            .into(),
+                    return crate::workspace_lease_unavailable_tool_result_for_workspace(
+                        name,
+                        &self.ctx.workspace_root,
                     );
                 }
             }
@@ -705,70 +478,6 @@ impl ToolExecutor for DefaultToolExecutor {
             result
         };
 
-        if name == "bash"
-            && !crate::workspace_observation::is_explicit_workspace_verification_request(name, args)
-            && !result.is_error
-            && let Some(key) = self.bash_cache_key(
-                args,
-                bash_workdir.as_ref().expect("bash workdir resolved above"),
-            )
-        {
-            self.bash_cache
-                .lock()
-                .unwrap_or_else(|e| recover_poisoned_lock(Err(e), "bash_cache"))
-                .insert(
-                    key,
-                    BashCacheEntry {
-                        result: result.clone(),
-                        inserted_at: std::time::Instant::now(),
-                    },
-                );
-        }
-        // A direct writer is known from its typed tool contract; even a
-        // failed attempt invalidates cached reads because a writer can
-        // partially apply before returning an error. Opaque Bash may only be
-        // classified after the executor's bounded pre/post observation. A
-        // changed receipt likewise invalidates the generation on failure.
-        let observed_bound_workspace_mutation = name == "bash"
-            && result
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get(crate::workspace_observation::OBSERVED_FIELD))
-                .and_then(Value::as_bool)
-                == Some(true)
-            && result
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get(crate::workspace_observation::SCOPE_FIELD))
-                .and_then(Value::as_str)
-                == Some(crate::workspace_observation::BOUND_WORKSPACE_SCOPE)
-            && result
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get(crate::workspace_observation::RECEIPT_FIELD))
-                .is_some_and(crate::workspace_observation::is_changed_receipt);
-        // `run_script` is an opaque workspace writer even when its Python
-        // body returns an error or cancellation after a partial write.  It
-        // therefore participates in cache-generation invalidation whenever
-        // execution may have started.  The one explicit exception is the
-        // capability/admission failure which carries
-        // `execution_started=false`; that path guarantees no child was
-        // spawned and must not make unrelated read caches stale.
-        let exact_desired_state_noop = !result.is_error
-            && result
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get(crate::workspace_observation::RECEIPT_FIELD))
-                .is_some_and(
-                    crate::workspace_observation::is_typed_workspace_desired_state_convergence_receipt,
-                );
-        if (is_workspace_mutation_tool(name, args) && !exact_desired_state_noop)
-            || observed_bound_workspace_mutation
-            || run_script_may_have_mutated(name, &result)
-        {
-            self.workspace_generation.fetch_add(1, Ordering::Relaxed);
-        }
-
         if let Some(cb) = &self.progress_callback {
             cb.tool_completed(&call_id, &result.output, !result.is_error)
                 .await;
@@ -841,69 +550,6 @@ impl DefaultToolExecutor {
             .await
     }
 
-    fn bash_cache_key(
-        &self,
-        args: &Value,
-        workdir: &crate::shell_ops::PreparedBashWorkdir,
-    ) -> Option<BashCacheKey> {
-        use crate::bash_cache_safety::bash_command_is_cache_safe;
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let command = args.get("command")?.as_str()?.to_string();
-        // Readonly classifier: only commands whose output depends
-        // solely on fs + env may hit the cache. Anything with side
-        // effects (rm, cargo build, git commit, curl, …) or shell
-        // compound markers is rejected — returning None disables
-        // caching for this call entirely. See
-        // `bash_cache_safety.rs` for the full taxonomy.
-        if !bash_command_is_cache_safe(&command) {
-            return None;
-        }
-
-        // Env fingerprint: a subset of env vars meaningfully
-        // influences output of read-only tools. We hash rather than
-        // store to keep the key bounded. Absent vars hash as empty.
-        let env_fingerprint = {
-            const KEYS: &[&str] = &[
-                "PATH",
-                "HOME",
-                "LANG",
-                "LC_ALL",
-                "LC_CTYPE",
-                "LC_MESSAGES",
-                "TZ",
-            ];
-            let mut h = DefaultHasher::new();
-            for k in KEYS {
-                k.hash(&mut h);
-                std::env::var(k).unwrap_or_default().hash(&mut h);
-            }
-            h.finish()
-        };
-
-        // Stdin hash: `cat`, `grep`, etc. can be fed via stdin —
-        // same command string + different stdin must not collide.
-        let stdin_hash = {
-            let mut h = DefaultHasher::new();
-            let stdin = args
-                .get("stdin")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            stdin.hash(&mut h);
-            h.finish()
-        };
-
-        Some(BashCacheKey {
-            workspace_root: self.ctx.workspace_root.display().to_string(),
-            workdir: workdir.identity().to_string(),
-            workspace_generation: self.workspace_generation.load(Ordering::Relaxed),
-            command,
-            env_fingerprint,
-            stdin_hash,
-        })
-    }
-
     async fn dispatch(
         &self,
         name: &str,
@@ -922,52 +568,24 @@ impl DefaultToolExecutor {
                     .unwrap_or(false)
                 {
                     crate::fs_ops::delete_file(ws, args)
-                } else if self.filesystem_write_boundary.is_some() {
-                    crate::fs_ops::write_file_without_formatter(ws, args)
                 } else {
                     crate::fs_ops::write_file(ws, args)
                 }
             }
-            "str_replace" => {
-                if self.filesystem_write_boundary.is_some() {
-                    crate::fs_ops::str_replace_without_formatter(ws, args)
-                } else {
-                    crate::fs_ops::str_replace(ws, args)
-                }
-            }
+            "str_replace" => crate::fs_ops::str_replace(ws, args),
             "delete_file" => crate::fs_ops::delete_file(ws, args),
             "list_dir" => crate::fs_ops::list_dir(ws, args),
 
             // ── Multi-edit (atomic) ──────────────────────────────────
-            "multi_edit" => {
-                if self.filesystem_write_boundary.is_some() {
-                    crate::fs_ops::multi_edit_without_formatter(ws, args)
-                } else {
-                    crate::fs_ops::multi_edit(ws, args)
-                }
-            }
+            "multi_edit" => crate::fs_ops::multi_edit(ws, args),
 
             // ── Shell operations ─────────────────────────────────────
-            "bash" => match &self.filesystem_write_boundary {
-                Some(paths) => {
-                    crate::shell_ops::execute_bash_with_filesystem_boundary_at_workdir(
-                        &self.ctx,
-                        args,
-                        paths,
-                        bash_workdir.expect("bash dispatch requires a resolved workdir"),
-                    )
-                    .await
-                }
-                None => {
-                    crate::shell_ops::execute_bash_with_environment_at_workdir(
-                        &self.ctx,
-                        args,
-                        &[],
-                        bash_workdir.expect("bash dispatch requires a resolved workdir"),
-                    )
-                    .await
-                }
-            },
+            "bash" => crate::shell_ops::execute_bash_with_environment_at_workdir(
+                &self.ctx,
+                args,
+                &[],
+                bash_workdir.expect("bash dispatch requires a resolved workdir"),
+            ).await,
             "grep" => crate::shell_ops::grep(&self.ctx, args).await,
             "glob" => crate::shell_ops::glob(&self.ctx, args).await,
 
@@ -988,7 +606,7 @@ impl DefaultToolExecutor {
             // ── Utility tools ────────────────────────────────────────
             "tool_search" => {
                 let schemas = self.tool_schemas();
-                string_to_result(crate::tool_search::tool_search(&schemas, args))
+                crate::tool_search::tool_search_result(&schemas, args)
             }
             "env" => string_to_result(crate::env_tools::env_tool(args)),
             "config" => {
@@ -1130,30 +748,6 @@ impl DefaultToolExecutor {
     }
 }
 
-fn mark_result_cached(result: &mut ToolResult) {
-    let metadata = result.metadata.get_or_insert_with(serde_json::Map::new);
-    metadata.insert("cached".to_string(), Value::Bool(true));
-}
-
-/// Whether a `run_script` result must conservatively advance the workspace
-/// cache generation.  `run_script` executes arbitrary Python, so a successful
-/// result is not the only mutation-bearing outcome: a timeout, cancellation,
-/// or child error may arrive after a partial write.  Only the explicit
-/// pre-admission contract (`execution_started=false`) proves that no process
-/// ran.  Missing or malformed metadata is intentionally treated as started;
-/// fail-closed cache invalidation is safer than serving a stale read.
-fn run_script_may_have_mutated(name: &str, result: &ToolResult) -> bool {
-    if name != "run_script" {
-        return false;
-    }
-    result
-        .metadata
-        .as_ref()
-        .and_then(|fields| fields.get("execution_started"))
-        .and_then(Value::as_bool)
-        != Some(false)
-}
-
 /// Return whether a typed tool invocation may mutate the bound workspace.
 ///
 /// This is intentionally an admission/serialization predicate, not proof that
@@ -1181,43 +775,15 @@ pub fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
     }
 }
 
-fn validate_host_owned_write_boundary(
-    name: &str,
-    args: &Value,
-    workspace_root: &Path,
-    protected: &[std::path::PathBuf],
-) -> Result<(), String> {
-    if matches!(name, "run_script" | "worktree") {
-        return Err(format!(
-            "Error: tool '{name}' cannot run outside the managed filesystem boundary; use bash so the command executes inside the protected mount namespace"
-        ));
-    }
-
-    let mut paths = Vec::new();
-    if matches!(
-        name,
-        "write_file" | "str_replace" | "multi_edit" | "delete_file"
-    ) {
-        paths.extend(args.get("path").and_then(Value::as_str));
-    }
-    if name == "str_replace"
-        && let Some(edits) = args.get("edits").and_then(Value::as_array)
-    {
-        paths.extend(
-            edits
-                .iter()
-                .filter_map(|edit| edit.get("path").and_then(Value::as_str)),
-        );
-    }
-    for path in paths {
-        let resolved = crate::fs_ops::resolve_path(workspace_root, path)?;
-        if protected.iter().any(|root| resolved.starts_with(root)) {
-            return Err(format!(
-                "Error: tool '{name}' cannot modify host-owned managed runtime paths"
-            ));
-        }
-    }
-    Ok(())
+/// Return whether a top-level invocation must serialize against other
+/// operations on the same physical workspace.
+///
+/// Provider-owned MCP effects are resolved from their discovered declaration
+/// by the MCP manager and are intentionally not classified here. This
+/// function is the typed-tool predicate shared by Edge and Server; MCP uses
+/// the same lease implementation through its provider effect contract.
+pub fn requires_workspace_serialization(name: &str, args: &Value) -> bool {
+    is_workspace_mutation_tool(name, args)
 }
 
 #[cfg(test)]
@@ -1225,13 +791,7 @@ mod tests {
     #[tokio::test]
     async fn removed_repository_tools_are_unknown_before_execution() {
         let dir = tempfile::tempdir().unwrap();
-        let executor = DefaultToolExecutor::for_server_workspace(
-            dir.path(),
-            "test-user",
-            "test-session",
-            "test",
-            std::time::Duration::from_secs(1),
-        );
+        let executor = DefaultToolExecutor::for_workspace(dir.path(), "test-user", "test-session");
         for name in ["git", "github"] {
             assert!(
                 !crate::schemas::all_tool_schemas()
@@ -1257,7 +817,6 @@ mod tests {
         assert!(!dir.path().join(".git").exists());
     }
 
-    use std::path::Path;
     use std::sync::Arc;
 
     use super::*;
@@ -1272,59 +831,6 @@ mod tests {
     }
 
     #[test]
-    fn managed_boundary_checks_every_str_replace_target() {
-        let workspace = Path::new("/sandbox");
-        let protected = vec![Path::new("/sandbox/.moi/runtime/task-1").to_path_buf()];
-        let args = serde_json::json!({
-            "edits": [
-                {"path": "ordinary.txt", "old_str": "a", "new_str": "b"},
-                {
-                    "path": ".moi/runtime/task-1/owned.txt",
-                    "old_str": "a",
-                    "new_str": "b"
-                }
-            ]
-        });
-
-        let error = validate_host_owned_write_boundary("str_replace", &args, workspace, &protected)
-            .expect_err("a nested edit path must not bypass the host-owned lane");
-        assert!(error.contains("host-owned managed runtime paths"));
-    }
-
-    #[tokio::test]
-    async fn managed_boundary_rejects_run_script_before_python_can_write() {
-        let tmp = TempDir::new().unwrap();
-        let protected = tmp.path().join(".moi/runtime/task-1");
-        std::fs::create_dir_all(&protected).unwrap();
-        let sentinel = protected.join("owned.txt");
-        let exec = DefaultToolExecutor::new(ToolContext::test(tmp.path()))
-            .with_filesystem_write_boundary(vec![protected]);
-
-        let result = exec
-            .execute(
-                "run_script",
-                &serde_json::json!({
-                    "script": format!(
-                        "from pathlib import Path\nPath({:?}).write_text('owned')",
-                        sentinel
-                    )
-                }),
-            )
-            .await;
-
-        assert!(result.is_error, "run_script must fail closed");
-        assert!(
-            result.output.contains("managed filesystem boundary"),
-            "unexpected error: {}",
-            result.output
-        );
-        assert!(
-            !sentinel.exists(),
-            "Python must not run outside the boundary"
-        );
-    }
-
-    #[test]
     fn run_script_schema_matches_process_scope_capability() {
         let (_tmp, exec) = test_executor();
         let visible = <DefaultToolExecutor as ToolExecutor>::tool_schemas(&exec)
@@ -1335,44 +841,6 @@ mod tests {
             astra_sandbox::process_scope_available(),
             "run_script must not be advertised when its ownership capability is unavailable"
         );
-    }
-
-    #[test]
-    fn run_script_generation_invalidation_is_conservative_after_dispatch() {
-        // Arbitrary Python can mutate the workspace on success, partial
-        // failure, or cancellation.  All of those outcomes must invalidate
-        // read caches once execution may have started.
-        assert!(run_script_may_have_mutated(
-            "run_script",
-            &ToolResult::text("ok".into())
-        ));
-        assert!(run_script_may_have_mutated(
-            "run_script",
-            &ToolResult::error("partial failure".into())
-        ));
-
-        let mut cancelled = crate::cancelled_tool_result("run_script", true);
-        assert!(run_script_may_have_mutated("run_script", &cancelled));
-
-        // OwnershipUnavailable is the one fail-closed admission result that
-        // proves no child was spawned, so it must not evict unrelated read
-        // caches.  Malformed metadata is not proof and remains conservative.
-        cancelled
-            .metadata
-            .get_or_insert_with(serde_json::Map::new)
-            .insert("execution_started".into(), Value::Bool(false));
-        assert!(!run_script_may_have_mutated("run_script", &cancelled));
-
-        let mut malformed = ToolResult::error("unknown execution state".into());
-        malformed
-            .metadata
-            .get_or_insert_with(serde_json::Map::new)
-            .insert("execution_started".into(), Value::String("false".into()));
-        assert!(run_script_may_have_mutated("run_script", &malformed));
-        assert!(!run_script_may_have_mutated(
-            "read_file",
-            &ToolResult::text("ok".into())
-        ));
     }
 
     #[test]
@@ -1494,7 +962,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_write_file_noop_emits_convergence_without_generation_or_cache_change() {
+    async fn exact_write_file_noop_emits_convergence_without_rewriting() {
         let (tmp, exec) = test_executor();
         let args = serde_json::json!({"path": "answer.txt", "content": "stable\n"});
         let changed = exec.execute("write_file", &args).await;
@@ -1505,10 +973,6 @@ mod tests {
                 .is_some_and(crate::workspace_observation::is_typed_workspace_tool_receipt)
         }));
 
-        let generation = exec.workspace_generation.load(Ordering::Relaxed);
-        let bash_args = serde_json::json!({"command": "pwd"});
-        let first_read = exec.execute("bash", &bash_args).await;
-        assert!(!first_read.is_error, "{first_read:?}");
         let before = std::fs::metadata(tmp.path().join("answer.txt"))
             .expect("target metadata")
             .modified()
@@ -1561,28 +1025,12 @@ mod tests {
             crate::workspace_observation::workspace_file_state_identity(b"stable\n")
         );
         assert_eq!(
-            exec.workspace_generation.load(Ordering::Relaxed),
-            generation,
-            "an exact no-op must not advance the workspace generation"
-        );
-        assert_eq!(
             std::fs::metadata(tmp.path().join("answer.txt"))
                 .expect("target metadata")
                 .modified()
                 .expect("mtime"),
             before,
             "an exact no-op must not rewrite the target"
-        );
-
-        let cached_read = exec.execute("bash", &bash_args).await;
-        assert_eq!(
-            cached_read
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get("cached"))
-                .and_then(Value::as_bool),
-            Some(true),
-            "an exact no-op must not invalidate an existing read cache"
         );
     }
 
@@ -1806,473 +1254,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_bash_reuses_identical_readonly_result() {
-        // Cache-safe command: `pwd` — pure readonly, output depends
-        // only on cwd. The classifier admits it; second call must
-        // short-circuit to cache.
-        let (_tmp, exec) = test_executor();
-        let args = serde_json::json!({ "command": "pwd" });
-
-        let first = exec.execute("bash", &args).await;
-        let second = exec.execute("bash", &args).await;
-
-        assert!(!first.is_error, "first failed: {}", first.output);
-        assert!(!second.is_error, "second failed: {}", second.output);
-        assert_eq!(first.output, second.output);
-        assert_eq!(
-            second
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true),
-            "second call must be served from cache"
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_bash_cache_separates_execution_directories() {
+    async fn dispatch_bash_reads_external_changes_without_replay() {
         let (tmp, exec) = test_executor();
-        std::fs::create_dir(tmp.path().join("a")).unwrap();
-        std::fs::create_dir(tmp.path().join("b")).unwrap();
-
-        let in_a = exec
-            .execute(
-                "bash",
-                &serde_json::json!({"command": "pwd", "workdir": "a"}),
-            )
-            .await;
-        let in_b = exec
-            .execute(
-                "bash",
-                &serde_json::json!({"command": "pwd", "workdir": "b"}),
-            )
-            .await;
-        assert!(!in_a.is_error && !in_b.is_error);
-        assert_ne!(in_a.output, in_b.output);
-        assert_ne!(
-            in_b.metadata
-                .as_ref()
-                .and_then(|fields| fields.get("cached"))
-                .and_then(Value::as_bool),
-            Some(true),
-            "same command in another workdir must not reuse cached output"
-        );
-
-        let in_b_again = exec
-            .execute(
-                "bash",
-                &serde_json::json!({"command": "pwd", "workdir": "b"}),
-            )
-            .await;
-        assert_eq!(
-            in_b_again
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get("cached"))
-                .and_then(Value::as_bool),
-            Some(true),
-            "same command in the same canonical workdir should remain cacheable"
-        );
-
-        let in_b_alias = exec
-            .execute(
-                "bash",
-                &serde_json::json!({"command": "pwd", "workdir": "a/../b"}),
-            )
-            .await;
-        assert_eq!(
-            in_b_alias.metadata.as_ref().unwrap()["bash_workdir"]["requested"],
-            "a/../b",
-            "a canonical cache hit must retain the current invocation's requested directory"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn dispatch_bash_cache_identity_survives_workdir_alias_retarget() {
-        use std::os::unix::fs::symlink;
-
-        let (tmp, exec) = test_executor();
-        let a = tmp.path().join("a");
-        let b = tmp.path().join("b");
-        std::fs::create_dir(&a).unwrap();
-        std::fs::create_dir(&b).unwrap();
-        std::fs::write(a.join("input"), "from-a\n").unwrap();
-        std::fs::write(b.join("input"), "from-b\n").unwrap();
-        let alias = tmp.path().join("alias");
-        symlink("a", &alias).unwrap();
-
-        let first = exec
-            .execute(
-                "bash",
-                &serde_json::json!({"command": "cat input", "workdir": "alias"}),
-            )
-            .await;
-        assert!(!first.is_error, "first call failed: {}", first.output);
-        assert_eq!(first.output.trim(), "from-a");
-
-        std::fs::remove_file(&alias).unwrap();
-        symlink("b", &alias).unwrap();
-
-        let from_b = exec
-            .execute(
-                "bash",
-                &serde_json::json!({"command": "cat input", "workdir": "alias"}),
-            )
-            .await;
-        assert_eq!(from_b.output.trim(), "from-b");
-        assert_ne!(
-            from_b
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get("cached"))
-                .and_then(Value::as_bool),
-            Some(true),
-            "retargeting an alias must not relabel or reuse the old directory's cache entry"
-        );
-        let from_b_again = exec
-            .execute(
-                "bash",
-                &serde_json::json!({"command": "cat input", "workdir": "alias"}),
-            )
-            .await;
-        assert!(
-            !from_b_again.is_error,
-            "cached call failed: {}",
-            from_b_again.output
-        );
-        assert_eq!(from_b_again.output.trim(), "from-b");
-        assert_eq!(
-            from_b_again
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get("cached"))
-                .and_then(Value::as_bool),
-            Some(true),
-            "the new canonical workdir should be cached independently"
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_bash_verify_mode_is_never_served_from_cache() {
-        let (_tmp, exec) = test_executor();
-        let args = serde_json::json!({ "command": "pwd", "mode": "verify" });
-
-        let _first = exec.execute("bash", &args).await;
-        let second = exec.execute("bash", &args).await;
-
-        assert_ne!(
-            second
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true),
-            "verify mode must establish a fresh observation window"
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_bash_does_not_cache_unsafe_commands() {
-        // Compound command: cache MUST NOT fire. The classifier
-        // refuses any command containing shell metacharacters, so
-        // both calls re-execute.
-        let (_tmp, exec) = test_executor();
-        let args = serde_json::json!({
-            "command": "printf 'tick\\n' >> dedup-count; wc -l dedup-count"
-        });
-
+        let path = tmp.path().join("state.txt");
+        let args = serde_json::json!({"command":"cat state.txt"});
+        std::fs::write(&path, "before\n").unwrap();
         let first = exec.execute("bash", &args).await;
+        assert!(!first.is_error, "{first:?}");
+        assert_eq!(first.output.trim(), "before");
+        // An external editor does not participate in tool-owned generations.
+        std::fs::write(&path, "after\n").unwrap();
         let second = exec.execute("bash", &args).await;
-
-        assert!(!first.is_error, "first failed: {}", first.output);
-        assert_ne!(
-            second
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true),
-            "second call must NOT be marked cached"
-        );
-        let counter = std::fs::read_to_string(_tmp.path().join("dedup-count")).unwrap();
-        if second.is_error {
-            // A host with only weak process-group ownership must quarantine
-            // after the first opaque writer.  Refusing the second execution is
-            // the secure outcome and still proves no result was replayed.
-            assert!(
-                second.output.contains("workspace coordination lock"),
-                "unexpected second failure: {}",
-                second.output
-            );
-            assert_eq!(counter, "tick\n");
-        } else {
-            // With authoritative process ownership both calls may execute;
-            // the counter proves the unsafe command was never cached.
-            assert_eq!(
-                counter, "tick\ntick\n",
-                "compound command must re-execute both times when the host can prove ownership"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn dispatch_bash_does_not_cache_mutating_commands() {
-        // Even a single-token mutating command must bypass the cache
-        // — rm / mv / curl / cargo build / git commit / etc.
-        // Regression guard for the 🔴 critical bug: without the
-        // classifier, a second `rm foo` would return the first call's
-        // "file removed" success while the real filesystem has moved
-        // on and the file no longer exists.
-        let (tmp, exec) = test_executor();
-        std::fs::write(tmp.path().join("victim"), "x").unwrap();
-        let args = serde_json::json!({ "command": "rm victim" });
-
-        let first = exec.execute("bash", &args).await;
-        assert!(!first.is_error, "first rm failed: {}", first.output);
-        // File gone. Second invocation MUST re-run and therefore
-        // fail (no such file), not succeed-from-cache.
-        let second = exec.execute("bash", &args).await;
-        assert!(
-            second.is_error,
-            "second rm must re-execute and fail (file already gone); got output={}",
-            second.output
-        );
-        assert_ne!(
-            second
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true),
-            "rm must never be marked cached"
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_bash_cache_expires_after_ttl() {
-        // External-mutation backstop: a cached readonly result must
-        // be evicted when older than the TTL so e.g. `ls` reflects
-        // files created by a user's editor (not bumping
-        // `workspace_generation`).
-        let dir = tempfile::tempdir().unwrap();
-        let exec = DefaultToolExecutor::new(ToolContext {
-            project_root: dir.path().to_path_buf(),
-            workspace_root: dir.path().to_path_buf(),
-            user_id: String::new(),
-            session_id: String::new(),
-            sandbox: crate::SandboxConfig::standard(dir.path()),
-            http_client: None,
-            logger: std::sync::Arc::new(crate::TracingLogger),
-            cancel_token: None,
-            detach_shell_handle: None,
-        })
-        .with_bash_cache_ttl(std::time::Duration::from_millis(30));
-
-        let args = serde_json::json!({ "command": "ls" });
-        let _first = exec.execute("bash", &args).await;
-
-        // Simulated external mutation: drop a file without touching
-        // the workspace_generation counter.
-        std::fs::write(dir.path().join("external.txt"), "hi").unwrap();
-
-        // Within TTL → still cached (shows the stale listing).
-        let cached = exec.execute("bash", &args).await;
-        assert_eq!(
-            cached
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true),
-            "within TTL, cache should still hit"
-        );
-
-        // Sleep past TTL, try again — must re-execute and show the
-        // new file.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let fresh = exec.execute("bash", &args).await;
-        assert_ne!(
-            fresh
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true),
-            "after TTL, cache must be evicted and re-executed"
-        );
-        assert!(
-            fresh.output.contains("external.txt"),
-            "fresh re-execution must see the new file: {}",
-            fresh.output
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_bash_cache_key_includes_stdin_hash() {
-        // Same command text, different stdin → must hit different
-        // cache slots. A `cat` invocation fed two different stdins
-        // must never share a result.
-        let (_tmp, exec) = test_executor();
-
-        let args_a = serde_json::json!({
-            "command": "cat",
-            "stdin": "alpha",
-        });
-        let args_b = serde_json::json!({
-            "command": "cat",
-            "stdin": "beta",
-        });
-
-        let ra = exec.execute("bash", &args_a).await;
-        let rb = exec.execute("bash", &args_b).await;
-        // We don't assert on the actual shell output (cat behaviour
-        // with stdin depends on how the bash tool plumbs it). We
-        // only require that B did not serve A's cached result —
-        // the cached flag on B must not be set.
-        assert_ne!(
-            rb.metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true),
-            "different stdin must not collide with a previous cache entry; ra={} rb={}",
-            ra.output,
-            rb.output
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_bash_force_bypasses_dedup_cache() {
-        // Use a classifier-admitted readonly command so the cache
-        // WOULD hit without `force`. Then `force=true` proves it's
-        // actually bypassing the hit (cached flag not set), rather
-        // than the classifier just never letting it hit in the
-        // first place.
-        let (tmp, exec) = test_executor();
-        // `ls` is cache-safe; first call sees the workspace empty.
-        let args = serde_json::json!({ "command": "ls" });
-        let first = exec.execute("bash", &args).await;
-        assert!(!first.is_error);
-
-        // Normal second call — expected to hit the cache.
-        let cached = exec.execute("bash", &args).await;
-        assert_eq!(
-            cached
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true),
-            "sanity: second ls must hit cache"
-        );
-
-        // External file appears — classifier doesn't see it (no
-        // mutation tool call) so the cache would still hit.
-        std::fs::write(tmp.path().join("appeared.txt"), "x").unwrap();
-
-        // Forced call must bypass cache AND see the fresh file.
-        let forced = exec
-            .execute("bash", &serde_json::json!({"command": "ls", "force": true}))
-            .await;
-        assert_ne!(
-            forced
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true),
-            "force=true must not return cached result"
-        );
-        assert!(
-            forced.output.contains("appeared.txt"),
-            "forced call must re-execute and see the fresh file: {}",
-            forced.output
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_bash_cache_invalidates_after_file_mutation() {
-        let (tmp, exec) = test_executor();
-        std::fs::write(tmp.path().join("watched.txt"), "one\n").unwrap();
-        let args = serde_json::json!({"command": "cat watched.txt"});
-
-        let first = exec.execute("bash", &args).await;
-        let write = exec
-            .execute(
-                "write_file",
-                &serde_json::json!({"path": "watched.txt", "content": "two"}),
-            )
-            .await;
-        let second = exec.execute("bash", &args).await;
-
-        assert!(!first.is_error, "first failed: {}", first.output);
-        assert!(!write.is_error, "write failed: {}", write.output);
-        assert!(!second.is_error, "second failed: {}", second.output);
-        assert_eq!(first.output, "one\n");
-        assert_eq!(second.output, "two\n");
-        assert_ne!(
-            second
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
-    }
-
-    /// Regression guard: a failed bash run (non-zero exit, sandbox
-    /// block, permission denied, timeout, cancellation) MUST NOT be
-    /// cached — otherwise after the user fixes the underlying
-    /// condition (chmod, install, whatever) the next call returns
-    /// the stale error for up to the TTL window.
-    ///
-    /// This covers the user-reported worry that "bash dedup caches
-    /// failures" — the insert path is guarded by `!result.is_error`
-    /// (see dispatch around line 295) and this test locks the
-    /// invariant in.
-    #[tokio::test]
-    async fn dispatch_bash_does_not_cache_failed_results() {
-        let (tmp, exec) = test_executor();
-        // Use a readonly command (`cat`) so it WOULD be classifier-
-        // admitted. First call reads a non-existent path → cat
-        // exits 1 → is_error=true. Second call targets the same
-        // path but the file now exists → must re-execute, not
-        // replay the "No such file" error.
-        let args = serde_json::json!({ "command": "cat missing.txt" });
-        let first = exec.execute("bash", &args).await;
-        assert!(
-            first.is_error,
-            "first call must surface the cat error: {}",
-            first.output
-        );
-
-        // Fix the condition: create the file.
-        std::fs::write(tmp.path().join("missing.txt"), "hello\n").unwrap();
-
-        // Second call — must re-execute and succeed, not return the
-        // cached error.
-        let second = exec.execute("bash", &args).await;
-        assert!(
-            !second.is_error,
-            "second call must not replay cached error (got: {})",
-            second.output
-        );
-        assert_ne!(
-            second
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("cached"))
-                .and_then(|v| v.as_bool()),
-            Some(true),
-            "second call must not be served from cache"
-        );
-        assert!(
-            second.output.contains("hello"),
-            "second call must show the real file content: {}",
-            second.output
-        );
+        assert!(!second.is_error, "{second:?}");
+        assert_eq!(second.output.trim(), "after");
     }
 
     #[tokio::test]
@@ -2540,35 +1534,6 @@ mod tests {
                 result.output
             );
         }
-    }
-
-    #[test]
-    fn recover_poisoned_lock_increments_counter() {
-        use std::sync::Mutex;
-
-        let before = super::poisoned_lock_recovery_count();
-
-        // Create a mutex and poison it by panicking while holding the lock
-        let mutex = Mutex::new(42);
-        let mutex_arc = Arc::new(mutex);
-        let mutex_clone = mutex_arc.clone();
-
-        let handle = std::thread::spawn(move || {
-            let _guard = mutex_clone.lock().unwrap();
-            panic!("poison the lock");
-        });
-        let _ = handle.join();
-
-        // Now try to lock it - it should be poisoned
-        let result = mutex_arc.lock();
-        let _guard = super::recover_poisoned_lock(result, "test_lock");
-
-        let after = super::poisoned_lock_recovery_count();
-        assert_eq!(
-            after,
-            before + 1,
-            "poisoned lock recovery should increment the counter"
-        );
     }
 
     #[tokio::test]

@@ -295,12 +295,13 @@ focus without duplicating the whole scripted journey.
 | `text_json_path_absent { path }`                    | selected JSON pointer is absent (`null` is still present)      | envelope |
 | `text_json_dag { nodes_path, node_id_path, node_required_string_paths?, edges_path, predecessor_path, successor_path }` | required node strings are non-empty, endpoints are unique/resolved, and the graph is acyclic | envelope |
 | `fork_cache_outcome { expect }`                     | `[fork-cache]` event `outcome` ∈ `expect`                    | stderr      |
-| `session_event_count { event_type, min, optional }` | journal has ≥ `min` events of that type                      | journal     |
+| `session_event_count { event_type, min, max?, optional }` | session-capture event count is within bounds; JSON predicates can link a step event's `run_id` to another event such as its `agent_spawned` record | journal + step events |
+| `session_child_result_adopted { expected_result, spawn_match? }` | exact completed child result is adopted before its parent's finalization; optional `{ path, equals }` predicate binds that same child's spawn to a model or slot | journal + trace events |
 | `journal_tool_called { name, optional }`            | tool name appears in journal `tool_calls`                    | journal     |
 | `journal_turn_tool_hidden { name }`                 | tool is absent from every canonical coordinator tool surface | journal     |
-| `journal_tool_call_count { name, min, max }`        | complete durable calls for `name` are within the range       | journal     |
+| `journal_tool_call_count { name, min, max, root_only? }` | complete durable calls for `name` are within the range; `root_only: true` excludes child runs and fails on unattributed matching calls | journal |
 | `journal_tool_success_ratio { min, min_calls, allowed_failures? }` | raw and expected-negative-adjusted typed tool success meet the minimum | journal |
-| `journal_tool_json { name, document, path, equals }`| arguments, result, or bounded runtime metadata has the exact JSON-pointer value | journal     |
+| `journal_tool_json { name, document, path, equals, where_match? }`| arguments, result, or bounded runtime metadata has the exact JSON-pointer value; optional `{ document, path, equals }` predicate constrains the same call | journal     |
 | `journal_tool_json_contains { name, document, path, contains }` | arguments, result, failure error, or bounded runtime metadata has a string at the JSON pointer containing the semantic marker; formatting remains provider data | journal |
 | `journal_tool_sequence { tools }` | durable tool calls contain the ordered lifecycle subsequence | journal |
 | `journal_tool_precedence { predecessor, successor }` | every durable successor call happens after its predecessor | journal |
@@ -349,6 +350,9 @@ provider ratio criterion. Old reports retain their original criteria and verdict
 Both conditions apply to the same durable invocation: a failed remember plus a
 successful recall cannot count as a successful remember. Missing outcome evidence
 fails an explicit `ok` filter.
+With `root_only: true`, the CLI root run ID and every matching call's producer run
+ID must be known; ambiguous attribution fails rather than satisfying a zero-call
+assertion.
 
 All journal criteria require a loaded session. `session_event_count` and
 `journal_tool_called` are hard requirements by default; set `optional: true`
@@ -537,6 +541,15 @@ On FAIL, each case report includes:
 - `judger full_detail`: the untruncated rationale for every judge
   vote when quorum is on.
 - `failure_class`: automated classification (infra, model, flaky, etc.)
+
+With `--artifacts-dir`, `stream-events.json` privately retains selected child
+output, identity, commit, terminal, and gap events before owned session deletion.
+Each subprocess capture is bounded to 1 MiB / 4096 records; thinking and tool
+bodies are excluded, and child text is not added to ordinary JSON reports.
+Case/model path components use UTF-8 byte percent encoding to avoid collisions.
+Archive failure retains the owned sessions and reports a separate cleanup error.
+These events are diagnostic evidence, not an authoritative final-result oracle;
+missing gaps do not prove complete delivery. Review/redact sidecars before sharing.
 
 ## CLI reference
 

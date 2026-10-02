@@ -557,7 +557,6 @@ async fn execution_switch_and_turn_admission_have_one_linearization_winner() {
 
     for table in [
         "session_execution_switches",
-        "session_execution_workspace_claims",
         "session_execution_bindings",
         "session_context_operation_receipts",
         "session_context_authority_events",
@@ -622,20 +621,7 @@ async fn execution_read_is_non_mutating_during_an_active_turn() {
         .expect("read execution binding during active turn")
         .expect("binding remains present");
     assert_eq!(loaded, initial);
-    let claim_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session_execution_workspace_claims
-         WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?",
-    )
-    .bind(&key.isolation_domain)
-    .bind(&owner_id)
-    .bind(&session_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("count read fixture claims");
-    assert_eq!(claim_count, 0, "server-only reads do not create claims");
-
     for table in [
-        "session_execution_workspace_claims",
         "session_execution_bindings",
         "session_context_operation_receipts",
         "session_context_authority_events",
@@ -757,7 +743,6 @@ async fn session_lifecycle_fence_rejects_context_admission_before_child_locks() 
     );
 
     for table in [
-        "session_execution_workspace_claims",
         "session_execution_bindings",
         "session_context_operation_receipts",
         "session_context_authority_events",
@@ -1165,20 +1150,18 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
         "edge-other",
         "/workspace/target",
     );
-    assert!(matches!(
-        coordinator
-            .compare_and_swap_execution_binding(&other_key, 1, &same_checkout)
-            .await,
-        Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
-            ref owner_session_id,
-            ref owner_branch_id,
-            ..
-        }) if owner_session_id == &key.session_id && owner_branch_id == &key.branch_id
-    ));
+    let shared_checkout = coordinator
+        .compare_and_swap_execution_binding(&other_key, 1, &same_checkout)
+        .await
+        .expect("independent sessions may select the same physical checkout");
+    assert_eq!(shared_checkout.generation, 2);
+    assert_eq!(
+        shared_checkout.state,
+        SessionExecutionBindingStateV1::Switching
+    );
 
     for table in [
         "session_execution_switches",
-        "session_execution_workspace_claims",
         "session_attachments",
         "session_execution_bindings",
         "session_context_heads",
@@ -1198,7 +1181,7 @@ async fn execution_switch_is_idempotent_retriable_and_workspace_exclusive() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_checkout() {
+async fn independent_sessions_share_one_physical_checkout() {
     let pool = common::setup_pool().await;
     let suffix = Uuid::new_v4().to_string();
     let owner_id = format!("execution-claim-owner-{suffix}");
@@ -1292,7 +1275,7 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
     coordinator
         .compare_and_swap_execution_binding(&work_key, 2, &work_edge)
         .await
-        .expect("the first Session claims the checkout");
+        .expect("the first Session selects the checkout");
 
     let active_writer = match coordinator
         .acquire_writer(
@@ -1323,31 +1306,25 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
         "materialization-shared-device",
     );
     ordinary_edge.state = SessionExecutionBindingStateV1::Switching;
-    let error = coordinator
+    let shared_preparing = coordinator
         .compare_and_swap_execution_binding(&ordinary_key, 1, &ordinary_edge)
         .await
-        .expect_err("a second Session must not execute in an actively owned checkout");
-    assert!(
-        matches!(
-            error,
-            SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
-                ref owner_session_id,
-                ref owner_branch_id,
-                ..
-            } if owner_session_id == &work_key.session_id && owner_branch_id == &work_key.branch_id
-        ),
-        "unexpected claim failure: {error:?}"
-    );
-    let ordinary_after = coordinator
-        .load_execution_binding(&ordinary_key)
-        .await
-        .expect("load ordinary binding after rejected claim")
-        .expect("ordinary binding remains present");
-    assert_eq!(ordinary_after.generation, 1);
+        .expect("a second Session may select an actively used checkout");
+    assert_eq!(shared_preparing.generation, 2);
     assert_eq!(
-        ordinary_after.workspace.kind,
-        astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox
+        shared_preparing.state,
+        SessionExecutionBindingStateV1::Switching
     );
+    let ordinary_ready = edge_binding(
+        &ordinary_initial.logical_workspace_id,
+        3,
+        "edge-renamed",
+        "materialization-shared-device",
+    );
+    coordinator
+        .compare_and_swap_execution_binding(&ordinary_key, 2, &ordinary_ready)
+        .await
+        .expect("the second Session can finish selecting the shared checkout");
     coordinator.release_writer(&active_writer).await.unwrap();
 
     let mut other_device_preparing = edge_binding(
@@ -1372,10 +1349,8 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
         .await
         .expect("an independent device may materialize the same path");
 
-    // Moving one Session to another materialization must release its old
-    // claim and install the new one in the same transaction. The old checkout
-    // is then available to a different Session without a transient self-
-    // conflict from the per-Session unique claim key.
+    // A Session can still switch to another materialization independently of
+    // the other Session's binding.
     let mut work_preparing = edge_binding(
         &work_initial.logical_workspace_id,
         4,
@@ -1399,31 +1374,8 @@ async fn execution_workspace_claim_fences_work_and_ordinary_sessions_on_one_chec
         .await
         .expect("the Session can move its claim to another materialization");
     assert_eq!(switched.generation, 5);
-    let mut ordinary_reclaim = edge_binding(
-        &ordinary_initial.logical_workspace_id,
-        2,
-        "edge-reclaimed",
-        "materialization-shared-device",
-    );
-    ordinary_reclaim.state = SessionExecutionBindingStateV1::Switching;
-    coordinator
-        .compare_and_swap_execution_binding(&ordinary_key, 1, &ordinary_reclaim)
-        .await
-        .expect("the old materialization can be prepared after the handoff");
-    let ordinary_reclaim = edge_binding(
-        &ordinary_initial.logical_workspace_id,
-        3,
-        "edge-reclaimed",
-        "materialization-shared-device",
-    );
-    coordinator
-        .compare_and_swap_execution_binding(&ordinary_key, 2, &ordinary_reclaim)
-        .await
-        .expect("the old materialization is released after the handoff");
-
     for key in [&work_key, &ordinary_key, &other_device_key] {
         for table in [
-            "session_execution_workspace_claims",
             "session_execution_bindings",
             "session_context_operation_receipts",
             "session_context_authority_events",

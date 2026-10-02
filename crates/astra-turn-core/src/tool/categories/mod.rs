@@ -2,7 +2,7 @@
 //!
 //! Every hardcoded tool-name list in the codebase (stall.rs, turn_guard.rs,
 //! parallel_tool_exec.rs, microcompact.rs, headless_tool_assembly.rs,
-//! safety_middleware.rs, cloud_approval_policy.rs, concurrency_safety.rs)
+//! safety_middleware.rs, cloud_approval_policy.rs)
 //! should derive its answers from queries against this registry.
 
 use std::collections::HashMap;
@@ -199,6 +199,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     // ── Agent info / reflection (read-only) ──────────────────────────
     tool("get_agent_info", RO, C),
     tool("introspect", RO, C),
+    tool("model_catalog", RO, C),
     tool("reflect", RO, C),
     tool("inspect_work_plan", RO, C.union(OR)),
     tool("inspect_work_criteria", RO, C.union(OR)),
@@ -243,7 +244,6 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("send_message", MU, OR),
     tool("share_context", MU, OR),
     tool("run_chain", MU, OR),
-    tool("run_build_test", MU, OR),
     tool("config", MU, OR),
     tool("adjust_config", MU, OR),
     tool("compress_context", MU, OR),
@@ -423,7 +423,7 @@ impl ToolRegistry {
             ToolDisplayCategory::Mo
         } else if flags.contains(ToolFlags::MEMORY) {
             ToolDisplayCategory::Memory
-        } else if category.is_shell() || name == "run_build_test" {
+        } else if category.is_shell() {
             ToolDisplayCategory::Shell
         } else if flags.contains(ToolFlags::FILE_OP) {
             ToolDisplayCategory::File
@@ -434,12 +434,7 @@ impl ToolRegistry {
             )
         {
             ToolDisplayCategory::Search
-        } else if flags.contains(ToolFlags::ORCHESTRATION)
-            || matches!(
-                name,
-                "get_agent_info" | "introspect" | "reflect" | "skill" | "discover_skills"
-            )
-        {
+        } else if self.get(name).is_some() {
             ToolDisplayCategory::Utility
         } else {
             ToolDisplayCategory::Other
@@ -1317,17 +1312,12 @@ mod tests {
         assert!(!r.is_compactable(mcp_tool));
     }
 
-    /// Concurrency safety registry is empty by default (MCP-only).
     /// Static tools are classified through tool_categories::classify(),
     /// which is authoritative. Verify the chain:
     ///   tool_categories → parallel_tool_exec::is_read_only_tool
     #[test]
-    fn scenario_concurrency_bootstrap_chain() {
+    fn scenario_concurrency_classifier_chain() {
         let r = registry();
-        let cs = crate::concurrency_safety::ConcurrencySafetyRegistry::bootstrap_default();
-
-        // bootstrap_default is empty — static tools are NOT in the registry
-        assert!(cs.is_empty());
 
         // Read-only tools: classified via tool_categories, surfaced via
         // parallel_tool_exec::is_read_only_tool (which delegates to classify).
@@ -1336,12 +1326,6 @@ mod tests {
             assert!(
                 crate::parallel_tool_exec::is_read_only_tool(name),
                 "{name} should be read-only via parallel_tool_exec"
-            );
-            // Concurrency registry returns Unknown for static tools (expected)
-            assert_eq!(
-                cs.classify(name),
-                crate::concurrency_safety::ConcurrencySafety::Unknown,
-                "{name} should be Unknown in empty concurrency registry"
             );
         }
         let status_action = serde_json::json!({"action": "recall"});
@@ -1372,10 +1356,7 @@ mod tests {
         // Unknown tool: both agree on safe defaults
         let unknown = "brand_new_mcp_tool";
         assert_eq!(r.category(unknown), ToolCategory::Mutating);
-        assert_eq!(
-            cs.classify(unknown),
-            crate::concurrency_safety::ConcurrencySafety::Unknown,
-        );
+        assert!(!crate::parallel_tool_exec::is_read_only_tool(unknown));
     }
 
     #[test]
@@ -2099,14 +2080,7 @@ mod tests {
     #[test]
     fn display_category_shell_tools() {
         let r = registry();
-        for name in [
-            "bash",
-            "exec",
-            "run_command",
-            "shell",
-            "powershell",
-            "run_build_test",
-        ] {
+        for name in ["bash", "exec", "run_command", "shell", "powershell"] {
             assert_eq!(
                 r.display_category(name),
                 ToolDisplayCategory::Shell,

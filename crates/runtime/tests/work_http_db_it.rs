@@ -220,7 +220,7 @@ impl RunLifecycleService for WorkTurnRecordingLifecycle {
         Ok(astra_services::runs::CancelSessionRecord {
             runs: Vec::new(),
             execution_settled: true,
-            workspace_blocker: None,
+            execution_blocker: None,
         })
     }
 
@@ -356,7 +356,6 @@ async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
         ("session_attachments", "owner_user_id"),
         ("session_handoff_slots", "owner_user_id"),
         ("session_execution_switches", "owner_user_id"),
-        ("session_execution_workspace_claims", "owner_user_id"),
         ("session_execution_bindings", "owner_user_id"),
         ("work_branch_creation_operations", "owner_id"),
         ("work_branch_control_operations", "owner_id"),

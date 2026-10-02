@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+pub const MAX_AGENT_MESSAGE_CHARS: usize = 3_000;
+
 // ─── Agent Address ──────────────────────────────────────────────────────────
 
 /// Uniquely identifies an agent within a delegation hierarchy.
@@ -98,21 +100,6 @@ pub enum MessagePayload {
 
     /// Coordination signal (lightweight, no LLM context needed).
     Signal(AgentSignal),
-
-    /// Acknowledgment of a received message.
-    Ack {
-        /// The ID of the message being acknowledged.
-        message_id: String,
-    },
-
-    /// Negative acknowledgment — message could not be processed.
-    Nack {
-        /// The ID of the message being rejected.
-        message_id: String,
-        /// Reason for rejection.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
 }
 
 /// Request types for structured request–response exchanges.
@@ -173,15 +160,6 @@ pub struct AgentMessage {
     /// Time-to-live in milliseconds. `None` = no expiry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<i64>,
-
-    /// Whether the sender expects an acknowledgment for this message.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub requires_ack: bool,
-
-    /// Logical message id an acknowledgement should reference when a durable
-    /// delivery has to be re-enveloped with a fresh queue identity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ack_message_id: Option<String>,
 }
 
 const AGENT_COMMUNICATION_SUMMARY_CHARS: usize = 1_000;
@@ -206,7 +184,6 @@ pub fn agent_communication_event(
         related_message_id,
         timestamp_ms: message.timestamp_ms,
         correlation_id: message.correlation_id.clone(),
-        requires_ack: message.requires_ack,
     }
 }
 
@@ -279,13 +256,6 @@ fn communication_payload_evidence(
             None,
             None,
         ),
-        MessagePayload::Ack { message_id } => (Kind::Ack, None, None, Some(message_id.clone())),
-        MessagePayload::Nack { message_id, reason } => (
-            Kind::Nack,
-            reason.as_deref().map(bounded_communication_summary),
-            None,
-            Some(message_id.clone()),
-        ),
     }
 }
 
@@ -312,8 +282,6 @@ impl AgentMessage {
             timestamp_ms,
             correlation_id: None,
             ttl_ms: None,
-            requires_ack: false,
-            ack_message_id: None,
         }
     }
 
@@ -332,45 +300,6 @@ impl AgentMessage {
             millis as i64
         });
         self
-    }
-
-    /// Mark this message as requiring acknowledgment from the receiver.
-    pub fn with_ack_required(mut self) -> Self {
-        self.requires_ack = true;
-        self
-    }
-
-    /// Create an Ack reply for this message (from receiver back to sender).
-    pub fn make_ack(&self, from: AgentAddress) -> Self {
-        Self::new(
-            from,
-            MessageTarget::Direct {
-                address: self.from.clone(),
-            },
-            MessagePayload::Ack {
-                message_id: self
-                    .ack_message_id
-                    .clone()
-                    .unwrap_or_else(|| self.id.clone()),
-            },
-        )
-    }
-
-    /// Create a Nack reply for this message.
-    pub fn make_nack(&self, from: AgentAddress, reason: Option<String>) -> Self {
-        Self::new(
-            from,
-            MessageTarget::Direct {
-                address: self.from.clone(),
-            },
-            MessagePayload::Nack {
-                message_id: self
-                    .ack_message_id
-                    .clone()
-                    .unwrap_or_else(|| self.id.clone()),
-                reason,
-            },
-        )
     }
 
     /// Whether this message has expired.
@@ -403,15 +332,10 @@ pub enum MailboxError {
     ChannelClosed,
     /// No parent agent found for `MessageTarget::Parent`.
     NoParent,
+    /// This send was rejected before the envelope entered transport custody.
+    DeliveryRejected(String),
     /// Transport-layer error.
     Transport(String),
-    /// Message delivery was not acknowledged within timeout.
-    AckTimeout { message_id: String, attempts: u32 },
-    /// Message was explicitly rejected (Nack'd) by the receiver.
-    Rejected {
-        message_id: String,
-        reason: Option<String>,
-    },
     /// Request/response timeout (e.g., permission request).
     Timeout(String),
     /// The mailbox was disconnected while waiting.
@@ -434,20 +358,8 @@ impl std::fmt::Display for MailboxError {
             ),
             Self::ChannelClosed => write!(f, "message channel closed"),
             Self::NoParent => write!(f, "no parent agent in delegation hierarchy"),
+            Self::DeliveryRejected(msg) => write!(f, "delivery rejected: {msg}"),
             Self::Transport(msg) => write!(f, "transport error: {msg}"),
-            Self::AckTimeout {
-                message_id,
-                attempts,
-            } => {
-                write!(
-                    f,
-                    "ack timeout for message {message_id} after {attempts} attempts"
-                )
-            }
-            Self::Rejected { message_id, reason } => {
-                let r = reason.as_deref().unwrap_or("no reason");
-                write!(f, "message {message_id} rejected: {r}")
-            }
             Self::Timeout(msg) => write!(f, "request timeout: {msg}"),
             Self::Disconnected => write!(f, "mailbox disconnected"),
             Self::Protocol(msg) => write!(f, "mailbox protocol error: {msg}"),
@@ -493,6 +405,9 @@ mod tests {
         let restored: AgentMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.id, msg.id);
         assert_eq!(restored.from.agent_id, "coder");
+        let wire: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(wire.get("requires_ack").is_none());
+        assert!(wire.get("ack_message_id").is_none());
     }
 
     #[test]
@@ -568,80 +483,56 @@ mod tests {
     }
 
     #[test]
-    fn ack_payload_roundtrip() {
-        let ack = MessagePayload::Ack {
-            message_id: "msg-123".into(),
-        };
-        let json = serde_json::to_value(&ack).unwrap();
-        assert_eq!(json["type"], "ack");
-        assert_eq!(json["message_id"], "msg-123");
-
-        let restored: MessagePayload = serde_json::from_value(json).unwrap();
-        match restored {
-            MessagePayload::Ack { message_id } => assert_eq!(message_id, "msg-123"),
-            _ => panic!("expected Ack"),
+    fn application_receipt_payloads_are_not_supported() {
+        for kind in ["ack", "nack"] {
+            let payload = serde_json::json!({"type": kind, "message_id": "msg-1"});
+            assert!(serde_json::from_value::<MessagePayload>(payload).is_err());
+            assert!(
+                serde_json::from_value::<astra_turn_types::AgentCommunicationPayloadKind>(
+                    serde_json::json!(kind)
+                )
+                .is_err()
+            );
         }
     }
 
     #[test]
-    fn nack_payload_roundtrip() {
-        let nack = MessagePayload::Nack {
-            message_id: "msg-456".into(),
-            reason: Some("invalid format".into()),
-        };
-        let json = serde_json::to_value(&nack).unwrap();
-        assert_eq!(json["type"], "nack");
-        assert_eq!(json["reason"], "invalid format");
-
-        let restored: MessagePayload = serde_json::from_value(json).unwrap();
-        match restored {
-            MessagePayload::Nack { message_id, reason } => {
-                assert_eq!(message_id, "msg-456");
-                assert_eq!(reason.as_deref(), Some("invalid format"));
-            }
-            _ => panic!("expected Nack"),
+    fn response_roundtrip_preserves_semantic_decision_and_correlation() {
+        for accepted in [false, true] {
+            let receiver = AgentAddress::new("run-child", "worker");
+            let message = AgentMessage::new(
+                AgentAddress::new("run-parent", "parent"),
+                MessageTarget::Direct {
+                    address: receiver.clone(),
+                },
+                MessagePayload::Response {
+                    request_id: "request-1".into(),
+                    accepted,
+                    data: Some(serde_json::json!({"reason": "permission decision"})),
+                },
+            )
+            .with_correlation("request-1");
+            let restored: AgentMessage =
+                serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap();
+            let evidence = agent_communication_event(
+                &receiver,
+                astra_turn_types::AgentCommunicationDirection::Received,
+                &restored,
+            );
+            assert_eq!(
+                evidence.payload_kind,
+                astra_turn_types::AgentCommunicationPayloadKind::Response
+            );
+            assert_eq!(evidence.response_accepted, Some(accepted));
+            assert_eq!(evidence.related_message_id.as_deref(), Some("request-1"));
+            assert_eq!(evidence.correlation_id.as_deref(), Some("request-1"));
+            let wire = serde_json::to_value(&evidence).unwrap();
+            assert!(wire.get("requires_ack").is_none());
+            assert_eq!(
+                serde_json::from_value::<astra_turn_types::AgentCommunicationEvent>(wire).unwrap(),
+                evidence
+            );
         }
-    }
-
-    #[test]
-    fn make_ack_creates_reply() {
-        let original = AgentMessage::new(
-            AgentAddress::new("r1", "sender"),
-            MessageTarget::Direct {
-                address: AgentAddress::new("r2", "receiver"),
-            },
-            MessagePayload::Text {
-                content: "hello".into(),
-                summary: None,
-            },
-        )
-        .with_ack_required();
-
-        assert!(original.requires_ack);
-
-        let ack = original.make_ack(AgentAddress::new("r2", "receiver"));
-        assert_eq!(ack.from.agent_id, "receiver");
-        match &ack.to {
-            MessageTarget::Direct { address } => {
-                assert_eq!(address.agent_id, "sender");
-            }
-            _ => panic!("expected Direct target"),
-        }
-        match &ack.payload {
-            MessagePayload::Ack { message_id } => assert_eq!(message_id, &original.id),
-            _ => panic!("expected Ack payload"),
-        }
-    }
-
-    #[test]
-    fn requires_ack_not_serialized_when_false() {
-        let msg = AgentMessage::new(
-            AgentAddress::new("r", "a"),
-            MessageTarget::Parent,
-            MessagePayload::Signal(AgentSignal::Heartbeat),
-        );
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(!json.contains("requires_ack"));
     }
 
     #[test]
@@ -657,8 +548,7 @@ mod tests {
                 content: "界".repeat(1_500),
                 summary: None,
             },
-        )
-        .with_ack_required();
+        );
 
         let evidence = agent_communication_event(
             &receiver,
@@ -673,7 +563,6 @@ mod tests {
             evidence.payload_kind,
             astra_turn_types::AgentCommunicationPayloadKind::Text
         );
-        assert!(evidence.requires_ack);
         let summary = evidence.summary.expect("text evidence summary");
         assert_eq!(summary.chars().count(), 1_001);
         assert!(summary.ends_with('…'));

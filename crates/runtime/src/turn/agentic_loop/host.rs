@@ -56,9 +56,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::turn::runtime_policy::RuntimePolicy;
 use astra_core::ObservationJournal;
+use astra_services::DatabaseEventService;
 use astra_services::session_audit::RuntimePromotionEventData;
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord, TraceSpanBuilder};
-use astra_services::{DatabaseEvaluationService, DatabaseEventService};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -196,7 +196,7 @@ pub struct SkillAutoRouteJudgeContext<'a> {
     pub visible_skills: &'a [crate::turn::skill_tool::SkillToolInfo],
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RejectedToolCall {
     pub(crate) invocation: astra_turn_core::tool::deferred_activation::CanonicalToolInvocation,
     pub(crate) result: String,
@@ -455,14 +455,49 @@ pub enum AdmittedToolCallControl {
 #[derive(Clone, Debug, Default)]
 pub struct AdmittedToolCallOutcome {
     pub results: Vec<EdgeToolExecResult>,
+    /// Server-owned preflight failures rejoin canonical admission rejections.
+    pub pre_execution_rejections: Vec<RejectedToolCall>,
     pub control: AdmittedToolCallControl,
+    /// Transient, trusted constraints for exact logical calls in this round.
+    /// Neither model-authored arguments nor a shared executor map owns them.
+    pub delegation_model_admissions:
+        std::collections::HashMap<String, PreparedDelegationModelAdmission>,
+    pub auxiliary_usage: Option<AdmittedAuxiliaryUsage>,
+}
+
+/// One invocation's trusted model admission and transient ledger preparation.
+/// The latter is never persisted or exposed to the model; the ledger remains
+/// authoritative if another worker wins the same identity before dispatch.
+#[derive(Clone, Debug)]
+pub struct PreparedDelegationModelAdmission {
+    pub admission: astra_turn_types::DelegationModelAdmission,
+    pub(crate) preparation:
+        Option<crate::server::tool_invocation_runtime::InvocationPreparationProbe>,
+}
+
+impl std::ops::Deref for PreparedDelegationModelAdmission {
+    type Target = astra_turn_types::DelegationModelAdmission;
+
+    fn deref(&self) -> &Self::Target {
+        &self.admission
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AdmittedAuxiliaryUsage {
+    pub usage: crate::turn::token_usage::TokenUsage,
+    pub attempts: u32,
+    pub provider_reported: u32,
 }
 
 impl From<Vec<EdgeToolExecResult>> for AdmittedToolCallOutcome {
     fn from(results: Vec<EdgeToolExecResult>) -> Self {
         Self {
             results,
+            pre_execution_rejections: Vec::new(),
             control: AdmittedToolCallControl::Continue,
+            delegation_model_admissions: std::collections::HashMap::new(),
+            auxiliary_usage: None,
         }
     }
 }
@@ -490,6 +525,18 @@ pub use astra_turn_core::interaction_types::{
 /// streams SSE to client, executes tools via ledger.
 #[async_trait]
 pub trait AgenticLoopHost: Send {
+    /// Parking on external input must not occupy a scarce execution slot.
+    /// Hosts without run admission (CLI and scripted tests) are no-ops.
+    fn release_execution_capacity_for_wait(&mut self) {}
+
+    /// Re-enter the normal execution admission before applying a wake or
+    /// dispatching another model/tool round.
+    async fn reacquire_execution_capacity_after_wait(
+        &mut self,
+    ) -> Result<(), astra_core::ClassifiedError> {
+        Ok(())
+    }
+
     /// Remaining wall-clock authority for this execution, when the host has a
     /// request-scoped deadline. The runtime uses this to stop exploration
     /// before the host's hard boundary, leaving time for safe settlement.
@@ -497,10 +544,56 @@ pub trait AgenticLoopHost: Send {
         None
     }
 
+    /// The producer-owned direct-child barrier for this exact execution.
+    /// Hosts only expose ownership; waiting and model delivery stay in the
+    /// shared loop. No status reconstruction or database read is allowed here.
+    fn direct_child_completion_owner(
+        &self,
+        state: &AgenticLoopState,
+    ) -> Option<Arc<crate::orchestration::FanoutParentAdmission>> {
+        state
+            .runtime_tool_executor
+            .as_deref()?
+            .direct_child_completion_owner()
+    }
+
+    /// Project shared child-completion facts through the host's canonical
+    /// Explain stream. Child output stays in required context, never labels.
+    fn on_direct_child_completion_boundary(
+        &mut self,
+        _state: &AgenticLoopState,
+        _outcome: &str,
+        _child_count: usize,
+        _started_at: Instant,
+    ) {
+    }
+
     /// Physical request topology owned by this execution host. Remote thin
     /// clients never reconstruct it; they forward the Server-authored frame.
     fn runtime_feedback_topology(&self) -> astra_services::ModelRequestTopology {
         astra_services::ModelRequestTopology::ServerOnly
+    }
+
+    /// Snapshot the exact model identity and effective reasoning setting for
+    /// children created during this turn. Hosts with a provider boundary own
+    /// this identity; it must not be reconstructed from a display-name alias.
+    fn parent_model_reasoning_snapshot(
+        &self,
+        state: &AgenticLoopState,
+    ) -> Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning> {
+        state
+            .hooks
+            .admitted_model_execution
+            .as_ref()
+            .map(
+                |execution| astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                    selection: astra_turn_types::ModelSelection {
+                        offering_id: execution.offering_id.clone(),
+                    },
+                    resolved_model_name: Some(execution.model_name.clone()),
+                    thinking: state.thinking.clone(),
+                },
+            )
     }
 
     /// Project one already-validated runtime feedback frame to live clients.
@@ -707,7 +800,7 @@ pub trait AgenticLoopHost: Send {
     /// attached through dispatch.
     async fn handle_admitted_tool_invocations(
         &mut self,
-        state: &AgenticLoopState,
+        state: &mut AgenticLoopState,
         invocations: &[astra_turn_core::tool::deferred_activation::CanonicalToolInvocation],
     ) -> AdmittedToolCallOutcome {
         let tool_calls = invocations
@@ -1093,7 +1186,7 @@ pub trait AgenticLoopHost: Send {
     /// tool-turn output when the loop continues.
     ///
     /// Default: no-op (tests, headless, sub-run hosts).
-    fn render_final_text(&mut self, _text: &str) {}
+    fn render_final_text(&mut self, _text: &str, _model_item_id: Option<&str>) {}
 
     /// Publish the canonical terminal outcome for a pre-resolved Server tool.
     ///
@@ -1500,25 +1593,23 @@ mod semantic_cache_introspection_tests {
 fn step_latency_snapshot_entries(
     step_recorder: &astra_pipeline::step_recorder::StepRecorder,
 ) -> Vec<astra_turn_core::introspect::StepLatencySnapshotEntry> {
-    astra_pipeline::trace_query::TraceQuery::step_latency_breakdown_from_events(
-        step_recorder.events(),
-    )
-    .into_iter()
-    .map(
-        |entry| astra_turn_core::introspect::StepLatencySnapshotEntry {
-            step_id: entry.step_id,
-            total_ms: entry.total_ms,
-            pre_tool_wait_ms: entry.pre_tool_wait_ms,
-            first_tool_name: entry.first_tool_name,
-            tool_call_count: entry.tool_call_count,
-            skipped_tool_count: entry.skipped_tool_count,
-            tool_execution_ms: entry.tool_execution_ms,
-            max_tool_execution_ms: entry.max_tool_execution_ms,
-            terminal_event_kind: entry.terminal_event_kind,
-            dominant_phase: entry.dominant_phase.as_str().to_string(),
-        },
-    )
-    .collect()
+    astra_pipeline::step_latency::step_latency_breakdown_from_events(step_recorder.events())
+        .into_iter()
+        .map(
+            |entry| astra_turn_core::introspect::StepLatencySnapshotEntry {
+                step_id: entry.step_id,
+                total_ms: entry.total_ms,
+                pre_tool_wait_ms: entry.pre_tool_wait_ms,
+                first_tool_name: entry.first_tool_name,
+                tool_call_count: entry.tool_call_count,
+                skipped_tool_count: entry.skipped_tool_count,
+                tool_execution_ms: entry.tool_execution_ms,
+                max_tool_execution_ms: entry.max_tool_execution_ms,
+                terminal_event_kind: entry.terminal_event_kind,
+                dominant_phase: entry.dominant_phase.as_str().to_string(),
+            },
+        )
+        .collect()
 }
 
 pub(crate) fn introspect_token_pressure(state: &AgenticLoopState) -> f64 {
@@ -1550,6 +1641,9 @@ pub(crate) fn introspect_estimated_input_tokens(state: &AgenticLoopState) -> u64
 ///   `skill` / `discover_skills` tool schemas.
 #[derive(Clone, Debug, Default)]
 pub struct RequestConstraints {
+    /// Authenticated human model requirements, not child-prompt text. This
+    /// must be explicitly assessed before delegation can treat it as empty.
+    pub delegated_model_requirements: astra_turn_types::DelegationIntentRequirements,
     /// When set, only this subset of non-skill tools may execute for the request.
     ///
     /// This does not restrict the `skill` or `discover_skills` tool schemas;
@@ -1569,11 +1663,11 @@ pub struct RequestConstraints {
 }
 
 impl RequestConstraints {
-    /// Construct with all three lanes set explicitly.
+    /// Construct with the four external tool/skill lanes set explicitly.
     ///
-    /// Every field is required so adding a new constraint axis is a hard
-    /// compile error at every call site, not a silent default. Callers that
-    /// don't have a specific lane should pass `None`.
+    /// Callers that don't have a specific external lane pass `None`. The
+    /// authenticated model-requirement lane starts `Unassessed` and is set by
+    /// turn admission, never by an external tool payload.
     pub fn new(
         allowed_tools: Option<HashSet<String>>,
         enabled_tools: Option<HashSet<String>>,
@@ -1581,6 +1675,7 @@ impl RequestConstraints {
         allowed_skill_sources: Option<HashSet<crate::skills::manifest::SkillSourceKind>>,
     ) -> Self {
         Self {
+            delegated_model_requirements: Default::default(),
             allowed_tools,
             enabled_tools,
             allowed_skills,
@@ -1615,8 +1710,9 @@ pub struct SkillState {
     /// Optional skill executor for fork-context skills. When set, skills with
     /// `execution_context: Fork` are executed via this executor (sub-agent loop).
     pub executor: Option<Arc<dyn crate::skills::traits::SkillExecutor>>,
-    /// Request-scoped tool/skill constraints supplied by the external caller.
-    /// Nested runs inherit these constraints unchanged.
+    /// Request-scoped constraints supplied by the external caller and the
+    /// authenticated turn. Tool/skill lanes narrow for children; admitted
+    /// model requirements project by their explicit propagation scope.
     pub request_constraints: RequestConstraints,
     /// Per-skill quality metrics accumulated during the session.
     /// Used to boost high-performing skills in selection priority.
@@ -1819,8 +1915,6 @@ pub struct TelemetryState {
     /// Shared observability hub for profile/experiment management.
     /// Typically set at session init and shared across agents.
     pub observability_hub: Option<std::sync::Arc<crate::observability::ObservabilityHub>>,
-    /// Optional evaluation persistence context for refreshing DB-backed runtime signals.
-    pub evaluation_persistence: Option<EvaluationPersistenceContext>,
     /// Optional event persistence context for mirroring context traces into cloud events.
     pub context_trace_persistence: Option<ContextTracePersistenceContext>,
     pub trace_ingestion: Option<astra_services::event_ingestion::IngestionSender>,
@@ -1836,12 +1930,6 @@ pub struct TelemetryState {
     /// the journal event is only emitted when the turn actually commits (not on
     /// aborts/retries), preventing ghost `context_assembly_recorded` events.
     pub pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
-}
-
-#[derive(Clone, Debug)]
-pub struct EvaluationPersistenceContext {
-    pub user_id: String,
-    pub evaluation_service: DatabaseEvaluationService,
 }
 
 #[derive(Clone, Debug)]
@@ -1888,6 +1976,12 @@ pub struct StallTrackingState {
     pub last_heavy_checkpoint: Option<StepCheckpoint>,
     /// Tool call records for session journal.
     pub tool_call_records: Vec<ToolCallRecord>,
+    /// Exact child receipts resolved at finalization. Run-local evaluation
+    /// evidence beside the tool records; never provider context or checkpoint.
+    pub terminal_child_evaluation_refs: Option<(
+        String,
+        Vec<astra_turn_types::task_resolution::ToolExecutionEvidenceRef>,
+    )>,
     /// Sticky, cross-process projection of an observation quarantine.  A
     /// foreground process-group receipt cannot prove that a detached
     /// descendant is dead; once such a receipt crosses the Edge/server
@@ -1989,6 +2083,9 @@ pub(crate) struct DurableUserIntentState {
 #[derive(Default)]
 pub struct UserIntentState {
     durable: DurableUserIntentState,
+    /// Process-local readiness hint for this provider's durable intent lane.
+    /// It is not an applied cursor or a second input queue.
+    pub(crate) wake: Option<tokio::sync::watch::Receiver<i64>>,
     /// Next time a best-effort empty/error intent poll is allowed.
     /// Due release acknowledgements may wake the poll independently.
     next_user_intent_poll_at: Option<tokio::time::Instant>,
@@ -2009,6 +2106,10 @@ pub(crate) struct ObservedUserIntents {
 }
 
 impl UserIntentState {
+    pub fn bind_wake(&mut self, wake: Option<tokio::sync::watch::Receiver<i64>>) {
+        self.wake = wake;
+    }
+
     pub(crate) fn durable_continuation(&self) -> DurableUserIntentState {
         self.durable.clone()
     }
@@ -2196,12 +2297,9 @@ pub struct MessagingState {
     /// When set, incoming messages are drained at each turn start and
     /// progress updates are sent to the parent at turn end.
     pub mailbox: Option<astra_messaging::router::AgentMailbox>,
-    /// Tracks messages that require acknowledgment and handles retries.
-    pub ack_tracker: Option<std::sync::Arc<astra_messaging::ack_tracker::PendingAckTracker>>,
-    /// Background retry/dead-letter sweep for ack-tracked messages.
-    pub ack_sweep_task: Option<astra_messaging::ack_tracker::AckSweepHandle>,
-    /// Dead letter queue for permanently failed messages.
-    pub dead_letter_queue: Option<std::sync::Arc<astra_messaging::dead_letter::DeadLetterQueue>>,
+    /// Run-owned question obligations shared with the sending tool. These
+    /// remain empty for ordinary turns and never trigger a database read.
+    pub reply_obligations: Arc<crate::messaging::reply_obligations::ReplyObligations>,
     /// Unified messaging metrics (optional, shared across agents in a delegation).
     pub metrics: Option<std::sync::Arc<astra_messaging::metrics::MessagingMetrics>>,
     /// Optional progress emitter for broadcasting turn events to UI/subscribers.
@@ -2237,7 +2335,7 @@ pub struct StopHookState {
 pub(crate) const WORK_SETTLEMENT_CONTRACT_FAILURE_TEXT: &str = "I couldn't complete and verify the requested work in this run, so I'm not claiming it as finished.";
 
 /// Cancellation state for the agentic loop.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CancellationState {
     /// Shared flag checked between turns. Set externally (e.g. by cancel_run).
     pub flag: Option<Arc<AtomicBool>>,
@@ -2381,6 +2479,7 @@ pub(crate) struct OriginalLoopExecutionFacts {
     pub turn_guard: TurnGuard,
     pub message: String,
     pub user_intent: String,
+    pub delegated_model_requirements: astra_turn_types::DelegationIntentRequirements,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub turn_intent: Option<astra_config::user_profile::TurnIntent>,
     pub task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
@@ -2412,6 +2511,8 @@ pub(crate) struct OriginalLoopExecutionFacts {
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub last_finish_reason: Option<String>,
     pub final_text: String,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub final_text_model_item_id: Option<String>,
     pub final_text_streamed: bool,
     pub final_output_ready_notified: bool,
     pub skill_produced_output: bool,
@@ -2449,6 +2550,11 @@ impl OriginalLoopExecutionFacts {
             turn_guard: state.turn_guard.clone(),
             message: state.message.clone(),
             user_intent: state.user_intent.clone(),
+            delegated_model_requirements: state
+                .skills
+                .request_constraints
+                .delegated_model_requirements
+                .clone(),
             turn_intent: state.turn_intent.clone(),
             task_profile: state.task_profile,
             session_turn: state.session_turn,
@@ -2472,6 +2578,7 @@ impl OriginalLoopExecutionFacts {
             max_turn_input_tokens: state.max_turn_input_tokens,
             last_finish_reason: state.last_finish_reason.clone(),
             final_text: state.final_text.clone(),
+            final_text_model_item_id: state.final_text_model_item_id.clone(),
             final_text_streamed: state.final_text_streamed,
             final_output_ready_notified: state.final_output_ready_notified,
             skill_produced_output: state.skill_produced_output,
@@ -2534,6 +2641,12 @@ fn validate_pending_context(pending: &[VolatileInjection]) -> Result<(), &'stati
             || volatile_payload_is_empty(&entry.payload)
         {
             return Err("runtime context continuation contains a non-deliverable item");
+        }
+        if is_retained_mailbox_context(entry)
+            && entry.payload["message_kind"] == "response"
+            && retained_response_identity(entry).is_none()
+        {
+            return Err("retained response has no exact request or sender identity");
         }
         if entry.kind.is_singleton() {
             if singletons.contains(&entry.kind) {
@@ -2631,7 +2744,9 @@ pub enum VolatileKind {
     /// artifact whose original bytes were retained. Advisory-only: it never
     /// authorizes rollback, retry, budget extension, or terminal settlement.
     SourceRecoveryAdvisory,
-    /// Mailbox / agent-to-agent volatile drop-offs.
+    /// Mailbox / agent-to-agent drop-offs. Multiple batches accumulate until
+    /// one provider attempt consumes them; later drains must not erase earlier
+    /// acknowledged messages.
     Mailbox,
     /// Runtime-owned terminal/needs-input facts from background work. These
     /// are required context, never synthetic user intent.
@@ -2652,10 +2767,9 @@ pub enum VolatileKind {
     /// Compaction may drop the original tool messages; this snapshot is not
     /// part of that history and is not a completion receipt.
     ExternalEffectLedger,
-    /// A provider response completed after newer durable user guidance was
-    /// accepted. The stale response is not executable; this singleton tells
-    /// the next request to re-evaluate from the applied control epoch.
-    UserIntentBoundary,
+    /// A provider response completed before newly applied runtime input.
+    /// The stale response is not executable; the next request re-evaluates.
+    RuntimeInputBoundary,
     /// Context-pressure guidance from [`RuntimePolicy`]. Singleton so repeated
     /// pressure checks replace the prior guidance instead of stacking prompt
     /// noise inside the same LLM call.
@@ -2688,6 +2802,36 @@ pub enum VolatileKind {
     PlanModeMarker,
 }
 
+pub(crate) const RETAINED_MAILBOX_CONTEXT_SCHEMA: &str = "astra.mailbox_context.v1";
+pub(crate) const DIRECT_CHILD_RESULT_SCHEMA: &str = "direct_child_completion.v1";
+
+pub(crate) fn is_retained_mailbox_context(injection: &VolatileInjection) -> bool {
+    injection.kind == VolatileKind::Mailbox
+        && injection.payload["schema"] == RETAINED_MAILBOX_CONTEXT_SCHEMA
+}
+
+fn retained_response_identity(
+    injection: &VolatileInjection,
+) -> Option<(&str, astra_messaging::AgentAddress)> {
+    if !is_retained_mailbox_context(injection) || injection.payload["message_kind"] != "response" {
+        return None;
+    }
+    let request_id = injection.payload["response_request_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())?;
+    let sender: astra_messaging::AgentAddress =
+        serde_json::from_value(injection.payload["sender"].clone()).ok()?;
+    if sender.run_id.is_empty() || sender.agent_id.is_empty() {
+        return None;
+    }
+    Some((request_id, sender))
+}
+
+pub(crate) fn is_direct_child_result(injection: &VolatileInjection) -> bool {
+    injection.kind == VolatileKind::BackgroundTaskNotification
+        && injection.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+}
+
 impl VolatileKind {
     /// Snapshot-style kinds where only the most recent value is
     /// semantically meaningful. `push_volatile` replaces any prior
@@ -2699,7 +2843,6 @@ impl VolatileKind {
         matches!(
             self,
             Self::ContextPressure
-                | Self::Mailbox
                 | Self::CompactResume
                 | Self::CircuitBreaker
                 | Self::FinalAnswerSettlement
@@ -2713,7 +2856,7 @@ impl VolatileKind {
                 | Self::SelfStatus
                 | Self::PermissionMode
                 | Self::PolicyAdvisory
-                | Self::UserIntentBoundary
+                | Self::RuntimeInputBoundary
                 | Self::BehaviorAdvisory
                 | Self::SourceRecoveryAdvisory
                 | Self::ActiveTurnFrame
@@ -2740,7 +2883,7 @@ impl VolatileKind {
             | Self::CanonicalWorkState
             | Self::WorkEvidenceContext
             | Self::ExternalEffectLedger
-            | Self::UserIntentBoundary
+            | Self::RuntimeInputBoundary
             | Self::FinalAnswerSettlement
             | Self::CanonicalWorkEstablishmentRetry
             | Self::OutputCapContinuation
@@ -2788,6 +2931,21 @@ fn volatile_payload_is_empty(payload: &Value) -> bool {
     }
 }
 
+pub(crate) fn volatile_injection_edge_profile(
+    injection: &VolatileInjection,
+) -> astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+    use astra_turn_types::RuntimeAuthorityLifetime;
+    astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+        kind: injection.kind.wire_kind(),
+        delivery_class: injection.kind.delivery_class(),
+        payload: injection.payload.clone(),
+        round_index: injection.round_index,
+        authority_lifetime: (injection.kind == VolatileKind::ActiveTurnFrame
+            || is_retained_mailbox_context(injection))
+        .then_some(RuntimeAuthorityLifetime::CurrentUserTurn),
+    }
+}
+
 /// Serialize runtime-owned volatile injections for the CLI/server edge_profile
 /// boundary without flattening away their producer kind.
 #[must_use]
@@ -2800,29 +2958,10 @@ pub fn runtime_volatile_injections_edge_profile_value(
             if volatile_payload_is_empty(&injection.payload) {
                 return None;
             }
-            let mut object = serde_json::Map::new();
-            object.insert(
-                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_RUNTIME_VOLATILE_KIND
-                    .to_string(),
-                serde_json::Value::String(injection.kind.wire_kind()),
-            );
-            object.insert(
-                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_RUNTIME_VOLATILE_DELIVERY_CLASS
-                    .to_string(),
-                serde_json::to_value(injection.kind.delivery_class())
-                    .expect("volatile delivery class must serialize"),
-            );
-            object.insert(
-                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_RUNTIME_VOLATILE_PAYLOAD
-                    .to_string(),
-                injection.payload.clone(),
-            );
-            object.insert(
-                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_RUNTIME_VOLATILE_ROUND_INDEX
-                    .to_string(),
-                serde_json::json!(injection.round_index),
-            );
-            Some(serde_json::Value::Object(object))
+            Some(
+                serde_json::to_value(volatile_injection_edge_profile(injection))
+                    .expect("runtime volatile injection must serialize"),
+            )
         })
         .collect::<Vec<_>>();
     (!items.is_empty()).then_some(serde_json::Value::Array(items))
@@ -3364,6 +3503,10 @@ pub struct AgenticLoopState {
 
     // ── Accumulated output ──
     pub final_text: String,
+    /// Fresh identity assigned before dispatch, never derived from a round counter.
+    pub current_model_item_id: Option<String>,
+    /// Origin of accepted final text; a failed/new attempt cannot overwrite it.
+    pub final_text_model_item_id: Option<String>,
     /// True once the current `final_text` has already been sent to the user.
     /// Deferred completion paths leave this false so finalization emits exactly once.
     pub final_text_streamed: bool,
@@ -3536,10 +3679,6 @@ pub struct AgenticLoopState {
     pub self_agent_id: String,
 
     // ── Composite Snapshot ──
-    /// Optional data snapshot provider for building composite snapshots.
-    /// When set, heavy checkpoints will also capture a data dimension.
-    pub data_snapshot_provider:
-        Option<Arc<dyn astra_core::composite_snapshot::DataSnapshotProvider>>,
     /// Most recent composite snapshot created for this session.
     pub last_composite_snapshot: Option<astra_core::composite_snapshot::CompositeSnapshot>,
 
@@ -3631,11 +3770,6 @@ pub struct AgenticLoopState {
     /// When set, incoming PermissionRequest messages are handled automatically.
     pub permission_handler: Option<crate::orchestration::PermissionRequestHandler>,
 
-    // ── Mid-execution checkpoint gate ──
-    /// Optional checkpoint gate checked every N turns during delegation sub-runs.
-    /// When the gate returns `false`, the loop aborts with `Cancelled`.
-    pub checkpoint_gate: Option<Arc<dyn crate::server::delegation::engine::CheckpointGate>>,
-
     /// Last context assembly trace produced by the shared LLM context assembler.
     /// The per-call context manifest writer uses this to describe the actual
     /// prompt/cache assembly path instead of reconstructing it independently.
@@ -3647,15 +3781,6 @@ pub struct AgenticLoopState {
     /// turns can wait or reject early instead of immediately re-hitting the
     /// limit.  Shared across all turns within a single agentic loop invocation.
     pub rate_limit_cooldown: astra_turn_core::rate_limit_cooldown::RateLimitCooldown,
-
-    // ── Liquid (within-turn tactical adaptation) ──
-    /// Optional tactical adapter for step-level adaptation within a turn.
-    pub tactical_adapter: Option<astra_turn_core::liquid_tactical::TacticalAdapter>,
-    /// Optional step signal collector for within-turn outcome tracking.
-    pub step_signal_collector: Option<astra_turn_core::liquid_step_signals::StepSignalCollector>,
-
-    /// Recent tactical adaptations applied while liquid tactical tuning runs.
-    pub recent_tactical_actions: Vec<String>,
 
     // ── Server-side tool execution ──
     /// Optional server-side tool executor for web agent sessions (no CLI edge agent).
@@ -3842,6 +3967,137 @@ pub fn runtime_manifest_for_model(
 }
 
 impl AgenticLoopState {
+    /// Common empty loop state. Callers install identity, authority, context and
+    /// restored frontiers explicitly; this never admits, restores or performs I/O.
+    pub(crate) fn fresh(
+        step_recorder: StepRecorder,
+        agentic_turn_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
+        policy: &astra_config::runtime_config::EffectiveToolPolicy,
+        inference_purpose: astra_turn_types::InferencePurpose,
+    ) -> Self {
+        Self {
+            messages: Vec::new(),
+            run_transcript_capture: None,
+            volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
+            tool_results: Vec::new(),
+            current_session_id: None,
+            current_run_id: None,
+            current_run_owner_generation: None,
+            applied_permission_mode: None,
+            inference_purpose,
+            context_manifest_pool: None,
+            context_manifest_user_id: None,
+            context_manifest_model_name: None,
+            recursion_depth: 0,
+            final_text: String::new(),
+            current_model_item_id: None,
+            final_text_model_item_id: None,
+            final_text_streamed: false,
+            final_output_ready_notified: false,
+            total_prompt: 0,
+            total_completion: 0,
+            total_cache_read: 0,
+            total_cache_creation: 0,
+            total_tool_calls: 0,
+            total_observation_tool_calls: 0,
+            tool_ledger_receipt: Default::default(),
+            has_any_usage: false,
+            qualified_usage: None,
+            last_request_usage: None,
+            last_finish_reason: None,
+            max_turns: agentic_turn_budget.initial_turns,
+            remaining_turns: agentic_turn_budget.initial_turns,
+            charged_iterations: 0,
+            agentic_turn_budget,
+            budget_is_explicit: false,
+            budget_policy: None,
+            loop_entry: Default::default(),
+            current_round_index: 0,
+            llm_rounds_completed: 0,
+            last_request_message_count: None,
+            turn_guard: TurnGuard::new(),
+            restricted_tools: HashSet::new(),
+            boosted_tools: HashSet::new(),
+            widen_selection_pending: false,
+            step_recorder,
+            idempotency_cache: InMemoryIdempotencyCache::new(),
+            semantic_dedup: SemanticDedup::new(0.75),
+            call_counts: HashMap::new(),
+            max_identical_tool_calls: policy.max_identical_tool_calls,
+            max_tools_per_turn: policy.max_tools_per_turn,
+            max_consecutive_empty_name: policy.max_consecutive_empty_name,
+            stall: Default::default(),
+            telemetry: Default::default(),
+            skills: SkillState {
+                quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
+                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
+                ..Default::default()
+            },
+            hooks: Default::default(),
+            messaging: Default::default(),
+            cancellation: Default::default(),
+            user_intents: Default::default(),
+            error_recovery: Default::default(),
+            provider_adaptation: Default::default(),
+            pipeline_session: None,
+            message: String::new(),
+            user_intent: String::new(),
+            has_prior_assistant_turn: false,
+            recent_tools: Vec::new(),
+            deferred_tool_activations: Vec::new(),
+            turn_intent: None,
+            task_profile: TaskExecutionProfile::default(),
+            last_turn_policy: TurnInteractionPolicy::default(),
+            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            api_token: String::new(),
+            delegation_engine: None,
+            delegations_this_turn: 0,
+            delegation_chain: Vec::new(),
+            self_agent_id: "main".to_string(),
+            runtime_manifest: None,
+            run_control: None,
+            project_context: None,
+            last_llm_context_manifest_trace: None,
+            rate_limit_cooldown: Default::default(),
+            last_composite_snapshot: None,
+            last_measured_prompt_tokens: None,
+            consecutive_context_window_errors: 0,
+            compaction_effectiveness: Default::default(),
+            pinned_tool_schema_tokens: 0,
+            sticky_tool_schemas: Vec::new(),
+            max_turn_input_tokens: 0,
+            budget_wrapup_injected: false,
+            context_compression_triggered: false,
+            canonical_rewrite_state: Default::default(),
+            provider_canonical_wal_base: None,
+            provider_canonical_wal_head: None,
+            budget_wrapup_ignored_rounds: 0,
+            compact_tier_applied: CompactionTier::Normal,
+            skill_produced_output: false,
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+            permission_context: None,
+            permission_handler: None,
+            runtime_tool_executor: None,
+            interruption: None,
+            session_facts: Default::default(),
+            memory_extraction_service: None,
+            session_memory_state: Default::default(),
+            compact_strategy: Default::default(),
+            approval_overrides: None,
+            confidence_trend: Default::default(),
+            last_confidence_diagnosis: None,
+            session_turn: 0,
+            canonical_turn_chain_id: None,
+            root_user_query_event_id: None,
+            turn_event_buffer: None,
+            canonical_turn_started_at: Default::default(),
+            canonical_trace_time_bounds: Default::default(),
+            harness: super::super::harness_adapter::HarnessSlot::empty(),
+            observation_journal: Default::default(),
+        }
+    }
+
     pub(crate) fn add_qualified_usage(
         &mut self,
         usage: Option<astra_turn_types::CanonicalTokenUsage>,
@@ -3860,9 +4116,9 @@ impl AgenticLoopState {
     pub fn run_execution_control_snapshot(
         &self,
     ) -> Option<astra_pipeline::step_protocol::RunExecutionControl> {
-        self.current_run_id.as_ref().filter(|id| !id.is_empty())?;
-        self.current_run_owner_generation?;
-        Some(astra_pipeline::step_protocol::RunExecutionControl::V2 {
+        let run_id = self.current_run_id.as_ref().filter(|id| !id.is_empty())?;
+        let generation = self.current_run_owner_generation?;
+        Some(astra_pipeline::step_protocol::RunExecutionControl::V3 {
             completion_settlement: self.hooks.completion_settlement.clone(),
             hook_obligations: astra_turn_types::StopHookObligations {
                 stop_hooks: self.hooks.stop_hooks.clone(),
@@ -3870,6 +4126,11 @@ impl AgenticLoopState {
                 teammate_idle_hooks: self.hooks.teammate_idle_hooks.clone(),
                 teammate_idle_hook_runs: self.hooks.teammate_idle_hook_runs,
             },
+            reply_obligations: self
+                .messaging
+                .reply_obligations
+                .snapshot(run_id, generation)
+                .ok()?,
             budget_wrapup_injected: self.budget_wrapup_injected,
             budget_wrapup_ignored_rounds: self.budget_wrapup_ignored_rounds,
         })
@@ -4362,6 +4623,23 @@ impl AgenticLoopState {
         input.trim().to_string()
     }
 
+    pub(crate) fn settle_admitted_auxiliary_usage(&mut self, delta: AdmittedAuxiliaryUsage) {
+        for attempt in 0..delta.attempts {
+            self.record_local_usage_coverage(attempt < delta.provider_reported);
+        }
+        self.total_prompt = self.total_prompt.saturating_add(delta.usage.input_tokens);
+        self.total_cache_read = self
+            .total_cache_read
+            .saturating_add(delta.usage.cached_input_tokens);
+        self.total_cache_creation = self
+            .total_cache_creation
+            .saturating_add(delta.usage.cache_creation_tokens);
+        self.total_completion = self
+            .total_completion
+            .saturating_add(delta.usage.output_tokens);
+        self.has_any_usage |= delta.provider_reported > 0;
+    }
+
     pub fn push_volatile(&mut self, kind: VolatileKind, content: impl Into<String>) {
         let content = content.into().trim().to_string();
         if content.is_empty() {
@@ -4625,16 +4903,72 @@ impl AgenticLoopState {
             ));
         }
         for injection in &mut self.volatile_pending {
-            injection.attempt_leased = true;
+            if !(is_direct_child_result(injection)
+                && injection.payload["delivery_count"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    >= 2)
+            {
+                injection.attempt_leased = true;
+            }
         }
-        Ok(self.volatile_pending.clone())
+        Ok(self
+            .volatile_pending
+            .iter()
+            .filter(|injection| injection.attempt_leased)
+            .cloned()
+            .collect())
     }
 
     /// Commit only the authorities actually leased to the completed attempt.
     /// Facts queued after request construction remain pending.
     pub fn commit_volatile_attempt_lease(&mut self) {
-        self.volatile_pending
-            .retain(|injection| !injection.attempt_leased);
+        let run_id = self.current_run_id.as_deref();
+        let replies = &self.messaging.reply_obligations;
+        self.volatile_pending.retain_mut(|injection| {
+            if !injection.attempt_leased {
+                return true;
+            }
+            if let Some(run_id) = run_id
+                && let Some((request_id, sender)) = retained_response_identity(injection)
+            {
+                replies.observe_typed_response(run_id, request_id, &sender);
+            }
+            if is_retained_mailbox_context(injection) || is_direct_child_result(injection) {
+                let delivery_count = injection.payload["delivery_count"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    .saturating_add(1);
+                if delivery_count >= 2 {
+                    if is_direct_child_result(injection) {
+                        if let Some(children) = injection.payload["children"].as_array_mut() {
+                            for child in children {
+                                *child = serde_json::json!({
+                                    "agent_id": child["agent_id"],
+                                    "run_id": child["run_id"],
+                                    "status": child["status"],
+                                    "status_fingerprint": child["status_fingerprint"],
+                                    "result_bytes": child["result_bytes"],
+                                });
+                            }
+                        }
+                        if let Some(payload) = injection.payload.as_object_mut() {
+                            payload.remove("instruction");
+                        }
+                        injection.payload["delivery_count"] = Value::from(delivery_count);
+                        injection.attempt_leased = false;
+                        return true;
+                    }
+                    return false;
+                }
+                injection.payload["delivery_count"] = Value::from(delivery_count);
+                injection.payload["observed_by_provider"] = Value::Bool(true);
+                injection.attempt_leased = false;
+                true
+            } else {
+                !injection.attempt_leased
+            }
+        });
     }
 
     /// Release a failed provider attempt without consuming its authority.
@@ -4859,8 +5193,7 @@ pub(crate) use super::super::agentic::delegate_interception::{
     delegation_final_output_preview, format_delegation_result, format_delegation_terminal_preview,
     is_delegation_call, merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
     parse_delegate_agents, parse_delegation_request, partition_and_execute_delegations,
-    pattern_from_name, select_default_coordination_pattern, tool_call_arguments_value,
-    tool_call_name,
+    select_default_coordination_pattern, tool_call_arguments_value, tool_call_name,
 };
 
 use super::super::harness_adapter::harness_at;
@@ -4868,9 +5201,20 @@ pub(crate) use super::execution_phase::{
     TurnExecutionControl, TurnExecutionPhase, execute_turn_and_ingest_phase,
 };
 pub(crate) use super::finalization::{
-    finalize_and_render, finalize_turn_trace, run_agentic_loop_with_host,
-    try_write_heavy_checkpoint,
+    finalize_turn_trace, run_agentic_loop_with_host, try_write_heavy_checkpoint,
 };
+
+/// Every shared-loop finalization route (including exhausted slices and
+/// harness exits) must retain the producer-owned child obligation.
+pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) {
+    if !state.final_output_ready_notified {
+        super::execution_phase::fence_direct_child_finalization(host, state).await;
+    }
+    super::finalization::finalize_and_render(host, state).await;
+}
 pub(crate) use super::lifecycle::{
     PreparedTurnIteration, TurnIterationPrep, prepare_turn_iteration, run_loop_preamble,
 };
@@ -5382,130 +5726,20 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         .tool_policy
         .resolve_for_model(model);
     AgenticLoopState {
-        messages: Vec::new(),
-        run_transcript_capture: None,
-        volatile_pending: Vec::new(),
-        recent_rounds: Vec::new(),
-        tool_results: Vec::new(),
-        current_session_id: None,
-        current_run_id: None,
-        current_run_owner_generation: None,
-        applied_permission_mode: None,
-        inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-        context_manifest_pool: None,
-        context_manifest_user_id: None,
-        context_manifest_model_name: None,
-        recursion_depth: 0,
-        final_text: String::new(),
-        final_text_streamed: false,
-        final_output_ready_notified: false,
-        total_prompt: 0,
-        total_completion: 0,
-        total_cache_read: 0,
-        total_cache_creation: 0,
-        total_tool_calls: 0,
-        total_observation_tool_calls: 0,
-        tool_ledger_receipt: Default::default(),
-        has_any_usage: false,
-        qualified_usage: None,
-        last_request_usage: None,
-        last_finish_reason: None,
         max_turns: 10,
         remaining_turns: 10,
-        charged_iterations: 0,
-        agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
-        budget_is_explicit: false,
-        budget_policy: None,
-        loop_entry: Default::default(),
-        current_round_index: 0,
-        llm_rounds_completed: 0,
-        last_request_message_count: None,
-        turn_guard: TurnGuard::new(),
-        restricted_tools: HashSet::new(),
-        boosted_tools: HashSet::new(),
-        widen_selection_pending: false,
-        step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
-        idempotency_cache: InMemoryIdempotencyCache::new(),
         semantic_dedup: SemanticDedup::new(0.95),
-        call_counts: HashMap::new(),
-        max_identical_tool_calls: policy.max_identical_tool_calls,
-        max_tools_per_turn: policy.max_tools_per_turn,
-        max_consecutive_empty_name: policy.max_consecutive_empty_name,
-        stall: Default::default(),
-        telemetry: Default::default(),
-        skills: SkillState {
-            quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-            improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-            ..Default::default()
-        },
-        hooks: Default::default(),
-        messaging: Default::default(),
-        cancellation: Default::default(),
-        user_intents: Default::default(),
-        error_recovery: Default::default(),
-        provider_adaptation: Default::default(),
         pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         )),
         message: "test query".to_string(),
         user_intent: "test query".to_string(),
-        has_prior_assistant_turn: false,
-        recent_tools: Vec::new(),
-        deferred_tool_activations: Vec::new(),
-        turn_intent: None,
-        task_profile: TaskExecutionProfile::default(),
-        last_turn_policy: TurnInteractionPolicy::default(),
-        api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
-        api_token: String::new(),
-        delegation_engine: None,
-        delegations_this_turn: 0,
-        delegation_chain: Vec::new(),
-        self_agent_id: "main".to_string(),
-        runtime_manifest: None,
-        run_control: None,
-        project_context: None,
-        checkpoint_gate: None,
-        last_llm_context_manifest_trace: None,
-        rate_limit_cooldown: Default::default(),
-        data_snapshot_provider: None,
-        last_composite_snapshot: None,
-        last_measured_prompt_tokens: None,
-        consecutive_context_window_errors: 0,
-        compaction_effectiveness: Default::default(),
-        pinned_tool_schema_tokens: 0,
-        sticky_tool_schemas: Vec::new(),
-        max_turn_input_tokens: 0,
-        budget_wrapup_injected: false,
-        context_compression_triggered: false,
-        canonical_rewrite_state: Default::default(),
-        provider_canonical_wal_base: None,
-        provider_canonical_wal_head: None,
-        budget_wrapup_ignored_rounds: 0,
-        compact_tier_applied: CompactionTier::Normal,
-        skill_produced_output: false,
-        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
-        permission_context: None,
-        permission_handler: None,
-        tactical_adapter: None,
-        step_signal_collector: None,
-        recent_tactical_actions: Vec::new(),
-        runtime_tool_executor: None,
-        interruption: None,
-        session_facts: Default::default(),
-        memory_extraction_service: None,
-        session_memory_state: Default::default(),
-        compact_strategy: Default::default(),
-        approval_overrides: None,
-        confidence_trend: Default::default(),
-        last_confidence_diagnosis: None,
-        session_turn: 0,
-        canonical_turn_chain_id: None,
-        root_user_query_event_id: None,
-        turn_event_buffer: None,
-        canonical_turn_started_at: Default::default(),
-        canonical_trace_time_bounds: Default::default(),
-        harness: super::super::harness_adapter::HarnessSlot::empty(),
-        observation_journal: Default::default(),
+        ..AgenticLoopState::fresh(
+            StepRecorder::new("test-user", "test-session", "test-task"),
+            TaskExecutionProfile::default().agentic_turn_budget,
+            &policy,
+            astra_turn_types::InferencePurpose::PrimaryAgent,
+        )
     }
 }
 
@@ -6299,6 +6533,7 @@ pub(crate) mod tests {
         handoff_snapshots: Vec<astra_pipeline::step_protocol::HeavyCheckpoint>,
         turn_results: Vec<HostTurnResult>,
         current_turn: usize,
+        pub(crate) provider_call_counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
         pub(crate) valid_tools: HashSet<String>,
         pub(crate) emitted_lines: Vec<String>,
         pub(crate) compaction_events: Vec<CompactionEvent>,
@@ -6315,6 +6550,7 @@ pub(crate) mod tests {
         hydration_error: bool,
         recovered_message: Option<Value>,
         pub(crate) executed_messages: Vec<Vec<Value>>,
+        pub(crate) executed_model_item_ids: Vec<Option<String>>,
         pub(crate) executed_volatile: Vec<Vec<VolatileInjection>>,
         pub(crate) text_only_turns: Vec<bool>,
         pub(crate) turn_intent: Option<TurnIntent>,
@@ -6340,6 +6576,9 @@ pub(crate) mod tests {
         committed_work_synthesis_sequence: std::collections::VecDeque<Result<bool, String>>,
         pub(crate) committed_work_synthesis_checks: usize,
         execution_time_budget_remaining: Option<Duration>,
+        pub(crate) direct_child_owner: Option<Arc<crate::orchestration::FanoutParentAdmission>>,
+        pub(crate) child_wait_started: Option<Arc<tokio::sync::Notify>>,
+        pub(crate) child_boundary_outcomes: Vec<String>,
     }
 
     impl MockHost {
@@ -6366,6 +6605,8 @@ pub(crate) mod tests {
                 hydration_error: false,
                 recovered_message: None,
                 executed_messages: Vec::new(),
+                executed_model_item_ids: Vec::new(),
+                provider_call_counter: None,
                 executed_volatile: Vec::new(),
                 text_only_turns: Vec::new(),
                 turn_intent: None,
@@ -6391,6 +6632,9 @@ pub(crate) mod tests {
                 committed_work_synthesis_sequence: std::collections::VecDeque::new(),
                 committed_work_synthesis_checks: 0,
                 execution_time_budget_remaining: None,
+                direct_child_owner: None,
+                child_wait_started: None,
+                child_boundary_outcomes: Vec::new(),
             }
         }
 
@@ -6499,6 +6743,32 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl AgenticLoopHost for MockHost {
+        fn direct_child_completion_owner(
+            &self,
+            state: &AgenticLoopState,
+        ) -> Option<Arc<crate::orchestration::FanoutParentAdmission>> {
+            self.direct_child_owner.clone().or_else(|| {
+                state
+                    .runtime_tool_executor
+                    .as_deref()?
+                    .direct_child_completion_owner()
+            })
+        }
+
+        fn on_direct_child_completion_boundary(
+            &mut self,
+            _state: &AgenticLoopState,
+            outcome: &str,
+            _child_count: usize,
+            _started_at: Instant,
+        ) {
+            self.child_boundary_outcomes.push(outcome.to_string());
+            if outcome == "wait_started"
+                && let Some(notify) = &self.child_wait_started
+            {
+                notify.notify_one();
+            }
+        }
         fn execution_time_budget_remaining(&self) -> Option<Duration> {
             self.execution_time_budget_remaining
         }
@@ -6558,7 +6828,12 @@ pub(crate) mod tests {
                 ));
             }
             self.executed_messages.push(state.messages.clone());
+            self.executed_model_item_ids
+                .push(state.current_model_item_id.clone());
             self.executed_volatile.push(state.volatile_pending.clone());
+            if self.direct_child_completion_owner(state).is_some() {
+                state.lease_volatile_pending()?;
+            }
             self.text_only_turns
                 .push(state.hooks.completion_settlement.text_only);
             let result = self.turn_results.remove(0);
@@ -6566,6 +6841,9 @@ pub(crate) mod tests {
                 self.valid_tools.insert(edge_result.tool.clone());
             }
             self.current_turn += 1;
+            if let Some(counter) = &self.provider_call_counter {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             Ok(result)
         }
 
@@ -6717,7 +6995,7 @@ pub(crate) mod tests {
             self.injected_schemas.push(schema);
         }
 
-        fn render_final_text(&mut self, text: &str) {
+        fn render_final_text(&mut self, text: &str, _model_item_id: Option<&str>) {
             self.rendered_final_text.push(text.to_string());
         }
 
@@ -7143,9 +7421,9 @@ pub(crate) mod tests {
             "terminal": 3,
             "completed": 3,
             "results": [
-                {"slot_index": 0, "result": "finding-a"},
-                {"slot_index": 1, "result": "finding-b"},
-                {"slot_index": 2, "result": "finding-c"}
+                {"slot_index": 0, "agent_id": "child-0", "result": {"result_family": "child_result", "agent_id": "child-0", "status": "completed", "result": "finding-a"}},
+                {"slot_index": 1, "agent_id": "child-1", "result": {"result_family": "child_result", "agent_id": "child-1", "status": "completed", "result": "finding-b"}},
+                {"slot_index": 2, "agent_id": "child-2", "result": {"result_family": "child_result", "agent_id": "child-2", "status": "completed", "result": "finding-c"}}
             ]
         })
         .to_string();
@@ -7314,140 +7592,20 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn make_state() -> AgenticLoopState {
+        let policy = astra_config::runtime_config::RuntimeConfig::load().tool_policy;
         AgenticLoopState {
-            messages: Vec::new(),
-            run_transcript_capture: None,
-            volatile_pending: Vec::new(),
-            recent_rounds: Vec::new(),
-            tool_results: Vec::new(),
-            // Tests that attach durable run-control authority must carry the
-            // same immutable session fence as production. Tests exercising a
-            // pre-admission/no-session path explicitly clear this field.
+            // Durable-control tests use the same immutable session fence as production.
             current_session_id: Some("test-session".to_string()),
-            current_run_id: None,
-            current_run_owner_generation: None,
-            applied_permission_mode: None,
-            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-            context_manifest_pool: None,
-            context_manifest_user_id: None,
-            context_manifest_model_name: None,
-            recursion_depth: 0,
-            final_text: String::new(),
-            final_text_streamed: false,
-            final_output_ready_notified: false,
-            total_prompt: 0,
-            total_completion: 0,
-            total_cache_read: 0,
-            total_cache_creation: 0,
-            total_tool_calls: 0,
-            total_observation_tool_calls: 0,
-            tool_ledger_receipt: Default::default(),
-            has_any_usage: false,
-            qualified_usage: None,
-            last_request_usage: None,
-            max_turns: 10,
-            remaining_turns: 10,
-            charged_iterations: 0,
-            agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
-            budget_is_explicit: false,
-            budget_policy: None,
-            loop_entry: Default::default(),
-            current_round_index: 0,
-            llm_rounds_completed: 0,
-            last_request_message_count: None,
-            turn_guard: TurnGuard::new(),
-            restricted_tools: HashSet::new(),
-            boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
-            step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
-            idempotency_cache: InMemoryIdempotencyCache::new(),
-            semantic_dedup: SemanticDedup::new(0.95),
-            call_counts: HashMap::new(),
-            max_identical_tool_calls: astra_config::runtime_config::RuntimeConfig::load()
-                .tool_policy
-                .effective_max_identical_calls(),
-            max_tools_per_turn: astra_config::runtime_config::RuntimeConfig::load()
-                .tool_policy
-                .effective_max_tools_per_turn(),
+            max_identical_tool_calls: policy.effective_max_identical_calls(),
+            max_tools_per_turn: policy.effective_max_tools_per_turn(),
             max_consecutive_empty_name: 3,
-            stall: Default::default(),
-            telemetry: Default::default(),
-            skills: SkillState {
-                quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-                ..Default::default()
-            },
-            hooks: Default::default(),
-            messaging: Default::default(),
-            cancellation: Default::default(),
-            user_intents: Default::default(),
-            error_recovery: Default::default(),
-            provider_adaptation: Default::default(),
             pipeline_session: None,
-            message: "test query".to_string(),
-            user_intent: "test query".to_string(),
-            has_prior_assistant_turn: false,
-            recent_tools: Vec::new(),
-            deferred_tool_activations: Vec::new(),
-            turn_intent: None,
-            task_profile: TaskExecutionProfile::default(),
-            last_finish_reason: None,
-            last_turn_policy: TurnInteractionPolicy::default(),
-            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
-            api_token: String::new(),
-            delegation_engine: None,
-            delegations_this_turn: 0,
-            delegation_chain: Vec::new(),
-            self_agent_id: "main".to_string(),
-            runtime_manifest: None,
-            run_control: None,
-            project_context: None,
-            checkpoint_gate: None,
-            last_llm_context_manifest_trace: None,
-            rate_limit_cooldown: Default::default(),
-            data_snapshot_provider: None,
-            last_composite_snapshot: None,
-            last_measured_prompt_tokens: None,
-            consecutive_context_window_errors: 0,
-            compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
-            sticky_tool_schemas: Vec::new(),
-            max_turn_input_tokens: 0,
-            budget_wrapup_injected: false,
-            context_compression_triggered: false,
-            canonical_rewrite_state: Default::default(),
-            provider_canonical_wal_base: None,
-            provider_canonical_wal_head: None,
-            budget_wrapup_ignored_rounds: 0,
-            compact_tier_applied: CompactionTier::Normal,
-            skill_produced_output: false,
-            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             permission_context: Some(
                 astra_turn_core::permission::types::PermissionSyncContext::shared_root(
                     astra_turn_core::permission::types::PermissionMode::Auto,
                 ),
             ),
-            permission_handler: None,
-            tactical_adapter: None,
-            step_signal_collector: None,
-            recent_tactical_actions: Vec::new(),
-            runtime_tool_executor: None,
-            interruption: None,
-            session_facts: Default::default(),
-            memory_extraction_service: None,
-            session_memory_state: Default::default(),
-            compact_strategy: Default::default(),
-            approval_overrides: None,
-            confidence_trend: Default::default(),
-            last_confidence_diagnosis: None,
-            session_turn: 0,
-            canonical_turn_chain_id: None,
-            root_user_query_event_id: None,
-            turn_event_buffer: None,
-            canonical_turn_started_at: Default::default(),
-            canonical_trace_time_bounds: Default::default(),
-            harness: crate::turn::harness_adapter::HarnessSlot::empty(),
-            observation_journal: Default::default(),
+            ..make_test_loop_state()
         }
     }
 
@@ -10475,32 +10633,6 @@ pub(crate) mod tests {
         assert_eq!(state.final_text, "Passed through.");
     }
 
-    #[tokio::test]
-    async fn e2e_adversarial_delegation_pattern() {
-        let turns = vec![
-            delegate_tool_call_result(
-                "call_adversarial",
-                r#"{"task": "write secure auth", "agents": ["coder", "reviewer"], "pattern": "adversarial", "max_rounds": 2}"#,
-                200,
-                100,
-            ),
-            text_result("Adversarial review complete.", 80, 40, None),
-        ];
-
-        let mut host = MockHost::new(turns).with_valid_tools(&["delegate"]);
-        let mut state = make_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "write and review auth"}));
-        state.current_run_id = Some("run-adversarial".to_string());
-        state.delegation_engine =
-            Some(make_test_delegation_engine("run-adversarial", "test-session").await);
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-        assert_eq!(state.final_text, "Adversarial review complete.");
-    }
-
     // ── Auto-injection tests ────────────────────────────────────────────────
 
     #[tokio::test]
@@ -13098,206 +13230,6 @@ print(json.dumps({'context': 'user said: ' + msg}))
         );
     }
 
-    // ── L1.3 Tactical adapter wiring tests ──────────────────────────────
-
-    #[test]
-    fn tactical_adapter_state_fields_default_to_none() {
-        let state = make_state();
-        assert!(state.tactical_adapter.is_none());
-        assert!(state.step_signal_collector.is_none());
-    }
-
-    #[test]
-    fn tactical_adapter_wiring_produces_hints_on_error_streak() {
-        use astra_turn_core::liquid_step_signals::{StepSignalCollector, StepSignalConfig};
-        use astra_turn_core::liquid_tactical::{DampenerConfig, TacticalAction, TacticalAdapter};
-
-        let mut state = make_state();
-        state.max_turn_input_tokens = 100_000;
-
-        // Set up collector with low error-streak threshold for testability.
-        let mut sig_cfg = StepSignalConfig::default();
-        sig_cfg.error_streak_threshold = 2;
-        state.step_signal_collector = Some(StepSignalCollector::new(sig_cfg, 100_000));
-
-        // Use a permissive dampener so actions fire easily.
-        let dampener_cfg = DampenerConfig {
-            min_calls_between_same_type: 1,
-            max_actions_per_turn: 10,
-            drift_freeze_threshold: 1.0,
-        };
-        state.tactical_adapter = Some(TacticalAdapter::new(dampener_cfg));
-
-        // Simulate 3 consecutive failures for the same tool
-        let records = vec![
-            ToolCallRecord {
-                name: "bash".into(),
-                ok: false,
-                ms: 100,
-                error: Some("exit code 1".into()),
-                input_bytes: Some(50),
-                output_bytes: Some(200),
-                args_preview: Some("ls -la".into()),
-                result_preview: Some("error".into()),
-                file_path: None,
-                surgically_removed: None,
-                original_tool_name: None,
-                ..Default::default()
-            },
-            ToolCallRecord {
-                name: "bash".into(),
-                ok: false,
-                ms: 120,
-                error: Some("exit code 1".into()),
-                input_bytes: Some(50),
-                output_bytes: Some(200),
-                args_preview: Some("cat foo".into()),
-                result_preview: Some("not found".into()),
-                file_path: None,
-                surgically_removed: None,
-                original_tool_name: None,
-                ..Default::default()
-            },
-            ToolCallRecord {
-                name: "bash".into(),
-                ok: false,
-                ms: 130,
-                error: Some("exit code 1".into()),
-                input_bytes: Some(50),
-                output_bytes: Some(200),
-                args_preview: Some("rm bar".into()),
-                result_preview: Some("permission denied".into()),
-                file_path: None,
-                surgically_removed: None,
-                original_tool_name: None,
-                ..Default::default()
-            },
-        ];
-
-        let evo_records_before = state.stall.tool_call_records.len();
-        state.stall.tool_call_records.extend(records);
-
-        // Replay the tactical wiring logic manually (mirrors the loop body)
-        let new_records: Vec<ToolCallRecord> =
-            state.stall.tool_call_records[evo_records_before..].to_vec();
-        let mut step_actions: Vec<TacticalAction> = Vec::new();
-
-        for rec in &new_records {
-            let outcome = astra_turn_core::liquid_step_signals::StepOutcome {
-                tool_name: rec.name.clone(),
-                ok: rec.ok,
-                latency_ms: rec.ms,
-                tokens_used: (rec.input_bytes.unwrap_or(0) + rec.output_bytes.unwrap_or(0)) as u64,
-                error_hint: rec.error.clone(),
-            };
-            let triggers = if let Some(ref mut collector) = state.step_signal_collector {
-                collector.record(outcome)
-            } else {
-                vec![]
-            };
-            if !triggers.is_empty() {
-                if let Some(ref mut adapter) = state.tactical_adapter {
-                    let actions = adapter.evaluate(&triggers);
-                    for action in actions {
-                        if !matches!(action, TacticalAction::NoOp) {
-                            step_actions.push(action);
-                        }
-                    }
-                    adapter.advance_step();
-                }
-            }
-        }
-
-        // We should see at least one non-NoOp action (IncreaseVerification or SuggestToolSwitch)
-        assert!(
-            !step_actions.is_empty(),
-            "3 consecutive errors should produce tactical actions, got none"
-        );
-
-        assert!(
-            step_actions.iter().any(|action| matches!(
-                action,
-                TacticalAction::IncreaseVerification { .. }
-                    | TacticalAction::SuggestToolSwitch { .. }
-            )),
-            "repeated failures should produce an actionable tactical response: {step_actions:?}"
-        );
-    }
-
-    #[test]
-    fn tactical_adapter_reset_clears_turn_state() {
-        use astra_turn_core::liquid_step_signals::{StepSignalCollector, StepSignalConfig};
-        use astra_turn_core::liquid_tactical::TacticalAdapter;
-
-        let mut state = make_state();
-        state.max_turn_input_tokens = 50_000;
-        state.step_signal_collector = Some(StepSignalCollector::new(
-            StepSignalConfig::default(),
-            50_000,
-        ));
-        state.tactical_adapter = Some(TacticalAdapter::new(
-            astra_turn_core::liquid_tactical::DampenerConfig::default(),
-        ));
-
-        // Record some outcomes
-        if let Some(ref mut collector) = state.step_signal_collector {
-            collector.record(astra_turn_core::liquid_step_signals::StepOutcome {
-                tool_name: "test".into(),
-                ok: false,
-                latency_ms: 100,
-                tokens_used: 500,
-                error_hint: Some("err".into()),
-            });
-        }
-
-        // Reset (mimics turn boundary logic)
-        if let Some(ref mut adapter) = state.tactical_adapter {
-            adapter.reset_turn();
-        }
-        if let Some(ref mut collector) = state.step_signal_collector {
-            let budget = state.max_turn_input_tokens;
-            collector.reset(budget);
-        }
-
-        // After reset, recording a single OK outcome should produce no triggers
-        let triggers = if let Some(ref mut collector) = state.step_signal_collector {
-            collector.record(astra_turn_core::liquid_step_signals::StepOutcome {
-                tool_name: "test".into(),
-                ok: true,
-                latency_ms: 50,
-                tokens_used: 100,
-                error_hint: None,
-            })
-        } else {
-            vec![]
-        };
-
-        assert!(
-            triggers.is_empty()
-                || triggers.iter().all(|t| matches!(
-                    t,
-                    astra_turn_core::liquid_step_signals::AdaptationTrigger::Nominal
-                )),
-            "After reset, a single OK call should not trigger error-based adaptation"
-        );
-    }
-
-    #[test]
-    fn tactical_adapter_noop_when_none() {
-        // When tactical fields are None, the code path just skips.
-        // This test ensures no panic.
-        let state = make_state();
-        assert!(state.tactical_adapter.is_none());
-        assert!(state.step_signal_collector.is_none());
-
-        // The guard condition in the loop body is:
-        // if state.step_signal_collector.is_some() || state.tactical_adapter.is_some()
-        // When both are None, the block is skipped entirely.
-        let should_enter =
-            state.step_signal_collector.is_some() || state.tactical_adapter.is_some();
-        assert!(!should_enter, "Neither field set — block should be skipped");
-    }
-
     // ── Skill deferral behavior tests ─────────────────────────────────────
 
     /// Helper: build a HostTurnResult with a skill call + non-skill tool calls.
@@ -14467,6 +14399,180 @@ mod parallel_execution_tests {
         assert_eq!(retry[0].payload, leased[0].payload);
         state.commit_volatile_attempt_lease();
         assert!(state.volatile_pending.is_empty());
+    }
+
+    #[test]
+    fn only_successfully_observed_leased_exact_response_clears_a_restored_question() {
+        for mismatch in ["none", "owner", "request", "sender", "not-leased"] {
+            let mut state = make_state();
+            state.current_run_id = Some("questioner".into());
+            let original = crate::messaging::reply_obligations::ReplyObligations::default();
+            original
+                .reserve(
+                    "questioner",
+                    "q1",
+                    astra_messaging::AgentAddress::new("parent-mailbox", "orchestrator"),
+                )
+                .unwrap();
+            let snapshot: astra_turn_types::ReplyObligationsSnapshotV1 = serde_json::from_slice(
+                &serde_json::to_vec(&original.snapshot("questioner", 3).unwrap()).unwrap(),
+            )
+            .unwrap();
+            state
+                .messaging
+                .reply_obligations
+                .restore(&snapshot, "questioner", 3)
+                .unwrap();
+            state.push_volatile_payload(VolatileKind::Mailbox, json!({
+                "schema": RETAINED_MAILBOX_CONTEXT_SCHEMA,
+                "message_kind": "response",
+                "message_id": "answer-envelope",
+                "response_request_id": if mismatch == "request" { "other-question" } else { "q1" },
+                "sender": {"run_id": if mismatch == "sender" { "stranger" } else { "parent-mailbox" }, "agent_id":"orchestrator"},
+                "display": "Use JSON.",
+                "delivery_count": 0,
+            }));
+            state.lease_volatile_pending().unwrap();
+            state.restore_volatile_attempt_lease();
+            assert!(state.messaging.reply_obligations.has_pending("questioner"));
+            if mismatch != "not-leased" {
+                state.lease_volatile_pending().unwrap();
+            }
+            if mismatch == "owner" {
+                state.current_run_id = Some("another-run".into());
+            }
+            state.commit_volatile_attempt_lease();
+            assert_eq!(
+                state.messaging.reply_obligations.has_pending("questioner"),
+                mismatch != "none",
+                "{mismatch}"
+            );
+        }
+    }
+
+    #[test]
+    fn mailbox_context_survives_an_intervening_assistant_decision() {
+        let mut state = make_state();
+        state.push_volatile_payload(
+            VolatileKind::Mailbox,
+            serde_json::json!({
+                "schema": RETAINED_MAILBOX_CONTEXT_SCHEMA,
+                "message_id": "question-1",
+                "display": "message id=question-1 from child: Which format?",
+            }),
+        );
+        state.push_volatile(VolatileKind::PolicyAdvisory, "one-decision advice");
+
+        let first = state.lease_volatile_pending().expect("first model request");
+        assert_eq!(first.len(), 2);
+        state.commit_volatile_attempt_lease();
+
+        let second = state.lease_volatile_pending().expect("next model request");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].kind, VolatileKind::Mailbox);
+        assert_eq!(
+            second[0].payload["message_id"],
+            first[0].payload["message_id"]
+        );
+        assert_eq!(second[0].payload["display"], first[0].payload["display"]);
+        state.commit_volatile_attempt_lease();
+        assert!(
+            state.volatile_pending.is_empty(),
+            "mailbox context is retained through one intervening decision, then retired"
+        );
+    }
+
+    #[test]
+    fn direct_child_result_is_delivered_twice_then_retained_for_settlement() {
+        let mut state = make_state();
+        state.push_volatile_payload(
+            VolatileKind::BackgroundTaskNotification,
+            serde_json::json!({
+                "schema": DIRECT_CHILD_RESULT_SCHEMA,
+                "children": [{"agent_id": "child", "status": "completed", "result": "large child result"}],
+            }),
+        );
+
+        state
+            .lease_volatile_pending()
+            .expect("first provider request");
+        state.commit_volatile_attempt_lease();
+        let retained = state
+            .volatile_pending
+            .first()
+            .expect("first delivery remains as evidence");
+        assert_eq!(retained.payload["delivery_count"], 1);
+        assert_eq!(retained.payload["observed_by_provider"], true);
+
+        state
+            .lease_volatile_pending()
+            .expect("bounded retry request");
+        state.commit_volatile_attempt_lease();
+        assert_eq!(state.volatile_pending[0].payload["delivery_count"], 2);
+        assert_eq!(
+            state.volatile_pending[0].payload["observed_by_provider"],
+            true
+        );
+        assert!(
+            state.volatile_pending[0].payload["children"][0]
+                .get("result")
+                .is_none()
+        );
+        assert!(
+            state
+                .lease_volatile_pending()
+                .expect("third provider request")
+                .is_empty()
+        );
+        let checkpoint = OriginalLoopExecutionFacts::capture(&state).expect("checkpoint");
+        let restored: OriginalLoopExecutionFacts =
+            serde_json::from_value(serde_json::to_value(checkpoint).unwrap()).unwrap();
+        let mut resumed = make_state();
+        resumed.volatile_pending = restored.pending_context;
+        assert!(
+            resumed
+                .lease_volatile_pending()
+                .expect("resumed provider request")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn commit_does_not_consume_mailbox_context_queued_after_the_attempt_started() {
+        let mut state = make_state();
+        state.push_volatile_payload(
+            VolatileKind::Mailbox,
+            serde_json::json!({
+                "schema": RETAINED_MAILBOX_CONTEXT_SCHEMA,
+                "message_id": "before-1",
+                "display": "before",
+                "delivery_count": 0,
+            }),
+        );
+        state.lease_volatile_pending().expect("first model request");
+        state.push_volatile_payload(
+            VolatileKind::Mailbox,
+            serde_json::json!({
+                "schema": RETAINED_MAILBOX_CONTEXT_SCHEMA,
+                "message_id": "after-1",
+                "display": "after",
+                "delivery_count": 0,
+            }),
+        );
+
+        state.commit_volatile_attempt_lease();
+
+        let after = state
+            .volatile_pending
+            .iter()
+            .find(|injection| injection.payload["message_id"] == "after-1")
+            .expect("new context must remain pending");
+        assert_eq!(after.payload["delivery_count"], 0);
+        assert!(
+            !after.payload["observed_by_provider"]
+                .as_bool()
+                .unwrap_or(false)
+        );
     }
 
     #[test]

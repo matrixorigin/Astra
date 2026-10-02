@@ -6,7 +6,6 @@ import {
   ListTodo,
   MessageSquare,
   Search,
-  Workflow,
   type LucideIcon,
 } from "lucide-react";
 import Link from "next/link";
@@ -126,12 +125,6 @@ export function AppShell({ children }: { children: ReactNode }) {
               label="Projects"
               icon={FolderKanban}
               active={pathname === "/projects" || pathname.startsWith("/projects/")}
-            />
-            <MobileNavItem
-              href="/harnesses"
-              label="Harnesses"
-              icon={Workflow}
-              active={pathname === "/harnesses"}
             />
           </nav>
         </div>

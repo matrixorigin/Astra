@@ -581,10 +581,10 @@ async fn cancelled_inference_recovery_and_settlement_close_their_physical_checko
         .expect("finish cancellation-safe terminal fixture");
     sqlx::query(
         "INSERT INTO inference_invocation_settlement_debts
-         (user_id, invocation_id, session_id, harness_run_id,
+         (user_id, invocation_id, session_id,
           terminal_status, terminal_fingerprint, usage_status,
           provider_delivery_state)
-         SELECT user_id, invocation_id, session_id, harness_run_id,
+         SELECT user_id, invocation_id, session_id,
                 status, terminal_fingerprint, usage_status,
                 provider_delivery_state
          FROM inference_invocations
@@ -2784,9 +2784,9 @@ async fn recovery_discards_unproven_success_without_blocking_later_settlement() 
     ] {
         sqlx::query(
             "INSERT INTO inference_invocation_settlement_debts
-             (user_id, invocation_id, session_id, harness_run_id,
+             (user_id, invocation_id, session_id,
               terminal_status, terminal_fingerprint, error_kind)
-             VALUES (?, ?, ?, NULL, ?, REPEAT(?, 64), ?)",
+             VALUES (?, ?, ?, ?, REPEAT(?, 64), ?)",
         )
         .bind(&user_id)
         .bind(plan.invocation_id())
@@ -3588,10 +3588,10 @@ async fn orphaned_settlement_debt_is_quarantined_out_of_the_active_batch() {
 
     sqlx::query(
         "INSERT INTO inference_invocation_settlement_debts
-         (user_id, invocation_id, session_id, harness_run_id,
+         (user_id, invocation_id, session_id,
           terminal_status, terminal_fingerprint, usage_status,
           provider_delivery_state)
-         VALUES (?, ?, ?, NULL, 'failed', REPEAT('e', 64), 'unavailable', 'unknown')",
+         VALUES (?, ?, ?, 'failed', REPEAT('e', 64), 'unavailable', 'unknown')",
     )
     .bind(&user_id)
     .bind(&invocation_id)
@@ -5477,20 +5477,6 @@ async fn concurrent_logical_cursor_readers_have_one_admission_winner_and_zero_pr
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
-async fn seed_harness_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, harness_run_id: &str) {
-    sqlx::query(
-        "INSERT INTO harness_runs
-         (harness_run_id, harness_id, version_id, user_id, session_id, status,
-          input_json, output_json, created_at, updated_at)
-         VALUES (?, 'skillify', 'skillify.v1', ?, NULL, 'running', '{}', '{}', NOW(6), NOW(6))",
-    )
-    .bind(harness_run_id)
-    .bind(user_id)
-    .execute(pool)
-    .await
-    .expect("seed harness inference owner");
-}
-
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
@@ -6071,7 +6057,7 @@ async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() 
         .await
         .expect("persist successful provider attempt");
     let pending_success_debt = sqlx::query(
-        "SELECT session_id, harness_run_id FROM inference_invocation_settlement_debts
+        "SELECT session_id FROM inference_invocation_settlement_debts
          WHERE user_id = ? AND invocation_id = ?",
     )
     .bind(&user_id)
@@ -6085,11 +6071,6 @@ async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() 
             .as_deref(),
         Some(session_id.as_str()),
         "recovery evidence must carry the canonical session owner"
-    );
-    assert_eq!(
-        pending_success_debt.get::<Option<String>, _>("harness_run_id"),
-        None,
-        "session recovery evidence must not fabricate a harness owner"
     );
     assert_eq!(
         begin_inference_provider_attempt(&shared_pool, &provider_attempt(&plan, 1))
@@ -6433,7 +6414,7 @@ async fn concurrent_run_and_session_admission_preserve_variant_owner_shapes() {
     session_result.expect("concurrent session-scoped admission");
 
     let rows = sqlx::query(
-        "SELECT scope_kind, session_id, run_id, harness_run_id
+        "SELECT scope_kind, session_id, run_id
          FROM inference_routes
          WHERE user_id = ? AND route_id IN (?, ?)
          ORDER BY scope_kind",
@@ -6451,7 +6432,6 @@ async fn concurrent_run_and_session_admission_preserve_variant_owner_shapes() {
             row.get::<Option<String>, _>("session_id").as_deref(),
             Some(session_id.as_str())
         );
-        assert_eq!(row.get::<Option<String>, _>("harness_run_id"), None);
         match scope_kind.as_str() {
             "run" => assert_eq!(
                 row.get::<Option<String>, _>("run_id").as_deref(),
@@ -6463,195 +6443,6 @@ async fn concurrent_run_and_session_admission_preserve_variant_owner_shapes() {
     }
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
-}
-
-#[tokio::test]
-#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
-#[serial]
-async fn harness_inference_is_owned_without_fabricated_session_coordinates() {
-    let (shared_pool, _) = common::setup_pool_and_settings().await;
-    let pool = shared_pool.get();
-    let suffix = Uuid::new_v4().simple().to_string();
-    let user_id = format!("harness-inf-user-{suffix}");
-    let harness_run_id = format!("harness-run-{suffix}");
-    seed_harness_run(pool, &user_id, &harness_run_id).await;
-
-    let input = InferenceInvocationInput {
-        user_id: user_id.clone(),
-        scope: InferenceInvocationScope::HarnessRun {
-            harness_run_id: harness_run_id.clone(),
-            operation_id: "skillify_extract".to_string(),
-            logical_attempt: 0,
-        },
-        offering_id: "offer-skillify".to_string(),
-        resolved_model_name: "skillify-model".to_string(),
-        upstream_model_name: "skillify-model".to_string(),
-        provider: "openai".to_string(),
-        purpose: InferencePurpose::SkillSynthesis,
-        execution_placement: ModelExecutionPlacement::Server,
-        access_kind: ModelAccessKind::SelfHosted,
-        run_authority: None,
-    };
-
-    let mut wrong_owner_input = input.clone();
-    wrong_owner_input.user_id = format!("other-{suffix}");
-    let wrong_owner = plan_inference_invocation(wrong_owner_input).expect("wrong owner plan");
-    assert_eq!(
-        admit_inference_invocation(&shared_pool, &wrong_owner)
-            .await
-            .expect_err("cross-user harness ownership must reject")
-            .kind,
-        ServiceErrorKind::NotFound
-    );
-
-    let plan = plan_inference_invocation(input).expect("harness inference plan");
-    admit_inference_invocation(&shared_pool, &plan)
-        .await
-        .expect("admit harness inference");
-    let route = sqlx::query(
-        "SELECT scope_kind, session_id, run_id, harness_run_id
-         FROM inference_routes WHERE user_id = ? AND route_id = ?",
-    )
-    .bind(&user_id)
-    .bind(plan.route_id())
-    .fetch_one(pool)
-    .await
-    .expect("load harness route");
-    assert_eq!(route.get::<String, _>("scope_kind"), "harness_run");
-    assert_eq!(route.get::<Option<String>, _>("session_id"), None);
-    assert_eq!(route.get::<Option<String>, _>("run_id"), None);
-    assert_eq!(
-        route.get::<Option<String>, _>("harness_run_id").as_deref(),
-        Some(harness_run_id.as_str())
-    );
-
-    for table in [
-        "model_request_context_events",
-        "inference_invocation_settlement_debts",
-        "inference_provider_attempts",
-        "inference_invocations",
-        "inference_routes",
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE user_id = ? AND harness_run_id = ?");
-        sqlx::query(&statement)
-            .bind(&user_id)
-            .bind(&harness_run_id)
-            .execute(pool)
-            .await
-            .unwrap_or_else(|error| panic!("cleanup `{statement}`: {error}"));
-    }
-    sqlx::query("DELETE FROM harness_runs WHERE user_id = ? AND harness_run_id = ?")
-        .bind(&user_id)
-        .bind(&harness_run_id)
-        .execute(pool)
-        .await
-        .expect("cleanup harness owner");
-}
-
-#[tokio::test]
-#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
-#[serial]
-async fn harness_inference_requires_running_authority_at_admission_and_provider_boundary() {
-    let (shared_pool, _) = common::setup_pool_and_settings().await;
-    let pool = shared_pool.get();
-    let suffix = Uuid::new_v4().simple().to_string();
-    let user_id = format!("harness-state-user-{suffix}");
-    let input_for = |harness_run_id: &str, logical_attempt: u32| InferenceInvocationInput {
-        user_id: user_id.clone(),
-        scope: InferenceInvocationScope::HarnessRun {
-            harness_run_id: harness_run_id.to_string(),
-            operation_id: "skillify_state_fence".to_string(),
-            logical_attempt,
-        },
-        offering_id: "offer-skillify-state".to_string(),
-        resolved_model_name: "skillify-model".to_string(),
-        upstream_model_name: "skillify-model".to_string(),
-        provider: "openai".to_string(),
-        purpose: InferencePurpose::SkillSynthesis,
-        execution_placement: ModelExecutionPlacement::Server,
-        access_kind: ModelAccessKind::SelfHosted,
-        run_authority: None,
-    };
-
-    let mut harness_run_ids = Vec::new();
-    for (logical_attempt, status) in ["completed", "waiting_for_review", "reviewed", "failed"]
-        .into_iter()
-        .enumerate()
-    {
-        let harness_run_id = format!("harness-closed-{logical_attempt}-{suffix}");
-        seed_harness_run(pool, &user_id, &harness_run_id).await;
-        sqlx::query(
-            "UPDATE harness_runs SET status = ?, updated_at = NOW(6)
-             WHERE user_id = ? AND harness_run_id = ?",
-        )
-        .bind(status)
-        .bind(&user_id)
-        .bind(&harness_run_id)
-        .execute(pool)
-        .await
-        .expect("close harness before inference admission");
-        let plan = plan_inference_invocation(input_for(
-            &harness_run_id,
-            u32::try_from(logical_attempt).expect("bounded logical attempt"),
-        ))
-        .expect("plan closed harness inference");
-        assert_eq!(
-            admit_inference_invocation(&shared_pool, &plan)
-                .await
-                .expect_err("non-running harness must not admit inference")
-                .kind,
-            ServiceErrorKind::NotFound
-        );
-        harness_run_ids.push(harness_run_id);
-    }
-
-    let boundary_run_id = format!("harness-boundary-{suffix}");
-    seed_harness_run(pool, &user_id, &boundary_run_id).await;
-    let boundary_plan =
-        plan_inference_invocation(input_for(&boundary_run_id, 10)).expect("boundary plan");
-    admit_inference_invocation(&shared_pool, &boundary_plan)
-        .await
-        .expect("running harness admits logical inference");
-    sqlx::query(
-        "UPDATE harness_runs SET status = 'completed', updated_at = NOW(6)
-         WHERE user_id = ? AND harness_run_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&boundary_run_id)
-    .execute(pool)
-    .await
-    .expect("close harness before provider boundary");
-    assert_eq!(
-        begin_inference_provider_attempt(&shared_pool, &provider_attempt(&boundary_plan, 0))
-            .await
-            .expect_err("terminal harness must fence provider I/O")
-            .kind,
-        ServiceErrorKind::NotFound
-    );
-    harness_run_ids.push(boundary_run_id);
-
-    for table in [
-        "model_request_context_events",
-        "inference_invocation_settlement_debts",
-        "inference_provider_attempts",
-        "inference_invocations",
-        "inference_routes",
-    ] {
-        let statement = format!("DELETE FROM {table} WHERE user_id = ?");
-        sqlx::query(&statement)
-            .bind(&user_id)
-            .execute(pool)
-            .await
-            .unwrap_or_else(|error| panic!("cleanup `{statement}`: {error}"));
-    }
-    for harness_run_id in harness_run_ids {
-        sqlx::query("DELETE FROM harness_runs WHERE user_id = ? AND harness_run_id = ?")
-            .bind(&user_id)
-            .bind(&harness_run_id)
-            .execute(pool)
-            .await
-            .expect("cleanup harness state owner");
-    }
 }
 
 #[tokio::test]
@@ -7309,11 +7100,11 @@ async fn combined_successful_settlement_fails_closed_with_multiple_open_attempts
     let shadow_attempt_id = format!("shadow-{suffix}");
     sqlx::query(
         "INSERT INTO inference_provider_attempts
-         (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id,
+         (attempt_id, invocation_id, user_id, session_id, run_id,
           attempt_index, provider, admission_token, provider_protocol,
           provider_wire_hash, provider_wire_bytes, status, usage_status,
           started_at, terminal_at)
-         SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
+         SELECT ?, invocation_id, user_id, session_id, run_id,
                 attempt_index + 1, provider, ?, provider_protocol,
                 provider_wire_hash, provider_wire_bytes, 'started', 'unavailable',
                 NOW(6), NULL
@@ -7407,10 +7198,10 @@ async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
         let invocation_id = format!("fair-inv-{index}-{suffix}");
         sqlx::query(
             "INSERT INTO inference_routes
-             (route_id, user_id, session_id, scope_kind, run_id, harness_run_id,
+             (route_id, user_id, session_id, scope_kind, run_id,
               offering_id, resolved_model_name, upstream_model_name, provider,
               execution_placement, access_kind, purpose, created_at)
-             VALUES (?, ?, ?, 'session', NULL, NULL, 'fair-offering', 'fair-model',
+             VALUES (?, ?, ?, 'session', NULL, 'fair-offering', 'fair-model',
                      'fair-model', 'openai', 'server', 'self_hosted',
                      'primary_agent', NOW(6))",
         )
@@ -7423,11 +7214,11 @@ async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
         sqlx::query(
             "INSERT INTO inference_invocations
              (invocation_id, route_id, user_id, session_id, scope_kind, run_id,
-              harness_run_id, admission_token, owner_token, owner_generation,
+              admission_token, owner_token, owner_generation,
               owner_lease_expires_at, turn_index, round_index, operation_id,
               logical_attempt, purpose, status, terminal_fingerprint, usage_status,
               provider_delivery_state, created_at, terminal_at)
-             VALUES (?, ?, ?, ?, 'session', NULL, NULL, ?, ?, 1,
+             VALUES (?, ?, ?, ?, 'session', NULL, ?, ?, 1,
                      TIMESTAMP('1970-01-01 00:00:00.000001'), 1, ?, 'fair_recovery', 0,
                      'primary_agent', 'admitted', NULL, 'unavailable', 'unknown',
                      NOW(6), NULL)",

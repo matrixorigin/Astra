@@ -17,7 +17,8 @@
 //!
 //! Every method must be panic-free. When underlying data is absent (empty
 //! journal, missing task board, unlimited budget), methods return sensible
-//! zero/default values rather than panicking or returning `Option`.
+//! zero/default values rather than panicking. Ratios without a measured
+//! denominator return `None`, not a fabricated zero.
 
 use astra_core::observation_journal::{JournalFacts, MetricTrend};
 
@@ -31,8 +32,8 @@ pub trait LiveRuntimeProvider: Send + Sync {
 
     /// Ratio of prompt-cache reads to total input tokens for the current live
     /// runtime snapshot, 0.0–1.0. This is not a durable session aggregate.
-    /// Returns 0.0 when no input tokens have been consumed.
-    fn cache_hit_ratio(&self) -> f64;
+    /// Returns `None` when no input denominator has been observed.
+    fn cache_hit_ratio(&self) -> Option<f64>;
 
     /// Error rate across recent tool calls, 0.0–1.0.
     /// Returns 0.0 when no tool records exist.

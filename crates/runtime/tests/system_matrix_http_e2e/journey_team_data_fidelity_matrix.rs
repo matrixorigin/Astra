@@ -11,7 +11,7 @@ fn fidelity_team_payload(name: &str) -> Value {
     json!({
         "name": name,
         "description": "data fidelity probe",
-        "coordination": { "type": "pipeline" },
+        "coordination": { "type": "sequential", "stop_on_success": false },
         "members": [
             {
                 "role": "coder",

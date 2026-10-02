@@ -1109,6 +1109,8 @@ pub struct CoordinationMeta {
 /// and pagination; consumers must never use message text as an identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JournalTranscriptItem {
+    /// The accepted model item, distinct from this journal receipt's identity.
+    pub model_item_id: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_event_id: String,
     pub run_id: String,
@@ -1384,6 +1386,17 @@ pub enum ToolPreDispatchRejection {
 }
 
 impl ToolCallDisposition {
+    pub fn terminal_event_type(self, ok: bool) -> &'static str {
+        match self {
+            Self::Executed if ok => "tool_call_completed",
+            Self::Executed => "tool_call_failed",
+            Self::Rejected => "tool_call_rejected",
+            Self::Reused => "tool_call_reused",
+            Self::Suppressed => "tool_call_suppressed",
+            Self::Deferred => "tool_call_deferred",
+        }
+    }
+
     /// Shared projection of executor-owned metadata. A route dispatch is not
     /// proof that the requested operation started; explicit non-execution must
     /// not be promoted to execution by a caller's fallback.
@@ -1489,14 +1502,7 @@ impl ToolCallRecord {
     /// trace persistence, transcripts, and audit analytics from inventing
     /// incompatible interpretations of the same disposition.
     pub fn canonical_terminal_event_type(&self) -> &'static str {
-        match self.effective_disposition() {
-            ToolCallDisposition::Executed if self.ok => "tool_call_completed",
-            ToolCallDisposition::Executed => "tool_call_failed",
-            ToolCallDisposition::Rejected => "tool_call_rejected",
-            ToolCallDisposition::Reused => "tool_call_reused",
-            ToolCallDisposition::Suppressed => "tool_call_suppressed",
-            ToolCallDisposition::Deferred => "tool_call_deferred",
-        }
+        self.effective_disposition().terminal_event_type(self.ok)
     }
 
     pub fn effective_disposition(&self) -> ToolCallDisposition {
@@ -5776,8 +5782,11 @@ impl JournalEvent {
         } else {
             message.clone()
         };
+        // Redacted projections retain receipt identity, not model coverage.
+        let model_item_id = astra_turn_types::model_item_id(&message).map(str::to_string);
         let mut event = Self::base(JournalEventType::TranscriptItem, Some(session_id));
         event.transcript_item = Some(JournalTranscriptItem {
+            model_item_id,
             source_event_id: local_transcript_source_event_id(
                 session_id, run_id, agent_id, item_seq,
             ),
@@ -10731,8 +10740,23 @@ mod tests {
         assert!(user.starts_with("<redacted:"));
         assert!(asst.starts_with("<redacted:"));
 
+        let mut message = serde_json::json!({"role":"assistant", "content":"secret answer"});
+        astra_turn_types::mark_model_message(&mut message, Some("model-A"));
+        let redacted = JournalEvent::transcript_item("s1", "r1", "a1", 1, &message)
+            .unwrap()
+            .transcript_item
+            .unwrap();
+        assert!(redacted.model_item_id.is_none());
+        assert!(!redacted.message.to_string().contains("secret answer"));
+
         // ── Turn event keeps content when env unset ──
         unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
+        let visible = JournalEvent::transcript_item("s1", "r1", "a1", 1, &message)
+            .unwrap()
+            .transcript_item
+            .unwrap();
+        assert_eq!(visible.model_item_id.as_deref(), Some("model-A"));
+        assert_eq!(visible.source_event_id, redacted.source_event_id);
         let evt = JournalEvent::turn(
             Some("s1"),
             1,
@@ -10751,6 +10775,7 @@ mod tests {
         let message = serde_json::json!({
             "role": "assistant",
             "content": "child answer",
+            "model_item_id": "accepted-A",
             "reasoning_content": "checked the invariant",
         });
         let evt =
@@ -10767,6 +10792,7 @@ mod tests {
         assert_eq!(payload.run_id, "local-run");
         assert_eq!(payload.agent_id, "reviewer");
         assert_eq!(payload.item_seq, 7);
+        assert_eq!(payload.model_item_id.as_deref(), Some("accepted-A"));
         assert_eq!(payload.message, message);
         let retry = JournalEvent::transcript_item(
             "parent-session",

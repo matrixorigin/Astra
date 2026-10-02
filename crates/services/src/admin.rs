@@ -54,21 +54,6 @@ pub struct AdminAuditRecord {
     pub details: Option<serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AdminFeedbackStatsFilter {
-    pub agent_id: Option<String>,
-    pub since: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AdminFeedbackStatsRecord {
-    pub total_feedback: i64,
-    pub positive_feedback: i64,
-    pub negative_feedback: i64,
-    pub avg_rating: Option<f64>,
-    pub feedback_by_type: serde_json::Map<String, serde_json::Value>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdminInitRecord {
     pub message: String,
@@ -123,14 +108,6 @@ pub trait AdminAuditReader: Send + Sync {
         &self,
         filter: AdminAuditFilter,
     ) -> Result<Vec<AdminAuditRecord>, (StatusCode, Json<ErrorResponse>)>;
-}
-
-#[async_trait]
-pub trait AdminFeedbackStatsReader: Send + Sync {
-    async fn read_feedback_stats(
-        &self,
-        filter: AdminFeedbackStatsFilter,
-    ) -> Result<AdminFeedbackStatsRecord, (StatusCode, Json<ErrorResponse>)>;
 }
 
 #[async_trait]

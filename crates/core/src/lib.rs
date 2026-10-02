@@ -844,7 +844,6 @@ mod connection_quota_tests {
 pub mod composite_snapshot;
 pub mod confidence;
 pub mod config;
-pub mod delegation;
 pub mod drift;
 pub mod error_kind;
 pub mod feedback;
@@ -878,9 +877,9 @@ pub use observation::{
     ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
     ObservationGraphNodeKind, ObservationGraphSlice, ObservationHorizon,
     ObservationProviderCoverage, ObservationRecord, ObservationTopic, ObservationView,
-    SourcePolicy, ToolCallSample, ToolFamily, TurnMetrics, Urn, classify_event_kind,
-    classify_tool_family, normalize_observation_arg, push_graph_edge, push_graph_node,
-    truncate_graph_summary, urn_component,
+    SourcePolicy, ToolCallSample, ToolFamily, TurnMetrics, Urn, budget_observation_support,
+    classify_event_kind, classify_tool_family, normalize_observation_arg, observation_priority_key,
+    push_graph_edge, push_graph_node, truncate_graph_summary, urn_component,
 };
 pub use observation_journal::{
     JournalEntry, JournalFacts, MetricTrend, ObservationJournal, StrategyVerification,

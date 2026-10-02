@@ -112,6 +112,38 @@ The existing owner lease and durable Edge dispatch relay own cross-pod
 execution. A new scheduler, sticky-session requirement, or process-local
 parallel state machine must not be introduced to make a scale test pass.
 
+Direct-child completion waits are a delivery concern, not a new lifecycle
+authority. Local children notify their parent in memory. Remotely owned
+children are observed by one Server-instance coordinator that batches exact
+owner/session/run identities across waiting sessions; it reads existing
+durable facts and only wakes the affected parents. A parent must not start
+its own fixed-interval database poll. With no remote waiters, the coordinator
+makes no database requests. A wakeup is only a hint: the parent revalidates
+the durable status and result before final synthesis. Capacity evidence must
+count the pre-existing run-control and live-stream observers as well as this
+coordinator, rather than presenting the coordinator's isolated query rate as
+the deployment total.
+
+A parent awaiting children must not retain an execution permit, weighted
+admission reservation, full agentic-loop state, or per-run control poll for the
+duration of the wait. It may retain the logical session-writing exclusion, but
+must durably record a continuation before releasing execution ownership. A
+child-completion hint resumes that continuation through normal capacity
+admission and generation fencing; it cannot synthesize an answer from a stale
+in-memory parent. Cancellation and explicit user pause take precedence over
+automatic resume. A normal conversation with no child wait does not pay this
+checkpoint or observer cost. Merely batching child polls while leaving the
+parent loop alive does not meet the multi-session scale target.
+
+The staged shared observer does not yet satisfy this whole invariant: parent
+parking, durable same-run continuation, and automatic re-admission remain
+required before claiming scale for 1,000 waiting parents. Current recovery
+also fails explicitly when one selected set exceeds 1,024 exact IDs or its
+event projection exceeds 2,048 rows, 16 MiB total, or 2 MiB per event. These
+limits prevent silent omission and unbounded loading; they are not a substitute
+for paged discovery and a completeness-aware parent barrier for very large
+fan-in.
+
 ## Admission and failure behavior
 
 - A run waits only at the existing bounded admission boundary; the local
@@ -138,6 +170,9 @@ Every capacity change reports, per workload and per pod count:
 - run RSS and retained live-event bytes;
 - provider request rate, token rate, time to first token, and error rate;
 - durable event/control-plane QPS and end-to-end turn latency.
+- for 1,000 waiting parents: execution permits and weighted reservations held,
+  retained parent state bytes, observer queries per second, resume queue depth,
+  and ordinary-turn admission latency while children complete in a burst.
 
 Measure observer read QPS separately for idle, active, and terminal runs, with
 SSE and WebSocket attachments on both owner and other pods. Include event-tail

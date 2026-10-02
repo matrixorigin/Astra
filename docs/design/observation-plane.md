@@ -222,6 +222,17 @@ failed_at
 
 ## Model request attribution and usage
 
+For local CLI child runs, the existing `agent_spawned` journal and Trace event
+carry a credential-free `model_configuration` snapshot: effective thinking and
+first-output cap at spawn, the requested Offering when known, and a prepared
+Offering/model identity when available. `catalog_resolved` means directory
+resolution only; `admission_validated` means batch admission passed before
+launch. The requested Offering may be inherited, not explicitly chosen by the
+user. These are spawn-time configuration facts, never proof that a provider
+accepted the request or consumed a particular reasoning level. Actual request
+and usage attribution remains with inference evidence; absent evidence is
+unknown, not zero.
+
 The inference ledger stores content-free accepted/terminal request diagnostics
 in `model_request_context_events`. These records complement `agent_events` and
 are exposed through the existing owner-scoped request queries and session
@@ -259,6 +270,24 @@ Usage coverage is independent of request outcome:
   a complete input measurement, budget estimate error, or cache-read share.
 - `unavailable`: usage and measured diagnostic fields are absent. Placeholder
   zeroes in legacy records are not evidence of zero-token billing.
+
+Session Audit request usage reads retained physical provider attempts for the
+authenticated owner and session. It counts failures, cancellation and unknown
+delivery as attempts; each token lane reports a known sum and the number of
+attempts that observed that lane. A missing lane is unknown, not zero. This
+snapshot is not proof that retained records cover the session's lifetime.
+Inference routes retain optional admission-time price snapshots. Session Audit
+does not yet join those snapshots with every physical attempt or prove complete
+historical price and usage coverage, so its cost remains unavailable with
+`historical_attempt_coverage_incomplete`. Current catalog prices or a display
+model name cannot fill those gaps or price historical requests reliably.
+
+Live runtime and feedback cache-read percentages require a positive observed
+input-token denominator. With no input measurement they display `unknown`, not
+`0%`; an observed positive input with zero cache reads may display `0%`.
+This live snapshot is not a durable session or task-tree usage aggregate.
+It does not establish whether a provider omitted cache buckets; request-ledger
+usage coverage remains authoritative for that distinction.
 
 Accepted events have no provider measurements. Terminal diagnostics with
 unavailable usage store nullable token columns as `NULL`. Aggregate request

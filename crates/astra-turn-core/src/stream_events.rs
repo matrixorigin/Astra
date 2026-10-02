@@ -386,6 +386,7 @@ pub fn build_tool_request_event(
     identity: &EdgeDispatchIdentity,
     execution_timeout_ms: u64,
     execution_deadline_unix_ms: u64,
+    read_only_execution: bool,
 ) -> Map<String, Value> {
     let edge = build_edge_tool_call_event(tool_call);
     let tool = edge
@@ -425,6 +426,12 @@ pub fn build_tool_request_event(
         (
             "execution_deadline_unix_ms".to_string(),
             Value::from(execution_deadline_unix_ms),
+        ),
+        // This is a monotonic child ceiling. A client may only preserve or
+        // tighten it; local approval must never widen it.
+        (
+            "read_only_execution".to_string(),
+            Value::Bool(read_only_execution),
         ),
         ("tool".to_string(), tool),
         ("args".to_string(), args),
@@ -634,7 +641,7 @@ mod tests {
             ),
         ]);
         let identity = EdgeDispatchIdentity::new("u1", "s1", "r1", "chain1", "call_abc");
-        let ev = build_tool_request_event(&tc, &identity, 300_000, 1_700_000_300_000);
+        let ev = build_tool_request_event(&tc, &identity, 300_000, 1_700_000_300_000, false);
         assert_eq!(ev.get("type").and_then(Value::as_str), Some("tool_request"));
         assert_eq!(ev.get("session_id").and_then(Value::as_str), Some("s1"));
         assert_eq!(ev.get("run_id").and_then(Value::as_str), Some("r1"));
@@ -653,6 +660,10 @@ mod tests {
         assert_eq!(
             ev.get("execution_timeout_ms").and_then(Value::as_u64),
             Some(300_000)
+        );
+        assert_eq!(
+            ev.get("read_only_execution").and_then(Value::as_bool),
+            Some(false)
         );
         assert_eq!(ev.get("tool").and_then(Value::as_str), Some("bash"));
     }
@@ -1109,7 +1120,7 @@ mod tests {
             json!({"name": "read_file", "arguments": "{}"}),
         )]);
         let identity = EdgeDispatchIdentity::new("u1", "s1", "r1", "chain1", "call_missing");
-        let ev = build_tool_request_event(&tc, &identity, 300_000, 1_700_000_300_000);
+        let ev = build_tool_request_event(&tc, &identity, 300_000, 1_700_000_300_000, false);
         assert_eq!(
             ev.get("request_id").and_then(Value::as_str),
             Some("call_missing")

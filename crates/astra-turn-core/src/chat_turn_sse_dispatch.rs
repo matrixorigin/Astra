@@ -187,6 +187,8 @@ impl StreamRootIdentity {
 /// State collected from one `/chat/turn` SSE stream (excluding edge executor bookkeeping).
 #[derive(Debug, Clone, Default)]
 pub struct ChatTurnSseAccum {
+    /// Origin of the current output, independent of the physical receipt/event id.
+    pub model_item_id: Option<String>,
     pub session_id: Option<String>,
     pub run_id: Option<String>,
     /// Durable guidance that the exact physical root incorporated while the
@@ -550,8 +552,14 @@ pub enum SseRenderEffect {
     StopThinkingSpinner,
     StartThinkingSpinner,
     /// Incremental reasoning chunk for a compact terminal preview (CLI).
-    ThinkingPreviewChunk(String),
-    StreamText(String),
+    ThinkingPreviewChunk {
+        model_item_id: Option<String>,
+        text: String,
+    },
+    StreamText {
+        model_item_id: Option<String>,
+        text: String,
+    },
 }
 
 fn normalize_tool_call_for_accum(event: &Value) -> Result<Value, &'static str> {
@@ -785,16 +793,36 @@ fn apply_one_event(
     }
     match etype {
         "text_delta" => {
+            if let Some(id) = event.get("model_item_id").and_then(Value::as_str) {
+                if accum
+                    .model_item_id
+                    .as_deref()
+                    .is_some_and(|previous| previous != id)
+                {
+                    accum.full_text.clear();
+                }
+                accum.model_item_id = Some(id.to_string());
+            }
             if accum.thinking_active {
                 accum.thinking_active = false;
                 effects.push(SseRenderEffect::StopThinkingSpinner);
             }
             if let Some(content) = event.get("content").and_then(|v| v.as_str()) {
                 accum.full_text.push_str(content);
-                effects.push(SseRenderEffect::StreamText(content.to_string()));
+                effects.push(SseRenderEffect::StreamText {
+                    model_item_id: event
+                        .get("model_item_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    text: content.to_string(),
+                });
             }
         }
         "text_done" => {
+            accum.model_item_id = event
+                .get("model_item_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             if let Some(ft) = event.get("full_text").and_then(|v| v.as_str()) {
                 let was_empty = accum.full_text.is_empty();
                 // Durable/replayed server streams may contain only the
@@ -811,7 +839,13 @@ fn apply_one_event(
                         accum.thinking_active = false;
                         effects.push(SseRenderEffect::StopThinkingSpinner);
                     }
-                    effects.push(SseRenderEffect::StreamText(ft.to_string()));
+                    effects.push(SseRenderEffect::StreamText {
+                        model_item_id: event
+                            .get("model_item_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        text: ft.to_string(),
+                    });
                 }
             }
         }
@@ -823,7 +857,13 @@ fn apply_one_event(
             if let Some(chunk) = event.get("content").and_then(|v| v.as_str()) {
                 accum.reasoning_content.push_str(chunk);
                 if !chunk.is_empty() {
-                    effects.push(SseRenderEffect::ThinkingPreviewChunk(chunk.to_string()));
+                    effects.push(SseRenderEffect::ThinkingPreviewChunk {
+                        model_item_id: event
+                            .get("model_item_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        text: chunk.to_string(),
+                    });
                 }
             }
         }
@@ -1920,6 +1960,45 @@ mod tests {
     }
 
     #[test]
+    fn replayed_model_fragments_retain_each_event_identity_not_the_last_accumulator_id() {
+        let mut accum = ChatTurnSseAccum::default();
+        let mut projected = Vec::new();
+        for event in [
+            serde_json::json!({"type":"text_delta", "model_item_id":"accepted-A", "content":"same"}),
+            serde_json::json!({"type":"reasoning_delta", "model_item_id":"partial-P", "content":"partial"}),
+            serde_json::json!({"type":"text_delta", "model_item_id":"resume-B", "content":"same"}),
+            serde_json::json!({"type":"text_delta", "content":"unknown"}),
+        ] {
+            for effect in dispatch_chat_turn_sse_event_block(
+                &format!("data: {event}\n\n"),
+                &mut accum,
+                &mut Vec::new(),
+            ) {
+                match effect {
+                    SseRenderEffect::StreamText {
+                        model_item_id,
+                        text,
+                    } => projected.push(("output", model_item_id, text)),
+                    SseRenderEffect::ThinkingPreviewChunk {
+                        model_item_id,
+                        text,
+                    } => projected.push(("reasoning", model_item_id, text)),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            projected,
+            vec![
+                ("output", Some("accepted-A".into()), "same".into()),
+                ("reasoning", Some("partial-P".into()), "partial".into()),
+                ("output", Some("resume-B".into()), "same".into()),
+                ("output", None, "unknown".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn parse_utf8_body_roundtrip_text() {
         let body = format!(
             "{}{}",
@@ -2061,7 +2140,7 @@ mod tests {
         let chunks: Vec<&str> = efx
             .iter()
             .filter_map(|e| match e {
-                SseRenderEffect::ThinkingPreviewChunk(s) => Some(s.as_str()),
+                SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => Some(s.as_str()),
                 _ => None,
             })
             .collect();
@@ -3155,7 +3234,7 @@ mod tests {
         assert_eq!(a.full_text, "complete answer");
         assert!(
             effects.iter().any(
-                |effect| matches!(effect, SseRenderEffect::StreamText(text) if text == "complete answer")
+                |effect| matches!(effect, SseRenderEffect::StreamText { text, .. } if text == "complete answer")
             ),
             "terminal text learned from a replay must enter the render lane"
         );
@@ -3186,7 +3265,7 @@ mod tests {
         let chunks: Vec<&str> = efx
             .iter()
             .filter_map(|e| match e {
-                SseRenderEffect::ThinkingPreviewChunk(s) => Some(s.as_str()),
+                SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => Some(s.as_str()),
                 _ => None,
             })
             .collect();
@@ -4066,7 +4145,7 @@ mod tests {
         );
         assert!(
             !efx.iter()
-                .any(|e| matches!(e, SseRenderEffect::ThinkingPreviewChunk(_)))
+                .any(|e| matches!(e, SseRenderEffect::ThinkingPreviewChunk { .. }))
         );
     }
 

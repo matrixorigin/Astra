@@ -5,6 +5,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+use astra_turn_core::provider_resolution::{
+    ProviderClaimTrustPolicy, ResolvedInvocationPolicy, ResolvedProviderPolicyIndex,
+    resolve_provider_snapshot,
+};
+use astra_turn_types::{NativeToolId, ProviderClaimTrust, PublicToolAlias};
 use rmcp::model::{
     CallToolResult, CompleteResult, GetPromptResult, Prompt, Reference, Resource, Root, Tool,
 };
@@ -14,7 +19,8 @@ use tokio::sync::RwLock;
 use crate::connection::{self, McpConnection};
 use crate::error::McpError;
 use crate::tools::{
-    McpToolCallResult, extract_tool_call_result, mcp_tool_to_schema, sanitize_tool_name,
+    McpToolCallResult, extract_tool_call_result, mcp_tool_to_schema,
+    mcp_tools_to_provider_snapshot, sanitize_tool_name,
 };
 use crate::types::{ConnectionState, McpServerConfig};
 
@@ -38,6 +44,45 @@ pub struct McpToolCollision {
     pub sources: Vec<McpToolCollisionSource>,
 }
 
+/// Immutable route, policy, and connection selected together for one MCP
+/// invocation. Admission must use this object instead of resolving the
+/// effect and transport route in separate lookups.
+#[derive(Clone)]
+pub struct PreparedMcpToolCall {
+    server_name: String,
+    original_tool_name: String,
+    connection: Arc<McpConnection>,
+    policy: ResolvedInvocationPolicy,
+}
+
+impl PreparedMcpToolCall {
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
+
+    pub fn original_tool_name(&self) -> &str {
+        &self.original_tool_name
+    }
+
+    pub fn connection(&self) -> Arc<McpConnection> {
+        self.connection.clone()
+    }
+
+    pub fn policy(&self) -> &ResolvedInvocationPolicy {
+        &self.policy
+    }
+
+    pub async fn call(
+        &self,
+        arguments: Value,
+        protocol_metadata: Option<serde_json::Map<String, Value>>,
+    ) -> Result<CallToolResult, rmcp::ServiceError> {
+        self.connection
+            .call_tool_with_metadata(&self.original_tool_name, arguments, protocol_metadata)
+            .await
+    }
+}
+
 /// MCP client manager for multiple server connections.
 pub struct McpClientManager {
     connections: HashMap<String, Arc<McpConnection>>,
@@ -45,6 +90,8 @@ pub struct McpClientManager {
     tool_routes_by_public_name: HashMap<String, McpToolRoute>,
     /// Collisions detected during the last tool route index rebuild.
     tool_collisions: Vec<McpToolCollision>,
+    /// Resolver-owned policies for the same aliases as the route index.
+    provider_policy_index: ResolvedProviderPolicyIndex,
     /// Shared roots list — returned to servers via `roots/list`.
     roots: Arc<RwLock<Vec<Root>>>,
 }
@@ -75,6 +122,7 @@ impl Default for McpClientManager {
             states: HashMap::new(),
             tool_routes_by_public_name: HashMap::new(),
             tool_collisions: Vec::new(),
+            provider_policy_index: ResolvedProviderPolicyIndex::default(),
             roots: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -247,6 +295,34 @@ impl McpClientManager {
         None
     }
 
+    /// Prepare one public MCP alias. Route, connection, and resolver policy
+    /// are captured from the same manager snapshot, so a later reconnect
+    /// cannot make admission describe a different invocation.
+    pub fn prepare_tool_call_by_mcp_name(
+        &self,
+        mcp_name: &str,
+    ) -> Result<PreparedMcpToolCall, McpError> {
+        let route = self
+            .tool_routes_by_public_name
+            .get(mcp_name)
+            .ok_or_else(|| McpError::ToolNotFound(mcp_name.to_string()))?;
+        let connection = self
+            .connections
+            .get(&route.server_name)
+            .ok_or_else(|| McpError::ServerNotConnected(route.server_name.clone()))?;
+        let policy = self
+            .provider_policy_index
+            .resolve(mcp_name)
+            .cloned()
+            .ok_or_else(|| McpError::ToolPolicyUnavailable(mcp_name.to_string()))?;
+        Ok(PreparedMcpToolCall {
+            server_name: route.server_name.clone(),
+            original_tool_name: route.original_tool_name.clone(),
+            connection: connection.clone(),
+            policy,
+        })
+    }
+
     /// Call a tool by its original name, routing to the correct server.
     pub async fn call_tool(
         &self,
@@ -285,17 +361,9 @@ impl McpClientManager {
         arguments: Value,
         protocol_metadata: Option<serde_json::Map<String, Value>>,
     ) -> Result<McpToolCallResult, McpError> {
-        let (server_name, original_name) = self
-            .find_tool_by_mcp_name(mcp_name)
-            .ok_or_else(|| McpError::ToolNotFound(mcp_name.to_string()))?;
-
-        let conn = self
-            .connections
-            .get(server_name)
-            .ok_or_else(|| McpError::ServerNotConnected(server_name.to_string()))?;
-
-        let result = conn
-            .call_tool_with_metadata(original_name, arguments, protocol_metadata)
+        let prepared = self.prepare_tool_call_by_mcp_name(mcp_name)?;
+        let result = prepared
+            .call(arguments, protocol_metadata)
             .await
             .map_err(McpError::Service)?;
 
@@ -475,7 +543,76 @@ impl McpClientManager {
         }
         self.tool_routes_by_public_name = routes;
         self.tool_collisions = collisions;
+        self.provider_policy_index =
+            build_provider_policy_index(self.all_tools()).unwrap_or_else(|error| {
+                tracing::error!(
+                    error = %error,
+                    "MCP provider policy resolution failed; unresolved tools fail closed"
+                );
+                ResolvedProviderPolicyIndex::default()
+            });
     }
+}
+
+fn build_provider_policy_index<'a, I>(
+    tools: I,
+) -> Result<
+    ResolvedProviderPolicyIndex,
+    astra_turn_core::provider_resolution::ProviderResolutionError,
+>
+where
+    I: IntoIterator<Item = (&'a str, &'a Tool)>,
+{
+    let mut tools_by_server: std::collections::BTreeMap<String, Vec<Tool>> =
+        std::collections::BTreeMap::new();
+    for (server, tool) in tools {
+        tools_by_server
+            .entry(server.to_string())
+            .or_default()
+            .push(tool.clone());
+    }
+
+    let trust_policy = ProviderClaimTrustPolicy {
+        // A CLI user explicitly enabled this MCP binding. The claim is still
+        // resolved by the canonical provider resolver; this is the host trust
+        // decision, not a raw annotation classifier.
+        standard_protocols: std::collections::BTreeMap::from([(
+            "mcp".to_string(),
+            ProviderClaimTrust::Trusted,
+        )]),
+        ..Default::default()
+    };
+    let mut snapshots = Vec::with_capacity(tools_by_server.len());
+    for (server, tools) in tools_by_server {
+        let discovery = mcp_tools_to_provider_snapshot(
+            astra_turn_types::ProviderIdentity::new(format!("mcp:{server}"))?,
+            astra_turn_types::ProviderBindingRef::new(format!("mcp:{server}"))?,
+            &tools,
+        )?;
+        let aliases = discovery
+            .tool_declarations
+            .iter()
+            .map(|declaration| {
+                Ok::<_, astra_turn_types::ProviderContractError>((
+                    declaration.native_tool_id.clone(),
+                    PublicToolAlias::new(public_tool_name_for_declaration(
+                        &server,
+                        &declaration.native_tool_name,
+                    ))?,
+                ))
+            })
+            .collect::<Result<std::collections::BTreeMap<NativeToolId, PublicToolAlias>, _>>()?;
+        snapshots.push(resolve_provider_snapshot(
+            &discovery,
+            &trust_policy,
+            &aliases,
+        )?);
+    }
+    ResolvedProviderPolicyIndex::from_snapshots(&snapshots)
+}
+
+fn public_tool_name_for_declaration(server: &str, tool_name: &str) -> String {
+    sanitize_tool_name(&format!("mcp__{server}__{tool_name}"))
 }
 
 fn build_tool_route_index<'a, I>(tools: I) -> (HashMap<String, McpToolRoute>, Vec<McpToolCollision>)

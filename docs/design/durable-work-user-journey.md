@@ -179,7 +179,7 @@ The user-visible states are:
 | Controller/attachment | `attachment_id + controller basis` | Work branch control and Session handoff authorize a client to submit; a read attachment grants no control |
 | Edge process | `registry_id + connection generation` | Edge registry owns connection liveness and advertised capabilities; `executor_id` is a selectable label |
 | Provider binding | `Session/workspace + binding generation` | Canonical selection authorizes provider use at Run admission and invocation dispatch |
-| Workspace materialization | persisted `materialization_id` plus authenticated canonical checkout root (bounded physical claim) and repo identity/ref/tree hash | The local Edge state identity survives reconnects and Edge-label changes, while independently materialized devices can use the same path without sharing a claim; a matching hash proves committed tree identity, not environment or external effects |
+| Workspace materialization | persisted `materialization_id` plus authenticated canonical checkout root and repo identity/ref/tree hash | The local Edge state identity survives reconnects and Edge-label changes; independent Sessions may bind it, while the executor's workspace coordination lease serializes physical operations. A matching hash proves committed tree identity, not environment or external effects |
 
 Client URLs and normal user-facing controls identify Work and branch. Session
 and Run ids remain available in diagnostics and repair surfaces, not as the
@@ -233,36 +233,27 @@ Each authenticated read and mutation is scoped by the resolved principal and
 workspace authority. A foreign owner receives the same not-found behavior as a
 missing Work. Runs in different Sessions must not share cursors, attachments,
 leases, idempotency keys, or provider bindings. Independent Sessions may
-progress concurrently. If they share a physical checkout, its workspace
-mutation boundary must still serialize conflicting mutations or require
-separate worktrees; independent Session leases alone do not make a shared
-workspace safe.
+progress concurrently. If they share a physical checkout, the executor's
+workspace observation and mutation lease serializes physical operations.
+Read-only observations may run independently when the executor supports them,
+while conflicting writes are serialized or return the executor's typed
+base/conflict result. A physical directory is therefore not a Session-level
+mutex.
 
 A saved Session does not permanently own its checkout. Ordinary CLI startup
 creates a fresh conversation in the selected directory; continuing a saved
-conversation requires explicit resume. When another Session has an idle
-physical claim, admission may retire that claim without changing its binding,
-history, files, or Git state. This is workspace reuse, not conversation handoff.
-Dirty files alone are not a reason to resume an old conversation or reject a
-new one; verified Edge-to-Edge transfer remains a separate operation.
+conversation requires explicit resume. A new Session can bind the same
+authenticated Edge materialization without changing the other Session's
+binding, history, files, or Git state. Dirty files alone are not a reason to
+resume an old conversation or reject a new one; verified Edge-to-Edge transfer
+remains a separate operation.
 
-Idle reuse must be proven under the previous owner's canonical execution
-fence. Live writer/reservation authority, an execution slot, active child or
-retry Runs, unresolved tool invocations, or an unfinished provider switch
-prevent release. Expired leases or disconnected clients alone do not prove
-that external effects have stopped. Release runs in its own transaction before
-claimant admission, so no transaction locks two Session heads. Root, child,
-and retry Run admission rechecks the physical claim, including when resuming,
-to fence delayed execution after reuse. The existing per-checkout uniqueness
-constraint arbitrates concurrent claimants; tool dispatch retains its
-non-locking verification path.
-
-When reuse is unsafe, admission returns `execution_workspace_claimed` with
-the owning Session and branch plus a typed `workspace_blocker` from the fenced
-check. Active execution, turn admission, provider switching, and unresolved
-external effects are different recovery conditions; a conflict must not instruct
-the user to resume or delete history as a universal remedy. Claim races request
-a retry; unresolved effects remain fenced until their outcome is reconciled.
+Session execution debt remains Session-scoped: a live Run, unresolved tool,
+writer/reservation, settlement fence, or provider switch can block that
+Session's own cancellation or binding change, but it cannot block an
+independent Session in the same directory. The canonical binding generation
+fences delayed work for its own Session. The executor-owned workspace lease is
+the only physical-operation serialization boundary.
 
 ## Unhappy paths
 
@@ -283,8 +274,8 @@ a retry; unresolved effects remain fenced until their outcome is reconciled.
 | Target validation fails after binding commit | Keep the prior Edge fenced for this binding, preserve evidence, and show `Needs attention` |
 | Disconnect or cancel races with transfer | Before binding commit, an abandoned preflight leaves the current provider unchanged; after commit, keep the new binding and admit no execution until resumed |
 | Transfer races with a new Run | Serialize at canonical admission or binding compare-and-swap; exactly one transition wins |
-| Different Sessions share a checkout | Serialize conflicting workspace mutations or require isolated worktrees |
-| Old Session is idle in the selected checkout | Admit a fresh conversation after fenced idle-claim release; preserve old history and binding; do not require resume or a new worktree |
+| Different Sessions share a checkout | Admit independent Sessions; serialize physical workspace operations with the executor-owned lease and return a retryable result when it is unavailable |
+| Old Session is idle in the selected checkout | Admit a fresh conversation after the Session-local execution-debt check; preserve old history and binding; do not require resume or a new worktree |
 | DB or event service degraded | Show last confirmed revision and staleness; retry with bounded backoff |
 | Duplicate or reordered updates | Reconcile by durable cursor/revision; never regress status or synthesize twice |
 
@@ -362,12 +353,13 @@ a retry; unresolved effects remain fenced until their outcome is reconciled.
   scoped to the affected Session; dispatch does not lock the selection row, so
   the binding fence adds no serialization to parallel tool fan-out. Live
   MatrixOne coverage exists for owner/Session isolation, stale generations,
-  switching-state admission, and busy-switch rejection, but this environment
-  cannot execute those database tests. Dispatch verifies an existing physical
-  workspace claim with a non-locking read; claim insertion and repair stay on
-  binding admission, so parallel tool fan-out does not add a write/lock to the
-  hot path. A physical identity is derived from the persisted materialization
-  identity and authenticated canonical checkout root; hostname, executor
+  switching-state admission, busy-switch rejection, and same-directory
+  multi-Session admission, but this environment cannot execute those database
+  tests. Dispatch rechecks only the Session binding generation in the same
+  transaction as Run action admission and the invocation claim; it does not
+  issue a physical-workspace claim query or write. A physical identity is still
+  derived from the persisted materialization identity and authenticated
+  canonical checkout root for executor-local coordination; hostname, executor
   labels, and connection registry ids are never used as a checkout fallback.
   The identity file lives in Edge local state rather than the repository, so
   attestation does not manufacture a dirty workspace.

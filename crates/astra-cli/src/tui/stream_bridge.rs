@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::app_event::TuiAppEvent;
@@ -138,7 +138,9 @@ fn coalesce_text_stream_event(
 
 fn stream_event_text_len(event: &StreamEvent) -> Option<usize> {
     match event {
-        StreamEvent::Token(text) | StreamEvent::ThinkingChunk(text) if !text.is_empty() => {
+        StreamEvent::Token { text, .. } | StreamEvent::ThinkingChunk { text, .. }
+            if !text.is_empty() =>
+        {
             Some(text.len())
         }
         _ => None,
@@ -148,15 +150,18 @@ fn stream_event_text_len(event: &StreamEvent) -> Option<usize> {
 fn same_text_stream_event_kind(left: &StreamEvent, right: &StreamEvent) -> bool {
     matches!(
         (left, right),
-        (StreamEvent::Token(_), StreamEvent::Token(_))
-            | (StreamEvent::ThinkingChunk(_), StreamEvent::ThinkingChunk(_))
+        (StreamEvent::Token { model_item_id: left, .. }, StreamEvent::Token { model_item_id: right, .. })
+            | (StreamEvent::ThinkingChunk { model_item_id: left, .. }, StreamEvent::ThinkingChunk { model_item_id: right, .. }) if left == right
     )
 }
 
 fn append_text_stream_event(first: &mut StreamEvent, next: StreamEvent) {
     match (first, next) {
-        (StreamEvent::Token(first), StreamEvent::Token(next))
-        | (StreamEvent::ThinkingChunk(first), StreamEvent::ThinkingChunk(next)) => {
+        (StreamEvent::Token { text: first, .. }, StreamEvent::Token { text: next, .. })
+        | (
+            StreamEvent::ThinkingChunk { text: first, .. },
+            StreamEvent::ThinkingChunk { text: next, .. },
+        ) => {
             first.push_str(&next);
         }
         _ => unreachable!("text event kinds were checked before append"),
@@ -165,17 +170,16 @@ fn append_text_stream_event(first: &mut StreamEvent, next: StreamEvent) {
 
 const LIVE_AGENT_QUEUE_CAPACITY: usize = 1024;
 const LIVE_AGENT_BATCH_LIMIT: usize = 128;
-const LIVE_AGENT_HIGH_PRIORITY_BATCH_QUOTA: usize = 8;
-const LIVE_AGENT_HIGH_PRIORITY_OVERFLOW_TASKS: usize = 16;
-const LIVE_AGENT_HIGH_PRIORITY_OVERFLOW_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_millis(500);
 const LIVE_AGENT_GAP_QUEUE_CAPACITY: usize = 64;
+struct QueuedAgentLiveEvent {
+    event: AgentLiveEvent,
+    _normal_permit: Option<OwnedSemaphorePermit>,
+}
 #[derive(Clone)]
 struct BoundedAgentLiveSink {
-    tx: mpsc::Sender<AgentLiveEvent>,
-    high_priority_tx: mpsc::Sender<AgentLiveEvent>,
+    tx: mpsc::Sender<QueuedAgentLiveEvent>,
     gap_tx: mpsc::Sender<AgentLiveGap>,
-    high_priority_overflow_permits: Arc<Semaphore>,
+    normal_permits: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for BoundedAgentLiveSink {
@@ -188,71 +192,33 @@ impl std::fmt::Debug for BoundedAgentLiveSink {
 
 impl AgentLiveEventSink for BoundedAgentLiveSink {
     fn send(&self, event: AgentLiveEvent) -> Result<(), AgentLiveSendError> {
-        if is_high_priority_live_event(&event) {
-            match self.high_priority_tx.try_send(event) {
-                Ok(()) => Ok(()),
-                Err(mpsc::error::TrySendError::Full(event)) => {
-                    let Ok(permit) = self
-                        .high_priority_overflow_permits
-                        .clone()
-                        .try_acquire_owned()
-                    else {
-                        tracing::warn!(
-                            target: "astra_cli::tui",
-                            "dropping high-priority agent live event: overflow forwarding limit reached"
-                        );
-                        self.report_gap(&event);
-                        return Err(AgentLiveSendError::Dropped);
-                    };
-                    let tx = self.high_priority_tx.clone();
-                    let gap_tx = self.gap_tx.clone();
-                    let gap_event = AgentLiveGap {
-                        run_id: event.run_id.clone(),
-                        agent_id: event.agent_id.clone(),
-                        dropped_event_count: 1,
-                    };
-                    tokio::spawn(async move {
-                        match tokio::time::timeout(
-                            LIVE_AGENT_HIGH_PRIORITY_OVERFLOW_TIMEOUT,
-                            tx.send(event),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(_)) => {
-                                tracing::warn!(
-                                    target: "astra_cli::tui",
-                                    "failed to forward high-priority agent live event: receiver closed"
-                                );
-                                let _ = enqueue_agent_live_gap(&gap_tx, gap_event);
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    target: "astra_cli::tui",
-                                    error = %err,
-                                    "timed out forwarding high-priority agent live event"
-                                );
-                                let _ = enqueue_agent_live_gap(&gap_tx, gap_event);
-                            }
-                        }
-                        drop(permit);
-                    });
-                    Ok(())
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => Err(AgentLiveSendError::Closed),
-            }
+        if self.tx.is_closed() {
+            return Err(AgentLiveSendError::Closed);
+        }
+        let normal_permit = if is_high_priority_live_event(&event) {
+            None
         } else {
-            match self.tx.try_send(event) {
-                Ok(()) => Ok(()),
-                Err(mpsc::error::TrySendError::Full(event)) => {
-                    // Lossy by design for high-volume token/status updates:
-                    // preserve bounded memory. The typed gap tells the TUI to
-                    // reconcile instead of presenting this lane as complete.
+            match self.normal_permits.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
                     self.report_gap(&event);
-                    Err(AgentLiveSendError::Dropped)
+                    return Err(AgentLiveSendError::Dropped);
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => Err(AgentLiveSendError::Closed),
             }
+        };
+        // Success is immediate FIFO admission, never deferred forwarding.
+        // Normal traffic cannot consume the critical reserve; critical floods
+        // still have a finite ceiling and report loss instead of false success.
+        match self.tx.try_send(QueuedAgentLiveEvent {
+            event,
+            _normal_permit: normal_permit,
+        }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(queued)) => {
+                self.report_gap(&queued.event);
+                Err(AgentLiveSendError::Dropped)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(AgentLiveSendError::Closed),
         }
     }
 
@@ -297,16 +263,14 @@ fn is_high_priority_live_event(event: &AgentLiveEvent) -> bool {
                 | astra_turn_core::agent_live_event::AgentLiveSignal::ToolProgress { .. }
                 | astra_turn_core::agent_live_event::AgentLiveSignal::TranscriptCommitted { .. }
         ),
-        AgentLiveEventKind::OutputDelta(_)
-        | AgentLiveEventKind::ThinkingDelta(_)
-        | AgentLiveEventKind::Status(_) => false,
+        AgentLiveEventKind::OutputDelta { .. }
+        | AgentLiveEventKind::ThinkingDelta { .. }
+        | AgentLiveEventKind::Status { .. } => false,
     }
 }
 
 pub(crate) fn create_agent_live_sink(tui_tx: TuiAppEventTx) -> SharedAgentLiveEventSink {
-    let (tx, mut rx) = mpsc::channel::<AgentLiveEvent>(LIVE_AGENT_QUEUE_CAPACITY);
-    let (high_priority_tx, mut high_priority_rx) =
-        mpsc::channel::<AgentLiveEvent>(LIVE_AGENT_QUEUE_CAPACITY);
+    let (tx, mut rx) = mpsc::channel::<QueuedAgentLiveEvent>(LIVE_AGENT_QUEUE_CAPACITY * 2);
     let (gap_tx, mut gap_rx) = mpsc::channel::<AgentLiveGap>(LIVE_AGENT_GAP_QUEUE_CAPACITY);
 
     tokio::spawn(async move {
@@ -319,31 +283,25 @@ pub(crate) fn create_agent_live_sink(tui_tx: TuiAppEventTx) -> SharedAgentLiveEv
                         if tui_tx.send(TuiAppEvent::AgentLiveGap(gap)).await.is_err() {
                             break;
                         }
-                        continue;
+                        // Incompleteness notices must not starve already
+                        // accepted output or termination during sustained loss.
+                        match rx.try_recv() {
+                            Ok(event) => Some(event),
+                            Err(mpsc::error::TryRecvError::Empty) => continue,
+                            Err(mpsc::error::TryRecvError::Disconnected) => break,
+                        }
                     }
-                    None => recv_next_live_event(&mut high_priority_rx, &mut rx).await,
+                    None => rx.recv().await,
                 },
-                event = recv_next_live_event(&mut high_priority_rx, &mut rx) => event,
+                event = rx.recv() => event,
             };
             let Some(first) = first else {
                 break;
             };
-            let mut high_priority_since_normal = usize::from(is_high_priority_live_event(&first));
-            batch.push(first);
+            batch.push(first.event);
             while batch.len() < LIVE_AGENT_BATCH_LIMIT {
-                if high_priority_since_normal >= LIVE_AGENT_HIGH_PRIORITY_BATCH_QUOTA
-                    && let Ok(event) = rx.try_recv()
-                {
-                    high_priority_since_normal = 0;
-                    batch.push(event);
-                    continue;
-                }
-                if let Ok(event) = high_priority_rx.try_recv() {
-                    high_priority_since_normal += 1;
-                    batch.push(event);
-                } else if let Ok(event) = rx.try_recv() {
-                    high_priority_since_normal = 0;
-                    batch.push(event);
+                if let Ok(queued) = rx.try_recv() {
+                    batch.push(queued.event);
                 } else {
                     break;
                 }
@@ -361,56 +319,9 @@ pub(crate) fn create_agent_live_sink(tui_tx: TuiAppEventTx) -> SharedAgentLiveEv
 
     std::sync::Arc::new(BoundedAgentLiveSink {
         tx,
-        high_priority_tx,
         gap_tx,
-        high_priority_overflow_permits: Arc::new(Semaphore::new(
-            LIVE_AGENT_HIGH_PRIORITY_OVERFLOW_TASKS,
-        )),
+        normal_permits: Arc::new(Semaphore::new(LIVE_AGENT_QUEUE_CAPACITY)),
     })
-}
-
-async fn recv_next_live_event(
-    high_priority_rx: &mut mpsc::Receiver<AgentLiveEvent>,
-    rx: &mut mpsc::Receiver<AgentLiveEvent>,
-) -> Option<AgentLiveEvent> {
-    let mut high_priority_open = true;
-    let mut normal_open = true;
-    loop {
-        if !high_priority_open && !normal_open {
-            return None;
-        }
-        if high_priority_open {
-            match high_priority_rx.try_recv() {
-                Ok(event) => return Some(event),
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => high_priority_open = false,
-            }
-        }
-        if normal_open {
-            match rx.try_recv() {
-                Ok(event) => return Some(event),
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => normal_open = false,
-            }
-        }
-        if !high_priority_open && !normal_open {
-            return None;
-        }
-        tokio::select! {
-            event = high_priority_rx.recv(), if high_priority_open => {
-                match event {
-                    Some(event) => return Some(event),
-                    None => high_priority_open = false,
-                }
-            }
-            event = rx.recv(), if normal_open => {
-                match event {
-                    Some(event) => return Some(event),
-                    None => normal_open = false,
-                }
-            }
-        }
-    }
 }
 
 /// Convert typed stream evidence to the shared TUI event model. Plan execution
@@ -434,10 +345,22 @@ pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
         StreamEvent::ContextWindowMeasured(tokens) => TuiAppEvent::ContextWindowMeasured(tokens),
         StreamEvent::RequestTokenUsage(usage) => TuiAppEvent::RequestTokenUsage(usage),
         StreamEvent::RuntimeFeedback(_) => return None,
-        StreamEvent::Token(text) => TuiAppEvent::Token(text),
+        StreamEvent::Token {
+            model_item_id,
+            text,
+        } => TuiAppEvent::Token {
+            model_item_id,
+            text,
+        },
         StreamEvent::Thinking(true) => TuiAppEvent::ThinkingStarted,
         StreamEvent::Thinking(false) => TuiAppEvent::ThinkingStopped,
-        StreamEvent::ThinkingChunk(text) => TuiAppEvent::ThinkingChunk(text),
+        StreamEvent::ThinkingChunk {
+            model_item_id,
+            text,
+        } => TuiAppEvent::ThinkingChunk {
+            model_item_id,
+            text,
+        },
         StreamEvent::ToolStarted {
             name,
             description,
@@ -597,7 +520,10 @@ mod tests {
         AgentLiveEvent {
             run_id: "test-run".into(),
             agent_id: agent_id.into(),
-            kind: AgentLiveEventKind::OutputDelta(text.into()),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("test-model-item".into()),
+                text: text.into(),
+            },
         }
     }
 
@@ -623,6 +549,7 @@ mod tests {
             start_elapsed_ms: None,
             duration_ms: None,
             outcome: None,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),
@@ -773,7 +700,10 @@ mod tests {
             let text = format!("token-{index};");
             expected_before.push_str(&text);
             stream_tx
-                .try_send(StreamEvent::Token(text))
+                .try_send(StreamEvent::Token {
+                    model_item_id: None,
+                    text,
+                })
                 .expect("the bounded producer queue accepts the pressure burst");
         }
         stream_tx
@@ -789,7 +719,10 @@ mod tests {
             let text = format!("tail-{index};");
             expected_after.push_str(&text);
             stream_tx
-                .try_send(StreamEvent::Token(text))
+                .try_send(StreamEvent::Token {
+                    model_item_id: None,
+                    text,
+                })
                 .expect("tail output should be accepted");
         }
         stream_tx
@@ -808,12 +741,12 @@ mod tests {
                 .expect("bridge must drain the accepted stream")
                 .expect("TUI channel remains open");
             match event {
-                TuiAppEvent::Token(text) if !saw_boundary => {
+                TuiAppEvent::Token { text, .. } if !saw_boundary => {
                     token_batches += 1;
                     before.push_str(&text);
                 }
                 TuiAppEvent::ToolStarted { .. } => saw_boundary = true,
-                TuiAppEvent::Token(text) if saw_boundary => {
+                TuiAppEvent::Token { text, .. } if saw_boundary => {
                     token_batches += 1;
                     after.push_str(&text);
                 }
@@ -846,7 +779,10 @@ mod tests {
 
         for index in 0..512 {
             stream_tx
-                .try_send(StreamEvent::Token(format!("root-{index};")))
+                .try_send(StreamEvent::Token {
+                    model_item_id: None,
+                    text: format!("root-{index};"),
+                })
                 .expect("root pressure burst fits the bounded stream lane");
         }
         stream_tx
@@ -872,7 +808,7 @@ mod tests {
                 break;
             };
             match event {
-                TuiAppEvent::Token(_) => root_batches += 1,
+                TuiAppEvent::Token { .. } => root_batches += 1,
                 TuiAppEvent::AgentLive(event) => {
                     saw_child_terminal |=
                         matches!(event.kind, AgentLiveEventKind::AgentTerminated { .. });
@@ -902,11 +838,17 @@ mod tests {
     fn text_batch_respects_event_and_byte_limits() {
         let (stream_tx, mut stream_rx) = crate::cli::chat_stream::stream_event_channel();
         stream_tx
-            .try_send(StreamEvent::Token("a".into()))
+            .try_send(StreamEvent::Token {
+                model_item_id: None,
+                text: "a".into(),
+            })
             .expect("first token");
         for _ in 0..64 {
             stream_tx
-                .try_send(StreamEvent::Token("a".into()))
+                .try_send(StreamEvent::Token {
+                    model_item_id: None,
+                    text: "a".into(),
+                })
                 .expect("token burst");
         }
 
@@ -914,7 +856,7 @@ mod tests {
         let mut pending = None;
         let merged = coalesce_text_stream_event(first, &mut stream_rx, &mut pending);
         assert!(
-            matches!(merged, StreamEvent::Token(text) if text.len() == TUI_TEXT_BATCH_MAX_EVENTS)
+            matches!(merged, StreamEvent::Token { text, .. } if text.len() == TUI_TEXT_BATCH_MAX_EVENTS)
         );
         assert!(
             pending.is_none(),
@@ -922,18 +864,27 @@ mod tests {
         );
         assert!(matches!(
             stream_rx.try_recv(),
-            Ok(StreamEvent::Token(text)) if text == "a"
+            Ok(StreamEvent::Token { text, .. }) if text == "a"
         ));
 
         let (stream_tx, mut stream_rx) = crate::cli::chat_stream::stream_event_channel();
         stream_tx
-            .try_send(StreamEvent::Token("x".repeat(TUI_TEXT_BATCH_MAX_BYTES / 2)))
+            .try_send(StreamEvent::Token {
+                model_item_id: None,
+                text: "x".repeat(TUI_TEXT_BATCH_MAX_BYTES / 2),
+            })
             .expect("large first token");
         stream_tx
-            .try_send(StreamEvent::Token("y".repeat(TUI_TEXT_BATCH_MAX_BYTES / 2)))
+            .try_send(StreamEvent::Token {
+                model_item_id: None,
+                text: "y".repeat(TUI_TEXT_BATCH_MAX_BYTES / 2),
+            })
             .expect("large second token");
         stream_tx
-            .try_send(StreamEvent::Token("z".into()))
+            .try_send(StreamEvent::Token {
+                model_item_id: None,
+                text: "z".into(),
+            })
             .expect("overflow token");
 
         let first = stream_rx.try_recv().expect("first large token");
@@ -941,11 +892,11 @@ mod tests {
         let merged = coalesce_text_stream_event(first, &mut stream_rx, &mut pending);
         assert!(matches!(
             merged,
-            StreamEvent::Token(text) if text.len() == TUI_TEXT_BATCH_MAX_BYTES
+            StreamEvent::Token { text, .. } if text.len() == TUI_TEXT_BATCH_MAX_BYTES
         ));
         assert!(matches!(
             pending,
-            Some(StreamEvent::Token(text)) if text == "z"
+            Some(StreamEvent::Token { text, .. }) if text == "z"
         ));
         assert!(
             stream_rx.try_recv().is_err(),
@@ -957,28 +908,37 @@ mod tests {
     fn text_batch_never_crosses_token_and_thinking_boundaries() {
         let (stream_tx, mut stream_rx) = crate::cli::chat_stream::stream_event_channel();
         stream_tx
-            .try_send(StreamEvent::Token("answer".into()))
+            .try_send(StreamEvent::Token {
+                model_item_id: None,
+                text: "answer".into(),
+            })
             .expect("token");
         stream_tx
-            .try_send(StreamEvent::ThinkingChunk("reason".into()))
+            .try_send(StreamEvent::ThinkingChunk {
+                model_item_id: None,
+                text: "reason".into(),
+            })
             .expect("thinking chunk");
         stream_tx
-            .try_send(StreamEvent::Token(" continues".into()))
+            .try_send(StreamEvent::Token {
+                model_item_id: None,
+                text: " continues".into(),
+            })
             .expect("token suffix");
 
         let mut pending = None;
         let first = stream_rx.try_recv().expect("first event");
         let merged = coalesce_text_stream_event(first, &mut stream_rx, &mut pending);
-        assert!(matches!(merged, StreamEvent::Token(text) if text == "answer"));
+        assert!(matches!(merged, StreamEvent::Token { text, .. } if text == "answer"));
         assert!(matches!(
             pending.as_ref(),
-            Some(StreamEvent::ThinkingChunk(text)) if text == "reason"
+            Some(StreamEvent::ThinkingChunk { text, .. }) if text == "reason"
         ));
 
         let thinking = pending.take().expect("thinking boundary");
         let merged = coalesce_text_stream_event(thinking, &mut stream_rx, &mut pending);
-        assert!(matches!(merged, StreamEvent::ThinkingChunk(text) if text == "reason"));
-        assert!(matches!(pending, Some(StreamEvent::Token(text)) if text == " continues"));
+        assert!(matches!(merged, StreamEvent::ThinkingChunk { text, .. } if text == "reason"));
+        assert!(matches!(pending, Some(StreamEvent::Token { text, .. }) if text == " continues"));
     }
 
     #[tokio::test]
@@ -986,13 +946,31 @@ mod tests {
         let (tui_tx, mut tui_rx) = create_channels();
         let (stream_tx, control) = create_controlled_per_turn_bridge(tui_tx);
         for event in [
-            StreamEvent::Token("t0".into()),
-            StreamEvent::ThinkingChunk("h0".into()),
-            StreamEvent::Token("t1".into()),
-            StreamEvent::ThinkingChunk("h1".into()),
+            StreamEvent::Token {
+                model_item_id: None,
+                text: "t0".into(),
+            },
+            StreamEvent::ThinkingChunk {
+                model_item_id: None,
+                text: "h0".into(),
+            },
+            StreamEvent::Token {
+                model_item_id: None,
+                text: "t1".into(),
+            },
+            StreamEvent::ThinkingChunk {
+                model_item_id: None,
+                text: "h1".into(),
+            },
             StreamEvent::StatusLine("boundary".into()),
-            StreamEvent::Token("t2".into()),
-            StreamEvent::ThinkingChunk("h2".into()),
+            StreamEvent::Token {
+                model_item_id: None,
+                text: "t2".into(),
+            },
+            StreamEvent::ThinkingChunk {
+                model_item_id: None,
+                text: "h2".into(),
+            },
             StreamEvent::AssistantOutputSettled,
         ] {
             stream_tx.try_send(event).expect("accepted event");
@@ -1008,8 +986,10 @@ mod tests {
                 .expect("cancellation must not strand the bridge")
                 .expect("TUI channel remains open");
             match event {
-                TuiAppEvent::Token(text) => observed.push(format!("token:{text}")),
-                TuiAppEvent::ThinkingChunk(text) => observed.push(format!("thinking:{text}")),
+                TuiAppEvent::Token { text, .. } => observed.push(format!("token:{text}")),
+                TuiAppEvent::ThinkingChunk { text, .. } => {
+                    observed.push(format!("thinking:{text}"))
+                }
                 TuiAppEvent::StatusLine(text) => observed.push(format!("status:{text}")),
                 TuiAppEvent::AssistantOutputSettled => observed.push("settled".into()),
                 TuiAppEvent::TurnStreamClosed => stream_closed += 1,
@@ -1038,7 +1018,10 @@ mod tests {
         assert_eq!(projection_drained, 1);
         assert!(
             stream_tx
-                .send(StreamEvent::Token("late".into()))
+                .send(StreamEvent::Token {
+                    model_item_id: None,
+                    text: "late".into()
+                })
                 .await
                 .is_err(),
             "cancellation must close the producer side after draining accepted events"
@@ -1057,8 +1040,14 @@ mod tests {
             .expect("the foreground slot is intentionally occupied");
         let (stream_tx, control) = create_controlled_per_turn_bridge(tui_tx);
         for event in [
-            StreamEvent::Token("t0".into()),
-            StreamEvent::ThinkingChunk("h0".into()),
+            StreamEvent::Token {
+                model_item_id: None,
+                text: "t0".into(),
+            },
+            StreamEvent::ThinkingChunk {
+                model_item_id: None,
+                text: "h0".into(),
+            },
         ] {
             stream_tx.try_send(event).expect("accepted event");
         }
@@ -1088,8 +1077,10 @@ mod tests {
                 .expect("the bridge must drain accepted events")
                 .expect("TUI channel remains open");
             match event {
-                TuiAppEvent::Token(text) => observed.push(format!("token:{text}")),
-                TuiAppEvent::ThinkingChunk(text) => observed.push(format!("thinking:{text}")),
+                TuiAppEvent::Token { text, .. } => observed.push(format!("token:{text}")),
+                TuiAppEvent::ThinkingChunk { text, .. } => {
+                    observed.push(format!("thinking:{text}"))
+                }
                 TuiAppEvent::AssistantOutputSettled => observed.push("settled".into()),
                 TuiAppEvent::TurnStreamClosed => stream_closed += 1,
                 TuiAppEvent::TurnProjectionDrained => {
@@ -1104,7 +1095,10 @@ mod tests {
         assert_eq!(projection_drained, 1);
         assert!(
             stream_tx
-                .send(StreamEvent::Token("late".into()))
+                .send(StreamEvent::Token {
+                    model_item_id: None,
+                    text: "late".into()
+                })
                 .await
                 .is_err(),
             "the closed receiver must reject late events"
@@ -1116,7 +1110,10 @@ mod tests {
         let (tui_tx, mut tui_rx) = create_channels();
         let (stream_tx, control) = create_controlled_per_turn_bridge(tui_tx);
         stream_tx
-            .send(StreamEvent::Token("partial-before-error".into()))
+            .send(StreamEvent::Token {
+                model_item_id: None,
+                text: "partial-before-error".into(),
+            })
             .await
             .expect("turn stream is open");
         stream_tx
@@ -1131,7 +1128,7 @@ mod tests {
 
         assert!(matches!(
             tui_rx.recv().await,
-            Some(TuiAppEvent::Token(text)) if text == "partial-before-error"
+            Some(TuiAppEvent::Token { text, .. }) if text == "partial-before-error"
         ));
         assert!(matches!(
             tui_rx.recv().await,
@@ -1151,7 +1148,10 @@ mod tests {
         ));
         assert!(
             stream_tx
-                .send(StreamEvent::Token("late-old-turn-output".into()))
+                .send(StreamEvent::Token {
+                    model_item_id: None,
+                    text: "late-old-turn-output".into()
+                })
                 .await
                 .is_err(),
             "the terminal projection barrier must reject late events from the old turn"
@@ -1175,7 +1175,10 @@ mod tests {
         // The bridge consumes this event, then waits because the downstream
         // application queue is full. Wait until that state is observable.
         stream_tx
-            .send(StreamEvent::Token("bridge-held".into()))
+            .send(StreamEvent::Token {
+                model_item_id: None,
+                text: "bridge-held".into(),
+            })
             .await
             .expect("bridge open");
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -1188,14 +1191,20 @@ mod tests {
 
         for index in 0..stream_capacity {
             stream_tx
-                .try_send(StreamEvent::Token(format!("stream-{index}")))
+                .try_send(StreamEvent::Token {
+                    model_item_id: None,
+                    text: format!("stream-{index}"),
+                })
                 .expect("stream queue should accept exactly its bounded capacity");
         }
         assert_eq!(stream_tx.capacity(), 0);
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(50),
-                stream_tx.send(StreamEvent::Token("blocked".into())),
+                stream_tx.send(StreamEvent::Token {
+                    model_item_id: None,
+                    text: "blocked".into()
+                }),
             )
             .await
             .is_err(),
@@ -1203,10 +1212,14 @@ mod tests {
         );
 
         let resumed_tx = stream_tx.clone();
-        let resumed =
-            tokio::spawn(
-                async move { resumed_tx.send(StreamEvent::Token("resumed".into())).await },
-            );
+        let resumed = tokio::spawn(async move {
+            resumed_tx
+                .send(StreamEvent::Token {
+                    model_item_id: None,
+                    text: "resumed".into(),
+                })
+                .await
+        });
         let _ = tui_rx.recv().await.expect("filled application event");
         tokio::time::timeout(std::time::Duration::from_secs(1), resumed)
             .await
@@ -1244,7 +1257,10 @@ mod tests {
             let _ = sink.send(AgentLiveEvent {
                 run_id: "test-run".into(),
                 agent_id: "reviewer@abc12345".into(),
-                kind: AgentLiveEventKind::OutputDelta(format!("tok-{i}")),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("test-model-item".into()),
+                    text: format!("tok-{i}"),
+                },
             });
         }
         sink.send(AgentLiveEvent {
@@ -1311,70 +1327,170 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn high_priority_live_events_bypass_queued_output() {
-        let (tx, mut rx) = mpsc::channel::<AgentLiveEvent>(4);
-        let (high_priority_tx, mut high_priority_rx) = mpsc::channel::<AgentLiveEvent>(4);
+    async fn accepted_output_precedes_terminal_with_reserved_capacity() {
+        let (tx, mut rx) = mpsc::channel(4);
         let (gap_tx, _gap_rx) = mpsc::channel::<AgentLiveGap>(1);
         let sink = BoundedAgentLiveSink {
             tx,
-            high_priority_tx,
             gap_tx,
-            high_priority_overflow_permits: Arc::new(Semaphore::new(
-                LIVE_AGENT_HIGH_PRIORITY_OVERFLOW_TASKS,
-            )),
+            normal_permits: Arc::new(Semaphore::new(1)),
         };
 
         sink.send(output_event("reviewer@abc12345", "token"))
             .expect("normal output should queue");
+        assert!(matches!(
+            sink.send(output_event("reviewer@abc12345", "overflow")),
+            Err(AgentLiveSendError::Dropped)
+        ));
         sink.send(terminated_event("reviewer@abc12345"))
             .expect("terminal event should queue");
 
-        let first = recv_next_live_event(&mut high_priority_rx, &mut rx)
-            .await
-            .expect("first event");
+        let first = rx.recv().await.expect("first event");
         assert!(
-            matches!(first.kind, AgentLiveEventKind::AgentTerminated { .. }),
-            "terminal/lifecycle events must not wait behind token backlog"
+            matches!(first.event.kind, AgentLiveEventKind::OutputDelta { .. }),
+            "accepted output precedes terminal"
+        );
+        assert!(matches!(
+            rx.recv().await.unwrap().event.kind,
+            AgentLiveEventKind::AgentTerminated { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_terminal_priority_preserves_previously_queued_transcript_output() {
+        use crate::tui::chat_widget::{self, ChatWidget, TurnContext};
+
+        let (tui_tx, mut tui_rx) = mpsc::channel(8);
+        let sink = create_agent_live_sink(tui_tx);
+        sink.send(output_event("child@owned", "child output"))
+            .expect("output admitted");
+        sink.send(terminated_event("child@owned"))
+            .expect("terminal admitted");
+        drop(sink);
+
+        let mut widget = ChatWidget::new("parent-session");
+        while let Some(event) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), tui_rx.recv())
+                .await
+                .expect("bounded bridge must drain and close")
+        {
+            if let Some(event) = chat_widget::translate(event, TurnContext::default()) {
+                widget.handle_event(event);
+            }
+        }
+        let (replay, dropped) = widget.agent_live_transcript_replay("child@owned", "test-run");
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            widget
+                .agent_run_state("child@owned")
+                .expect("owned child projection")
+                .status,
+            crate::tui::agent_run_projection::AgentRunStatus::Completed
+        );
+        assert!(
+            replay
+                .iter()
+                .any(|event| matches!(event.kind, AgentLiveEventKind::AgentTerminated { .. })),
+            "preserving output must not lose terminal delivery"
+        );
+        assert!(
+            replay.iter().any(|event| matches!(
+                &event.kind,
+                AgentLiveEventKind::OutputDelta { text, .. } if text == "child output"
+            )),
+            "terminal priority must not erase admitted child output from Ctrl+G replay"
+        );
+        assert!(
+            widget.history().is_empty(),
+            "child internals must not enter parent scrollback"
         );
     }
 
     #[tokio::test]
-    async fn full_high_priority_queue_accepts_timeout_guarded_fallback() {
-        let (tx, _rx) = mpsc::channel::<AgentLiveEvent>(4);
-        let (high_priority_tx, high_priority_rx) = mpsc::channel::<AgentLiveEvent>(1);
-        let (gap_tx, _gap_rx) = mpsc::channel::<AgentLiveGap>(1);
+    async fn replenished_gap_notices_cannot_starve_accepted_child_events() {
+        let (tui_tx, mut tui_rx) = mpsc::channel(4);
+        let sink = create_agent_live_sink(tui_tx);
+        sink.send(output_event("child@owned", "output")).unwrap();
+        sink.send(terminated_event("child@owned")).unwrap();
+        let gap = AgentLiveGap {
+            run_id: "test-run".into(),
+            agent_id: "child@owned".into(),
+            dropped_event_count: 1,
+        };
+        for _ in 0..LIVE_AGENT_GAP_QUEUE_CAPACITY {
+            sink.send_gap(gap.clone()).unwrap();
+        }
+        let mut output = false;
+        let mut terminal = false;
+        for _ in 0..4 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), tui_rx.recv())
+                .await
+                .expect("available consumer must make bounded progress")
+                .unwrap();
+            let events = match event {
+                TuiAppEvent::AgentLiveGap(_) => {
+                    let _ = sink.send_gap(gap.clone());
+                    Vec::new()
+                }
+                TuiAppEvent::AgentLive(event) => vec![event],
+                TuiAppEvent::AgentLiveBatch(events) => events,
+                other => panic!("unexpected event: {other:?}"),
+            };
+            for event in events {
+                output |= matches!(event.kind, AgentLiveEventKind::OutputDelta { .. });
+                terminal |= matches!(event.kind, AgentLiveEventKind::AgentTerminated { .. });
+            }
+            if output && terminal {
+                break;
+            }
+        }
+        assert!(
+            output && terminal,
+            "continuously replenished gaps cannot monopolize delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_saturation_reports_loss_without_deferred_resurrection() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (gap_tx, mut gap_rx) = mpsc::channel::<AgentLiveGap>(1);
         let sink = BoundedAgentLiveSink {
             tx,
-            high_priority_tx,
             gap_tx,
-            high_priority_overflow_permits: Arc::new(Semaphore::new(
-                LIVE_AGENT_HIGH_PRIORITY_OVERFLOW_TASKS,
-            )),
+            normal_permits: Arc::new(Semaphore::new(1)),
         };
 
         sink.send(terminated_event("reviewer@one"))
             .expect("first high-priority event fills the queue");
-        sink.send(terminated_event("reviewer@two"))
-            .expect("overflow fallback accepted the event for bounded async forwarding");
-        drop(high_priority_rx);
+        assert!(matches!(
+            sink.send(terminated_event("reviewer@two")),
+            Err(AgentLiveSendError::Dropped)
+        ));
+        assert_eq!(gap_rx.recv().await.unwrap().agent_id, "reviewer@two");
+        assert_eq!(rx.recv().await.unwrap().event.agent_id, "reviewer@one");
         tokio::task::yield_now().await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(rx);
+        assert!(matches!(
+            sink.send(terminated_event("reviewer@three")),
+            Err(AgentLiveSendError::Closed)
+        ));
     }
 
     #[tokio::test]
     async fn dropped_local_live_activity_emits_a_typed_gap() {
-        let (tx, _rx) = mpsc::channel::<AgentLiveEvent>(1);
-        tx.try_send(output_event("reviewer@run-a", "backlog"))
-            .expect("fill the bounded live lane");
-        let (high_priority_tx, _high_priority_rx) = mpsc::channel::<AgentLiveEvent>(1);
+        let (tx, _rx) = mpsc::channel(2);
         let (gap_tx, mut gap_rx) = mpsc::channel::<AgentLiveGap>(1);
         let sink = BoundedAgentLiveSink {
             tx,
-            high_priority_tx,
             gap_tx,
-            high_priority_overflow_permits: Arc::new(Semaphore::new(
-                LIVE_AGENT_HIGH_PRIORITY_OVERFLOW_TASKS,
-            )),
+            normal_permits: Arc::new(Semaphore::new(1)),
         };
+        sink.send(output_event("reviewer@run-a", "backlog"))
+            .expect("fill normal quota");
 
         assert!(matches!(
             sink.send(output_event("reviewer@run-a", "dropped")),
@@ -1391,13 +1507,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_bridge_batches_include_normal_events_under_high_priority_load() {
+    async fn live_bridge_preserves_fifo_across_batch_boundaries() {
         let (tui_tx, mut tui_rx) = create_channels();
         let sink = create_agent_live_sink(tui_tx);
 
         sink.send(output_event("reviewer@abc12345", "normal-token"))
             .expect("normal event should queue before flood");
-        for i in 0..(LIVE_AGENT_HIGH_PRIORITY_BATCH_QUOTA * 4) {
+        for i in 0..(LIVE_AGENT_BATCH_LIMIT * 2) {
             sink.send(AgentLiveEvent {
                 run_id: "test-run".into(),
                 agent_id: format!("reviewer@{i}"),
@@ -1410,37 +1526,31 @@ mod tests {
             .expect("high-priority event should queue");
         }
 
-        let first = tokio::time::timeout(std::time::Duration::from_secs(1), tui_rx.recv())
-            .await
-            .expect("batch should arrive")
-            .expect("channel open");
-        let events = match first {
-            TuiAppEvent::AgentLive(event) => vec![event],
-            TuiAppEvent::AgentLiveBatch(events) => events,
-            other => panic!("unexpected event: {other:?}"),
-        };
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event.kind, AgentLiveEventKind::OutputDelta(_))),
-            "normal events must not starve behind a continuous high-priority stream"
-        );
-    }
-
-    #[tokio::test]
-    async fn recv_next_live_event_exits_cleanly_when_both_channels_close_while_waiting() {
-        let (high_priority_tx, mut high_priority_rx) = mpsc::channel::<AgentLiveEvent>(1);
-        let (tx, mut rx) = mpsc::channel::<AgentLiveEvent>(1);
-
-        let waiter =
-            tokio::spawn(async move { recv_next_live_event(&mut high_priority_rx, &mut rx).await });
-        tokio::task::yield_now().await;
-        drop(high_priority_tx);
-        drop(tx);
-
-        assert!(
-            waiter.await.expect("join").is_none(),
-            "bridge should stop once both lanes disconnect"
-        );
+        drop(sink);
+        let mut events = Vec::new();
+        while let Some(batch) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), tui_rx.recv())
+                .await
+                .expect("accepted batches drain after producer closure")
+        {
+            match batch {
+                TuiAppEvent::AgentLive(event) => events.push(event),
+                TuiAppEvent::AgentLiveBatch(batch) => {
+                    assert!(batch.len() <= LIVE_AGENT_BATCH_LIMIT);
+                    events.extend(batch);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            events[0].kind,
+            AgentLiveEventKind::OutputDelta { .. }
+        ));
+        assert_eq!(events.len(), LIVE_AGENT_BATCH_LIMIT * 2 + 1);
+        for (index, event) in events[1..].iter().enumerate() {
+            assert!(
+                matches!(&event.kind, AgentLiveEventKind::ToolStarted { tool_use_id, .. } if tool_use_id == &format!("tool-{index}"))
+            );
+        }
     }
 }

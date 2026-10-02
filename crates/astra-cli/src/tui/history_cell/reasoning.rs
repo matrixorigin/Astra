@@ -21,6 +21,7 @@ use crate::tui::turn_event::TurnEvent;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReasoningCell {
+    pub(crate) model_item_id: Option<String>,
     text: String,
     live: bool,
     /// When the cell was created. Used to compute duration on
@@ -34,6 +35,7 @@ pub(crate) struct ReasoningCell {
 impl ReasoningCell {
     pub fn new_streaming() -> Self {
         Self {
+            model_item_id: None,
             text: String::new(),
             live: true,
             started_at: Some(Instant::now()),
@@ -45,6 +47,7 @@ impl ReasoningCell {
     /// Build from a complete reasoning blob (replay path).
     pub fn from_text(text: impl Into<String>, duration_ms: Option<u64>) -> Self {
         Self {
+            model_item_id: None,
             text: text.into(),
             live: false,
             started_at: None,
@@ -60,6 +63,7 @@ impl ReasoningCell {
                 text,
                 duration_ms,
             } => Some(Self {
+                model_item_id: None,
                 text,
                 live: false,
                 started_at: None,
@@ -200,6 +204,9 @@ impl ReasoningCell {
 const LIVE_PREVIEW_MAX_ROWS: usize = 4;
 
 impl HistoryCell for ReasoningCell {
+    fn model_item_id(&self) -> Option<&str> {
+        self.model_item_id.as_deref()
+    }
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         self.display_lines_with_mode(width, false, false)
     }

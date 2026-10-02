@@ -181,57 +181,15 @@ fn skill_listing_contains_skill_invocation_nudge() {
     );
 }
 
-/// REGRESSION (session 5e74f365): the listing nudge said
-/// "call the `skill` tool with that skill's name FIRST (before any
-/// other tool)". This was a hard imperative — it routed every request
-/// matching a skill (e.g. `review-changes` matching "review latest
-/// commit") through the skill, even when the user explicitly asked
-/// for parallel agents ("多agents review", "3 agents review"). The
-/// model never reached the agent spawn action.
-///
-/// Fix: soften the nudge so explicit user intent for parallel
-/// fan-out wins over skill routing. The nudge now must mention BOTH
-/// the parallel-agent override AND name the consolidated spawn syntax as the path
-/// (so the model has a concrete next step, not just "don't use the
-/// skill").
 #[test]
-fn skill_listing_nudge_carves_out_parallel_agent_intent() {
+fn skill_listing_and_schema_assign_skills_to_objective_owner() {
     let section =
         build_skill_listing_section(&[skill("review-changes", "Review code changes")]).unwrap();
-    let body = &section.text;
-
-    // The hard "FIRST (before any other tool)" imperative is gone.
-    // Tolerate any case-insensitive variant of "FIRST" only when it's
-    // qualified — assert the *unqualified* hard form is absent.
-    assert!(
-        !body.contains("FIRST (before any other tool)"),
-        "the unqualified 'FIRST (before any other tool)' rule must be \
-         removed — it overrode explicit user parallel-agent intent. \
-         Got:\n{body}"
-    );
-
-    // The nudge MUST tell the model that parallel-agent requests
-    // bypass skill routing and go to the consolidated agent spawn action.
-    let lower = body.to_ascii_lowercase();
-    assert!(
-        lower.contains("parallel")
-            || lower.contains("multi-agent")
-            || lower.contains("multiple agents"),
-        "nudge must name the parallel-agent override (the very intent \
-         that was being silently routed through skills). Got:\n{body}"
-    );
-    assert!(
-        body.contains(r#"{"action":"start","target_count":2"#)
-            && body.contains(r#"{"action":"get_results","group_id":"returned-group-id"}"#,)
-            && body.contains("Never write function-call text"),
-        "nudge must use native JSON argument objects without a competing \
-          pseudo-call syntax when the user wants parallel fan-out. \
-          Got:\n{body}"
-    );
-    assert!(
-        !body.contains("agent.spawn")
-            && !body.contains("agent.get_result")
-            && !body.contains("agent(action='spawn', ...)"),
-        "skill listing must actively reject the legacy dotted agent syntax. Got:\n{body}"
-    );
+    let schema = skill_tool_schema_v2();
+    let description = schema["function"]["description"].as_str().unwrap();
+    for text in [section.text.as_str(), description] {
+        assert!(text.contains("work this agent owns") || text.contains("work you own"));
+        assert!(text.contains("child"));
+        assert!(!text.contains("before any other tool"));
+    }
 }

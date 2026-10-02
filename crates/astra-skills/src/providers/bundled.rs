@@ -291,7 +291,7 @@ Instructions B.
         let manifests = provider.discover().await.unwrap();
 
         let expected_composable = ["batch", "debug", "reflect", "review", "verify"];
-        let expected_non_composable = ["remember", "skillify", "stuck"];
+        let expected_non_composable = ["remember", "stuck"];
 
         for m in &manifests {
             let loaded = provider.load(&m.name).await.unwrap();

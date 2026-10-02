@@ -61,6 +61,42 @@ pub enum ExplainAnalyzeOutcomeV1 {
     Delegated,
 }
 
+/// Bounded evidence for a material runtime decision. These facts are
+/// explanatory only and never grant execution authority.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExplainAnalyzeDecisionDetailV1 {
+    DelegationCatalogResolution {
+        requirement_index: u32,
+        match_count: u32,
+    },
+}
+
+impl ExplainAnalyzeDecisionDetailV1 {
+    fn is_valid_for(
+        &self,
+        kind: ExplainAnalyzeNodeKindV1,
+        transition: ExplainAnalyzeTransitionV1,
+        outcome: Option<ExplainAnalyzeOutcomeV1>,
+    ) -> bool {
+        match self {
+            Self::DelegationCatalogResolution {
+                requirement_index,
+                match_count,
+            } => {
+                kind == ExplainAnalyzeNodeKindV1::Admission
+                    && transition == ExplainAnalyzeTransitionV1::Finished
+                    && matches!(
+                        outcome,
+                        Some(ExplainAnalyzeOutcomeV1::Blocked | ExplainAnalyzeOutcomeV1::Rejected)
+                    )
+                    && *requirement_index < 16
+                    && *match_count != 1
+            }
+        }
+    }
+}
+
 /// Execution boundaries that the current producer cannot independently time.
 /// These are attached to a terminal turn fact so consumers never present the
 /// observed graph as a complete account of execution.
@@ -491,6 +527,10 @@ pub struct ExplainAnalyzeEventV1 {
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<ExplainAnalyzeOutcomeV1>,
+    /// Safe structured detail for a completed material decision. It is
+    /// omitted when a decision has no additional bounded evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_detail: Option<ExplainAnalyzeDecisionDetailV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<ExplainAnalyzeTokenUsageV1>,
     /// Auxiliary usage is separate from timed provider-attempt node usage.
@@ -565,6 +605,7 @@ impl ExplainAnalyzeEventV1 {
                 self.start_elapsed_ms.is_none()
                     && self.duration_ms.is_none()
                     && self.outcome.is_none()
+                    && self.decision_detail.is_none()
                     && self.usage.is_none()
                     && self.auxiliary_details.is_none()
                     && self.context.is_none()
@@ -577,6 +618,9 @@ impl ExplainAnalyzeEventV1 {
                             self.elapsed_ms.abs_diff(start).abs_diff(duration) <= 1
                         })
                 }) && self.outcome.is_some()
+                    && self.decision_detail.as_ref().is_none_or(|detail| {
+                        detail.is_valid_for(self.kind, self.transition, self.outcome)
+                    })
                     && self
                         .usage
                         .as_ref()
@@ -669,6 +713,7 @@ mod tests {
             start_elapsed_ms: None,
             duration_ms: None,
             outcome: None,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),
@@ -698,6 +743,48 @@ mod tests {
         event.label = fact.presentation_label();
         assert!(event.label.len() <= SEMANTIC_JUDGMENT_PRESENTATION_MAX_BYTES);
         assert!(event.is_valid(), "{}", event.label);
+    }
+
+    #[test]
+    fn delegation_catalog_detail_is_limited_to_blocked_admission_terminals() {
+        let mut event = started();
+        event.event_id = "turn-1/admission/0/finished".to_string();
+        event.node_id = "turn-1/admission/0".to_string();
+        event.kind = ExplainAnalyzeNodeKindV1::Admission;
+        event.round_index = None;
+        event.attempt_index = None;
+        event.transition = ExplainAnalyzeTransitionV1::Finished;
+        event.elapsed_ms = 20;
+        event.start_elapsed_ms = Some(15);
+        event.duration_ms = Some(5);
+        event.outcome = Some(ExplainAnalyzeOutcomeV1::Blocked);
+        event.decision_detail = Some(
+            ExplainAnalyzeDecisionDetailV1::DelegationCatalogResolution {
+                requirement_index: 0,
+                match_count: 0,
+            },
+        );
+        assert!(event.is_valid());
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            encoded["decision_detail"],
+            serde_json::json!({
+                "kind": "delegation_catalog_resolution",
+                "requirement_index": 0,
+                "match_count": 0,
+            })
+        );
+
+        event.outcome = Some(ExplainAnalyzeOutcomeV1::Succeeded);
+        assert!(!event.is_valid());
+        event.outcome = Some(ExplainAnalyzeOutcomeV1::Blocked);
+        event.decision_detail = Some(
+            ExplainAnalyzeDecisionDetailV1::DelegationCatalogResolution {
+                requirement_index: 0,
+                match_count: 1,
+            },
+        );
+        assert!(!event.is_valid());
     }
 
     #[test]

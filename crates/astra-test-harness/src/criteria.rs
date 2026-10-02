@@ -13,6 +13,7 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::case::PromptCacheReuseScope;
@@ -22,6 +23,58 @@ use crate::runner::RunOutcome;
 use crate::session_capture::SessionCapture;
 
 mod work_replacement;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventJsonMatch {
+    /// Missing fields do not match, even when `equals` is JSON null.
+    pub path: String,
+    pub equals: serde_json::Value,
+    /// Require every matching event to carry a distinct, non-empty string at
+    /// this pointer (for example, a child `run_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique_by: Option<String>,
+    /// Require the matched event's `run_id` (top-level for step events,
+    /// `metadata.run_id` for lifecycle events) to equal an identity carried
+    /// by an event of this type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_run_as: Option<SessionEventRunIdMatch>,
+    /// Require the unique event IDs to equal IDs in a successful tool result
+    /// from the events' parent run (for example, returned fanout child runs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ids_match: Option<SessionEventResultIdMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventFieldMatch {
+    pub path: String,
+    pub equals: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventRunIdMatch {
+    pub event_type: String,
+    /// JSON pointer to the related event's run ID (for example,
+    /// `/metadata/run_id` on `agent_spawned`).
+    pub run_id_path: String,
+    /// Optional predicate on the related event. This lets a provider event
+    /// prove the exact child slot/configuration it belongs to, rather than
+    /// merely proving that some spawn with the same run ID exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_match: Option<SessionEventFieldMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventResultIdMatch {
+    pub tool_name: String,
+    /// Event pointer for the parent run that owns the matching tool call.
+    pub event_parent_run_id_path: String,
+    pub result_array_path: String,
+    pub item_id_path: String,
+}
 
 /// One declarative success check. Serialized into YAML cases as
 /// `type: <variant>` discriminator.
@@ -104,8 +157,10 @@ pub enum Criterion {
         successor_path: String,
     },
 
-    /// Passes when the session journal contains at least `min`
-    /// events with `type == event_type`. Requires session capture.
+    /// Passes when session capture contains at least `min`
+    /// events with `type == event_type`, optionally matching one exact
+    /// JSON pointer/value pair or linking a step-event `run_id` to a related
+    /// lifecycle event. Requires session capture.
     /// Use for structural checks ("at least one subagent_spawned
     /// event appears").
     ///
@@ -120,11 +175,33 @@ pub enum Criterion {
         event_type: String,
         #[serde(default = "default_event_min")]
         min: u32,
+        /// Optional upper bound; `min: 0, max: 0` proves absence.
+        #[serde(default)]
+        max: Option<u32>,
+        /// Optional exact JSON-pointer predicate against the complete event.
+        #[serde(default)]
+        json_match: Option<SessionEventJsonMatch>,
         /// When true, skip-pass when session is unavailable. Use
         /// sparingly — only for cases that are meaningful even
         /// without the journal check.
         #[serde(default)]
         optional: bool,
+    },
+
+    /// The exact completed child result reached its owning parent's model
+    /// request, followed by that parent's accepted finalization. Cases may
+    /// also accept an exact terminal get_result read by that owning parent.
+    /// Uses existing journal identities and trace hashes, not run storage.
+    SessionChildResultAdopted {
+        expected_result: String,
+        /// Restrict the originating spawn, e.g. to the required model or slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spawn_match: Option<SessionEventFieldMatch>,
+        /// Accept a successful foreground get_result for this same spawned
+        /// and completed child, with exact caller, agent, run and body proof.
+        /// Ordinary messages and incomplete observations never qualify.
+        #[serde(default)]
+        allow_get_result: bool,
     },
 
     /// Counts typed signal codes in durable `turn_evaluation` events.
@@ -190,6 +267,9 @@ pub enum Criterion {
         name: String,
         min: u32,
         max: u32,
+        /// Limit the count to the CLI run, excluding delegated child runs.
+        #[serde(default)]
+        root_only: bool,
         /// Bind the structural predicate to this same call's typed outcome.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ok: Option<bool>,
@@ -231,6 +311,15 @@ pub enum Criterion {
         document: JournalToolDocument,
         path: String,
         equals: serde_json::Value,
+        /// Optional predicate on the same durable call as `path`.
+        #[serde(default)]
+        where_match: Option<JournalJsonPredicate>,
+        /// When `equals` is JSON null, also accept a missing pointer. This
+        /// models optional API fields whose omitted and explicit-null forms
+        /// both mean "unset" without weakening exact JSON assertions by
+        /// default.
+        #[serde(default)]
+        allow_missing: bool,
     },
 
     /// Requires a durable JSON-pointer value to be a string containing the
@@ -687,6 +776,8 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::AnyOf { .. }
         | Criterion::AllOf { .. } => CriterionSeverity::Hard,
 
+        Criterion::SessionChildResultAdopted { .. } => CriterionSeverity::Hard,
+
         Criterion::SessionEventCount {
             optional: false, ..
         }
@@ -1059,6 +1150,7 @@ pub fn requires_durable_run_binding(criteria: &[Criterion]) -> bool {
 fn criterion_requires_session_capture(c: &Criterion) -> bool {
     match c {
         Criterion::SessionEventCount { .. }
+        | Criterion::SessionChildResultAdopted { .. }
         | Criterion::JournalTurnEvaluationSignalCount { .. }
         | Criterion::JournalTurnEvaluationSuccess { .. }
         | Criterion::SessionSubsystemHealthy { .. }
@@ -1199,6 +1291,22 @@ fn journal_tool_document(
         JournalToolDocument::Error => call.error.as_ref(),
         JournalToolDocument::RuntimeMetadata => Some(&call.runtime_metadata),
     }
+}
+
+fn journal_tool_missing_optional_property(value: &serde_json::Value, path: &str) -> bool {
+    let Some((parent_path, property)) = path.rsplit_once('/') else {
+        return false;
+    };
+    let parent = if parent_path.is_empty() {
+        Some(value)
+    } else {
+        value.pointer(parent_path)
+    };
+    let Some(parent) = parent.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let property = property.replace("~1", "/").replace("~0", "~");
+    !parent.contains_key(&property)
 }
 
 fn call_matches_predicates(
@@ -1369,6 +1477,241 @@ fn validate_text_json_dag(
         ));
     }
     Ok((node_ids.len(), unique_edges.len()))
+}
+
+fn session_event_ids_match_tool_result(
+    session: &SessionCapture,
+    events: &[&crate::session_capture::JournalEvent],
+    event_id_path: &str,
+    link: &SessionEventResultIdMatch,
+) -> bool {
+    let event_ids = events
+        .iter()
+        .filter_map(|event| {
+            event
+                .raw
+                .pointer(event_id_path)
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .collect::<std::collections::HashSet<_>>();
+    if event_ids.len() != events.len() {
+        return false;
+    }
+
+    let parent_run_ids = events
+        .iter()
+        .filter_map(|event| {
+            event
+                .raw
+                .pointer(&link.event_parent_run_id_path)
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+        })
+        .collect::<std::collections::HashSet<_>>();
+    if parent_run_ids.len() != 1
+        || events.iter().any(|event| {
+            event
+                .raw
+                .pointer(&link.event_parent_run_id_path)
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|run_id| run_id.trim().is_empty())
+        })
+    {
+        return false;
+    }
+    let parent_run_id = parent_run_ids.iter().next().copied();
+
+    session.journal_tool_calls().into_iter().any(|call| {
+        if call.name != link.tool_name
+            || call.ok != Some(true)
+            || call.run_id.as_deref() != parent_run_id
+        {
+            return false;
+        }
+        let Some(items) = call
+            .result
+            .as_ref()
+            .and_then(|result| result.pointer(&link.result_array_path))
+            .and_then(serde_json::Value::as_array)
+        else {
+            return false;
+        };
+        let result_ids = items
+            .iter()
+            .map(|item| {
+                item.pointer(&link.item_id_path)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_owned)
+            })
+            .collect::<Option<std::collections::HashSet<_>>>();
+        result_ids
+            .is_some_and(|result_ids| result_ids.len() == items.len() && result_ids == event_ids)
+    })
+}
+
+fn child_result_adoption_proven(
+    session: &SessionCapture,
+    expected_result: &str,
+    spawn_match: Option<&SessionEventFieldMatch>,
+    allow_get_result: bool,
+) -> bool {
+    let expected_hash = format!("{:x}", Sha256::digest(expected_result.as_bytes()));
+    let calls = allow_get_result.then(|| session.journal_tool_calls());
+    let events = &session.events;
+    events
+        .iter()
+        .filter(|event| {
+            event.event_type == "agent_spawned"
+                && spawn_match.is_none_or(|predicate| {
+                    event.raw.pointer(&predicate.path) == Some(&predicate.equals)
+                })
+        })
+        .any(|spawn| {
+            let Some(child_run_id) = spawn
+                .raw
+                .pointer("/metadata/run_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            let Some(child_agent_id) = spawn
+                .raw
+                .pointer("/metadata/agent_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            let Some(parent_run_id) = spawn
+                .raw
+                .pointer("/metadata/parent_run_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            if child_run_id.is_empty() || child_agent_id.is_empty() || parent_run_id.is_empty() {
+                return false;
+            }
+            let terminated = events.iter().any(|event| {
+                event.event_type == "agent_terminated"
+                    && event
+                        .raw
+                        .pointer("/metadata/run_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(child_run_id)
+                    && event
+                        .raw
+                        .pointer("/metadata/agent_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(child_agent_id)
+                    && event
+                        .raw
+                        .pointer("/metadata/status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("completed")
+            });
+            if !terminated {
+                return false;
+            }
+            if calls.as_ref().is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    let Some(arguments) = call.arguments.as_ref() else {
+                        return false;
+                    };
+                    let Some(result) = call.result.as_ref() else {
+                        return false;
+                    };
+                    call.name == "agent"
+                        && call.ok == Some(true)
+                        && call.run_id.as_deref() == Some(parent_run_id)
+                        && arguments.get("action").and_then(serde_json::Value::as_str)
+                            == Some("get_result")
+                        && arguments
+                            .get("agent_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(child_agent_id)
+                        && result
+                            .get("result_family")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("child_result")
+                        && result.get("status").and_then(serde_json::Value::as_str)
+                            == Some("completed")
+                        && result
+                            .get("incomplete")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(false)
+                        && result.get("agent_id").and_then(serde_json::Value::as_str)
+                            == Some(child_agent_id)
+                        && result.get("run_id").and_then(serde_json::Value::as_str)
+                            == Some(child_run_id)
+                        && result.get("result").and_then(serde_json::Value::as_str)
+                            == Some(expected_result)
+                })
+            }) {
+                return true;
+            }
+            events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| event.event_type == "trace_span")
+                .any(|(adoption_index, adoption)| {
+                    if adoption
+                        .raw
+                        .pointer("/metadata/attrs/outcome")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("results_adopted")
+                        || adoption
+                            .raw
+                            .pointer("/metadata/attrs/parent_run_id")
+                            .and_then(serde_json::Value::as_str)
+                            != Some(parent_run_id)
+                    {
+                        return false;
+                    }
+                    let children = adoption
+                        .raw
+                        .pointer("/metadata/attrs/children")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+                    let matched_child = children
+                        .as_ref()
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|children| {
+                            children.iter().any(|child| {
+                                child.get("run_id").and_then(serde_json::Value::as_str)
+                                    == Some(child_run_id)
+                                    && child.get("agent_id").and_then(serde_json::Value::as_str)
+                                        == Some(child_agent_id)
+                                    && child.get("status").and_then(serde_json::Value::as_str)
+                                        == Some("completed")
+                                    && child
+                                        .get("result_sha256")
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some(expected_hash.as_str())
+                                    && child
+                                        .get("result_truncated")
+                                        .and_then(serde_json::Value::as_bool)
+                                        == Some(false)
+                            })
+                        });
+                    matched_child
+                        && events.iter().skip(adoption_index + 1).any(|event| {
+                            event.event_type == "trace_span"
+                                && event
+                                    .raw
+                                    .pointer("/metadata/attrs/outcome")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some("finalization_accepted")
+                                && event
+                                    .raw
+                                    .pointer("/metadata/attrs/parent_run_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some(parent_run_id)
+                        })
+                })
+        })
 }
 
 fn evaluate_one(
@@ -1776,6 +2119,8 @@ fn evaluate_one_with_primary_cache(
         Criterion::SessionEventCount {
             event_type,
             min,
+            max,
+            json_match,
             optional,
         } => {
             let Some(sess) = session else {
@@ -1805,15 +2150,148 @@ fn evaluate_one_with_primary_cache(
                     score: if passed { Some(1.0) } else { Some(0.0) },
                 };
             };
-            let n = sess.count_events(event_type);
-            let pass = n as u32 >= *min;
+            let matching_events = sess
+                .events
+                .iter()
+                .filter(|event| event.event_type == *event_type)
+                .filter(|event| {
+                    json_match.as_ref().is_none_or(|predicate| {
+                        event.raw.pointer(&predicate.path) == Some(&predicate.equals)
+                    })
+                })
+                .filter(|event| {
+                    let Some(link) = json_match
+                        .as_ref()
+                        .and_then(|predicate| predicate.same_run_as.as_ref())
+                    else {
+                        return true;
+                    };
+                    let Some(run_id) = event
+                        .raw
+                        .get("run_id")
+                        .or_else(|| event.raw.pointer("/metadata/run_id"))
+                        .and_then(serde_json::Value::as_str)
+                    else {
+                        return false;
+                    };
+                    if run_id.trim().is_empty() {
+                        return false;
+                    }
+                    sess.events.iter().any(|related| {
+                        related.event_type == link.event_type
+                            && related
+                                .raw
+                                .pointer(&link.run_id_path)
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|related_id| {
+                                    !related_id.trim().is_empty()
+                                        && related_id == run_id
+                                        && link.related_match.as_ref().is_none_or(|predicate| {
+                                            related.raw.pointer(&predicate.path)
+                                                == Some(&predicate.equals)
+                                        })
+                                })
+                    })
+                })
+                .collect::<Vec<_>>();
+            let n = matching_events.len();
+            let unique_count = json_match
+                .as_ref()
+                .and_then(|predicate| predicate.unique_by.as_ref())
+                .map(|path| {
+                    matching_events
+                        .iter()
+                        .filter_map(|event| {
+                            event.raw.pointer(path).and_then(serde_json::Value::as_str)
+                        })
+                        .filter(|value| !value.trim().is_empty())
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                });
+            let result_ids_match = match json_match
+                .as_ref()
+                .and_then(|predicate| predicate.result_ids_match.as_ref())
+            {
+                None => true,
+                Some(link) => json_match
+                    .as_ref()
+                    .and_then(|predicate| predicate.unique_by.as_deref())
+                    .is_some_and(|id_path| {
+                        session_event_ids_match_tool_result(sess, &matching_events, id_path, link)
+                    }),
+            };
+            let pass = n as u32 >= *min
+                && max.is_none_or(|max| n as u32 <= max)
+                && unique_count.is_none_or(|unique_count| unique_count == n)
+                && result_ids_match;
+            let predicate = json_match.as_ref().map_or_else(String::new, |predicate| {
+                let unique_by = predicate
+                    .unique_by
+                    .as_ref()
+                    .map_or_else(String::new, |path| {
+                        format!(
+                            ", unique_by={path} distinct={}",
+                            unique_count.unwrap_or_default()
+                        )
+                    });
+                let id_link = predicate
+                    .result_ids_match
+                    .as_ref()
+                    .map_or_else(String::new, |_| {
+                        format!(", result_ids_match={result_ids_match}")
+                    });
+                let run_link = predicate
+                    .same_run_as
+                    .as_ref()
+                    .map_or_else(String::new, |link| {
+                        format!(", same_run_as={}", link.event_type)
+                    });
+                format!(
+                    ", {}={}{}{}{}",
+                    predicate.path, predicate.equals, unique_by, id_link, run_link
+                )
+            });
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed: pass,
-                detail: format!("session events type={event_type} count={n} (expected >= {min})"),
+                detail: format!(
+                    "session events type={event_type}{predicate} count={n} (expected {min}..={})",
+                    max.map_or("unbounded".to_string(), |max| max.to_string())
+                ),
                 full_detail: None,
                 score: if pass { Some(1.0) } else { Some(0.0) },
+            }
+        }
+        Criterion::SessionChildResultAdopted {
+            expected_result,
+            spawn_match,
+            allow_get_result,
+        } => {
+            let Some(session) = session else {
+                return missing_required_session(c, "session_child_result_adopted");
+            };
+            let passed = child_result_adoption_proven(
+                session,
+                expected_result,
+                spawn_match.as_ref(),
+                *allow_get_result,
+            );
+            CriterionResult {
+                criterion: c.clone(),
+                severity: CriterionSeverity::Hard,
+                passed,
+                detail: if *allow_get_result {
+                    format!(
+                        "same completed child result through parent adoption or exact parent get_result: {passed}"
+                    )
+                } else if passed {
+                    "same child result adopted by its parent before finalization".into()
+                } else {
+                    "missing same-child result hash, parent adoption, or later finalization".into()
+                },
+                full_detail: None,
+                score: Some(if passed { 1.0 } else { 0.0 }),
             }
         }
         Criterion::JournalTurnEvaluationSignalCount { kind, min, max } => {
@@ -2079,6 +2557,7 @@ fn evaluate_one_with_primary_cache(
             name,
             min,
             max,
+            root_only,
             document,
             path,
             equals,
@@ -2087,10 +2566,37 @@ fn evaluate_one_with_primary_cache(
             let Some(session) = session else {
                 return missing_required_session(c, "journal_tool_call_count");
             };
-            let count = session
-                .journal_tool_calls()
+            if *root_only && outcome.run_id.is_none() {
+                return CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    passed: false,
+                    detail: "root_only requires a captured root run_id".to_string(),
+                    full_detail: None,
+                    score: None,
+                };
+            }
+            let calls = session.journal_tool_calls();
+            if *root_only
+                && calls
+                    .iter()
+                    .any(|call| call.name == *name && call.run_id.is_none())
+            {
+                return CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    passed: false,
+                    detail: format!("root-only tool {name} has a call with unknown run_id"),
+                    full_detail: None,
+                    score: None,
+                };
+            }
+            let count = calls
                 .iter()
                 .filter(|call| {
+                    if *root_only && call.run_id.as_deref() != outcome.run_id.as_deref() {
+                        return false;
+                    }
                     if call.name != *name || ok.is_some_and(|expected| call.ok != Some(expected)) {
                         return false;
                     }
@@ -2116,7 +2622,8 @@ fn evaluate_one_with_primary_cache(
                 severity: criterion_severity(c),
                 passed,
                 detail: format!(
-                    "journal tool {name}{outcome_filter}{predicate} full-call count={count}, expected {min}..={max}"
+                    "journal tool {name}{outcome_filter}{predicate}{} full-call count={count}, expected {min}..={max}",
+                    if *root_only { " root-only" } else { "" }
                 ),
                 full_detail: None,
                 score: None,
@@ -2187,6 +2694,8 @@ fn evaluate_one_with_primary_cache(
             document,
             path,
             equals,
+            where_match,
+            allow_missing,
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_tool_json");
@@ -2194,16 +2703,35 @@ fn evaluate_one_with_primary_cache(
             let calls = session.journal_tool_calls();
             let passed = calls.iter().filter(|call| call.name == *name).any(|call| {
                 let value = journal_tool_document(call, *document);
-                value.and_then(|value| value.pointer(path)) == Some(equals)
+                if let Some(predicate) = where_match
+                    && journal_tool_document(call, predicate.document)
+                        .and_then(|value| value.pointer(&predicate.path))
+                        != Some(&predicate.equals)
+                {
+                    return false;
+                }
+                let actual = value.and_then(|value| value.pointer(path));
+                actual == Some(equals)
+                    || (*allow_missing
+                        && equals.is_null()
+                        && actual.is_none()
+                        && value.is_some_and(|value| {
+                            journal_tool_missing_optional_property(value, path)
+                        }))
             });
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed,
                 detail: format!(
-                    "journal tool {name} {document:?} pointer {path:?} {} expected {}",
+                    "journal tool {name} {document:?} pointer {path:?} {} expected {}{}",
                     if passed { "matched" } else { "did not match" },
-                    equals
+                    equals,
+                    if *allow_missing && equals.is_null() {
+                        " (missing also accepted)"
+                    } else {
+                        ""
+                    },
                 ),
                 full_detail: None,
                 score: None,
@@ -4194,15 +4722,19 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             name,
             path,
             document: _,
-            equals: _,
+            equals,
+            where_match,
+            allow_missing,
         } => {
             if name.trim().is_empty() {
                 return Err("JournalToolJson.name must not be empty".into());
             }
-            if !path.is_empty() && !path.starts_with('/') {
-                return Err(format!(
-                    "JournalToolJson.path must be an RFC 6901 JSON pointer; got {path:?}"
-                ));
+            validate_json_pointer("JournalToolJson.path", path)?;
+            if let Some(predicate) = where_match {
+                validate_json_pointer("JournalToolJson.where_match.path", &predicate.path)?;
+            }
+            if *allow_missing && !equals.is_null() {
+                return Err("JournalToolJson.allow_missing requires equals: null".into());
             }
             Ok(())
         }
@@ -4353,13 +4885,85 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             Ok(())
         }
         Criterion::SessionEventCount {
-            min, event_type, ..
+            min,
+            max,
+            event_type,
+            json_match,
+            ..
         } => {
-            if *min == 0 {
+            if let Some(predicate) = json_match {
+                validate_json_pointer("SessionEventCount.json_match.path", &predicate.path)?;
+                if let Some(path) = predicate.unique_by.as_ref() {
+                    validate_json_pointer("SessionEventCount.json_match.unique_by", path)?;
+                }
+                if let Some(link) = predicate.same_run_as.as_ref() {
+                    if link.event_type.trim().is_empty() {
+                        return Err(
+                            "SessionEventCount.same_run_as.event_type must not be empty".into()
+                        );
+                    }
+                    validate_json_pointer(
+                        "SessionEventCount.same_run_as.run_id_path",
+                        &link.run_id_path,
+                    )?;
+                    if let Some(related_match) = link.related_match.as_ref() {
+                        validate_json_pointer(
+                            "SessionEventCount.same_run_as.related_match.path",
+                            &related_match.path,
+                        )?;
+                    }
+                }
+                if let Some(link) = predicate.result_ids_match.as_ref() {
+                    if predicate.unique_by.is_none() {
+                        return Err(
+                            "SessionEventCount.result_ids_match requires json_match.unique_by"
+                                .into(),
+                        );
+                    }
+                    if link.tool_name.trim().is_empty() {
+                        return Err(
+                            "SessionEventCount.result_ids_match.tool_name must not be empty".into(),
+                        );
+                    }
+                    validate_json_pointer(
+                        "SessionEventCount.result_ids_match.event_parent_run_id_path",
+                        &link.event_parent_run_id_path,
+                    )?;
+                    validate_json_pointer(
+                        "SessionEventCount.result_ids_match.result_array_path",
+                        &link.result_array_path,
+                    )?;
+                    validate_json_pointer(
+                        "SessionEventCount.result_ids_match.item_id_path",
+                        &link.item_id_path,
+                    )?;
+                }
+            }
+            if *min == 0 && max.is_none() {
                 return Err(format!(
-                    "SessionEventCount.min must be >= 1 (min=0 is trivially-true for \
-                     event_type={event_type:?}; did you mean >= 1?)"
+                    "SessionEventCount with min=0 requires max for event_type={event_type:?}"
                 ));
+            }
+            if max.is_some_and(|max| max < *min) {
+                return Err("SessionEventCount.max must be >= min".into());
+            }
+            Ok(())
+        }
+        Criterion::SessionChildResultAdopted {
+            expected_result,
+            spawn_match,
+            ..
+        } => {
+            if expected_result.is_empty() || expected_result.len() > 4_096 {
+                return Err(
+                    "SessionChildResultAdopted.expected_result must be 1..=4096 bytes".into(),
+                );
+            }
+            if let Some(predicate) = spawn_match {
+                validate_json_pointer(
+                    "SessionChildResultAdopted.spawn_match.path",
+                    &predicate.path,
+                )?;
             }
             Ok(())
         }
@@ -4629,6 +5233,7 @@ mod tests {
             prompt_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_tokens: 0,
+            token_usage_coverage: None,
             duration_ms: 0,
             turn_rounds: 0,
             cache_hits: 0,
@@ -4638,6 +5243,7 @@ mod tests {
             interruption_kind: None,
             error_kind: None,
             explain_capture: None,
+            stream_capture: None,
             tool_result_class_counts: std::collections::BTreeMap::new(),
         }
     }
@@ -5142,6 +5748,47 @@ mod tests {
     }
 
     #[test]
+    fn root_only_tool_count_excludes_child_calls_and_requires_root_identity() {
+        let criterion = Criterion::JournalToolCallCount {
+            name: "bash".into(),
+            min: 0,
+            max: 0,
+            root_only: true,
+            ok: None,
+            document: None,
+            path: None,
+            equals: None,
+        };
+        let session = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "run_id": "child-run",
+                "tool_calls": [{"tool_call_id":"child-bash","name":"bash"}]
+            }),
+        )]);
+        let mut outcome = outcome_with_tools(&["agent"]);
+        outcome.run_id = Some("root-run".into());
+        assert!(
+            evaluate_deterministic_with_session(&[criterion.clone()], &outcome, Some(&session))[0]
+                .passed
+        );
+        let unknown = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [{"tool_call_id":"unknown-bash","name":"bash"}]
+            }),
+        )]);
+        assert!(
+            !evaluate_deterministic_with_session(&[criterion.clone()], &outcome, Some(&unknown))[0]
+                .passed
+        );
+        outcome.run_id = None;
+        assert!(
+            !evaluate_deterministic_with_session(&[criterion], &outcome, Some(&session))[0].passed
+        );
+    }
+
+    #[test]
     fn child_tool_count_requires_distinct_successful_child_runs() {
         let criterion = Criterion::JournalChildToolCallCount {
             parent: "agent_fanout".into(),
@@ -5322,6 +5969,8 @@ mod tests {
             &[Criterion::SessionEventCount {
                 event_type: "llm_round".into(),
                 min: 2,
+                max: None,
+                json_match: None,
                 optional: false,
             }],
             &out,
@@ -5329,6 +5978,995 @@ mod tests {
         );
         assert!(r[0].passed);
         assert_eq!(r[0].severity, CriterionSeverity::Hard);
+    }
+
+    #[test]
+    fn adopted_child_result_requires_exact_child_parent_hash_and_order() {
+        let result = "ASTRA-CHILD-ANSWERED-JSON";
+        let hash = format!("{:x}", Sha256::digest(result.as_bytes()));
+        let children = serde_json::json!([{
+            "agent_id": "child-agent", "run_id": "child-run", "status": "completed",
+            "result_sha256": hash, "result_truncated": false
+        }])
+        .to_string();
+        let session = mk_session(&[
+            (
+                "agent_spawned",
+                serde_json::json!({"metadata": {
+                    "run_id": "child-run", "agent_id": "child-agent", "parent_run_id": "parent-run",
+                    "model_configuration": {"prepared_selection": {"model_name": "glm-5.2"}}
+                }}),
+            ),
+            (
+                "agent_terminated",
+                serde_json::json!({"metadata": {
+                    "run_id": "child-run", "agent_id": "child-agent", "status": "completed"
+                }}),
+            ),
+            (
+                "trace_span",
+                serde_json::json!({"metadata": {
+                    "end_us": 20, "attrs": {"parent_run_id": "parent-run", "outcome": "results_adopted", "children": children}
+                }}),
+            ),
+            (
+                "trace_span",
+                serde_json::json!({"metadata": {
+                    "start_us": 21, "attrs": {"parent_run_id": "parent-run", "outcome": "finalization_accepted"}
+                }}),
+            ),
+        ]);
+        let criterion = Criterion::SessionChildResultAdopted {
+            expected_result: result.into(),
+            spawn_match: None,
+            allow_get_result: false,
+        };
+        let outcome = outcome_with_tools(&[]);
+        let check = |capture: &SessionCapture| {
+            evaluate_deterministic_with_session(&[criterion.clone()], &outcome, Some(capture))[0]
+                .passed
+        };
+        assert!(check(&session));
+        assert!(!check(&mk_session(&[])));
+        assert!(
+            !evaluate_deterministic_with_session(&[criterion.clone()], &outcome, None)[0].passed
+        );
+        assert!(!child_result_adoption_proven(
+            &session,
+            "OTHER-RESULT",
+            None,
+            false
+        ));
+        let model_match = SessionEventFieldMatch {
+            path: "/metadata/model_configuration/prepared_selection/model_name".into(),
+            equals: serde_json::json!("required-model"),
+        };
+        assert!(!child_result_adoption_proven(
+            &session,
+            result,
+            Some(&model_match),
+            false
+        ));
+        let mut model_bound = session.clone();
+        model_bound.events[0].raw["metadata"]["model_configuration"] = serde_json::json!({
+            "prepared_selection": {"model_name": "required-model"}
+        });
+        assert!(child_result_adoption_proven(
+            &model_bound,
+            result,
+            Some(&model_match),
+            false
+        ));
+        model_bound.events[0].raw["metadata"]["model_configuration"]["prepared_selection"]["model_name"] =
+            serde_json::json!("other-model");
+        assert!(!child_result_adoption_proven(
+            &model_bound,
+            result,
+            Some(&model_match),
+            false
+        ));
+
+        let mut wrong = session.clone();
+        wrong.events[1].raw["metadata"]["run_id"] = serde_json::json!("other-child");
+        assert!(!check(&wrong));
+        let mut wrong = session.clone();
+        wrong.events[2].raw["metadata"]["attrs"]["parent_run_id"] =
+            serde_json::json!("other-parent");
+        assert!(!check(&wrong));
+        let mut wrong = session.clone();
+        wrong.events[2].raw["metadata"]["attrs"]["children"] = serde_json::json!("[]");
+        assert!(!check(&wrong));
+        let mut wrong = session.clone();
+        let mut truncated: serde_json::Value = serde_json::from_str(
+            wrong.events[2].raw["metadata"]["attrs"]["children"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        truncated[0]["result_truncated"] = serde_json::json!(true);
+        wrong.events[2].raw["metadata"]["attrs"]["children"] =
+            serde_json::json!(truncated.to_string());
+        assert!(!check(&wrong));
+        let mut clock_shifted = session.clone();
+        clock_shifted.events[3].raw["metadata"]["start_us"] = serde_json::json!(19);
+        assert!(
+            check(&clock_shifted),
+            "journal order survives wall-clock changes"
+        );
+        let mut wrong = session.clone();
+        wrong.events.swap(2, 3);
+        assert!(!check(&wrong));
+        let mut wrong = session.clone();
+        wrong.events[3].raw["metadata"]["attrs"]["outcome"] =
+            serde_json::json!("finalization_incomplete");
+        assert!(!check(&wrong));
+
+        let case = crate::case::Case::from_path(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("cases/subagent_model_selection/flash_child_question_parent_answer.yaml"),
+        )
+        .expect("load shipped child question case");
+        // Load the whole handoff assertion, including any alternatives. A
+        // plain-marker alternative must not hide behind a tested strong leaf.
+        let handoff = case
+            .criteria
+            .iter()
+            .find(|criterion| {
+                matches!(
+                    criterion,
+                    Criterion::SessionChildResultAdopted { .. } | Criterion::AnyOf { .. }
+                )
+            })
+            .expect("shipped case must prove the child handoff");
+        validate_criterion(handoff).expect("valid shipped handoff");
+        let handoff_check = |capture: &SessionCapture| {
+            evaluate_deterministic_with_session(
+                std::slice::from_ref(handoff),
+                &outcome,
+                Some(capture),
+            )[0]
+            .passed
+        };
+        assert!(handoff_check(&session), "canonical adoption remains valid");
+
+        let tool_turn =
+            |caller: &str, arguments: serde_json::Value, body: serde_json::Value, ok: bool| {
+                let call = astra_services::session_journal::ToolCallRecord {
+                    tool_call_id: Some("handoff-call".into()),
+                    name: "agent".into(),
+                    ok,
+                    args_full: Some(arguments.to_string()),
+                    result_full: Some(body.to_string()),
+                    ..Default::default()
+                };
+                let event = astra_services::session_journal::JournalEvent::turn(
+                    Some("s"),
+                    1,
+                    None,
+                    "fixture",
+                    "done",
+                    1,
+                    0,
+                    0,
+                    1,
+                )
+                .with_producer_scope(Some(caller))
+                .with_tool_calls(vec![call]);
+                mk_session(&[("turn", serde_json::to_value(event).unwrap())])
+                    .events
+                    .into_iter()
+                    .next()
+                    .unwrap()
+            };
+        for caller in ["parent-run", "child-run"] {
+            for ok in [true, false] {
+                let mut wrong = session.clone();
+                let mut children: serde_json::Value = serde_json::from_str(
+                    wrong.events[2].raw["metadata"]["attrs"]["children"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                children[0]["result_sha256"] =
+                    serde_json::json!(format!("{:x}", Sha256::digest(b"WRONG-RESULT")));
+                wrong.events[2].raw["metadata"]["attrs"]["children"] =
+                    serde_json::json!(children.to_string());
+                wrong.events.push(tool_turn(
+                    caller,
+                    serde_json::json!({"action": "send_message", "message_type": "text", "message": result}),
+                    serde_json::json!({"result_family": "control_receipt", "status": "queued", "success": true}),
+                    ok,
+                ));
+                assert!(
+                    !handoff_check(&wrong),
+                    "ordinary marker from {caller}, ok={ok}, cannot replace the wrong terminal body"
+                );
+            }
+        }
+
+        let arguments = serde_json::json!({"action": "get_result", "agent_id": "child-agent"});
+        // Use the real completed-result renderer, then the run_id enrichment
+        // performed by the production get_result owner.
+        let mut body: serde_json::Value = serde_json::from_str(
+            &astra_turn_core::orchestration::agent_result_wire::render_completed_agent_result(
+                "child-agent",
+                result,
+                None,
+            ),
+        )
+        .unwrap();
+        body["run_id"] = serde_json::json!("child-run");
+        let foreground =
+            |caller: &str, arguments: serde_json::Value, body: serde_json::Value, ok: bool| {
+                let mut capture = session.clone();
+                capture.events.truncate(2);
+                capture.events.push(tool_turn(caller, arguments, body, ok));
+                capture
+            };
+        let healthy = foreground("parent-run", arguments.clone(), body.clone(), true);
+        assert!(
+            handoff_check(&healthy),
+            "healthy foreground retrieval does not need background adoption"
+        );
+        assert!(!check(&healthy), "adoption-only default remains strict");
+        assert!(!handoff_check(&foreground(
+            "other-parent",
+            arguments.clone(),
+            body.clone(),
+            true
+        )));
+        assert!(!handoff_check(&foreground(
+            "parent-run",
+            arguments.clone(),
+            body.clone(),
+            false
+        )));
+        let mut wrong_arguments = arguments.clone();
+        wrong_arguments["agent_id"] = serde_json::json!("other-agent");
+        assert!(!handoff_check(&foreground(
+            "parent-run",
+            wrong_arguments,
+            body.clone(),
+            true
+        )));
+        for (field, value) in [
+            ("agent_id", serde_json::json!("other-agent")),
+            ("run_id", serde_json::json!("other-run")),
+            ("result", serde_json::json!("WRONG-RESULT")),
+            ("status", serde_json::json!("still_running")),
+            ("incomplete", serde_json::json!(true)),
+            ("result_family", serde_json::json!("control_receipt")),
+        ] {
+            let mut wrong_body = body.clone();
+            wrong_body[field] = value;
+            assert!(
+                !handoff_check(&foreground(
+                    "parent-run",
+                    arguments.clone(),
+                    wrong_body,
+                    true
+                )),
+                "wrong returned {field} must fail"
+            );
+        }
+        let mut wrong = healthy.clone();
+        wrong.events[1].raw["metadata"]["status"] = serde_json::json!("failed");
+        assert!(
+            !handoff_check(&wrong),
+            "terminal receipt cannot override failed child"
+        );
+        let mut wrong = healthy;
+        wrong.events[0].raw["metadata"]["model_configuration"]["prepared_selection"]["model_name"] =
+            serde_json::json!("deepseek-v4-flash");
+        assert!(
+            !handoff_check(&wrong),
+            "wrong model cannot supply the handoff"
+        );
+
+        for name in [
+            "flash_semantic_model_reference_glm",
+            "flash_discover_then_delegate_glm",
+        ] {
+            let case = crate::case::Case::from_path(
+                &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(format!("cases/subagent_model_selection/{name}.yaml")),
+            )
+            .expect("load shipped GLM journey");
+            let witness = case
+                .criteria
+                .iter()
+                .find(|criterion| matches!(criterion, Criterion::SessionChildResultAdopted { .. }))
+                .expect("GLM journey must prove its actual child result");
+            let Criterion::SessionChildResultAdopted {
+                expected_result, ..
+            } = witness
+            else {
+                unreachable!()
+            };
+            let mut parent_marker = outcome.clone();
+            parent_marker.text = expected_result.clone();
+            let journey_check = |capture: &SessionCapture| {
+                evaluate_deterministic_with_session(
+                    std::slice::from_ref(witness),
+                    &parent_marker,
+                    Some(capture),
+                )[0]
+                .passed
+            };
+            assert!(
+                !journey_check(&mk_session(&[])),
+                "parent-only marker must fail"
+            );
+            assert!(
+                !journey_check(&session),
+                "wrong actual child body must fail"
+            );
+            let mut exact = session.clone();
+            let mut children: serde_json::Value = serde_json::from_str(
+                exact.events[2].raw["metadata"]["attrs"]["children"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            children[0]["result_sha256"] =
+                serde_json::json!(format!("{:x}", Sha256::digest(expected_result.as_bytes())));
+            exact.events[2].raw["metadata"]["attrs"]["children"] =
+                serde_json::json!(children.to_string());
+            assert!(journey_check(&exact), "exact child adoption remains valid");
+            let mut read_body = body.clone();
+            read_body["result"] = serde_json::json!(expected_result);
+            assert!(
+                journey_check(&foreground(
+                    "parent-run",
+                    arguments.clone(),
+                    read_body,
+                    true
+                )),
+                "exact foreground retrieval remains valid"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_child_question_flow_rejects_parent_to_child_question() {
+        let case = crate::case::Case::from_path(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("cases/subagent_model_selection/flash_child_question_parent_answer.yaml"),
+        )
+        .expect("load shipped child question case");
+        let flow = case
+            .criteria
+            .iter()
+            .find(|criterion| matches!(criterion, Criterion::JournalToolValueFlowBound { .. }))
+            .expect("case must bind the question and answer");
+        let check = |question_to: &str| {
+            let calls = serde_json::json!([
+                {
+                    "tool_call_id": "question-1", "name": "agent", "ok": true,
+                    "args_full": serde_json::json!({
+                        "action": "send_message", "message_type": "question", "to": question_to,
+                        "message": "Which format?"
+                    }).to_string(),
+                    "result_full": serde_json::json!({"message_id": "request-1"}).to_string()
+                },
+                {
+                    "tool_call_id": "answer-1", "name": "agent", "ok": true,
+                    "args_full": serde_json::json!({
+                        "action": "send_message", "message_type": "answer", "to": "child-1",
+                        "request_id": "request-1", "message": "JSON"
+                    }).to_string(),
+                    "result_full": serde_json::json!({"queued": true}).to_string()
+                }
+            ]);
+            let session = mk_session(&[("turn", serde_json::json!({"tool_calls": calls}))]);
+            evaluate_deterministic_with_session(
+                std::slice::from_ref(flow),
+                &outcome_with_tools(&[]),
+                Some(&session),
+            )[0]
+            .passed
+        };
+        assert!(check("parent"), "child question to parent must count");
+        assert!(!check("child-1"), "reverse question must not count");
+    }
+
+    #[test]
+    fn shipped_child_question_requires_both_outputs_in_the_child_brief() {
+        let case = crate::case::Case::from_path(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("cases/subagent_model_selection/flash_child_question_parent_answer.yaml"),
+        )
+        .expect("load shipped child question case");
+        let brief_checks: Vec<_> = case
+            .criteria
+            .iter()
+            .filter(|criterion| {
+                matches!(criterion, Criterion::JournalToolJsonContains { name, document: JournalToolDocument::Arguments, path, .. }
+                    if name == "agent" && path == "/prompt")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(brief_checks.len(), 2);
+        let check = |brief: &str| {
+            let session = mk_session(&[(
+                "turn",
+                serde_json::json!({"tool_calls": [{
+                    "tool_call_id": "spawn-1", "name": "agent", "ok": true,
+                    "args_full": serde_json::json!({
+                        "action": "spawn", "prompt": brief
+                    }).to_string(),
+                    "result_full": serde_json::json!({"status": "launched"}).to_string()
+                }]}),
+            )]);
+            evaluate_deterministic_with_session(
+                &brief_checks,
+                &outcome_with_tools(&[]),
+                Some(&session),
+            )
+            .iter()
+            .all(|result| result.passed)
+        };
+        assert!(!check("Ask the parent for a format, then produce one line"));
+        assert!(!check("JSON => ASTRA-CHILD-ANSWERED-JSON"));
+        assert!(check(
+            "JSON => ASTRA-CHILD-ANSWERED-JSON; TEXT => ASTRA-CHILD-ANSWERED-TEXT"
+        ));
+    }
+
+    #[test]
+    fn session_event_count_can_match_model_identity_in_spawn_metadata() {
+        fn spawn_event(
+            run_id: &str,
+            parent_run_id: &str,
+            group_id: &str,
+            slot_index: usize,
+            model_name: &str,
+        ) -> serde_json::Value {
+            let fanout_slot = serde_json::json!({
+                "group_id": group_id,
+                "target_count": 2,
+                "slot_index": slot_index,
+                "slot_id": run_id
+            });
+            let mut event =
+                astra_services::session_journal::JournalEvent::agent_spawned_with_fanout(
+                    Some("s"),
+                    run_id,
+                    run_id,
+                    parent_run_id,
+                    "explore",
+                    "fixture child",
+                    None,
+                    false,
+                    Some(&fanout_slot),
+                    None,
+                )
+                .with_producer_scope(Some(run_id));
+            event.metadata.as_mut().expect("spawn metadata")["model_configuration"] = serde_json::json!({
+                "prepared_selection": {"model_name": model_name}
+            });
+            serde_json::to_value(event).expect("serialize real journal event")
+        }
+
+        fn fanout_turn(parent_run_id: &str, child_ids: &[&str]) -> serde_json::Value {
+            let agents = child_ids
+                .iter()
+                .map(|run_id| {
+                    serde_json::json!({
+                        "run_id": run_id, "agent_id": run_id, "status": "launched"
+                    })
+                })
+                .collect::<Vec<_>>();
+            let call = astra_services::session_journal::ToolCallRecord {
+                tool_call_id: Some("reused-call-id".into()),
+                name: "agent_fanout".into(),
+                ok: true,
+                args_full: Some(
+                    serde_json::json!({
+                        "action": "start", "group_id": "flash-model-selection-test",
+                        "defaults": {"reasoning": {"mode": "model_default"}}
+                    })
+                    .to_string(),
+                ),
+                result_full: Some(
+                    serde_json::json!({
+                        "status": "started",
+                        "group_id": "flash-model-selection-test",
+                        "agents": agents,
+                        "fanout": {"accepted": child_ids.len(), "terminal": 0},
+                        "delivery": "parent_owned_concurrent"
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            };
+            let event = astra_services::session_journal::JournalEvent::turn(
+                Some("s"),
+                1,
+                None,
+                "fixture",
+                "done",
+                1,
+                0,
+                0,
+                1,
+            )
+            .with_producer_scope(Some(parent_run_id))
+            .with_tool_calls(vec![call]);
+            serde_json::to_value(event).expect("serialize real journal tool record")
+        }
+
+        fn model_spawn_events() -> Vec<(&'static str, serde_json::Value)> {
+            vec![
+                (
+                    "agent_spawned",
+                    spawn_event(
+                        "child-1",
+                        "parent-1",
+                        "flash-model-selection-test",
+                        0,
+                        "deepseek-v4-flash",
+                    ),
+                ),
+                (
+                    "agent_spawned",
+                    spawn_event(
+                        "child-2",
+                        "parent-1",
+                        "flash-model-selection-test",
+                        1,
+                        "deepseek-v4-flash",
+                    ),
+                ),
+                (
+                    "agent_spawned",
+                    spawn_event("child-3", "parent-2", "another-group", 0, "another-model"),
+                ),
+            ]
+        }
+
+        let mut events = model_spawn_events();
+        events.push(("turn", fanout_turn("parent-1", &["child-1", "child-2"])));
+        let session = mk_session(&events);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("cases/subagent_model_selection/flash_fanout_model_default.yaml");
+        let case = crate::case::Case::from_path(&path).expect("load shipped fanout case");
+        let criterion = case
+            .criteria
+            .iter()
+            .find(|criterion| {
+                matches!(
+                    criterion,
+                    Criterion::SessionEventCount { json_match: Some(predicate), .. }
+                        if predicate.result_ids_match.is_some()
+                )
+            })
+            .expect("shipped fanout case must enforce parent-owned result IDs")
+            .clone();
+        validate_criterion(&criterion).expect("valid event JSON predicate");
+        let results = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&session),
+        );
+        assert!(results[0].passed, "{}", results[0].detail);
+        assert!(results[0].detail.contains("count=2"));
+
+        let mut uniqueness_only = criterion.clone();
+        if let Criterion::SessionEventCount {
+            json_match: Some(predicate),
+            ..
+        } = &mut uniqueness_only
+        {
+            predicate.result_ids_match = None;
+        }
+        let duplicate_run_ids = mk_session(&[
+            (
+                "agent_spawned",
+                spawn_event(
+                    "same-child",
+                    "parent-1",
+                    "flash-model-selection-test",
+                    0,
+                    "deepseek-v4-flash",
+                ),
+            ),
+            (
+                "agent_spawned",
+                spawn_event(
+                    "same-child",
+                    "parent-1",
+                    "flash-model-selection-test",
+                    1,
+                    "deepseek-v4-flash",
+                ),
+            ),
+        ]);
+        let duplicate = evaluate_deterministic_with_session(
+            std::slice::from_ref(&uniqueness_only),
+            &outcome_with_tools(&[]),
+            Some(&duplicate_run_ids),
+        );
+        assert!(!duplicate[0].passed, "duplicate child run IDs must fail");
+
+        let mut mismatched_events = model_spawn_events();
+        mismatched_events.push((
+            "turn",
+            fanout_turn("parent-1", &["child-1", "unrelated-child"]),
+        ));
+        let mismatched_result = mk_session(&mismatched_events);
+        let mismatched = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&mismatched_result),
+        );
+        assert!(
+            !mismatched[0].passed,
+            "spawn IDs must match returned children"
+        );
+
+        let mut wrong_parent_events = model_spawn_events();
+        wrong_parent_events.push((
+            "turn",
+            fanout_turn("parent-1", &["unrelated-child-1", "unrelated-child-2"]),
+        ));
+        wrong_parent_events.push(("turn", fanout_turn("parent-2", &["child-1", "child-2"])));
+        let wrong_parent = mk_session(&wrong_parent_events);
+        let wrong_parent_result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&wrong_parent),
+        );
+        assert!(
+            !wrong_parent_result[0].passed,
+            "a different run reusing a tool call ID cannot authorize the match"
+        );
+
+        let mut missing_parent_identity = session.clone();
+        let child = missing_parent_identity
+            .events
+            .iter_mut()
+            .find(|event| {
+                event.event_type == "agent_spawned"
+                    && event
+                        .raw
+                        .pointer("/metadata/run_id")
+                        .and_then(|id| id.as_str())
+                        == Some("child-2")
+            })
+            .expect("second fixture spawn event");
+        child.raw["metadata"]
+            .as_object_mut()
+            .expect("metadata object")
+            .remove("parent_run_id");
+        let missing_parent = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&missing_parent_identity),
+        );
+        assert!(
+            !missing_parent[0].passed,
+            "every matched event must carry its parent run identity"
+        );
+
+        // A real start receipt has /agents, not terminal /results. Evaluate
+        // the entire shipped case with automatic adoption and no get_results.
+        let mut adopted = model_spawn_events();
+        adopted.truncate(2);
+        adopted.push(("turn", fanout_turn("parent-1", &["child-1", "child-2"])));
+        let mut children = Vec::new();
+        for (run_id, result) in [
+            ("child-1", "FLASH-SLOT-ALPHA"),
+            ("child-2", "FLASH-SLOT-BETA"),
+        ] {
+            adopted.push((
+                "agent_terminated",
+                serde_json::json!({"metadata": {
+                    "agent_id": run_id, "run_id": run_id, "status": "completed"
+                }}),
+            ));
+            children.push(serde_json::json!({
+                "agent_id": run_id, "run_id": run_id, "status": "completed",
+                "result_sha256": format!("{:x}", Sha256::digest(result.as_bytes())),
+                "result_truncated": false
+            }));
+        }
+        adopted.push((
+            "trace_span",
+            serde_json::json!({"metadata": {"attrs": {
+                "parent_run_id": "parent-1", "outcome": "results_adopted",
+                "children": serde_json::to_string(&children).unwrap()
+            }}}),
+        ));
+        adopted.push((
+            "trace_span",
+            serde_json::json!({"metadata": {"attrs": {
+                "parent_run_id": "parent-1", "outcome": "finalization_accepted"
+            }}}),
+        ));
+        let mut outcome = outcome_with_tools(&[]);
+        outcome.text = "FLASH-SLOT-ALPHA FLASH-SLOT-BETA 2/2".into();
+        let results = evaluate_deterministic_with_session(
+            &case.criteria,
+            &outcome,
+            Some(&mk_session(&adopted)),
+        );
+        assert!(results.iter().all(|result| result.passed), "{results:?}");
+    }
+
+    #[test]
+    fn session_event_json_match_preserves_yaml_null() {
+        let parsed: Criterion = serde_yaml_ng::from_str(
+            "type: session_event_count\nevent_type: agent_spawned\nmin: 1\njson_match:\n  path: /metadata/model\n  equals: null\n",
+        )
+        .expect("YAML preserves explicit null in the nested matcher");
+        let Criterion::SessionEventCount {
+            json_match: Some(predicate),
+            ..
+        } = &parsed
+        else {
+            panic!("expected a session event matcher");
+        };
+        assert!(predicate.equals.is_null());
+        validate_criterion(&parsed).expect("parsed null predicate is valid");
+        let session = mk_session(&[(
+            "agent_spawned",
+            serde_json::json!({"metadata": {"model": null}}),
+        )]);
+        let evaluated = evaluate_deterministic_with_session(
+            std::slice::from_ref(&parsed),
+            &outcome_with_tools(&[]),
+            Some(&session),
+        );
+        assert!(evaluated[0].passed, "{}", evaluated[0].detail);
+    }
+
+    #[test]
+    fn session_event_count_can_bind_completed_model_call_to_spawned_child_run() {
+        let criterion = Criterion::SessionEventCount {
+            event_type: "LlmRoundCompleted".into(),
+            min: 1,
+            max: None,
+            json_match: Some(SessionEventJsonMatch {
+                path: "/payload/model".into(),
+                equals: serde_json::json!("glm-5.2"),
+                unique_by: None,
+                same_run_as: Some(SessionEventRunIdMatch {
+                    event_type: "agent_spawned".into(),
+                    run_id_path: "/metadata/run_id".into(),
+                    related_match: None,
+                }),
+                result_ids_match: None,
+            }),
+            optional: false,
+        };
+        validate_criterion(&criterion).expect("related run identity path is valid");
+
+        let linked = mk_session(&[
+            (
+                "agent_spawned",
+                serde_json::json!({"metadata": {"run_id": "child-run"}}),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "child-run",
+                    "payload": {"model": "glm-5.2"}
+                }),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "parent-run",
+                    "payload": {"model": "glm-5.2"}
+                }),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "other-child",
+                    "payload": {"model": "other-model"}
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&linked),
+        );
+        assert!(result[0].passed, "{}", result[0].detail);
+        assert!(result[0].detail.contains("count=1"));
+
+        let unlinked = mk_session(&[(
+            "LlmRoundCompleted",
+            serde_json::json!({
+                "run_id": "parent-run",
+                "payload": {"model": "glm-5.2"}
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&unlinked),
+        );
+        assert!(
+            !result[0].passed,
+            "a parent call must not satisfy child evidence"
+        );
+    }
+
+    #[test]
+    fn session_event_count_binds_lifecycle_metadata_run_without_spoofing_step_run() {
+        let criterion = Criterion::SessionEventCount {
+            event_type: "agent_terminated".into(),
+            min: 1,
+            max: Some(1),
+            json_match: Some(SessionEventJsonMatch {
+                path: "/metadata/status".into(),
+                equals: serde_json::json!("completed"),
+                unique_by: None,
+                same_run_as: Some(SessionEventRunIdMatch {
+                    event_type: "agent_spawned".into(),
+                    run_id_path: "/metadata/run_id".into(),
+                    related_match: None,
+                }),
+                result_ids_match: None,
+            }),
+            optional: false,
+        };
+        let check = |termination: serde_json::Value| {
+            let session = mk_session(&[
+                (
+                    "agent_spawned",
+                    serde_json::json!({"metadata": {"run_id": "child-run"}}),
+                ),
+                ("agent_terminated", termination),
+            ]);
+            evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome_with_tools(&[]),
+                Some(&session),
+            )[0]
+            .passed
+        };
+        assert!(check(serde_json::json!({"metadata": {
+            "run_id": "child-run", "status": "completed"
+        }})));
+        assert!(!check(serde_json::json!({"metadata": {
+            "run_id": "other-run", "status": "completed"
+        }})));
+        assert!(!check(serde_json::json!({
+            "run_id": "other-run",
+            "metadata": {"run_id": "child-run", "status": "completed"}
+        })));
+    }
+
+    #[test]
+    fn session_event_count_can_bind_provider_call_to_a_specific_spawn_configuration() {
+        let criterion = Criterion::SessionEventCount {
+            event_type: "LlmRoundCompleted".into(),
+            min: 1,
+            max: Some(1),
+            json_match: Some(SessionEventJsonMatch {
+                path: "/payload/model".into(),
+                equals: serde_json::json!("glm-5.2"),
+                unique_by: None,
+                same_run_as: Some(SessionEventRunIdMatch {
+                    event_type: "agent_spawned".into(),
+                    run_id_path: "/metadata/run_id".into(),
+                    related_match: Some(SessionEventFieldMatch {
+                        path: "/metadata/fanout_slot/slot_index".into(),
+                        equals: serde_json::json!(1),
+                    }),
+                }),
+                result_ids_match: None,
+            }),
+            optional: false,
+        };
+        validate_criterion(&criterion).expect("specific related event predicate is valid");
+
+        let session = mk_session(&[
+            (
+                "agent_spawned",
+                serde_json::json!({
+                    "metadata": {
+                        "run_id": "plan-run",
+                        "fanout_slot": {"slot_index": 0}
+                    }
+                }),
+            ),
+            (
+                "agent_spawned",
+                serde_json::json!({
+                    "metadata": {
+                        "run_id": "review-run",
+                        "fanout_slot": {"slot_index": 1}
+                    }
+                }),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "review-run",
+                    "payload": {"model": "glm-5.2"}
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&session),
+        );
+        assert!(result[0].passed, "{}", result[0].detail);
+
+        let mut wrong_slot = session.clone();
+        wrong_slot.events[1].raw["metadata"]["fanout_slot"]["slot_index"] = serde_json::json!(0);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&wrong_slot),
+        );
+        assert!(!result[0].passed, "wrong slot must not satisfy the link");
+
+        let case = crate::case::Case::from_path(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("cases/subagent_model_selection/flash_fanout_two_models_high.yaml"),
+        )
+        .expect("load shipped high-reasoning fanout case");
+        let high_checks: Vec<_> = case
+            .criteria
+            .iter()
+            .filter(|criterion| {
+                matches!(criterion,
+                    Criterion::SessionEventCount { json_match: Some(predicate), .. }
+                        if predicate.path.starts_with("/metadata/model_configuration/thinking/")
+                            || (predicate.path == "/payload/model"
+                                && predicate.equals == serde_json::json!("deepseek-v4-flash"))
+                )
+            })
+            .cloned()
+            .collect();
+        assert_eq!(high_checks.len(), 3, "mode, effort and actual Flash round");
+        let mut configured = session.clone();
+        configured.events[0].raw["metadata"]["model_configuration"] = serde_json::json!({
+            "prepared_selection": {"model_name": "glm-5.2"},
+            "thinking": {"mode": "disabled", "effort": "medium"}
+        });
+        configured.events[1].raw["metadata"]["model_configuration"] = serde_json::json!({
+            "prepared_selection": {"model_name": "deepseek-v4-flash"},
+            "thinking": {"mode": "adaptive", "effort": "high"}
+        });
+        configured.events[2].raw["payload"]["model"] = serde_json::json!("deepseek-v4-flash");
+        let high_check = |capture: &SessionCapture| {
+            evaluate_deterministic_with_session(
+                &high_checks,
+                &outcome_with_tools(&[]),
+                Some(capture),
+            )
+            .iter()
+            .all(|result| result.passed)
+        };
+        assert!(high_check(&configured));
+        for (field, other_value) in [
+            ("mode", serde_json::json!("disabled")),
+            ("effort", serde_json::json!("medium")),
+        ] {
+            let mut wrong = configured.clone();
+            let requested =
+                wrong.events[1].raw["metadata"]["model_configuration"]["thinking"][field].clone();
+            wrong.events[0].raw["metadata"]["model_configuration"]["thinking"][field] = requested;
+            wrong.events[1].raw["metadata"]["model_configuration"]["thinking"][field] = other_value;
+            assert!(
+                !high_check(&wrong),
+                "{field} on GLM slot 0 cannot count for Flash slot 1"
+            );
+        }
+        let mut wrong = configured;
+        wrong.events[2].raw["run_id"] = serde_json::json!("plan-run");
+        assert!(
+            !high_check(&wrong),
+            "Flash round must belong to its actual slot"
+        );
     }
 
     #[test]
@@ -5341,6 +6979,8 @@ mod tests {
             &[Criterion::SessionEventCount {
                 event_type: "llm_round".into(),
                 min: 2,
+                max: None,
+                json_match: None,
                 optional: false,
             }],
             &out,
@@ -5357,6 +6997,8 @@ mod tests {
             &[Criterion::SessionEventCount {
                 event_type: "llm_round".into(),
                 min: 2,
+                max: None,
+                json_match: None,
                 optional: true,
             }],
             &out,
@@ -5666,6 +7308,7 @@ mod tests {
                 name: "agent_fanout".into(),
                 min: 1,
                 max: 1,
+                root_only: false,
                 document: Some(JournalToolDocument::Arguments),
                 path: Some("/action".into()),
                 equals: Some(serde_json::json!("start")),
@@ -5675,18 +7318,24 @@ mod tests {
                 document: JournalToolDocument::Arguments,
                 path: "/target_count".into(),
                 equals: serde_json::json!(3),
+                where_match: None,
+                allow_missing: false,
             },
             Criterion::JournalToolJson {
                 name: "agent_fanout".into(),
                 document: JournalToolDocument::Result,
                 path: "/provenance/all_slots_delivered".into(),
                 equals: serde_json::json!(true),
+                where_match: None,
+                allow_missing: false,
             },
             Criterion::JournalToolJson {
                 name: "submit_task_resolution".into(),
                 document: JournalToolDocument::RuntimeMetadata,
                 path: "/pre_dispatch_rejection".into(),
                 equals: serde_json::json!("provider_schema_validation"),
+                where_match: None,
+                allow_missing: false,
             },
         ];
         let results =
@@ -5704,6 +7353,8 @@ mod tests {
                 document: JournalToolDocument::Result,
                 path: "/fanout/terminal".into(),
                 equals: serde_json::json!(2),
+                where_match: None,
+                allow_missing: false,
             }],
             &outcome_with_tools(&[]),
             Some(&sess),
@@ -5716,6 +7367,8 @@ mod tests {
                 document: JournalToolDocument::RuntimeMetadata,
                 path: "/pre_dispatch_rejection".into(),
                 equals: serde_json::json!("handler_error"),
+                where_match: None,
+                allow_missing: false,
             }],
             &outcome_with_tools(&[]),
             Some(&sess),
@@ -5723,6 +7376,159 @@ mod tests {
         assert!(
             !wrong_stage[0].passed,
             "another rejection stage must not match"
+        );
+    }
+
+    #[test]
+    fn durable_tool_json_can_assert_optional_field_is_unset() {
+        let session_with_args = |args: &str| {
+            mk_session(&[(
+                "turn",
+                serde_json::json!({
+                    "tool_calls": [{
+                        "tool_call_id": "spawn-call",
+                        "name": "agent",
+                        "ok": true,
+                        "args_full": args,
+                        "result_full": "{}"
+                    }]
+                }),
+            )])
+        };
+        let criterion = Criterion::JournalToolJson {
+            name: "agent".into(),
+            document: JournalToolDocument::Arguments,
+            path: "/requested_model_policy".into(),
+            equals: serde_json::Value::Null,
+            where_match: Some(JournalJsonPredicate {
+                document: JournalToolDocument::Arguments,
+                path: "/action".into(),
+                equals: serde_json::json!("spawn"),
+            }),
+            allow_missing: true,
+        };
+        let outcome = outcome_with_tools(&[]);
+
+        for args in [
+            r#"{"action":"spawn"}"#,
+            r#"{"action":"spawn","requested_model_policy":null}"#,
+        ] {
+            let session = session_with_args(args);
+            let result = evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&session),
+            );
+            assert!(result[0].passed, "unset selector should match: {result:?}");
+        }
+
+        let selected =
+            session_with_args(r#"{"action":"spawn","requested_model_policy":{"mode":"fixed"}}"#);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome,
+            Some(&selected),
+        );
+        assert!(!result[0].passed, "a non-null selection must not match");
+
+        let selected_then_retrieved = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [
+                    {"tool_call_id":"spawn-call", "name":"agent", "ok":true,
+                     "args_full":r#"{"action":"spawn","requested_model_policy":{"mode":"fixed"}}"#,
+                     "result_full":"{}"},
+                    {"tool_call_id":"get-call", "name":"agent", "ok":true,
+                     "args_full":r#"{"action":"get_result","agent_id":"child"}"#,
+                     "result_full":"{}"}
+                ]
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome,
+            Some(&selected_then_retrieved),
+        );
+        assert!(
+            !result[0].passed,
+            "get_result must not supply the spawn's absent selector"
+        );
+
+        let null_filter: Criterion = serde_json::from_value(serde_json::json!({
+            "type":"journal_tool_json", "name":"agent", "document":"arguments",
+            "path":"/requested_model_policy", "equals":null,
+            "allow_missing":true,
+            "where_match":{"document":"arguments","path":"/action","equals":null}
+        }))
+        .unwrap();
+        assert!(matches!(
+            &null_filter,
+            Criterion::JournalToolJson { where_match: Some(predicate), .. }
+                if predicate.equals.is_null()
+        ));
+        let explicit_null = session_with_args(r#"{"action":null,"requested_model_policy":null}"#);
+        assert!(
+            evaluate_deterministic_with_session(
+                &[null_filter.clone()],
+                &outcome,
+                Some(&explicit_null)
+            )[0]
+            .passed
+        );
+        let missing_action = session_with_args(r#"{"requested_model_policy":null}"#);
+        assert!(
+            !evaluate_deterministic_with_session(&[null_filter], &outcome, Some(&missing_action))
+                [0]
+            .passed
+        );
+
+        let strict = Criterion::JournalToolJson {
+            name: "agent".into(),
+            document: JournalToolDocument::Arguments,
+            path: "/requested_model_policy".into(),
+            equals: serde_json::Value::Null,
+            where_match: None,
+            allow_missing: false,
+        };
+        let missing = session_with_args(r#"{"action":"spawn"}"#);
+        let result = evaluate_deterministic_with_session(&[strict], &outcome, Some(&missing));
+        assert!(
+            !result[0].passed,
+            "exact null assertion must continue distinguishing a missing key"
+        );
+
+        for unusable in ["not-json", "[]", "null"] {
+            let session = session_with_args(unusable);
+            let result = evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&session),
+            );
+            assert!(
+                !result[0].passed,
+                "unusable/non-object arguments must not count as an omitted property: {unusable}"
+            );
+        }
+
+        let missing_document = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [{
+                    "tool_call_id": "spawn-call",
+                    "name": "agent",
+                    "ok": true,
+                    "result_full": "{}"
+                }]
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome,
+            Some(&missing_document),
+        );
+        assert!(
+            !result[0].passed,
+            "missing arguments evidence must not count as an omitted property"
         );
     }
 
@@ -7601,14 +9407,42 @@ mod tests {
     }
 
     #[test]
-    fn validate_session_event_count_rejects_min_zero() {
+    fn validate_session_event_count_rejects_unbounded_min_zero() {
         let err = validate_criterion(&Criterion::SessionEventCount {
             event_type: "llm_round".into(),
             min: 0,
+            max: None,
+            json_match: None,
             optional: false,
         })
         .expect_err("min=0 is trivially-true — should reject");
-        assert!(err.contains("min must be >= 1"));
+        assert!(err.contains("min=0 requires max"));
+    }
+
+    #[test]
+    fn session_event_count_can_prove_no_child_start() {
+        let session = mk_session(&[("llm_round", serde_json::json!({}))]);
+        let criterion = Criterion::SessionEventCount {
+            event_type: "agent_spawned".into(),
+            min: 0,
+            max: Some(0),
+            json_match: None,
+            optional: false,
+        };
+        validate_criterion(&criterion).expect("bounded absence check");
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&session),
+        );
+        assert!(result[0].passed, "{}", result[0].detail);
+        let started = mk_session(&[("agent_spawned", serde_json::json!({}))]);
+        let result = evaluate_deterministic_with_session(
+            &[criterion],
+            &outcome_with_tools(&[]),
+            Some(&started),
+        );
+        assert!(!result[0].passed, "{}", result[0].detail);
     }
 
     #[test]
@@ -7634,6 +9468,7 @@ mod tests {
             name: "agent_fanout".into(),
             min: 1,
             max: 1,
+            root_only: false,
             document: Some(JournalToolDocument::Arguments),
             path: Some("/action".into()),
             equals: None,
@@ -7649,6 +9484,7 @@ mod tests {
             name: "agent_fanout".into(),
             min: 1,
             max: 1,
+            root_only: false,
             document: Some(JournalToolDocument::Arguments),
             path: Some("action".into()),
             equals: Some(serde_json::json!("start")),

@@ -1,0 +1,62 @@
+name: flash_reasoning_phrase_is_subject
+description: |
+  Mentioning a reasoning phrase as the subject of a child's explanation must
+  not silently turn it into the child's execution setting.
+prompt: |
+  请让一个子代理只用一句话解释下面的短语：
+  “用 high 思考”。这是被解释的文字，不是子代理的执行设置。
+  不要调用任何工具，并在解释中包含 EXPLAIN-PHRASE-OK；完成后把解释告诉我。
+  本用例不指定模型，子代理应继承当前模型；父代理调用 agent 时不要填写
+  requested_model_policy。
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: deepseek-v4-flash
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
+    json_match:
+      path: /metadata/model_configuration/thinking/effort
+      equals: high
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    json_match:
+      path: /payload/model
+      equals: deepseek-v4-flash
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: grep
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: read_file
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0
+  - type: journal_tool_outcome_count
+    name: agent
+    ok: false
+    min: 0
+    max: 0
+  - type: text_contains
+    needle: EXPLAIN-PHRASE-OK

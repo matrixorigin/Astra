@@ -365,6 +365,7 @@ pub const HEALTH: &str = "/health";
 
 pub const MODELS: &str = "/models";
 pub const MODEL_ACCESS: &str = "/model-access";
+pub const MODEL_ACCESS_ADMIT: &str = "/model-access/admit";
 pub const ME_MODELS: &str = "/me/models";
 pub const ME_MODEL_VALIDATE_ENDPOINT: &str = "/me/models/validate-endpoint";
 
@@ -428,7 +429,6 @@ pub const ADMIN_USERS_GRANT_ROLE: &str = "/admin/users/grant-role";
 pub const ADMIN_USERS_REVOKE_ROLE: &str = "/admin/users/revoke-role";
 pub const ADMIN_TOKENS: &str = "/admin/tokens";
 pub const ADMIN_PROMPTS_OPTIMIZE: &str = "/admin/prompts/optimize";
-pub const ADMIN_FEEDBACK_STATS: &str = "/admin/feedback/stats";
 pub const ADMIN_FEEDBACK_EXPORT: &str = "/admin/feedback/export";
 pub const ADMIN_CONFIG: &str = "/admin/config";
 
@@ -526,7 +526,6 @@ mod tests {
             ADMIN_USERS_REVOKE_ROLE,
             ADMIN_TOKENS,
             ADMIN_PROMPTS_OPTIMIZE,
-            ADMIN_FEEDBACK_STATS,
             ADMIN_FEEDBACK_EXPORT,
             ADMIN_CONFIG,
             AUDIT_SESSIONS,

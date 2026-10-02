@@ -1,0 +1,54 @@
+name: flash_spawn_prohibited_model_fail_closed
+description: |
+  Unhappy-path intent check: a negative-only prohibition is unresolved rather
+  than being converted into an implicit model choice; the child is blocked
+  before execution.
+prompt: |
+  The next action must be exactly one call to agent(action="spawn") with
+  description "Prohibited model check", agent_type "explore", and prompt
+  "Reply exactly PROHIBITED-MODEL-MUST-NOT-RUN". This call is deliberately
+  expected to be rejected by runtime admission: do not decide whether it is
+  possible, and do not simulate the rejection in text. Do not use model
+  glm-5.2 for this child; that is a hard prohibition, not a request to choose
+  another model. Leave requested_model_policy unset. Do not substitute a
+  model, retry, or call any other tool. Do not call Reflect.
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: spawn
+  - type: journal_tool_outcome_count
+    name: agent
+    ok: false
+    min: 1
+    max: 1
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /status
+    equals: failed
+  - type: journal_tool_json_contains
+    name: agent
+    document: result
+    path: /error_kind
+    contains: delegation_model_scope_unresolved
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

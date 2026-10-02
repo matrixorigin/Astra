@@ -21,7 +21,8 @@ use astra_services::{
 use astra_turn_types::{
     NativeToolId, ProviderBindingRef, ProviderClaim, ProviderClaimSource, ProviderClaimTrust,
     ProviderDiscoverySnapshot, ProviderIdentity, ProviderProtocolId, ProviderSemanticCacheContract,
-    PublicToolAlias, ResolvedProviderSnapshot, SemanticFreshnessFact, SemanticFreshnessScope,
+    PublicToolAlias, ResolvedProviderSnapshot, ResolvedToolEffect, SemanticFreshnessFact,
+    SemanticFreshnessScope,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
@@ -166,6 +167,7 @@ pub(crate) struct AgentBindingMcpRuntime {
     endpoint_url: String,
     authorization: String,
     tool_names_by_public_name: Arc<HashMap<String, String>>,
+    workspace_effects_by_public_name: Arc<HashMap<String, ResolvedToolEffect>>,
     semantic_read_tools: Arc<HashSet<String>>,
 }
 
@@ -1206,6 +1208,32 @@ fn tool_names_by_public_name(
         .collect()
 }
 
+fn workspace_effects_by_public_name(
+    snapshot: &ResolvedProviderSnapshot,
+) -> Result<HashMap<String, ResolvedToolEffect>, String> {
+    let descriptors = snapshot
+        .descriptors
+        .iter()
+        .map(|descriptor| (descriptor.descriptor_ref(), descriptor))
+        .collect::<BTreeMap<_, _>>();
+    snapshot
+        .alias_index
+        .iter()
+        .map(|(public_alias, descriptor_ref)| {
+            let descriptor = descriptors.get(descriptor_ref).ok_or_else(|| {
+                format!(
+                    "Agent Binding alias '{}' references missing descriptor '{}@{}'",
+                    public_alias,
+                    descriptor_ref.identity.native_tool_id,
+                    descriptor_ref.descriptor_version,
+                )
+            })?;
+            let effect = descriptor.semantic_baseline.effect;
+            Ok((public_alias.as_str().to_string(), effect))
+        })
+        .collect()
+}
+
 fn agent_binding_tool_call_arguments(args: &Value) -> Value {
     match args {
         Value::Object(_) => args.clone(),
@@ -1281,12 +1309,27 @@ impl AgentBindingMcpRuntime {
             endpoint_url: endpoint_url.to_string(),
             authorization: "Bearer test".to_string(),
             tool_names_by_public_name: Arc::new(tool_names_by_public_name),
+            workspace_effects_by_public_name: Arc::new(
+                public_tool_names
+                    .iter()
+                    .map(|name| ((*name).to_string(), ResolvedToolEffect::Unknown))
+                    .collect(),
+            ),
             semantic_read_tools: Arc::new(HashSet::new()),
         }
     }
 
     pub(crate) fn owns_public_tool_name(&self, public_name: &str) -> bool {
         self.tool_names_by_public_name.contains_key(public_name)
+    }
+
+    pub(crate) fn workspace_effect_for_public_name(
+        &self,
+        public_name: &str,
+    ) -> Option<ResolvedToolEffect> {
+        self.workspace_effects_by_public_name
+            .get(public_name)
+            .copied()
     }
 
     pub(crate) async fn call_tool_by_mcp_name(
@@ -1655,11 +1698,20 @@ fn build_agent_binding_mcp_bundle(
                 "agent_binding_provider_resolution_failed",
             )
         })?;
+    let workspace_effects_by_public_name = workspace_effects_by_public_name(&resolved_snapshot)
+        .map_err(|error| {
+            mcp_error(
+                StatusCode::BAD_GATEWAY,
+                error,
+                "agent_binding_provider_resolution_failed",
+            )
+        })?;
     let agent_binding_mcp = Arc::new(AgentBindingMcpRuntime {
         server_name: tool_namespace,
         endpoint_url: endpoint_url.to_string(),
         authorization: authorization.to_string(),
         tool_names_by_public_name: Arc::new(tool_names_by_public_name),
+        workspace_effects_by_public_name: Arc::new(workspace_effects_by_public_name),
         semantic_read_tools: Arc::new(semantic_read_tools),
     });
     let provider_snapshots = vec![resolved_snapshot];

@@ -18,9 +18,8 @@
 //!
 //! Writing the resolved config back to disk is the caller's job — the
 //! view merely reports a `ConfigEditAction` via `pending_action()`.
-//! The routing layer in `tui/mod.rs` reads that, writes the TOML to
-//! the chosen scope (via the same helper `slash_config` uses in
-//! line-mode), and reloads the process-wide overlay.
+//! `tui/config_edit_router.rs` resolves the typed completion, writes TOML
+//! to the selected scope, and reloads the process-wide overlay.
 
 use astra_config::config_overlay::{
     SettingItem, SettingKind, apply_edit, build_settings_catalog, filter_settings,

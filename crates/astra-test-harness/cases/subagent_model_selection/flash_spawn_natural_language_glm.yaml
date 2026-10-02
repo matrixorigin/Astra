@@ -1,0 +1,92 @@
+name: flash_spawn_natural_language_glm
+description: |
+  Verify an authenticated natural-language hard model requirement binds a
+  child even when the parent leaves the structured selector unset.
+prompt: |
+  Please start one small child with Astra's agent tool. Use model glm-5.2 for
+  it; this is a hard user requirement. Astra applies user-level model
+  requirements independently of the optional selector, so leave
+  requested_model_policy unset. Do not inspect files or use shell tools, and do
+  not retry. Invoke agent(action="spawn") once with description "Natural
+  language model requirement check", agent_type "explore", and prompt "Reply
+  exactly GLM-NATURAL-REQUIREMENT-OK". Report the exact reply.
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  # Tool discovery/diagnostics are model-dependent; the contract is the one
+  # child request and its authenticated model binding, not a fixed parent
+  # tool-call count.
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: spawn
+  - type: journal_tool_json
+    name: agent
+    document: arguments
+    path: /action
+    equals: spawn
+  - type: journal_tool_json
+    name: agent
+    document: arguments
+    path: /description
+    equals: Natural language model requirement check
+  - type: journal_tool_json
+    name: agent
+    document: arguments
+    path: /requested_model_policy
+    equals: null
+    where_match:
+      document: arguments
+      path: /action
+      equals: spawn
+    allow_missing: true
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /status
+    equals: launched
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /prepared_model/model_name
+    equals: glm-5.2
+  - type: text_contains
+    needle: GLM-NATURAL-REQUIREMENT-OK
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: glm-5.2
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    json_match:
+      path: /payload/model
+      equals: glm-5.2
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 1
+    max: 1
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: submit_task_resolution
+    min: 0
+    max: 0

@@ -62,6 +62,16 @@ describe("/api/models", () => {
         architecture: "deepseek-v4",
         context_window: 128_000,
         thinking_capability: "native_only",
+        pricing: {
+          currency: "USD",
+          unit: "per_token",
+          source: "configured",
+          prompt: 0.000001,
+          completion: 0.000002,
+          cache_read: 0.0000002,
+          cache_write: null,
+          configuration_updated_at: "2026-09-23 12:00:00.000000",
+        },
         is_active: true,
       },
       {
@@ -76,6 +86,7 @@ describe("/api/models", () => {
         architecture: null,
         context_window: 8192,
         max_completion_tokens: null,
+        pricing: null,
         is_active: true,
       },
     ]});
@@ -96,12 +107,15 @@ describe("/api/models", () => {
     expect(payload.items[0].subtitle).toContain("Self-hosted");
     expect(payload.items[0].subtitle).toContain("Runs on server");
     expect(payload.items[0].subtitle).toContain("128k context");
+    expect(payload.items[0].subtitle).toContain("Configured USD: $1 input / $2 output / $0.2 cache read / cache write unknown per 1M tokens");
+    expect(payload.items[0].subtitle).toContain("config updated 2026-09-23");
     expect(payload.items[1]).toMatchObject({
       id: "row-only",
       name: "row-only",
       tier: "included",
     });
     expect(payload.items[1].subtitle).toContain("Self-hosted");
+    expect(payload.items[1].subtitle).toContain("Price unknown");
     expect(payload.defaultOfferingId).toBe("row-only");
     expect(payload.catalogRevision).toBe("sha256:catalog");
     expect(payload.observedAt).toBe("2026-07-20T00:00:00Z");

@@ -30,6 +30,44 @@ impl ToolSafetyGuard {
         }
     }
 
+    /// Apply the server-issued immutable execution ceiling before any local
+    /// approval or pre-approved cloud decision. The pure turn-core evaluator
+    /// remains the only authority for whether a capability is provably safe.
+    pub(crate) fn check_read_only_request(
+        perm_manager: Option<&mut crate::cli::permission_manager::PermissionManager>,
+        name: &str,
+        args: &Value,
+    ) -> crate::cli::permission_manager::GateOutcome {
+        if let Err(error) = Self::check_dispatch(name, args) {
+            return crate::cli::permission_manager::GateOutcome::Deny(error);
+        }
+        match perm_manager {
+            Some(pm) => pm.check_nonblocking_read_only(name, args),
+            None => {
+                let mut context = astra_turn_core::permission::types::PermissionSyncContext::new(
+                    astra_turn_core::permission::types::InheritedPermissions::auto_approve(),
+                );
+                context.inherited.read_only_execution = true;
+                match astra_turn_core::permission::engine::evaluate_permission(name, args, &context)
+                    .decision
+                {
+                    astra_turn_core::permission::engine::HardDecision::Allow => {
+                        crate::cli::permission_manager::GateOutcome::Allow
+                    }
+                    astra_turn_core::permission::engine::HardDecision::Deny { reason } => {
+                        crate::cli::permission_manager::GateOutcome::Deny(reason)
+                    }
+                    astra_turn_core::permission::engine::HardDecision::NeedExternal { prompt } => {
+                        crate::cli::permission_manager::GateOutcome::Deny(format!(
+                            "read-only execution cannot be escalated by approval: {}",
+                            prompt.reason
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
     /// Safety checks are now handled by [`evaluate_permission`] (Step 2) which
     /// respects [`PermissionMode::Auto`]. This function is a pass-through to
     /// avoid double-evaluating the safety middleware.
@@ -219,5 +257,23 @@ mod tests {
             }
             other => panic!("expected deny, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn read_only_request_cannot_be_overridden_by_parent_mode_or_approval() {
+        let mut pm = PermissionManager::new(true);
+        let denied = ToolSafetyGuard::check_read_only_request(
+            Some(&mut pm),
+            "write_file",
+            &json!({"path": "file.txt", "content": "x"}),
+        );
+        assert!(matches!(denied, GateOutcome::Deny(reason) if reason.contains("read-only")));
+
+        let allowed = ToolSafetyGuard::check_read_only_request(
+            Some(&mut pm),
+            "read_file",
+            &json!({"path": "file.txt"}),
+        );
+        assert!(matches!(allowed, GateOutcome::Allow));
     }
 }

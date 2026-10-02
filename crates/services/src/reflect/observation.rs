@@ -101,6 +101,28 @@ pub(super) fn build_observation_envelope(
 
     evidence.extend(graph_evidence);
 
+    if let Some(graph) = evidence_graph {
+        for node in graph
+            .nodes
+            .iter()
+            .filter(|node| super::is_execution_spine(node))
+        {
+            observations.push(ObservationRecord {
+                ref_id: Urn::new("observation", "graph", "reflect")
+                    .seg(session_id)
+                    .seg(&node.ref_id)
+                    .build(),
+                topic: "execution".into(),
+                facet: "trace".into(),
+                kind: "execution_spine".into(),
+                severity: "info".into(),
+                summary: super::EXECUTION_SPINE_SUMMARY.into(),
+                confidence: ObservationConfidence::evidence(GRAPH_EVIDENCE_CONFIDENCE),
+                evidence_refs: vec![node.ref_id.clone()],
+            });
+        }
+    }
+
     let action_hints =
         build_action_hints_from_recommendations(recommendations, &observations, session_id);
 
@@ -353,7 +375,6 @@ fn insight_topic_facet(insight: &Insight) -> (String, String) {
         InsightKind::ToolFailure { .. } | InsightKind::ToolConcentration { .. } => {
             ("execution".to_string(), "tools".to_string())
         }
-        InsightKind::DecisionStall => ("execution".to_string(), "stall".to_string()),
         InsightKind::ModelFanout { .. } | InsightKind::EmptySession => {
             ("runtime".to_string(), "performance".to_string())
         }
@@ -376,7 +397,6 @@ fn insight_observation_ref(session_id: &str, kind: &InsightKind) -> String {
         InsightKind::ToolConcentration { tool } => format!("tool_concentration:{tool}"),
         InsightKind::ModelFanout { decision_type } => format!("model_fanout:{decision_type}"),
         InsightKind::EmptySession => "empty_session".to_string(),
-        InsightKind::DecisionStall => "decision_stall".to_string(),
     };
     Urn::new("observation", "graph", "reflect")
         .seg(session_id)
@@ -453,8 +473,8 @@ fn build_reflect_summary(
         "Empty session - no events recorded yet".to_string()
     } else if overview.error_count == 0 {
         format!(
-            "Session healthy - {} events and {} decisions with no errors detected",
-            overview.total_events, overview.total_decisions
+            "No classified error events observed across {} events; task completion is not established",
+            overview.total_events
         )
     } else {
         format!(

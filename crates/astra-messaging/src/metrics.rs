@@ -120,16 +120,6 @@ pub struct MessagingMetrics {
     pub messages_received: AtomicU64,
     pub messages_dropped: AtomicU64,
 
-    // Ack/Nack counters
-    pub acks_sent: AtomicU64,
-    pub acks_received: AtomicU64,
-    pub nacks_sent: AtomicU64,
-    pub nacks_received: AtomicU64,
-
-    // Retry & failure counters
-    pub retries: AtomicU64,
-    pub dead_letters: AtomicU64,
-
     // Transport-level counters
     pub send_errors: AtomicU64,
     pub poll_errors: AtomicU64,
@@ -137,7 +127,6 @@ pub struct MessagingMetrics {
 
     // Latency trackers
     pub delivery_latency: LatencyTracker,
-    pub ack_latency: LatencyTracker,
 }
 
 impl MessagingMetrics {
@@ -151,17 +140,10 @@ impl MessagingMetrics {
             messages_sent: self.messages_sent.load(Ordering::Relaxed),
             messages_received: self.messages_received.load(Ordering::Relaxed),
             messages_dropped: self.messages_dropped.load(Ordering::Relaxed),
-            acks_sent: self.acks_sent.load(Ordering::Relaxed),
-            acks_received: self.acks_received.load(Ordering::Relaxed),
-            nacks_sent: self.nacks_sent.load(Ordering::Relaxed),
-            nacks_received: self.nacks_received.load(Ordering::Relaxed),
-            retries: self.retries.load(Ordering::Relaxed),
-            dead_letters: self.dead_letters.load(Ordering::Relaxed),
             send_errors: self.send_errors.load(Ordering::Relaxed),
             poll_errors: self.poll_errors.load(Ordering::Relaxed),
             broadcast_lag_events: self.broadcast_lag_events.load(Ordering::Relaxed),
             delivery_latency: self.delivery_latency.snapshot(),
-            ack_latency: self.ack_latency.snapshot(),
         }
     }
 
@@ -170,17 +152,10 @@ impl MessagingMetrics {
         self.messages_sent.store(0, Ordering::Relaxed);
         self.messages_received.store(0, Ordering::Relaxed);
         self.messages_dropped.store(0, Ordering::Relaxed);
-        self.acks_sent.store(0, Ordering::Relaxed);
-        self.acks_received.store(0, Ordering::Relaxed);
-        self.nacks_sent.store(0, Ordering::Relaxed);
-        self.nacks_received.store(0, Ordering::Relaxed);
-        self.retries.store(0, Ordering::Relaxed);
-        self.dead_letters.store(0, Ordering::Relaxed);
         self.send_errors.store(0, Ordering::Relaxed);
         self.poll_errors.store(0, Ordering::Relaxed);
         self.broadcast_lag_events.store(0, Ordering::Relaxed);
         self.delivery_latency.reset();
-        self.ack_latency.reset();
     }
 }
 
@@ -190,37 +165,23 @@ pub struct MetricsSnapshot {
     pub messages_sent: u64,
     pub messages_received: u64,
     pub messages_dropped: u64,
-    pub acks_sent: u64,
-    pub acks_received: u64,
-    pub nacks_sent: u64,
-    pub nacks_received: u64,
-    pub retries: u64,
-    pub dead_letters: u64,
     pub send_errors: u64,
     pub poll_errors: u64,
     pub broadcast_lag_events: u64,
     pub delivery_latency: LatencySnapshot,
-    pub ack_latency: LatencySnapshot,
 }
 
 impl std::fmt::Display for MetricsSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "messaging: sent={} recv={} dropped={} acks={}/{} nacks={}/{} retries={} dlq={} errors={}+{} delivery=[{}] ack=[{}]",
+            "messaging: sent={} recv={} dropped={} errors={}+{} delivery=[{}]",
             self.messages_sent,
             self.messages_received,
             self.messages_dropped,
-            self.acks_sent,
-            self.acks_received,
-            self.nacks_sent,
-            self.nacks_received,
-            self.retries,
-            self.dead_letters,
             self.send_errors,
             self.poll_errors,
             self.delivery_latency,
-            self.ack_latency,
         )
     }
 }
@@ -242,20 +203,6 @@ pub enum MessagingEvent {
         from: AgentAddress,
         to: AgentAddress,
     },
-    /// A message was acknowledged.
-    Acked {
-        message_id: String,
-        latency: Duration,
-    },
-    /// A message was rejected (Nack).
-    Nacked {
-        message_id: String,
-        reason: Option<String>,
-    },
-    /// A message is being retried.
-    Retried { message_id: String, attempt: u32 },
-    /// A message was dead-lettered.
-    DeadLettered { message_id: String, reason: String },
     /// A message was dropped (backpressure / channel full).
     Dropped { message_id: String, reason: String },
 }
@@ -320,28 +267,6 @@ impl MessagingEventHandler for StderrEventHandler {
                     from.agent_id
                 );
             }
-            MessagingEvent::Acked {
-                message_id,
-                latency,
-            } => {
-                eprintln!(
-                    "  ✅ messaging: acked {message_id} ({}ms)",
-                    latency.as_millis()
-                );
-            }
-            MessagingEvent::Nacked { message_id, reason } => {
-                let r = reason.as_deref().unwrap_or("no reason");
-                eprintln!("  ❌ messaging: nacked {message_id}: {r}");
-            }
-            MessagingEvent::Retried {
-                message_id,
-                attempt,
-            } => {
-                eprintln!("  🔄 messaging: retry {message_id} attempt #{attempt}");
-            }
-            MessagingEvent::DeadLettered { message_id, reason } => {
-                eprintln!("  💀 messaging: dead-lettered {message_id}: {reason}");
-            }
             MessagingEvent::Dropped { message_id, reason } => {
                 eprintln!("  ⚠️ messaging: dropped {message_id}: {reason}");
             }
@@ -387,14 +312,14 @@ mod tests {
         let m = MessagingMetrics::new();
         m.messages_sent.fetch_add(10, Ordering::Relaxed);
         m.messages_received.fetch_add(8, Ordering::Relaxed);
-        m.dead_letters.fetch_add(2, Ordering::Relaxed);
+        m.send_errors.fetch_add(2, Ordering::Relaxed);
         m.delivery_latency.record(Duration::from_millis(5));
 
         // Snapshot
         let snap = m.snapshot();
         assert_eq!(snap.messages_sent, 10);
         assert_eq!(snap.messages_received, 8);
-        assert_eq!(snap.dead_letters, 2);
+        assert_eq!(snap.send_errors, 2);
         assert_eq!(snap.delivery_latency.count, 1);
 
         // Display
@@ -406,7 +331,7 @@ mod tests {
         let snap = m.snapshot();
         assert_eq!(snap.messages_sent, 0);
         assert_eq!(snap.messages_received, 0);
-        assert_eq!(snap.dead_letters, 0);
+        assert_eq!(snap.send_errors, 0);
     }
 
     #[tokio::test]
@@ -467,22 +392,6 @@ mod tests {
                 message_id: "m1".into(),
                 from: AgentAddress::new("r1", "a1"),
                 to: AgentAddress::new("r1", "a2"),
-            },
-            MessagingEvent::Acked {
-                message_id: "m1".into(),
-                latency: Duration::from_millis(50),
-            },
-            MessagingEvent::Nacked {
-                message_id: "m1".into(),
-                reason: Some("bad".into()),
-            },
-            MessagingEvent::Retried {
-                message_id: "m1".into(),
-                attempt: 2,
-            },
-            MessagingEvent::DeadLettered {
-                message_id: "m1".into(),
-                reason: "timeout".into(),
             },
             MessagingEvent::Dropped {
                 message_id: "m1".into(),

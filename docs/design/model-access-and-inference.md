@@ -117,6 +117,17 @@ complete effective catalog, not from the current page. Only the first page
 may carry `default_offering_id`; continuation pages carry `null` and clients
 must preserve the first-page server decision.
 
+Catalog entries expose `pricing` only when the deployment configuration has
+explicit `currency=USD`, `unit=per_token`, and valid input and output rates.
+An explicit zero is a rate; unannotated legacy prices, missing or malformed
+rates, other currencies, personal BYOK, Genesis, and device Offerings
+report `null`, not a fabricated free price. Optional cache rates stay nullable.
+Administrators must explicitly reconfigure legacy prices before they can be
+shown or used by future cost routing; the system never infers their currency.
+`configuration_updated_at` dates the whole model configuration, not a provider
+price verification or a bill. This projection uses the existing catalog query
+and does not replace execution-time admission or physical-usage accounting.
+
 Both endpoints accept `purpose=chat|typed_judgment`, defaulting to `chat`.
 Only `/models` additionally accepts `purpose=all` for registry inspection;
 `/model-access?purpose=all` returns `400 model_catalog_purpose_invalid`, since
@@ -247,6 +258,12 @@ their own provider account.
   OpenAI transport; adding user ownership does not create another agent loop.
 - Inference admission revalidates `(user_id, offering_id, is_active)` and
   decrypts the current credential immediately before provider execution.
+  Server child fanout admits a bounded set of distinct Offerings with batched
+  owner-scoped and deployment reads, preserving per-Offering freshness without
+  one database round trip per child. The all-or-nothing batch is validated
+  before any child is launched; inherited parent admission adds no read.
+  Strict compatible-endpoint policy checks distinct child endpoints in one
+  trusted-domain query; the default public-HTTPS policy uses no domain read.
 - Create, credential rotation and explicit probe validate connectivity with a
   small output budget using the same provider-specific wire-field rule as
   inference: OpenAI (including o-series) and the generic OpenAI-compatible
@@ -817,6 +834,13 @@ This rule applies to primary, delegated, compaction, memory, reflection,
 verification, and introspection calls. Auxiliary paths must not create their
 own provider heuristics.
 
+Model catalogs expose the resolved, non-secret thinking protocol alongside the
+probed capability. Model pickers and execution admission share the exact control
+support policy: a binary protocol supports `On`/`Off`, not an invented effort or
+token budget. Explicit effort and budget requests are rejected when unsupported,
+never silently converted to a toggle. An unsuffixed model preserves its default;
+`(thinking:on)` and `(thinking:off)` retain explicit intent across surfaces.
+
 ### Resolved generation policy
 
 Model admission resolves the call-level generation behavior before provider
@@ -830,7 +854,9 @@ struct ResolvedGenerationPolicy {
 }
 
 enum ThinkingConfig {
+    ModelDefault,
     Off,
+    On,
     Enabled { budget_tokens: u32 },
     Adaptive { effort: ThinkingEffort },
 }
@@ -1217,7 +1243,7 @@ failure.
 
 Clients obtain one Server projection containing Model Access, effective Offerings, default selection, typed statuses/actions, and a catalog revision.
 
-Chat submits only the user selection:
+Normal chat clients submit only the user selection:
 
 ```json
 {
@@ -1228,6 +1254,12 @@ Chat submits only the user selection:
   }
 }
 ```
+
+A locally orchestrated CLI child run may also send `expected_model_name` after
+batch preflight. It is only an expected-value assertion: Server freshly admits
+the selected Offering and returns `model_identity_changed` if its resolved name
+drifted. The field never authorizes a route or replaces Offering admission.
+Ordinary clients omit it.
 
 Normal run requests never contain:
 
@@ -1255,9 +1287,9 @@ Refresh or reconnect resumes from a durable event cursor. The SDK does not inven
 wire types, not parallel Web/CLI/Server structs. Non-streaming SDK calls use a
 typed `CompletionRequest` and `CompletionResponse`; callers do not construct a
 free-form JSON envelope or index into an unvalidated response. A completion
-scope is an authenticated agent run, a real session-owned operation, or a
-durable Harness run. Memory and compaction require session ownership; Skillify
-requires Harness ownership. Neither fabricates a run or session identity.
+scope is an authenticated agent run or a real session-owned operation. Memory
+and compaction require session ownership; neither fabricates a run or session
+identity.
 
 Version-2 typed judgment responses carry execution-owned `judgment_provenance`
 alongside text and the adapter's model identity. TypeSafe System One supplies
@@ -1513,9 +1545,8 @@ Tests validate behavior, persisted facts, wire payloads, streams, and product pr
 - External-account and cross-tenant isolation.
 - CAS transition and revoke races.
 - Route/invocation/attempt persistence before provider execution.
-- Run-owned, session-owned, and Harness-owned admission, including cross-user
-  rejection and no fabricated run/session identity for memory, compaction,
-  reflection, or Skillify work.
+- Run-owned and session-owned admission, including cross-user rejection and no
+  fabricated run/session identity for memory, compaction, or reflection work.
 - Idempotent usage settlement and crash recovery.
 - Revision invalidation across multiple Server instances.
 

@@ -659,11 +659,7 @@ struct SettlementAdmissionOwner {
 
 impl SettlementAdmissionOwner {
     fn new(user_id: &str, scope: &astra_turn_types::InferenceInvocationScope) -> Self {
-        let session_id = scope
-            .session_id()
-            .or_else(|| scope.harness_run_id())
-            .unwrap_or(scope.kind())
-            .to_string();
+        let session_id = scope.session_id().unwrap_or(scope.kind()).to_string();
         Self {
             user_id: user_id.to_string(),
             session_id,
@@ -2852,6 +2848,9 @@ impl DurableInferenceLedger {
                 upstream_model_name,
                 provider,
             ))
+            .and_then(|plan| {
+                plan.with_price_snapshot(self.admitted_execution.price_snapshot.as_ref())
+            })
             .map_err(|error| service_error("planning", error))?;
             // Reserve reconciliation capacity before durable invocation
             // admission and therefore before any provider I/O. A recovered
@@ -4808,7 +4807,9 @@ mod tests {
         persistence: Arc<dyn InferenceLedgerPersistence>,
     ) -> DurableInferenceLedger {
         let execution = astra_services::AdmittedModelExecution {
+            price_snapshot: None,
             offering_id: "offering-test".to_string(),
+            source_identity: None,
             access_kind: astra_services::ModelAccessKind::SelfHosted,
             execution_placement: astra_services::ModelExecutionPlacement::Server,
             model_name: "model-test".to_string(),

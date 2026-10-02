@@ -13,15 +13,15 @@ mod e2e_loop_tests;
 mod integration_tests;
 #[cfg(test)]
 mod orchestrator_mailbox_tests;
+pub mod reply_obligations;
 
 // Re-export key types for convenience.
 pub use astra_messaging::{
-    AckConfig, AckOutcome, AgentAddress, AgentMailbox, AgentMailboxRouter, AgentMessage,
-    AgentSignal, CleanupScheduler, DatabaseTransport, DbTransportMetrics, DeadLetter,
-    DeadLetterQueue, DeadLetterReason, DeadLetterSummary, DelegationLookup, EventDispatcher,
-    InProcessMetrics, InProcessTransport, LatencySnapshot, LatencyTracker, MailboxError,
-    MessagePayload, MessageStream, MessageTarget, MessageTransport, MessagingEvent,
-    MessagingEventHandler, MessagingMetrics, MetricsSnapshot, PendingAckTracker, PermissionOutcome,
-    RequestType, StderrEventHandler, SubRunInfo,
+    AgentAddress, AgentMailbox, AgentMailboxRouter, AgentMessage, AgentSignal, CleanupScheduler,
+    DatabaseTransport, DbTransportMetrics, DelegationLookup, EventDispatcher, InProcessMetrics,
+    InProcessTransport, LatencySnapshot, LatencyTracker, MailboxError, MessagePayload,
+    MessageStream, MessageTarget, MessageTransport, MessagingEvent, MessagingEventHandler,
+    MessagingMetrics, MetricsSnapshot, PermissionOutcome, RequestType, StderrEventHandler,
+    SubRunInfo,
 };
 pub use astra_messaging::{db_transport, in_process, metrics, router, transport, types};

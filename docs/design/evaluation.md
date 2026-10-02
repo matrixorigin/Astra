@@ -63,3 +63,9 @@ A change should not activate if it causes material regression in:
 ## Relationship to learning
 
 Evaluation produces labels and quality signals. It is not itself a training pipeline. Learning artifacts require the additional consent/redaction/lineage rules in [evaluation-and-learning.md](evaluation-and-learning.md).
+
+Execution evidence belongs to the shared turn evaluator and runtime journal.
+Reproducible experiments use the test harness; consent-gated routing datasets
+belong to `services::model_routing::offline`. These contracts do not require a
+separate analytics API or persistence service. Activation belongs to the tuning
+owner.

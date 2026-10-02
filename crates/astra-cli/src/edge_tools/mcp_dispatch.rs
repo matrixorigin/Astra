@@ -37,6 +37,7 @@ fn acknowledged_mcp_error_outcome(error: &astra_mcp::McpError) -> ToolExecutionO
 }
 
 fn mcp_result_to_tool_outcome(result: astra_mcp::McpToolCallResult) -> ToolExecutionOutcome {
+    let workspace_effect_settled = result.workspace_effect_is_settled();
     let mut fields = serde_json::Map::new();
     if let Some(content) = result.structured_content {
         fields.insert("mcp_structured_content".to_string(), content);
@@ -44,6 +45,11 @@ fn mcp_result_to_tool_outcome(result: astra_mcp::McpToolCallResult) -> ToolExecu
     if let Some(metadata) = result.protocol_metadata {
         fields.insert("mcp_protocol_metadata".to_string(), metadata);
     }
+    fields.insert("mcp_call_dispatched".to_string(), Value::Bool(true));
+    fields.insert(
+        "workspace_effect_settled".to_string(),
+        Value::Bool(workspace_effect_settled),
+    );
     ToolExecutionOutcome {
         output: result.output,
         is_error: result.is_error,
@@ -52,42 +58,55 @@ fn mcp_result_to_tool_outcome(result: astra_mcp::McpToolCallResult) -> ToolExecu
 }
 
 impl ToolExecutor {
+    pub(super) async fn prepare_mcp_tool_call(
+        &self,
+        mcp_name: &str,
+    ) -> Result<
+        (
+            std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>,
+            astra_mcp::PreparedMcpToolCall,
+        ),
+        ToolExecutionOutcome,
+    > {
+        let manager = self
+            .mcp_runtime_snapshot("mcp_prepare_tool_call")
+            .manager
+            .ok_or_else(|| {
+                ToolExecutionOutcome::error(format!(
+                    "Error: MCP not available. Tool '{mcp_name}' cannot be executed."
+                ))
+            })?;
+        let prepared = manager
+            .read()
+            .await
+            .prepare_tool_call_by_mcp_name(mcp_name)
+            .map_err(|error| ToolExecutionOutcome::error(format!("Error: {error}")))?;
+        Ok((manager, prepared))
+    }
+
     pub(super) async fn execute_mcp_tool(
         &self,
         mcp_name: &str,
         args: &Value,
     ) -> ToolExecutionOutcome {
-        let manager_arc = match self.mcp_runtime_snapshot("mcp_runtime_dispatch").manager {
-            Some(m) => m.clone(),
-            None => {
-                return ToolExecutionOutcome::error(format!(
-                    "Error: MCP not available. Tool '{mcp_name}' cannot be executed."
-                ));
-            }
+        let (manager_arc, prepared) = match self.prepare_mcp_tool_call(mcp_name).await {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
         };
+        self.execute_prepared_mcp_tool(&manager_arc, mcp_name, &prepared, args)
+            .await
+    }
 
-        // Resolve the sanitized MCP name to server + original tool name, and get the
-        // connection Arc — all in a single read lock to avoid TOCTOU races.
-        let (server_name, original_name, conn) = {
-            let mgr = manager_arc.read().await;
-            let (srv, tool) = match mgr.find_tool_by_mcp_name(mcp_name) {
-                Some((s, t)) => (s.to_string(), t.to_string()),
-                None => {
-                    return ToolExecutionOutcome::error(format!(
-                        "Error: MCP tool '{mcp_name}' not found on any connected server."
-                    ));
-                }
-            };
-            let c = match mgr.get(&srv) {
-                Some(c) => c,
-                None => {
-                    return ToolExecutionOutcome::error(format!(
-                        "Error: MCP server '{srv}' not connected."
-                    ));
-                }
-            };
-            (srv, tool, c)
-        };
+    pub(super) async fn execute_prepared_mcp_tool(
+        &self,
+        manager_arc: &std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>,
+        mcp_name: &str,
+        prepared: &astra_mcp::PreparedMcpToolCall,
+        args: &Value,
+    ) -> ToolExecutionOutcome {
+        let server_name = prepared.server_name();
+        let original_name = prepared.original_tool_name();
+        let conn = prepared.connection();
 
         let dispatch_advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
             Self::mcp_runtime_environment_binding(mcp_name, super::runtime_env_builtin_registry()),
@@ -96,7 +115,7 @@ impl ToolExecutor {
         // Once call_tool starts, a transport error cannot prove that the MCP
         // server did not apply the operation. Reconnect may restore the server
         // for later invocations, but must never replay this invocation.
-        let mut outcome = match conn.call_tool(&original_name, args.clone()).await {
+        let mut outcome = match prepared.call(args.clone(), None).await {
             Ok(result) => {
                 mcp_result_to_tool_outcome(astra_mcp::extract_tool_call_result_with_limit(
                     &result,
@@ -109,10 +128,10 @@ impl ToolExecutor {
                     let mut mgr = manager_arc.write().await;
                     // Another caller may already have replaced this connection.
                     if mgr
-                        .get(&server_name)
+                        .get(server_name)
                         .is_some_and(|current| std::sync::Arc::ptr_eq(&current, &conn))
                     {
-                        if let Err(reconnect_error) = mgr.reconnect(&server_name).await {
+                        if let Err(reconnect_error) = mgr.reconnect(server_name).await {
                             tracing::warn!(
                                 server = %server_name,
                                 error = %reconnect_error,
@@ -151,6 +170,10 @@ impl ToolExecutor {
                 serde_json::to_value(dispatch_advertisement)
                     .expect("MCP dispatch binding is serializable"),
             );
+        outcome
+            .tool_result_fields
+            .get_or_insert_with(Default::default)
+            .insert("mcp_call_dispatched".into(), Value::Bool(true));
         outcome
     }
 }
@@ -238,7 +261,9 @@ mod tests {
         assert_eq!(metadata["side_effects_maybe"], true);
         assert_eq!(metadata["retryable"], false);
         assert_eq!(metadata["dispatch_certainty"], "unknown");
-        assert_eq!(metadata["error_kind"], "tool_outcome_unknown");
+        assert_eq!(metadata["error_kind"], "workspace_effect_unsettled");
+        assert_eq!(metadata["mcp_call_dispatched"], true);
+        assert_eq!(metadata["workspace_effect_settled"], false);
         assert_eq!(
             std::fs::read_to_string(&counter).expect("durable fixture mutation"),
             "applied\n",

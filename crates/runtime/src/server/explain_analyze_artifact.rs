@@ -23,6 +23,7 @@ const ARTIFACT_SCHEMA_VERSION: u16 = 1;
 const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_WINDOW_BYTES: usize = 8 * 1024;
 const MAX_WINDOW_BYTES: usize = 64 * 1024;
+const EXACT_RUN_OBSERVATION_EVENTS: usize = astra_services::runs::MAX_RUN_OBSERVATION_EVENTS;
 
 #[cfg(test)]
 tokio::task_local! {
@@ -341,6 +342,10 @@ fn graph_projection(facts: &[astra_turn_types::ExplainAnalyzeEventV1]) -> GraphP
         graph.apply(fact.clone());
     }
     graph.finish_ingest();
+    project_graph(&graph)
+}
+
+fn project_graph(graph: &astra_turn_types::ExplainAnalyzeGraphV1) -> GraphProjection {
     GraphProjection {
         has_terminal_turn: graph.nodes().iter().any(|node| {
             node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::Turn && node.terminal_observed
@@ -664,9 +669,9 @@ fn validate_storage_integrity(artifact: &StoredSessionArtifact) -> Result<Vec<u8
 fn validate_capture_projection(
     content: &Value,
     status: &str,
-    facts: &[astra_turn_types::ExplainAnalyzeEventV1],
+    graph: &astra_turn_types::ExplainAnalyzeGraphV1,
 ) -> Result<(), String> {
-    let projection = graph_projection(facts);
+    let projection = project_graph(graph);
     let delivery_degraded = content
         .get("delivery_degraded")
         .and_then(Value::as_bool)
@@ -723,7 +728,7 @@ fn validate_snapshot_payload<'a>(
         expected_run_id,
         expected_owner_generation,
     )
-    .map(|(status, _)| status)
+    .map(|(status, _, _)| status)
 }
 
 fn validate_snapshot_payload_with_bytes<'a>(
@@ -731,7 +736,10 @@ fn validate_snapshot_payload_with_bytes<'a>(
     reader_session_id: &str,
     expected_run_id: Option<&str>,
     expected_owner_generation: Option<u64>,
-) -> Result<(&'a str, Vec<u8>), String> {
+) -> Result<(&'a str, Vec<u8>, astra_turn_types::ExplainAnalyzeGraphV1), String> {
+    if artifact.artifact_kind != ARTIFACT_KIND {
+        return Err("artifact handle does not name a server Explain Analyze snapshot".into());
+    }
     if artifact.status.as_deref() != Some("active") {
         return Err(format!(
             "server Explain Analyze artifact is not active (storage status: {})",
@@ -799,12 +807,16 @@ fn validate_snapshot_payload_with_bytes<'a>(
         if !events.is_empty() {
             return Err("unavailable Explain Analyze artifact contains runtime facts".to_string());
         }
-        return Ok((status, bytes));
+        return Ok((
+            status,
+            bytes,
+            astra_turn_types::ExplainAnalyzeGraphV1::default(),
+        ));
     }
     if events.is_empty() {
         return Err("readable Explain Analyze artifact contains no runtime facts".to_string());
     }
-    let mut facts = Vec::with_capacity(events.len());
+    let mut graph = astra_turn_types::ExplainAnalyzeGraphV1::default();
     for event in events {
         let fact = astra_turn_types::decode_explain_analyze_wire(event).map_err(|error| {
             format!("Explain Analyze artifact contains an invalid typed event: {error}")
@@ -815,10 +827,11 @@ fn validate_snapshot_payload_with_bytes<'a>(
                     .to_string(),
             );
         }
-        facts.push(fact);
+        graph.apply(fact);
     }
-    validate_capture_projection(content, status, &facts)?;
-    Ok((status, bytes))
+    graph.finish_ingest();
+    validate_capture_projection(content, status, &graph)?;
+    Ok((status, bytes, graph))
 }
 
 /// Explicit discovery resolves one exact identity. Pagination uses its concrete handle.
@@ -850,7 +863,7 @@ pub(crate) async fn resolve_selector(
     let (offset, max_bytes) = window_arguments(args)?;
     if offset != 0 {
         return Err(
-            "Explain discovery starts at offset 0; paginate with the returned artifact handle"
+            "Explain selectors require offset 0. Only returned artifact handles support pagination; ordinary run projections do not."
                 .into(),
         );
     }
@@ -860,24 +873,24 @@ pub(crate) async fn resolve_selector(
     ) {
         return Err("server Explain snapshots require a durable server source".into());
     }
-    let store = store.ok_or("server Explain Analyze artifact reader is unavailable")?;
     let (run_id, generation) = match selector {
         ExplainSelector::Previous {} => engine
             .find_latest_explain_analyze_root(user_id, session_id, Some(current_root))
             .await?
             .ok_or("no previous Explain Analyze root exists in this session")?,
         ExplainSelector::Run { run_id } => {
-            let run = engine
-                .load_run(user_id, &run_id)
+            let observation = engine
+                .load_run_observation(user_id, &run_id, EXACT_RUN_OBSERVATION_EVENTS)
                 .await?
-                .filter(|run| {
-                    run.session_id == session_id
-                        && astra_services::runs::run_requested_explain_analyze(run)
-                })
+                .filter(|observation| observation.run.session_id == session_id)
                 .ok_or("Explain Analyze run was not found in the active session")?;
-            (run.run_id, run.run_generation)
+            if !astra_services::runs::run_requested_explain_analyze(&observation.run) {
+                return render_exact_run_projection(&observation, args, max_bytes);
+            }
+            (observation.run.run_id, observation.run.run_generation)
         }
     };
+    let store = store.ok_or("server Explain Analyze artifact reader is unavailable")?;
     let id = artifact_id(&run_id);
     record_artifact_fetch(ArtifactFetchPurpose::Discovery);
     let mut artifact = store
@@ -900,6 +913,12 @@ pub(crate) async fn resolve_selector(
             .map_err(|error| format!("load recovered Explain Analyze artifact: {error}"))?;
     }
     let artifact = artifact.ok_or("selected Explain Analyze capture is unavailable")?;
+    if !matches!(
+        args.get("depth").and_then(Value::as_str),
+        Some("diagnostic" | "forensic")
+    ) {
+        return render_summary(&artifact, session_id, &run_id, generation, max_bytes);
+    }
     render_window(
         &artifact,
         session_id,
@@ -908,6 +927,182 @@ pub(crate) async fn resolve_selector(
         offset,
         max_bytes,
     )
+}
+
+fn render_summary(
+    artifact: &StoredSessionArtifact,
+    session_id: &str,
+    run_id: &str,
+    generation: u64,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let (status, _, graph) =
+        validate_snapshot_payload_with_bytes(artifact, session_id, Some(run_id), Some(generation))?;
+    if status == "unavailable" {
+        return Err("the selected Explain Analyze capture is unavailable".into());
+    }
+    let auxiliary = graph.auxiliary_usage_snapshot();
+    let auxiliary_attempts = graph.auxiliary_attempts();
+    let scopes = graph.execution_scope_coverage();
+    let mut turn_outcomes = std::collections::BTreeMap::<String, usize>::new();
+    for node in graph
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::Turn)
+    {
+        let outcome = node
+            .outcome
+            .map(|outcome| {
+                serde_json::to_value(outcome)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .unwrap_or_else(|| "unknown".into());
+        *turn_outcomes.entry(outcome).or_default() += 1;
+    }
+    let mut diagnostics = std::collections::BTreeMap::<&str, usize>::new();
+    for diagnostic in graph.diagnostics().iter() {
+        *diagnostics.entry(diagnostic.code.as_str()).or_default() += 1;
+    }
+    let mut nodes = graph
+        .nodes()
+        .iter()
+        .map(|node| {
+            json!({
+                "node_id": node.node_id, "parent_node_id": node.parent_node_id,
+                "clock_domain_id": node.clock_domain_id, "kind": node.kind,
+                "label": node.label, "start_elapsed_ms": node.start_elapsed_ms,
+                "duration_ms": node.duration_ms, "outcome": node.outcome,
+                "terminal_observed": node.terminal_observed, "conflicted": node.conflicted,
+                "round_index": node.round_index, "attempt_index": node.attempt_index,
+                "usage": node.usage,
+                "context": node.context.as_ref().map(|context| json!({
+                    "budget": context.budget,
+                    "assembly": context.assembly.as_ref().map(|assembly| json!({
+                        "basis": assembly.basis, "sources": assembly.sources,
+                    })),
+                })),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut summary = json!({
+        "observation": "explain_analyze_summary", "run_id": run_id,
+        "turn_id": artifact.content["turn_id"], "execution_owner_generation": generation,
+        "artifact": artifact_handle(&artifact.artifact_id), "capture_status": status,
+        "graph_integrity": match graph.integrity() {
+            astra_turn_types::ExplainAnalyzeGraphIntegrityV1::Consistent => "consistent",
+            astra_turn_types::ExplainAnalyzeGraphIntegrityV1::Unknown => "unknown",
+        },
+        "delivery_degraded": artifact.content["delivery_degraded"],
+        "invalid_event_count": artifact.content["invalid_event_count"],
+        "foreign_event_count": artifact.content["foreign_event_count"],
+        "open_node_count": artifact.content["open_node_count"],
+        "turn_outcome_counts": turn_outcomes,
+        "coverage_gaps": graph.coverage_gaps(), "diagnostics": diagnostics,
+        "auxiliary": {
+            "available": auxiliary.available,
+            "unavailable": graph.auxiliary_usage_unavailable(),
+            "truncated": graph.auxiliary_usage_truncated(),
+            "conflicted": graph.auxiliary_capture_conflicted(),
+            "observed_attempt_count": auxiliary_attempts.len(),
+            "shown_attempt_count": 0, "omitted_attempt_count": auxiliary_attempts.len(),
+            "identity_conflict_count": graph.auxiliary_usage_conflict_count(),
+            "scope_coverage": {
+                "total_scope_count": scopes.len(),
+                "missing_turn_count": scopes.iter().filter(|scope| !scope.turn_observed).count(),
+                "nonterminal_turn_count": scopes.iter().filter(|scope| !scope.terminal_turn_observed).count(),
+                "conflicted_turn_count": scopes.iter().filter(|scope| scope.turn_conflicted).count(),
+                "snapshot_observed_count": scopes.iter().filter(|scope| scope.auxiliary_snapshot_observed).count(),
+                "snapshot_missing_count": scopes.iter().filter(|scope| !scope.auxiliary_snapshot_observed).count(),
+            },
+        },
+        "total_node_count": nodes.len(), "shown_node_count": 0, "omitted_node_count": nodes.len(),
+        "nodes": [],
+        "auxiliary_attempts": [],
+        "note": "Bounded projected facts; null outcomes and measurements are unknown. Detail is available through the artifact handle at offset 0; this summary is not a pagination cursor. Child execution needs its own run evidence.",
+    });
+    // Reserve the mandatory envelope first, then select whole rows in one pass.
+    // Keep factual identity/coverage even when the caller cannot afford any rows.
+    let minimum = serde_json::to_string(&summary)
+        .map_err(|error| format!("encode Explain summary: {error}"))?
+        .len();
+    if minimum > max_bytes {
+        return Err(format!(
+            "max_bytes is too small for an Explain summary (minimum {minimum})"
+        ));
+    }
+    // Four count fields can grow by at most 20 decimal digits each on a
+    // 64-bit target. Reserve that envelope growth independently of row bytes.
+    let mut budget = max_bytes.saturating_sub(minimum + 80);
+    let mut priority = (0..nodes.len()).collect::<Vec<_>>();
+    priority.sort_by_key(|index| {
+        let node = &graph.nodes()[*index];
+        std::cmp::Reverse((
+            node.conflicted
+                || !node.terminal_observed
+                || matches!(
+                    node.outcome,
+                    Some(
+                        astra_turn_types::ExplainAnalyzeOutcomeV1::Failed
+                            | astra_turn_types::ExplainAnalyzeOutcomeV1::Cancelled
+                            | astra_turn_types::ExplainAnalyzeOutcomeV1::Blocked
+                            | astra_turn_types::ExplainAnalyzeOutcomeV1::Interrupted
+                    )
+                ),
+            matches!(
+                node.kind,
+                astra_turn_types::ExplainAnalyzeNodeKindV1::Run
+                    | astra_turn_types::ExplainAnalyzeNodeKindV1::Turn
+            ),
+            matches!(
+                node.kind,
+                astra_turn_types::ExplainAnalyzeNodeKindV1::ToolCall
+                    | astra_turn_types::ExplainAnalyzeNodeKindV1::ChildRun
+                    | astra_turn_types::ExplainAnalyzeNodeKindV1::Wait
+            ),
+        ))
+    });
+    let mut retained = std::collections::HashSet::new();
+    for index in priority {
+        let size = serde_json::to_vec(&nodes[index])
+            .map_err(|error| error.to_string())?
+            .len()
+            + 1;
+        if size <= budget {
+            retained.insert(index);
+            budget -= size;
+        }
+    }
+    nodes = nodes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, node)| retained.contains(&index).then_some(node))
+        .collect();
+    let mut attempts = Vec::new();
+    for attempt in &auxiliary_attempts {
+        let row = serde_json::to_value(attempt).map_err(|error| error.to_string())?;
+        let size = serde_json::to_vec(&row)
+            .map_err(|error| error.to_string())?
+            .len()
+            + 1;
+        if size <= budget {
+            attempts.push(row);
+            budget -= size;
+        }
+    }
+    summary["shown_node_count"] = json!(nodes.len());
+    summary["omitted_node_count"] = json!(graph.nodes().len() - nodes.len());
+    summary["nodes"] = json!(nodes);
+    summary["auxiliary"]["shown_attempt_count"] = json!(attempts.len());
+    summary["auxiliary"]["omitted_attempt_count"] =
+        json!(auxiliary_attempts.len() - attempts.len());
+    summary["auxiliary_attempts"] = json!(attempts);
+    let output = serde_json::to_string(&summary)
+        .map_err(|error| format!("encode Explain summary: {error}"))?;
+    debug_assert!(output.len() <= max_bytes);
+    Ok(output)
 }
 
 fn window_arguments(args: &Value) -> Result<(usize, usize), String> {
@@ -937,10 +1132,7 @@ fn render_window(
     offset: usize,
     max_bytes: usize,
 ) -> Result<String, String> {
-    if artifact.artifact_kind != ARTIFACT_KIND {
-        return Err("artifact handle does not name a server Explain Analyze snapshot".into());
-    }
-    let (status, bytes) = validate_snapshot_payload_with_bytes(
+    let (status, bytes, _) = validate_snapshot_payload_with_bytes(
         artifact,
         session_id,
         expected_run,
@@ -966,6 +1158,229 @@ fn render_window(
     Ok(format!(
         "<explain-analyze-artifact>\nArtifact handle: {handle}\nRun: {run}\nTurn: {turn}\nGeneration: {generation}\nCapture status: {status}\nBytes: [{offset}..{next_offset}) of {total_bytes}\n\n{window}\n\n{continuation}\n</explain-analyze-artifact>"
     ))
+}
+
+/// Render exact durable run evidence when the run did not opt into the full
+/// Explain Analyze capture.
+///
+/// `introspect(explain={target:"run"})` promises exact active-session
+/// execution evidence, not only an Explain artifact. A normal run already
+/// owns a bounded, server-authorized event projection; using it here avoids
+/// turning every run into an artifact-writing run and avoids a second run
+/// lookup. Full Explain runs continue through the immutable artifact path
+/// above and retain pagination handles.
+fn render_exact_run_projection(
+    observation: &astra_services::runs::DurableRunObservation,
+    args: &Value,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let run = &observation.run;
+    let (events, omitted_events) = bounded_exact_run_events(observation)?;
+
+    let projection = json!({
+        "schema_version": 1,
+        "observation": "exact_run_projection",
+        "capture_status": "durable_event_projection",
+        "explain_analyze_requested": astra_services::runs::run_requested_explain_analyze(run),
+        "run": {
+            "run_id": run.run_id,
+            "session_id": run.session_id,
+            "parent_run_id": run.parent_run_id,
+            "root_run_id": run.root_run_id,
+            "depth": run.depth,
+            "agent_id": run.agent_id,
+            "status": run.status,
+            "waiting_for": run.waiting_for,
+            "resolved_model_name": run.resolved_model_name,
+            "total_prompt_tokens": run.total_prompt_tokens,
+            "total_completion_tokens": run.total_completion_tokens,
+            "total_tool_calls": run.total_tool_calls,
+            "error_code": run.error_code,
+            "error_message": run.error_message,
+        },
+        "events": events,
+        "omitted_event_count": omitted_events,
+        "observed_event_count": run.events.len(),
+        "total_event_count": observation.total_event_count,
+        "note": "This is the exact bounded durable run projection. A full Explain Analyze artifact is only created when the run requests Explain.",
+    });
+
+    let format_json = args
+        .get("format")
+        .and_then(Value::as_str)
+        .is_some_and(|format| format == "json");
+    if format_json {
+        return render_bounded_exact_run_json(projection, max_bytes, 0);
+    }
+
+    let prefix = format!(
+        "<exact-run-projection>\nRun: {}\nStatus: {}\n\n",
+        run.run_id, run.status
+    );
+    let suffix = "\n\nBounded evidence without pagination; check omitted_event_count.\n</exact-run-projection>";
+    let body = render_bounded_exact_run_json(projection, max_bytes, prefix.len() + suffix.len())?;
+    Ok(format!("{prefix}{body}{suffix}"))
+}
+
+fn exact_run_event_priority(event: &Value) -> u8 {
+    match astra_services::runs::extract_event_type(event).as_str() {
+        "run_finished" | "run_error" | "run_cancelled" | "run_interrupted" | "run_paused"
+        | "run_waiting" | "turn_complete" | "turn_done" => 2,
+        "run_created" | "run_started" | "tool_call_start" | "tool_result" | "tool_call_end" => 1,
+        _ => 0,
+    }
+}
+
+fn bounded_exact_run_events(
+    observation: &astra_services::runs::DurableRunObservation,
+) -> Result<(Vec<Value>, u64), String> {
+    const MAX_EVENTS: usize = 256;
+    const MAX_EVENT_BYTES: usize = 48 * 1024;
+    // One deliverable must not consume the whole execution-evidence budget.
+    const MAX_SINGLE_EVENT_BYTES: usize = MAX_EVENT_BYTES / 4;
+
+    let projected = observation
+        .run
+        .events
+        .iter()
+        .map(project_exact_run_observation_event)
+        .filter(|event| !event.is_null())
+        .collect::<Vec<_>>();
+    let observed = projected.len();
+    // Allocate the bounded evidence budget to final lifecycle events first,
+    // then the newest ordinary events. The final list is sorted again so the
+    // model sees a chronological projection without losing the run outcome
+    // when an old run has a long stream of deltas.
+    let mut priority = (0..observed).collect::<Vec<_>>();
+    priority.sort_unstable_by_key(|index| {
+        std::cmp::Reverse((exact_run_event_priority(&projected[*index]), *index))
+    });
+
+    let mut retained = Vec::new();
+    let mut event_bytes = 0usize;
+    for index in priority {
+        if retained.len() >= MAX_EVENTS {
+            break;
+        }
+        let bytes = serde_json::to_vec(&projected[index])
+            .map_err(|error| format!("encode exact run event projection: {error}"))?;
+        if bytes.len() > MAX_SINGLE_EVENT_BYTES
+            || event_bytes.saturating_add(bytes.len()) > MAX_EVENT_BYTES
+        {
+            continue;
+        }
+        event_bytes += bytes.len();
+        retained.push(index);
+    }
+    retained.sort_unstable();
+    retained.dedup();
+    let events = retained
+        .into_iter()
+        .map(|index| projected[index].clone())
+        .collect::<Vec<_>>();
+    let omitted = observation
+        .total_event_count
+        .saturating_sub(events.len() as u64);
+    Ok((events, omitted))
+}
+
+fn project_exact_run_observation_event(event: &Value) -> Value {
+    match astra_services::runs::extract_event_type(event).as_str() {
+        "reasoning_message_content" | "thinking_delta" | "reasoning_delta" => return Value::Null,
+        _ => {}
+    }
+    let projected = astra_services::runs::transform_run_event_for_client(event.clone());
+    let call = match projected["type"].as_str() {
+        Some("tool_call") => json!({
+            "type": "tool_call_start",
+            "call_id": projected.pointer("/tool_call/id"),
+            "tool": projected.pointer("/tool_call/function/name"),
+        }),
+        Some("tool_call_start") => json!({
+            "type": "tool_call_start",
+            "call_id": projected["call_id"],
+            "tool": projected["tool"],
+        }),
+        Some("tool_call_end") => {
+            let mut receipt = projected.as_object().unwrap().clone();
+            receipt.remove("arguments");
+            receipt.remove("args");
+            receipt.insert("arguments_omitted".into(), Value::Bool(true));
+            return Value::Object(receipt);
+        }
+        _ => return projected,
+    };
+    let mut call = call.as_object().unwrap().clone();
+    for field in [
+        "run_id",
+        "producer_run_id",
+        "parent_run_id",
+        "parent_tool_use_id",
+        "turn",
+        "round",
+    ] {
+        if let Some(value) = projected.get(field) {
+            call.insert(field.into(), value.clone());
+        }
+    }
+    call.insert("arguments_omitted".into(), Value::Bool(true));
+    Value::Object(call)
+}
+
+fn render_bounded_exact_run_json(
+    mut projection: Value,
+    max_bytes: usize,
+    envelope_bytes: usize,
+) -> Result<String, String> {
+    loop {
+        let encoded = serde_json::to_string(&projection)
+            .map_err(|error| format!("encode exact run projection: {error}"))?;
+        if encoded.len().saturating_add(envelope_bytes) <= max_bytes {
+            return Ok(encoded);
+        }
+        let Some(events) = projection["events"].as_array_mut() else {
+            break;
+        };
+        if events.is_empty() {
+            break;
+        }
+        let remove_at = events
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, event)| exact_run_event_priority(event))
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        events.remove(remove_at);
+        projection["omitted_event_count"] = projection["omitted_event_count"]
+            .as_u64()
+            .unwrap_or_default()
+            .saturating_add(1)
+            .into();
+    }
+
+    // A tiny caller window must still receive valid JSON. Keep the identity
+    // and terminal status, but do not return an oversized or sliced object.
+    let compact = json!({
+        "observation": projection["observation"],
+        "capture_status": projection["capture_status"],
+        "run": {
+            "run_id": projection["run"]["run_id"],
+            "status": projection["run"]["status"],
+        },
+        "events": [],
+        "omitted_event_count": projection["omitted_event_count"],
+        "note": "event window omitted; increase max_bytes",
+    });
+    let encoded = serde_json::to_string(&compact)
+        .map_err(|error| format!("encode compact exact run projection: {error}"))?;
+    let minimum_bytes = encoded.len().saturating_add(envelope_bytes);
+    if minimum_bytes > max_bytes {
+        return Err(format!(
+            "max_bytes is too small for a valid exact run projection (minimum {})",
+            minimum_bytes
+        ));
+    }
+    Ok(encoded)
 }
 
 fn read_window(
@@ -1217,6 +1632,236 @@ mod tests {
         }
     }
 
+    #[test]
+    fn summary_preserves_unknown_capture_and_whole_evidence_with_tiny_budget() {
+        let mut artifact = stored(explain_record(
+            "summary-test",
+            "user-a",
+            "session-a",
+            "complete",
+        ));
+        let terminal = artifact.content["events"][0].clone();
+        for index in 0..300 {
+            let mut event = terminal.clone();
+            event["event_id"] = json!(format!("stage-event-{index}"));
+            event["node_id"] = json!(format!("stage-{index}"));
+            event["parent_node_id"] = json!("turn-1");
+            event["kind"] = json!("preparation");
+            event["label"] = json!("上下文准备".repeat(10));
+            artifact.content["events"]
+                .as_array_mut()
+                .unwrap()
+                .push(event);
+        }
+        refresh_integrity_metadata(&mut artifact);
+        assert!(serde_json::to_vec(&artifact.content).unwrap().len() > 32768);
+        let output = render_summary(&artifact, "session-a", "run-1", 1, 8192).unwrap();
+        assert!(output.len() <= 8192);
+        let summary: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(summary["total_node_count"], 301);
+        assert_eq!(
+            summary["shown_node_count"].as_u64().unwrap()
+                + summary["omitted_node_count"].as_u64().unwrap(),
+            301
+        );
+        assert!(summary["omitted_node_count"].as_u64().unwrap() > 0);
+        assert_eq!(summary["nodes"][0]["node_id"], "turn-1");
+        assert_eq!(summary["turn_outcome_counts"]["completed"], 1);
+        assert_eq!(summary["auxiliary"]["available"], false);
+        assert_eq!(
+            summary["auxiliary"]["scope_coverage"]["snapshot_missing_count"],
+            1
+        );
+        let error = render_summary(&artifact, "session-a", "run-1", 1, 1).unwrap_err();
+        let minimum: usize = error
+            .split("minimum ")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(')')
+            .parse()
+            .unwrap();
+        assert!(render_summary(&artifact, "session-a", "run-1", 1, minimum - 1).is_err());
+        let minimum_output = render_summary(&artifact, "session-a", "run-1", 1, minimum).unwrap();
+        assert_eq!(minimum_output.len(), minimum);
+        let minimum_summary: Value = serde_json::from_str(&minimum_output).unwrap();
+        assert_eq!(minimum_summary["shown_node_count"], 0);
+        assert_eq!(
+            minimum_summary["turn_outcome_counts"],
+            summary["turn_outcome_counts"]
+        );
+        assert_eq!(minimum_summary["auxiliary"], summary["auxiliary"]);
+        assert_eq!(minimum_summary["diagnostics"], summary["diagnostics"]);
+        assert_eq!(minimum_summary["artifact"], artifact_handle("summary-test"));
+        artifact.content["events"][0]["auxiliary_usage"] =
+            json!({"available": true, "attempts": []});
+        refresh_integrity_metadata(&mut artifact);
+        let captured: Value = serde_json::from_str(
+            &render_summary(&artifact, "session-a", "run-1", 1, 8192).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(captured["auxiliary"]["available"], true);
+        assert_eq!(
+            captured["auxiliary"]["scope_coverage"]["snapshot_observed_count"],
+            1
+        );
+        for event in artifact.content["events"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .skip(1)
+        {
+            event["kind"] = json!("tool_call");
+        }
+        artifact.content["events"][299]["kind"] = json!("child_run");
+        artifact.content["events"][299]["outcome"] = json!("failed");
+        artifact.content["events"][300]["kind"] = json!("wait");
+        artifact.content["events"][300]["transition"] = json!("started");
+        for field in ["outcome", "duration_ms", "start_elapsed_ms"] {
+            artifact.content["events"][300]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        artifact.content["capture_status"] = json!("partial");
+        artifact.metadata.as_mut().unwrap()["status"] = json!("partial");
+        let facts = artifact.content["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| astra_turn_types::decode_explain_analyze_wire(event).unwrap())
+            .collect::<Vec<_>>();
+        let projection = graph_projection(&facts);
+        artifact.content["open_node_count"] = json!(projection.open_node_count);
+        artifact.content["graph_diagnostics"] = json!(projection.graph_diagnostics);
+        artifact.content["coverage_gaps"] = json!(projection.coverage_gaps);
+        refresh_integrity_metadata(&mut artifact);
+        let partial: Value = serde_json::from_str(
+            &render_summary(&artifact, "session-a", "run-1", 1, 8192).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(partial["capture_status"], "partial");
+        assert_eq!(partial["open_node_count"], 1);
+        assert!(
+            partial["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["node_id"] == "stage-298" && node["outcome"] == "failed")
+        );
+        assert!(
+            partial["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["node_id"] == "stage-299" && node["outcome"].is_null())
+        );
+        artifact.artifact_kind = "unrelated".into();
+        assert!(
+            render_summary(&artifact, "session-a", "run-1", 1, 8192)
+                .unwrap_err()
+                .contains("does not name")
+        );
+    }
+
+    #[test]
+    fn summary_bounds_scope_cardinality_and_keeps_nonconflicting_auxiliary_attempts() {
+        let mut artifact = stored(explain_record(
+            "scope-test",
+            "user-a",
+            "session-a",
+            "partial",
+        ));
+        let template = artifact.content["events"][0].clone();
+        let attempt = json!({
+            "attempt_id": "conflicting", "usage_status": "provider_exact",
+            "provider": "test", "offering_id": "offering-1", "model_name": "test-model",
+            "purpose": "introspection", "operation_id": "request_judgment",
+            "usage": {"basis": "provider_exact", "fresh_input_tokens": 10},
+        });
+        let mut valid = attempt.clone();
+        valid["attempt_id"] = json!("nonconflicting");
+        artifact.content["events"][0]["auxiliary_usage"] =
+            json!({"available": true, "attempts": [attempt.clone(), valid]});
+        for index in 0..1000 {
+            let mut event = template.clone();
+            event["event_id"] = json!(format!("scope-event-{index}"));
+            event["node_id"] = json!(format!("scope-turn-{index}"));
+            event["clock_domain_id"] = json!(format!("scope-clock-{index}"));
+            if index == 0 {
+                let mut conflicting = attempt.clone();
+                conflicting["usage"]["fresh_input_tokens"] = json!(20);
+                event["auxiliary_usage"] =
+                    json!({"available": true, "truncated": true, "attempts": [conflicting]});
+            }
+            artifact.content["events"]
+                .as_array_mut()
+                .unwrap()
+                .push(event);
+        }
+        let facts = artifact.content["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| astra_turn_types::decode_explain_analyze_wire(event).unwrap())
+            .collect::<Vec<_>>();
+        let projection = graph_projection(&facts);
+        artifact.content["open_node_count"] = json!(projection.open_node_count);
+        artifact.content["graph_diagnostics"] = json!(projection.graph_diagnostics);
+        artifact.content["coverage_gaps"] = json!(projection.coverage_gaps);
+        refresh_integrity_metadata(&mut artifact);
+        let output = render_summary(&artifact, "session-a", "run-1", 1, 8192).unwrap();
+        assert!(output.len() <= 8192);
+        let summary: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            summary["auxiliary"]["scope_coverage"]["total_scope_count"],
+            1001
+        );
+        assert_eq!(
+            summary["auxiliary"]["scope_coverage"]["snapshot_missing_count"],
+            999
+        );
+        assert_eq!(summary["auxiliary"]["identity_conflict_count"], 1);
+        assert_eq!(summary["auxiliary"]["observed_attempt_count"], 1);
+        assert_eq!(summary["auxiliary"]["available"], false);
+        assert_eq!(summary["auxiliary"]["truncated"], true);
+        assert_eq!(summary["turn_outcome_counts"]["completed"], 1001);
+        assert_eq!(
+            summary["auxiliary"]["shown_attempt_count"]
+                .as_u64()
+                .unwrap()
+                + summary["auxiliary"]["omitted_attempt_count"]
+                    .as_u64()
+                    .unwrap(),
+            1
+        );
+        let error = render_summary(&artifact, "session-a", "run-1", 1, 1).unwrap_err();
+        let minimum: usize = error
+            .split("minimum ")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(')')
+            .parse()
+            .unwrap();
+        let minimal: Value = serde_json::from_str(
+            &render_summary(&artifact, "session-a", "run-1", 1, minimum).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(minimal["nodes"], json!([]));
+        assert_eq!(minimal["auxiliary_attempts"], json!([]));
+        assert_eq!(minimal["auxiliary"]["shown_attempt_count"], 0);
+        assert_eq!(minimal["auxiliary"]["omitted_attempt_count"], 1);
+        for field in [
+            "available",
+            "truncated",
+            "identity_conflict_count",
+            "observed_attempt_count",
+            "scope_coverage",
+        ] {
+            assert_eq!(minimal["auxiliary"][field], summary["auxiliary"][field]);
+        }
+        assert_eq!(minimal["artifact"], summary["artifact"]);
+    }
+
     async fn handler_fixture() -> (
         crate::server::runtime_tool_executor::RuntimeToolExecutor,
         Arc<MemoryStore>,
@@ -1282,9 +1927,19 @@ mod tests {
     #[tokio::test]
     async fn lazy_handler_discovers_previous_without_prompt_handle_and_paginates() {
         let (executor, store, engine) = handler_fixture().await;
+        let summary = executor
+            .execute_with_metadata("introspect", &json!({"explain": {"target": "previous"}}))
+            .await;
+        assert!(!summary.is_error, "{summary:?}");
+        let summary: Value = serde_json::from_str(&summary.output).unwrap();
+        assert_eq!(summary["observation"], "explain_analyze_summary");
+        assert_eq!(summary["run_id"], "run-1");
+        assert_eq!(summary["shown_node_count"], 1);
+        assert_eq!(summary["nodes"][0]["outcome"], "completed");
+        assert_eq!(summary["auxiliary"]["available"], false);
         let (first, fetches) = count_explain_artifact_fetches(executor.execute_with_metadata(
             "introspect",
-            &json!({"explain": {"target": "previous"}, "max_bytes": 128}),
+            &json!({"explain": {"target": "previous"}, "depth": "diagnostic", "max_bytes": 128}),
         ))
         .await;
         assert!(!first.is_error, "{first:?}");
@@ -1349,6 +2004,283 @@ mod tests {
                 assert!(denied.is_error, "{denied:?}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn exact_run_returns_durable_projection_without_explain_artifact() {
+        let (executor, store, engine) = handler_fixture().await;
+        engine
+            .persist_status(
+                "user-a",
+                "session-a",
+                "current-root",
+                "completed",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .start_run("plain-run", "user-a", "session-a")
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                "user-a",
+                "session-a",
+                "plain-run",
+                json!({
+                    "event_type": "tool_call_start",
+                    "data": {
+                        "name": "bash",
+                        "tool_call_id": "call-1",
+                        "args": {"command": "private-argument-marker"}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                "user-a",
+                "session-a",
+                "plain-run",
+                json!({
+                    "event_type": "tool_result",
+                    "data": {
+                        "name": "bash",
+                        "tool_call_id": "call-1",
+                        "output": "42",
+                        "success": true
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        for index in 0..300 {
+            engine
+                .append_event(
+                    "user-a",
+                    "session-a",
+                    "plain-run",
+                    json!({
+                        "event_type": "agent_progress",
+                        "data": {"index": index}
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        for event_type in [
+            "reasoning_message_content",
+            "thinking_delta",
+            "reasoning_delta",
+        ] {
+            engine.append_event("user-a", "session-a", "plain-run", json!({
+                "event_type": event_type,
+                "data": {"content": "private-reasoning-marker", "chunk": "private-reasoning-marker"}
+            })).await.unwrap();
+        }
+        engine.append_event("user-a", "session-a", "plain-run", json!({
+            "type": "tool_call",
+            "tool_call": {"id":"call-modern", "type":"function", "function": {
+                "name":"read_file", "arguments":"{\"path\":\"private-modern-argument-marker\"}"
+            }}
+        })).await.unwrap();
+        engine
+            .append_event(
+                "user-a",
+                "session-a",
+                "plain-run",
+                json!({
+                    "type":"tool_call_end", "call_id":"call-terminal", "tool":"read_file",
+                    "arguments":{"path":"private-terminal-argument-marker"},
+                    "result":"public-result", "status":"completed", "success":true,
+                    "executed":true, "disposition":"executed"
+                }),
+            )
+            .await
+            .unwrap();
+        engine.append_event("user-a", "session-a", "plain-run", json!({
+            "event_type": "tool_result",
+            "data": {"name": "large_output", "tool_call_id": "large-call", "output": "x".repeat(48 * 1024 - 128), "success": true}
+        })).await.unwrap();
+        engine
+            .append_event(
+                "user-a",
+                "session-a",
+                "plain-run",
+                json!({
+                    "event_type": "run_finished",
+                    "data": {"run_id": "plain-run", "status": "completed"}
+                }),
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_status("user-a", "session-a", "plain-run", "completed", None, None)
+            .await
+            .unwrap();
+
+        let output = executor
+            .execute_with_metadata(
+                "introspect",
+                &json!({
+                    "explain": {"target": "run", "run_id": "plain-run"},
+                    "format": "json"
+                }),
+            )
+            .await;
+        assert!(!output.is_error, "{output:?}");
+        let projection: Value = serde_json::from_str(&output.output).unwrap();
+        assert_eq!(projection["observation"], "exact_run_projection");
+        assert_eq!(projection["capture_status"], "durable_event_projection");
+        assert_eq!(projection["run"]["run_id"], "plain-run");
+        assert_eq!(projection["run"]["status"], "completed");
+        assert!(output.output.contains("bash"));
+        assert!(output.output.contains("42"));
+        assert!(output.output.contains("run_finished"));
+        assert!(!output.output.contains("private-reasoning-marker"));
+        assert!(!output.output.contains("private-argument-marker"));
+        assert!(!output.output.contains("private-modern-argument-marker"));
+        assert!(!output.output.contains("private-terminal-argument-marker"));
+        assert!(
+            projection["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event["call_id"] == "call-terminal"
+                        && event["tool"] == "read_file"
+                        && event["result"] == "public-result"
+                        && event["success"] == true
+                        && event["executed"] == true
+                        && event["disposition"] == "executed"
+                        && event["arguments_omitted"] == true
+                })
+        );
+        assert!(
+            projection["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event["call_id"] == "call-1"
+                        && event["tool"] == "bash"
+                        && event["arguments_omitted"] == true
+                })
+        );
+        assert!(
+            projection["omitted_event_count"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
+
+        let compact = executor
+            .execute_with_metadata(
+                "introspect",
+                &json!({
+                    "explain": {"target": "run", "run_id": "plain-run"},
+                    "format": "json",
+                    "max_bytes": 512
+                }),
+            )
+            .await;
+        assert!(!compact.is_error, "{compact:?}");
+        assert!(
+            compact.output.len() <= 512,
+            "{} bytes",
+            compact.output.len()
+        );
+        let compact_projection: Value = serde_json::from_str(&compact.output).unwrap();
+        assert_eq!(compact_projection["run"]["run_id"], "plain-run");
+        let default_text = executor
+            .execute_with_metadata(
+                "introspect",
+                &json!({"explain": {"target": "run", "run_id": "plain-run"}}),
+            )
+            .await;
+        assert!(!default_text.is_error, "{default_text:?}");
+        let default_projection: Value =
+            serde_json::from_str(default_text.output.split("\n\n").nth(1).unwrap()).unwrap();
+        assert!(default_text.output.len() <= DEFAULT_WINDOW_BYTES);
+        assert!(default_text.output.contains("run_finished"));
+        assert_eq!(default_projection["run"]["status"], "completed");
+        assert_eq!(
+            default_projection["events"].as_array().unwrap().len() as u64
+                + default_projection["omitted_event_count"].as_u64().unwrap(),
+            default_projection["total_event_count"].as_u64().unwrap()
+        );
+        let text = executor
+            .execute_with_metadata(
+                "introspect",
+                &json!({
+                    "explain": {"target": "run", "run_id": "plain-run"},
+                    "max_bytes": 512
+                }),
+            )
+            .await;
+        assert!(!text.is_error, "{text:?}");
+        let body = text.output.split("\n\n").nth(1).unwrap();
+        let text_projection: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(text_projection["run"], compact_projection["run"]);
+        assert!(text.output.len() <= 512);
+        assert!(text.output.contains("check omitted_event_count"));
+        let too_small = executor
+            .execute_with_metadata(
+                "introspect",
+                &json!({"explain": {"target": "run", "run_id": "plain-run"}, "max_bytes": 1}),
+            )
+            .await;
+        assert!(too_small.is_error);
+        let minimum: usize = too_small
+            .output
+            .split("minimum ")
+            .nth(1)
+            .unwrap()
+            .split(')')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let retry = executor
+            .execute_with_metadata(
+                "introspect",
+                &json!({"explain": {"target": "run", "run_id": "plain-run"}, "max_bytes": minimum}),
+            )
+            .await;
+        assert!(!retry.is_error, "{retry:?}");
+        assert_eq!(retry.output.len(), minimum);
+        assert!(
+            store
+                .artifacts
+                .lock()
+                .unwrap()
+                .get(&(
+                    "user-a".into(),
+                    "session-a".into(),
+                    artifact_id("plain-run")
+                ))
+                .is_none()
+        );
+
+        let foreign = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            std::env::temp_dir(),
+            "other-user".into(),
+            "session-a".into(),
+            None,
+            None,
+        )
+        .with_explain_root(engine, "current-root".into())
+        .with_test_session_artifact_store(store);
+        let denied = foreign
+            .execute_with_metadata(
+                "introspect",
+                &json!({"explain": {"target": "run", "run_id": "plain-run"}}),
+            )
+            .await;
+        assert!(denied.is_error, "{denied:?}");
     }
 
     #[tokio::test]
@@ -1529,7 +2461,7 @@ mod tests {
             .execute(
                 "introspect",
                 &json!({
-                    "explain": {"target": "previous"}, "max_bytes": 128
+                    "explain": {"target": "previous"}, "depth": "forensic", "max_bytes": 128
                 }),
             )
             .await;
@@ -1632,6 +2564,7 @@ mod tests {
             start_elapsed_ms: finished.then_some(0),
             duration_ms: finished.then_some(1),
             outcome: finished.then_some(astra_turn_types::ExplainAnalyzeOutcomeV1::Completed),
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),

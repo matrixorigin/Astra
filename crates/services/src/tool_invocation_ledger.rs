@@ -84,9 +84,64 @@ pub struct DatabaseToolInvocationLedger {
     pool: SharedPool,
 }
 
+/// A missing hot row is only an observation, never a reservation or dispatch
+/// grant. The later transactional insert/re-read still decides races.
+#[derive(Clone, Debug)]
+pub struct MissingToolInvocationPreparation {
+    identity: ToolInvocationIdentity,
+    tool: astra_turn_types::DurableToolReference,
+    canonical_arguments_hash: String,
+}
+
+impl MissingToolInvocationPreparation {
+    pub fn identity(&self) -> &ToolInvocationIdentity {
+        &self.identity
+    }
+
+    pub fn matches_tool_and_arguments(&self, fingerprint: &ToolInvocationFingerprint) -> bool {
+        self.tool == fingerprint.tool
+            && self.canonical_arguments_hash == fingerprint.canonical_arguments_hash
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ToolInvocationPreparationProbe {
+    Existing(Box<ToolInvocationRecord>),
+    Missing(Box<MissingToolInvocationPreparation>),
+}
+
 impl DatabaseToolInvocationLedger {
     pub fn new(pool: SharedPool) -> Self {
         Self { pool }
+    }
+
+    /// Reuse the original hot-ledger point read before semantic admission.
+    /// The connection is released before judgment. A missing identity can
+    /// still be archived; transactional continuation resolves that case.
+    pub async fn probe_for_prepare(
+        &self,
+        identity: &ToolInvocationIdentity,
+        fingerprint: &ToolInvocationFingerprint,
+    ) -> Result<ToolInvocationPreparationProbe, ToolInvocationLedgerStoreError> {
+        let row = select_record_query(identity)
+            .fetch_optional(self.pool.get())
+            .await?;
+        if let Some(row) = row {
+            let record = decode_record(&row, identity)?;
+            if !record.fingerprint.same_tool_and_arguments(fingerprint) {
+                return Err(ToolInvocationLedgerStoreError::IdentityConflict {
+                    identity: Box::new(identity.clone()),
+                });
+            }
+            return Ok(ToolInvocationPreparationProbe::Existing(Box::new(record)));
+        }
+        Ok(ToolInvocationPreparationProbe::Missing(Box::new(
+            MissingToolInvocationPreparation {
+                identity: identity.clone(),
+                tool: fingerprint.tool.clone(),
+                canonical_arguments_hash: fingerprint.canonical_arguments_hash.clone(),
+            },
+        )))
     }
 
     /// Return an existing identity or insert `Prepared` idempotently.
@@ -101,7 +156,32 @@ impl DatabaseToolInvocationLedger {
         fingerprint: &ToolInvocationFingerprint,
         decision: &ToolInvocationDecision,
     ) -> Result<ToolInvocationPrepareOutcome, ToolInvocationLedgerStoreError> {
-        let fingerprint_json = serde_json::to_string(fingerprint).map_err(|source| {
+        self.prepare_internal(identity, fingerprint, decision, false)
+            .await
+    }
+
+    pub async fn finish_prepare_after_miss(
+        &self,
+        missing: Box<MissingToolInvocationPreparation>,
+        decision: &ToolInvocationDecision,
+    ) -> Result<ToolInvocationPrepareOutcome, ToolInvocationLedgerStoreError> {
+        let fingerprint = ToolInvocationFingerprint {
+            tool: missing.tool.clone(),
+            canonical_arguments_hash: missing.canonical_arguments_hash.clone(),
+            policy_decision_id: decision.decision_id.clone(),
+        };
+        self.prepare_internal(&missing.identity, &fingerprint, decision, true)
+            .await
+    }
+
+    async fn prepare_internal(
+        &self,
+        identity: &ToolInvocationIdentity,
+        fingerprint: &ToolInvocationFingerprint,
+        decision: &ToolInvocationDecision,
+        initial_hot_lookup_already_missed: bool,
+    ) -> Result<ToolInvocationPrepareOutcome, ToolInvocationLedgerStoreError> {
+        let fingerprint_json = serde_json::to_string(&fingerprint).map_err(|source| {
             ToolInvocationLedgerStoreError::Serialization {
                 field: "fingerprint_json",
                 source,
@@ -115,7 +195,9 @@ impl DatabaseToolInvocationLedger {
         })?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
         let mut tx = connection.begin().await?;
-        if let Some(record) = load_record_in_tx(&mut tx, identity).await? {
+        if !initial_hot_lookup_already_missed
+            && let Some(record) = load_record_in_tx(&mut tx, identity).await?
+        {
             if !record.fingerprint.same_tool_and_arguments(fingerprint) {
                 if rollback(tx, "prepare identity conflict").await.is_ok() {
                     connection.release();
@@ -129,6 +211,32 @@ impl DatabaseToolInvocationLedger {
             return Ok(ToolInvocationPrepareOutcome::Existing(record));
         }
         if let Err(error) = lock_executable_run(&mut tx, identity).await {
+            // Another worker may have inserted this identity and closed the
+            // run during semantic admission after our missing probe. Check
+            // the hot winner before falling back to archived recovery.
+            if initial_hot_lookup_already_missed
+                && matches!(
+                    error,
+                    ToolInvocationLedgerStoreError::RunNotExecutable { .. }
+                        | ToolInvocationLedgerStoreError::RunNotFound { .. }
+                )
+                && let Some(record) = load_record_in_tx(&mut tx, identity).await?
+            {
+                if !record.fingerprint.same_tool_and_arguments(fingerprint) {
+                    if rollback(tx, "prepare raced identity conflict")
+                        .await
+                        .is_ok()
+                    {
+                        connection.release();
+                    }
+                    return Err(ToolInvocationLedgerStoreError::IdentityConflict {
+                        identity: Box::new(identity.clone()),
+                    });
+                }
+                tx.commit().await?;
+                connection.release();
+                return Ok(ToolInvocationPrepareOutcome::Existing(record));
+            }
             if rollback(tx, "prepare run admission denied").await.is_ok() {
                 connection.release();
             } else {
@@ -2018,22 +2126,11 @@ async fn validate_execution_binding_generation_in_tx(
             binding.state,
         ));
     }
-    // Claim creation belongs to binding/admission transactions. Dispatch is a
-    // hot path and must not INSERT/DELETE/lock the claim for every tool call;
-    // observe the already-established owner mapping instead.
-    crate::session_context_coordinator::verify_execution_workspace_claim_in_tx(tx, &key, &binding)
-        .await
-        .map_err(|error| match error {
-            crate::SessionContextCoordinatorError::ExecutionBindingBusy => {
-                ToolInvocationLedgerStoreError::ExecutionBindingBusy
-            }
-            crate::SessionContextCoordinatorError::ExecutionWorkspaceClaimed { .. } => {
-                ToolInvocationLedgerStoreError::ExecutionBindingInvalid(
-                    "execution workspace claim changed owner during tool dispatch".to_string(),
-                )
-            }
-            other => ToolInvocationLedgerStoreError::ExecutionBindingInvalid(other.to_string()),
-        })?;
+    // The binding row and generation are the Session-scoped authority. The
+    // physical workspace is deliberately not represented by a Session-wide
+    // database claim; its executor serializes actual observations and writes
+    // with the workspace mutation lease. Omitting the old claim lookup keeps
+    // parallel tool dispatch on the database-only binding fence.
     Ok(())
 }
 
@@ -2203,7 +2300,7 @@ pub enum ToolInvocationLedgerStoreError {
     ExecutionBindingNotReady(crate::SessionExecutionBindingStateV1),
     #[error("stored Session execution binding is invalid: {0}")]
     ExecutionBindingInvalid(String),
-    #[error("Session execution binding is busy with another physical workspace claim")]
+    #[error("Session execution binding is occupied by active session execution state")]
     ExecutionBindingBusy,
     #[error(
         "tool invocation action was superseded by user intent at event {user_intent_event_index}: {identity:?}"

@@ -31,20 +31,18 @@ const _: () = assert!(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModelRequestContextScope<'a> {
     Session(&'a str),
-    HarnessRun(&'a str),
 }
 
 impl<'a> ModelRequestContextScope<'a> {
     fn column(self) -> &'static str {
         match self {
             Self::Session(_) => "session_id",
-            Self::HarnessRun(_) => "harness_run_id",
         }
     }
 
     fn id(self) -> &'a str {
         match self {
-            Self::Session(id) | Self::HarnessRun(id) => id,
+            Self::Session(id) => id,
         }
     }
 }
@@ -250,8 +248,7 @@ pub(crate) async fn compact_model_request_context_scope(
 }
 
 /// Delete diagnostic attempts after their explicit retention window.
-/// This also covers harness runs, which have no session row to delete. Each
-/// attempt is removed atomically only after its newest diagnostic fact has
+/// Each attempt is removed atomically only after its newest diagnostic fact has
 /// exceeded the retention window, so complete pairs remain intact and stale
 /// incomplete attempts cannot survive forever after a process failure.
 pub(crate) async fn expire_model_request_context_events(
@@ -415,10 +412,6 @@ mod retention_tests {
         assert_eq!(
             ModelRequestContextScope::Session("s-1").column(),
             "session_id"
-        );
-        assert_eq!(
-            ModelRequestContextScope::HarnessRun("h-1").column(),
-            "harness_run_id"
         );
     }
 
@@ -763,7 +756,6 @@ pub struct ModelRequestIdentity {
     pub owner_scope: String,
     pub session_id: Option<String>,
     pub run_id: Option<String>,
-    pub harness_run_id: Option<String>,
     pub turn: Option<u32>,
     pub round: Option<u32>,
     pub logical_attempt: u32,

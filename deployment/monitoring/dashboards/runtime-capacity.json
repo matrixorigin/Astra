@@ -302,29 +302,6 @@
           {
             "expr": "rate(astra_interaction_approval_resolution_total[5m])",
             "legendFormat": "approval resolution {{outcome}}"
-          },
-          {
-            "expr": "rate(astra_interaction_ask_user_journal_lookup_total[5m])",
-            "legendFormat": "ask_user lookup {{outcome}}"
-          },
-          {
-            "expr": "rate(astra_interaction_ask_user_journal_write_total[5m])",
-            "legendFormat": "ask_user write {{event}} {{outcome}}"
-          }
-        ]
-      },
-      {
-        "title": "Interaction Wait And Cleanup",
-        "type": "graph",
-        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 77},
-        "targets": [
-          {
-            "expr": "rate(astra_interaction_ask_user_wait_total[5m])",
-            "legendFormat": "ask_user wait {{source}} {{outcome}}"
-          },
-          {
-            "expr": "rate(astra_interaction_ask_user_ledger_cleanup_total[5m])",
-            "legendFormat": "ask_user cleanup {{outcome}}"
           }
         ]
       },

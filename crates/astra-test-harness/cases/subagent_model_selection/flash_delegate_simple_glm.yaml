@@ -1,0 +1,60 @@
+name: flash_delegate_simple_glm
+description: |
+  Minimal natural-language delegation with the same arithmetic as the direct
+  control. Measures selection, spawn, child execution, wait, and handoff. The
+  exact child result makes the adoption oracle independent of explanation style.
+prompt: |
+  让 glm-5.2 的子代理独立计算 17×19−281。请在给子代理的任务中明确要求：
+  它完成计算后最终只回复结果整数，不要输出算式、步骤、解释、标记或其他内容，
+  也不要在任务中泄露计算结果。等子代理完成并采用它的结果后，你也只输出这个整数，
+  不要解释或标点。
+debug_log: true
+capability: delegation
+timeout_seconds: 120
+criteria:
+  - type: exit_code
+    code: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: glm-5.2
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    json_match:
+      path: /payload/model
+      equals: glm-5.2
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/status
+      equals: completed
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: session_child_result_adopted
+    expected_result: "42"
+  - type: text_equals
+    expected: "42"
+  - type: journal_tool_call_count
+    name: bash
+    root_only: true
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: read_file
+    root_only: true
+    min: 0
+    max: 0

@@ -79,6 +79,7 @@ struct LiveMarkdownLayoutCache {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AssistantCell {
+    pub(crate) model_item_id: Option<String>,
     /// Raw markdown. Growing during stream via `push_delta`.
     source: String,
     /// `true` while tokens can still arrive. Flipped to false by
@@ -102,6 +103,7 @@ pub(crate) struct AssistantCell {
 impl AssistantCell {
     pub fn new_streaming() -> Self {
         Self {
+            model_item_id: None,
             source: String::new(),
             live: true,
             ts: None,
@@ -115,6 +117,7 @@ impl AssistantCell {
     /// resume, or a non-streaming model reply. Not live.
     pub fn from_markdown(markdown: impl Into<String>) -> Self {
         Self {
+            model_item_id: None,
             source: markdown.into(),
             live: false,
             ts: None,
@@ -128,6 +131,7 @@ impl AssistantCell {
     pub fn from_persist(ev: TurnEvent) -> Option<Self> {
         match ev {
             TurnEvent::Assistant { ts, markdown } => Some(Self {
+                model_item_id: None,
                 source: markdown,
                 live: false,
                 ts,
@@ -570,6 +574,9 @@ impl AssistantCell {
 }
 
 impl HistoryCell for AssistantCell {
+    fn model_item_id(&self) -> Option<&str> {
+        self.model_item_id.as_deref()
+    }
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let (think_inner, think_closed, body) = self.split_think();
 

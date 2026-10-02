@@ -64,6 +64,21 @@ completion under its inference contract; it does not prove task correctness.
 Cost evaluation must respect the usage-coverage contract in
 [observation-plane.md](observation-plane.md#model-request-attribution-and-usage).
 
+An Auto routing decision that reuses a Work judgment also retains that
+judgment's child-model requirement and authenticated user-intent identity.
+Recovery may rebind it to a new run-owner generation and advanced event cursor
+only when the user, session, run, turn chain, and instruction digest still
+match. Missing or changed source evidence fails closed; a restored
+`not_applicable` answer cannot erase a
+previously positive child-model requirement. This remains one durable routing
+fact, not a second judgment or database projection.
+
+Decision schema v2 intentionally does not read v1 routing events: v1 did not
+retain the child-model judgment or its source. Existing v1 Auto runs cannot
+resume under this contract, and v1 decisions must not be treated as v2 offline
+training evidence. Deployments that need those records require an explicit
+separate migration decision; runtime does not guess the missing fields.
+
 ## Escalation
 
 Escalate when:
@@ -219,8 +234,8 @@ independent child routing remain later stages.
 `astra-test router-offline` builds a consented structural dataset and fits an
 **offline-only** candidate. It does not load credentials, query production
 traces, invoke providers/tools, activate a policy, or change Offering admission.
-The existing session-score training exporter is not a router corpus and remains
-unchanged. Dataset validation belongs to `services::evaluation::router`; the
+The router corpus uses explicitly consented structural evidence, not a product
+analytics exporter. Dataset validation belongs to `services::model_routing::offline`; the
 pure categorical trainer belongs to `turn_core::model_routing::offline`. The
 harness supplies the explicit local file boundary.
 

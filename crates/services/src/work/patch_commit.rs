@@ -138,6 +138,7 @@ impl WorkPatchCommitPhase {
 pub enum WorkPatchCommitFailureCode {
     AuthorizationDenied,
     WorkspaceUnavailable,
+    InvalidWorkspace,
     ProviderUnavailable,
     InvalidMetadata,
     BaseChanged,
@@ -152,6 +153,7 @@ impl WorkPatchCommitFailureCode {
         match self {
             Self::AuthorizationDenied => "authorization_denied",
             Self::WorkspaceUnavailable => "workspace_unavailable",
+            Self::InvalidWorkspace => "invalid_workspace",
             Self::ProviderUnavailable => "provider_unavailable",
             Self::InvalidMetadata => "invalid_metadata",
             Self::BaseChanged => "base_changed",
@@ -166,6 +168,7 @@ impl WorkPatchCommitFailureCode {
         match value {
             "authorization_denied" => Some(Self::AuthorizationDenied),
             "workspace_unavailable" => Some(Self::WorkspaceUnavailable),
+            "invalid_workspace" => Some(Self::InvalidWorkspace),
             "provider_unavailable" => Some(Self::ProviderUnavailable),
             "invalid_metadata" => Some(Self::InvalidMetadata),
             "base_changed" => Some(Self::BaseChanged),

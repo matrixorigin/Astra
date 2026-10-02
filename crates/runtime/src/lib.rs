@@ -61,10 +61,7 @@ pub mod auto_invoke_handler;
 pub mod bash_intent;
 pub mod capabilities;
 pub(crate) mod capability_endpoint_pool;
-pub mod capability_registry;
 pub(crate) mod capacity_model;
-pub mod deployment;
-pub mod evaluation;
 pub mod learning;
 pub(crate) mod llm_provider_admission;
 pub mod matrix_cloud_runtime;
@@ -72,10 +69,8 @@ pub mod memory_hooks;
 pub mod observability;
 pub use astra_plan as plan;
 pub mod prompts;
-pub mod provider;
 pub mod server;
 pub mod session_memory;
-pub mod storage;
 pub mod tool_registry;
 pub mod turn;
 
@@ -127,11 +122,10 @@ pub fn apply_safety_config_from_runtime_config(cfg: &astra_config::RuntimeConfig
 
 pub use astra_services::{
     admin::{
-        AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer,
-        AdminFeedbackStatsFilter, AdminFeedbackStatsReader, AdminFeedbackStatsRecord,
-        AdminInitRecord, AdminInitializer, AdminTokenCreateRequestData, AdminTokenFilter,
-        AdminTokenReader, AdminTokenRecord, AdminTokenWriter, AdminUserRoleManager,
-        AdminUserRoleRecord, AdminUserRoleRequestData, AuthenticatedUser,
+        AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer, AdminInitRecord,
+        AdminInitializer, AdminTokenCreateRequestData, AdminTokenFilter, AdminTokenReader,
+        AdminTokenRecord, AdminTokenWriter, AdminUserRoleManager, AdminUserRoleRecord,
+        AdminUserRoleRequestData, AuthenticatedUser,
     },
     agents::{
         AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
@@ -140,13 +134,12 @@ pub use astra_services::{
     auth::{
         AuthLoginRequestData, AuthPrincipal, AuthPrincipalOrigin, AuthRefreshRequestData,
         AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord,
-        DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminFeedbackStatsReader,
-        DatabaseAdminInitializer, DatabaseAdminTokenReader, DatabaseAdminTokenWriter,
-        DatabaseAdminUserRoleManager, DatabaseAuthService, DatabaseSessionService,
-        FernetTokenEncryptor, ReauthenticationProofRecord, ReauthenticationPurpose,
-        ReauthenticationRequestData, SessionActivityRecord, SessionCreateRequestData,
-        SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-        SessionUpdateRequestData,
+        DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminInitializer,
+        DatabaseAdminTokenReader, DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager,
+        DatabaseAuthService, DatabaseSessionService, FernetTokenEncryptor,
+        ReauthenticationProofRecord, ReauthenticationPurpose, ReauthenticationRequestData,
+        SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
+        SessionRecord, SessionService, SessionUpdateRequestData,
     },
     branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService},
     context::{
@@ -163,17 +156,6 @@ pub use astra_services::{
     events::{
         DatabaseEventService, EventCreateRequestData, EventListFilter, EventListRecord,
         EventRecord, EventService, UnconfiguredEventService,
-    },
-    harness::{
-        DatabaseHarnessService, HarnessCitationRecord, HarnessDecisionRequest, HarnessItemRecord,
-        HarnessNodeCatalogRecord, HarnessRunRecord, HarnessService, HarnessSkillDraftRecord,
-        HarnessSkillRuleRecord, HarnessTemplateRecord, SkillifyAgentCitation, SkillifyAgentDraft,
-        SkillifyAgentExecutor, SkillifyAgentOutput, SkillifyAgentRequest, SkillifyAgentRule,
-        SkillifyDraftRecord, SkillifyDraftRequest, SkillifyPublishRecord, SkillifyPublishRequest,
-        SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
-    },
-    jobs::{
-        InMemoryJobService, JobRecord, JobService, JobSubmitRequestData, UnconfiguredJobService,
     },
     marketplace::{DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService},
     marketplace_stats::{
@@ -210,10 +192,6 @@ pub use astra_services::{
     },
     skills::{DatabaseSkillService, SkillRecord, SkillService, UnconfiguredSkillService},
     triggers::{DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService},
-    workflows::{
-        UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,
-        WorkflowService,
-    },
 };
 
 pub(crate) use astra_services::runs::UnconfiguredRunLifecycleService;
@@ -225,9 +203,8 @@ pub use app_state::{
     MemoriaHealth, NoopMemoriaForwarder, ReqwestMemoriaForwarder, ServiceInfo,
 };
 
-// ── Re-exports: evaluation & introspection ───────────────────────────────────
+// ── Re-exports: introspection ────────────────────────────────────────────────
 
-pub use evaluation::{DatabaseEvaluationService, EvaluationService, UnconfiguredEvaluationService};
 pub use introspection::{
     DatabaseIntrospectionService, IntrospectionService, UnconfiguredIntrospectionService,
 };
@@ -235,10 +212,7 @@ pub use introspection::{
 // ── Re-exports: server ───────────────────────────────────────────────────────
 
 pub use server::build_test_router;
-pub use server::delegation::engine::{
-    CheckpointGate, DefaultQualityGate, DelegationEngine, DelegationTracker, GateVerdict,
-    QualityThresholds, VerificationGate,
-};
+pub use server::delegation::engine::{DelegationEngine, DelegationTracker};
 pub use server::run::engine::RunEngine;
 pub use server::run::lifecycle::AgenticRunLifecycleService;
 pub use server::{build_app, build_server_state, serve};
@@ -273,7 +247,6 @@ pub use astra_turn_core::{
         tool_requires_explicit_approval,
     },
     activity::SessionActivityUpdatePlan,
-    cache::SessionCache,
     cloud_attachments::{
         AttachmentBuilder, PlanAttachment, PostCompactAttachments, SkillAttachment,
     },
@@ -294,7 +267,6 @@ pub use astra_turn_core::{
     hook_plans::{SnapshotLinkPlan, build_snapshot_link_plan},
     observer::{build_observer_messages, should_run_observer},
     response_guard::{is_prompt_leaked, is_repetition_loop},
-    routing::build_skipped_routing_metadata,
     stall::{
         DivergenceStatus, SERVER_STALL_WINDOW, canonical_tool_args, detect_divergence,
         detect_server_stall, record_server_tool_signatures, server_tool_call_signature,

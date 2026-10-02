@@ -17,9 +17,8 @@ use std::path::{Path, PathBuf};
 /// numeric prefix). UI and JSON dumps show **message delta** (suffix after shared prefix with the
 /// previous heavy snapshot), not the entire accumulated history. If there are fewer heavy files
 /// than journal turns, the latest heavy file is used and a warning is recorded.
-/// Retention: fallback handler for `/debug` — called from slash_router.rs.
-/// Interactive users should prefer the native `/inspect` surface; `/debug`
-/// remains an explicit legacy handoff until its remaining diagnostics migrate.
+/// Used by the non-interactive `astra debug` bridge in `command_router`.
+/// Interactive users inspect live session evidence with native `/inspect`.
 pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
     let session_id = if arg.is_empty() {
         match &state.session_id {

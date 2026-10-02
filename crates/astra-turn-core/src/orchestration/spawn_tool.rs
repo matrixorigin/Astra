@@ -1,7 +1,85 @@
 //! Spawn agent tool schema and types.
 
 use super::fanout_group::AgentFanoutSlotIdentity;
+use astra_turn_types::{ModelSelection, RequestedModelPolicy};
 use serde::{Deserialize, Serialize};
+
+/// Child reasoning intent, kept independent from model identity.
+///
+/// `ModelDefault` means that Astra sends no explicit reasoning override. The
+/// other variants are exact controls and must be validated against the
+/// admitted Offering before any provider request is made.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReasoningSelection {
+    ModelDefault,
+    Off,
+    On {},
+    Enabled {
+        budget_tokens: u32,
+    },
+    Adaptive {
+        effort: crate::thinking_config::ThinkingEffort,
+    },
+}
+
+impl ReasoningSelection {
+    #[must_use]
+    pub fn config(&self) -> crate::thinking_config::ThinkingConfig {
+        match self {
+            Self::ModelDefault => crate::thinking_config::ThinkingConfig::ModelDefault,
+            Self::Off => crate::thinking_config::ThinkingConfig::Off,
+            Self::On {} => crate::thinking_config::ThinkingConfig::On {},
+            Self::Enabled { budget_tokens } => crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: *budget_tokens,
+            },
+            Self::Adaptive { effort } => {
+                crate::thinking_config::ThinkingConfig::Adaptive { effort: *effort }
+            }
+        }
+    }
+}
+
+impl From<crate::thinking_config::ThinkingConfig> for ReasoningSelection {
+    fn from(config: crate::thinking_config::ThinkingConfig) -> Self {
+        use crate::thinking_config::ThinkingConfig;
+        match config {
+            ThinkingConfig::ModelDefault => Self::ModelDefault,
+            ThinkingConfig::Off => Self::Off,
+            ThinkingConfig::On {} => Self::On {},
+            ThinkingConfig::Enabled { budget_tokens } => Self::Enabled { budget_tokens },
+            ThinkingConfig::Adaptive { effort } => Self::Adaptive { effort },
+        }
+    }
+}
+
+/// Immutable effective parent setting, paired with its exact Offering identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentModelReasoning {
+    pub selection: ModelSelection,
+    /// Exact model name resolved when this parent run was admitted. This is
+    /// an identity assertion for same-Offering inheritance, not authority to
+    /// execute; every child still passes fresh model admission.
+    pub resolved_model_name: Option<String>,
+    pub thinking: crate::thinking_config::ThinkingConfig,
+}
+
+/// Resolve after slot/shared/profile defaults. Explicit model-default stops
+/// inheritance; controls from another Offering must never cross this boundary.
+pub fn resolve_child_thinking(
+    requested: Option<&ReasoningSelection>,
+    child: Option<&ModelSelection>,
+    parent: Option<&ParentModelReasoning>,
+) -> crate::thinking_config::ThinkingConfig {
+    requested
+        .map(ReasoningSelection::config)
+        .unwrap_or_else(|| {
+            parent
+                .filter(|parent| child.is_none_or(|child| child == &parent.selection))
+                .map(|parent| parent.thinking.clone())
+                .unwrap_or(crate::thinking_config::ThinkingConfig::ModelDefault)
+        })
+}
 /// Request to inherit the parent's cacheable prefix when spawning.
 ///
 /// When present in a `SpawnAgentInput`, the runtime looks up the
@@ -62,6 +140,7 @@ pub struct SpawnAgentInput {
     pub prompt: String,
 
     /// Agent type: "explore", "code-review", "task", "general-purpose".
+    /// Omitted values use the bounded read-only `explore` persona.
     #[serde(default = "default_agent_type")]
     pub agent_type: String,
 
@@ -157,11 +236,23 @@ pub struct SpawnAgentInput {
     #[serde(default)]
     pub work_item: Option<WorkItemExecutionSpec>,
 
-    /// Explicit child model override. When absent, the child inherits the
-    /// parent's admitted model. This field is appended because the serialized
-    /// field order participates in fork-prefix schema identity.
+    /// Optional reasoning override. Omission inherits the effective parent
+    /// setting only for the same Offering; model_default explicitly opts out.
     #[serde(default)]
-    pub model: Option<String>,
+    pub reasoning: Option<ReasoningSelection>,
+
+    /// User-requested model behavior. Omission follows the normal inherited
+    /// path; explicit `inherit` overrides lower-priority defaults. Auto is
+    /// represented so the request is not confused with a resolved Offering,
+    /// but execution rejects it until the shared router is available.
+    #[serde(default)]
+    pub requested_model_policy: Option<RequestedModelPolicy>,
+
+    /// Concrete Offering resolved by trusted orchestration after applying the
+    /// requested policy and parent snapshot. This is never accepted from tool
+    /// JSON and is deliberately omitted from the public schema.
+    #[serde(skip)]
+    pub resolved_model_selection: Option<ModelSelection>,
 }
 
 impl SpawnAgentInput {
@@ -257,7 +348,9 @@ impl Default for SpawnAgentInput {
             fanout_slot_index: None,
             fanout_slot_id: None,
             work_item: None,
-            model: None,
+            reasoning: None,
+            requested_model_policy: None,
+            resolved_model_selection: None,
         }
     }
 }
@@ -366,7 +459,7 @@ mod budget_resolve_tests {
 }
 
 fn default_agent_type() -> String {
-    "general-purpose".to_string()
+    "explore".to_string()
 }
 
 /// Output from spawn_agent tool.
@@ -459,6 +552,7 @@ impl SpawnAgentOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_turn_types::ModelSelector;
     use serde_json::json;
 
     #[test]
@@ -466,7 +560,7 @@ mod tests {
         let json = r#"{"description": "Test", "prompt": "Do the thing"}"#;
         let input: SpawnAgentInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.description, "Test");
-        assert_eq!(input.agent_type, "general-purpose");
+        assert_eq!(input.agent_type, "explore");
         // Default is synchronous (run_in_background=false) so the parent
         // receives the child's result in the tool-call response.
         assert!(!input.run_in_background);
@@ -488,11 +582,186 @@ mod tests {
     }
 
     #[test]
-    fn spawn_accepts_an_explicit_model_override_for_admitted_routing() {
-        let json = r#"{"description":"Test","prompt":"Do the thing","model":"gpt-4o"}"#;
+    fn spawn_accepts_a_fixed_offering_policy() {
+        let json = r#"{"description":"Test","prompt":"Do the thing","requested_model_policy":{"mode":"fixed","selector":{"kind":"offering_id","offering_id":"offer-gpt-4o"}}}"#;
         let input = serde_json::from_str::<SpawnAgentInput>(json)
-            .expect("an explicit child model override is part of the typed spawn contract");
-        assert_eq!(input.model.as_deref(), Some("gpt-4o"));
+            .expect("a fixed model policy is part of the typed spawn contract");
+        assert_eq!(
+            input.requested_model_policy,
+            Some(RequestedModelPolicy::Fixed {
+                selector: ModelSelector::OfferingId {
+                    offering_id: "offer-gpt-4o".to_string(),
+                }
+            })
+        );
+        assert!(input.resolved_model_selection.is_none());
+    }
+
+    #[test]
+    fn spawn_preserves_explicit_inherit_and_auto_requests() {
+        let inherited = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"Test","prompt":"Do the thing","requested_model_policy":{"mode":"inherit"}}"#,
+        )
+        .expect("explicit inherit is a real override");
+        assert_eq!(
+            inherited.requested_model_policy,
+            Some(RequestedModelPolicy::Inherit)
+        );
+        let automatic = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"Test","prompt":"Do the thing","requested_model_policy":{"mode":"auto","strategy":"cost_priority"}}"#,
+        )
+        .expect("Auto policy remains explicit even while routing is unavailable");
+        assert_eq!(
+            automatic.requested_model_policy,
+            Some(RequestedModelPolicy::Auto {
+                strategy: astra_turn_types::AutoModelStrategy::CostPriority,
+            })
+        );
+    }
+
+    #[test]
+    fn spawn_rejects_the_previous_untyped_selection_key() {
+        let error = serde_json::from_str::<SpawnAgentInput>(
+            r#"{"description":"Test","prompt":"Do the thing","model_selection":{"offering_id":"offer-gpt-4o"}}"#,
+        )
+        .expect_err("the model request uses one typed policy field");
+        assert!(error.to_string().contains("model_selection"), "{error}");
+    }
+
+    #[test]
+    fn spawn_rejects_the_removed_model_name_override() {
+        let json = r#"{"description":"Test","prompt":"Do the thing","model":"gpt-4o"}"#;
+        let error = serde_json::from_str::<SpawnAgentInput>(json)
+            .expect_err("model names are not execution identities");
+        assert!(
+            error.to_string().contains("unknown field `model`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn spawn_parses_reasoning_independently_from_model_policy() {
+        let input: SpawnAgentInput = serde_json::from_str(
+            r#"{"description":"Review","prompt":"Check it","requested_model_policy":{"mode":"fixed","selector":{"kind":"offering_id","offering_id":"offer-b"}},"reasoning":{"mode":"adaptive","effort":"high"}}"#,
+        )
+        .expect("typed reasoning and model policy");
+        assert_eq!(
+            input.requested_model_policy,
+            Some(RequestedModelPolicy::Fixed {
+                selector: ModelSelector::OfferingId {
+                    offering_id: "offer-b".to_string(),
+                },
+            })
+        );
+
+        assert_eq!(
+            input.reasoning.map(|selection| selection.config()),
+            Some(crate::thinking_config::ThinkingConfig::Adaptive {
+                effort: crate::thinking_config::ThinkingEffort::High,
+            })
+        );
+    }
+
+    #[test]
+    fn resolved_selection_is_never_accepted_from_tool_json() {
+        let json = r#"{"description":"Test","prompt":"Do the thing","resolved_model_selection":{"offering_id":"forged"}}"#;
+        let error = serde_json::from_str::<SpawnAgentInput>(json)
+            .expect_err("resolved Offering identity is runtime-owned");
+        assert!(error.to_string().contains("resolved_model_selection"));
+    }
+
+    #[test]
+    fn auto_policy_does_not_silently_fall_back_to_the_parent_offering() {
+        let policy = RequestedModelPolicy::Auto {
+            strategy: astra_turn_types::AutoModelStrategy::CostPriority,
+        };
+        let parent = ModelSelection {
+            offering_id: "offer-parent".into(),
+        };
+        assert_eq!(
+            astra_turn_types::resolve_requested_model_selection(Some(&policy), Some(&parent)),
+            Err(astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable)
+        );
+    }
+
+    #[test]
+    fn model_default_is_distinct_from_explicit_off() {
+        assert_eq!(
+            ReasoningSelection::ModelDefault.config(),
+            crate::thinking_config::ThinkingConfig::ModelDefault
+        );
+        assert_eq!(
+            ReasoningSelection::Off.config(),
+            crate::thinking_config::ThinkingConfig::Off
+        );
+    }
+
+    #[test]
+    fn explicit_budget_preserves_exact_control() {
+        let input = serde_json::from_value::<SpawnAgentInput>(serde_json::json!({
+            "description": "inspect",
+            "prompt": "inspect",
+            "reasoning": {"mode": "enabled", "budget_tokens": 8_000}
+        }))
+        .unwrap();
+        assert_eq!(
+            input.reasoning.unwrap().config(),
+            crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 8_000
+            }
+        );
+    }
+
+    #[test]
+    fn child_reasoning_inherits_only_the_matching_offering() {
+        use crate::thinking_config::{ThinkingConfig, ThinkingEffort};
+        let selection = ModelSelection {
+            offering_id: "parent".into(),
+        };
+        let other = ModelSelection {
+            offering_id: "other".into(),
+        };
+        for thinking in [
+            ThinkingConfig::Off,
+            ThinkingConfig::On {},
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+            ThinkingConfig::Enabled {
+                budget_tokens: 8_000,
+            },
+        ] {
+            let parent = ParentModelReasoning {
+                selection: selection.clone(),
+                resolved_model_name: Some("parent-model".to_string()),
+                thinking: thinking.clone(),
+            };
+            assert_eq!(resolve_child_thinking(None, None, Some(&parent)), thinking);
+            assert_eq!(
+                resolve_child_thinking(None, Some(&selection), Some(&parent)),
+                thinking
+            );
+            assert_eq!(
+                resolve_child_thinking(None, Some(&other), Some(&parent)),
+                ThinkingConfig::ModelDefault
+            );
+            assert_eq!(
+                resolve_child_thinking(
+                    Some(&ReasoningSelection::ModelDefault),
+                    Some(&selection),
+                    Some(&parent)
+                ),
+                ThinkingConfig::ModelDefault
+            );
+            assert_eq!(
+                ReasoningSelection::from(thinking.clone()).config(),
+                thinking
+            );
+        }
+        assert_eq!(
+            resolve_child_thinking(None, Some(&selection), None),
+            ThinkingConfig::ModelDefault
+        );
     }
 
     #[test]

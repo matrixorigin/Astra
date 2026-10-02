@@ -1,6 +1,6 @@
 //! Reproducible categorical outcome baseline. This produces an offline candidate
 //! only; it cannot authorize an Offering or activate a runtime policy.
-use astra_services::evaluation::router::*;
+use astra_services::model_routing::offline::*;
 use astra_turn_types::model_routing::ModelRoutingFeatures;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

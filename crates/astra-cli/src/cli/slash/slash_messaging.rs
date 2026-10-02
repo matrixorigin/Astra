@@ -1,22 +1,18 @@
 //! `/messaging` slash command — inspect inter-agent messaging state.
 //!
-//! Subcommands:
-//! - `/messaging` (no args): Show current metrics snapshot
-//! - `/messaging dlq`: Show dead letter queue summary
-//! - `/messaging status`: Show mailbox status if available
+//! Shows the runtime's observed messaging metrics, not an inferred delivery
+//! or retry status for messages without a production receipt owner.
 
 use crate::cli::session::session_state::SessionState;
 use crossterm::style::Stylize;
 
 /// Handle `/messaging [subcommand]` command.
-pub(crate) async fn handle_messaging_command(arg: &str, state: &SessionState) {
+pub(crate) fn handle_messaging_command(arg: &str, state: &SessionState) {
     let parts: Vec<&str> = arg.split_whitespace().collect();
     let subcmd = parts.first().copied().unwrap_or("");
 
     match subcmd {
         "" | "metrics" => show_metrics(state),
-        "dlq" | "deadletter" => show_dlq(state).await,
-        "status" => show_status(state),
         "help" | "?" => show_help(),
         _ => {
             eprintln!(
@@ -42,40 +38,6 @@ fn show_metrics(state: &SessionState) {
                 snap.messages_dropped.to_string().red()
             } else {
                 snap.messages_dropped.to_string().dim()
-            }
-        );
-        eprintln!(
-            "  {} {} sent, {} received",
-            "Acks:".bold(),
-            snap.acks_sent.to_string().green(),
-            snap.acks_received.to_string().green()
-        );
-        eprintln!(
-            "  {} {} sent, {} received",
-            "Nacks:".bold(),
-            if snap.nacks_sent > 0 {
-                snap.nacks_sent.to_string().yellow()
-            } else {
-                snap.nacks_sent.to_string().dim()
-            },
-            if snap.nacks_received > 0 {
-                snap.nacks_received.to_string().yellow()
-            } else {
-                snap.nacks_received.to_string().dim()
-            }
-        );
-        eprintln!(
-            "  {} {} retries, {} dead-lettered",
-            "Failures:".bold(),
-            if snap.retries > 0 {
-                snap.retries.to_string().yellow()
-            } else {
-                snap.retries.to_string().dim()
-            },
-            if snap.dead_letters > 0 {
-                snap.dead_letters.to_string().red()
-            } else {
-                snap.dead_letters.to_string().dim()
             }
         );
         eprintln!(
@@ -108,16 +70,6 @@ fn show_metrics(state: &SessionState) {
                 snap.delivery_latency.count.to_string().dim()
             );
         }
-        if snap.ack_latency.count > 0 {
-            eprintln!(
-                "  {} avg={}µs min={}µs max={}µs (n={})",
-                "Ack latency:".bold(),
-                snap.ack_latency.avg_us.to_string().magenta(),
-                snap.ack_latency.min_us.to_string().dim(),
-                snap.ack_latency.max_us.to_string().dim(),
-                snap.ack_latency.count.to_string().dim()
-            );
-        }
         eprintln!();
     } else {
         eprintln!(
@@ -125,111 +77,6 @@ fn show_metrics(state: &SessionState) {
             "No messaging metrics available (no active delegation).".dim()
         );
     }
-}
-
-async fn show_dlq(state: &SessionState) {
-    if let Some(ref dlq) = state.dead_letter_queue {
-        let summary = dlq.reason_summary().await;
-        eprintln!("\n  {}", "📭 Dead Letter Queue".red().bold());
-        eprintln!("  {}", "─".repeat(40).dim());
-        eprintln!(
-            "  {} {} messages",
-            "Total:".bold(),
-            summary.total.to_string().red()
-        );
-        if summary.ack_timeouts > 0 {
-            eprintln!(
-                "    {} ack timeouts",
-                summary.ack_timeouts.to_string().yellow()
-            );
-        }
-        if summary.rejections > 0 {
-            eprintln!(
-                "    {} rejected (nack)",
-                summary.rejections.to_string().yellow()
-            );
-        }
-        if summary.transport_failures > 0 {
-            eprintln!(
-                "    {} transport failures",
-                summary.transport_failures.to_string().yellow()
-            );
-        }
-        if summary.expired > 0 {
-            eprintln!("    {} expired (TTL)", summary.expired.to_string().dim());
-        }
-        eprintln!();
-
-        // List recent entries
-        let recent = dlq.list_page(0, 5).await;
-        if !recent.is_empty() {
-            eprintln!("  {}", "Recent entries:".bold());
-            for dl in recent {
-                let reason_str = match &dl.reason {
-                    astra_messaging::DeadLetterReason::AckTimeout { attempts } => {
-                        format!("ack timeout ({attempts} attempts)")
-                    }
-                    astra_messaging::DeadLetterReason::Rejected { reason } => {
-                        format!("rejected: {}", reason.as_deref().unwrap_or("no reason"))
-                    }
-                    astra_messaging::DeadLetterReason::TransportFailure { error } => {
-                        format!("transport: {error}")
-                    }
-                    astra_messaging::DeadLetterReason::Expired => "expired".into(),
-                };
-                let short_id = if dl.message.id.len() >= 8 {
-                    &dl.message.id[..8]
-                } else {
-                    &dl.message.id
-                };
-                eprintln!(
-                    "    {} {} → {}",
-                    short_id.dim(),
-                    dl.message.from.agent_id.clone().magenta(),
-                    reason_str.yellow()
-                );
-            }
-        }
-        eprintln!();
-    } else {
-        eprintln!(
-            "  {}",
-            "No dead letter queue available (no active delegation).".dim()
-        );
-    }
-}
-
-fn show_status(state: &SessionState) {
-    eprintln!("\n  {}", "📬 Mailbox Status".blue().bold());
-    eprintln!("  {}", "─".repeat(40).dim());
-
-    let has_metrics = state.messaging_metrics.is_some();
-    let has_dlq = state.dead_letter_queue.is_some();
-
-    eprintln!(
-        "  {} {}",
-        "Metrics:".bold(),
-        if has_metrics {
-            "active".green()
-        } else {
-            "not available".dim()
-        }
-    );
-    eprintln!(
-        "  {} {}",
-        "Dead Letter Queue:".bold(),
-        if has_dlq {
-            "active".green()
-        } else {
-            "not available".dim()
-        }
-    );
-
-    eprintln!(
-        "\n  {}",
-        "Note: Messaging state is per-delegation, not per-session.".dim()
-    );
-    eprintln!();
 }
 
 fn show_help() {
@@ -241,24 +88,16 @@ fn show_help() {
     );
     eprintln!("  {}", "─".repeat(50).dim());
     eprintln!("  {}  Show metrics snapshot", "/messaging".bold());
-    eprintln!("  {}  Show dead letter queue", "/messaging dlq".bold());
-    eprintln!("  {}  Show mailbox status", "/messaging status".bold());
     eprintln!("  {}  This help", "/messaging help".bold());
     eprintln!();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_messaging_command, show_help};
+    use super::show_help;
 
     #[test]
     fn help_does_not_panic() {
         show_help();
-    }
-
-    #[tokio::test]
-    async fn dlq_inspection_inside_runtime_does_not_nest_block_on_runtime() {
-        let state = crate::cli::session::session_state::SessionState::default();
-        handle_messaging_command("dlq", &state).await;
     }
 }

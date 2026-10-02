@@ -217,6 +217,22 @@ impl CliDelegateSubRunExecutor {
             .and_then(|provider| provider())
             .unwrap_or_else(|| self.token.clone())
     }
+
+    fn build_skill_state(
+        &self,
+        request_constraints: astra_runtime::turn::agentic_loop::host::RequestConstraints,
+        effective_root: &Path,
+    ) -> SkillState {
+        SkillState {
+            request_constraints,
+            resolver: self.skill_resolver.clone(),
+            quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
+            improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
+            tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(effective_root),
+            session_event_hooks: astra_skills::hooks::load_session_event_hooks(effective_root),
+            ..Default::default()
+        }
+    }
 }
 
 /// Build the set of restricted tools from an agent profile's `skill_filter`.
@@ -250,7 +266,195 @@ fn build_restricted_tools(
 
 #[async_trait]
 impl SubRunExecutor for CliDelegateSubRunExecutor {
+    async fn prepare_model_batch(
+        &self,
+        requests: &[astra_runtime::server::delegation::engine::SubRunModelRequest],
+    ) -> Result<Vec<Option<astra_runtime::server::delegation::engine::PreparedSubRunModel>>, String>
+    {
+        use astra_turn_core::orchestration_spawn_tool::ReasoningSelection;
+
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if requests
+            .iter()
+            .any(|request| request.user_id != requests[0].user_id)
+        {
+            return Err("one sub-run model batch cannot span multiple owners".into());
+        }
+
+        let token = self.resolve_token();
+        let default_selection = if requests.iter().any(|request| {
+            request
+                .selection
+                .as_ref()
+                .or(request
+                    .parent_model_reasoning
+                    .as_ref()
+                    .map(|parent| &parent.selection))
+                .map(|selection| selection.offering_id.as_str())
+                .or_else(|| {
+                    request
+                        .inherited_execution
+                        .as_ref()
+                        .map(|execution| execution.offering_id.as_str())
+                })
+                .is_none()
+        }) {
+            Some(
+                crate::cli::skill_subrun::resolve_subrun_model_selection(
+                    &self.api,
+                    &token,
+                    self.default_model.as_deref(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        let mut slots = Vec::new();
+        let mut slot_indexes = Vec::with_capacity(requests.len());
+        let mut inherited_models = Vec::with_capacity(requests.len());
+        let mut distinct = HashMap::<(String, Option<u32>, String), usize>::new();
+        for request in requests {
+            let offering_id = request
+                .selection
+                .as_ref()
+                .or(request
+                    .parent_model_reasoning
+                    .as_ref()
+                    .map(|parent| &parent.selection))
+                .map(|selection| selection.offering_id.as_str())
+                .or_else(|| {
+                    request
+                        .inherited_execution
+                        .as_ref()
+                        .map(|execution| execution.offering_id.as_str())
+                })
+                .or_else(|| {
+                    default_selection
+                        .as_ref()
+                        .map(|selection| selection.offering_id.as_str())
+                })
+                .ok_or_else(|| {
+                    "sub-run has no model Offering and no configured default is available"
+                        .to_string()
+                })?;
+            astra_services::validate_model_offering_id(offering_id)
+                .map_err(|error| format!("invalid child model selection: {error}"))?;
+            let reusable_parent = request.parent_model_reasoning.as_ref().and_then(|parent| {
+                let model_name = parent.resolved_model_name.as_deref()?;
+                (parent.selection.offering_id == offering_id
+                    && parent.thinking == request.thinking
+                    && !model_name.trim().is_empty())
+                .then_some((parent, model_name))
+            });
+            if let Some((parent, model_name)) = reusable_parent {
+                inherited_models.push(Some(
+                    astra_runtime::server::delegation::engine::PreparedSubRunModel {
+                        offering_id: parent.selection.offering_id.clone(),
+                        model_name: model_name.to_string(),
+                        admitted_execution: None,
+                    },
+                ));
+                slot_indexes.push(None);
+                continue;
+            }
+            inherited_models.push(None);
+            let reasoning =
+                serde_json::to_value(ReasoningSelection::from(request.thinking.clone()))
+                    .map_err(|error| error.to_string())?;
+            let reasoning_key =
+                serde_json::to_string(&reasoning).map_err(|error| error.to_string())?;
+            let key = (
+                offering_id.to_string(),
+                request.max_output_tokens,
+                reasoning_key,
+            );
+            let slot_index = if let Some(index) = distinct.get(&key) {
+                *index
+            } else {
+                let index = slots.len();
+                slots.push(astra_server_types::ModelAdmissionSlotV1 {
+                    selector: astra_turn_types::ModelSelector::OfferingId {
+                        offering_id: offering_id.to_string(),
+                    },
+                    max_output_tokens: request.max_output_tokens,
+                    reasoning,
+                    inherited_reasoning: None,
+                });
+                distinct.insert(key, index);
+                index
+            };
+            slot_indexes.push(Some(slot_index));
+        }
+
+        let selections = if slots.is_empty() {
+            Vec::new()
+        } else {
+            crate::cli::session::session_runtime::admit_server_model_slots(
+                &self.api,
+                &token,
+                astra_server_types::ModelAdmissionRequestV1 { slots },
+            )
+            .await?
+            .into_iter()
+            .map(|admitted| admitted.model)
+            .collect::<Vec<_>>()
+        };
+        requests
+            .iter()
+            .zip(slot_indexes)
+            .zip(inherited_models)
+            .map(|((request, slot_index), inherited)| {
+                if let Some(inherited) = inherited {
+                    return Ok(Some(inherited));
+                }
+                let slot_index =
+                    slot_index.ok_or_else(|| "sub-run model slot was not prepared".to_string())?;
+                let selection = selections
+                    .get(slot_index)
+                    .ok_or_else(|| "model admission omitted a prepared child slot".to_string())?;
+                let requested = request
+                    .selection
+                    .as_ref()
+                    .or(request
+                        .parent_model_reasoning
+                        .as_ref()
+                        .map(|parent| &parent.selection))
+                    .map(|model| model.offering_id.as_str())
+                    .or_else(|| {
+                        request
+                            .inherited_execution
+                            .as_ref()
+                            .map(|execution| execution.offering_id.as_str())
+                    })
+                    .or_else(|| {
+                        default_selection
+                            .as_ref()
+                            .map(|selection| selection.offering_id.as_str())
+                    });
+                if requested != Some(selection.offering_id.as_str()) {
+                    return Err("model admission returned a different child Offering".into());
+                }
+                Ok(Some(
+                    astra_runtime::server::delegation::engine::PreparedSubRunModel {
+                        offering_id: selection.offering_id.clone(),
+                        model_name: selection.name.clone(),
+                        admitted_execution: None,
+                    },
+                ))
+            })
+            .collect()
+    }
+
     async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        let cancel_token = config.cancel_token.clone().or_else(|| {
+            self.cancel_token
+                .as_ref()
+                .map(|parent| Arc::new(parent.child_token()))
+        });
         let runtime_ceiling = astra_config::RuntimeConfig::cached()
             .runtime_limits
             .resolve_turn_ceiling(
@@ -298,7 +502,20 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 "delegated agent start was not delivered to the live workbench"
             );
         }
-        let model_selection = if let Some(selection) = profile.model_selection.as_ref() {
+        let model_selection = if let Some(prepared) = config.prepared_model.as_ref() {
+            if profile
+                .model_selection
+                .as_ref()
+                .is_some_and(|selection| selection.offering_id != prepared.offering_id)
+            {
+                return Err("prepared sub-run Offering changed before execution".into());
+            }
+            crate::cli::session::session_runtime::ServerModelSelection {
+                name: prepared.model_name.clone(),
+                context_window: None,
+                offering_id: prepared.offering_id.clone(),
+            }
+        } else if let Some(selection) = profile.model_selection.as_ref() {
             crate::cli::session::session_runtime::resolve_server_offering_selection(
                 &self.api,
                 &token,
@@ -314,10 +531,6 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             .await?
         };
         let effective_model = Some(model_selection.name.clone());
-        let child_thinking = effective_model
-            .as_deref()
-            .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
-            .unwrap_or_default();
         // The model alias does not establish a cache protocol. The admitted
         // server execution owns provider-specific request shaping.
         let compact_strategy = astra_turn_core::microcompact::CompactStrategy::default();
@@ -385,16 +598,18 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             token: token.clone(),
             model: effective_model.clone(),
             offering_id: model_selection.offering_id,
+            requested_model_policy: config.requested_model_policy.clone(),
             project_root: effective_root.clone(),
             executor: std::sync::Arc::new(executor),
             all_schemas,
             valid_tool_names: valid_tool_names.clone(),
             perm_manager,
             max_completion_tokens: None,
+            initial_output_limit: config.max_output_tokens,
             effort: None,
             agent_type: None,
             execution_deadline: None,
-            cancel_token: self.cancel_token.clone(),
+            cancel_token: cancel_token.clone(),
             skill_resolver: self.skill_resolver.clone(),
             progress_tx: self.progress_tx.clone(),
             agent_id: live_agent_id.clone(),
@@ -531,6 +746,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             ),
             recursion_depth: config.recursion_depth,
             final_text: String::new(),
+            current_model_item_id: None,
+            final_text_model_item_id: None,
             final_text_streamed: false,
             final_output_ready_notified: false,
             total_prompt: 0,
@@ -578,14 +795,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 s
             },
             telemetry: Default::default(),
-            skills: SkillState {
-                resolver: self.skill_resolver.clone(),
-                quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-                tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&effective_root),
-                session_event_hooks: astra_skills::hooks::load_session_event_hooks(&effective_root),
-                ..Default::default()
-            },
+            skills: self.build_skill_state(config.request_constraints, &effective_root),
             hooks: StopHookState {
                 workspace_root_hint: Some(effective_root.to_string_lossy().into_owned()),
                 ..Default::default()
@@ -606,7 +816,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             cancellation: CancellationState {
                 flag: None,
                 pause_flag: config.pause_flag.clone(),
-                token: self.cancel_token.clone(),
+                token: cancel_token,
                 execution_lease_lost: None,
                 resolved_origin: None,
             },
@@ -637,10 +847,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             delegation_chain: config.delegation_chain.clone(),
             self_agent_id: profile.agent_id.clone(),
             project_context: None,
-            checkpoint_gate: config.checkpoint_gate.clone(),
             last_llm_context_manifest_trace: None,
             rate_limit_cooldown: Default::default(),
-            data_snapshot_provider: None,
             last_composite_snapshot: None,
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
@@ -655,13 +863,10 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
-            thinking: child_thinking,
+            thinking: config.thinking.clone(),
             permission_context: Some(permission_context),
             applied_permission_mode: None,
             permission_handler: None,
-            tactical_adapter: None,
-            step_signal_collector: None,
-            recent_tactical_actions: Vec::new(),
             runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
@@ -856,80 +1061,36 @@ pub(crate) fn register_default_agents(
     registry: &mut astra_services::coordination::AgentProfileRegistry,
 ) {
     use astra_services::coordination::{AgentProfile, AgentTier};
-    use std::collections::HashMap;
 
     let profiles = [
         // Root orchestrator for main REPL session — can delegate to all agents.
+        AgentProfile::new("main", "Main", AgentTier::Orchestrator),
         AgentProfile {
-            agent_id: "main".into(),
-            name: "Main".into(),
-            tier: AgentTier::Orchestrator,
-            system_prompt: None,
-            skill_filter: Vec::new(),
-            model_selection: None,
-            can_delegate: true,
-            delegate_to: Vec::new(), // empty = all
-            max_delegation_depth: 3,
-            triggers: Vec::new(),
-            metadata: HashMap::new(),
-            mcp_servers: Vec::new(),
-        },
-        AgentProfile {
-            agent_id: "coder".into(),
-            name: "Coder".into(),
-            tier: AgentTier::User,
             system_prompt: Some(
                 "You are a code implementation agent. Write clean, correct code. \
                  Use tools to read files, understand context, then make precise changes. \
                  Always verify your changes compile/pass before finishing."
                     .into(),
             ),
-            skill_filter: Vec::new(),
-            model_selection: None,
-            can_delegate: false,
-            delegate_to: Vec::new(),
-            max_delegation_depth: 0,
-            triggers: Vec::new(),
-            metadata: HashMap::new(),
-            mcp_servers: Vec::new(),
+            ..AgentProfile::new("coder", "Coder", AgentTier::User)
         },
         AgentProfile {
-            agent_id: "reviewer".into(),
-            name: "Reviewer".into(),
-            tier: AgentTier::User,
             system_prompt: Some(
                 "You are a code review agent. Analyze code changes with high signal-to-noise. \
                  Only surface issues that genuinely matter — bugs, security vulnerabilities, \
                  logic errors. Never comment on style or formatting."
                     .into(),
             ),
-            skill_filter: Vec::new(),
-            model_selection: None,
-            can_delegate: false,
-            delegate_to: Vec::new(),
-            max_delegation_depth: 0,
-            triggers: Vec::new(),
-            metadata: HashMap::new(),
-            mcp_servers: Vec::new(),
+            ..AgentProfile::new("reviewer", "Reviewer", AgentTier::User)
         },
         AgentProfile {
-            agent_id: "writer".into(),
-            name: "Writer".into(),
-            tier: AgentTier::User,
             system_prompt: Some(
                 "You are a documentation agent. Write clear, concise documentation. \
                  Read existing docs and code to understand conventions, then produce \
                  consistent, helpful documentation."
                     .into(),
             ),
-            skill_filter: Vec::new(),
-            model_selection: None,
-            can_delegate: false,
-            delegate_to: Vec::new(),
-            max_delegation_depth: 0,
-            triggers: Vec::new(),
-            metadata: HashMap::new(),
-            mcp_servers: Vec::new(),
+            ..AgentProfile::new("writer", "Writer", AgentTier::User)
         },
     ];
 
@@ -946,7 +1107,7 @@ mod tests {
     };
     use crate::cli::permission_manager::PermissionMode;
     use std::collections::{HashMap, HashSet};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn register_default_agents_populates_registry() {
@@ -995,6 +1156,55 @@ mod tests {
             astra_runtime::orchestration::PermissionMode::Auto
         );
         assert!(executor.inherited_permissions.is_background);
+    }
+
+    #[test]
+    fn delegate_child_state_retains_authenticated_request_constraints() {
+        let executor = CliDelegateSubRunExecutor::new(
+            astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
+            "token".to_string(),
+            None,
+            PathBuf::from("."),
+            astra_runtime::orchestration::InheritedPermissions::new(PermissionMode::Auto),
+            None,
+        );
+        let source = astra_turn_types::DelegationUserRequirementSource {
+            user_id: "user".into(),
+            session_id: "session".into(),
+            session_turn: 1,
+            applied_intent_id: None,
+            command_intent_id: None,
+            user_intent_digest: "sha256:request".into(),
+        };
+        let mut constraints =
+            astra_runtime::turn::agentic_loop::host::RequestConstraints::default();
+        constraints.delegated_model_requirements =
+            astra_turn_types::DelegationIntentRequirements::Unconstrained { source };
+        constraints.allowed_tools = Some(HashSet::from(["read_file".to_string()]));
+        let expected = constraints.clone();
+
+        let state = executor.build_skill_state(constraints, Path::new("."));
+
+        assert_eq!(
+            state.request_constraints.delegated_model_requirements,
+            expected.delegated_model_requirements
+        );
+        assert_eq!(
+            state.request_constraints.allowed_tools,
+            expected.allowed_tools
+        );
+        assert_eq!(
+            state.request_constraints.enabled_tools, None,
+            "local CLI children do not inherit the server's explicit optional-tool deny set"
+        );
+
+        let mut explicitly_disabled = expected;
+        explicitly_disabled.enabled_tools = Some(HashSet::new());
+        let disabled_state = executor.build_skill_state(explicitly_disabled, Path::new("."));
+        assert_eq!(
+            disabled_state.request_constraints.enabled_tools,
+            Some(HashSet::new())
+        );
     }
 
     #[test]
@@ -1069,13 +1279,16 @@ mod tests {
             context: HashMap::new(),
             forward_headers: HashMap::new(),
             admitted_model_execution: None,
+            prepared_model: None,
+            requested_model_policy: None,
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+            max_output_tokens: None,
             interaction_mode: astra_services::runs::RequestedTurnInteractionMode::Headless,
             request_constraints: Default::default(),
             recursion_depth: 0,
             max_turns: Some(0),
             initial_turns: None,
             pause_flag: None,
-            checkpoint_gate: None,
             mailbox: None,
             progress_emitter: None,
             live_event_sink: None,
@@ -1438,4 +1651,163 @@ mod tests {
     //
     // Structural tests — avoiding the trait-mocking rabbit hole
     // from the `basic_cli` tests earlier.
+
+    #[tokio::test]
+    async fn missing_parent_identity_resolves_default_once_then_batch_admits_children() {
+        use astra_runtime::server::delegation::engine::{SubRunExecutor, SubRunModelRequest};
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let projection = astra_services::ModelAccessProjectionResponse {
+            accesses: Vec::new(),
+            offerings: vec![astra_services::ModelListItemResponse {
+                thinking_protocol: None,
+                offering_id: "offer-default".into(),
+                access_id: "self-hosted".into(),
+                access_kind: astra_services::ModelAccessKind::SelfHosted,
+                access_label: "Self-hosted".into(),
+                execution_placement: astra_services::ModelExecutionPlacement::Server,
+                name: "deepseek-v4-flash".into(),
+                provider: "deepseek".into(),
+                description: None,
+                is_active: true,
+                context_window: 64_000,
+                max_completion_tokens: None,
+                architecture: None,
+                thinking_capability: None,
+                pricing: None,
+            }],
+            default_offering_id: Some("offer-default".into()),
+            default_resolution: Some(astra_services::ModelDefaultResolution::Selected {
+                offering_id: "offer-default".into(),
+                source: astra_services::ModelDefaultSource::Astra,
+                scope: astra_services::ModelDefaultScope::EffectiveCatalog,
+            }),
+            next_cursor: None,
+            limit: 50,
+            total: 1,
+            catalog_revision: "sha256:default-test".into(),
+            observed_at: "2026-09-23T00:00:00Z".into(),
+        };
+        Mock::given(method("GET"))
+            .and(path("/model-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(projection))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/model-access/admit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "slots": [{
+                    "offering_id": "offer-default",
+                    "reasoning": {"mode": "model_default"},
+                    "model_name": "deepseek-v4-flash",
+                    "context_window": 64000
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let executor = CliDelegateSubRunExecutor::new(
+            astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            "test-token".into(),
+            None,
+            PathBuf::from("."),
+            astra_runtime::orchestration::InheritedPermissions::auto_approve(),
+            None,
+        );
+        let requests = (0..2)
+            .map(|_| SubRunModelRequest {
+                user_id: "user-1".into(),
+                selection: None,
+                parent_model_reasoning: None,
+                inherited_execution: None,
+                provider_scope_bound: false,
+                thinking: ThinkingConfig::ModelDefault,
+                max_output_tokens: None,
+            })
+            .collect::<Vec<_>>();
+
+        let prepared = executor
+            .prepare_model_batch(&requests)
+            .await
+            .expect("configured default is resolved and admitted before children start");
+
+        assert_eq!(prepared.len(), 2);
+        for child in prepared {
+            let child = child.expect("default Offering is bound to every child");
+            assert_eq!(child.offering_id, "offer-default");
+            assert_eq!(child.model_name, "deepseek-v4-flash");
+        }
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            2,
+            "one default read and one batch admission"
+        );
+        assert_eq!(received[0].url.path(), "/model-access");
+        assert_eq!(received[1].url.path(), "/model-access/admit");
+        assert_eq!(
+            received[1].body_json::<serde_json::Value>().unwrap()["slots"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "identical child choices share one admission slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn inherited_parent_model_reuses_exact_snapshot_without_admission() {
+        use astra_runtime::server::delegation::engine::{SubRunExecutor, SubRunModelRequest};
+        use astra_turn_core::orchestration_spawn_tool::ParentModelReasoning;
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        use astra_turn_types::ModelSelection;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let executor = CliDelegateSubRunExecutor::new(
+            astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            "test-token".into(),
+            None,
+            PathBuf::from("."),
+            astra_runtime::orchestration::InheritedPermissions::auto_approve(),
+            None,
+        );
+        let requests = [None, Some("offer-parent")]
+            .into_iter()
+            .map(|selection| SubRunModelRequest {
+                user_id: "user-1".into(),
+                selection: selection.map(|offering_id| ModelSelection {
+                    offering_id: offering_id.into(),
+                }),
+                parent_model_reasoning: Some(ParentModelReasoning {
+                    selection: ModelSelection {
+                        offering_id: "offer-parent".into(),
+                    },
+                    resolved_model_name: Some("deepseek-v4-flash".into()),
+                    thinking: ThinkingConfig::ModelDefault,
+                }),
+                inherited_execution: None,
+                provider_scope_bound: false,
+                thinking: ThinkingConfig::ModelDefault,
+                max_output_tokens: None,
+            })
+            .collect::<Vec<_>>();
+
+        let prepared = executor.prepare_model_batch(&requests).await.unwrap();
+
+        assert_eq!(prepared.len(), 2);
+        for model in prepared.into_iter().flatten() {
+            assert_eq!(model.offering_id, "offer-parent");
+            assert_eq!(model.model_name, "deepseek-v4-flash");
+        }
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "inherited same-Offering children must not repeat model admission"
+        );
+    }
 }

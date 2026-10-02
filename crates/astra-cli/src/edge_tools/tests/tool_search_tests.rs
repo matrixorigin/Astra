@@ -79,8 +79,12 @@ async fn direct_tool_search_fails_closed_without_installed_surface() {
     let executor = executor();
     executor.clear_current_tool_surface_for_tests();
 
-    let parsed: Value =
-        serde_json::from_str(&executor.tool_search(&json!({"query": "select:bash"}))).unwrap();
+    let parsed: Value = serde_json::from_str(
+        &executor
+            .tool_search(&json!({"query": "select:bash"}))
+            .output,
+    )
+    .unwrap();
 
     assert_eq!(parsed["mode"].as_str(), Some("select"));
     assert_eq!(parsed["status"].as_str(), Some("completed"));

@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -315,10 +316,54 @@ impl WorktreeManager {
         delegation_id: &str,
         merge_order: &[String],
     ) -> Result<MergeResult, WorktreeError> {
-        let _lock = self.repo_lock.clone().lock_owned().await;
+        Ok(self
+            .merge_worktrees_inner(delegation_id, merge_order, None)
+            .await?
+            .unwrap_or_default())
+    }
+
+    /// Merge worktrees while honoring cooperative cancellation.
+    ///
+    /// `None` means cancellation won the race while waiting for the repository
+    /// lock, so no caller-branch mutation was attempted. Once the lock is
+    /// acquired, an already-started git operation is allowed to settle and the
+    /// returned result records any merges completed before the next boundary.
+    pub async fn merge_worktrees_with_cancellation(
+        &self,
+        delegation_id: &str,
+        merge_order: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<Option<MergeResult>, WorktreeError> {
+        self.merge_worktrees_inner(delegation_id, merge_order, Some(cancellation))
+            .await
+    }
+
+    async fn merge_worktrees_inner(
+        &self,
+        delegation_id: &str,
+        merge_order: &[String],
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<Option<MergeResult>, WorktreeError> {
+        let _lock = if let Some(cancellation) = cancellation {
+            tokio::select! {
+                lock = self.repo_lock.clone().lock_owned() => lock,
+                _ = cancellation.cancelled() => return Ok(None),
+            }
+        } else {
+            self.repo_lock.clone().lock_owned().await
+        };
         let mut result = MergeResult::default();
 
         for agent_id in merge_order {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                if result.merged.is_empty()
+                    && result.skipped.is_empty()
+                    && result.conflicts.is_empty()
+                {
+                    return Ok(None);
+                }
+                break;
+            }
             let info = self
                 .active
                 .get(agent_id)
@@ -333,10 +378,21 @@ impl WorktreeManager {
                 continue;
             }
 
+            // Do not begin a new caller-branch mutation after cancellation.
+            // A git operation already in flight is allowed to settle, but the
+            // next merge boundary must observe the caller's decision.
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
+
             // Capture current HEAD before this merge attempt so that the
             // conflict snapshot enables rollback to the correct state (which
             // includes prior successful merges, not the original base).
             let pre_merge_head = self.current_head().await?;
+
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
 
             // Attempt merge
             let output = Command::new("git")
@@ -436,7 +492,7 @@ impl WorktreeManager {
             }
         }
 
-        Ok(result)
+        Ok(Some(result))
     }
 
     /// Remove all worktrees and their temporary branches.
@@ -510,6 +566,13 @@ impl WorktreeManager {
         } else {
             Ok(())
         }
+    }
+
+    /// Detach active worktrees without deleting their directories or
+    /// temporary branches. Cancellation uses this to preserve partial work
+    /// for later recovery after child execution has stopped.
+    pub fn preserve(&mut self) -> Vec<WorktreeInfo> {
+        self.active.drain().map(|(_, info)| info).collect()
     }
 
     /// Get the worktree path for a specific agent.
@@ -653,6 +716,67 @@ mod tests {
         // Verify the file is now in main
         assert!(repo.join("new_file.txt").exists());
 
+        mgr.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_merge_waiting_for_repo_lock_leaves_caller_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        init_test_repo(&repo).await;
+
+        let mut mgr = make_manager(&repo);
+        let agents = vec!["agent-a".to_string()];
+        let paths = mgr
+            .create_worktrees("del-lockcancel", &agents)
+            .await
+            .unwrap();
+        let wt_path = &paths["agent-a"];
+        tokio::fs::write(wt_path.join("should-not-merge.txt"), "cancelled\n")
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(wt_path)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "child change"])
+            .current_dir(wt_path)
+            .output()
+            .await
+            .unwrap();
+
+        let head_before = mgr.current_head().await.unwrap();
+        let lock = mgr.repo_lock.clone().lock_owned().await;
+        let manager = Arc::new(mgr);
+        let cancellation = CancellationToken::new();
+        let merge = tokio::spawn({
+            let manager = manager.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                manager
+                    .merge_worktrees_with_cancellation(
+                        "del-lockcancel",
+                        &["agent-a".to_string()],
+                        &cancellation,
+                    )
+                    .await
+                    .unwrap()
+            }
+        });
+
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        drop(lock);
+
+        assert!(merge.await.unwrap().is_none());
+        assert_eq!(manager.current_head().await.unwrap(), head_before);
+        assert!(!repo.join("should-not-merge.txt").exists());
+
+        let mut mgr =
+            Arc::try_unwrap(manager).unwrap_or_else(|_| panic!("merge task retained manager"));
         mgr.cleanup().await.unwrap();
     }
 

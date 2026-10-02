@@ -26,9 +26,7 @@
 //! # Coordination Patterns
 //!
 //! - **FanOut**: Dispatch task to N agents in parallel, aggregate results
-//! - **Pipeline**: Sequential chain where each agent's output feeds the next
-//! - **AdversarialReview**: One agent produces, another reviews/critiques
-//! - **Sequential**: Simple sequential delegation to agents in order
+//! - **Sequential**: Ordered execution with output handoff and optional early exit
 
 use astra_core::SubRunState;
 use serde::{Deserialize, Serialize};
@@ -46,35 +44,17 @@ pub const AGENT_RESULT_STATUS_VERIFICATION_FAILED: &str = "verification_failed";
 /// Typed durable error code used when a terminal failed run represents an
 /// interrupted child with a usable partial result.
 pub const AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE: &str = "agent_result_partial";
-/// Compatibility boundary for durable rows written before partial outcomes
-/// had a typed `error_code`. New writers must never encode control state in
-/// `error_message` with this prefix.
-const LEGACY_AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX: &str = "partial:";
-
-pub fn durable_agent_result_is_partial(
-    error_code: Option<&str>,
-    error_message: Option<&str>,
-) -> bool {
-    match error_code {
-        Some(code) => code == AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE,
-        None => error_message.is_some_and(|message| {
-            message.starts_with(LEGACY_AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX)
-        }),
-    }
+pub fn durable_agent_result_is_partial(error_code: Option<&str>) -> bool {
+    error_code == Some(AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE)
 }
 
 pub fn durable_agent_partial_reason<'a>(
     error_code: Option<&str>,
     error_message: Option<&'a str>,
 ) -> Option<&'a str> {
-    if error_code == Some(AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE) {
-        return error_message;
-    }
-    if error_code.is_some() {
-        return None;
-    }
-    error_message
-        .and_then(|message| message.strip_prefix(LEGACY_AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX))
+    durable_agent_result_is_partial(error_code)
+        .then_some(error_message)
+        .flatten()
 }
 
 pub const DELEGATION_RESULT_STATUS_COMPLETED: &str = "completed";
@@ -251,8 +231,6 @@ pub struct AgentProfile {
     pub delegate_to: Vec<String>,
     /// Maximum delegation depth (prevents infinite loops).
     pub max_delegation_depth: u32,
-    /// Optional triggers that auto-activate this agent.
-    pub triggers: Vec<AgentTrigger>,
     /// Additional metadata.
     pub metadata: HashMap<String, serde_json::Value>,
     /// MCP server names to connect when this agent starts (D-10).
@@ -276,7 +254,6 @@ impl AgentProfile {
                 AgentTier::System => 1,
                 AgentTier::User => 0,
             },
-            triggers: Vec::new(),
             metadata: HashMap::new(),
             mcp_servers: Vec::new(),
         }
@@ -297,20 +274,11 @@ impl AgentProfile {
     }
 }
 
-/// Trigger that can auto-activate an agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentTrigger {
-    /// Trigger type (e.g., "keyword", "tool_failure", "plan_step").
-    pub trigger_type: String,
-    /// Trigger-specific pattern or condition.
-    pub pattern: String,
-}
-
 // ─── Coordination Patterns ──────────────────────────────────────────────────
 
 /// Pattern for coordinating multiple agents on a task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "pattern", rename_all = "snake_case")]
+#[serde(tag = "pattern", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CoordinationPattern {
     /// Dispatch to N agents in parallel, aggregate results.
     FanOut {
@@ -319,30 +287,6 @@ pub enum CoordinationPattern {
         /// How to aggregate results.
         aggregation: AggregationStrategy,
         /// Maximum time per agent (seconds). 0 = no per-agent timeout.
-        timeout_sec: u64,
-    },
-
-    /// Sequential chain: output of agent N feeds into agent N+1.
-    Pipeline {
-        /// Ordered list of agent IDs forming the pipeline.
-        stages: Vec<PipelineStage>,
-        /// Maximum time per pipeline stage (seconds). 0 = no per-stage timeout.
-        #[serde(default)]
-        timeout_sec: u64,
-    },
-
-    /// One agent produces, another reviews.
-    AdversarialReview {
-        /// The producing agent.
-        producer_id: String,
-        /// The reviewing agent.
-        reviewer_id: String,
-        /// Maximum revision rounds.
-        max_rounds: u32,
-        /// Minimum acceptance confidence (0.0-1.0).
-        acceptance_threshold: f64,
-        /// Maximum time per round (seconds). 0 = no per-round timeout.
-        #[serde(default)]
         timeout_sec: u64,
     },
 
@@ -371,16 +315,6 @@ pub enum CoordinationPattern {
         #[serde(default)]
         timeout_sec: u64,
     },
-}
-
-/// A stage in a pipeline coordination pattern.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PipelineStage {
-    /// Agent to execute this stage.
-    pub agent_id: String,
-    /// Transformation to apply to output before passing to next stage.
-    /// `None` = pass full output.
-    pub output_transform: Option<String>,
 }
 
 /// Strategy for aggregating results from multiple agents.
@@ -616,14 +550,6 @@ impl AgentProfileRegistry {
 
         let agent_ids = match &request.pattern {
             CoordinationPattern::FanOut { agent_ids, .. } => agent_ids.clone(),
-            CoordinationPattern::Pipeline { stages, .. } => {
-                stages.iter().map(|s| s.agent_id.clone()).collect()
-            }
-            CoordinationPattern::AdversarialReview {
-                producer_id,
-                reviewer_id,
-                ..
-            } => vec![producer_id.clone(), reviewer_id.clone()],
             CoordinationPattern::Sequential { agent_ids, .. } => agent_ids.clone(),
             CoordinationPattern::Fork { agent_id, .. } => vec![agent_id.clone()],
         };
@@ -774,8 +700,6 @@ pub fn aggregate_results(
 pub struct CoordinationHints {
     /// Agent IDs available for this delegation.
     pub agent_ids: Vec<String>,
-    /// Whether the task involves review/verification.
-    pub needs_review: bool,
     /// Whether sub-tasks have ordering dependencies.
     pub has_dependencies: bool,
     /// Default timeout per agent (seconds). 0 = no timeout.
@@ -785,10 +709,9 @@ pub struct CoordinationHints {
 /// Suggest a coordination pattern from typed orchestration facts.
 ///
 /// Rules (in priority order):
-/// 1. `needs_review` + exactly 2 agents → AdversarialReview
-/// 2. `has_dependencies` → Sequential (ordered)
-/// 3. 2+ independent agents → FanOut
-/// 4. Fallback → Sequential { stop_on_success: true }
+/// 1. `has_dependencies` → Sequential (ordered)
+/// 2. 2+ independent agents → FanOut
+/// 3. Fallback → Sequential { stop_on_success: true }
 ///
 /// Task prose is deliberately not accepted here. Natural-language keyword
 /// matching is not a reliable semantic classifier and must never silently
@@ -803,17 +726,6 @@ pub fn suggest_pattern(hints: &CoordinationHints) -> CoordinationPattern {
         return CoordinationPattern::Sequential {
             agent_ids: vec![],
             stop_on_success: true,
-            timeout_sec: timeout,
-        };
-    }
-
-    // Rule 1: Review pattern
-    if hints.needs_review && n == 2 {
-        return CoordinationPattern::AdversarialReview {
-            producer_id: hints.agent_ids[0].clone(),
-            reviewer_id: hints.agent_ids[1].clone(),
-            max_rounds: 3,
-            acceptance_threshold: 0.8,
             timeout_sec: timeout,
         };
     }
@@ -871,7 +783,6 @@ mod tests {
             "can_delegate": false,
             "delegate_to": [],
             "max_delegation_depth": 0,
-            "triggers": [],
             "metadata": {},
             "mcp_servers": []
         });
@@ -896,10 +807,9 @@ mod tests {
     #[test]
     fn durable_partial_result_uses_typed_error_code() {
         let reason = "budget_exhausted: adaptive hard turn limit reached";
-        assert!(durable_agent_result_is_partial(
-            Some(AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE),
-            Some(reason),
-        ));
+        assert!(durable_agent_result_is_partial(Some(
+            AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE
+        ),));
         assert_eq!(
             durable_agent_partial_reason(
                 Some(AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE),
@@ -907,25 +817,11 @@ mod tests {
             ),
             Some(reason)
         );
-        assert!(!durable_agent_result_is_partial(
-            None,
-            Some("partial result could not be verified"),
-        ));
-        assert!(!durable_agent_result_is_partial(
-            Some("ordinary_failure"),
-            Some("partial:still not an interrupted result"),
-        ));
-    }
-
-    #[test]
-    fn durable_partial_result_reads_legacy_prefix_at_compatibility_boundary() {
-        assert!(durable_agent_result_is_partial(
-            None,
-            Some("partial:budget_exhausted"),
-        ));
+        assert!(!durable_agent_result_is_partial(None));
+        assert!(!durable_agent_result_is_partial(Some("ordinary_failure")));
         assert_eq!(
             durable_agent_partial_reason(None, Some("partial:budget_exhausted")),
-            Some("budget_exhausted")
+            None
         );
     }
 
@@ -1270,7 +1166,7 @@ mod tests {
     // ── Coordination Pattern Validation ───
 
     #[test]
-    fn validate_pipeline_pattern() {
+    fn validate_ordered_sequential_pattern() {
         let mut reg = AgentProfileRegistry::new();
         reg.register(orchestrator()).unwrap();
         reg.register(system_agent("coder")).unwrap();
@@ -1281,17 +1177,9 @@ mod tests {
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "write and review".into(),
-            pattern: CoordinationPattern::Pipeline {
-                stages: vec![
-                    PipelineStage {
-                        agent_id: "coder".into(),
-                        output_transform: None,
-                    },
-                    PipelineStage {
-                        agent_id: "reviewer".into(),
-                        output_transform: Some("extract_issues".into()),
-                    },
-                ],
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into(), "reviewer".into()],
+                stop_on_success: false,
                 timeout_sec: 0,
             },
             user_id: "u1".into(),
@@ -1303,37 +1191,6 @@ mod tests {
 
         assert!(reg.validate_delegation(&req, "orch-1").is_ok());
     }
-
-    #[test]
-    fn validate_adversarial_review_pattern() {
-        let mut reg = AgentProfileRegistry::new();
-        reg.register(orchestrator()).unwrap();
-        reg.register(system_agent("writer")).unwrap();
-        reg.register(system_agent("critic")).unwrap();
-
-        let req = DelegationRequest {
-            session_id: "test-session".into(),
-            delegation_id: "d1".into(),
-            parent_run_id: "run-1".into(),
-            task: "write with review".into(),
-            pattern: CoordinationPattern::AdversarialReview {
-                producer_id: "writer".into(),
-                reviewer_id: "critic".into(),
-                max_rounds: 3,
-                acceptance_threshold: 0.8,
-                timeout_sec: 0,
-            },
-            user_id: "u1".into(),
-            depth: 0,
-            delegation_chain: Vec::new(),
-            context: HashMap::new(),
-            execution_metadata: None,
-        };
-
-        assert!(reg.validate_delegation(&req, "orch-1").is_ok());
-    }
-
-    // ── Result Aggregation ───
 
     fn make_result(agent_id: &str, output: &str) -> AgentResult {
         AgentResult {
@@ -1709,6 +1566,12 @@ mod tests {
         let json = serde_json::to_value(&pattern).unwrap();
         assert_eq!(json["pattern"], "fan_out");
         assert_eq!(json["timeout_sec"], 60);
+        for value in [
+            serde_json::json!({"pattern":"adversarial_review","producer_id":"a","reviewer_id":"b","max_rounds":1,"timeout_sec":0,"acceptance_threshold":0.9}),
+            serde_json::json!({"pattern":"pipeline","stages":[{"agent_id":"a","output_transform":"extract"}],"timeout_sec":0}),
+        ] {
+            assert!(serde_json::from_value::<CoordinationPattern>(value).is_err());
+        }
     }
 
     #[test]
@@ -1728,11 +1591,9 @@ mod tests {
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "test".into(),
-            pattern: CoordinationPattern::AdversarialReview {
-                producer_id: "w".into(),
-                reviewer_id: "r".into(),
-                max_rounds: 3,
-                acceptance_threshold: 0.8,
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["w".into(), "r".into()],
+                stop_on_success: false,
                 timeout_sec: 0,
             },
             user_id: "u1".into(),
@@ -1748,21 +1609,6 @@ mod tests {
     }
 
     // ── suggest_pattern tests ──
-
-    #[test]
-    fn suggest_review_with_two_agents() {
-        let hints = CoordinationHints {
-            agent_ids: vec!["a1".into(), "a2".into()],
-            needs_review: true,
-            timeout_sec: 60,
-            ..Default::default()
-        };
-        let pattern = suggest_pattern(&hints);
-        assert!(
-            matches!(pattern, CoordinationPattern::AdversarialReview { .. }),
-            "review + 2 agents should yield AdversarialReview"
-        );
-    }
 
     #[test]
     fn suggest_sequential_with_dependencies() {

@@ -782,7 +782,7 @@ pub(crate) const WORK_PATCH_MATERIALIZATION_OPERATIONS_CREATE_SQL: &str =
       (apply_invocation_ref IS NOT NULL AND observed_subject_revision IS NULL
        AND apply_outcome = 'not_applied'
        AND failure_code IN ('provider_unavailable', 'authorization_denied',
-                            'workspace_unavailable', 'patch_rejected',
+                            'workspace_unavailable', 'invalid_workspace', 'patch_rejected',
                             'invocation_cancelled', 'provider_internal')
        AND operation_state = 'failed' AND operation_phase = 'complete')
     ),

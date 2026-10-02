@@ -554,6 +554,10 @@ impl std::fmt::Display for PermissionRule {
 pub struct InheritedPermissions {
     /// Permission mode inherited from parent.
     pub mode: PermissionMode,
+    /// An immutable child execution ceiling. Approval and allow rules cannot
+    /// authorize a tool call whose arguments are not provably read-only.
+    #[serde(default)]
+    pub read_only_execution: bool,
     /// Tools explicitly allowed by parent (child can use without asking).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_rules: Vec<PermissionRule>,
@@ -992,7 +996,9 @@ impl PermissionSyncContext {
     /// user already made this turn. Only the policy half (`inherited`) is
     /// replaced; runtime accumulators stay.
     pub fn merge_policy_from(&mut self, fresh: &PermissionSyncContext) {
+        let read_only_execution = self.inherited.read_only_execution;
         self.inherited = fresh.inherited.clone();
+        self.inherited.read_only_execution |= read_only_execution;
         // session_allow / session_deny / telemetry are intentionally
         // preserved — they belong to this handle's runtime, not the policy.
     }
@@ -1474,6 +1480,17 @@ mod tests {
 
         assert_eq!(child_perms.mode, PermissionMode::Auto);
         assert!(child_perms.is_background);
+    }
+
+    #[test]
+    fn read_only_child_ceiling_survives_permission_refresh_and_nested_child() {
+        let mut child = PermissionSyncContext::new(InheritedPermissions {
+            read_only_execution: true,
+            ..InheritedPermissions::auto_approve()
+        });
+        child.merge_policy_from(&PermissionSyncContext::root(PermissionMode::Auto));
+        assert!(child.inherited.read_only_execution);
+        assert!(child.for_child(false).read_only_execution);
     }
 
     #[tokio::test]

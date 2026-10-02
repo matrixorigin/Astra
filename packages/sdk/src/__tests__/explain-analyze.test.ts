@@ -61,6 +61,39 @@ function finished(
 }
 
 describe("Explain Analyze graph reducer", () => {
+  it("keeps bounded delegation-catalog evidence through admission replay and renderers", () => {
+    const detail = {
+      kind: "delegation_catalog_resolution" as const,
+      requirement_index: 0,
+      match_count: 3,
+    };
+    const terminal = finished("admission-agent", "admission", 4, 9, {
+      outcome: "blocked",
+      decision_detail: detail,
+    });
+    expect(isExplainAnalyzeEventV1(terminal)).toBe(true);
+    expect(isExplainAnalyzeEventV1({ ...terminal, kind: "tool_call" })).toBe(false);
+    expect(isExplainAnalyzeEventV1({ ...terminal, decision_detail: { ...detail, match_count: 1 } })).toBe(false);
+    expect(isExplainAnalyzeEventV1({
+      ...started("admission-agent", "admission", 4),
+      decision_detail: detail,
+    })).toBe(false);
+
+    const duplicate = { ...terminal, event_id: "admission-agent:replay" };
+    const graph = reduceExplainAnalyzeEvents([terminal, duplicate]);
+    expect(graph.integrity).toBe("consistent");
+    expect(graph.nodes[0].decisionDetail).toEqual(detail);
+    expect(renderExplainAnalyzeHtml([terminal])).toContain(
+      "3 active authorized Chat-capable catalog entries matched exactly",
+    );
+
+    const conflict = reduceExplainAnalyzeEvents([
+      terminal,
+      { ...duplicate, decision_detail: { ...detail, match_count: 2 } },
+    ]);
+    expect(conflict.conflictedNodeIds).toEqual(["admission-agent"]);
+  });
+
   it("accepts and renders a terminal judgment stage", () => {
     const judgment = finished("tool-result-judgment", "judgment", 10, 25, {
       round_index: 0,

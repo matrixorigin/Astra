@@ -1448,7 +1448,7 @@ fn append_session_section(
     let mut line2: Vec<Span<'static>> = vec![Span::raw("    └ ")];
     line2.push(Span::raw(format!(
         "cost {}",
-        crate::cli::slash::slash_stats::format_optional_cost(s.total_cost)
+        crate::cli::session::session_stats_scan::format_optional_cost(s.total_cost)
     )));
     out.push(Line::from(line2));
 

@@ -494,7 +494,10 @@ fn hidden_agent_conversation_keeps_receiving_typed_live_events() {
     assert!(pane.refresh_agent_live_event(&AgentLiveEvent {
         agent_id: "agent-reviewer".into(),
         run_id: "run-reviewer".into(),
-        kind: AgentLiveEventKind::OutputDelta("completed finding".into()),
+        kind: AgentLiveEventKind::OutputDelta {
+            model_item_id: Some("test-model-item".into()),
+            text: "completed finding".into()
+        },
     }));
     assert!(pane.close_active_view());
 

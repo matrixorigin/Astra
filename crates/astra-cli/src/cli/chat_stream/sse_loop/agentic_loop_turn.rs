@@ -508,8 +508,16 @@ fn server_loop_admission_payload(
     prepared: &Value,
     message: &str,
     explain: bool,
+    initial_output_limit: Option<u32>,
 ) -> Result<Value, &'static str> {
-    server_loop_admission_payload_with_execution_time_budget(prepared, message, explain, None)
+    let mut request =
+        server_loop_admission_payload_with_execution_time_budget(prepared, message, explain, None)?;
+    // Only an explicit first-round child cap crosses this boundary. Prepared
+    // max_tokens can instead be skill/catalog metadata; never infer a cap from it.
+    if let Some(limit) = initial_output_limit {
+        request["context"]["max_output_tokens"] = json!(limit);
+    }
+    Ok(request)
 }
 
 pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
@@ -582,6 +590,15 @@ pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
             context.insert(field.to_string(), value.clone());
         }
     }
+    if let Some(value) = source
+        .get("context")
+        .and_then(|context| context.get(astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY))
+    {
+        context.insert(
+            astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY.to_string(),
+            value.clone(),
+        );
+    }
 
     let mut request = serde_json::Map::from_iter([
         ("message".to_string(), Value::String(message.to_string())),
@@ -633,6 +650,7 @@ pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
         "enabled_tools",
         "plan_subtask_id",
         "is_plan_subtask",
+        "requested_model_policy",
     ] {
         if let Some(value) = source.get(field) {
             request.insert(field.to_string(), value.clone());
@@ -694,7 +712,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     let requested_model = astra_core::model_override::normalize_model_override(ctx.model);
     let thinking_config = match requested_model {
         Some(m) => {
-            let (_, cfg) = astra_turn_core::thinking_config::resolve_model_thinking(m);
+            let (_, cfg) = astra_turn_core::thinking_config::resolve_model_thinking_request(m);
             // Per-turn dampener: the model suffix encodes the user's CEILING
             // (e.g. `thinking:high`), not a command to burn that budget on every
             // turn regardless of content. Short read-only questions get a
@@ -703,7 +721,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             let signals = thinking_complexity_signals(ctx.message, ctx.turn_intent);
             cfg.scale_for_turn(signals)
         }
-        None => astra_turn_core::thinking_config::ThinkingConfig::Off,
+        None => astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
     };
     crate::cli::history_work::record_json_history(
         astra_core::history_work::HistoryWorkSite::CliPromptPayloadClone,
@@ -718,6 +736,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
         round_index: ctx.round_index,
         offering_id: ctx.offering_id,
+        expected_model_name: None,
         interaction_mode: Some(ctx.interaction_mode.label()),
         explain_verbose: ctx.explain.explain_verbose,
         explain_on: ctx.explain.explain_on,
@@ -725,7 +744,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         capabilities: astra_thin_client::builtin_capability_preset(),
         project_root: ctx.project_root,
         git_branch,
-        thinking: thinking_config,
+        thinking: thinking_config.clone(),
     });
 
     // Carry only typed routing metadata across the trust boundary. Full skill
@@ -1370,6 +1389,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         );
     }
 
+    ctx.executor
+        .publish_parent_model_reasoning(ctx.offering_id, ctx.model, thinking_config);
     PreparedChatTurnPayload {
         payload,
         context_window_estimate: astra_turn_types::ContextWindowUsage::estimated(
@@ -2034,7 +2055,7 @@ mod tests {
             "thinking": {"type": "enabled", "budget_tokens": 1024},
         });
 
-        let admitted = server_loop_admission_payload(&prepared, "current request", true)
+        let admitted = server_loop_admission_payload(&prepared, "current request", true, None)
             .expect("Server loop admission");
         assert_eq!(admitted["message"], "current request");
         assert_eq!(
@@ -2084,6 +2105,10 @@ mod tests {
     fn server_loop_admission_carries_typed_time_budget_outside_prompt_context() {
         let prepared = json!({
             "model_selection": {"offering_id": "generic-offering"},
+            "requested_model_policy": {
+                "mode": "fixed",
+                "selector": {"kind": "offering_id", "offering_id": "selected-offering"}
+            },
             "edge_executor_id": "edge-1",
             "capabilities": [],
             "edge_profile": {
@@ -2104,12 +2129,57 @@ mod tests {
         .expect("typed time budget admission");
 
         assert_eq!(admitted["execution_time_budget"]["remaining_seconds"], 37);
+        assert_eq!(
+            admitted["requested_model_policy"]["selector"]["offering_id"],
+            "selected-offering"
+        );
+        assert!(admitted["context"].get("requested_model_policy").is_none());
         assert_eq!(admitted["runtime_system_prompt"], "stable runtime prompt");
         assert!(
             admitted["context"]["edge_profile"]
                 .get("execution_time_budget")
                 .is_none(),
             "dynamic time must not enter the cache-stable edge profile"
+        );
+    }
+
+    #[test]
+    fn server_loop_admission_carries_typed_delegated_model_handoff() {
+        let source = astra_turn_types::DelegationUserRequirementSource {
+            user_id: "user-1".into(),
+            session_id: "session-1".into(),
+            session_turn: 3,
+            applied_intent_id: None,
+            command_intent_id: Some("6bca9f9c-6d18-4579-bce1-2b45f573a098".into()),
+            user_intent_digest: "sha256:task".into(),
+        };
+        let handoff = serde_json::to_value(
+            astra_turn_types::DelegationIntentRequirements::Unconstrained { source },
+        )
+        .expect("typed handoff serializes");
+        let mut context = serde_json::Map::new();
+        context.insert(
+            astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY.to_string(),
+            handoff,
+        );
+        let prepared = json!({
+            "model_selection": {"offering_id": "child-offering"},
+            "edge_executor_id": "edge-1",
+            "capabilities": [],
+            "edge_profile": {"cwd": "/workspace"},
+            "context": context
+        });
+
+        let admitted = server_loop_admission_payload(&prepared, "child request", false, None)
+            .expect("Server loop admission");
+        assert_eq!(
+            admitted["context"][astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY]["state"],
+            "unconstrained"
+        );
+        assert_eq!(
+            admitted["context"][astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY]["source"]
+                ["session_id"],
+            "session-1"
         );
     }
 
@@ -2122,12 +2192,33 @@ mod tests {
             }),
             "request",
             false,
+            None,
         )
         .expect_err("missing edge executor must fail before transport");
         assert_eq!(
             error,
             "prepared developer loop payload has no executable edge identity"
         );
+    }
+
+    #[test]
+    fn server_loop_admission_bridges_only_explicit_child_output_limit() {
+        let prepared = json!({
+            "model_selection": {"offering_id": "offer-child"},
+            "edge_executor_id": "subrun", "capabilities": [],
+            "edge_profile": {"cwd": "/workspace"},
+            "max_tokens": 64000,
+            "max_completion_tokens": 128000,
+        });
+        for cap in [None, Some(8192)] {
+            let request =
+                server_loop_admission_payload(&prepared, "child task", false, cap).unwrap();
+            assert_eq!(
+                request["context"].get("max_output_tokens").cloned(),
+                cap.map(|cap| json!(cap))
+            );
+            assert!(request.get("max_tokens").is_none());
+        }
     }
 
     #[test]
@@ -2141,6 +2232,7 @@ mod tests {
             }),
             "request",
             false,
+            None,
         )
         .expect_err("an executor identity without an executable workspace must fail closed");
 
@@ -2161,6 +2253,7 @@ mod tests {
             }),
             "request",
             false,
+            None,
         )
         .expect_err("unknown authority must not silently become read-write");
 
@@ -2171,6 +2264,24 @@ mod tests {
     }
     use astra_turn_core::chat_turn_payload::attach_turn_identity;
     use serde_json::{Value, json};
+
+    #[test]
+    fn model_selector_parse_preserves_absence_and_explicit_effort() {
+        use astra_turn_core::thinking_config::ThinkingConfig;
+
+        let (_, plain) =
+            astra_turn_core::thinking_config::resolve_model_thinking_request("model-a");
+        assert_eq!(plain, ThinkingConfig::ModelDefault);
+        let selector = "model-a(thinking:high)";
+        let (_, effort) =
+            astra_turn_core::thinking_config::resolve_model_thinking_request(selector);
+        assert_eq!(
+            effort,
+            ThinkingConfig::Adaptive {
+                effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+            }
+        );
+    }
 
     #[test]
     fn thinking_complexity_consumes_typed_llm_intent_without_text_matching() {
@@ -2244,6 +2355,31 @@ mod tests {
         message: &str,
         semantic_query_override: Option<&str>,
     ) -> Value {
+        prepare_payload_with_reasoning_for_test(
+            messages,
+            runtime_required_texts,
+            active_system_skills,
+            runtime_volatile_texts,
+            message,
+            semantic_query_override,
+            None,
+        )
+        .await
+        .0
+    }
+
+    async fn prepare_payload_with_reasoning_for_test(
+        messages: Vec<Value>,
+        runtime_required_texts: &[String],
+        active_system_skills: &[String],
+        runtime_volatile_texts: &[String],
+        message: &str,
+        semantic_query_override: Option<&str>,
+        reasoning: Option<(&str, &str, &TurnIntent)>,
+    ) -> (
+        Value,
+        Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>,
+    ) {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
         use astra_runtime::{
@@ -2273,7 +2409,7 @@ mod tests {
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
 
-        prepare_chat_turn_payload(PrepareChatTurnRequest {
+        let prepared = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts,
             active_system_skills,
@@ -2281,8 +2417,8 @@ mod tests {
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
-            offering_id: None,
-            model: None,
+            offering_id: reasoning.map(|(offering, _, _)| offering),
+            model: reasoning.map(|(_, model, _)| model),
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
@@ -2290,10 +2426,10 @@ mod tests {
             message,
             user_intent: semantic_query_override.unwrap_or(message),
             semantic_query_override,
-            turn_intent: None,
+            turn_intent: reasoning.map(|(_, _, intent)| intent),
             history: &history,
             recent_tools: &recent_tools,
-            executor,
+            executor: executor.clone(),
             registry: &registry,
             tool_results: &tool_results,
             all_schemas: &all_schemas,
@@ -2333,8 +2469,53 @@ mod tests {
             plan_mode_active: false,
             lessons_text: None,
         })
-        .await
-        .payload
+        .await;
+        (prepared.payload, executor.parent_model_reasoning_snapshot())
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_turn_payload_publishes_effective_parent_reasoning() {
+        use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+        let intent = TurnIntent::default()
+            .with_requested_scenario(Scenario::QuickAnswer)
+            .with_workspace_mutation(WorkspaceMutationIntent::ReadOnly);
+        let (payload, parent) = prepare_payload_with_reasoning_for_test(
+            vec![json!({"role":"user", "content":"Explain this."})],
+            &[],
+            &[],
+            &[],
+            "Explain this.",
+            None,
+            Some(("offer-parent", "model-a(thinking:high)", &intent)),
+        )
+        .await;
+        let parent = parent.unwrap();
+        assert_eq!(parent.selection.offering_id, "offer-parent");
+        assert_eq!(
+            parent.thinking,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Medium
+            }
+        );
+        assert_eq!(
+            payload["thinking"],
+            serde_json::to_value(parent.thinking).unwrap()
+        );
+
+        let (_, parent) = prepare_payload_with_reasoning_for_test(
+            vec![json!({"role":"user", "content":"Explain this."})],
+            &[],
+            &[],
+            &[],
+            "Explain this.",
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            parent.is_none(),
+            "no Offering means no trusted inheritance identity"
+        );
     }
 
     #[tokio::test]

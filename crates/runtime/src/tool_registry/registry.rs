@@ -299,38 +299,6 @@ impl ToolRegistry {
         TOOL_CATALOG.iter().find(|t| t.name == name)
     }
 
-    /// Register plugin tools from a PluginRegistry.
-    ///
-    /// Plugin schemas become **lookup-able** (the executor can dispatch them
-    /// and `tool_search(select:NAME)` can return them), but lookup alone does
-    /// not place them in the visible `tools[]` surface. Plugins default to the
-    /// deferred listing. Callers that need a plugin in `tools[]` must build the
-    /// visible surface with that plugin explicitly always_load.
-    ///
-    /// This keeps the Anthropic prompt-cache prefix byte-stable across
-    /// plugin registration: schemas are added to lookup/execution indexes,
-    /// but the selected `tools[]` surface remains always_load-only.
-    pub fn register_plugins(
-        &mut self,
-        plugins: &astra_turn_core::tool_registry_plugin::PluginRegistry,
-    ) {
-        let plugin_schemas = plugins.schemas();
-        if plugin_schemas.is_empty() {
-            return;
-        }
-        // Plugins are looked up by name for executor dispatch and
-        // `tool_search(select:NAME)`. They live in the deferred listing unless
-        // the caller builds a always_load visible surface for them.
-        self.all_schemas.extend(
-            plugin_schemas
-                .into_iter()
-                .filter(|schema| tool_schema_name(schema).is_some()),
-        );
-        // Rebuild indexes to include the new schemas
-        self.measured_costs = Self::measure_all_schemas(&self.all_schemas);
-        self.schema_index = Self::build_schema_index(&self.all_schemas);
-    }
-
     /// Inject a single tool schema dynamically (e.g. a session-local plugin tool).
     ///
     /// When `always_load` is true the tool is budget-exempt (always included like
@@ -391,7 +359,7 @@ impl ToolRegistry {
         self.upsert_schema_always_load(schema, true);
     }
 
-    /// Total tool count (built-in + registered plugins).
+    /// Total tool count, including dynamically injected schemas.
     pub fn total_tool_count(&self) -> usize {
         self.all_schemas.len()
     }

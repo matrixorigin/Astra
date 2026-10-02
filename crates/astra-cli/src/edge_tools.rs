@@ -136,6 +136,7 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "get_agent_info",
     "hover_info",
     "introspect",
+    "model_catalog",
     "lsp",
     "mo_query",
     "notebook_edit",
@@ -146,7 +147,6 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "rollback_database_snapshots",
     "rollback_file_edits",
     "rollback_session_state",
-    "run_build_test",
     "session",
     "share_context",
     "symbol_search",
@@ -491,6 +491,15 @@ impl EdgeToolRun {
         }
     }
 
+    fn from_tool_result(result: astra_tools::ToolResult) -> Self {
+        Self {
+            output: result.output,
+            is_error: result.is_error,
+            error_kind: None,
+            tool_result_fields: result.metadata,
+        }
+    }
+
     fn classified_error(output: String, kind: astra_core::ErrorKind) -> Self {
         let evidence = astra_core::ToolFailureEvidence::from_error_kind(kind);
         let mut fields = serde_json::Map::new();
@@ -574,6 +583,19 @@ fn cancelled_edge_tool_run(name: &str, execution_started: bool) -> EdgeToolRun {
         is_error: true,
         error_kind: Some(astra_core::ErrorKind::Cancelled),
         tool_result_fields: result.metadata,
+    }
+}
+
+pub(crate) fn workspace_lease_unavailable_tool_execution_outcome(
+    name: &str,
+    workspace_root: &Path,
+) -> ToolExecutionOutcome {
+    let result =
+        astra_tools::workspace_lease_unavailable_tool_result_for_workspace(name, workspace_root);
+    ToolExecutionOutcome {
+        output: result.output,
+        tool_result_fields: result.metadata,
+        is_error: result.is_error,
     }
 }
 
@@ -1318,7 +1340,7 @@ pub struct ToolExecutor {
     /// Set before each tool execution batch, read by tools that produce
     /// variable-size output to scale their limits.
     budget_pressure: std::sync::Mutex<f64>,
-    /// Build/test iteration tracker — tracks error deltas across fix cycles.
+    /// Per-command diagnostic deltas rendered by CLI Bash build/test calls.
     build_test_tracker: std::sync::Mutex<build_test::BuildTestTracker>,
     /// Shared-state circuit breaker for process-lived Memoria availability.
     memoria_circuit: astra_tools::memoria::MemoryCircuitBreaker,
@@ -1404,6 +1426,16 @@ pub struct ToolExecutor {
     pub(crate) bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
     /// Optional agent spawning context for `agent(action='spawn'|'get_result')`.
     pub spawn_context: Option<agent_spawning::AgentActionContext>,
+    /// CLI has no trusted natural-language binder for inherited descendant
+    /// requirements. A constrained child must not delegate without one.
+    delegation_requires_admission: bool,
+    /// A read-only child has no shell capability. Typed observation tools are
+    /// the only execution surface that remains available under this ceiling.
+    read_only_execution: bool,
+    /// Effective request setting, published after payload preparation. This
+    /// bounded snapshot is copied into each child admission context.
+    parent_model_reasoning:
+        std::sync::Mutex<Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>>,
     /// Optional shared context cache for cross-agent knowledge sharing.
     /// Used by share_context and query_context tools.
     pub context_cache: Option<std::sync::Arc<astra_runtime::orchestration::SharedContextCache>>,
@@ -1503,6 +1535,10 @@ pub struct ToolExecutor {
 }
 
 impl ToolExecutor {
+    pub(crate) fn set_read_only_execution(&mut self) {
+        self.read_only_execution = true;
+    }
+
     pub(crate) fn apply_runtime_permission_sandbox(
         &self,
         mode: crate::cli::permission_manager::PermissionMode,
@@ -1570,6 +1606,9 @@ impl ToolExecutor {
             bg_task_list_cache: None,
             bash_detach_slot: None,
             spawn_context: None,
+            delegation_requires_admission: false,
+            read_only_execution: false,
+            parent_model_reasoning: std::sync::Mutex::new(None),
             context_cache: None,
             agent_id: None,
             send_message_context: std::sync::Mutex::new(None),
@@ -1591,10 +1630,7 @@ impl ToolExecutor {
                     user_id: String::new(),
                     session_id: String::new(),
                     sandbox: astra_tools::SandboxConfig::standard(&root),
-                    http_client: None,
-                    logger: std::sync::Arc::new(astra_tools::TracingLogger),
                     cancel_token: None,
-                    detach_shell_handle: None,
                 },
             ),
             plan_mode_authoring_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
@@ -1682,12 +1718,47 @@ impl ToolExecutor {
 
     /// Set the spawn context for agent spawning.
     pub fn with_spawn_context(mut self, ctx: agent_spawning::AgentActionContext) -> Self {
+        *self.parent_model_reasoning.lock_recover() = ctx.parent_model_reasoning.clone();
         self.spawn_context = Some(ctx);
         #[cfg(test)]
         {
             self.install_default_test_visible_surface();
         }
         self
+    }
+
+    pub(crate) fn require_delegation_admission(mut self, required: bool) -> Self {
+        self.delegation_requires_admission = required;
+        self
+    }
+
+    pub(crate) fn publish_parent_model_reasoning(
+        &self,
+        offering_id: Option<&str>,
+        resolved_model_name: Option<&str>,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig,
+    ) {
+        *self.parent_model_reasoning.lock_recover() = offering_id.map(|offering_id| {
+            astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                selection: astra_turn_types::ModelSelection {
+                    offering_id: offering_id.to_string(),
+                },
+                resolved_model_name: resolved_model_name.map(str::to_string),
+                thinking,
+            }
+        });
+    }
+
+    fn spawn_context_for_admission(&self) -> Option<agent_spawning::AgentActionContext> {
+        let mut context = self.spawn_context.clone()?;
+        context.parent_model_reasoning = self.parent_model_reasoning_snapshot();
+        Some(context)
+    }
+
+    pub(crate) fn parent_model_reasoning_snapshot(
+        &self,
+    ) -> Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning> {
+        self.parent_model_reasoning.lock_recover().clone()
     }
 
     /// Bind memory lifecycle events to one host-owned producer identity. Tool
@@ -3764,13 +3835,10 @@ impl ToolExecutor {
             if snap.semantic_judgments.is_none()
                 || request.source_policy == astra_core::SourcePolicy::LocalOnly
             {
-                let owner = astra_services::OwnerScope::local_user();
-                let window = astra_services::session_journal::read_journal_observation_window(
-                    &owner,
-                    &session_id,
-                );
+                let window =
+                    crate::cli::journal_digest::read_attached_observation_window(&session_id, None);
                 let mut view = match window {
-                    Ok(window) => astra_services::semantic_judgment_observation::project_local_semantic_judgments(&window, &owner, &session_id, request.depth),
+                    Ok(window) => window.semantic_judgments(&session_id, request.depth),
                     Err(_) => astra_services::semantic_judgment_observation::SemanticJudgmentView::unavailable(astra_services::semantic_judgment_observation::SemanticJudgmentCoverage::SourceUnavailable),
                 };
                 view.scope = astra_services::semantic_judgment_observation::SemanticJudgmentScope::LocalJournalAtRead;
@@ -4594,9 +4662,35 @@ impl ToolExecutor {
                 &self.project_root,
             )
         });
+        let mcp_prepared = if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
+            match self.prepare_mcp_tool_call(name).await {
+                Ok(prepared) => Some(prepared),
+                Err(outcome) => {
+                    return EdgeToolRun::error(outcome.output)
+                        .with_tool_result_fields(outcome.tool_result_fields);
+                }
+            }
+        } else {
+            None
+        };
+        let mcp_workspace_effect = mcp_prepared
+            .as_ref()
+            .map(|(_, prepared)| prepared.policy().effect);
+        if matches!(
+            mcp_workspace_effect,
+            Some(astra_turn_types::ResolvedToolEffect::Unknown)
+        ) {
+            return EdgeToolRun::from_tool_result(
+                astra_tools::mcp_workspace_effect_undeclared_tool_result(name),
+            );
+        }
         let _workspace_mutation_lease = if name != "bash"
             && name != "run_script"
-            && (astra_tools::executor::is_workspace_mutation_tool(name, args) || targeted_observer)
+            // MCP effects are resolved once from the discovered provider
+            // declaration; typed tools use the shared built-in predicate.
+            && (mcp_workspace_effect == Some(astra_turn_types::ResolvedToolEffect::Mutating)
+                || astra_tools::executor::requires_workspace_serialization(name, args)
+                || targeted_observer)
             && !nested_run_script_callback
         {
             match astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
@@ -4614,9 +4708,11 @@ impl ToolExecutor {
                         }
                         return cancelled_edge_tool_run(name, false);
                     }
-                    return EdgeToolRun::error(
-                        "workspace coordination lock was unavailable, contended, or the host temporary lock namespace is not trustworthy; no tool was run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions"
-                            .to_string(),
+                    return EdgeToolRun::from_tool_result(
+                        astra_tools::workspace_lease_unavailable_tool_result_for_workspace(
+                            name,
+                            &self.project_root,
+                        ),
                     );
                 }
             }
@@ -4660,9 +4756,11 @@ impl ToolExecutor {
             {
                 Some(guard) => Some(guard),
                 None => {
-                    return EdgeToolRun::error(
-                        "workspace writer coordination was unavailable, contended, or the host temporary lock namespace is not trustworthy; run_script was not run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions"
-                            .to_string(),
+                    return EdgeToolRun::from_tool_result(
+                        astra_tools::workspace_lease_unavailable_tool_result_for_workspace(
+                            name,
+                            &self.project_root,
+                        ),
                     );
                 }
             }
@@ -4679,8 +4777,43 @@ impl ToolExecutor {
                 cancel_token,
                 &mut tool_result_fields,
                 &mut source_is_error,
+                mcp_prepared,
             )
             .await;
+        if matches!(
+            mcp_workspace_effect,
+            Some(astra_turn_types::ResolvedToolEffect::Mutating)
+        ) {
+            let result = astra_tools::ToolResult {
+                output,
+                metadata: tool_result_fields,
+                is_error: source_is_error.unwrap_or(false),
+                exit_semantics: None,
+            };
+            let dispatched = result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("mcp_call_dispatched"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            let settled = result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_effect_settled"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            let result = if dispatched && !settled {
+                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                    &self.project_root,
+                );
+                astra_tools::workspace_effect_unsettled_tool_result(name, result)
+            } else {
+                result
+            };
+            output = result.output;
+            tool_result_fields = result.metadata;
+            source_is_error = Some(result.is_error);
+        }
         let coordination_integrity_valid = _workspace_mutation_lease.as_ref().is_none_or(
             astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
         ) && _recursive_writer_epoch
@@ -4858,6 +4991,10 @@ impl ToolExecutor {
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
         tool_result_fields: &mut Option<serde_json::Map<String, Value>>,
         source_is_error: &mut Option<bool>,
+        mcp_prepared: Option<(
+            std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>,
+            astra_mcp::PreparedMcpToolCall,
+        )>,
     ) -> String {
         let output = if let Err(error) =
             crate::tool_safety_guard::ToolSafetyGuard::check_dispatch(name, args)
@@ -4886,7 +5023,12 @@ impl ToolExecutor {
                 // Uses the local CLI catalog plus plugin-installed schemas,
                 // so `select:NAME` matches the tools this surface actually
                 // exposes while still resolving MCP/skill-backed tools.
-                "tool_search" => self.tool_search(args),
+                "tool_search" => {
+                    let result = self.tool_search(args);
+                    *source_is_error = Some(result.is_error);
+                    *tool_result_fields = result.metadata;
+                    result.output
+                }
                 "read_file" => {
                     let result = self.read_file_with_metadata(args);
                     *source_is_error = Some(result.is_error);
@@ -5012,7 +5154,6 @@ impl ToolExecutor {
                 "type_hierarchy" => self.type_hierarchy(args),
                 "hover_info" => self.hover_info(args),
                 "symbol_search" => self.symbol_search(args),
-                "run_build_test" => self.run_build_test(args),
                 "symbols" => self.symbols(args),
                 "mo_query" => self.mo_query(args),
 
@@ -5217,14 +5358,36 @@ impl ToolExecutor {
                             }
                         }
                         astra_tools::agent_tool_contract::AgentAction::Spawn => {
-                            agent_spawning::handle_agent_spawn_action(
-                                args,
+                            if self.delegation_requires_admission {
+                                *source_is_error = Some(true);
+                                return "Error: inherited model requirements cannot be bound to a CLI child delegation".into();
+                            }
+                            let context = self.spawn_context_for_admission();
+                            agent_spawning::handle_agent_spawn_action(args, context.as_ref()).await
+                        }
+                        astra_tools::agent_tool_contract::AgentAction::Wait => {
+                            let mut correlated = args.clone();
+                            if let Some(fields) = correlated.as_object_mut() {
+                                fields.remove("_tool_call_id");
+                                if let Some(id) = invocation.tool_call_id {
+                                    fields.insert("_tool_call_id".into(), Value::String(id.into()));
+                                }
+                            }
+                            astra_runtime::orchestration::handle_agent_tool(
+                                &correlated,
                                 self.spawn_context.as_ref(),
                             )
                             .await
                         }
                         astra_tools::agent_tool_contract::AgentAction::GetResult => {
                             agent_spawning::handle_agent_get_result_action(
+                                args,
+                                self.spawn_context.as_ref(),
+                            )
+                            .await
+                        }
+                        astra_tools::agent_tool_contract::AgentAction::List => {
+                            agent_spawning::handle_agent_list_action(
                                 args,
                                 self.spawn_context.as_ref(),
                             )
@@ -5246,6 +5409,12 @@ impl ToolExecutor {
                     }
                 }
                 "agent_fanout" => {
+                    if self.delegation_requires_admission
+                        && args.get("action").and_then(Value::as_str) == Some("start")
+                    {
+                        *source_is_error = Some(true);
+                        return "Error: inherited model requirements cannot be bound to a CLI child delegation".into();
+                    }
                     if self.spawn_context.is_none()
                         && args.get("action").and_then(Value::as_str) == Some("get_results")
                         && let Some(group_id) = args.get("group_id").and_then(Value::as_str)
@@ -5254,8 +5423,8 @@ impl ToolExecutor {
                     {
                         projection.snapshot.output
                     } else {
-                        agent_spawning::handle_agent_fanout_tool(args, self.spawn_context.as_ref())
-                            .await
+                        let context = self.spawn_context_for_admission();
+                        agent_spawning::handle_agent_fanout_tool(args, context.as_ref()).await
                     }
                 }
                 // ── Consolidated session tool ──────────────────────────────
@@ -5335,6 +5504,16 @@ impl ToolExecutor {
                 "share_context" => self.share_context(args),
                 "query_context" => self.query_context(args),
                 "introspect" => self.handle_introspect(args),
+                "model_catalog" => {
+                    use astra_turn_core::model_catalog::{
+                        CatalogError, ModelCatalogRequest, unavailable_page,
+                    };
+                    *source_is_error = Some(true);
+                    let error = ModelCatalogRequest::from_args(args)
+                        .err()
+                        .unwrap_or(CatalogError::Unsupported);
+                    unavailable_page(error, "unbound").to_json()
+                }
                 "diagnose" => self.diagnose(args).await,
                 "lsp" => self.lsp(args),
                 "env" => self.env_tool(args),
@@ -5343,7 +5522,12 @@ impl ToolExecutor {
                 "brief" => self.brief(args).await,
                 "context_analysis" => self.context_analysis(args),
                 _ if astra_runtime_env::is_mcp_namespaced_tool_name(name) => {
-                    let outcome = self.execute_mcp_tool(name, args).await;
+                    let outcome = if let Some((manager, prepared)) = mcp_prepared.as_ref() {
+                        self.execute_prepared_mcp_tool(manager, name, prepared, args)
+                            .await
+                    } else {
+                        self.execute_mcp_tool(name, args).await
+                    };
                     *source_is_error = Some(outcome.is_error);
                     *tool_result_fields = outcome.tool_result_fields.clone();
                     outcome.output
@@ -6116,6 +6300,7 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn feedback_frame(
         session_turn: u32,
@@ -6328,10 +6513,14 @@ mod tests {
     ) -> astra_runtime::orchestration::AgentToolContext {
         astra_runtime::orchestration::AgentToolContext {
             fanout_admission: spawner.fanout_parent("run-parent"),
+            reply_obligations: Arc::new(Default::default()),
             run_id: "run-parent".into(),
             agent_id: "root-agent".into(),
             delegation_chain: Vec::new(),
             current_model: None,
+            current_model_selection: None,
+            delegation_model_admission: None,
+            parent_model_reasoning: None,
             recursion_depth: 0,
             is_fork_child: false,
             working_dir: PathBuf::from("."),
@@ -6349,6 +6538,98 @@ mod tests {
             transcript_location:
                 astra_runtime::orchestration::AgentTranscriptLocation::LocalJournal,
         }
+    }
+
+    #[test]
+    fn spawn_admission_snapshots_effective_parent_reasoning() {
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        let executor = ToolExecutor::new(std::path::Path::new("."))
+            .with_spawn_context(fanout_test_context(test_spawner()));
+        executor.publish_parent_model_reasoning(
+            Some("offer-a"),
+            Some("model-a"),
+            ThinkingConfig::Enabled {
+                budget_tokens: 8192,
+            },
+        );
+        let admitted = executor.spawn_context_for_admission().unwrap();
+        executor.publish_parent_model_reasoning(
+            Some("offer-b"),
+            Some("model-b"),
+            ThinkingConfig::Off,
+        );
+        let updated = executor.spawn_context_for_admission().unwrap();
+        let admitted = admitted.parent_model_reasoning.unwrap();
+        assert_eq!(admitted.selection.offering_id, "offer-a");
+        assert_eq!(
+            admitted.thinking,
+            ThinkingConfig::Enabled {
+                budget_tokens: 8192
+            }
+        );
+        let updated = updated.parent_model_reasoning.unwrap();
+        assert_eq!(updated.selection.offering_id, "offer-b");
+        assert_eq!(updated.thinking, ThinkingConfig::Off);
+        executor.publish_parent_model_reasoning(None, None, ThinkingConfig::Off);
+        assert!(
+            executor
+                .spawn_context_for_admission()
+                .unwrap()
+                .parent_model_reasoning
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn constrained_cli_child_cannot_start_unbound_nested_delegation() {
+        let spawner = test_spawner();
+        let executor = test_executor()
+            .with_spawn_context(fanout_test_context(spawner.clone()))
+            .require_delegation_admission(true);
+        let spawn = executor
+            .execute(
+                "agent",
+                &serde_json::json!({
+                    "action":"spawn","description":"Review","prompt":"Review the diff"
+                }),
+            )
+            .await;
+        assert!(spawn.contains("inherited model requirements cannot be bound"));
+        let fanout = executor
+            .execute(
+                "agent_fanout",
+                &serde_json::json!({
+                    "action":"start","target_count":1,
+                    "slots":[{"id":"review","description":"Review","prompt":"Review the diff"}]
+                }),
+            )
+            .await;
+        assert!(fanout.contains("inherited model requirements cannot be bound"));
+        assert!(spawner.list_all_agents().await.is_empty());
+        assert!(spawner.list_fanout_groups().await.is_empty());
+
+        let result_lookup = executor
+            .execute(
+                "agent",
+                &serde_json::json!({"action":"get_result","agent_id":"unknown"}),
+            )
+            .await;
+        assert!(!result_lookup.contains("inherited model requirements cannot be bound"));
+
+        let unconstrained = test_executor().with_spawn_context(fanout_test_context(test_spawner()));
+        let allowed = unconstrained
+            .execute(
+                "agent",
+                &serde_json::json!({
+                    "action":"spawn","description":"Review","prompt":"Review the diff"
+                }),
+            )
+            .await;
+        assert!(!allowed.contains("inherited model requirements cannot be bound"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&allowed).unwrap()["status"],
+            "completed"
+        );
     }
 
     fn test_spawner() -> Arc<astra_runtime::orchestration::DynamicAgentSpawner> {
@@ -6383,21 +6664,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         (dir, executor)
-    }
-
-    #[test]
-    fn top_level_detach_slot_is_not_inherited_by_nested_default_executor() {
-        let dir = tempfile::tempdir().unwrap();
-        let (slot, _listener) = astra_tools::detach::new_slot_with_handle();
-        let executor = ToolExecutor::new(dir.path()).with_bash_detach_slot(slot);
-        assert!(
-            executor
-                .default_executor
-                .context()
-                .detach_shell_handle
-                .is_none(),
-            "run_script's nested default executor must remain foreground-only"
-        );
     }
 
     fn function_schema(name: &str) -> serde_json::Value {
@@ -6560,6 +6826,7 @@ mod tests {
                 tool_call_id: Some(tool_call_id),
                 admission_source: None,
                 expected_control_epoch: None,
+                delegation_model_admission: None,
             }
         }
 
@@ -6747,6 +7014,7 @@ mod tests {
                     tool_call_id: Some("call-external-noop"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    delegation_model_admission: None,
                 },
             )
             .await;
@@ -8914,6 +9182,16 @@ mod tests {
         assert!(tool_search_string_array(&parsed, "missing").is_empty());
         assert_eq!(tool_search_match_names(&parsed), vec!["memory".to_string()]);
         assert!(parsed["matches"][0].get("parameters").is_some());
+        let result = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "tool_search",
+            &serde_json::json!({"query":"select:memory"}),
+        )
+        .await;
+        assert_eq!(
+            astra_tools::model_result_presentation(result.metadata.as_ref()),
+            astra_tools::ModelResultPresentation::SourceBounded
+        );
     }
 
     #[tokio::test]
@@ -9513,6 +9791,66 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn dynamic_mcp_call_waits_for_the_shared_workspace_lease() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let binary = crate::mcp_client::ensure_mock_mcp_server_binary();
+        let mut manager = crate::mcp_client::McpClientManager::new();
+        manager
+            .connect(crate::mcp_client::McpServerConfig {
+                name: "lease_test".into(),
+                transport: crate::mcp_client::Transport::Stdio {
+                    command: vec![binary.to_string_lossy().into_owned()],
+                    args: vec![],
+                    env: Default::default(),
+                },
+                description: String::new(),
+                enabled: true,
+                retry: Default::default(),
+            })
+            .await
+            .expect("connect real stdio MCP process");
+        let schemas = manager.all_tool_schemas();
+        let mut executor = ToolExecutor::new(workspace.path());
+        executor.install_mcp_bundle(Arc::new(tokio::sync::RwLock::new(manager)), schemas.clone());
+        executor.set_current_visible_tool_schemas(&schemas);
+        let executor = Arc::new(executor);
+        let lease =
+            astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
+                workspace.path(),
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("hold the real workspace lease");
+        let marker_path = workspace.path().join("marker.txt");
+        let task_executor = executor.clone();
+        let mut pending = tokio::spawn(async move {
+            task_executor
+                .execute_with_metadata(
+                    "mcp__lease_test__write_marker",
+                    &serde_json::json!({"path": marker_path, "message": "ok"}),
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut pending)
+                .await
+                .is_err(),
+            "an opaque dynamic provider call must not bypass the workspace lease"
+        );
+        drop(lease);
+        let outcome = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("MCP call after lease release")
+            .expect("MCP task");
+        assert!(
+            !outcome.is_error,
+            "MCP call after lease release: {outcome:?}"
+        );
+        assert!(outcome.output.contains("written"), "{outcome:?}");
+    }
+
     /// Poison recovery: CLI provider schemas are a cache. If a prior panic poisoned
     /// the RwLock, reset to a known empty state rather than reading possibly
     /// half-written inner data; a later `set_cli_local_provider_schemas` repopulates it.
@@ -9613,6 +9951,27 @@ mod tests {
             !out.contains("first turn"),
             "must not return opaque first-turn placeholder, got: {out}"
         );
+    }
+
+    #[tokio::test]
+    async fn model_catalog_without_server_binding_is_explicitly_unsupported() {
+        let executor = test_executor();
+        // No active session, observation snapshot, or local catalog is needed.
+        let output = executor
+            .execute("model_catalog", &serde_json::json!({}))
+            .await;
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["error"]["error_kind"], "unsupported");
+        assert_eq!(value["error"]["retryable"], false);
+        assert!(value["total"].is_null());
+        let rejected = executor
+            .execute_with_metadata(
+                "model_catalog",
+                &serde_json::json!({"artifact":"not-a-path"}),
+            )
+            .await;
+        assert!(rejected.is_error);
+        assert!(!rejected.output.contains("private"));
     }
 
     #[test]

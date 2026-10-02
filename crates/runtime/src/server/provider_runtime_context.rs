@@ -5,6 +5,11 @@ pub(crate) async fn inject_effective_runtime_context(
     principal: &AuthPrincipal,
     request: &mut astra_services::runs::ChatRequestData,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    request.model_catalog_reader = Some(astra_services::models::AuthorizedModelCatalogReader::new(
+        state.model_service.clone(),
+        state.auth_service.clone(),
+        principal.clone(),
+    ));
     if principal.is_provider_authorized_request() {
         request.provider_runtime_authorized = true;
         if let AuthPrincipalOrigin::ProviderAuthorizedRequest(ctx) = &principal.origin {
@@ -413,6 +418,7 @@ mod tests {
                 selected_model: ExternalSelectedModelResponse {
                     id: "model-requested".to_string(),
                     model: "provider-model".to_string(),
+                    source_identity: None,
                 },
                 runtime_auth: ExternalRuntimeAuthResponse {
                     auth_type: "moi_runtime_grant".to_string(),
@@ -623,6 +629,21 @@ mod tests {
             .expect("provider authorization should accept the supplied runtime context");
 
         assert!(request.provider_runtime_authorized);
+        let reader = request
+            .model_catalog_reader
+            .as_ref()
+            .expect("authenticated reader binding");
+        assert_eq!(reader.user_id(), principal.user.user_id);
+        assert_eq!(
+            reader.scope(),
+            if principal.is_edge_registration() {
+                "edge_registration"
+            } else if principal.is_provider_authorized_request() {
+                "provider_scope"
+            } else {
+                "user"
+            }
+        );
         assert_eq!(
             request.provider_run_owner,
             Some(astra_services::runs::ProviderRunOwner {

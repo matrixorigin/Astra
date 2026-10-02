@@ -40,13 +40,13 @@ use crate::cli::skill_catalog::{
 };
 use crate::cli::slash::slash_bug::handle_bug_command;
 use crate::cli::slash::slash_debug::handle_debug_command;
-use crate::cli::slash::slash_info::handle_info_command;
 use crate::cli::slash::slash_memory::handle_memory_domain_command;
 use crate::cli::slash::slash_messaging::handle_messaging_command;
 use crate::cli::slash::{slash_agent, slash_team, slash_telemetry};
 use crate::cli::stream::streaming_types::{
     StreamResult, format_background_agent_results, stream_result_from_resumable_turn_failure,
 };
+use crate::cli::workspace_inspection::{handle_grep_command, handle_review_command};
 use crate::cli::{
     agent_loader, delegate_subrun, diff_presenter, journal_diff, journal_digest, journal_tree,
     theme,
@@ -802,7 +802,7 @@ async fn execute_repl_bridge_command_impl(
 
     let mut state = initialize_session_state(profile, global_model, cli_context);
     if slash_cmd == "/messaging" {
-        handle_messaging_command(arg, &state).await;
+        handle_messaging_command(arg, &state);
         return Ok(ExitCode::Success);
     }
     maybe_load_project_instructions(&mut state);
@@ -832,9 +832,8 @@ async fn execute_repl_bridge_command_impl(
             )
             .await?
         }
-        "/review" | "/grep" => {
-            handle_info_command(slash_cmd, arg, api, &mut state, profile, token.as_deref()).await?
-        }
+        "/review" => handle_review_command(arg, api, &mut state, profile, token.as_deref()).await?,
+        "/grep" => handle_grep_command(arg).await?,
         "/diff" => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             diff_presenter::run_diff_command(&root, arg, cli_utils::terminal_width_usize());
@@ -851,7 +850,7 @@ async fn execute_repl_bridge_command_impl(
             };
             slash_agent::handle_agent_command(arg, &ctx).await;
         }
-        "/messaging" => handle_messaging_command(arg, &state).await,
+        "/messaging" => handle_messaging_command(arg, &state),
         _ => return Err(format!("unsupported bridged command: {slash_cmd}")),
     }
 

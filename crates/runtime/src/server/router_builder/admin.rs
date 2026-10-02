@@ -33,10 +33,6 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             get(admin_handlers::admin_audit_logs_handler),
         )
         .route(
-            "/admin/feedback/stats",
-            get(admin_handlers::admin_feedback_stats_handler),
-        )
-        .route(
             "/admin/feedback/export",
             post(admin_handlers::admin_feedback_export_handler),
         )

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use astra_core::SharedPool;
 use astra_core::config::AppSettings;
-use astra_runtime::{DatabaseEvaluationService, MemoriaForwarder, build_app, build_server_state};
+use astra_runtime::{MemoriaForwarder, build_app, build_server_state};
 use astra_services::runs::{
     AtomicRunInteractionBatchRegistrationRequest, AtomicRunInteractionWaitRequest,
     DurableRunInteractionKind, DurableRunInteractionWaitOutcome,
@@ -996,23 +996,12 @@ pub async fn bootstrap() -> BootstrapResult {
 
     cleanup_interrupted_matrix_e2e_sessions(&state).await;
 
-    // Reuse the server's database pool. A separate 80-connection evaluation
-    // pool per in-process app made a serial journey suite reserve twice the
-    // production capacity and obscured genuine leaks behind the global cap.
+    // Reuse the server's database pool for session lifecycle assertions.
     let session_lifecycle_pool = state
         .shared_pool
         .as_ref()
         .expect("build_server_state wires a shared MatrixOne pool")
         .clone();
-    let matrixone_settings = session_lifecycle_pool.settings().clone();
-    let state = state.with_evaluation_service(Arc::new(
-        DatabaseEvaluationService::new(matrixone_settings)
-            .with_pool(session_lifecycle_pool.clone())
-            .with_memoria_config(
-                memoria_base_url,
-                Some("system-e2e-mock-master-key".to_string()),
-            ),
-    ));
 
     // `build_app` is used in-process here, so the real server startup hook that
     // primes capability health does not run. Mirror that production boundary

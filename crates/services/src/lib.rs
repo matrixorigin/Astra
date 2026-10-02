@@ -17,18 +17,14 @@ pub mod coordination;
 pub mod data_versioning;
 pub mod db_row;
 pub mod decisions;
-pub mod delegated_findings;
 pub mod edge_context;
-pub mod evaluation;
 pub mod event_ingestion;
 pub mod events;
 pub mod execution_grant;
 pub mod external_artifacts;
-pub mod harness;
 pub mod inference_execution;
 pub mod interaction_contract;
 pub mod introspection;
-pub mod jobs;
 pub mod judgment_presentation;
 pub mod llm_trusted_domains;
 pub mod marketplace;
@@ -45,6 +41,7 @@ pub mod prompt_delta;
 pub mod reflect;
 pub(crate) mod registry_payload;
 pub use registry_payload::validate_registered_endpoint_url;
+pub mod delegation_model_requirement;
 pub mod replay;
 pub mod resource_governor;
 pub mod runs;
@@ -74,7 +71,6 @@ pub mod snapshot_sql;
 pub mod state_projection;
 pub mod state_sync;
 pub mod storage;
-pub mod sync_engine;
 pub mod sync_outbox;
 pub mod team_persistence;
 pub mod tool_invocation_ledger;
@@ -86,7 +82,6 @@ pub mod verification;
 pub mod weighted_admission;
 pub mod work;
 pub mod work_admission_judgment;
-pub mod workflows;
 pub mod workspace_records;
 
 fn missing_shared_pool_error(
@@ -120,8 +115,7 @@ fn require_shared_pool_message(
 }
 
 pub use admin::{
-    AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer,
-    AdminFeedbackStatsFilter, AdminFeedbackStatsReader, AdminFeedbackStatsRecord, AdminInitRecord,
+    AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer, AdminInitRecord,
     AdminInitializer, AdminTokenCreateRequestData, AdminTokenFilter, AdminTokenReader,
     AdminTokenRecord, AdminTokenWriter, AdminUserRoleManager, AdminUserRoleRecord,
     AdminUserRoleRequestData, AuthenticatedUser,
@@ -151,22 +145,21 @@ pub use artifact_policy::{
 };
 pub use astra_core::composite_snapshot::{
     CompositeSnapshot, CompositeSnapshotIndex, DataSnapshotRef, MemorySnapshotRef, SnapshotRef,
-    SnapshotSpec,
 };
 pub use auth::{
     AuthLoginRequestData, AuthPrincipal, AuthPrincipalOrigin, AuthProviderAuthorizedRequestContext,
     AuthRefreshRequestData, AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord,
-    DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminFeedbackStatsReader,
-    DatabaseAdminInitializer, DatabaseAdminTokenReader, DatabaseAdminTokenWriter,
-    DatabaseAdminUserRoleManager, DatabaseAuthService, DatabaseSessionService, EdgeTokenBinding,
-    ExternalAuthProviderConfig, ExternalAuthorizeRequestData, ExternalAuthorizedRequest,
-    ExternalCatalogResponse, ExternalLoginRequestData, ExternalProviderClient,
-    ExternalProviderPublicRecord, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
-    ExternalRuntimeContextResponse, ExternalSessionRecord, FernetTokenEncryptor,
-    HttpExternalProviderClient, ProviderRequestDescriptor, ProviderSessionCreationIdentity,
-    ReauthenticationProofRecord, ReauthenticationPurpose, ReauthenticationRequestData,
-    SessionCreateRequestData, SessionCreationResult, SessionListFilter, SessionListRecord,
-    SessionRecord, SessionService, SessionUpdateRequestData,
+    DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminInitializer,
+    DatabaseAdminTokenReader, DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager,
+    DatabaseAuthService, DatabaseSessionService, EdgeTokenBinding, ExternalAuthProviderConfig,
+    ExternalAuthorizeRequestData, ExternalAuthorizedRequest, ExternalCatalogResponse,
+    ExternalLoginRequestData, ExternalProviderClient, ExternalProviderPublicRecord,
+    ExternalRequestDescriptor, ExternalRuntimeContextRequestData, ExternalRuntimeContextResponse,
+    ExternalSessionRecord, FernetTokenEncryptor, HttpExternalProviderClient,
+    ProviderRequestDescriptor, ProviderSessionCreationIdentity, ReauthenticationProofRecord,
+    ReauthenticationPurpose, ReauthenticationRequestData, SessionCreateRequestData,
+    SessionCreationResult, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
+    SessionUpdateRequestData,
 };
 pub use branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService};
 pub use context::{
@@ -181,8 +174,8 @@ pub use context_manifest::{
     budget_for_turn_intent, expired_artifact_placeholder,
 };
 pub use coordination::{
-    AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AgentTrigger, AggregationStrategy,
-    CoordinationPattern, DelegationRequest, DelegationResult, PipelineStage, aggregate_results,
+    AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AggregationStrategy,
+    CoordinationPattern, DelegationRequest, DelegationResult, aggregate_results,
 };
 pub use data_versioning::{
     DataVersioningService, DatabaseDataVersioningService, UnconfiguredDataVersioningService,
@@ -192,20 +185,11 @@ pub use decisions::{
     DecisionRecord, DecisionService, DecisionWithContextRecord, UnconfiguredDecisionService,
 };
 pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
-pub use evaluation::{DatabaseEvaluationService, EvaluationService, UnconfiguredEvaluationService};
 pub use events::{
     DatabaseEventService, EventCreateRequestData, EventIngestionSource, EventListFilter,
     EventListRecord, EventRecord, EventService, UnconfiguredEventService,
 };
 pub use execution_grant::{ExecutionGrantError, ExecutionGrantSigner};
-pub use harness::{
-    DatabaseHarnessService, HarnessCitationRecord, HarnessDecisionRequest, HarnessItemRecord,
-    HarnessNodeCatalogRecord, HarnessRunRecord, HarnessService, HarnessSkillDraftRecord,
-    HarnessSkillRuleRecord, HarnessTemplateRecord, SkillifyAgentCitation, SkillifyAgentDraft,
-    SkillifyAgentExecutor, SkillifyAgentOutput, SkillifyAgentRequest, SkillifyAgentRule,
-    SkillifyDraftRecord, SkillifyDraftRequest, SkillifyPublishRecord, SkillifyPublishRequest,
-    SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
-};
 pub use inference_execution::{
     AuxiliaryExecutionAttemptFact, InferenceCanonicalTransitionReceipt,
     InferenceInvocationAdmissionResolution, InferenceInvocationInput, InferenceInvocationPlan,
@@ -231,9 +215,6 @@ pub use interaction_contract::{
 };
 pub use introspection::{
     DatabaseIntrospectionService, IntrospectionService, UnconfiguredIntrospectionService,
-};
-pub use jobs::{
-    InMemoryJobService, JobRecord, JobService, JobSubmitRequestData, UnconfiguredJobService,
 };
 pub use llm_trusted_domains::{
     DatabaseLlmTrustedDomainService, LlmTrustedDomainDeleteResponse, LlmTrustedDomainRecord,
@@ -266,19 +247,20 @@ pub use model_request_context::{
 pub use models::{
     AdmittedModelExecution, DatabaseModelService, DeclaredModelAccess, ModelAccessAction,
     ModelAccessAvailability, ModelAccessKind, ModelAccessProjectionResponse, ModelAccessReason,
-    ModelAccessStatus, ModelAccessViewResponse, ModelCreateRequestData, ModelDefaultCandidate,
-    ModelDefaultInvalidReason, ModelDefaultResolution, ModelDefaultScope, ModelDefaultSource,
-    ModelExecutionPlacement, ModelListCursor, ModelListItem, ModelListItemResponse, ModelListPage,
-    ModelListPageResponse, ModelOfferingResolutionError, ModelRecord, ModelService,
-    ModelUpdateRequestData, PricingData, PromptCacheCapabilityData, PromptCacheProtocolData,
-    PromptCacheReuseScopeData, PromptCacheVolatileDeliveryData, PromptCacheVolatilePlacementData,
-    QuirksData, ResolvedActiveLlmModel, ResolvedModelOffering, UnconfiguredModelService,
-    UserModelCreateRequestData, UserModelRecord, UserModelUpdateRequestData,
-    model_catalog_revision, project_model_access, project_model_access_page,
-    project_model_access_page_with_default_catalog, project_model_access_with_default,
-    prompt_cache_capability_from_models_yaml, resolve_active_llm_model,
-    resolve_active_llm_offering, resolve_memory_offerings, resolve_reasoning_offering,
-    revalidate_active_llm_offering, revalidate_admitted_model_execution,
+    ModelAccessStatus, ModelAccessViewResponse, ModelCatalogPricing, ModelCreateRequestData,
+    ModelDefaultCandidate, ModelDefaultInvalidReason, ModelDefaultResolution, ModelDefaultScope,
+    ModelDefaultSource, ModelExecutionPlacement, ModelListCursor, ModelListItem,
+    ModelListItemResponse, ModelListPage, ModelListPageResponse, ModelOfferingResolutionError,
+    ModelRecord, ModelService, ModelUpdateRequestData, PricingData, PromptCacheCapabilityData,
+    PromptCacheProtocolData, PromptCacheReuseScopeData, PromptCacheVolatileDeliveryData,
+    PromptCacheVolatilePlacementData, QuirksData, ResolvedActiveLlmModel, ResolvedModelOffering,
+    UnconfiguredModelService, UserModelCreateRequestData, UserModelRecord,
+    UserModelUpdateRequestData, model_catalog_revision, project_model_access,
+    project_model_access_page, project_model_access_page_with_default_catalog,
+    project_model_access_with_default, prompt_cache_capability_from_models_yaml,
+    resolve_active_llm_model, resolve_active_llm_offering, resolve_memory_offerings,
+    resolve_reasoning_offering, revalidate_active_llm_offering,
+    revalidate_admitted_model_execution, revalidate_admitted_model_executions,
     validate_model_offering_id,
 };
 pub use multi_agent::{
@@ -376,7 +358,7 @@ pub use skills::{
     UnconfiguredSkillService,
 };
 pub use state_projection::{
-    BubbleUpTarget, DatabaseStateProjectionStore, DelegationProjectionUpsert, StateItemUpsert,
+    DatabaseStateProjectionStore, DelegationProjectionUpsert, StateItemUpsert,
     StateProjectionError, UserAnchorMemoryItem, validate_state_mutation,
 };
 pub use state_sync::{
@@ -387,15 +369,10 @@ pub use storage::{
     CleanupResult, RetentionPolicy, cleanup_expired_data, database_user_from_row,
     ensure_core_schema, log_session_audit, resolve_active_skill_versions, session_record_from_row,
 };
-pub use sync_engine::{
-    CloudTransport, DomainAdapter, DomainSyncResult, MergeResult, NoopTransport, PayloadFormat,
-    PullResult, PullTrigger, PushResult, PushTrigger, SyncDomain, SyncEnvelope, SyncError,
-    SyncEvent, SyncOperation, SyncOrchestrator, SyncPayload, SyncPolicy, SyncState, SyncStats,
-};
 pub use sync_outbox::{
     SYNC_OUTBOX_ACK_TOMBSTONE_RETAINED_RECORDS, SYNC_OUTBOX_ACKED_RETAINED_RECORDS,
     SYNC_OUTBOX_IN_FLIGHT_LEASE_MS, SYNC_OUTBOX_MAX_ATTEMPTS, SYNC_OUTBOX_SCHEMA_VERSION,
-    SYNC_OUTBOX_SKIPPED_RETAINED_RECORDS, SyncOutboxAckOutcome, SyncOutboxAckTombstone,
+    SYNC_OUTBOX_SKIPPED_RETAINED_RECORDS, SyncDomain, SyncOutboxAckOutcome, SyncOutboxAckTombstone,
     SyncOutboxDeliverySettlement, SyncOutboxEnqueueOutcome, SyncOutboxFile,
     SyncOutboxJournalBatchOutcome, SyncOutboxJournalDelta, SyncOutboxJournalDeltaOutcome,
     SyncOutboxPoisonKind, SyncOutboxRecord, SyncOutboxRecordState, SyncOutboxSettlementReport,
@@ -415,17 +392,12 @@ pub use turn_intent_judge::{
     work_admission_judge_messages, work_admission_repair_hints,
 };
 pub use verification::{
-    LlmJudge, SubtaskVerificationReport, VerificationCriterion, VerificationResult,
-    VerificationRunner, VerifierKind,
+    VerificationCriterion, VerificationResult, VerificationRunner, VerifierKind,
 };
 pub use weighted_admission::{
     AdmissionWork, DatabaseWeightedAdmissionController, DistributedAdmissionError,
     DistributedAdmissionPermit, DistributedAdmissionReservation, WeightedAdmissionController,
     WeightedAdmissionError, WeightedAdmissionLimits, WeightedAdmissionPermit,
-};
-pub use workflows::{
-    UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,
-    WorkflowService,
 };
 pub use workspace_records::{
     DatabaseWorkspaceRecordStore, InMemoryWorkspaceRecordStore, WorkspaceCleanupDebtEntry,

@@ -1,0 +1,190 @@
+name: flash_fanout_two_models_high
+description: |
+  Deterministic two-slot control journey. The parent fixes one child to
+  GLM-5.2 and one child to DeepSeek Flash with adaptive high reasoning. Each
+  child returns a fixed marker, so the oracle measures admission, execution,
+  configuration and handoff rather than task quality.
+prompt: |
+  Run exactly one agent_fanout.start group with group_id
+  two-model-marker and target_count 2. Use two explore slots.
+  Slot 0 must use configured model glm-5.2 and reply exactly
+  GLM-SLOT-MARKER-OK.
+  Slot 1 must use configured model deepseek-v4-flash with reasoning
+  {"mode":"adaptive","effort":"high"} and reply exactly
+  FLASH-HIGH-SLOT-MARKER-OK.
+  Do not retry, replace or add slots. Do not busy-poll. Report both exact
+  markers and 2/2 after the group reaches its terminal boundary. Do not call
+  Reflect or another diagnostic tool.
+debug_log: true
+capability: delegation
+timeout_seconds: 240
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent_fanout
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: start
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /group_id
+    equals: two-model-marker
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /target_count
+    equals: 2
+  # The model may express these requirements in natural language and let the
+  # runtime's candidate-aware admission fill the structured selector. Assert
+  # the admitted child identity below, not an incidental provider tool shape.
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /slots/1/reasoning/mode
+    equals: adaptive
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /slots/1/reasoning/effort
+    equals: high
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /fanout/accepted
+    equals: 2
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/fanout_slot/slot_index
+      equals: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/fanout_slot/slot_index
+      equals: 1
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: glm-5.2
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: deepseek-v4-flash
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    max: 1
+    json_match:
+      path: /payload/model
+      equals: glm-5.2
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+        related_match:
+          path: /metadata/fanout_slot/slot_index
+          equals: 0
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    max: 1
+    json_match:
+      path: /payload/model
+      equals: deepseek-v4-flash
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+        related_match:
+          path: /metadata/fanout_slot/slot_index
+          equals: 1
+  # Admission owns the requested reasoning configuration. Runtime round
+  # completion intentionally reports provider usage and model identity only;
+  # do not require it to duplicate spawn metadata.
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/thinking/mode
+      equals: adaptive
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+        related_match:
+          path: /metadata/fanout_slot/slot_index
+          equals: 1
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/thinking/effort
+      equals: high
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+        related_match:
+          path: /metadata/fanout_slot/slot_index
+          equals: 1
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 2
+    max: 2
+    json_match:
+      path: /metadata/status
+      equals: completed
+  # A foreground fanout may deliver terminal child results through a later
+  # get_results response or the parent-owned completion mailbox. Both paths
+  # must prove the exact child result and its originating slot.
+  - type: any_of
+    criteria:
+      - type: all_of
+        criteria:
+          - type: journal_tool_json
+            name: agent_fanout
+            document: result
+            path: /fanout/terminal
+            equals: 2
+          - type: journal_tool_json
+            name: agent_fanout
+            document: result
+            path: /results/0/result/result
+            equals: GLM-SLOT-MARKER-OK
+          - type: journal_tool_json
+            name: agent_fanout
+            document: result
+            path: /results/1/result/result
+            equals: FLASH-HIGH-SLOT-MARKER-OK
+      - type: all_of
+        criteria:
+          - type: session_child_result_adopted
+            expected_result: GLM-SLOT-MARKER-OK
+            spawn_match:
+              path: /metadata/fanout_slot/slot_index
+              equals: 0
+          - type: session_child_result_adopted
+            expected_result: FLASH-HIGH-SLOT-MARKER-OK
+            spawn_match:
+              path: /metadata/fanout_slot/slot_index
+              equals: 1
+  - type: text_contains
+    needle: GLM-SLOT-MARKER-OK
+  - type: text_contains
+    needle: FLASH-HIGH-SLOT-MARKER-OK
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

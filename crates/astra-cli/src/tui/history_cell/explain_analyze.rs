@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
 };
 
+use crate::explain_analyze_format::decision_detail_line;
 use astra_turn_types::ExplainAnalyzeGraphV1;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -330,6 +331,19 @@ fn render_graph(
                     available > remaining_nodes.saturating_add(3)
                 });
             if show_node_details {
+                if let Some(detail) = &node.decision_detail {
+                    if !push_wrapped_node_detail(
+                        &mut lines,
+                        &decision_detail_line(detail),
+                        width,
+                        Style::default().fg(Color::Yellow),
+                        detail_limit,
+                        &detail_ancestors,
+                    ) && !live
+                    {
+                        truncated = true;
+                    }
+                }
                 if let Some(usage) = &node.usage {
                     let lanes = [
                         usage
@@ -1313,6 +1327,7 @@ mod tests {
             start_elapsed_ms,
             duration_ms,
             outcome,
+            decision_detail: None,
             usage,
             context,
             coverage_gaps: Vec::new(),

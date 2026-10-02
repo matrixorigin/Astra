@@ -80,14 +80,10 @@ pub(super) async fn build_runtime_wiring(
             delegation_tracker,
             sub_run_executor,
         )
-        .with_mailbox_router(Arc::clone(&agent_mailbox_router))
-        .with_projection_store(Arc::clone(&state_projection_store)),
+        .with_mailbox_router(Arc::clone(&agent_mailbox_router)),
     );
 
     astra_turn_core::parallel_tool_exec::set_tool_execution_metrics_registry(
-        state.metrics_registry(),
-    );
-    astra_turn_core::ws_user_prompt_gate::set_ws_user_prompt_metrics_registry(
         state.metrics_registry(),
     );
     crate::llm_provider_admission::set_llm_provider_admission_metrics_registry(

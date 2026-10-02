@@ -18,6 +18,9 @@ pub enum McpError {
     #[error("Tool not found: {0}")]
     ToolNotFound(String),
 
+    #[error("No resolved execution policy for MCP tool: {0}")]
+    ToolPolicyUnavailable(String),
+
     #[error("Server not connected: {0}")]
     ServerNotConnected(String),
 

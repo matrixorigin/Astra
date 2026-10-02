@@ -51,13 +51,11 @@ mod validation;
 mod verified;
 
 pub use admin::{
-    DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminFeedbackStatsReader,
-    DatabaseAdminInitializer, DatabaseAdminTokenReader, DatabaseAdminTokenWriter,
-    DatabaseAdminUserRoleManager,
+    DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminInitializer,
+    DatabaseAdminTokenReader, DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager,
 };
 pub use admin::{
-    UnconfiguredAdminAuditReader, UnconfiguredAdminAuthorizer,
-    UnconfiguredAdminFeedbackStatsReader, UnconfiguredAdminInitializer,
+    UnconfiguredAdminAuditReader, UnconfiguredAdminAuthorizer, UnconfiguredAdminInitializer,
     UnconfiguredAdminTokenReader, UnconfiguredAdminTokenWriter, UnconfiguredAdminUserRoleManager,
 };
 pub use encryption::FernetTokenEncryptor;

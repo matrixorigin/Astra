@@ -353,8 +353,13 @@ mod tests {
             effective_hard_turn_limit: None,
         };
 
-        let control = astra_pipeline::step_protocol::RunExecutionControl::V2 {
+        let control = astra_pipeline::step_protocol::RunExecutionControl::V3 {
             hook_obligations: astra_turn_types::StopHookObligations::default(),
+            reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
+                run_id: "test-run".into(),
+                producer_owner_generation: 3,
+                pending: Vec::new(),
+            },
             completion_settlement: astra_turn_types::CompletionSettlementState {
                 work_settlement_only: true,
                 textless_response_retries: 1,

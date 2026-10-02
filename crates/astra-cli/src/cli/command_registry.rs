@@ -21,7 +21,7 @@ pub enum CommandGroup {
     Inspect,
     Tools,
     Settings,
-    /// Line-mode workspace commands, intentionally hidden from TUI discovery.
+    /// Non-interactive workspace commands, hidden from TUI discovery.
     Workspace,
 }
 
@@ -214,8 +214,6 @@ const EXPLAIN_SUBCOMMANDS: &[(&str, &str)] = &[
     ),
 ];
 
-const SYNC_SUBCOMMANDS: &[(&str, &str)] = &[("log", "Server-owned sync log hint")];
-
 const REVIEW_SUBCOMMANDS: &[(&str, &str)] = &[
     ("latest", "Review HEAD (default)"),
     ("working", "Review working tree vs HEAD"),
@@ -313,30 +311,16 @@ const TUI_MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
     ("session", "Show memory for this session"),
 ];
 
-const PROFILE_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("show", "Show the current user profile"),
-    ("edit", "Edit a preference"),
-    ("scenario", "Show the detected working scenario"),
-    ("stats", "Show profile usage stats"),
-    ("tools", "Show blocked tool policy"),
-    ("experiments", "Show enrolled experiments"),
-    ("reset", "Reset profile preferences"),
-    ("help", "Show profile help"),
-];
-
-// Shared line-mode completions retain `/session fork` and `/session list`.
-// The TUI uses the narrower list below to omit the unsupported fork action
-// and the redundant picker alias.
+// `/session list` is a native alias for the resume picker. Keep it accepted
+// without advertising a duplicate picker action in workbench completion.
 const SESSION_SUBCOMMANDS: &[(&str, &str)] = &[
     ("analyze", "Counter-only diagnostics for a session"),
     ("export", "Write a markdown transcript to disk"),
-    ("fork", "Branch a parallel session from a parent"),
     ("history", "Scroll a session's conversation history"),
     ("list", "Pick a session to resume"),
 ];
 
-// `/session list` remains accepted as an alias for `/resume`; session fork is
-// line-mode only. Surface only actions that add a distinct workbench flow.
+// Surface only actions that add a distinct workbench flow.
 const TUI_SESSION_SUBCOMMANDS: &[(&str, &str)] = &[
     ("analyze", "Show a concise session summary"),
     ("export", "Export a session transcript to Markdown"),
@@ -402,10 +386,8 @@ const TEAM_SUBCOMMANDS: &[(&str, &str)] = &[
 ];
 
 const MESSAGING_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("dlq", "Show dead letter queue"),
     ("help", "Show messaging help"),
     ("metrics", "Show metrics snapshot"),
-    ("status", "Show mailbox status"),
 ];
 
 const COMPACT_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -644,13 +626,6 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
-        "/cache",
-        "Prompt-cache summary and diagnosis for the active session",
-        CommandGroup::Inspect,
-    )
-    .with_arg_hint("[diagnosis|diag|detail]")
-    .with_tui_route(TuiCommandRoute::Unavailable),
-    CommandMeta::new(
         "/inspect",
         "Open the runtime inspector",
         CommandGroup::Inspect,
@@ -685,14 +660,6 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_subcommands(CONFIG_SUBCOMMANDS)
     .with_tui_subcommands(TUI_CONFIG_SUBCOMMANDS)
     .with_tui_route(TuiCommandRoute::Native),
-    CommandMeta::new(
-        "/sync",
-        "Cloud sync status (server-owned)",
-        CommandGroup::Inspect,
-    )
-    .with_subcommands(SYNC_SUBCOMMANDS)
-    .with_arg_hint("[log|push|pull]")
-    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/context",
         "Inspect the context window or export a JSON snapshot",
@@ -781,14 +748,6 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new("/logout", "Logout from the API", CommandGroup::Settings)
         .with_tui_route(TuiCommandRoute::Unavailable),
-    CommandMeta::new(
-        "/profile",
-        "Profile preferences: show, edit, scenario, stats, tools, experiments, reset",
-        CommandGroup::Settings,
-    )
-    .with_subcommands(PROFILE_SUBCOMMANDS)
-    .with_arg_hint("[show|edit <key> <value>|scenario|stats|tools|experiments|reset]")
-    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/memory-setup",
         "Guided Memoria configuration",
@@ -1053,6 +1012,9 @@ mod tests {
             "/quit",
             "/whoami",
             "/health",
+            "/cache",
+            "/sync",
+            "/profile",
             "/panels",
             "/turn",
             "/verbose",
@@ -1099,7 +1061,7 @@ mod tests {
 
     #[test]
     fn resolve_prefix_ambiguous() {
-        // Both /session and /sync start with /s
+        // Several current commands (including /session and /stats) start with /s
         let result = resolve_command("/s");
         assert!(result.is_err());
         let candidates = result.unwrap_err();
@@ -1211,7 +1173,7 @@ mod tests {
         let subs = subs.unwrap();
         assert!(subs.iter().any(|(tok, _)| *tok == "list"));
         assert!(subs.iter().any(|(tok, _)| *tok == "history"));
-        assert!(subs.iter().any(|(tok, _)| *tok == "fork"));
+        assert!(!subs.iter().any(|(tok, _)| *tok == "fork"));
         assert!(subs.iter().any(|(tok, _)| *tok == "analyze"));
         assert!(subs.iter().any(|(tok, _)| *tok == "export"));
     }
@@ -1430,14 +1392,14 @@ mod tests {
         assert!(
             cli_session_subcommands
                 .iter()
-                .any(|(name, _)| *name == "fork")
+                .all(|(name, _)| *name != "fork")
         );
         let tui_session = resolve_command_meta("/session")
             .unwrap()
             .visible_tui_subcommands();
         assert!(
             tui_session.iter().all(|(name, _)| *name != "fork"),
-            "line-mode fork must not appear in workbench completion"
+            "unsupported fork must not appear in workbench completion"
         );
     }
 }

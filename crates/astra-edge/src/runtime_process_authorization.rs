@@ -23,7 +23,6 @@ pub(crate) async fn execute_bash(
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn managed_edge_bash_receives_call_scoped_runtime_authorization() {
@@ -37,8 +36,6 @@ mod tests {
             &workspace,
             "user-1",
             "session-1",
-            "astra-edge/test",
-            Duration::from_secs(30),
         );
 
         let result = execute_bash(

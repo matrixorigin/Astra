@@ -1,24 +1,15 @@
-pub mod adjust;
 pub mod capability_matrix;
-pub mod debug;
 pub mod forensics;
 mod kernel;
-pub mod query;
-pub mod rollback;
-pub mod scenario;
 mod snapshot_diff;
 pub mod trace;
 pub mod verifiers;
 
-pub use adjust::{AdjustCommand, AdjustSender, adjust_channel};
 pub use capability_matrix::{
     CAPABILITY_CASES, CapabilityCase, CapabilityQuadrant, CaseKind, MatrixIssue, ModelValidation,
     Topology, TraceContractViolation, validate_capability_matrix, verify_trace_contract,
 };
-pub use debug::{Breakpoint, DebugKernel};
 pub use kernel::{HarnessLimits, HarnessProfile, StandardKernel};
-pub use query::{HarnessQueryReceiver, HarnessQuerySender, query_channel};
-pub use rollback::RollbackAssessment;
 pub use snapshot_diff::SnapshotDiff;
 pub use trace::{PrivacyPolicy, RecordingKernel, SessionTrace, TraceOutcome};
 

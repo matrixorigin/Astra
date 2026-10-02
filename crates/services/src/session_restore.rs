@@ -430,21 +430,6 @@ pub struct RestoredCheckpoint {
     pub total_tokens: u64,
 }
 
-/// Result of restoring from a composite snapshot.
-#[derive(Debug, Clone)]
-pub struct RestoredCompositeState {
-    /// The base restored session (from session state dimension).
-    pub session: Option<RestoredSession>,
-    /// The composite snapshot that was restored from.
-    pub snapshot: astra_core::composite_snapshot::CompositeSnapshot,
-    /// Which dimensions were successfully restored.
-    pub restored_dimensions: Vec<String>,
-    /// Data snapshot ref to restore (caller handles actual SQL).
-    pub data_snapshot_to_restore: Option<astra_core::composite_snapshot::DataSnapshotRef>,
-    /// Git commit to checkout (caller handles actual git).
-    pub git_commit_to_checkout: Option<String>,
-}
-
 // ─── Session Restore Trait ──────────────────────────────────────────────────
 
 /// Abstraction for restoring session state from various backends.
@@ -474,29 +459,6 @@ pub trait SessionRestoreService: Send + Sync {
 
     /// List resumable sessions for a user (active or paused).
     async fn list_resumable_sessions(&self, user_id: &str) -> Result<Vec<RestoredSession>, String>;
-
-    /// Restore session state to a specific composite snapshot.
-    /// Uses the `RestoreSelector` to determine which dimensions to restore.
-    async fn restore_to_composite_snapshot(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        snapshot_id: &str,
-        selector: &astra_core::composite_snapshot::RestoreSelector,
-    ) -> Result<Option<RestoredCompositeState>, String> {
-        let _ = (user_id, session_id, snapshot_id, selector);
-        Ok(None)
-    }
-
-    /// List composite snapshots for a session.
-    async fn list_composite_snapshots(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<astra_core::composite_snapshot::CompositeSnapshotIndex, String> {
-        let _ = (user_id, session_id);
-        Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default())
-    }
 }
 
 async fn restore_cloud_cache_token_totals(
@@ -831,36 +793,6 @@ impl HybridRestoreService {
                 .map_err(|e| format!("restore_cloud_workspace: {e}"))?;
 
         Ok(Some(CloudWorkspaceArtifact { metadata }))
-    }
-
-    async fn restore_cloud_composite_snapshot_index(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<Option<astra_core::composite_snapshot::CompositeSnapshotIndex>, String> {
-        let pool = match self.pool.as_ref() {
-            Some(pool) => pool,
-            None => return Ok(None),
-        };
-        let artifact = crate::session_artifact_store::load_json_artifact_from_pool(
-            pool,
-            user_id,
-            session_id,
-            COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID,
-        )
-        .await
-        .map_err(|error| format!("restore_cloud_composite_snapshot_index: {error}"))?;
-
-        let Some(artifact) = artifact else {
-            return Ok(None);
-        };
-
-        let mut index = serde_json::from_value::<
-            astra_core::composite_snapshot::CompositeSnapshotIndex,
-        >(artifact.content)
-        .map_err(|error| format!("restore_cloud_composite_snapshot_index: {error}"))?;
-        index.normalize_versions();
-        Ok(Some(index))
     }
 
     /// Restore from MatrixOne agent_sessions table.
@@ -1621,35 +1553,6 @@ pub async fn persist_remote_composite_snapshot_index(
         .map_err(|error| error.to_string())
 }
 
-fn merge_composite_snapshot_indexes(
-    local: astra_core::composite_snapshot::CompositeSnapshotIndex,
-    remote: astra_core::composite_snapshot::CompositeSnapshotIndex,
-) -> astra_core::composite_snapshot::CompositeSnapshotIndex {
-    local.merge_by_identity(remote)
-}
-
-fn merge_composite_snapshot_sources(
-    session_id: &str,
-    local: astra_core::composite_snapshot::CompositeSnapshotIndex,
-    remote: Result<Option<astra_core::composite_snapshot::CompositeSnapshotIndex>, String>,
-) -> Result<astra_core::composite_snapshot::CompositeSnapshotIndex, String> {
-    let remote = remote
-        .map_err(|error| {
-            format!(
-                "list_composite_snapshots: failed to read remote composite snapshot index for {session_id}: {error}"
-            )
-        })?
-        .unwrap_or_default();
-    Ok(merge_composite_snapshot_indexes(local, remote))
-}
-
-/// Parse checkpoint number from a heavy checkpoint filename ref (e.g. `000005-heavy.json`).
-fn parse_heavy_checkpoint_number(session_state_ref: &str) -> Option<u32> {
-    session_state_ref
-        .strip_suffix("-heavy.json")
-        .and_then(|prefix| prefix.parse().ok())
-}
-
 fn recent_tools_from_context_trace(
     trace: Option<&super::session_workspace::ContextTraceSignal>,
 ) -> Vec<String> {
@@ -2101,92 +2004,6 @@ impl SessionRestoreService for HybridRestoreService {
             sessions.push(restored);
         }
         Ok(sessions)
-    }
-
-    async fn restore_to_composite_snapshot(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        snapshot_id: &str,
-        selector: &astra_core::composite_snapshot::RestoreSelector,
-    ) -> Result<Option<RestoredCompositeState>, String> {
-        let index = self.list_composite_snapshots(user_id, session_id).await?;
-        let Some(snapshot) = index
-            .snapshots
-            .iter()
-            .find(|s| s.snapshot_id == snapshot_id)
-            .cloned()
-        else {
-            return Ok(None);
-        };
-
-        if snapshot.session_id != session_id {
-            return Err(format!(
-                "composite snapshot {} belongs to session {}, not {}",
-                snapshot_id, snapshot.session_id, session_id
-            ));
-        }
-
-        let mut restored_dimensions: Vec<String> = Vec::new();
-        let mut session: Option<RestoredSession> = None;
-
-        if selector.restore_session_state
-            && let Some(ref_str) = snapshot.session_state()
-            && let Some(ckpt_num) = parse_heavy_checkpoint_number(ref_str)
-        {
-            match self
-                .restore_to_checkpoint(user_id, session_id, ckpt_num)
-                .await
-            {
-                Ok(Some(s)) => {
-                    session = Some(s);
-                    restored_dimensions.push("session".to_string());
-                }
-                Ok(None) => {}
-                Err(e) => return Err(e),
-            }
-        }
-
-        let data_snapshot_to_restore = if selector.restore_data {
-            snapshot.data_snapshot().cloned()
-        } else {
-            None
-        };
-
-        let git_commit_to_checkout = if selector.restore_git {
-            snapshot.git_commit().map(str::to_string)
-        } else {
-            None
-        };
-
-        Ok(Some(RestoredCompositeState {
-            session,
-            snapshot,
-            restored_dimensions,
-            data_snapshot_to_restore,
-            git_commit_to_checkout,
-        }))
-    }
-
-    async fn list_composite_snapshots(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<astra_core::composite_snapshot::CompositeSnapshotIndex, String> {
-        if !self
-            .require_owned_cloud_session(user_id, session_id)
-            .await?
-        {
-            return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
-        }
-        // Runtime pushes this mutable projection after every successful local
-        // index update. The authenticated services view therefore reads the
-        // owner-scoped remote projection only.
-        let local = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
-        let remote = self
-            .restore_cloud_composite_snapshot_index(user_id, session_id)
-            .await;
-        merge_composite_snapshot_sources(session_id, local, remote)
     }
 }
 
@@ -4133,81 +3950,6 @@ mod tests {
         assert_eq!(merged[0].total_tokens, 1234);
     }
 
-    #[test]
-    fn merge_composite_snapshot_indexes_prefers_remote_snapshot_for_same_id() {
-        let local = astra_core::composite_snapshot::CompositeSnapshotIndex {
-            snapshots: vec![astra_core::composite_snapshot::CompositeSnapshot {
-                snapshot_id: "snap-1".into(),
-                session_id: "s1".into(),
-                turn: 2,
-                created_at: "2025-01-01T00:00:00Z".into(),
-                version: 1,
-                label: Some("local".into()),
-                refs: vec![],
-            }],
-        };
-        let remote = astra_core::composite_snapshot::CompositeSnapshotIndex {
-            snapshots: vec![astra_core::composite_snapshot::CompositeSnapshot {
-                snapshot_id: "snap-1".into(),
-                session_id: "s1".into(),
-                turn: 2,
-                created_at: "2025-01-01T00:00:01Z".into(),
-                version: 1,
-                label: Some("remote".into()),
-                refs: vec![],
-            }],
-        };
-
-        let merged = merge_composite_snapshot_indexes(local, remote);
-        assert_eq!(merged.snapshots.len(), 1);
-        assert_eq!(merged.snapshots[0].label.as_deref(), Some("remote"));
-    }
-
-    #[test]
-    fn merge_composite_snapshot_sources_keeps_local_when_remote_is_absent() {
-        let local = astra_core::composite_snapshot::CompositeSnapshotIndex {
-            snapshots: vec![astra_core::composite_snapshot::CompositeSnapshot {
-                snapshot_id: "snap-local".into(),
-                session_id: "s1".into(),
-                turn: 2,
-                created_at: "2025-01-01T00:00:00Z".into(),
-                version: 1,
-                label: Some("local".into()),
-                refs: vec![],
-            }],
-        };
-
-        let merged = merge_composite_snapshot_sources("s1", local, Ok(None)).unwrap();
-
-        assert_eq!(merged.snapshots.len(), 1);
-        assert_eq!(merged.snapshots[0].snapshot_id, "snap-local");
-    }
-
-    #[test]
-    fn merge_composite_snapshot_sources_fails_loudly_on_remote_error() {
-        let local = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
-
-        let error = merge_composite_snapshot_sources(
-            "s1",
-            local,
-            Err("restore_cloud_composite_snapshot_index: corrupt artifact JSON".into()),
-        )
-        .unwrap_err();
-
-        assert!(
-            error.contains("list_composite_snapshots"),
-            "remote composite snapshot error should keep caller context: {error}"
-        );
-        assert!(
-            error.contains("failed to read remote composite snapshot index"),
-            "remote composite snapshot error should identify the failed source: {error}"
-        );
-        assert!(
-            error.contains("corrupt artifact JSON"),
-            "remote composite snapshot error should preserve the source error: {error}"
-        );
-    }
-
     #[tokio::test]
     async fn local_only_restore_to_checkpoint_session_not_found() {
         let svc = HybridRestoreService::local_only();
@@ -4937,24 +4679,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_heavy_checkpoint_number_from_ref() {
-        assert_eq!(
-            super::parse_heavy_checkpoint_number("000005-heavy.json"),
-            Some(5)
-        );
-        assert_eq!(
-            super::parse_heavy_checkpoint_number("000042-heavy.json"),
-            Some(42)
-        );
-        assert!(super::parse_heavy_checkpoint_number("not-a-checkpoint").is_none());
-        assert!(super::parse_heavy_checkpoint_number("000005-light.json").is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // Unhappy-path / edge-case tests
-    // -----------------------------------------------------------------------
-
-    #[test]
     fn restored_session_minimal_json() {
         // Required fields without serde(default)
         let json = r#"{
@@ -5012,54 +4736,6 @@ mod tests {
         assert_eq!(loaded.number, 5);
         assert_eq!(loaded.turn, 10);
         assert_eq!(loaded.title, "Phase 1 complete");
-    }
-
-    #[test]
-    fn parse_heavy_checkpoint_number_zero_padded() {
-        assert_eq!(
-            super::parse_heavy_checkpoint_number("000001-heavy.json"),
-            Some(1)
-        );
-        assert_eq!(
-            super::parse_heavy_checkpoint_number("000999-heavy.json"),
-            Some(999)
-        );
-    }
-
-    #[test]
-    fn parse_heavy_checkpoint_number_no_padding() {
-        assert_eq!(
-            super::parse_heavy_checkpoint_number("1-heavy.json"),
-            Some(1)
-        );
-        assert_eq!(
-            super::parse_heavy_checkpoint_number("42-heavy.json"),
-            Some(42)
-        );
-    }
-
-    #[test]
-    fn parse_heavy_checkpoint_number_empty_string() {
-        assert!(super::parse_heavy_checkpoint_number("").is_none());
-    }
-
-    #[test]
-    fn parse_heavy_checkpoint_number_wrong_suffix() {
-        assert!(super::parse_heavy_checkpoint_number("000005-light.json").is_none());
-        assert!(super::parse_heavy_checkpoint_number("000005-heavy.txt").is_none());
-        assert!(super::parse_heavy_checkpoint_number("000005.json").is_none());
-    }
-
-    #[test]
-    fn parse_heavy_checkpoint_number_non_numeric_prefix() {
-        assert!(super::parse_heavy_checkpoint_number("abc-heavy.json").is_none());
-        assert!(super::parse_heavy_checkpoint_number("-heavy.json").is_none());
-    }
-
-    #[test]
-    fn parse_heavy_checkpoint_number_negative() {
-        // "-1-heavy.json" → strip suffix → "-1" → parse fails
-        assert!(super::parse_heavy_checkpoint_number("-1-heavy.json").is_none());
     }
 
     #[test]

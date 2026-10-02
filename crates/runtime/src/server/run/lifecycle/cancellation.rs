@@ -4,7 +4,7 @@
 use super::*;
 use astra_services::SessionContextCoordinator;
 use astra_services::runs::CancelSessionRecord;
-use astra_services::session_context_coordinator::WorkspaceReuseBlocker;
+use astra_services::session_context_coordinator::SessionExecutionBlocker;
 
 const SESSION_CANCEL_CONVERGENCE_BUDGET: Duration = Duration::from_secs(1);
 const SESSION_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -23,7 +23,7 @@ impl AgenticRunLifecycleService {
             .await
             .map_err(|error| Self::durable_persist_error("cancel session intent", error))?;
         let deadline = tokio::time::Instant::now() + SESSION_CANCEL_CONVERGENCE_BUDGET;
-        let mut workspace_blocker;
+        let mut execution_blocker;
         let execution_settled = 'convergence: {
             loop {
                 let mut candidates = self
@@ -60,12 +60,12 @@ impl AgenticRunLifecycleService {
                 }
                 self.release_cancelled_run_writer(session_id, user_id, &observed)
                     .await?;
-                workspace_blocker = self
+                execution_blocker = self
                     .session_cancellation_blocker(session_id, user_id)
                     .await?;
                 if all_observed
                     && observed.values().all(|run| run.execution_settled)
-                    && workspace_blocker.is_none()
+                    && execution_blocker.is_none()
                 {
                     break 'convergence true;
                 }
@@ -78,7 +78,7 @@ impl AgenticRunLifecycleService {
         Ok(CancelSessionRecord {
             runs: observed.into_values().collect(),
             execution_settled,
-            workspace_blocker,
+            execution_blocker,
         })
     }
 
@@ -289,7 +289,7 @@ impl AgenticRunLifecycleService {
         &self,
         session_id: &str,
         user_id: &str,
-    ) -> Result<Option<WorkspaceReuseBlocker>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<Option<SessionExecutionBlocker>, (StatusCode, Json<ErrorResponse>)> {
         if let Some(pool) = self.shared_pool.as_ref() {
             let blocker = astra_services::DatabaseSessionContextCoordinator::new(pool.clone())
                 .execution_reuse_blocker(&session_cancellation_key(user_id, session_id))
@@ -303,7 +303,7 @@ impl AgenticRunLifecycleService {
                         && run.session_id == session_id
                         && (run.execution_live || run.settlement_in_progress)
                 }) {
-                    Some(WorkspaceReuseBlocker::ActiveRun)
+                    Some(SessionExecutionBlocker::ActiveRun)
                 } else {
                     None
                 },
@@ -313,7 +313,7 @@ impl AgenticRunLifecycleService {
             .session_cancellation_candidates(session_id, user_id)
             .await?
             .is_empty())
-        .then_some(WorkspaceReuseBlocker::ActiveRun))
+        .then_some(SessionExecutionBlocker::ActiveRun))
     }
 }
 

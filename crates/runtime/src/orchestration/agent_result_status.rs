@@ -111,14 +111,7 @@ pub fn project_agent_tool_budget_record(
     } else {
         project_agent_tool_wire(action_name, record.ok, projection.parsed_result.as_ref())
     };
-    let terminal = matches!(
-        wire.outcome,
-        AgentToolWireOutcomeKind::Completed
-            | AgentToolWireOutcomeKind::Failed
-            | AgentToolWireOutcomeKind::TimedOut
-            | AgentToolWireOutcomeKind::Cancelled
-            | AgentToolWireOutcomeKind::Interrupted
-    );
+    let terminal = wire.child_terminal;
     let mut completed_result = None;
     let mut partial_result = None;
     let mut incomplete_reason = None;
@@ -393,6 +386,7 @@ mod tests {
     #[test]
     fn completed_text_extracts_interrupted_partial_results() {
         let parsed = json!({
+            "result_family": "child_result",
             "status": AgentToolResultStatusKind::Interrupted.as_str(),
             "agent_id": "reviewer@abc",
             "result": "partial findings",
@@ -480,8 +474,9 @@ mod tests {
     }
 
     #[test]
-    fn wire_projection_covers_interrupted_running_legacy_and_tool_failure_paths() {
+    fn wire_projection_covers_explicit_children_and_rejects_untyped_success() {
         let interrupted = json!({
+            "result_family": "child_result",
             "status": AgentToolResultStatusKind::Interrupted.as_str(),
             "agent_id": "reviewer@abc",
             "finish_reason": "budget_exhausted"
@@ -492,6 +487,7 @@ mod tests {
         assert_eq!(projection.finish_reason, Some("budget_exhausted"));
 
         let launched = json!({
+            "result_family": "child_result",
             "status": AgentToolResultStatusKind::Launched.as_str(),
             "agent_id": "reviewer@abc",
             "description": "Architecture review"
@@ -500,21 +496,24 @@ mod tests {
         assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Running);
         assert_eq!(projection.display_name_hint, Some("Architecture review"));
 
-        let legacy = json!({
+        let untyped = json!({
             "agent_id": "reviewer@abc",
             "result": "done"
         });
-        let projection = project_agent_tool_wire("get_result", true, Some(&legacy));
-        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Completed);
+        let projection = project_agent_tool_wire("get_result", true, Some(&untyped));
+        assert_ne!(projection.outcome, AgentToolWireOutcomeKind::Completed);
         assert!(projection.has_result);
 
         let empty_success = json!({
             "agent_id": "reviewer@abc"
         });
         let projection = project_agent_tool_wire("get_result", true, Some(&empty_success));
-        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::NoChange);
+        // Untyped data cannot prove completion. Whether malformed receipts
+        // change execution ownership is a separate lifecycle contract.
+        assert_ne!(projection.outcome, AgentToolWireOutcomeKind::Completed);
 
         let unknown_status = json!({
+            "result_family": "child_result",
             "status": "mystery",
             "agent_id": "reviewer@abc"
         });
@@ -590,6 +589,7 @@ mod tests {
             ),
             result_full: Some(
                 json!({
+                    "result_family": "child_result",
                     "status": AgentToolResultStatusKind::Launched.as_str(),
                     "agent_id": "reviewer@abc"
                 })
@@ -637,6 +637,7 @@ mod tests {
             result_full: Some(
                 json!({
                     "status": "failed",
+                    "result_family": "child_result",
                     "agent_id": "failed-child",
                     "error": "child exploded"
                 })
@@ -671,6 +672,18 @@ mod tests {
         assert_eq!(projection.outcome, AgentToolWireOutcomeKind::NoChange);
         assert!(!projection.terminal);
         assert!(!projection.successful);
+        for result in [
+            json!({"error":"observation rejected", "agent_id":"failed-child"}),
+            json!({"result_family":"child_result", "status":"unknown", "agent_id":"failed-child"}),
+            json!({"result_family":"child_result", "status":"timeout", "agent_id":"failed-child"}),
+        ] {
+            let mut observation = retry_error.clone();
+            observation.result_full = Some(result.to_string());
+            assert!(
+                !project_agent_tool_budget_record(&observation).terminal,
+                "failed observations cannot retire a child: {result}"
+            );
+        }
     }
 
     #[test]
@@ -688,6 +701,7 @@ mod tests {
             ),
             result_full: Some(
                 json!({
+                    "result_family": "child_result",
                     "status": "interrupted",
                     "agent_id": "interrupted-child",
                     "finish_reason": "budget_exhausted",

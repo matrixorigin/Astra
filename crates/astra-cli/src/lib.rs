@@ -161,6 +161,4 @@ pub(crate) mod tests {
     mod preamble_tests;
     mod resume_tests;
     mod self_command_tests;
-    mod slash_command_tests;
-    mod stats_tools_tests;
 }

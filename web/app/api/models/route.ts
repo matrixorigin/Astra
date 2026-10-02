@@ -19,6 +19,21 @@ function formatThinking(value: RuntimeModelListItem["thinking_capability"]) {
   return value;
 }
 
+function formatPrice(pricing: RuntimeModelListItem["pricing"]) {
+  if (!pricing) {
+    return "Price unknown";
+  }
+  const perMillion = (rate: number) =>
+    new Intl.NumberFormat("en-US", { maximumSignificantDigits: 6 }).format(rate * 1_000_000);
+  const cacheRead = pricing.cache_read === null
+    ? "cache read unknown"
+    : `$${perMillion(pricing.cache_read)} cache read`;
+  const cacheWrite = pricing.cache_write === null
+    ? "cache write unknown"
+    : `$${perMillion(pricing.cache_write)} cache write`;
+  return `Configured USD: $${perMillion(pricing.prompt)} input / $${perMillion(pricing.completion)} output / ${cacheRead} / ${cacheWrite} per 1M tokens · config updated ${pricing.configuration_updated_at}`;
+}
+
 function toModelSummary(model: RuntimeModelListItem): ModelSummary | null {
   const id = model.offering_id;
   const name = model.name.trim();
@@ -33,6 +48,7 @@ function toModelSummary(model: RuntimeModelListItem): ModelSummary | null {
     typeof model.architecture === "string" ? model.architecture : null,
     formatTokens(model.context_window),
     formatThinking(model.thinking_capability),
+    formatPrice(model.pricing),
   ].filter((part): part is string => Boolean(part));
 
   return {

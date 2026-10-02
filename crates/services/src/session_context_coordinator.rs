@@ -30,10 +30,13 @@ use uuid::Uuid;
 
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 512;
 
-/// Evidence preventing fenced checkout reuse. Session history is never a blocker.
+/// Evidence that a Session still has execution work which must settle before
+/// cancellation or provider handoff can be considered complete. Session
+/// history is never a blocker, and another Session using the same physical
+/// workspace is not a blocker either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkspaceReuseBlocker {
+pub enum SessionExecutionBlocker {
     ExecutionSlot,
     ActiveRun,
     SettlementPending,
@@ -41,13 +44,12 @@ pub enum WorkspaceReuseBlocker {
     BindingNotReady,
     UnresolvedTool,
     OwnerUnavailable,
-    ClaimChanged,
 }
 
-impl WorkspaceReuseBlocker {
+impl SessionExecutionBlocker {
     pub fn explanation(self) -> &'static str {
         match self {
-            Self::ExecutionSlot => "an execution still holds the checkout",
+            Self::ExecutionSlot => "an execution still holds the Session execution slot",
             Self::ActiveRun => "a run or child task has not stopped",
             Self::SettlementPending => "execution stopped but its durable settlement is incomplete",
             Self::WriterOrReservation => {
@@ -59,15 +61,14 @@ impl WorkspaceReuseBlocker {
             Self::UnresolvedTool => {
                 "a tool invocation has no confirmed outcome; external effects may still be running"
             }
-            Self::OwnerUnavailable => "the previous owner's state cannot be verified",
-            Self::ClaimChanged => "checkout ownership changed during admission",
+            Self::OwnerUnavailable => "the Session state cannot be verified",
         }
     }
 
     pub fn recovery_action(self) -> &'static str {
         match self {
             Self::ExecutionSlot | Self::ActiveRun => "wait_or_cancel_session",
-            Self::WriterOrReservation | Self::ClaimChanged => "retry_session",
+            Self::WriterOrReservation => "retry_session",
             Self::BindingNotReady
             | Self::UnresolvedTool
             | Self::OwnerUnavailable
@@ -86,7 +87,7 @@ impl WorkspaceReuseBlocker {
             ),
         };
         format!(
-            "Checkout temporarily unavailable: Session {owner}: {}. {action}. Session history can be kept; an idle checkout is reused automatically. Use a separate worktree for concurrent work.",
+            "Session {owner} still has execution state to settle: {}. {action}. Session history is preserved and another session may use the same workspace.",
             self.explanation()
         )
     }
@@ -134,14 +135,6 @@ pub enum SessionContextCoordinatorError {
     ExecutionBindingPresent { generation: u64 },
     #[error("session execution binding is busy with an active Run or unresolved invocation")]
     ExecutionBindingBusy,
-    #[error(
-        "execution workspace is already claimed by session {owner_session_id} on branch {owner_branch_id}: {blocker:?}"
-    )]
-    ExecutionWorkspaceClaimed {
-        owner_session_id: String,
-        owner_branch_id: String,
-        blocker: WorkspaceReuseBlocker,
-    },
     #[error("session execution binding is not ready: {0:?}")]
     ExecutionBindingNotReady(SessionExecutionBindingStateV1),
     #[error("coordinator database operation {operation} failed: {source}")]
@@ -243,10 +236,10 @@ pub enum SessionExecutionBindingStateV1 {
 }
 
 impl SessionExecutionBindingV1 {
-    /// Derive the bounded physical identity used by Edge workspace claims.
-    /// The persisted materialization identity separates independent devices
-    /// that happen to use the same path, while the canonical root prevents two
-    /// Edge labels from claiming one checkout after a reconnect or relabel.
+    /// Derive the bounded physical identity used by executor-local workspace
+    /// coordination. The persisted materialization identity separates
+    /// independent devices that happen to use the same path, while the
+    /// canonical root keeps reconnects tied to the same physical materialization.
     pub fn edge_materialization_physical_identity(
         materialization_id: &str,
         canonical_root: &str,
@@ -345,6 +338,13 @@ impl SessionExecutionBindingV1 {
                 | Some(crate::runs::ToolTransportKindRequest::EdgeWsAuthorized)
                 | Some(crate::runs::ToolTransportKindRequest::EdgeLedger)
         );
+        let edge_physical_identity_present =
+            self.physical_workspace_id
+                .as_deref()
+                .is_some_and(|identity| {
+                    let trimmed = identity.trim();
+                    !trimmed.is_empty() && trimmed.len() <= 512 && !trimmed.contains('\0')
+                });
         let valid_edge_binding = matches!(
             (self.workspace.kind, self.executor.kind),
             (
@@ -360,6 +360,7 @@ impl SessionExecutionBindingV1 {
                 !trimmed.is_empty() && trimmed.len() <= 255 && !trimmed.contains('\0')
             })
             && edge_transport_supported
+            && edge_physical_identity_present
             && self.workspace.authority != Some(crate::runs::WorkspaceAuthorityRequest::None);
         if !valid_server_binding && !valid_edge_binding {
             return Err(SessionContextCoordinatorError::Invalid(
@@ -911,12 +912,12 @@ impl DatabaseSessionContextCoordinator {
         Self { pool }
     }
 
-    /// The same fenced idle proof used by physical checkout reuse. A caller
-    /// must also retain any process-local executor evidence it owns.
+    /// Fenced proof that this Session has no remaining execution debt. A
+    /// caller must also retain any process-local executor evidence it owns.
     pub async fn execution_reuse_blocker(
         &self,
         key: &SessionKeyV1,
-    ) -> Result<Option<WorkspaceReuseBlocker>, SessionContextCoordinatorError> {
+    ) -> Result<Option<SessionExecutionBlocker>, SessionContextCoordinatorError> {
         key.validate()
             .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
@@ -926,7 +927,7 @@ impl DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_execution_idle_proof", source))?;
-        let blocker = locked_execution_reuse_blocker(&mut tx, key, None).await?;
+        let blocker = locked_execution_reuse_blocker(&mut tx, key).await?;
         tx.commit()
             .await
             .map_err(|source| database_error("commit_execution_idle_proof", source))?;
@@ -1039,116 +1040,6 @@ impl DatabaseSessionContextCoordinator {
         Ok(true)
     }
 
-    /// Retire only an idle physical claim, in a transaction belonging to its
-    /// existing owner. Never lock a second Session head inside admission.
-    async fn release_idle_execution_workspace_claim(
-        &self,
-        claimant: &SessionKeyV1,
-        target: &SessionExecutionBindingV1,
-    ) -> Result<(), SessionContextCoordinatorError> {
-        let Some(identity) = execution_workspace_identity(target) else {
-            return Ok(());
-        };
-        let identity_hash = execution_workspace_identity_hash(&identity);
-        let owner = sqlx::query(
-            "SELECT workspace_identity, session_id, branch_id
-             FROM session_execution_workspace_claims
-             WHERE isolation_domain = ? AND owner_user_id = ? AND workspace_identity_hash = ?",
-        )
-        .bind(&claimant.isolation_domain)
-        .bind(&claimant.owner_user_id)
-        .bind(&identity_hash)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| database_error("discover_idle_workspace_claim", source))?;
-        let Some(owner) = owner else {
-            return Ok(());
-        };
-        let existing_identity: String = owner
-            .try_get("workspace_identity")
-            .map_err(|source| database_error("decode_idle_workspace_identity", source))?;
-        let session_id: String = owner
-            .try_get("session_id")
-            .map_err(|source| database_error("decode_idle_workspace_session", source))?;
-        let branch_id: String = owner
-            .try_get("branch_id")
-            .map_err(|source| database_error("decode_idle_workspace_branch", source))?;
-        if existing_identity != identity
-            || (session_id == claimant.session_id && branch_id == claimant.branch_id)
-        {
-            return Ok(());
-        }
-        let key = SessionKeyV1::owner_session(
-            &claimant.isolation_domain,
-            &claimant.owner_user_id,
-            &session_id,
-            &branch_id,
-        );
-        let blocked = |blocker| SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
-            owner_session_id: session_id.clone(),
-            owner_branch_id: branch_id.clone(),
-            blocker,
-        };
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| database_error("acquire_idle_workspace_release", source))?;
-        let mut tx = connection
-            .begin()
-            .await
-            .map_err(|source| database_error("begin_idle_workspace_release", source))?;
-        if let Some(blocker) =
-            locked_execution_reuse_blocker(&mut tx, &key, Some(&identity)).await?
-        {
-            // Discovery precedes the owner's fence. It may since have moved
-            // to another checkout; never attribute its new execution to this
-            // checkout or suggest cancelling it. This is the last lock on a
-            // blocked path, so it cannot invert head-before-claim ordering.
-            if !workspace_claim_still_owned_in_tx(&mut tx, &key, &identity).await? {
-                return Ok(());
-            }
-            return Err(blocked(blocker));
-        }
-        // This conditional delete is a current write, not the discovery
-        // snapshot. If another owner won meanwhile it cannot delete its claim.
-        sqlx::query(
-            "DELETE FROM session_execution_workspace_claims
-             WHERE isolation_domain = ? AND owner_user_id = ? AND workspace_identity_hash = ?
-             AND workspace_identity = ? AND session_id = ? AND branch_id = ?",
-        )
-        .bind(&key.isolation_domain)
-        .bind(&key.owner_user_id)
-        .bind(&identity_hash)
-        .bind(&identity)
-        .bind(&key.session_id)
-        .bind(&key.branch_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| database_error("release_idle_workspace_claim", source))?;
-        tx.commit()
-            .await
-            .map_err(|source| database_error("commit_idle_workspace_release", source))?;
-        connection.release();
-        Ok(())
-    }
-
-    async fn release_idle_claim_for_current_binding(
-        &self,
-        key: &SessionKeyV1,
-        expected_generation: Option<u64>,
-    ) -> Result<(), SessionContextCoordinatorError> {
-        let Some(expected) = expected_generation.filter(|generation| *generation != 0) else {
-            return Ok(());
-        };
-        if let Some(binding) = self.load_execution_binding(key).await?
-            && binding.generation == expected
-            && binding.state == SessionExecutionBindingStateV1::Ready
-        {
-            self.release_idle_execution_workspace_claim(key, &binding)
-                .await?;
-        }
-        Ok(())
-    }
-
     /// Load the provider selection for one Work Session, creating the supplied
     /// server-owned initial binding exactly once when upgrading an existing
     /// Work branch. Session-head locking serializes concurrent first reads
@@ -1166,12 +1057,6 @@ impl DatabaseSessionContextCoordinator {
                 "initial Session execution binding must be ready at generation 1".into(),
             ));
         }
-        let target = self
-            .load_execution_binding(key)
-            .await?
-            .unwrap_or_else(|| initial.clone());
-        self.release_idle_execution_workspace_claim(key, &target)
-            .await?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| database_error("acquire_execution_binding_initialize", source))?;
@@ -1193,17 +1078,12 @@ impl DatabaseSessionContextCoordinator {
             return Err(SessionContextCoordinatorError::ExecutionBindingBusy);
         }
 
-        // Existing Edge bindings may predate the workspace-claim table. Bring
-        // their physical claim into the same transaction before returning so
-        // initialization is also an admission boundary for multi-Session
-        // callers.
         if let Some(binding) = load_execution_binding_in_tx(&mut tx, key, true).await? {
             if binding.logical_workspace_id != initial.logical_workspace_id {
                 return Err(SessionContextCoordinatorError::NeedsRepair(
                     "Session execution binding belongs to another logical workspace".into(),
                 ));
             }
-            ensure_execution_workspace_claim_in_tx(&mut tx, key, &binding).await?;
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_execution_binding_existing", source))?;
@@ -1211,7 +1091,6 @@ impl DatabaseSessionContextCoordinator {
             return Ok(binding);
         }
 
-        ensure_execution_workspace_claim_in_tx(&mut tx, key, initial).await?;
         let binding_json = database_to_json("session_execution_binding", initial)?;
         sqlx::query(
             "INSERT IGNORE INTO session_execution_bindings \
@@ -1294,8 +1173,6 @@ impl DatabaseSessionContextCoordinator {
             ));
         }
 
-        self.release_idle_execution_workspace_claim(key, next)
-            .await?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| database_error("acquire_execution_binding_cas", source))?;
@@ -1370,7 +1247,6 @@ impl DatabaseSessionContextCoordinator {
             return Err(SessionContextCoordinatorError::ExecutionBindingBusy);
         }
 
-        ensure_execution_workspace_claim_in_tx(&mut tx, key, next).await?;
         let binding_json = database_to_json("session_execution_binding", next)?;
         let updated = sqlx::query(
             "UPDATE session_execution_bindings \
@@ -1438,8 +1314,6 @@ impl DatabaseSessionContextCoordinator {
         }
 
         let request_hash = execution_switch_request_hash(key, request)?;
-        self.release_idle_execution_workspace_claim(key, &request.target)
-            .await?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| database_error("acquire_execution_switch", source))?;
@@ -3215,11 +3089,6 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         validate_ttl(ttl, MAX_RESERVATION_TTL)?;
         validate_idempotency_key(idempotency_key)?;
         validate_optional_cursor(&lease.key, expected_cursor)?;
-        self.release_idle_claim_for_current_binding(
-            &lease.key,
-            expected_execution_binding_generation,
-        )
-        .await?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| database_error("acquire_reserve_turn", source))?;
@@ -3451,8 +3320,6 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .map_err(|_| SessionContextCoordinatorError::Unauthorized)?;
         validate_optional_cursor(key, expected_cursor)?;
 
-        self.release_idle_claim_for_current_binding(key, expected_execution_binding_generation)
-            .await?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| database_error("acquire_and_reserve_turn", source))?;
@@ -4769,47 +4636,28 @@ async fn clear_writer_authority_in_tx(
     update_database_state(tx, state).await
 }
 
-async fn workspace_claim_still_owned_in_tx(
-    tx: &mut Transaction<'_, MySql>,
-    key: &SessionKeyV1,
-    identity: &str,
-) -> Result<bool, SessionContextCoordinatorError> {
-    let current = sqlx::query(
-        "SELECT 1 FROM session_execution_workspace_claims
-         WHERE isolation_domain = ? AND owner_user_id = ? AND workspace_identity_hash = ?
-           AND workspace_identity = ? AND session_id = ? AND branch_id = ? FOR UPDATE",
-    )
-    .bind(&key.isolation_domain)
-    .bind(&key.owner_user_id)
-    .bind(execution_workspace_identity_hash(identity))
-    .bind(identity)
-    .bind(&key.session_id)
-    .bind(&key.branch_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|source| database_error("recheck_workspace_blocker_owner", source))?;
-    Ok(current.is_some())
-}
-
-/// One owner-scoped current-read proof for cancellation and checkout reuse.
-/// Never hold a claimant's Session head while establishing this proof.
+/// One owner-scoped current-read proof for cancellation and provider handoff.
+/// A physical workspace is intentionally absent from this proof: independent
+/// Sessions may share it, while each Session's own execution state remains
+/// fenced by its Session head, Run slot, and binding generation.
 async fn locked_execution_reuse_blocker(
     tx: &mut Transaction<'_, MySql>,
     key: &SessionKeyV1,
-    expected_workspace_identity: Option<&str>,
-) -> Result<Option<WorkspaceReuseBlocker>, SessionContextCoordinatorError> {
+) -> Result<Option<SessionExecutionBlocker>, SessionContextCoordinatorError> {
     match crate::storage::admit_session_execution_write(tx, &key.session_id, &key.owner_user_id)
         .await
     {
         Ok(()) => {}
-        Err(sqlx::Error::RowNotFound) => return Ok(Some(WorkspaceReuseBlocker::OwnerUnavailable)),
+        Err(sqlx::Error::RowNotFound) => {
+            return Ok(Some(SessionExecutionBlocker::OwnerUnavailable));
+        }
         Err(source) => return Err(database_error("fence_idle_workspace_session", source)),
     }
     let slot = sqlx::query("SELECT 1 FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE")
         .bind(&key.owner_user_id).bind(&key.session_id).fetch_optional(&mut **tx).await
         .map_err(|source| database_error("lock_idle_workspace_slot", source))?;
     if slot.is_some() {
-        return Ok(Some(WorkspaceReuseBlocker::ExecutionSlot));
+        return Ok(Some(SessionExecutionBlocker::ExecutionSlot));
     }
     // Terminal executors may still be unwinding. Their owner lease remains
     // relevant even though active-status discovery no longer includes them.
@@ -4825,7 +4673,7 @@ async fn locked_execution_reuse_blocker(
     .await
     .map_err(|source| database_error("lock_idle_workspace_runs", source))?;
     if running.is_some() {
-        return Ok(Some(WorkspaceReuseBlocker::ActiveRun));
+        return Ok(Some(SessionExecutionBlocker::ActiveRun));
     }
     // An executor may release its lease after failed closure. The durable
     // generation-scoped fence survives pod loss and is still execution debt.
@@ -4846,7 +4694,7 @@ async fn locked_execution_reuse_blocker(
             .await
             .map_err(|source| database_error("lock_idle_workspace_settlement", source))?
         {
-            return Ok(Some(WorkspaceReuseBlocker::SettlementPending));
+            return Ok(Some(SessionExecutionBlocker::SettlementPending));
         }
     }
     let head_exists = sqlx::query(
@@ -4864,35 +4712,14 @@ async fn locked_execution_reuse_blocker(
                 .as_ref()
                 .is_some_and(|lease| lease.expires_at_unix_ms > now)
         {
-            return Ok(Some(WorkspaceReuseBlocker::WriterOrReservation));
+            return Ok(Some(SessionExecutionBlocker::WriterOrReservation));
         }
-    } else if expected_workspace_identity.is_some() {
-        return Ok(Some(WorkspaceReuseBlocker::OwnerUnavailable));
     }
-    let binding_identity = match load_execution_binding_in_tx(tx, key, true).await? {
-        Some(binding) => {
-            if !head_exists {
-                return Ok(Some(WorkspaceReuseBlocker::OwnerUnavailable));
-            }
-            if binding.state != SessionExecutionBindingStateV1::Ready
-                || expected_workspace_identity.is_some_and(|identity| {
-                    execution_workspace_identity(&binding).as_deref() != Some(identity)
-                })
-            {
-                return Ok(Some(WorkspaceReuseBlocker::BindingNotReady));
-            }
-            execution_workspace_identity(&binding)
-        }
-        None => {
-            let claim = sqlx::query("SELECT 1 FROM session_execution_workspace_claims WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ? LIMIT 1")
-                .bind(&key.isolation_domain).bind(&key.owner_user_id).bind(&key.session_id).bind(&key.branch_id)
-                .fetch_optional(&mut **tx).await.map_err(|source| database_error("read_idle_workspace_binding_claim", source))?;
-            if expected_workspace_identity.is_some() || claim.is_some() {
-                return Ok(Some(WorkspaceReuseBlocker::OwnerUnavailable));
-            }
-            None
-        }
-    };
+    if let Some(binding) = load_execution_binding_in_tx(tx, key, true).await?
+        && binding.state != SessionExecutionBindingStateV1::Ready
+    {
+        return Ok(Some(SessionExecutionBlocker::BindingNotReady));
+    }
     let unresolved = sqlx::query(
         "SELECT 1 FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?
          AND state IN ('prepared', 'dispatched', 'outcome_unknown') LIMIT 1 FOR UPDATE",
@@ -4903,22 +4730,7 @@ async fn locked_execution_reuse_blocker(
     .await
     .map_err(|source| database_error("lock_idle_workspace_invocations", source))?;
     if unresolved.is_some() {
-        return Ok(Some(WorkspaceReuseBlocker::UnresolvedTool));
-    }
-    if expected_workspace_identity.is_none() {
-        // Cancellation has no claimant-supplied physical identity. Check any
-        // retained claim against the same binding before saying it is reusable.
-        // This is the final lock; do not acquire another Session/head after it.
-        let claim: Option<String> = sqlx::query_scalar(
-            "SELECT workspace_identity FROM session_execution_workspace_claims WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ? LIMIT 1 FOR UPDATE",
-        ).bind(&key.isolation_domain).bind(&key.owner_user_id).bind(&key.session_id).bind(&key.branch_id)
-            .fetch_optional(&mut **tx).await.map_err(|source| database_error("lock_idle_workspace_binding_claim", source))?;
-        if claim
-            .as_ref()
-            .is_some_and(|identity| binding_identity.as_ref() != Some(identity))
-        {
-            return Ok(Some(WorkspaceReuseBlocker::BindingNotReady));
-        }
+        return Ok(Some(SessionExecutionBlocker::UnresolvedTool));
     }
     Ok(None)
 }
@@ -5434,267 +5246,12 @@ async fn update_execution_switch_in_tx(
     Ok(())
 }
 
-fn execution_workspace_root(binding: &SessionExecutionBindingV1) -> Option<String> {
-    if binding.workspace.kind == crate::runs::WorkspaceBindingRequestKind::EdgeWorkspace {
-        binding
-            .workspace
-            .root
-            .as_deref()
-            .map(str::trim)
-            .filter(|root| !root.is_empty())
-            .map(ToOwned::to_owned)
-    } else {
-        None
-    }
-}
-
-fn execution_workspace_identity(binding: &SessionExecutionBindingV1) -> Option<String> {
-    let root = execution_workspace_root(binding)?;
-    let provider_scope = binding
-        .physical_workspace_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|scope| !scope.is_empty())?;
-    Some(format!("{provider_scope}\0{root}"))
-}
-
-fn execution_workspace_identity_hash(identity: &str) -> String {
-    format!("{:x}", Sha256::digest(identity.as_bytes()))
-}
-
-fn ordered_execution_claim_hashes(previous_hash: Option<&str>, next_hash: &str) -> Vec<String> {
-    let mut hashes = Vec::with_capacity(2);
-    if let Some(previous_hash) = previous_hash {
-        hashes.push(previous_hash.to_owned());
-    }
-    hashes.push(next_hash.to_owned());
-    hashes.sort_unstable();
-    hashes.dedup();
-    hashes
-}
-
-/// Reserve an Edge checkout for one executing Session at a time. Idle claims
-/// may be retired under their owner's canonical execution fence. The claim is
-/// keyed by a hash so long paths remain indexable; the full identity is
-/// retained and compared after the lock to make a hash collision fail closed.
-/// Claims move with the binding in the same transaction, so two Sessions
-/// racing for one directory cannot both commit a Ready/Switching selection,
-/// even when they use different Edge connection IDs.
-pub(crate) async fn ensure_execution_workspace_claim_in_tx(
-    tx: &mut Transaction<'_, MySql>,
-    key: &SessionKeyV1,
-    next: &SessionExecutionBindingV1,
-) -> Result<(), SessionContextCoordinatorError> {
-    let is_edge_binding = matches!(
-        (next.workspace.kind, next.executor.kind),
-        (
-            crate::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
-            crate::runs::ExecutorBindingRequestKind::EdgeAgent
-        )
-    );
-    if is_edge_binding && next.physical_workspace_id.is_none() {
-        return Err(SessionContextCoordinatorError::NeedsRepair(
-            "Edge execution binding has no authenticated physical workspace identity".into(),
-        ));
-    }
-    let Some(identity) = execution_workspace_identity(next) else {
-        sqlx::query(
-            "DELETE FROM session_execution_workspace_claims
-             WHERE isolation_domain = ? AND owner_user_id = ?
-               AND session_id = ? AND branch_id = ?",
-        )
-        .bind(&key.isolation_domain)
-        .bind(&key.owner_user_id)
-        .bind(&key.session_id)
-        .bind(&key.branch_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(|source| database_error("release_execution_workspace_claim", source))?;
-        return Ok(());
-    };
-    let identity_hash = execution_workspace_identity_hash(&identity);
-    // A Session may move from one Edge materialization to another. Read its
-    // current claim before changing it, then lock the old and new claim keys in
-    // canonical order. Two Sessions swapping checkouts therefore wait in the
-    // same order instead of deadlocking on opposite unique-key locks.
-    let previous_hash = sqlx::query_scalar::<_, String>(
-        "SELECT workspace_identity_hash
-         FROM session_execution_workspace_claims
-         WHERE isolation_domain = ? AND owner_user_id = ?
-           AND session_id = ? AND branch_id = ?
-         LIMIT 1",
-    )
-    .bind(&key.isolation_domain)
-    .bind(&key.owner_user_id)
-    .bind(&key.session_id)
-    .bind(&key.branch_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|source| database_error("read_execution_workspace_claim", source))?;
-    for claim_hash in ordered_execution_claim_hashes(previous_hash.as_deref(), &identity_hash) {
-        sqlx::query(
-            "SELECT workspace_identity_hash
-             FROM session_execution_workspace_claims
-             WHERE isolation_domain = ? AND owner_user_id = ?
-               AND workspace_identity_hash = ?
-             FOR UPDATE",
-        )
-        .bind(&key.isolation_domain)
-        .bind(&key.owner_user_id)
-        .bind(claim_hash)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|source| database_error("lock_execution_workspace_claim_ordered", source))?;
-    }
-    // The per-Session unique key would otherwise make `INSERT IGNORE` hide the
-    // old row and the subsequent lookup could never see the new workspace.
-    sqlx::query(
-        "DELETE FROM session_execution_workspace_claims
-         WHERE isolation_domain = ? AND owner_user_id = ?
-           AND session_id = ? AND branch_id = ?
-           AND workspace_identity_hash <> ?",
-    )
-    .bind(&key.isolation_domain)
-    .bind(&key.owner_user_id)
-    .bind(&key.session_id)
-    .bind(&key.branch_id)
-    .bind(&identity_hash)
-    .execute(&mut **tx)
-    .await
-    .map_err(|source| database_error("release_stale_execution_workspace_claim", source))?;
-    sqlx::query(
-        "INSERT IGNORE INTO session_execution_workspace_claims
-         (isolation_domain, owner_user_id, workspace_identity_hash, workspace_identity,
-          session_id, branch_id, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, NOW(6))",
-    )
-    .bind(&key.isolation_domain)
-    .bind(&key.owner_user_id)
-    .bind(&identity_hash)
-    .bind(&identity)
-    .bind(&key.session_id)
-    .bind(&key.branch_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(|source| database_error("claim_execution_workspace", source))?;
-    let existing = sqlx::query(
-        "SELECT workspace_identity, session_id, branch_id
-         FROM session_execution_workspace_claims
-         WHERE isolation_domain = ? AND owner_user_id = ?
-           AND workspace_identity_hash = ?
-         FOR UPDATE",
-    )
-    .bind(&key.isolation_domain)
-    .bind(&key.owner_user_id)
-    .bind(&identity_hash)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|source| database_error("lock_execution_workspace_claim", source))?;
-    let existing_identity = existing
-        .try_get::<String, _>("workspace_identity")
-        .map_err(|source| database_error("decode_execution_workspace_identity", source))?;
-    let existing_session = existing
-        .try_get::<String, _>("session_id")
-        .map_err(|source| database_error("decode_execution_workspace_session", source))?;
-    let existing_branch = existing
-        .try_get::<String, _>("branch_id")
-        .map_err(|source| database_error("decode_execution_workspace_branch", source))?;
-    if existing_identity != identity
-        || existing_session != key.session_id
-        || existing_branch != key.branch_id
-    {
-        return Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
-            owner_session_id: existing_session,
-            owner_branch_id: existing_branch,
-            blocker: WorkspaceReuseBlocker::ClaimChanged,
-        });
-    }
-    Ok(())
-}
-
-/// Run creation/resume holds the canonical Session execution fence. Recheck
-/// its selection using current reads so delayed admission cannot execute after
-/// an idle Session has relinquished the checkout. This is not a tool hot path.
-pub(crate) async fn ensure_run_execution_workspace_claim_in_tx(
-    tx: &mut Transaction<'_, MySql>,
-    user_id: &str,
-    session_id: &str,
-) -> Result<(), SessionContextCoordinatorError> {
-    let key = SessionKeyV1::owner_session(
-        "server",
-        user_id,
-        session_id,
-        astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
-    );
-    if let Some(binding) = load_execution_binding_in_tx(tx, &key, true).await? {
-        if binding.state != SessionExecutionBindingStateV1::Ready {
-            return Err(SessionContextCoordinatorError::ExecutionBindingNotReady(
-                binding.state,
-            ));
-        }
-        ensure_execution_workspace_claim_in_tx(tx, &key, &binding).await?;
-    }
-    Ok(())
-}
-
-/// Verify the claim that admission already established without taking a row
-/// lock or issuing a write. Tool dispatch runs once per invocation and may
-/// fan out many independent calls; it must only observe the immutable
-/// binding/claim pair while the Session execution slot fences handoff.
-pub(crate) async fn verify_execution_workspace_claim_in_tx(
-    tx: &mut Transaction<'_, MySql>,
-    key: &SessionKeyV1,
-    binding: &SessionExecutionBindingV1,
-) -> Result<(), SessionContextCoordinatorError> {
-    let Some(identity) = execution_workspace_identity(binding) else {
-        return Ok(());
-    };
-    let identity_hash = execution_workspace_identity_hash(&identity);
-    let row = sqlx::query(
-        "SELECT workspace_identity, session_id, branch_id
-         FROM session_execution_workspace_claims
-         WHERE isolation_domain = ? AND owner_user_id = ?
-           AND workspace_identity_hash = ?
-         LIMIT 1",
-    )
-    .bind(&key.isolation_domain)
-    .bind(&key.owner_user_id)
-    .bind(&identity_hash)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|source| database_error("verify_execution_workspace_claim", source))?;
-    let Some(row) = row else {
-        return Err(SessionContextCoordinatorError::ExecutionBindingBusy);
-    };
-    let existing_identity = row
-        .try_get::<String, _>("workspace_identity")
-        .map_err(|source| database_error("decode_execution_workspace_identity", source))?;
-    let existing_session = row
-        .try_get::<String, _>("session_id")
-        .map_err(|source| database_error("decode_execution_workspace_session", source))?;
-    let existing_branch = row
-        .try_get::<String, _>("branch_id")
-        .map_err(|source| database_error("decode_execution_workspace_branch", source))?;
-    if existing_identity != identity
-        || existing_session != key.session_id
-        || existing_branch != key.branch_id
-    {
-        return Err(SessionContextCoordinatorError::ExecutionWorkspaceClaimed {
-            owner_session_id: existing_session,
-            owner_branch_id: existing_branch,
-            blocker: WorkspaceReuseBlocker::ClaimChanged,
-        });
-    }
-    Ok(())
-}
-
 async fn update_execution_binding_in_tx(
     tx: &mut Transaction<'_, MySql>,
     key: &SessionKeyV1,
     expected_generation: u64,
     next: &SessionExecutionBindingV1,
 ) -> Result<(), SessionContextCoordinatorError> {
-    ensure_execution_workspace_claim_in_tx(tx, key, next).await?;
     let binding_json = database_to_json("session_execution_binding", next)?;
     let updated = sqlx::query(
         "UPDATE session_execution_bindings
@@ -5724,6 +5281,30 @@ async fn update_execution_binding_in_tx(
             expected: expected_generation,
             current: Some(next.generation),
         });
+    }
+    Ok(())
+}
+
+/// Run creation and non-root child admission must still respect the current
+/// Session binding state. The physical directory is not part of this check:
+/// executor-owned workspace leases coordinate operations after admission.
+pub(crate) async fn ensure_run_execution_binding_ready_in_tx(
+    tx: &mut Transaction<'_, MySql>,
+    user_id: &str,
+    session_id: &str,
+) -> Result<(), SessionContextCoordinatorError> {
+    let key = SessionKeyV1::owner_session(
+        "server",
+        user_id,
+        session_id,
+        astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+    );
+    if let Some(binding) = load_execution_binding_in_tx(tx, &key, true).await?
+        && binding.state != SessionExecutionBindingStateV1::Ready
+    {
+        return Err(SessionContextCoordinatorError::ExecutionBindingNotReady(
+            binding.state,
+        ));
     }
     Ok(())
 }
@@ -5782,7 +5363,6 @@ async fn validate_execution_binding_generation_in_tx(
             current.state,
         ));
     }
-    ensure_execution_workspace_claim_in_tx(tx, key, &current).await?;
     Ok(())
 }
 
@@ -7137,113 +6717,43 @@ fn hash_field(digest: &mut Sha256, value: &str) {
 mod adoption_tests {
     use super::*;
 
-    #[tokio::test]
-    #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-    async fn workspace_blocker_rechecks_owner_after_discovery_race() {
-        let _ = dotenvy::dotenv();
-        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
-        let settings = astra_core::MatrixOneSettings::from_env();
-        crate::storage::ensure_core_schema(&settings, "mysql")
-            .await
-            .unwrap();
-        let pool = SharedPool::new(&settings).await.unwrap();
-        let user = format!("blocker-race-{}", Uuid::new_v4());
-        let discovered = SessionKeyV1::owner_session("server", &user, "old-owner", "main");
-        let identity = format!("checkout-{}", Uuid::new_v4());
-        let hash = execution_workspace_identity_hash(&identity);
-        sqlx::query("INSERT INTO session_execution_workspace_claims
-            (isolation_domain, owner_user_id, workspace_identity_hash, workspace_identity, session_id, branch_id)
-            VALUES ('server', ?, ?, ?, 'old-owner', 'main')")
-            .bind(&user).bind(&hash).bind(&identity).execute(pool.get()).await.unwrap();
-
-        let mut tx = pool.get().begin().await.unwrap();
-        assert!(
-            workspace_claim_still_owned_in_tx(&mut tx, &discovered, &identity)
-                .await
-                .unwrap()
-        );
-        tx.commit().await.unwrap();
-        // Deterministically model ownership changing after discovery but
-        // before taking the old owner's execution fence. Its execution is no
-        // longer a blocker for this checkout, regardless of its run state.
-        sqlx::query(
-            "UPDATE session_execution_workspace_claims SET session_id = 'new-owner'
-            WHERE owner_user_id = ? AND workspace_identity_hash = ?",
-        )
-        .bind(&user)
-        .bind(&hash)
-        .execute(pool.get())
-        .await
-        .unwrap();
-        let mut tx = pool.get().begin().await.unwrap();
-        assert!(
-            !workspace_claim_still_owned_in_tx(&mut tx, &discovered, &identity)
-                .await
-                .unwrap()
-        );
-        let current = SessionKeyV1::owner_session("server", &user, "new-owner", "main");
-        assert!(
-            workspace_claim_still_owned_in_tx(&mut tx, &current, &identity)
-                .await
-                .unwrap()
-        );
-        tx.commit().await.unwrap();
-        sqlx::query("DELETE FROM session_execution_workspace_claims WHERE owner_user_id = ?")
-            .bind(&user)
-            .execute(pool.get())
-            .await
-            .unwrap();
-        let mut tx = pool.get().begin().await.unwrap();
-        assert!(
-            !workspace_claim_still_owned_in_tx(&mut tx, &discovered, &identity)
-                .await
-                .unwrap()
-        );
-        tx.commit().await.unwrap();
-    }
-
     #[test]
-    fn workspace_reuse_blockers_preserve_evidence_and_do_not_require_history_deletion() {
+    fn session_execution_blockers_preserve_evidence_and_do_not_require_history_deletion() {
         for (blocker, wire, recovery) in [
             (
-                WorkspaceReuseBlocker::ExecutionSlot,
+                SessionExecutionBlocker::ExecutionSlot,
                 "execution_slot",
                 "wait_or_cancel_session",
             ),
             (
-                WorkspaceReuseBlocker::ActiveRun,
+                SessionExecutionBlocker::ActiveRun,
                 "active_run",
                 "wait_or_cancel_session",
             ),
             (
-                WorkspaceReuseBlocker::SettlementPending,
+                SessionExecutionBlocker::SettlementPending,
                 "settlement_pending",
                 "inspect_session",
             ),
             (
-                WorkspaceReuseBlocker::WriterOrReservation,
+                SessionExecutionBlocker::WriterOrReservation,
                 "writer_or_reservation",
                 "retry_session",
             ),
             (
-                WorkspaceReuseBlocker::BindingNotReady,
+                SessionExecutionBlocker::BindingNotReady,
                 "binding_not_ready",
                 "inspect_session",
             ),
             (
-                WorkspaceReuseBlocker::UnresolvedTool,
+                SessionExecutionBlocker::UnresolvedTool,
                 "unresolved_tool",
                 "inspect_session",
             ),
             (
-                WorkspaceReuseBlocker::OwnerUnavailable,
+                SessionExecutionBlocker::OwnerUnavailable,
                 "owner_unavailable",
                 "inspect_session",
-            ),
-            (
-                WorkspaceReuseBlocker::ClaimChanged,
-                "claim_changed",
-                "retry_session",
             ),
         ] {
             assert_eq!(serde_json::to_value(blocker).unwrap(), wire);
@@ -7251,7 +6761,7 @@ mod adoption_tests {
             let message = blocker.user_message("owner-session");
             assert!(message.contains("owner-session"));
             assert!(message.contains(blocker.explanation()));
-            assert!(message.contains("history can be kept"));
+            assert!(message.contains("history is preserved"));
             assert!(!message.contains("resume it"));
             assert!(!message.contains("session delete"));
         }
@@ -7281,6 +6791,24 @@ mod adoption_tests {
         incomplete_edge.executor.kind = crate::runs::ExecutorBindingRequestKind::EdgeAgent;
         assert!(incomplete_edge.validate().is_err());
 
+        let mut edge_without_physical_identity = incomplete_edge.clone();
+        edge_without_physical_identity.workspace.root = Some("/workspace/a".into());
+        edge_without_physical_identity.workspace.source =
+            Some(crate::runs::WorkspaceSourceRequest::EdgePath {
+                path: "/workspace/a".into(),
+            });
+        edge_without_physical_identity.workspace.authority =
+            Some(crate::runs::WorkspaceAuthorityRequest::ReadWrite);
+        edge_without_physical_identity.executor.executor_id = Some("edge-a".into());
+        edge_without_physical_identity.executor.transport =
+            Some(crate::runs::ToolTransportKindRequest::EdgeLedger);
+        edge_without_physical_identity.executor.status =
+            Some(crate::runs::ExecutorStatusRequest::Online);
+        assert!(
+            edge_without_physical_identity.validate().is_err(),
+            "a durable Edge binding without authenticated physical identity must be rejected"
+        );
+
         let mut overflow = SessionExecutionBindingV1::server_work_default("work:w1:b1");
         overflow.generation = i64::MAX as u64 + 1;
         assert!(overflow.validate().is_err());
@@ -7307,18 +6835,6 @@ mod adoption_tests {
         assert_eq!(first, reconnect);
         assert_ne!(first, other_device);
         assert_ne!(first, other_root);
-    }
-
-    #[test]
-    fn execution_workspace_claim_lock_order_is_symmetric_for_swaps() {
-        let left_to_right = ordered_execution_claim_hashes(Some("claim-a"), "claim-b");
-        let right_to_left = ordered_execution_claim_hashes(Some("claim-b"), "claim-a");
-        assert_eq!(left_to_right, vec!["claim-a", "claim-b"]);
-        assert_eq!(right_to_left, left_to_right);
-        assert_eq!(
-            ordered_execution_claim_hashes(Some("claim-a"), "claim-a"),
-            vec!["claim-a"]
-        );
     }
 
     #[test]

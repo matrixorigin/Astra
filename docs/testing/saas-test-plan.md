@@ -192,7 +192,6 @@ Admin 操作必须 **`astra_admin` 角色**，普通用户 403。
 | `POST /admin/users/grant-role` | 授予 admin | Admin smoke |
 | `POST /admin/cleanup` | 触发过期数据清理 | 手工 + DB 断言 |
 | `GET /admin/audit` | 审计导出 | 手工 |
-| `GET /admin/feedback/stats` | 反馈统计 | 手工 |
 
 **专项流程：**
 ```

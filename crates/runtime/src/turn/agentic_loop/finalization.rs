@@ -660,7 +660,7 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     ensure_terminal_text(state);
     materialize_terminal_text_message(state);
     if !state.final_text.is_empty() && !state.final_text_streamed {
-        host.render_final_text(&state.final_text);
+        host.render_final_text(&state.final_text, state.final_text_model_item_id.as_deref());
         state.final_text_streamed = true;
     }
     if !state.final_text.is_empty() && !state.final_output_ready_notified {
@@ -729,13 +729,24 @@ fn materialize_terminal_text_message(state: &mut AgenticLoopState) {
         .find(|message| {
             message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
         })
-        .and_then(astra_turn_core::prompt_facing::extract_text_content)
-        .is_some_and(|content| content.trim() == final_text);
+        .is_some_and(|message| match state.final_text_model_item_id.as_deref() {
+            Some(id) => astra_turn_types::model_item_id(message) == Some(id),
+            None => {
+                astra_turn_types::model_item_id(message).is_none()
+                    && astra_turn_core::prompt_facing::extract_text_content(message)
+                        .is_some_and(|content| content.trim() == final_text)
+            }
+        });
     if !already_materialized {
-        state.push_prompt_history_message(serde_json::json!({
+        let mut message = serde_json::json!({
             "role": "assistant",
             "content": state.final_text.clone(),
-        }));
+        });
+        astra_turn_types::mark_model_message(
+            &mut message,
+            state.final_text_model_item_id.as_deref(),
+        );
+        state.push_prompt_history_message(message);
     }
 }
 
@@ -820,12 +831,32 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
         .hooks
         .completion_settlement
         .latest_provider_text
-        .take();
+        .take()
+        .map(|text| {
+            (
+                text,
+                state
+                    .hooks
+                    .completion_settlement
+                    .latest_provider_text_model_item_id
+                    .take(),
+            )
+        });
     let deferred_candidate = state
         .hooks
         .completion_settlement
         .deferred_candidate_text
-        .take();
+        .take()
+        .map(|text| {
+            (
+                text,
+                state
+                    .hooks
+                    .completion_settlement
+                    .deferred_candidate_model_item_id
+                    .take(),
+            )
+        });
 
     // Interruption state is carried by the structured lifecycle projection;
     // assistant text remains assistant-authored content. Do not flatten
@@ -853,6 +884,7 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
             // Conversely, a satisfied window may remain until the next text
             // boundary, so its presence alone is not an incomplete result.
             state.final_text = interruption_terminal_message(interruption);
+            state.final_text_model_item_id = None;
             state.final_text_streamed = false;
             return;
         }
@@ -860,8 +892,8 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
         // candidate. A current runtime-owned Work settlement sentence is not
         // provider output and must not be promoted to partial assistant text.
         let candidate = latest_provider_text
-            .filter(|text| !text.trim().is_empty())
-            .or_else(|| deferred_candidate.filter(|text| !text.trim().is_empty()))
+            .filter(|(text, _)| !text.trim().is_empty())
+            .or_else(|| deferred_candidate.filter(|(text, _)| !text.trim().is_empty()))
             .or_else(|| {
                 // Work-settlement contract text is runtime-owned outcome
                 // copy, not a provider candidate. Repeating it under the
@@ -869,12 +901,18 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
                 // duplicated assistant prose.
                 (!state.hooks.completion_settlement.work_settlement_only
                     && !state.final_text.trim().is_empty())
-                .then(|| state.final_text.trim().to_string())
+                .then(|| {
+                    (
+                        state.final_text.trim().to_string(),
+                        state.final_text_model_item_id.clone(),
+                    )
+                })
             });
-        if let Some(candidate) = candidate {
+        if let Some((candidate, model_item_id)) = candidate {
             let candidate = candidate.trim();
             let already_current = state.final_text.trim() == candidate;
             state.final_text = candidate.to_string();
+            state.final_text_model_item_id = model_item_id;
             // Preserve the live-stream fact only when this is the exact text
             // that already crossed the render boundary. A replacement
             // candidate still needs one render.
@@ -886,15 +924,17 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
             // message. `error_detail` remains available on `run_interrupted`
             // for diagnostics but never becomes transcript text.
             state.final_text = interruption_terminal_message(interruption);
+            state.final_text_model_item_id = None;
             state.final_text_streamed = false;
         }
         return;
     }
 
-    if let Some(candidate) = deferred_candidate
+    if let Some((candidate, model_item_id)) = deferred_candidate
         && state.final_text.trim().is_empty()
     {
         state.final_text = candidate;
+        state.final_text_model_item_id = model_item_id;
         // The candidate was normally streamed before settlement started. Do
         // not render it twice; only later annotations need a fresh render.
         state.final_text_streamed = true;
@@ -968,6 +1008,7 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
         }
         if let Some(interruption) = state.interruption.as_ref() {
             state.final_text = interruption_terminal_message(interruption);
+            state.final_text_model_item_id = None;
             state.final_text.push_str(&tool_summary);
             state.final_text_streamed = false;
         }
@@ -985,6 +1026,7 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
     }
     if let Some(interruption) = state.interruption.as_ref() {
         state.final_text = interruption_terminal_message(interruption);
+        state.final_text_model_item_id = None;
         state.final_text_streamed = false;
     }
 }
@@ -1190,6 +1232,45 @@ mod tests {
 
         assert_eq!(state.final_text, "Done.");
         assert!(state.final_text_streamed);
+    }
+
+    #[test]
+    fn terminal_materialization_uses_model_identity_not_equal_text() {
+        let mut state = make_state();
+        state.messages = vec![
+            serde_json::json!({"role":"user", "content":"answer"}),
+            serde_json::json!({"role":"assistant", "content":"same", "model_item_id":"accepted-A"}),
+        ];
+        state.final_text = "same".into();
+        state.final_text_model_item_id = Some("resume-B".into());
+        materialize_terminal_text_message(&mut state);
+        materialize_terminal_text_message(&mut state);
+        assert_eq!(state.messages.len(), 3);
+        assert_eq!(
+            astra_turn_types::model_item_id(&state.messages[1]),
+            Some("accepted-A")
+        );
+        assert_eq!(
+            astra_turn_types::model_item_id(&state.messages[2]),
+            Some("resume-B")
+        );
+    }
+
+    #[test]
+    fn deferred_candidate_keeps_origin_when_a_later_attempt_is_current() {
+        let mut state = make_state();
+        state.current_model_item_id = Some("partial-P".into());
+        state.hooks.completion_settlement.deferred_candidate_text = Some("accepted answer".into());
+        state
+            .hooks
+            .completion_settlement
+            .deferred_candidate_model_item_id = Some("accepted-A".into());
+        ensure_terminal_text(&mut state);
+        assert_eq!(state.final_text, "accepted answer");
+        assert_eq!(
+            state.final_text_model_item_id.as_deref(),
+            Some("accepted-A")
+        );
     }
 
     #[test]
@@ -2069,8 +2150,11 @@ mod tests {
             Some("typed completion action was not satisfied")
         );
         assert_eq!(state.messages.len(), 2);
+        assert!(astra_turn_types::model_item_id(&state.messages[0]).is_some());
+        let mut provider_evidence = state.messages[0].clone();
+        astra_turn_types::mark_model_message(&mut provider_evidence, None);
         assert_eq!(
-            state.messages[0],
+            provider_evidence,
             serde_json::json!({
                 "role": "assistant",
                 "content": "No workspace mutation was needed based on the evidence."

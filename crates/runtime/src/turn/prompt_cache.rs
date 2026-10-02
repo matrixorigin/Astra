@@ -901,7 +901,6 @@ mod tests {
             );
         }
         for name in [
-            "agent",
             "agent_fanout",
             "inspect_work_plan",
             "propose_work_plan",

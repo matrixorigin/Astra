@@ -434,7 +434,12 @@ fn runtime_provider_contract_is_bound(
     // remain builtin-registry-only until their handshake carries the same
     // resolved descriptor and schema validator.
     matches!(executor.transport, ToolTransportKind::EdgeLedger)
-        && !matches!(class, ToolExecutionClass::TurnPipelineIntercept)
+        && !matches!(
+            class,
+            ToolExecutionClass::TurnPipelineIntercept
+                | ToolExecutionClass::ServerControlPlane
+                | ToolExecutionClass::ServerService
+        )
         && context
             .runtime_declared_tool_schema_digests
             .contains_key(tool_name)
@@ -555,6 +560,14 @@ pub(crate) fn active_provider_declarations_for_binding(
         // provider contracts. This is the only path by which a non-builtin
         // tool name can become an executable runtime offer.
         for (tool_name, schema_digest) in &context.runtime_declared_tool_schema_digests {
+            if matches!(
+                tool_execution_class(tool_name, registry),
+                ToolExecutionClass::ServerControlPlane
+                    | ToolExecutionClass::ServerService
+                    | ToolExecutionClass::TurnPipelineIntercept
+            ) {
+                continue;
+            }
             if context
                 .runtime_declared_tool_names
                 .as_ref()
@@ -1402,6 +1415,114 @@ mod tests {
             stale.hidden_reason,
             Some(ToolHiddenReason::RuntimeSurfaceDenied)
         );
+    }
+
+    #[test]
+    fn client_descriptor_cannot_take_ownership_of_server_agent_tools() {
+        let registry = registry();
+        let workspace = WorkspaceBinding::edge_workspace(
+            "CLI workspace",
+            "/project",
+            WorkspaceAuthority::ReadWrite,
+        );
+        let executor = ExecutorBinding::edge_agent(
+            "cli-edge",
+            "CLI workspace",
+            ToolTransportKind::EdgeLedger,
+            ExecutorStatus::Online,
+        );
+        for (tool_name, expected_route, expected_provider) in [
+            (
+                "agent",
+                ToolExecutionRouteKind::ServerControlPlane,
+                CapacityProviderType::ControlPlane,
+            ),
+            (
+                "agent_fanout",
+                ToolExecutionRouteKind::ServerControlPlane,
+                CapacityProviderType::ControlPlane,
+            ),
+            (
+                "memory",
+                ToolExecutionRouteKind::ServerRuntime,
+                CapacityProviderType::ServerService,
+            ),
+        ] {
+            let schema = json!({
+                "type": "function",
+                "function": {"name": tool_name, "parameters": {"type": "object"}}
+            });
+            let context = ToolAdmissionContext {
+                runtime_declared_tool_names: Some(HashSet::from([tool_name.to_string()])),
+                runtime_declared_tool_schema_digests: HashMap::from([(
+                    tool_name.to_string(),
+                    astra_runtime_env::canonical_tool_schema_digest(&schema),
+                )]),
+                runtime_declared_tool_native_ids: HashMap::from([(
+                    tool_name.to_string(),
+                    tool_name.to_string(),
+                )]),
+                ..ToolAdmissionContext::default()
+            };
+            let decision = resolve_tool_admission_for_binding_with_context(
+                tool_name,
+                std::slice::from_ref(&schema),
+                &workspace,
+                &executor,
+                None,
+                &registry,
+                context.clone(),
+            );
+            assert!(
+                decision.visible,
+                "server-owned {tool_name} must remain visible: {decision:?}"
+            );
+            assert!(decision.hidden_reason.is_none());
+            assert_eq!(
+                decision.route, expected_route,
+                "client schema must not change {tool_name} execution ownership: {decision:?}"
+            );
+            assert_eq!(
+                decision
+                    .selected_offer
+                    .as_ref()
+                    .map(|offer| offer.provider_type),
+                Some(expected_provider),
+                "{tool_name} must retain the server-owned offer: {decision:?}"
+            );
+            assert!(
+                decision
+                    .candidates
+                    .iter()
+                    .all(|candidate| { !candidate.offer.provider_type.is_runtime_executor() }),
+                "client declaration must not introduce a competing runtime offer: {decision:?}"
+            );
+
+            let mut unavailable = context;
+            match expected_provider {
+                CapacityProviderType::ControlPlane => {
+                    unavailable.control_plane_provider_ready = false
+                }
+                CapacityProviderType::ServerService => {
+                    unavailable.server_service_provider_ready = false
+                }
+                _ => unreachable!(),
+            }
+            let denied = resolve_tool_admission_for_binding_with_context(
+                tool_name,
+                &[schema],
+                &workspace,
+                &executor,
+                None,
+                &registry,
+                unavailable,
+            );
+            assert!(
+                !denied.visible,
+                "client descriptor cannot rescue an unavailable server owner: {denied:?}"
+            );
+            assert_ne!(denied.route, ToolExecutionRouteKind::EdgeBound);
+        }
     }
 
     #[test]

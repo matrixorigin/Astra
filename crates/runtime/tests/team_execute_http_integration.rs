@@ -5,16 +5,17 @@
 //! **CLI parity:** REPL command `/team run review review the latest commit` parses as
 //! team `review` and task `review the latest commit` (see `splitn(2, ' ')` in
 //! `astra-cli/src/cli/slash_team.rs`). The tests below use the same task string against
-//! the built-in adversarial `review` team (`InMemoryTeamStore::with_builtins`).
+//! the built-in parallel `review` team (`InMemoryTeamStore::with_builtins`).
 //!
 //! **Failure matrix:** custom `SubRunExecutor` types simulate hard `Err`, mid-run failure
-//! after N successes (pipeline + adversarial in one test), role-specific failures, HTTP-ish
+//! after N successes (sequential + fanout in one test), role-specific failures, HTTP-ish
 //! “200 + failed status” bodies, invalid JSON / missing `task`, and cross-user isolation —
 //! asserting HTTP codes and `TeamExecutionReport` mapping (`failed` vs `partial` when only
 //! some agents terminate successfully).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
@@ -273,6 +274,33 @@ impl SubRunExecutor for HighTokenExecutor {
     }
 }
 
+/// Captures the effective optional-tool policy reaching spawned children.
+/// HTTP Team has no enabled-tools request field, so omission must arrive as
+/// an explicit empty allowlist rather than the unmanaged CLI `None` state.
+struct CaptureEnabledToolsExecutor {
+    seen: Arc<Mutex<Vec<Option<HashSet<String>>>>>,
+}
+
+#[async_trait]
+impl SubRunExecutor for CaptureEnabledToolsExecutor {
+    async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        self.seen
+            .lock()
+            .expect("capture mutex is not poisoned")
+            .push(config.request_constraints.enabled_tools.clone());
+        Ok(AgentResult {
+            agent_id: config.agent_profile.agent_id,
+            run_id: config.run_id,
+            status: astra_core::STATUS_COMPLETED.to_string(),
+            output: Some("captured".into()),
+            error: None,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            tool_calls: 0,
+        })
+    }
+}
+
 /// First `fail_after` sub-runs succeed; the next returns `Err` (infra / LLM hard failure).
 struct FailAfterSuccessExecutor {
     calls: AtomicUsize,
@@ -405,8 +433,8 @@ async fn http_execute_review_latest_commit_happy_path_matches_cli_team_run() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "completed");
-    // Builtin `review` team: Adversarial, max_rounds=3 → 3 rounds × (producer + reviewer) = 6
-    assert_eq!(body["agent_count"], 6);
+    // Each independent reviewer executes once through ordinary fanout.
+    assert_eq!(body["agent_count"], 2);
     assert!(!body["delegation_id"].as_str().unwrap().is_empty());
 }
 
@@ -453,6 +481,34 @@ async fn http_execute_research_team_stub_success() {
 }
 
 #[tokio::test]
+async fn http_execute_omitted_optional_tools_are_explicitly_denied() {
+    let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let app = build_app_with_delegation(
+        store,
+        Arc::new(CaptureEnabledToolsExecutor { seen: seen.clone() }),
+    )
+    .await;
+
+    let (status, body) = post_json(
+        app,
+        "/teams/research/execute",
+        "test-user",
+        json!({ "task": "inspect the repository" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "completed");
+    let seen = seen.lock().expect("capture mutex is not poisoned");
+    assert_eq!(seen.len(), 2, "research team should spawn two children");
+    assert!(
+        seen.iter()
+            .all(|tools| tools.as_ref().is_some_and(HashSet::is_empty))
+    );
+}
+
+#[tokio::test]
 async fn http_execute_returns_503_without_delegation_engine() {
     let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
     let app = build_app_team_only(store);
@@ -494,7 +550,9 @@ async fn http_execute_validation_failure_400_empty_members() {
         user_id: "test-user".into(),
         name: "bad-empty".into(),
         description: "x".into(),
-        coordination: TeamCoordination::Pipeline,
+        coordination: TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
         members: vec![],
         context: HashMap::new(),
         worktree_mode: WorktreeMode::Shared,
@@ -527,7 +585,9 @@ async fn http_execute_token_budget_exceeded_body_status() {
         user_id: "test-user".into(),
         name: "budget-team".into(),
         description: "d".into(),
-        coordination: TeamCoordination::Pipeline,
+        coordination: TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
         members: vec![TeamMemberDef {
             role: "worker".into(),
             agent_id: None,
@@ -589,10 +649,10 @@ async fn http_execute_unauthorized_without_bearer() {
 
 // ─── Failure-matrix: sub-run patterns (HTTP surfaces same as CLI team run) ──
 
-/// Pipeline fails on 2nd sub-run vs adversarial fails after 4 successes — both should surface
+/// Sequential and fanout each fail one sibling after a successful sub-run and surface
 /// `failed` or `partial` over HTTP (same executors as `team_delegation_integration` mid-run cases).
 #[tokio::test]
-async fn http_fail_after_n_hard_error_pipeline_and_adversarial() {
+async fn http_fail_after_n_hard_error_sequential_and_fanout() {
     struct Case {
         path: &'static str,
         task: &'static str,
@@ -607,7 +667,7 @@ async fn http_fail_after_n_hard_error_pipeline_and_adversarial() {
         Case {
             path: "/teams/review/execute",
             task: "review the latest commit",
-            fail_after: 4,
+            fail_after: 1,
         },
     ];
     for case in cases {
@@ -638,11 +698,13 @@ async fn http_fail_after_n_hard_error_pipeline_and_adversarial() {
 }
 
 #[tokio::test]
-async fn http_review_only_reviewer_steps_return_err() {
+async fn http_fanout_preserves_partial_result_when_one_reviewer_fails() {
     let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
     let app = build_app_with_delegation(
         store,
-        Arc::new(ErrWhenAgentIdContains { needle: "reviewer" }),
+        Arc::new(ErrWhenAgentIdContains {
+            needle: "correctness_reviewer",
+        }),
     )
     .await;
 
@@ -655,11 +717,11 @@ async fn http_review_only_reviewer_steps_return_err() {
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    let st = body["status"].as_str().unwrap();
-    assert!(
-        st == "failed" || st == "partial",
-        "expected failed or partial when reviewer steps error, got {st}"
+    assert_eq!(
+        body["status"], "partial",
+        "successful sibling must be retained: {body}"
     );
+    assert_eq!(body["agent_count"], 2);
     assert!(body["error"].as_str().is_some());
 }
 
@@ -671,7 +733,9 @@ async fn http_pipeline_ok_response_but_agent_status_failed() {
         user_id: "test-user".into(),
         name: "single-fail".into(),
         description: "d".into(),
-        coordination: TeamCoordination::Pipeline,
+        coordination: TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
         members: vec![TeamMemberDef {
             role: "solo".into(),
             agent_id: None,

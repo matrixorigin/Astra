@@ -13,9 +13,9 @@ interaction. The canonical metadata lives in
   Select an entry to insert it into the composer.
 - Run `/help keys` for the current workbench keyboard shortcuts.
 
-Commands that only work in line mode are intentionally omitted from TUI
-completion. Typing one in the workbench shows an unavailable message; Astra
-never switches to a second terminal interface to complete it.
+Commands without a native workbench action are omitted from TUI completion.
+Typing one shows an unavailable message. There is no separate console slash
+frontend; non-interactive commands use the [CLI routes](cli-commands.md).
 
 ## Common
 
@@ -60,14 +60,14 @@ dispatch; a rejected native token never falls back to legacy profile refresh.
 `/session analyze [id]` opens a concise session summary; `/session history [id]`
 opens that transcript; and `/session export [id]` writes it as Markdown in the
 current working directory. `/session list` remains accepted as an alias for
-`/resume`. `/session fork` is a line-mode command and is not available in the
-TUI.
+`/resume`. `/session fork` is not supported by the workbench.
 
-If a new session targets a checkout already owned by another session, admission
-stops before model or tool work. The TUI keeps the new session attached and
-returns the draft to its composer; use `/resume` and choose a session explicitly
-to continue existing work, or switch to another worktree for the new session.
-Astra never resumes or takes over a session implicitly.
+Starting a new session in a directory already used by another session is
+allowed when the new session has no unresolved execution debt. Sessions keep
+their own binding and history; they do not take over one another. Physical
+workspace operations are serialized by the executor-owned lease, and a
+temporarily unavailable lease returns a typed retryable result. Use `/resume`
+only when you intend to continue the existing session.
 
 ## Work
 
@@ -184,5 +184,6 @@ redundant completion rows:
 | `/skill` | `/skill browse`, `/skill list` |
 | `/resume` | `/session list` |
 
-Line-mode-only commands such as `/grep`, `/diff`, and `/review` are not TUI
-commands. Use `/` to see every root command that the workbench can complete.
+Workspace commands such as `astra grep`, `astra diff`, and `astra review`
+use non-interactive CLI routes, not a console slash loop. Use `/` to see every
+root command that the workbench can complete.

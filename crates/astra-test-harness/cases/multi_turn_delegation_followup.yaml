@@ -1,51 +1,87 @@
 name: multi_turn_delegation_followup
-description: '**What**: Spawn a sub-agent in turn 1, then ask about its result in
-  turn 2 to verify delegation results persist.
-
-  **Tests**: Delegation discovery + dispatch + result surfacing + cross-turn persistence.
-  Subsumes the
-
-  basic spawn test — if this passes, tool discovery, delegation dispatch, and result
-  surfacing all work.
-
-  **Why**: In production multi-agent workflows, a coordinator often delegates in one
-  turn and reasons about results in the next; losing delegation results breaks orchestration.
-
-  **Pass means**: The sub-agent''s computed result (391) is correctly recalled in
-  turn 2, proving delegation output persists in session state.
-
-  **Fail means**: Delegation results were dropped between turns (session state bug)
-  or the sub-agent failed to compute correctly.
-
-  '
+description: |
+  Delegate a small calculation using a natural-language model request, then
+  inspect its execution in a later user turn. The retrospective must preserve
+  the result and obtain bounded evidence without failed introspection calls.
 prompt: |
-  Use the `agent` tool with action `spawn` to start one foreground child:
-    description: "Calculate 17 times 23"
-    prompt: "Calculate 17*23. Output only the final numeric answer, with no JSON, explanation, tool description, formatting, or extra words."
-    agent_type: "general-purpose"
-
-  The child result returns through the foreground tool call. Tell me the
-  numerical result it gave you. Do not use other tools after receiving it.
+  Ask a GLM 5.2 subagent to calculate 17 times 23 and return only the integer.
+  Report its actual result when it finishes. Do not change files or access the network.
 capability: delegation
 difficulty: 3
 weight: 2.0
 timeout_seconds: 240
+debug_log: true
 steps:
-- prompt: What was the numerical result the sub-agent gave you?
+- prompt: Briefly audit the previous execution trace. Report the child's numerical result and actual model, the parent and child tool sequence, and the evidence for successful completion. Ground the timeline in recorded execution events, and say what evidence is unavailable. Do not change files or access the network.
   criteria:
   - type: text_contains
     needle: '391'
+  - type: text_contains
+    needle: 'glm-5.2'
 criteria:
 - type: exit_code
   code: 0
 - type: tool_called
   name: agent
+- type: journal_tool_call_count
+  name: introspect
+  min: 1
+  max: 3
+- type: journal_tool_outcome_count
+  name: introspect
+  ok: false
+  min: 0
+  max: 0
+- type: journal_tool_call_count
+  name: introspect
+  min: 1
+  max: 3
+  ok: true
+  document: arguments
+  path: /explain/target
+  equals: run
+- type: journal_tool_value_flow_bound
+  producer: agent
+  producer_document: result
+  producer_path: /run_id
+  producer_filters:
+    - document: arguments
+      path: /action
+      equals: spawn
+  consumer: introspect
+  consumer_document: arguments
+  consumer_paths: [/explain/run_id]
+  consumer_filters:
+    - document: arguments
+      path: /explain/target
+      equals: run
+  min_turns_after_producer: 1
 - type: turn_rounds_between
   min: 1
-  max: 50
-- type: judger
-  question: >-
-    Did the agent correctly delegate 17*23 to a sub-agent and report back the
-    result 391? The agent must have used agent(action='spawn') (not calculated
-    directly) and the final answer must be 391.
-  threshold: 0.7
+  max: 10
+- type: session_event_count
+  event_type: agent_spawned
+  min: 1
+  max: 1
+- type: session_event_count
+  event_type: agent_spawned
+  min: 1
+  max: 1
+  json_match:
+    path: /metadata/model_configuration/prepared_selection/model_name
+    equals: glm-5.2
+- type: session_child_result_adopted
+  expected_result: '391'
+  spawn_match:
+    path: /metadata/model_configuration/prepared_selection/model_name
+    equals: glm-5.2
+- type: session_event_count
+  event_type: agent_terminated
+  min: 1
+  max: 1
+  json_match:
+    path: /metadata/status
+    equals: completed
+    same_run_as:
+      event_type: agent_spawned
+      run_id_path: /metadata/run_id

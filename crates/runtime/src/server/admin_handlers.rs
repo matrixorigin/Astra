@@ -178,24 +178,6 @@ pub(super) async fn admin_feedback_export_handler(
     }))
 }
 
-pub(super) async fn admin_feedback_stats_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AdminFeedbackStatsQuery>,
-) -> Result<Json<AdminFeedbackStatsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    state.admin.authorizer.require_admin(&headers).await?;
-    let stats = state
-        .admin
-        .feedback_stats_reader
-        .read_feedback_stats(AdminFeedbackStatsFilter {
-            agent_id: query.agent_id,
-            since: query.since,
-        })
-        .await?;
-
-    Ok(Json(AdminFeedbackStatsResponse::from(stats)))
-}
-
 pub(super) async fn admin_grant_role_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

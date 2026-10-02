@@ -32,9 +32,7 @@ pub struct CompletionSettlementState {
     /// A single provider-schema correction may replace a task-resolution
     /// submission rejected by the runtime argument preflight. This is
     /// independent of the one accepted assessment attempt and is initialized
-    /// only when a fresh reconciliation window is opened. Missing legacy
-    /// checkpoints default to zero so they never gain repair authority.
-    #[serde(default)]
+    /// only when a fresh reconciliation window is opened.
     pub outcome_reconciliation_schema_corrections_remaining: u8,
     /// Structurally valid evidence-linked model interpretation observed for the
     /// active boundary.  Executor evidence validation may still reject it;
@@ -140,7 +138,11 @@ pub struct CompletionSettlementState {
     #[serde(deserialize_with = "deserialize_required_option")]
     pub latest_provider_text: Option<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
+    pub latest_provider_text_model_item_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub deferred_candidate_text: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub deferred_candidate_model_item_id: Option<String>,
     /// Source of the active wrap-up boundary, if any.
     #[serde(deserialize_with = "deserialize_required_option")]
     pub wrapup_origin: Option<BudgetWrapupOrigin>,
@@ -265,7 +267,9 @@ mod tests {
             }),
             preserve_final_synthesis_wire_surface: true,
             latest_provider_text: Some("latest".into()),
+            latest_provider_text_model_item_id: Some("latest-item".into()),
             deferred_candidate_text: Some("candidate".into()),
+            deferred_candidate_model_item_id: Some("candidate-item".into()),
             completion_action_window: Some(CompletionActionWindow {
                 action: CompletionAction::ExplicitVerification {
                     missing_labels: vec!["validator".into()],
@@ -290,21 +294,7 @@ mod tests {
             serde_json::from_value::<CompletionSettlementState>(wire.clone()).unwrap(),
             state
         );
-        let mut legacy_wire = wire.clone();
-        legacy_wire
-            .as_object_mut()
-            .unwrap()
-            .remove("outcome_reconciliation_schema_corrections_remaining");
-        let restored_legacy =
-            serde_json::from_value::<CompletionSettlementState>(legacy_wire).unwrap();
-        assert_eq!(
-            restored_legacy.outcome_reconciliation_schema_corrections_remaining, 0,
-            "legacy checkpoints gain no schema-correction authority"
-        );
         for field in wire.as_object().unwrap().keys() {
-            if field == "outcome_reconciliation_schema_corrections_remaining" {
-                continue;
-            }
             let mut incomplete = wire.clone();
             incomplete.as_object_mut().unwrap().remove(field);
             assert!(

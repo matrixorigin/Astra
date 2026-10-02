@@ -5,8 +5,8 @@ use test_support::require_db_it_env;
 use std::sync::Arc;
 
 use astra_services::{
-    BubbleUpTarget, DatabasePersonalSkillStore, DatabaseRunStateStore,
-    DatabaseStateProjectionStore, DelegationProjectionUpsert, SubmitUserSkillVersion,
+    DatabasePersonalSkillStore, DatabaseRunStateStore, DatabaseStateProjectionStore,
+    DelegationProjectionUpsert, SubmitUserSkillVersion,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -283,6 +283,29 @@ async fn l2_36_delegation_projection_and_retry_supersede_are_transactional() {
         ["user_id", "parent_run_id", "status", "updated_at"],
         "delegation lookup index must preserve owner/parent/status/update ordering"
     );
+    let plan = explain_analyze_text(
+        &pool,
+        &format!(
+            "EXPLAIN ANALYZE SELECT event_id FROM session_state_item_events FORCE INDEX (idx_state_events_owner_session_created) \
+             WHERE user_id = '{}' AND session_id = '{}' ORDER BY created_at DESC LIMIT 5",
+            user_id, session_id
+        ),
+    )
+    .await;
+    assert!(
+        plan.contains("session_state_item_events"),
+        "EXPLAIN ANALYZE should execute the state-event history query, got:\n{plan}"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            "session_state_item_events",
+            "idx_state_events_owner_session_created"
+        )
+        .await,
+        ["user_id", "session_id", "created_at", "event_id"],
+        "state-event history index must stay owner/session ordered with event_id tie-breaker"
+    );
 }
 
 #[tokio::test]
@@ -328,67 +351,6 @@ async fn create_retry_run_and_supersede_rejects_wrong_owner_without_mutation() {
     .unwrap();
     assert_eq!(row.try_get::<String, _>("old_status").unwrap(), "failed");
     assert_eq!(row.try_get::<i64, _>("retry_count").unwrap(), 0);
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_37_bubble_up_writes_one_event_per_ancestor_layer() {
-    let pool = setup_pool().await;
-    let (session_id, user_id, root_run_id) = ids();
-    insert_session(&pool, &session_id, &user_id).await;
-    let targets = (0..5)
-        .map(|depth| BubbleUpTarget {
-            session_id: session_id.clone(),
-            run_id: format!("{root_run_id}-L{depth}"),
-            depth,
-        })
-        .collect::<Vec<_>>();
-    DatabaseStateProjectionStore::new(pool.clone())
-        .bubble_up_finding(
-            &user_id,
-            &format!("{root_run_id}-L4"),
-            "finding-critical",
-            "critical",
-            "critical schema drift found",
-            &targets,
-        )
-        .await
-        .unwrap();
-    let count = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_state_item_events
-         WHERE session_id = ? AND user_id = ? AND mutation = 'bubble_up'",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap()
-    .try_get::<i64, _>("c")
-    .unwrap();
-    assert_eq!(count, targets.len() as i64);
-    let plan = explain_analyze_text(
-        &pool,
-        &format!(
-            "EXPLAIN ANALYZE SELECT event_id FROM session_state_item_events FORCE INDEX (idx_state_events_owner_session_created) \
-             WHERE user_id = '{}' AND session_id = '{}' AND mutation = 'bubble_up' ORDER BY created_at DESC LIMIT 5",
-            user_id, session_id
-        ),
-    )
-    .await;
-    assert!(
-        plan.contains("session_state_item_events"),
-        "EXPLAIN ANALYZE should execute the state-event history query, got:\n{plan}"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            "session_state_item_events",
-            "idx_state_events_owner_session_created"
-        )
-        .await,
-        ["user_id", "session_id", "created_at", "event_id"],
-        "state-event history index must stay owner/session ordered with event_id tie-breaker"
-    );
 }
 
 #[tokio::test]
@@ -619,42 +581,4 @@ async fn delegation_projection_refresh_uses_current_run_status() {
         row.try_get::<String, _>("state_status").unwrap(),
         "completed"
     );
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l3_14_s10_bubble_up_five_levels_writes_one_event_per_target() {
-    let pool = setup_pool().await;
-    let (session_id, user_id, root_run_id) = ids();
-    insert_session(&pool, &session_id, &user_id).await;
-    let targets = (0..5)
-        .map(|depth| BubbleUpTarget {
-            session_id: session_id.clone(),
-            run_id: format!("{root_run_id}-L{depth}"),
-            depth,
-        })
-        .collect::<Vec<_>>();
-    DatabaseStateProjectionStore::new(pool.clone())
-        .bubble_up_finding(
-            &user_id,
-            &format!("{root_run_id}-L4"),
-            "finding-critical-l4",
-            "critical",
-            "L4 reviewer found migration would corrupt data",
-            &targets,
-        )
-        .await
-        .unwrap();
-    let count = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_state_item_events
-         WHERE session_id = ? AND user_id = ? AND mutation = 'bubble_up'",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap()
-    .try_get::<i64, _>("c")
-    .unwrap();
-    assert_eq!(count, 5);
 }

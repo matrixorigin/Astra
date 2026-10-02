@@ -51,6 +51,10 @@ use super::turn_event::TurnEvent;
 /// The trait is object-safe so the widget can store
 /// `Vec<Arc<dyn HistoryCell>>`.
 pub(crate) trait HistoryCell: Debug + Send + Sync + Any {
+    /// Exact producer identity for model content; non-model cells have none.
+    fn model_item_id(&self) -> Option<&str> {
+        None
+    }
     // ── Required ─────────────────────────────────────────────────
 
     /// Render this cell at the given terminal width. The output is

@@ -619,7 +619,31 @@ pub(crate) fn decision_feedback_preamble_message(text: &str) -> Option<Value> {
 pub(crate) fn runtime_volatile_preamble_message(
     injection: &astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection,
 ) -> Option<Value> {
-    let text = if RuntimeAuthorityKind::instruction_field_for_wire_kind(&injection.kind)
+    let text = if injection.kind == "background_task_notification"
+        && injection.payload["schema"]
+            == crate::turn::agentic_loop::host::DIRECT_CHILD_RESULT_SCHEMA
+    {
+        // Delivery bookkeeping is control-plane state. Keeping it out of the
+        // rendered content makes the second bounded delivery byte-identical,
+        // so append-only providers can dedupe it against their canonical frame.
+        let mut display_injection = injection.clone();
+        // A terminal child outcome is one content-addressed fact, not a new
+        // round-specific observation. Its transport round must not change the
+        // append-only identity when the same fact is retried.
+        display_injection.round_index = 0;
+        if let Some(payload) = display_injection.payload.as_object_mut() {
+            payload.remove("delivery_count");
+            payload.remove("observed_by_provider");
+        }
+        display_injection.render_for_prompt()?
+    } else if injection.kind == "mailbox"
+        && injection.payload["schema"]
+            == crate::turn::agentic_loop::host::RETAINED_MAILBOX_CONTEXT_SCHEMA
+    {
+        let mut display_injection = injection.clone();
+        display_injection.payload = Value::String(injection.payload["display"].as_str()?.into());
+        display_injection.render_for_prompt()?
+    } else if RuntimeAuthorityKind::instruction_field_for_wire_kind(&injection.kind)
         == Some("/instruction")
     {
         match &injection.payload {
@@ -1824,15 +1848,7 @@ fn render_drained_volatile_messages(
 ) -> Vec<Value> {
     let mut out = Vec::new();
     for inj in drained {
-        let edge_injection = astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
-            kind: inj.kind.wire_kind(),
-            delivery_class: inj.kind.delivery_class(),
-            payload: inj.payload.clone(),
-            round_index: inj.round_index,
-            authority_lifetime: (inj.kind
-                == crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame)
-                .then_some(astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn),
-        };
+        let edge_injection = crate::turn::agentic_loop::host::volatile_injection_edge_profile(inj);
         if let Some(message) = runtime_volatile_preamble_message(&edge_injection) {
             out.push(message);
         }
@@ -1844,6 +1860,110 @@ fn render_drained_volatile_messages(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn retained_mailbox_message_keeps_current_turn_lifetime_and_original_id_on_wire() {
+        let payload = json!({
+            "schema": crate::turn::agentic_loop::host::RETAINED_MAILBOX_CONTEXT_SCHEMA,
+            "message_id": "question-1",
+            "display": "📬 Message id=question-1 from child: Which format?",
+        });
+        let injection = crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::Mailbox,
+            payload,
+            round_index: 1,
+            attempt_leased: true,
+        };
+        let rendered = render_drained_volatile_messages(std::slice::from_ref(&injection));
+        let edge_wire =
+            crate::turn::agentic_loop::host::runtime_volatile_injections_edge_profile_value(
+                std::slice::from_ref(&injection),
+            )
+            .unwrap();
+        let edge: astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection =
+            serde_json::from_value(edge_wire[0].clone()).unwrap();
+        assert_eq!(
+            runtime_volatile_preamble_message(&edge),
+            Some(rendered[0].clone())
+        );
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(
+            rendered[0][RUNTIME_AUTHORITY_LIFETIME_MARKER],
+            "current_user_turn"
+        );
+        let content = rendered[0]["content"].as_str().unwrap();
+        assert!(content.contains("<runtime-required-context>"));
+        assert!(content.contains("Message id=question-1 from child: Which format?"));
+
+        let system = vec![json!({"role": "system", "content": "stable rules"})];
+        let mut history = vec![json!({"role": "user", "content": "coordinate the child"})];
+        let first = assemble_llm_messages_with_cache_capability_output(
+            system.clone(),
+            rendered.clone(),
+            Vec::new(),
+            history.clone(),
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "model",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            Some(append_only_required_capability()),
+            &cache_cfg(),
+        )
+        .unwrap();
+        assert_eq!(first.new_append_only_runtime_messages.len(), 1);
+        history.push(first.new_append_only_runtime_messages[0].clone());
+        for round in 0..20 {
+            history.push(json!({"role": "assistant", "content": format!("tool round {round}")}));
+            history.push(
+                json!({"role": "tool", "tool_call_id": format!("read-{round}"), "content": "ok"}),
+            );
+            let next = assemble_llm_messages_with_cache_capability_output(
+                system.clone(),
+                vec![runtime_volatile_preamble_message(&edge).unwrap()],
+                Vec::new(),
+                history.clone(),
+                &PostCompactAttachments::default(),
+                "sid",
+                "openai",
+                "model",
+                &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                Some(append_only_required_capability()),
+                &cache_cfg(),
+            )
+            .unwrap();
+            assert!(
+                next.new_append_only_runtime_messages.is_empty(),
+                "round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_child_result_wire_identity_is_stable_across_bounded_retry() {
+        let mut payload = json!({
+            "schema": crate::turn::agentic_loop::host::DIRECT_CHILD_RESULT_SCHEMA,
+            "children": [{"agent_id": "child", "status": "completed"}],
+        });
+        let first = crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+            payload: payload.clone(),
+            round_index: 1,
+            attempt_leased: true,
+        };
+        payload["delivery_count"] = json!(1);
+        payload["observed_by_provider"] = json!(true);
+        let second = crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+            payload,
+            round_index: 2,
+            attempt_leased: true,
+        };
+        let first_wire = render_drained_volatile_messages(&[first]);
+        let second_wire = render_drained_volatile_messages(&[second]);
+        assert_eq!(first_wire, second_wire);
+        assert!(message_text(&second_wire[0]).contains("child"));
+    }
 
     #[test]
     fn artifact_recovery_guidance_is_current_bound_and_byte_stable() {
@@ -2376,7 +2496,7 @@ mod tests {
             payload: json!({
                 "schema": "runtime_evidence_required.v1",
                 "reason": "runtime_or_session_retrospective_without_live_observation",
-                "instruction": "Before making runtime, session-state, trace, or tool-ledger claims, call introspect exactly once with facet=overview, depth=diagnostic, horizon=recent. Use reflect at most once only for persisted prior-turn causality. If observation is unavailable, explicitly limit the answer to visible conversation evidence; never claim that runtime records were inspected."
+                "instruction": "For current runtime-state claims, call ordinary introspect once with facet=overview, depth=summary, horizon=current_turn. For prior-session causality, use reflect at most once; it is session-scoped and does not identify an exact run or turn. For one exact historical execution, use Server Explain with its explicit run selector. Do not use an ordinary live introspect query as history. If observation is unavailable, explicitly limit the answer to visible conversation evidence; never claim that runtime records were inspected."
             }),
             round_index: 1,
             authority_lifetime: None,
@@ -2401,7 +2521,8 @@ mod tests {
         assert!(facts.contains("runtime_evidence_required.v1"));
         assert!(facts.contains("runtime_or_session_retrospective_without_live_observation"));
         assert!(facts.contains("boundary_instruction"));
-        assert!(facts.contains("call introspect exactly once"));
+        assert!(facts.contains("For prior-session causality, use reflect at most once"));
+        assert!(facts.contains("Do not use an ordinary live introspect query as history"));
     }
 
     #[test]

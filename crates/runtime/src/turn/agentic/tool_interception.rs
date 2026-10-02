@@ -248,33 +248,74 @@ pub(crate) fn resolve_deferred_tool_admission<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    resolve_deferred_tool_admission_with_identity(
+    resolve_carrier_tool_admission_with_identity(
         admission,
         activations,
         current_schema_digest,
         |activation| activation.descriptor.is_some(),
+        |_, _| false,
     )
 }
 
-/// Resolve deferred carriers while requiring an additional host-owned
-/// descriptor identity proof. The ordinary resolver requires a bound
-/// descriptor; authenticated edge/server hosts use this variant to also
-/// compare that descriptor with the current offer so a same-name,
-/// same-schema tool cannot cross a sequential provider rebind.
-pub(crate) fn resolve_deferred_tool_admission_with_identity<F, G>(
+/// Resolve the one carrier protocol against either explicit deferred
+/// selection evidence or a currently visible resident tool. Resident targets
+/// are still re-admitted by the ordinary logical-tool path; this only avoids
+/// requiring a needless `tool_search` round for the ordinary resident shape.
+/// Advanced arguments still require current selection evidence.
+pub(crate) fn resolve_carrier_tool_admission_with_identity<F, G, H>(
     mut admission: ToolCallAdmission,
     activations: &[DeferredToolActivation],
     current_schema_digest: F,
     descriptor_is_current: G,
+    resident_tool_is_current: H,
 ) -> ToolCallAdmission
 where
     F: Fn(&str) -> Option<String>,
     G: Fn(&DeferredToolActivation) -> bool,
+    H: Fn(&str, &Value) -> bool,
 {
     let mut retained = Vec::with_capacity(admission.admitted.len());
     for invocation in admission.admitted.drain(..) {
         if invocation.runtime_control_kind().is_some() {
             retained.push(invocation);
+            continue;
+        }
+        let resident_target = if astra_turn_core::tool::args::shape::tool_call_name(
+            invocation.physical_provider_call(),
+        ) == Some(
+            astra_turn_core::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER,
+        ) {
+            astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+                invocation.physical_provider_call(),
+            )
+            .ok()
+            .and_then(|args| {
+                astra_turn_core::tool::deferred_activation::parse_deferred_tool_invocation(&args)
+                    .ok()
+            })
+            .map(|target| (target.name, target.arguments))
+        } else {
+            None
+        };
+        if resident_target
+            .as_ref()
+            .is_some_and(|(name, arguments)| resident_tool_is_current(name, arguments))
+        {
+            match astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::resident_from_carrier(
+                invocation.physical_provider_call(),
+            ) {
+                Ok(resolved) => retained.push(resolved),
+                Err(error) => admission.rejected.push(RejectedToolCall {
+                    invocation,
+                    result: serde_json::json!({
+                        "status": "rejected",
+                        "error_kind": "deferred_tool_activation_invalid",
+                        "retryable": true,
+                        "error": error.as_str(),
+                    })
+                    .to_string(),
+                }),
+            }
             continue;
         }
         match astra_turn_core::tool::deferred_activation::canonicalize_deferred_tool_invocation(
@@ -1349,6 +1390,11 @@ pub(crate) fn build_skill_context(
     });
 
     crate::turn::skill_tool::SkillContext {
+        read_only_execution: state.permission_context.as_ref().is_some_and(|context| {
+            context
+                .try_read()
+                .map_or(true, |guard| guard.inherited.read_only_execution)
+        }),
         session_id: state.current_session_id.clone(),
         session_dir,
         work_dir: state.hooks.workspace_root_hint.clone(),
@@ -2088,6 +2134,16 @@ mod tests {
     }
 
     #[test]
+    fn skill_context_inherits_read_only_child_ceiling() {
+        let mut state = make_state();
+        let mut permissions = astra_turn_core::permission::types::InheritedPermissions::default();
+        permissions.read_only_execution = true;
+        state.permission_context =
+            Some(astra_turn_core::permission::types::PermissionSyncContext::shared(permissions));
+        assert!(build_skill_context(&state).read_only_execution);
+    }
+
+    #[test]
     fn runtime_tool_allowlist_notice_uses_applied_activation_not_stale_skill_state() {
         let mut state = make_state();
         state.skills.request_constraints.allowed_tools = Some(
@@ -2803,6 +2859,52 @@ mod tests {
             ),
             Some("web_fetch")
         );
+
+        let resident = super::resolve_carrier_tool_admission_with_identity(
+            super::admit_tool_calls(
+                &[json!({
+                    "id": "resident-carrier",
+                    "type": "function",
+                    "function": {
+                        "name": "invoke_tool",
+                        "arguments": r#"{"name":"agent","arguments":{"action":"wait"}}"#
+                    }
+                })],
+                Some("tool_calls"),
+            ),
+            &[],
+            |_| None,
+            |_| true,
+            |name, arguments| name == "agent" && arguments == &json!({"action":"wait"}),
+        );
+        assert!(resident.rejected.is_empty());
+        assert_eq!(resident.admitted.len(), 1);
+        assert_eq!(
+            astra_turn_core::tool::args::shape::tool_call_name(
+                resident.admitted[0].logical_target_call()
+            ),
+            Some("agent")
+        );
+
+        let unbound_resident = super::resolve_carrier_tool_admission_with_identity(
+            super::admit_tool_calls(
+                &[json!({
+                    "id": "unbound-resident-carrier",
+                    "type": "function",
+                    "function": {
+                        "name": "invoke_tool",
+                        "arguments": r#"{"name":"agent","arguments":{"action":"wait"}}"#
+                    }
+                })],
+                Some("tool_calls"),
+            ),
+            &[],
+            |_| None,
+            |_| true,
+            |_, _| false,
+        );
+        assert!(unbound_resident.admitted.is_empty());
+        assert_eq!(unbound_resident.rejected.len(), 1);
 
         // A matching compact digest is not an execution identity.  The
         // provider-owned descriptor must be present even when the schema has

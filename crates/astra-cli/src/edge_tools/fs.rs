@@ -8,7 +8,7 @@ use super::{
 use astra_runtime::tool_sandbox::validate_path;
 use astra_tools::fs_ops::{
     check_anchor_vs_replacement_size, normalize_read_file_line_range, read_to_string_lossy,
-    str_replace_fail, validate_read_file_args,
+    str_replace_fail, unified_diff_raw, validate_read_file_args,
 };
 use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
 use serde_json::{Value, json};
@@ -1065,7 +1065,7 @@ impl ToolExecutor {
             ));
         }
         let count = content.matches(old_str).count();
-        if count == 0 {
+        let (actual, replacement, strategy) = if count == 0 {
             let norm_count = fuzzy_replacer::quote_normalized_match_count(&content, old_str);
             if norm_count > 1 && !replace_all {
                 self.record_fuzzy_match_event(
@@ -1084,156 +1084,60 @@ impl ToolExecutor {
                     vec![astra_core::ToolRecoveryAction::CorrectArguments],
                 ));
             }
-
-            // Fuzzy cascade: try progressively looser matching strategies
-            if let Some(fuzzy_match) =
+            let Some(matched) =
                 fuzzy_replacer::fuzzy_find_replacement(&content, old_str, replace_all)
-            {
-                let replacement = if fuzzy_match.is_quote_normalized() {
-                    fuzzy_replacer::preserve_quote_style(old_str, fuzzy_match.actual, new_str)
-                } else {
-                    new_str.to_string()
-                };
-                let actual: &str = &fuzzy_match.actual;
-                let new_content = if replace_all {
-                    content.replace(actual, &replacement)
-                } else {
-                    content.replacen(actual, &replacement, 1)
-                };
-                if new_content == content {
+            else {
+                if replace_all && norm_count > 1 {
+                    self.record_fuzzy_match_event(
+                        &path,
+                        astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED,
+                        astra_runtime::observability::FuzzyMatchOutcome::Ambiguous,
+                    );
                     return Err(FsLeafError::caller_correctable_no_effect(
                         str_replace_fail(
-                            "the resolved replacement would not change the file.",
-                            "The anchor matched, but the resulting file bytes are identical to the current content.",
-                            "Choose a different new_str or skip this edit; no bytes were changed.",
+                            &format!(
+                                "old_str matches {norm_count} occurrences after normalizing curly quotes."
+                            ),
+                            "The file contains mixed curly quote forms; replace_all cannot safely apply with inconsistent quoting styles.",
+                            "Normalize the file's quote style first, or pass an old_str that matches the exact bytes you want to replace.",
                         ),
                         vec![astra_core::ToolRecoveryAction::CorrectArguments],
                     ));
                 }
-                // The matched anchor self-authorizes this localized edit.
-                // Keep the snapshot partial: the model did not receive the
-                // complete file, and a failed/ambiguous replace must not
-                // unlock a later full-file overwrite.
-                self.record_read_cached(&path, true, content.clone());
-                if dry_run {
-                    self.record_fuzzy_match_event(
-                        &path,
-                        fuzzy_match.strategy,
-                        astra_runtime::observability::FuzzyMatchOutcome::Matched,
-                    );
-                    return Ok(unified_diff(&content, &new_content, &path));
-                }
-                self.check_staleness(&path)
-                    .map_err(|e| format!("Error: Pre-write staleness check failed: {e}"))?;
-                // Journal: snapshot before-state for undo
-                let turn_idx = self
-                    .journal_turn_index
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let journal_call_id = if fuzzy_match.is_quote_normalized() {
-                    format!("str_replace_quote_norm:{}", path.display())
-                } else {
-                    format!("str_replace_fuzzy:{}", path.display())
-                };
-                if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_before_patch(&path, &journal_call_id, turn_idx);
-                }
-                match fs::write(&path, &new_content) {
-                    Ok(_) => {
-                        *applied = true;
-                        self.record_write_with_content(&path, &new_content);
-                        // Journal: record after-state
-                        if let Ok(mut journal) = self.file_journal.lock() {
-                            journal.record_after(&path, &journal_call_id, new_content.as_bytes());
-                        }
-                        let format_result = auto_format_file(&path, &self.project_root);
-                        if format_result.is_some() {
-                            self.record_write(&path);
-                        }
-                        let mut result = if fuzzy_match.is_quote_normalized() {
-                            String::from(
-                                "Replaced successfully (matched after normalizing curly quotes → ASCII)\n",
-                            )
-                        } else {
-                            format!(
-                                "Replaced successfully (matched via {})\n",
-                                fuzzy_match.strategy
-                            )
-                        };
-                        let old_lines: Vec<&str> = fuzzy_match.actual.lines().collect();
-                        let new_lines: Vec<&str> = replacement.lines().collect();
-                        if old_lines.len().max(new_lines.len()) <= 10 {
-                            for l in &old_lines {
-                                result.push_str(&format!("- {l}\n"));
-                            }
-                            for l in &new_lines {
-                                result.push_str(&format!("+ {l}\n"));
-                            }
-                        }
-                        if let Some(fmt_note) = format_result {
-                            result.push_str(&format!("\n{fmt_note}"));
-                        }
-                        append_str_replace_cli_unified_diff(
-                            &mut result,
-                            &content,
-                            &new_content,
-                            &path,
-                        );
-                        if let Some(diag) = self.inline_lsp_diagnostics(&path) {
-                            result.push_str(&diag);
-                        }
-                        self.record_fuzzy_match_event(
-                            &path,
-                            fuzzy_match.strategy,
-                            astra_runtime::observability::FuzzyMatchOutcome::Matched,
-                        );
-                        return Ok(result);
-                    }
-                    Err(e) => return Err(format!("Error writing file: {e}").into()),
-                }
-            }
-            if replace_all && norm_count > 1 {
                 self.record_fuzzy_match_event(
                     &path,
-                    astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED,
+                    "none",
+                    astra_runtime::observability::FuzzyMatchOutcome::NotFound,
+                );
+                return Err(FsLeafError::caller_correctable_no_effect(
+                    str_replace_not_found_hint(&content, old_str),
+                    vec![astra_core::ToolRecoveryAction::ReadTargetedRange],
+                ));
+            };
+            let replacement = if matched.is_quote_normalized() {
+                fuzzy_replacer::preserve_quote_style(old_str, matched.actual, new_str)
+            } else {
+                new_str.to_string()
+            };
+            (matched.actual, replacement, matched.strategy)
+        } else {
+            if count > 1 && !replace_all {
+                self.record_fuzzy_match_event(
+                    &path,
+                    "exact",
                     astra_runtime::observability::FuzzyMatchOutcome::Ambiguous,
                 );
                 return Err(FsLeafError::caller_correctable_no_effect(
-                    str_replace_fail(
-                        &format!(
-                            "old_str matches {norm_count} occurrences after normalizing curly quotes."
-                        ),
-                        "The file contains mixed curly quote forms; replace_all cannot safely apply with inconsistent quoting styles.",
-                        "Normalize the file's quote style first, or pass an old_str that matches the exact bytes you want to replace.",
-                    ),
+                    str_replace_ambiguous_hint(&content, old_str, count),
                     vec![astra_core::ToolRecoveryAction::CorrectArguments],
                 ));
             }
-            self.record_fuzzy_match_event(
-                &path,
-                "none",
-                astra_runtime::observability::FuzzyMatchOutcome::NotFound,
-            );
-            return Err(FsLeafError::caller_correctable_no_effect(
-                str_replace_not_found_hint(&content, old_str),
-                vec![astra_core::ToolRecoveryAction::ReadTargetedRange],
-            ));
-        }
-        if count > 1 && !replace_all {
-            self.record_fuzzy_match_event(
-                &path,
-                "exact",
-                astra_runtime::observability::FuzzyMatchOutcome::Ambiguous,
-            );
-            return Err(FsLeafError::caller_correctable_no_effect(
-                str_replace_ambiguous_hint(&content, old_str, count),
-                vec![astra_core::ToolRecoveryAction::CorrectArguments],
-            ));
-        }
-
+            (old_str, new_str.to_string(), "exact")
+        };
         let new_content = if replace_all {
-            content.replace(old_str, new_str)
+            content.replace(actual, &replacement)
         } else {
-            content.replacen(old_str, new_str, 1)
+            content.replacen(actual, &replacement, 1)
         };
         if new_content == content {
             return Err(FsLeafError::caller_correctable_no_effect(
@@ -1246,104 +1150,95 @@ impl ToolExecutor {
             ));
         }
 
-        // `old_str` is an optimistic-concurrency precondition, and this tool
-        // has just matched it against the complete current file. Snapshot the
-        // exact bytes for the pre-write hash check without claiming that the
-        // model received a full-file read.
+        // A matched anchor authorizes this localized edit, not a full-file read.
         self.record_read_cached(&path, true, content.clone());
-
-        // Dry run: show unified diff without writing
         if dry_run {
             self.record_fuzzy_match_event(
                 &path,
-                "exact",
+                strategy,
                 astra_runtime::observability::FuzzyMatchOutcome::Matched,
             );
             return Ok(unified_diff(&content, &new_content, &path));
         }
-
-        // Defense-in-depth: re-check staleness right before writing.
         self.check_staleness(&path)
             .map_err(|e| format!("Error: Pre-write staleness check failed: {e}"))?;
-
-        // Journal: snapshot before-state for undo
         let turn_idx = self
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
-        let journal_call_id = format!("str_replace:{}", path.display());
+        let journal_prefix = if strategy == "exact" {
+            "str_replace"
+        } else if strategy == astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED {
+            "str_replace_quote_norm"
+        } else {
+            "str_replace_fuzzy"
+        };
+        let journal_call_id = format!("{journal_prefix}:{}", path.display());
         if let Ok(mut journal) = self.file_journal.lock() {
             journal.record_before_patch(&path, &journal_call_id, turn_idx);
         }
-
-        match fs::write(&path, &new_content) {
-            Ok(_) => {
-                *applied = true;
-                // Record write state for staleness tracking
-                self.record_write_with_content(&path, &new_content);
-                // Journal: record after-state
-                if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_after(&path, &journal_call_id, new_content.as_bytes());
-                }
-
-                // Auto-format if formatter is available
-                let format_result = auto_format_file(&path, &self.project_root);
-                // Re-record after format (mtime may have changed)
-                if format_result.is_some() {
-                    self.record_write(&path);
-                }
-
-                // Build a compact diff preview for the LLM and user
-                let old_lines: Vec<&str> = old_str.lines().collect();
-                let new_lines: Vec<&str> = new_str.lines().collect();
-                let diff_lines = old_lines.len().max(new_lines.len());
-                let mut result = if diff_lines <= 10 {
-                    let mut diff = String::from("Replaced successfully\n");
-                    for l in &old_lines {
-                        diff.push_str(&format!("- {l}\n"));
-                    }
-                    for l in &new_lines {
-                        diff.push_str(&format!("+ {l}\n"));
-                    }
-                    diff
-                } else {
-                    format!(
-                        "Replaced successfully ({} lines → {} lines)",
-                        old_lines.len(),
-                        new_lines.len()
-                    )
-                };
-                if let Some(fmt_note) = format_result {
-                    result.push_str(&format!("\n{fmt_note}"));
-                }
-                if replace_all && count > 1 {
-                    result = format!("Replaced {count} occurrences\n{result}");
-                }
-
-                // Scope context: show where in the code structure this edit landed
-                if let Some(lang) = code_intel::detect_language(&path) {
-                    let edit_line = content[..content.find(old_str).unwrap_or(0)]
-                        .matches('\n')
-                        .count()
-                        + 1;
-                    let scope = code_intel::scope_at_line(&new_content, lang, edit_line);
-                    if !scope.breadcrumbs.is_empty() {
-                        result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
-                    }
-                }
-
-                append_str_replace_cli_unified_diff(&mut result, &content, &new_content, &path);
-                if let Some(diag) = self.inline_lsp_diagnostics(&path) {
-                    result.push_str(&diag);
-                }
-                self.record_fuzzy_match_event(
-                    &path,
-                    "exact",
-                    astra_runtime::observability::FuzzyMatchOutcome::Matched,
-                );
-                Ok(result)
-            }
-            Err(e) => Err(format!("Error writing file: {e}").into()),
+        fs::write(&path, &new_content).map_err(|e| format!("Error writing file: {e}"))?;
+        *applied = true;
+        self.record_write_with_content(&path, &new_content);
+        if let Ok(mut journal) = self.file_journal.lock() {
+            journal.record_after(&path, &journal_call_id, new_content.as_bytes());
         }
+        let format_result = auto_format_file(&path, &self.project_root);
+        if format_result.is_some() {
+            self.record_write(&path);
+        }
+
+        let old_lines: Vec<&str> = actual.lines().collect();
+        let new_lines: Vec<&str> = replacement.lines().collect();
+        let small_edit = old_lines.len().max(new_lines.len()) <= 10;
+        let mut result = if strategy == astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED {
+            "Replaced successfully (matched after normalizing curly quotes → ASCII)\n".to_string()
+        } else if strategy != "exact" {
+            format!("Replaced successfully (matched via {strategy})\n")
+        } else if small_edit {
+            "Replaced successfully\n".to_string()
+        } else {
+            format!(
+                "Replaced successfully ({} lines → {} lines)",
+                old_lines.len(),
+                new_lines.len()
+            )
+        };
+        if small_edit {
+            for line in old_lines {
+                result.push_str(&format!("- {line}\n"));
+            }
+            for line in new_lines {
+                result.push_str(&format!("+ {line}\n"));
+            }
+        }
+        if let Some(note) = format_result {
+            result.push_str(&format!("\n{note}"));
+        }
+        if strategy == "exact" {
+            if replace_all && count > 1 {
+                result = format!("Replaced {count} occurrences\n{result}");
+            }
+            if let Some(lang) = code_intel::detect_language(&path) {
+                let edit_line = content[..content.find(old_str).unwrap_or(0)]
+                    .matches('\n')
+                    .count()
+                    + 1;
+                let scope = code_intel::scope_at_line(&new_content, lang, edit_line);
+                if !scope.breadcrumbs.is_empty() {
+                    result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
+                }
+            }
+        }
+        append_str_replace_cli_unified_diff(&mut result, &content, &new_content, &path);
+        if let Some(diag) = self.inline_lsp_diagnostics(&path) {
+            result.push_str(&diag);
+        }
+        self.record_fuzzy_match_event(
+            &path,
+            strategy,
+            astra_runtime::observability::FuzzyMatchOutcome::Matched,
+        );
+        Ok(result)
     }
 
     pub(crate) fn delete_file(&self, args: &Value) -> String {
@@ -2944,75 +2839,6 @@ fn cap_cli_unified_diff(s: String) -> String {
         + "\n... (_cli_unified_diff truncated)\n"
 }
 
-/// Unified diff body (no dry-run banner) for CLI previews and `_cli_unified_diff`.
-fn unified_diff_raw(old_content: &str, new_content: &str, path: &std::path::Path) -> String {
-    let fname = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
-
-    let old_lines: Vec<&str> = old_content.lines().collect();
-    let new_lines: Vec<&str> = new_content.lines().collect();
-
-    let mut out = format!("--- a/{fname}\n+++ b/{fname}\n");
-
-    // Find first and last differing line
-    let max_len = old_lines.len().max(new_lines.len());
-    let mut first_diff = max_len;
-    let mut last_diff = 0;
-    for i in 0..max_len {
-        let old_line = old_lines.get(i).copied().unwrap_or("");
-        let new_line = new_lines.get(i).copied().unwrap_or("");
-        if old_line != new_line {
-            if i < first_diff {
-                first_diff = i;
-            }
-            last_diff = i;
-        }
-    }
-
-    if first_diff > last_diff {
-        out.push_str("(no changes)\n");
-        return out;
-    }
-
-    // Show context around the diff (3 lines before/after)
-    let ctx = 3;
-    let start = first_diff.saturating_sub(ctx);
-    let end = (last_diff + ctx + 1).min(max_len);
-
-    out.push_str(&format!(
-        "@@ -{},{} +{},{} @@\n",
-        start + 1,
-        end.min(old_lines.len()).saturating_sub(start),
-        start + 1,
-        end.min(new_lines.len()).saturating_sub(start),
-    ));
-
-    for i in start..end {
-        let old_line = old_lines.get(i).copied();
-        let new_line = new_lines.get(i).copied();
-        match (old_line, new_line) {
-            (Some(o), Some(n)) if o == n => {
-                out.push_str(&format!(" {o}\n"));
-            }
-            (Some(o), Some(n)) => {
-                out.push_str(&format!("-{o}\n"));
-                out.push_str(&format!("+{n}\n"));
-            }
-            (Some(o), None) => {
-                out.push_str(&format!("-{o}\n"));
-            }
-            (None, Some(n)) => {
-                out.push_str(&format!("+{n}\n"));
-            }
-            (None, None) => {}
-        }
-    }
-
-    out
-}
-
 /// Generate a unified diff between old and new content for a given file path.
 fn unified_diff(old_content: &str, new_content: &str, path: &std::path::Path) -> String {
     format!(
@@ -3046,74 +2872,11 @@ fn append_str_replace_cli_unified_diff(out: &mut String, before: &str, after: &s
 /// window depends on per-call old_str), and encourages the model to retry
 /// by re-emitting the full new_str instead of fixing the anchor.
 fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let old_lines: Vec<&str> = old_str.lines().collect();
-    let mut msg = str_replace_fail(
-        "old_str not found in file.",
-        "The exact byte sequence does not appear in the current file content (whitespace, indentation, or quote style may differ; or the file changed since you last read it).",
-        "Refer to the prior read_file tool_result for the current file content; copy the exact bytes into old_str and retry. If the file has changed, re-read it first.",
-    );
-    msg.push('\n');
-
-    let normalized_old = normalize_ws(old_str);
-    let normalized_content = normalize_ws(content);
-    if normalized_content.contains(&normalized_old) {
-        msg.push_str("whitespace_normalized_match: true (check indentation/trailing whitespace)\n");
-        if let Some(first_line) = old_lines.first() {
-            let norm_first = normalize_ws(first_line);
-            for (i, line) in lines.iter().enumerate() {
-                if normalize_ws(line) == norm_first {
-                    msg.push_str(&format!("first_line_at: L{}\n", i + 1));
-                    break;
-                }
-            }
-        }
-        return msg;
-    }
-
-    let mut has_specific_hint = false;
-    if let Some(first_line) = old_lines.first() {
-        let needle = first_line.trim();
-        if !needle.is_empty() {
-            let mut matches: Vec<usize> = Vec::new();
-            for (i, line) in lines.iter().enumerate() {
-                if line.trim() == needle || line.contains(needle) {
-                    matches.push(i + 1);
-                    if matches.len() >= 5 {
-                        break;
-                    }
-                }
-            }
-            if !matches.is_empty() {
-                has_specific_hint = true;
-                msg.push_str(&format!("first_line_at: {matches:?}\n"));
-            }
-        }
-    }
-
-    if old_lines.len() > 1 {
-        let file_line_set: std::collections::HashSet<&str> =
-            lines.iter().map(|l| l.trim()).collect();
-        let matching_count = old_lines
-            .iter()
-            .filter(|ol| {
-                let trimmed = ol.trim();
-                !trimmed.is_empty() && file_line_set.contains(trimmed)
-            })
-            .count();
-        if matching_count > 0 {
-            has_specific_hint = true;
-            msg.push_str(&format!(
-                "individual_line_match_ratio: {matching_count}/{}\n",
-                old_lines.len()
-            ));
-        }
-    }
-
-    if !has_specific_hint {
-        msg.push_str("no_partial_match: true (old_str doesn't appear under any normalization)\n");
-    }
-    msg
+    astra_tools::fs_ops::str_replace_not_found_hint_with_what(
+        "old_str not found in file.".to_string(),
+        content,
+        old_str,
+    )
 }
 
 /// When old_str found multiple times, show locations.
@@ -3141,10 +2904,6 @@ fn str_replace_ambiguous_hint(content: &str, old_str: &str, count: usize) -> Str
         }
     }
     msg
-}
-
-fn normalize_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Like `read_to_string_lossy` but reads at most `max_bytes` from the
@@ -3254,8 +3013,7 @@ mod tests {
     use super::super::ToolExecutor;
     use super::{
         Language, add_line_numbers, auto_format_file, detect_language, extract_outline,
-        is_unc_path, normalize_ws, similarity_score, str_replace_ambiguous_hint,
-        str_replace_not_found_hint,
+        is_unc_path, similarity_score, str_replace_ambiguous_hint, str_replace_not_found_hint,
     };
     use astra_text_utils::str_preview::truncate_str;
     use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
@@ -4813,9 +4571,6 @@ type Handler interface {
 
     #[test]
     fn text_utility_functions() {
-        // normalize_ws collapses whitespace
-        assert_eq!(normalize_ws("  fn   hello(  ) "), "fn hello( )");
-
         // truncate_str within limit returns unchanged
         assert_eq!(truncate_str("short", 10), "short");
         // truncate_str over limit truncates with ellipsis

@@ -13,12 +13,8 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use astra_core::work_unit::{
-    WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
-};
 use astra_sandbox::{CommandRisk, analyze_command_risks_in_workspace_from};
 
-use crate::detach::DetachShellHandle;
 use crate::exit_semantics::{
     CommandResultClass, ExitSemantics, classify_command_result, classify_exit,
 };
@@ -26,8 +22,6 @@ use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
 const GREP_MAX_RENDERED_LINE_CHARS: usize = 1_200;
-
-pub use crate::detach::render_bash_detached_marker;
 
 fn is_background_task_tool_shell_invocation(command: &str, tool: &str) -> bool {
     let lower = command.trim().to_ascii_lowercase();
@@ -113,48 +107,7 @@ pub fn validate_bash_background_task_contract(command: &str) -> Result<(), Strin
     Ok(())
 }
 
-/// RAII guard for one invocation's detach handle lifecycle.
-///
-/// Usage pattern:
-/// - Borrow handle via `.get_ref()` for operations
-/// - On every terminal path, call `.take()` to consume the one-shot pair
-/// - Guard's drop logs error if ownership was not settled explicitly
-struct DetachHandleGuard {
-    handle: Option<DetachShellHandle>,
-}
-
-impl DetachHandleGuard {
-    fn new(handle: Option<DetachShellHandle>) -> Self {
-        Self { handle }
-    }
-
-    /// Borrow the handle for use. Returns None if handle was already taken.
-    fn get_ref(&self) -> Option<&DetachShellHandle> {
-        self.handle.as_ref()
-    }
-
-    /// Take ownership of the handle. Guard's drop becomes a no-op.
-    /// Call this only on success paths where the handle is consumed (e.g., Detached).
-    fn take(&mut self) -> Option<DetachShellHandle> {
-        self.handle.take()
-    }
-}
-
-impl Drop for DetachHandleGuard {
-    fn drop(&mut self) {
-        // If handle is still present, we leaked it. This should never happen
-        // because callers must take() it before returning.
-        // We can't async-lock in drop, so we just log a warning.
-        if self.handle.is_some() {
-            tracing::error!("DetachHandleGuard dropped without settling its one-shot handle");
-        }
-    }
-}
-
-use crate::detach::{
-    detach_signal_observed, restore_detach_signal_receiver, sigkill_process_group,
-    sigkill_process_group_id, terminate_child_gracefully, terminate_detached_payload,
-};
+use crate::detach::{sigkill_process_group_id, terminate_child_gracefully};
 
 const GLOB_TIMEOUT: Duration = Duration::from_secs(15);
 /// Grace period for SIGTERM before escalating to SIGKILL. Gives child
@@ -512,26 +465,6 @@ enum SearchSortMode {
 enum StreamKind {
     Stdout,
     Stderr,
-}
-
-/// Outcome of a detach-aware bash invocation.
-///
-/// `Completed(...)` is the normal path — the command ran to exit
-/// (success, failure, timeout, or cancel) and produced an output
-/// payload exactly like [`run_readonly_command_with_partial`] would.
-/// `Detached(...)` means the user pressed Ctrl+B mid-run; the bash
-/// runner stopped reading and handed the live child + streams +
-/// already-consumed bytes back to the caller, who is expected to
-/// transfer them into the BackgroundTaskRegistry.
-pub(crate) enum BashRunOutcome {
-    Completed(ReadOnlyCommandOutput),
-    // The detached variant carries a live `tokio::process::Child` plus
-    // two `ChildStdout`/`ChildStderr` handles that are large; box it
-    // so the enum stays small for the dominant `Completed` path.
-    Detached {
-        payload: Box<crate::detach::DetachedShellPayload>,
-        adoption_rx: tokio::sync::oneshot::Receiver<Result<String, String>>,
-    },
 }
 
 pub(crate) struct ReadOnlyCommandOutput {
@@ -1116,21 +1049,14 @@ pub(crate) fn parse_bash_timeout_secs_for(args: &Value, command: &str) -> f64 {
     default_bash_timeout_for(command).clamp(BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS)
 }
 
-/// Whether a completed Bash call has only weak process ownership and enough
-/// mutation capability that a late escaped writer must disable future
-/// fingerprint attribution.
+/// Whether a completed Bash call lacks authoritative process ownership.
+/// Command spelling cannot prove that descendants are unable to mutate later.
+/// Missing ownership after execution is handled by the stronger unsettled
+/// boundary; absence here does not establish that no process ran.
 pub fn bash_scope_requires_attribution_quarantine(
-    command: &str,
     ownership: Option<astra_sandbox::ScopeOwnership>,
 ) -> bool {
-    // The union is the audited, fail-closed set of commands known not to
-    // mutate: cache-safe foreground reads plus the narrower harmless builtin /
-    // sleep shapes. Cache safety alone would conflate non-cacheability with
-    // mutation potential; detachable safety alone would reject ordinary
-    // foreground reads such as `ls`, `cat`, and `git log`.
-    !(crate::bash_cache_safety::bash_command_is_cache_safe(command)
-        || crate::workspace_observation::bash_command_is_detachable_safe(command))
-        && ownership.is_some_and(|ownership| !ownership.is_authoritative())
+    ownership.is_some_and(|ownership| !ownership.is_authoritative())
 }
 
 /// Execute a bash command with bounded partial-output capture.
@@ -1203,8 +1129,9 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
                 {
                     return crate::cancelled_tool_result("bash", false);
                 }
-                return ToolResult::error(
-                    "Error: workspace coordination lock is unavailable, contended past the command deadline, or the host temporary lock namespace is not trustworthy; no bash command was run. Retry after the active workspace writer finishes or repair the host temporary-directory ownership and sticky-bit permissions.".into(),
+                return crate::workspace_lease_unavailable_tool_result_for_workspace(
+                    "bash",
+                    &ctx.workspace_root,
                 );
             }
         }
@@ -1295,7 +1222,9 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
         .ok()
         .flatten();
         let after_captured = after.is_some();
-        let workspace_changed = before.changed_from(after);
+        let comparison = before.compare_with(after.as_ref());
+        let workspace_changed =
+            comparison == crate::workspace_observation::WorkspaceFingerprintComparison::Changed;
         // The pre-execution check cannot authorize a receipt after a slow
         // fingerprint capture: binding/lease integrity must still hold at the
         // exact mint boundary.
@@ -1315,7 +1244,8 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
             && scope_settled
             && !scope_quarantined
             && after_captured
-            && !workspace_changed
+            && comparison
+                == crate::workspace_observation::WorkspaceFingerprintComparison::Unchanged
             && scope_ownership.is_some_and(|ownership| ownership.is_authoritative());
         if verification_receipt_valid {
             result
@@ -1348,24 +1278,15 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
         }
         if receipt_authority_valid_at_mint && scope_settled && workspace_changed {
             if let Some(ownership) = scope_ownership {
-                if ownership.is_authoritative() {
-                    result
-                        .metadata
-                        .get_or_insert_with(serde_json::Map::new)
-                        .extend(
-                            crate::workspace_observation::changed_receipt_with_ownership(
-                                ownership.as_str(),
-                            ),
-                        );
-                } else {
-                    result
-                        .metadata
-                        .get_or_insert_with(serde_json::Map::new)
-                        .extend(
-                            crate::workspace_observation::changed_receipt_with_ownership(
-                                ownership.as_str(),
-                            ),
-                        );
+                result
+                    .metadata
+                    .get_or_insert_with(serde_json::Map::new)
+                    .extend(
+                        crate::workspace_observation::changed_receipt_with_ownership(
+                            ownership.as_str(),
+                        ),
+                    );
+                if !ownership.is_authoritative() {
                     crate::workspace_observation::quarantine_after_weak_receipt(
                         &ctx.workspace_root,
                         Some(ownership.as_str()),
@@ -1453,10 +1374,9 @@ fn finalize_bash_scope_quarantine(
     }
     // A foreground process group is useful current-call evidence, but it
     // cannot rule out a descendant that escaped with `setsid` and writes
-    // later. Quarantine future fingerprint attribution for commands with
-    // mutation potential even when the immediate pre/post state is clean.
-    // Proven mutation-free shapes retain the ordinary non-quarantining UX.
-    if bash_scope_requires_attribution_quarantine(command, scope_ownership) {
+    // later. Quarantine future fingerprint attribution even when the
+    // immediate pre/post state is clean.
+    if bash_scope_requires_attribution_quarantine(scope_ownership) {
         crate::workspace_observation::quarantine_after_weak_receipt(
             workspace_root,
             scope_ownership.as_ref().map(|ownership| ownership.as_str()),
@@ -1486,18 +1406,6 @@ async fn execute_bash_inner(
     let explicit_verification =
         crate::workspace_observation::is_explicit_workspace_verification_request("bash", args);
 
-    // A detach handle is only a transport affordance; it is not permission
-    // to let an arbitrary shell outlive this call.  In particular, a detached
-    // child has no executor-owned post-execution observation window, so a
-    // writer (including an opaque script) would be able to mutate the bound
-    // workspace without a receipt.  Keep unsafe commands in the foreground,
-    // where the outer execute_bash wrapper owns the lease and captures the
-    // post-state.  This gate lives here as well as in the edge adapter because
-    // server/RPC paths can reach the shared DefaultToolExecutor directly.
-    let detachable_requested = !explicit_verification
-        && ctx.detach_shell_handle.is_some()
-        && crate::workspace_observation::bash_command_is_detachable_safe(command);
-
     if let Err(reason) = validate_prepared_bash_command(command, workdir) {
         return ToolResult::error(reason);
     }
@@ -1517,10 +1425,8 @@ async fn execute_bash_inner(
     };
     // Automatic inference is deliberately advisory: only attempt it when the
     // caller did not opt into the hard source_artifacts contract, and never
-    // let an inference/store failure prevent an ordinary shell command. A
-    // detached command has no terminal receipt path yet, so it remains
-    // outside this best-effort lane.
-    if source_preimages.is_none() && !explicit_source_artifacts && !detachable_requested {
+    // let an inference/store failure prevent an ordinary shell command.
+    if source_preimages.is_none() && !explicit_source_artifacts {
         #[cfg(unix)]
         {
             source_preimages = crate::source_preimage::prepare_inferred_with_inspection(
@@ -1542,27 +1448,13 @@ async fn execute_bash_inner(
             .unwrap_or(None);
         }
     }
-    // A detached process outlives this call. Until the background registry can
-    // carry the prepared receipt through terminal completion, fail closed
-    // rather than claiming that a running command's sources are unchanged.
-    if source_preimages.is_some() && detachable_requested {
-        return ToolResult::error(
-            "Error: source_artifacts cannot be combined with detached bash until terminal receipt tracking is available".into(),
-        );
-    }
-
     let timeout = Duration::from_secs_f64(timeout_secs);
     let mut bash_args = Vec::new();
     if should_enable_pipefail(command) {
         bash_args.extend(["-o".to_string(), "pipefail".to_string()]);
     }
     bash_args.extend(["-c".to_string(), command.to_string()]);
-    let mut foreground_owner = None;
-    let mut cmd = if detachable_requested {
-        let mut command = Command::new("bash");
-        command.args(&bash_args);
-        command
-    } else {
+    let (mut cmd, foreground_owner) = {
         let (mut command, owner) =
             match astra_sandbox::BashInvocationOwner::prepare("bash", &bash_args) {
                 Ok(prepared) => prepared,
@@ -1594,8 +1486,7 @@ async fn execute_bash_inner(
                 "Error: unable to install Bash invocation owner: {error}"
             ));
         }
-        foreground_owner = Some(owner);
-        Command::from(command)
+        (Command::from(command), owner)
     };
     #[cfg(unix)]
     cmd.current_dir(workspace_root);
@@ -1605,158 +1496,26 @@ async fn execute_bash_inner(
     cmd.kill_on_drop(true);
     cmd.envs(environment.iter().map(|(key, value)| (key, value)));
     // Never let a caller-controlled shell startup hook execute in the tool
-    // process.  Detached commands additionally receive a minimal environment
-    // below, but foreground commands need the same invariant.
+    // process.
     cmd.env_remove("BASH_ENV").env_remove("ENV");
-    if detachable_requested {
-        cmd.env_clear()
-            .env("PATH", crate::workspace_observation::DETACHABLE_PATH)
-            .env("LC_ALL", "C")
-            // Keep the invariant explicit even on platforms/runtimes where
-            // environment clearing is emulated by the process launcher.
-            .env("BASH_ENV", "")
-            .env("ENV", "");
-    }
 
     let output_limit = per_tool_output_limit("bash");
     let raw_stdout_limit = output_limit.saturating_mul(2).max(16_384);
     let raw_stderr_limit = output_limit.clamp(8_192, 32_768);
 
-    // Detach-aware path: when the host wired a detach slot on
-    // ToolContext AND it currently holds a handle, run via the
-    // sibling runner so Ctrl+B can transfer child + streams to the
-    // BackgroundTaskRegistry. Without a slot OR with an empty slot
-    // this bash invocation remains a normal foreground command.
-    //
-    // RAII guard pattern: take handle from slot, wrap in guard that
-    // tracks ownership. Callers must explicitly restore() on error
-    // paths or take() on success paths where the handle is consumed.
-    // Guard's drop logs a warning if the handle is still present (leak).
-    let detach_slot = detachable_requested
-        .then(|| ctx.detach_shell_handle.as_ref().cloned())
-        .flatten();
-    let mut detach_handle_guard =
-        DetachHandleGuard::new(if let Some(slot) = detach_slot.as_ref() {
-            slot.lock().await.take()
-        } else {
-            None
-        });
-
-    let output = if let Some(handle_ref) = detach_handle_guard.get_ref() {
-        handle_ref.mark_active(true);
-        match run_bash_with_detach(
-            &mut cmd,
-            timeout,
-            raw_stdout_limit,
-            raw_stderr_limit,
-            ctx.cancel_token.as_deref(),
-            handle_ref,
-            command,
-        )
-        .await
-        {
-            Ok(BashRunOutcome::Completed(output)) => {
-                if let Some(handle) = detach_handle_guard.take() {
-                    handle.mark_active(false);
-                }
-                output
-            }
-            Ok(BashRunOutcome::Detached {
-                payload,
-                adoption_rx,
-            }) => {
-                // Hand the live child + streams back to the host
-                // through the one-shot reply channel. The host drains
-                // it in its event-loop tick and calls
-                // BackgroundTaskRegistry::adopt_detached_shell.
-                let Some(detach_handle) = detach_handle_guard.take() else {
-                    // Handle was somehow consumed between get_ref and take —
-                    // this should not happen, but handle gracefully.
-                    terminate_detached_payload(payload).await;
-                    return ToolResult::error(
-                        "Error: bash detach failed: handle was already consumed".to_string(),
-                    );
-                };
-                let Some(sender) = detach_handle.payload_tx.lock().await.take() else {
-                    detach_handle.mark_active(false);
-                    terminate_detached_payload(payload).await;
-                    return ToolResult::error(
-                        "Error: bash detach failed: host payload channel was not available"
-                            .to_string(),
-                    );
-                };
-                if let Err(payload) = sender.send(*payload) {
-                    detach_handle.mark_active(false);
-                    terminate_detached_payload(Box::new(payload)).await;
-                    return ToolResult::error(
-                        "Error: bash detach failed: host listener dropped before payload arrived"
-                            .to_string(),
-                    );
-                }
-                use crate::detach::AdoptionAckOutcome;
-                let task_id = match crate::detach::await_adoption_ack(adoption_rx).await {
-                    AdoptionAckOutcome::Adopted { task_id, .. } => task_id,
-                    AdoptionAckOutcome::Refused(error) => {
-                        return ToolResult::error(format!(
-                            "Error: bash detach failed: host could not adopt process: {error}"
-                        ));
-                    }
-                    AdoptionAckOutcome::SenderDropped => {
-                        return ToolResult::error(
-                            "Error: bash detach failed: host dropped adoption acknowledgement"
-                                .to_string(),
-                        );
-                    }
-                    AdoptionAckOutcome::TimedOut => {
-                        // Child was already sent to the host; if adoption timed out,
-                        // the host is responsible for cleanup or the child may have
-                        // already terminated. We cannot access payload.child here
-                        // because *payload was moved into sender.send().
-                        return ToolResult::error(
-                            "Error: bash detach failed: host did not acknowledge adoption in time"
-                                .to_string(),
-                        );
-                    }
-                };
-                let mut result = ToolResult::text(render_bash_detached_marker(&task_id));
-                let mut metadata = serde_json::Map::new();
-                metadata.insert("bash_detached".to_string(), serde_json::Value::Bool(true));
-                metadata.insert("background_task_id".to_string(), task_id.clone().into());
-                WorkUnitObservation::new(
-                    task_id,
-                    "shell",
-                    WorkUnitStatus::Running,
-                    1,
-                    WorkUnitObservationMode::Transition,
-                )
-                .expect("detached shell task ids are non-empty")
-                .with_wake_policy(WorkUnitWakePolicy::OnTerminal)
-                .insert_into(&mut metadata);
-                result.metadata = Some(metadata);
-                return result;
-            }
-            Err(e) => {
-                if let Some(handle) = detach_handle_guard.take() {
-                    handle.mark_active(false);
-                }
-                return ToolResult::error(e);
-            }
-        }
-    } else {
-        match run_owned_bash_command_with_partial(
-            &mut cmd,
-            foreground_owner.expect("foreground Bash owner prepared"),
-            timeout,
-            raw_stdout_limit,
-            raw_stderr_limit,
-            ctx.cancel_token.as_deref(),
-            "bash command",
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(e) => return attach_source_preimage(ToolResult::error(e), source_preimages),
-        }
+    let output = match run_owned_bash_command_with_partial(
+        &mut cmd,
+        foreground_owner,
+        timeout,
+        raw_stdout_limit,
+        raw_stderr_limit,
+        ctx.cancel_token.as_deref(),
+        "bash command",
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(e) => return attach_source_preimage(ToolResult::error(e), source_preimages),
     };
 
     let mut result = String::new();
@@ -1938,123 +1697,6 @@ async fn execute_bash_inner(
             output.descendants_terminated,
         )
     }
-}
-
-/// Execute bash behind a kernel mount-namespace write boundary. This is used
-/// by managed Edge workspaces whose host-owned runtime directories live below
-/// the otherwise writable workspace. Command parsing remains useful for
-/// diagnostics, but the mount namespace is the security boundary for writers
-/// such as interpreters, archivers, and newly installed binaries.
-pub async fn execute_bash_with_filesystem_boundary(
-    ctx: &crate::ToolContext,
-    args: &Value,
-    read_only_paths: &[PathBuf],
-) -> ToolResult {
-    let workspace_root = ctx.workspace_root.as_path();
-    let workdir = match resolve_bash_workdir(workspace_root, args) {
-        Ok(workdir) => workdir,
-        Err(error) => return ToolResult::error(error),
-    };
-    execute_bash_with_filesystem_boundary_at_workdir(ctx, args, read_only_paths, &workdir).await
-}
-
-pub(crate) async fn execute_bash_with_filesystem_boundary_at_workdir(
-    ctx: &crate::ToolContext,
-    args: &Value,
-    read_only_paths: &[PathBuf],
-    workdir: &PreparedBashWorkdir,
-) -> ToolResult {
-    let workspace_root = ctx.workspace_root.as_path();
-    let with_workdir_evidence = |mut result: ToolResult| {
-        attach_bash_workdir_evidence(&mut result, workspace_root, workdir, args);
-        result
-    };
-    let command = match args.get("command").and_then(Value::as_str) {
-        Some(command) if !command.trim().is_empty() => command,
-        _ => {
-            return ToolResult::error(
-                "Error: missing required field `command` for bash. Origin: model_argument_error; no command was run."
-                    .to_string(),
-            );
-        }
-    };
-    if let Err(reason) = validate_prepared_bash_command(command, workdir) {
-        return ToolResult::error(reason);
-    }
-
-    let timeout_secs = parse_bash_timeout_secs_for(args, command);
-    let boundary_root = match workspace_root.canonicalize() {
-        Ok(root) => root,
-        Err(error) => {
-            return ToolResult::error(format!(
-                "Error: cannot resolve managed workspace boundary: {error}; no command was run"
-            ));
-        }
-    };
-    let mut canonical_read_only_paths = Vec::with_capacity(read_only_paths.len());
-    for path in read_only_paths {
-        match path.canonicalize() {
-            Ok(path) => canonical_read_only_paths.push(path),
-            Err(error) => {
-                return ToolResult::error(format!(
-                    "Error: cannot resolve managed read-only path '{}': {error}; no command was run",
-                    path.display()
-                ));
-            }
-        }
-    }
-    let mut config = astra_sandbox::IsolationConfig::filesystem_boundary(
-        boundary_root,
-        canonical_read_only_paths,
-    );
-    workdir.install_on_isolation_config(&mut config);
-    config.timeout = Duration::from_secs_f64(timeout_secs);
-    config.max_output_bytes = per_tool_output_limit("bash");
-    let mut environment = std::env::vars().collect::<std::collections::HashMap<_, _>>();
-    astra_sandbox::scrub_secrets_from_env(&mut environment);
-    let output = astra_sandbox::execute_isolated(command, &environment, &config).await;
-    let rendered = output.combined_output();
-    if !output.namespace_active {
-        return with_workdir_evidence(ToolResult::error(if rendered.is_empty() {
-            "Error: managed filesystem write isolation is unavailable".to_string()
-        } else {
-            rendered
-        }));
-    }
-    let exit_code = output.exit_code.unwrap_or(-1);
-    if output.timed_out {
-        return with_workdir_evidence(
-            ToolResult::error(rendered)
-                .with_exit_semantics(ExitSemantics::TimedOut)
-                .with_exit_code(exit_code),
-        );
-    }
-    let exit_semantics = classify_exit(command, exit_code);
-    let result_class =
-        classify_command_result(command, &output.stdout, &output.stderr, output.exit_code);
-    if exit_code != 0 || result_class.is_tool_error() {
-        let result = if exit_semantics.is_tool_error() || result_class.is_tool_error() {
-            ToolResult::error(rendered)
-        } else {
-            ToolResult::text(rendered)
-        };
-        return with_workdir_evidence(
-            result
-                .with_exit_semantics(exit_semantics)
-                .with_result_class(result_class)
-                .with_exit_code(exit_code),
-        );
-    }
-    with_workdir_evidence(
-        ToolResult::text(if rendered.is_empty() {
-            "(command completed with no output)".to_string()
-        } else {
-            rendered
-        })
-        .with_exit_semantics(ExitSemantics::Success)
-        .with_result_class(result_class)
-        .with_exit_code(exit_code),
-    )
 }
 
 fn attach_scope_settled(
@@ -4559,256 +4201,6 @@ async fn join_command_streams_bounded(
     false
 }
 
-/// Detach-aware bash runner. Same shape as
-/// [`run_readonly_command_with_partial`] but the runner owns stdout
-/// and stderr directly in its `select!` loop. When Ctrl+B arrives,
-/// it can hand the live child and streams to the host immediately
-/// instead of waiting for helper reader tasks to return ownership.
-/// Detach wins over normal completion only while the child is still
-/// running — a child that exits before the user presses Ctrl+B still
-/// flows through the `Completed` path.
-///
-/// Returns `Detached(payload)` when the signal fires during reading;
-/// `Completed(output)` otherwise. The caller (bash tool) must
-/// observe the variant and emit the right ToolResult shape.
-pub(crate) async fn run_bash_with_detach(
-    cmd: &mut Command,
-    timeout: Duration,
-    max_stdout_bytes: usize,
-    max_stderr_bytes: usize,
-    cancel_token: Option<&CancellationToken>,
-    detach: &crate::detach::DetachShellHandle,
-    command_label: &str,
-) -> Result<BashRunOutcome, String> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(unix)]
-    cmd.process_group(0);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Error: failed to start bash command: {e}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Error: failed to capture bash command stdout".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "Error: failed to capture bash command stderr".to_string())?;
-    let mut stdout = stdout;
-    let mut stderr = stderr;
-
-    // Take the watch receiver for detach. If absent, the command
-    // cannot be promoted. The watch receiver is borrowed in select!
-    // so we don't need ownership gymnastics.
-    let mut signal_rx = detach.signal_rx.lock().await.take();
-
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut stdout_text = String::new();
-    let mut stderr_text = String::new();
-    let mut stdout_capped = false;
-    let mut stderr_capped = false;
-    let mut exit_code = None;
-    let mut timed_out = false;
-    let mut cancelled = false;
-    let mut detached = false;
-    let mut stdout_open = true;
-    let mut stderr_open = true;
-    let mut stdout_buffer = [0u8; 8192];
-    let mut stderr_buffer = [0u8; 8192];
-
-    loop {
-        if detach_signal_observed(&mut signal_rx) {
-            detached = true;
-            break;
-        }
-
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                exit_code = Some(exit_code_from_status(&status));
-                break;
-            }
-            Ok(None) => {
-                if tokio::time::Instant::now() >= deadline {
-                    timed_out = true;
-                    sigkill_process_group(&mut child).await;
-                    break;
-                }
-
-                if let Some(rx) = signal_rx.as_mut() {
-                    tokio::select! {
-                        biased;
-                        res = rx.changed() => {
-                            match res {
-                                Ok(()) if *rx.borrow_and_update() => {
-                                    detached = true;
-                                    break;
-                                }
-                                Ok(()) => {}
-                                Err(_) => {
-                                    signal_rx = None;
-                                }
-                            }
-                        }
-                        _ = async {
-                            if let Some(token) = cancel_token {
-                                token.cancelled().await;
-                            } else {
-                                std::future::pending::<()>().await;
-                            }
-                        } => {
-                            cancelled = true;
-                            sigkill_process_group(&mut child).await;
-                            break;
-                        }
-                        read = stdout.read(&mut stdout_buffer), if stdout_open => {
-                            match read {
-                                Ok(0) => stdout_open = false,
-                                Ok(read) => append_command_bytes(
-                                    &mut stdout_text,
-                                    &stdout_buffer[..read],
-                                    max_stdout_bytes,
-                                    &mut stdout_capped,
-                                ),
-                                Err(_) => stdout_open = false,
-                            }
-                        }
-                        read = stderr.read(&mut stderr_buffer), if stderr_open => {
-                            match read {
-                                Ok(0) => stderr_open = false,
-                                Ok(read) => append_command_bytes(
-                                    &mut stderr_text,
-                                    &stderr_buffer[..read],
-                                    max_stderr_bytes,
-                                    &mut stderr_capped,
-                                ),
-                                Err(_) => stderr_open = false,
-                            }
-                        }
-                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
-                    }
-                } else {
-                    tokio::select! {
-                        biased;
-                        _ = async {
-                            if let Some(token) = cancel_token {
-                                token.cancelled().await;
-                            } else {
-                                std::future::pending::<()>().await;
-                            }
-                        } => {
-                            cancelled = true;
-                            sigkill_process_group(&mut child).await;
-                            break;
-                        }
-                        read = stdout.read(&mut stdout_buffer), if stdout_open => {
-                            match read {
-                                Ok(0) => stdout_open = false,
-                                Ok(read) => append_command_bytes(
-                                    &mut stdout_text,
-                                    &stdout_buffer[..read],
-                                    max_stdout_bytes,
-                                    &mut stdout_capped,
-                                ),
-                                Err(_) => stdout_open = false,
-                            }
-                        }
-                        read = stderr.read(&mut stderr_buffer), if stderr_open => {
-                            match read {
-                                Ok(0) => stderr_open = false,
-                                Ok(read) => append_command_bytes(
-                                    &mut stderr_text,
-                                    &stderr_buffer[..read],
-                                    max_stderr_bytes,
-                                    &mut stderr_capped,
-                                ),
-                                Err(_) => stderr_open = false,
-                            }
-                        }
-                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
-                    }
-                }
-            }
-            Err(e) => {
-                let error_msg = format!("Error: bash command failed: {e}");
-                sigkill_process_group(&mut child).await;
-                drain_remaining_command_streams(
-                    &mut stdout,
-                    &mut stderr,
-                    CommandStreamDrainState {
-                        stdout_open: &mut stdout_open,
-                        stderr_open: &mut stderr_open,
-                        stdout_text: &mut stdout_text,
-                        stderr_text: &mut stderr_text,
-                        stdout_capped: &mut stdout_capped,
-                        stderr_capped: &mut stderr_capped,
-                        max_stdout_bytes,
-                        max_stderr_bytes,
-                    },
-                )
-                .await;
-                restore_detach_signal_receiver(detach, signal_rx).await;
-                return Err(error_msg);
-            }
-        }
-    }
-
-    if detached {
-        let (adoption_tx, adoption_rx) = tokio::sync::oneshot::channel();
-        let payload = Box::new(crate::detach::DetachedShellPayload {
-            child,
-            stdout,
-            stderr,
-            command: command_label.to_string(),
-            partial_stdout: stdout_text,
-            partial_stderr: stderr_text,
-            adoption_tx,
-        });
-        return Ok(BashRunOutcome::Detached {
-            payload,
-            adoption_rx,
-        });
-    }
-
-    // Normal completion path: drain remaining bytes and assemble
-    // output exactly like the legacy runner.
-    drain_remaining_command_streams(
-        &mut stdout,
-        &mut stderr,
-        CommandStreamDrainState {
-            stdout_open: &mut stdout_open,
-            stderr_open: &mut stderr_open,
-            stdout_text: &mut stdout_text,
-            stderr_text: &mut stderr_text,
-            stdout_capped: &mut stdout_capped,
-            stderr_capped: &mut stderr_capped,
-            max_stdout_bytes,
-            max_stderr_bytes,
-        },
-    )
-    .await;
-
-    if timed_out || cancelled {
-        truncate_partial_line(&mut stdout_text);
-        truncate_partial_line(&mut stderr_text);
-    }
-
-    restore_detach_signal_receiver(detach, signal_rx).await;
-    Ok(BashRunOutcome::Completed(ReadOnlyCommandOutput {
-        stdout: stdout_text,
-        stderr: stderr_text,
-        exit_code: exit_code.unwrap_or(-1),
-        timed_out,
-        cancelled,
-        stdout_capped,
-        stderr_capped,
-        scope_settled: false,
-        scope_ownership: None,
-        scope_quarantined: false,
-        descendants_terminated: false,
-    }))
-}
-
 async fn read_stream<R>(
     mut stream: R,
     kind: StreamKind,
@@ -4895,73 +4287,6 @@ fn append_capped(output: &mut String, chunk: &str, max_bytes: usize, capped: &mu
         return;
     }
     output.push_str(chunk);
-}
-
-fn append_command_bytes(output: &mut String, bytes: &[u8], max_bytes: usize, capped: &mut bool) {
-    let text = String::from_utf8_lossy(bytes);
-    append_capped(output, &text, max_bytes, capped);
-}
-
-struct CommandStreamDrainState<'a> {
-    stdout_open: &'a mut bool,
-    stderr_open: &'a mut bool,
-    stdout_text: &'a mut String,
-    stderr_text: &'a mut String,
-    stdout_capped: &'a mut bool,
-    stderr_capped: &'a mut bool,
-    max_stdout_bytes: usize,
-    max_stderr_bytes: usize,
-}
-
-async fn drain_remaining_command_streams<O, E>(
-    stdout: &mut O,
-    stderr: &mut E,
-    state: CommandStreamDrainState<'_>,
-) where
-    O: tokio::io::AsyncRead + Unpin,
-    E: tokio::io::AsyncRead + Unpin,
-{
-    let CommandStreamDrainState {
-        stdout_open,
-        stderr_open,
-        stdout_text,
-        stderr_text,
-        stdout_capped,
-        stderr_capped,
-        max_stdout_bytes,
-        max_stderr_bytes,
-    } = state;
-    let mut stdout_buffer = [0u8; 8192];
-    let mut stderr_buffer = [0u8; 8192];
-
-    while *stdout_open || *stderr_open {
-        tokio::select! {
-            read = stdout.read(&mut stdout_buffer), if *stdout_open => {
-                match read {
-                    Ok(0) => *stdout_open = false,
-                    Ok(read) => append_command_bytes(
-                        stdout_text,
-                        &stdout_buffer[..read],
-                        max_stdout_bytes,
-                        stdout_capped,
-                    ),
-                    Err(_) => *stdout_open = false,
-                }
-            }
-            read = stderr.read(&mut stderr_buffer), if *stderr_open => {
-                match read {
-                    Ok(0) => *stderr_open = false,
-                    Ok(read) => append_command_bytes(
-                        stderr_text,
-                        &stderr_buffer[..read],
-                        max_stderr_bytes,
-                        stderr_capped,
-                    ),
-                    Err(_) => *stderr_open = false,
-                }
-            }
-        }
-    }
 }
 
 fn annotate_grep_with_scope(grep_output: &str, workspace_root: &Path) -> String {
@@ -5139,7 +4464,6 @@ fn glob_pattern_fragment(pattern: &str) -> Result<String, String> {
 mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
-    use tokio::sync::Mutex;
 
     use super::*;
     #[cfg(unix)]
@@ -6405,37 +5729,15 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
-    fn weak_scope_quarantine_uses_general_mutation_classifier() {
-        let weak = Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup);
-        let authoritative = Some(astra_sandbox::ScopeOwnership::InvocationCgroup);
-
-        assert!(!bash_scope_requires_attribution_quarantine("true", weak));
-        assert!(!bash_scope_requires_attribution_quarantine(
-            "printf harmless",
-            weak
-        ));
-        for command in ["ls", "cat README.md", "git log --oneline -1", "sleep 0.01"] {
-            assert!(
-                !bash_scope_requires_attribution_quarantine(command, weak),
-                "audited foreground reads must not poison later workspace operations: {command}"
-            );
-        }
-        assert!(bash_scope_requires_attribution_quarantine(
-            "python3 worker.py",
-            weak
-        ));
-        assert!(bash_scope_requires_attribution_quarantine(
-            "echo hi & pwd",
-            weak
-        ));
-        assert!(!bash_scope_requires_attribution_quarantine(
-            "python3 worker.py",
-            authoritative
-        ));
-        assert!(!bash_scope_requires_attribution_quarantine(
-            "python3 worker.py",
-            None
-        ));
+    fn weak_scope_quarantine_uses_process_authority() {
+        assert!(bash_scope_requires_attribution_quarantine(Some(
+            astra_sandbox::ScopeOwnership::ForegroundProcessGroup
+        )));
+        assert!(!bash_scope_requires_attribution_quarantine(Some(
+            astra_sandbox::ScopeOwnership::InvocationCgroup
+        )));
+        // Executed scopes with missing authority are fenced by their producer.
+        assert!(!bash_scope_requires_attribution_quarantine(None));
     }
 
     #[cfg(target_os = "macos")]
@@ -7417,48 +6719,6 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
-    async fn bash_verify_mode_never_uses_detach_path() {
-        let dir = tempdir().unwrap();
-        let mut ctx = crate::ToolContext::test(dir.path());
-        let (slot, listener) = crate::detach::new_slot_with_handle();
-        ctx.detach_shell_handle = Some(slot);
-
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({"command": "printf ran", "mode": "verify"}),
-        )
-        .await;
-
-        assert!(!listener.is_active(), "verify must not arm detach");
-        assert_ne!(
-            result
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get("bash_detached")),
-            Some(&Value::Bool(true)),
-        );
-        if result.is_error {
-            assert!(result.output.contains("No command was run"));
-            assert!(!result.output.contains("ran"));
-            let fields = result.metadata.as_ref().unwrap();
-            assert_eq!(fields["disposition"], "rejected");
-            assert_eq!(fields["execution_started"], false);
-        } else {
-            assert_eq!(result.output, "ran");
-            assert!(
-                result
-                    .metadata
-                    .as_ref()
-                    .and_then(|fields| fields
-                        .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD))
-                    .is_some_and(
-                        crate::workspace_observation::is_explicit_workspace_verification_receipt
-                    )
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn bash_verify_mode_rejects_a_workspace_mutation() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -8120,590 +7380,6 @@ printf 'probe.txt:1:needle\n'
         );
     }
 
-    // ── Phase 3b.3b: bash detach path ─────────────────────────────────────
-    //
-    // When the host wires a `DetachShellHandle` on `ToolContext` and
-    // fires the signal mid-execution, the bash runner must NOT kill
-    // the child. It transfers child + live streams + already-consumed
-    // bytes through the handle's one-shot reply channel and returns
-    // a `<bash_detached>` marker ToolResult so the LLM sees the
-    // invocation ended via background promotion.
-
-    #[tokio::test]
-    async fn bash_detach_signal_transfers_live_child_to_listener() {
-        let dir = tempdir().unwrap();
-        let mut ctx = crate::ToolContext::test(dir.path());
-        let (slot, listener) = crate::detach::new_slot_with_handle();
-        ctx.detach_shell_handle = Some(slot);
-
-        // Long-running pure sleep gives the test a window to fire the
-        // detach signal. Commands with shell control or filesystem
-        // effects deliberately stay foreground so the executor can own
-        // their post-execution workspace receipt.
-        let bash_fut = tokio::spawn({
-            let ctx = ctx.clone();
-            async move {
-                execute_bash(
-                    &ctx,
-                    &serde_json::json!({
-                        "command": "sleep 1"
-                    }),
-                )
-                .await
-            }
-        });
-
-        // Wait for the runner to reach its idle-poll branch where the
-        // detach select is armed.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        listener.signal_tx.send(true).expect("detach signal send");
-
-        let payload = listener
-            .payload_rx
-            .await
-            .expect("listener must receive detached payload");
-        assert_eq!(payload.command, "sleep 1");
-        payload
-            .adoption_tx
-            .send(Ok("bg-shell-test".into()))
-            .expect("ack adoption");
-
-        // The bash invocation must have returned a marker result
-        // (not killed, not a normal output) so the LLM sees the
-        // detach path explicitly.
-        let result = bash_fut.await.expect("bash future");
-        assert!(
-            result.output.contains("bash_detached"),
-            "result must announce detach to the LLM: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("bg-shell-test"),
-            "result must include concrete task id: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("Do NOT poll"),
-            "result must tell the LLM not to poll task_output: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("do not rerun the bash command"),
-            "result must forbid the rerun anti-pattern: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("tail/cat/head/less are denied"),
-            "result must close the on-disk read escape hatch: {}",
-            result.output
-        );
-        assert!(
-            result
-                .output
-                .contains("call `task_output` ONCE with block=false"),
-            "result must show the user-asked-for-progress escape hatch: {}",
-            result.output
-        );
-        assert!(
-            !result.output.contains("task_output("),
-            "result must not use misleading pseudo-tool syntax: {}",
-            result.output
-        );
-        assert!(
-            !result.output.contains("task_list()"),
-            "result must not use misleading pseudo-tool syntax: {}",
-            result.output
-        );
-        assert!(
-            !result.output.contains("task_stop("),
-            "result must not use misleading pseudo-tool syntax: {}",
-            result.output
-        );
-        assert_eq!(
-            result
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("bash_detached"))
-                .and_then(|v| v.as_bool()),
-            Some(true),
-            "metadata.bash_detached flag must be set so downstream wiring can route correctly"
-        );
-        assert_eq!(
-            result
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("background_task_id"))
-                .and_then(|v| v.as_str()),
-            Some("bg-shell-test")
-        );
-        let work = result
-            .metadata
-            .as_ref()
-            .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
-            .expect("detach receipt must publish the shared work-unit contract");
-        assert_eq!(work.id, "bg-shell-test");
-        assert_eq!(work.status, WorkUnitStatus::Running);
-        assert_eq!(work.mode, WorkUnitObservationMode::Transition);
-        assert_eq!(work.wake_policy, WorkUnitWakePolicy::OnTerminal);
-    }
-
-    #[tokio::test]
-    async fn bash_detach_signal_wins_for_long_running_builtin() {
-        let dir = tempdir().unwrap();
-        let mut ctx = crate::ToolContext::test(dir.path());
-        let (slot, listener) = crate::detach::new_slot_with_handle();
-        ctx.detach_shell_handle = Some(slot);
-
-        let bash_fut = tokio::spawn({
-            let ctx = ctx.clone();
-            async move {
-                execute_bash(
-                    &ctx,
-                    &serde_json::json!({
-                        "command": "sleep 1"
-                    }),
-                )
-                .await
-            }
-        });
-
-        for _ in 0..50 {
-            if listener.is_active() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            listener.is_active(),
-            "detach listener should become active for running bash"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        listener.signal_tx.send(true).expect("detach signal send");
-
-        let payload = tokio::time::timeout(Duration::from_secs(1), listener.payload_rx)
-            .await
-            .expect("noisy bash must hand off promptly after Ctrl+B")
-            .expect("listener must receive noisy bash payload");
-        payload
-            .adoption_tx
-            .send(Ok("bg-shell-noisy".into()))
-            .expect("ack noisy adoption");
-
-        let result = tokio::time::timeout(Duration::from_secs(1), bash_fut)
-            .await
-            .expect("detached noisy bash should return promptly")
-            .expect("bash task");
-        assert!(result.output.contains("bash_detached"), "{}", result.output);
-        assert!(
-            result.output.contains("bg-shell-noisy"),
-            "{}",
-            result.output
-        );
-    }
-
-    #[tokio::test]
-    async fn unsafe_bash_with_detach_slot_stays_foreground_and_emits_receipt() {
-        let dir = tempdir().unwrap();
-        let ownership_guaranteed = astra_sandbox::apply_process_scope().ownership_guaranteed();
-        let expected_ownership = if ownership_guaranteed {
-            Some(crate::workspace_observation::INVOCATION_CGROUP_OWNERSHIP)
-        } else if cfg!(unix) {
-            Some(crate::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
-        } else {
-            None
-        };
-        let mut ctx = crate::ToolContext::test(dir.path());
-        let (slot, listener) = crate::detach::new_slot_with_handle();
-        ctx.detach_shell_handle = Some(slot);
-
-        // The presence of a detach slot must not turn an opaque writer into
-        // an unobserved background process.  It runs to completion under the
-        // normal pre/post fingerprint boundary instead.
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({
-                "command": "printf x > generated.txt; sleep 0.05"
-            }),
-        )
-        .await;
-
-        assert!(!result.output.contains("bash_detached"), "{result:?}");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("generated.txt")).unwrap(),
-            "x"
-        );
-        assert_eq!(
-            result
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get(crate::workspace_observation::OBSERVED_FIELD))
-                .and_then(serde_json::Value::as_bool),
-            expected_ownership.map(|_| true),
-            "receipt must be issued only when the executor proves process ownership"
-        );
-        assert_eq!(
-            result
-                .metadata
-                .as_ref()
-                .and_then(|fields| fields.get(crate::workspace_observation::OWNERSHIP_FIELD))
-                .and_then(serde_json::Value::as_str),
-            expected_ownership,
-        );
-        assert!(
-            !listener.is_active(),
-            "unsafe command must never arm detach"
-        );
-    }
-
-    #[tokio::test]
-    #[serial(detached_bash_environment)]
-    async fn detached_bash_clears_inherited_startup_environment() {
-        let dir = tempdir().unwrap();
-        let marker = dir.path().join("bash-env-marker");
-        let startup = dir.path().join("startup.sh");
-        // BASH_ENV is process-global in this test process.  Other shell
-        // tests run concurrently, so make the probe side-effect conditional
-        // on this invocation's unique workspace instead of letting unrelated
-        // children write our marker while the variable is temporarily set.
-        std::fs::write(
-            &startup,
-            format!(
-                "if [ \"$PWD\" = \"{}\" ]; then printf sourced > {}; fi\n",
-                dir.path().display(),
-                marker.display()
-            ),
-        )
-        .unwrap();
-        let previous = std::env::var_os("BASH_ENV");
-        // Rust 2024 marks process-environment mutation unsafe. The test is
-        // serialized because BASH_ENV is process-global; production code
-        // only clears the child command's environment.
-        unsafe { std::env::set_var("BASH_ENV", &startup) };
-
-        let mut ctx = crate::ToolContext::test(dir.path());
-        let (slot, listener) = crate::detach::new_slot_with_handle();
-        ctx.detach_shell_handle = Some(slot);
-        let bash_fut = tokio::spawn({
-            let ctx = ctx.clone();
-            async move {
-                execute_bash(
-                    &ctx,
-                    &serde_json::json!({
-                        "command": "sleep 1"
-                    }),
-                )
-                .await
-            }
-        });
-        for _ in 0..50 {
-            if listener.is_active() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(listener.is_active(), "detach listener should become active");
-        listener.signal_tx.send(true).expect("detach signal send");
-        let payload = tokio::time::timeout(Duration::from_secs(1), listener.payload_rx)
-            .await
-            .expect("detached command should hand off")
-            .expect("detach payload");
-        payload
-            .adoption_tx
-            .send(Ok("bg-env-test".into()))
-            .expect("ack adoption");
-        let result = tokio::time::timeout(Duration::from_secs(1), bash_fut)
-            .await
-            .expect("bash result timeout")
-            .expect("bash task");
-        assert!(result.output.contains("bash_detached"), "{result:?}");
-        assert!(
-            !marker.exists(),
-            "detached bash must not source inherited BASH_ENV"
-        );
-
-        match previous {
-            Some(value) => unsafe { std::env::set_var("BASH_ENV", value) },
-            None => unsafe { std::env::remove_var("BASH_ENV") },
-        }
-    }
-
-    #[tokio::test]
-    async fn bash_detach_without_payload_channel_kills_child_and_errors() {
-        let dir = tempdir().unwrap();
-        let mut ctx = crate::ToolContext::test(dir.path());
-        let (handle, listener) = crate::detach::new_detach_pair();
-        *handle.payload_tx.lock().await = None;
-        let slot = Arc::new(Mutex::new(Some(handle)));
-        ctx.detach_shell_handle = Some(slot);
-
-        let bash_fut = tokio::spawn({
-            let ctx = ctx.clone();
-            async move {
-                execute_bash(
-                    &ctx,
-                    &serde_json::json!({
-                        "command": "sleep 30"
-                    }),
-                )
-                .await
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        listener.signal_tx.send(true).expect("detach signal send");
-
-        let result = tokio::time::timeout(Duration::from_secs(2), bash_fut)
-            .await
-            .expect("detach failure should not hang")
-            .expect("bash task");
-        assert!(result.is_error, "{result:?}");
-        assert!(
-            result
-                .output
-                .contains("host payload channel was not available"),
-            "{}",
-            result.output
-        );
-    }
-
-    #[tokio::test]
-    async fn bash_detach_when_listener_dropped_kills_child_and_errors() {
-        let dir = tempdir().unwrap();
-        let mut ctx = crate::ToolContext::test(dir.path());
-        let (slot, listener) = crate::detach::new_slot_with_handle();
-        let signal_tx = listener.signal_tx.clone();
-        drop(listener.payload_rx);
-        ctx.detach_shell_handle = Some(slot);
-
-        let bash_fut = tokio::spawn({
-            let ctx = ctx.clone();
-            async move {
-                execute_bash(
-                    &ctx,
-                    &serde_json::json!({
-                        "command": "sleep 30"
-                    }),
-                )
-                .await
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        signal_tx.send(true).expect("detach signal send");
-
-        let result = tokio::time::timeout(Duration::from_secs(2), bash_fut)
-            .await
-            .expect("detach failure should not hang")
-            .expect("bash task");
-        assert!(result.is_error, "{result:?}");
-        assert!(
-            result
-                .output
-                .contains("host listener dropped before payload arrived"),
-            "{}",
-            result.output
-        );
-    }
-
-    #[tokio::test]
-    async fn bash_detach_adoption_error_returns_tool_error() {
-        let dir = tempdir().unwrap();
-        let mut ctx = crate::ToolContext::test(dir.path());
-        let (slot, listener) = crate::detach::new_slot_with_handle();
-        ctx.detach_shell_handle = Some(slot);
-
-        let bash_fut = tokio::spawn({
-            let ctx = ctx.clone();
-            async move {
-                execute_bash(
-                    &ctx,
-                    &serde_json::json!({
-                        "command": "sleep 30"
-                    }),
-                )
-                .await
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        listener.signal_tx.send(true).expect("detach signal send");
-        let payload = tokio::time::timeout(Duration::from_secs(1), listener.payload_rx)
-            .await
-            .expect("payload should arrive")
-            .expect("listener must receive payload");
-        payload
-            .adoption_tx
-            .send(Err("background shell task limit reached".into()))
-            .expect("ack adoption failure");
-
-        let result = tokio::time::timeout(Duration::from_secs(1), bash_fut)
-            .await
-            .expect("adoption failure should not hang")
-            .expect("bash task");
-        assert!(result.is_error, "{result:?}");
-        assert!(
-            result
-                .output
-                .contains("host could not adopt process: background shell task limit reached"),
-            "{}",
-            result.output
-        );
-    }
-
-    #[tokio::test]
-    async fn bash_detach_after_no_output_still_hands_off_child() {
-        let dir = tempdir().unwrap();
-        let mut ctx = crate::ToolContext::test(dir.path());
-        let (slot, listener) = crate::detach::new_slot_with_handle();
-        ctx.detach_shell_handle = Some(slot);
-
-        let bash_fut = tokio::spawn({
-            let ctx = ctx.clone();
-            async move {
-                execute_bash(
-                    &ctx,
-                    &serde_json::json!({
-                        "command": "sleep 30"
-                    }),
-                )
-                .await
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        listener.signal_tx.send(true).expect("detach signal send");
-
-        let payload = tokio::time::timeout(Duration::from_secs(1), listener.payload_rx)
-            .await
-            .expect("silent bash must still hand off promptly")
-            .expect("listener must receive payload for silent bash");
-        assert_eq!(payload.command, "sleep 30");
-        payload
-            .adoption_tx
-            .send(Ok("bg-shell-stdout-eof".into()))
-            .expect("ack stdout-eof adoption");
-
-        let result = tokio::time::timeout(Duration::from_secs(1), bash_fut)
-            .await
-            .expect("detached stdout-closed bash should return promptly")
-            .expect("bash task");
-        assert!(!result.is_error, "{result:?}");
-        assert!(result.output.contains("bash_detached"), "{}", result.output);
-        assert!(
-            result.output.contains("bg-shell-stdout-eof"),
-            "{}",
-            result.output
-        );
-    }
-
-    #[tokio::test]
-    async fn bash_detach_slot_accepts_fresh_handle_after_normal_completion() {
-        let dir = tempdir().unwrap();
-        let mut ctx = crate::ToolContext::test(dir.path());
-        let (slot, first_listener) = crate::detach::new_slot_with_handle();
-        ctx.detach_shell_handle = Some(slot.clone());
-
-        let first = tokio::time::timeout(
-            Duration::from_secs(2),
-            execute_bash(&ctx, &serde_json::json!({"command": "printf 'first\\n'"})),
-        )
-        .await
-        .expect("first foreground bash must settle promptly");
-        assert!(first.output.contains("first"), "{}", first.output);
-        assert!(
-            slot.lock().await.is_none(),
-            "an invocation-scoped detach handle must be consumed at normal completion"
-        );
-        first_listener.retire();
-        let (next_handle, listener) = crate::detach::new_detach_pair();
-        *slot.lock().await = Some(next_handle);
-
-        let second = tokio::spawn({
-            let ctx = ctx.clone();
-            async move {
-                execute_bash(
-                    &ctx,
-                    &serde_json::json!({
-                        "command": "sleep 30"
-                    }),
-                )
-                .await
-            }
-        });
-
-        listener.signal_tx.send(true).expect("detach signal send");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            slot.lock().await.is_none(),
-            "second bash must take the freshly installed invocation handle"
-        );
-        let payload = tokio::time::timeout(Duration::from_secs(10), listener.payload_rx)
-            .await
-            .expect("reused detach listener must receive the live child promptly")
-            .expect("listener must receive second bash payload");
-        payload
-            .adoption_tx
-            .send(Ok("bg-shell-second".into()))
-            .expect("ack second adoption");
-
-        let second = tokio::time::timeout(Duration::from_secs(2), second)
-            .await
-            .expect("detached second bash must settle promptly")
-            .expect("second bash task");
-        assert!(second.output.contains("bash_detached"), "{}", second.output);
-        assert!(
-            second.output.contains("bg-shell-second"),
-            "{}",
-            second.output
-        );
-    }
-
-    #[tokio::test]
-    async fn blocked_detach_slot_is_not_restored_after_normal_completion() {
-        let dir = tempdir().unwrap();
-        let mut ctx = crate::ToolContext::test(dir.path());
-        let (slot, listener) = crate::detach::new_slot_with_handle();
-        ctx.detach_shell_handle = Some(slot.clone());
-
-        listener.retire();
-
-        let result = execute_bash(&ctx, &serde_json::json!({"command": "printf 'done\\n'"})).await;
-        assert!(result.output.contains("done"), "{}", result.output);
-        assert!(
-            slot.lock().await.is_none(),
-            "blocked detach handles must not be restored with a consumed or abandoned listener"
-        );
-    }
-
-    /// Sanity: when no detach handle is wired, the bash tool falls
-    /// through the legacy code path and returns normally. Without
-    /// this guard, a regression in the new detach branch could
-    /// silently break ordinary bash commands.
-    #[tokio::test]
-    async fn bash_without_detach_handle_uses_legacy_path() {
-        let dir = tempdir().unwrap();
-        let ctx = crate::ToolContext::test(dir.path());
-        assert!(
-            ctx.detach_shell_handle.is_none(),
-            "default ToolContext::test must not wire a detach handle"
-        );
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({"command": "echo legacy-path-still-works"}),
-        )
-        .await;
-        assert!(
-            result.output.contains("legacy-path-still-works"),
-            "unhandled-detach bash must run normally: {}",
-            result.output
-        );
-        assert!(
-            !result.output.contains("bash_detached"),
-            "no detach handle means no marker output: {}",
-            result.output
-        );
-    }
-
     // ── background process warning ────────────────────────────────────────────
 
     #[test]
@@ -8862,7 +7538,7 @@ printf 'probe.txt:1:needle\n'
             .spawn()
             .expect("spawn sleep 999");
         assert!(child.try_wait().unwrap().is_none());
-        super::sigkill_process_group(&mut child).await;
+        crate::detach::sigkill_process_group(&mut child).await;
         let status = child.wait().await.expect("wait after sigkill");
         assert!(!status.success(), "process should have been killed");
     }

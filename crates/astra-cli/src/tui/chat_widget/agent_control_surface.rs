@@ -117,14 +117,18 @@ mod tests {
     }
 
     #[test]
-    fn result_without_status_is_completed_when_outer_status_is_completed() {
-        let parsed = parse(r#"{"agent_id":"reviewer@abc","result":"done"}"#);
+    fn child_result_without_status_fails_closed() {
+        let parsed =
+            parse(r#"{"result_family":"child_result","agent_id":"reviewer@abc","result":"done"}"#);
         let surface = AgentControlSurface::from_wire("get_result", "completed", Some(&parsed));
-        assert_eq!(surface.outcome(), AgentControlOutcome::Completed);
+        assert_eq!(
+            surface.outcome(),
+            AgentControlOutcome::Failed(AgentControlFailureKind::AgentFailed)
+        );
     }
 
     #[test]
-    fn result_without_status_fails_closed_when_outer_status_is_alias() {
+    fn result_without_family_fails_closed_when_outer_status_is_not_canonical() {
         let parsed = parse(r#"{"agent_id":"reviewer@abc","result":"done"}"#);
         let surface = AgentControlSurface::from_wire("get_result", "ok", Some(&parsed));
         assert_eq!(
@@ -147,15 +151,20 @@ mod tests {
     }
 
     #[test]
-    fn empty_completed_get_result_does_not_complete_agent() {
+    fn malformed_get_result_does_not_complete_agent() {
         let parsed = parse(r#"{"agent_id":"reviewer@abc"}"#);
         let surface = AgentControlSurface::from_wire("get_result", "completed", Some(&parsed));
-        assert_eq!(surface.outcome(), AgentControlOutcome::NoChange);
+        assert_eq!(
+            surface.outcome(),
+            AgentControlOutcome::Failed(AgentControlFailureKind::AgentFailed)
+        );
     }
 
     #[test]
     fn unknown_wire_status_fails_closed() {
-        let parsed = parse(r#"{"status":"mystery","agent_id":"reviewer@abc"}"#);
+        let parsed = parse(
+            r#"{"result_family":"child_result","status":"mystery","agent_id":"reviewer@abc"}"#,
+        );
         let surface = AgentControlSurface::from_wire("get_result", "completed", Some(&parsed));
         assert_eq!(
             surface.outcome(),
@@ -165,7 +174,9 @@ mod tests {
 
     #[test]
     fn cancelled_status_is_typed_cancelled_outcome() {
-        let parsed = parse(r#"{"status":"cancelled","agent_id":"reviewer@abc"}"#);
+        let parsed = parse(
+            r#"{"result_family":"child_result","status":"cancelled","agent_id":"reviewer@abc"}"#,
+        );
         let surface = AgentControlSurface::from_wire("spawn", "completed", Some(&parsed));
         assert_eq!(surface.outcome(), AgentControlOutcome::Cancelled);
     }
@@ -173,7 +184,7 @@ mod tests {
     #[test]
     fn still_running_preview_uses_wait_fields() {
         let parsed = parse(
-            r#"{"status":"still_running","agent_id":"reviewer@abc","current_status":"running","waited_secs":120,"hint":"call again"}"#,
+            r#"{"result_family":"child_result","status":"still_running","agent_id":"reviewer@abc","current_status":"running","waited_secs":120,"hint":"call again"}"#,
         );
         let surface = AgentControlSurface::from_wire("get_result", "completed", Some(&parsed));
         assert_eq!(surface.outcome(), AgentControlOutcome::Running);
@@ -186,7 +197,7 @@ mod tests {
     #[test]
     fn interrupted_get_result_is_failed_and_uses_shared_interrupted_copy() {
         let parsed = parse(
-            r#"{"status":"interrupted","agent_id":"reviewer@abc","finish_reason":"budget_exhausted"}"#,
+            r#"{"result_family":"child_result","status":"interrupted","agent_id":"reviewer@abc","finish_reason":"budget_exhausted"}"#,
         );
         let surface = AgentControlSurface::from_wire("get_result", "completed", Some(&parsed));
         assert_eq!(
@@ -202,7 +213,7 @@ mod tests {
     #[test]
     fn interrupted_spawn_is_failed_and_preserves_finish_reason_copy() {
         let parsed = parse(
-            r#"{"status":"interrupted","agent_id":"reviewer@abc","finish_reason":"budget_exhausted","result":"partial findings"}"#,
+            r#"{"result_family":"child_result","status":"interrupted","agent_id":"reviewer@abc","finish_reason":"budget_exhausted","result":"partial findings"}"#,
         );
         let surface = AgentControlSurface::from_wire("spawn", "completed", Some(&parsed));
         assert_eq!(

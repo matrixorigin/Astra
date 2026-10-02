@@ -1,8 +1,10 @@
 //! Provider-neutral Git worktree patch materialization.
 //!
-//! The caller owns the workspace mutation lease. This module owns the exact
-//! base observation and provider effect classification; it never interprets
-//! stderr or human-readable command output as control state.
+//! This module owns the workspace operation lease, exact base observation, and
+//! provider effect classification; it never interprets stderr or human-readable
+//! command output as control state. The lease is acquired before the private
+//! Git lock, giving all workspace mutation paths one ordering: executor lease
+//! first, Git lock second.
 
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -21,6 +23,7 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 const GIT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const WORKSPACE_LEASE_WAIT: Duration = Duration::from_secs(120);
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
 const REVISION_DOMAIN: &[u8] = b"astra.git-worktree.v1\0";
 
@@ -28,6 +31,7 @@ const REVISION_DOMAIN: &[u8] = b"astra.git-worktree.v1\0";
 pub enum GitPatchNotAppliedCode {
     BaseChanged,
     PatchRejected,
+    InvalidWorkspace,
     WorkspaceUnavailable,
     ProviderUnavailable,
 }
@@ -75,6 +79,7 @@ pub enum GitWorktreeCommitNotCreatedCode {
     PatchRejected,
     CommitRejected,
     RefConflict,
+    InvalidWorkspace,
     WorkspaceUnavailable,
     ProviderUnavailable,
 }
@@ -104,7 +109,17 @@ pub enum GitReviewedCommitReconciliation {
     },
     Diverged {
         observed_revision: Option<WorkContentHash>,
+        reason: GitReviewedCommitReconciliationReason,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitReviewedCommitReconciliationReason {
+    TargetChanged,
+    InvalidPatch,
+    InvalidWorkspace,
+    WorkspaceUnavailable,
+    ProviderUnavailable,
 }
 
 #[derive(Debug, Error)]
@@ -133,6 +148,8 @@ pub enum GitWorkspaceObservationError {
     Timeout,
     #[error("Git provider rejected a read-only observation")]
     ObservationRejected,
+    #[error("workspace Git lock was unavailable")]
+    LockUnavailable,
     #[error("Git returned an unsafe worktree path")]
     UnsafePath,
     #[error("workspace observation I/O failed: {0}")]
@@ -144,6 +161,24 @@ pub enum GitWorkspaceObservationError {
 /// Ignored files are intentionally outside the developer-work subject.
 pub async fn observe_git_worktree_revision(
     workspace_root: &Path,
+) -> Result<WorkContentHash, GitWorkspaceObservationError> {
+    let workspace_lease =
+        crate::workspace_observation::acquire_workspace_observation_lease_with_options(
+            workspace_root,
+            None,
+            WORKSPACE_LEASE_WAIT,
+        )
+        .await
+        .ok_or(GitWorkspaceObservationError::WorkspaceUnavailable)?;
+    observe_git_worktree_revision_with_workspace_lease(workspace_root, &workspace_lease).await
+}
+
+/// Observe under a lease already admitted by a durable executor.  Recovery
+/// callers acquire the physical lease before claiming durable execution so a
+/// long workspace wait cannot outlive the database authority that follows it.
+pub async fn observe_git_worktree_revision_with_workspace_lease(
+    workspace_root: &Path,
+    _workspace_lease: &crate::workspace_observation::WorkspaceObservationLease,
 ) -> Result<WorkContentHash, GitWorkspaceObservationError> {
     timeout(
         GIT_OPERATION_TIMEOUT,
@@ -163,6 +198,34 @@ pub async fn materialize_git_patch(
     workspace_root: &Path,
     expected_base_revision: &WorkContentHash,
     patch: &[u8],
+) -> GitPatchMaterializationOutcome {
+    let Some(workspace_lease) =
+        crate::workspace_observation::acquire_workspace_mutation_lease_with_options(
+            workspace_root,
+            None,
+            WORKSPACE_LEASE_WAIT,
+        )
+        .await
+    else {
+        return GitPatchMaterializationOutcome::NotApplied {
+            code: GitPatchNotAppliedCode::WorkspaceUnavailable,
+            observed_revision: None,
+        };
+    };
+    materialize_git_patch_with_workspace_lease(
+        workspace_root,
+        expected_base_revision,
+        patch,
+        &workspace_lease,
+    )
+    .await
+}
+
+pub async fn materialize_git_patch_with_workspace_lease(
+    workspace_root: &Path,
+    expected_base_revision: &WorkContentHash,
+    patch: &[u8],
+    _workspace_lease: &crate::workspace_observation::WorkspaceObservationLease,
 ) -> GitPatchMaterializationOutcome {
     if patch.len() as u64 > WORK_PATCH_ARTIFACT_MAX_BYTES
         || work_patch_line_count(patch) > WORK_PATCH_ARTIFACT_MAX_LINES
@@ -258,6 +321,16 @@ pub async fn materialize_git_patch(
 pub async fn export_git_worktree_patch(
     workspace_root: &Path,
 ) -> Result<GitWorktreePatchExport, GitWorktreePatchExportError> {
+    let _workspace_lease =
+        crate::workspace_observation::acquire_workspace_observation_lease_with_options(
+            workspace_root,
+            None,
+            WORKSPACE_LEASE_WAIT,
+        )
+        .await
+        .ok_or(GitWorktreePatchExportError::Observation(
+            GitWorkspaceObservationError::WorkspaceUnavailable,
+        ))?;
     let root = canonical_git_worktree_root(workspace_root).await?;
     let _workspace_lock = acquire_workspace_lock(&root).await?;
     let result_subject_revision = observe_git_worktree_revision_locked(&root).await?;
@@ -314,6 +387,38 @@ pub async fn commit_reviewed_git_patch(
     expected_result_revision: &WorkContentHash,
     patch: &[u8],
     metadata: &GitWorktreeCommitMetadata,
+) -> GitWorktreeCommitOutcome {
+    let Some(workspace_lease) =
+        crate::workspace_observation::acquire_workspace_mutation_lease_with_options(
+            workspace_root,
+            None,
+            WORKSPACE_LEASE_WAIT,
+        )
+        .await
+    else {
+        return GitWorktreeCommitOutcome::NotCreated {
+            code: GitWorktreeCommitNotCreatedCode::WorkspaceUnavailable,
+            observed_revision: None,
+        };
+    };
+    commit_reviewed_git_patch_with_workspace_lease(
+        workspace_root,
+        expected_base_revision,
+        expected_result_revision,
+        patch,
+        metadata,
+        &workspace_lease,
+    )
+    .await
+}
+
+pub async fn commit_reviewed_git_patch_with_workspace_lease(
+    workspace_root: &Path,
+    expected_base_revision: &WorkContentHash,
+    expected_result_revision: &WorkContentHash,
+    patch: &[u8],
+    metadata: &GitWorktreeCommitMetadata,
+    _workspace_lease: &crate::workspace_observation::WorkspaceObservationLease,
 ) -> GitWorktreeCommitOutcome {
     let not_created = |code, observed_revision| GitWorktreeCommitOutcome::NotCreated {
         code,
@@ -528,27 +633,60 @@ pub async fn reconcile_reviewed_git_patch_commit(
     expected_result_revision: &WorkContentHash,
     patch: &[u8],
 ) -> GitReviewedCommitReconciliation {
+    let Some(workspace_lease) =
+        crate::workspace_observation::acquire_workspace_mutation_lease_with_options(
+            workspace_root,
+            None,
+            WORKSPACE_LEASE_WAIT,
+        )
+        .await
+    else {
+        return GitReviewedCommitReconciliation::Diverged {
+            observed_revision: None,
+            reason: GitReviewedCommitReconciliationReason::WorkspaceUnavailable,
+        };
+    };
+    reconcile_reviewed_git_patch_commit_with_workspace_lease(
+        workspace_root,
+        expected_base_revision,
+        expected_result_revision,
+        patch,
+        &workspace_lease,
+    )
+    .await
+}
+
+pub async fn reconcile_reviewed_git_patch_commit_with_workspace_lease(
+    workspace_root: &Path,
+    expected_base_revision: &WorkContentHash,
+    expected_result_revision: &WorkContentHash,
+    patch: &[u8],
+    _workspace_lease: &crate::workspace_observation::WorkspaceObservationLease,
+) -> GitReviewedCommitReconciliation {
     let root = match canonical_git_worktree_root(workspace_root).await {
         Ok(root) => root,
-        Err(_) => {
+        Err(error) => {
             return GitReviewedCommitReconciliation::Diverged {
                 observed_revision: None,
+                reason: reconciliation_reason(&error),
             };
         }
     };
     let _workspace_lock = match acquire_workspace_lock(&root).await {
         Ok(lock) => lock,
-        Err(_) => {
+        Err(error) => {
             return GitReviewedCommitReconciliation::Diverged {
                 observed_revision: None,
+                reason: reconciliation_reason(&error),
             };
         }
     };
     let observed_revision = match observe_git_worktree_revision_locked(&root).await {
         Ok(revision) => revision,
-        Err(_) => {
+        Err(error) => {
             return GitReviewedCommitReconciliation::Diverged {
                 observed_revision: None,
+                reason: reconciliation_reason(&error),
             };
         }
     };
@@ -560,6 +698,7 @@ pub async fn reconcile_reviewed_git_patch_commit(
     {
         return GitReviewedCommitReconciliation::Diverged {
             observed_revision: Some(observed_revision),
+            reason: GitReviewedCommitReconciliationReason::InvalidPatch,
         };
     }
     let head = match git_small_output(&root, &["rev-parse", "HEAD"]).await {
@@ -567,6 +706,7 @@ pub async fn reconcile_reviewed_git_patch_commit(
         Err(_) => {
             return GitReviewedCommitReconciliation::Diverged {
                 observed_revision: Some(observed_revision),
+                reason: GitReviewedCommitReconciliationReason::ProviderUnavailable,
             };
         }
     };
@@ -575,6 +715,7 @@ pub async fn reconcile_reviewed_git_patch_commit(
         _ => {
             return GitReviewedCommitReconciliation::Diverged {
                 observed_revision: Some(observed_revision),
+                reason: GitReviewedCommitReconciliationReason::ProviderUnavailable,
             };
         }
     };
@@ -583,6 +724,7 @@ pub async fn reconcile_reviewed_git_patch_commit(
         Err(_) => {
             return GitReviewedCommitReconciliation::Diverged {
                 observed_revision: Some(observed_revision),
+                reason: GitReviewedCommitReconciliationReason::ProviderUnavailable,
             };
         }
     };
@@ -591,6 +733,7 @@ pub async fn reconcile_reviewed_git_patch_commit(
         _ => {
             return GitReviewedCommitReconciliation::Diverged {
                 observed_revision: Some(observed_revision),
+                reason: GitReviewedCommitReconciliationReason::ProviderUnavailable,
             };
         }
     };
@@ -598,6 +741,7 @@ pub async fn reconcile_reviewed_git_patch_commit(
     {
         return GitReviewedCommitReconciliation::Diverged {
             observed_revision: Some(observed_revision),
+            reason: GitReviewedCommitReconciliationReason::TargetChanged,
         };
     }
     let index_name = format!("astra-reconcile-{}.index", Uuid::new_v4());
@@ -615,12 +759,14 @@ pub async fn reconcile_reviewed_git_patch_commit(
             _ => {
                 return GitReviewedCommitReconciliation::Diverged {
                     observed_revision: Some(observed_revision),
+                    reason: GitReviewedCommitReconciliationReason::InvalidWorkspace,
                 };
             }
         },
         Err(_) => {
             return GitReviewedCommitReconciliation::Diverged {
                 observed_revision: Some(observed_revision),
+                reason: GitReviewedCommitReconciliationReason::ProviderUnavailable,
             };
         }
     };
@@ -644,6 +790,7 @@ pub async fn reconcile_reviewed_git_patch_commit(
     {
         return GitReviewedCommitReconciliation::Diverged {
             observed_revision: Some(observed_revision),
+            reason: GitReviewedCommitReconciliationReason::InvalidPatch,
         };
     }
     let expected_tree =
@@ -652,6 +799,7 @@ pub async fn reconcile_reviewed_git_patch_commit(
     if expected_tree.as_deref().map(trim_ascii) != actual_tree.as_deref().ok().map(trim_ascii) {
         return GitReviewedCommitReconciliation::Diverged {
             observed_revision: Some(observed_revision),
+            reason: GitReviewedCommitReconciliationReason::TargetChanged,
         };
     }
     let clean_committed_revision = clean_head_subject_revision(head.as_bytes()).ok();
@@ -706,13 +854,39 @@ fn commit_observation_code(
         GitWorkspaceObservationError::ProviderUnavailable => {
             GitWorktreeCommitNotCreatedCode::ProviderUnavailable
         }
-        GitWorkspaceObservationError::WorkspaceUnavailable
-        | GitWorkspaceObservationError::NotWorktreeRoot
-        | GitWorkspaceObservationError::Timeout
-        | GitWorkspaceObservationError::ObservationRejected
-        | GitWorkspaceObservationError::UnsafePath
-        | GitWorkspaceObservationError::Io(_) => {
+        GitWorkspaceObservationError::WorkspaceUnavailable => {
             GitWorktreeCommitNotCreatedCode::WorkspaceUnavailable
+        }
+        GitWorkspaceObservationError::NotWorktreeRoot
+        | GitWorkspaceObservationError::ObservationRejected
+        | GitWorkspaceObservationError::UnsafePath => {
+            GitWorktreeCommitNotCreatedCode::InvalidWorkspace
+        }
+        GitWorkspaceObservationError::Timeout
+        | GitWorkspaceObservationError::LockUnavailable
+        | GitWorkspaceObservationError::Io(_) => {
+            GitWorktreeCommitNotCreatedCode::ProviderUnavailable
+        }
+    }
+}
+
+fn reconciliation_reason(
+    error: &GitWorkspaceObservationError,
+) -> GitReviewedCommitReconciliationReason {
+    match error {
+        GitWorkspaceObservationError::WorkspaceUnavailable => {
+            GitReviewedCommitReconciliationReason::WorkspaceUnavailable
+        }
+        GitWorkspaceObservationError::NotWorktreeRoot
+        | GitWorkspaceObservationError::ObservationRejected
+        | GitWorkspaceObservationError::UnsafePath => {
+            GitReviewedCommitReconciliationReason::InvalidWorkspace
+        }
+        GitWorkspaceObservationError::ProviderUnavailable
+        | GitWorkspaceObservationError::Timeout
+        | GitWorkspaceObservationError::LockUnavailable
+        | GitWorkspaceObservationError::Io(_) => {
+            GitReviewedCommitReconciliationReason::ProviderUnavailable
         }
     }
 }
@@ -890,12 +1064,15 @@ fn observation_not_applied_code(error: &GitWorkspaceObservationError) -> GitPatc
         GitWorkspaceObservationError::ProviderUnavailable => {
             GitPatchNotAppliedCode::ProviderUnavailable
         }
-        GitWorkspaceObservationError::WorkspaceUnavailable
-        | GitWorkspaceObservationError::NotWorktreeRoot
-        | GitWorkspaceObservationError::Timeout
+        GitWorkspaceObservationError::WorkspaceUnavailable => {
+            GitPatchNotAppliedCode::WorkspaceUnavailable
+        }
+        GitWorkspaceObservationError::NotWorktreeRoot
         | GitWorkspaceObservationError::ObservationRejected
-        | GitWorkspaceObservationError::UnsafePath
-        | GitWorkspaceObservationError::Io(_) => GitPatchNotAppliedCode::WorkspaceUnavailable,
+        | GitWorkspaceObservationError::UnsafePath => GitPatchNotAppliedCode::InvalidWorkspace,
+        GitWorkspaceObservationError::Timeout
+        | GitWorkspaceObservationError::LockUnavailable
+        | GitWorkspaceObservationError::Io(_) => GitPatchNotAppliedCode::ProviderUnavailable,
     }
 }
 
@@ -970,12 +1147,19 @@ async fn acquire_workspace_lock(
         .read(true)
         .write(true)
         .open(lock_path)?;
-    tokio::task::spawn_blocking(move || {
-        file.lock_exclusive()?;
-        Ok(WorkspaceLock(file))
-    })
-    .await
-    .map_err(|_| GitWorkspaceObservationError::ObservationRejected)?
+    let deadline = tokio::time::Instant::now() + GIT_OPERATION_TIMEOUT;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(WorkspaceLock(file)),
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(GitWorkspaceObservationError::LockUnavailable);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(GitWorkspaceObservationError::Io(error)),
+        }
+    }
 }
 
 async fn git_small_output(
@@ -1529,7 +1713,8 @@ mod tests {
             )
             .await,
             GitReviewedCommitReconciliation::Diverged {
-                observed_revision: Some(_)
+                observed_revision: Some(_),
+                ..
             }
         ));
     }

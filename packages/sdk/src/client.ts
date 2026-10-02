@@ -2853,7 +2853,7 @@ export class AstraClient {
     if (
       raw.session_id !== sessionId ||
       typeof raw.execution_settled !== "boolean" ||
-      (raw.workspace_blocker != null && typeof raw.workspace_blocker !== "string") ||
+      (raw.execution_blocker != null && typeof raw.execution_blocker !== "string") ||
       raw.status !== (raw.execution_settled ? "cancelled" : "cancellation_requested") ||
       !Array.isArray(raw.runs) ||
       raw.runs.some((run) =>
@@ -2871,7 +2871,7 @@ export class AstraClient {
     return {
       ...normalizeSession(raw),
       executionSettled: raw.execution_settled,
-      workspaceBlocker: raw.workspace_blocker,
+      executionBlocker: raw.execution_blocker,
       runs: raw.runs.map((run) => ({
         runId: run.run_id,
         status: run.status,

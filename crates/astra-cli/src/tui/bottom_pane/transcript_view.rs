@@ -129,6 +129,7 @@ pub(crate) enum TranscriptItemKind {
 /// projections of the same canonical cell; expansion state lives in the view.
 #[derive(Debug, Clone)]
 pub(crate) struct TranscriptItem {
+    model_item_id: Option<String>,
     id: TranscriptItemId,
     kind: TranscriptItemKind,
     content: TranscriptContent,
@@ -136,6 +137,9 @@ pub(crate) struct TranscriptItem {
 }
 
 impl TranscriptItem {
+    pub(crate) fn model_identity(&self) -> Option<(&str, TranscriptItemKind)> {
+        self.model_item_id.as_deref().map(|id| (id, self.kind))
+    }
     #[cfg(test)]
     pub(crate) fn id(&self) -> &TranscriptItemId {
         &self.id
@@ -147,6 +151,7 @@ impl TranscriptItem {
         separator_rows: usize,
     ) -> Self {
         Self {
+            model_item_id: cell.model_item_id().map(str::to_owned),
             id,
             kind: committed_cell_kind(cell.as_ref()),
             content: TranscriptContent::Committed(cell),
@@ -169,6 +174,7 @@ impl TranscriptItem {
         separator_rows: usize,
     ) -> Self {
         Self {
+            model_item_id: None,
             id,
             kind,
             content: TranscriptContent::Rendered(lines),
@@ -192,6 +198,7 @@ impl TranscriptItem {
             TranscriptContent::Rendered(lines)
         };
         Self {
+            model_item_id: cell.model_item_id().map(str::to_owned),
             id,
             kind,
             content,
@@ -205,6 +212,7 @@ impl TranscriptItem {
         separator_rows: usize,
     ) -> Self {
         Self {
+            model_item_id: cell.model_item_id.clone(),
             id,
             kind: TranscriptItemKind::Reasoning,
             content: TranscriptContent::Reasoning(cell),
@@ -214,6 +222,7 @@ impl TranscriptItem {
 
     pub(crate) fn tool(id: TranscriptItemId, cell: ToolCell, separator_rows: usize) -> Self {
         Self {
+            model_item_id: None,
             id,
             kind: TranscriptItemKind::Tool,
             content: TranscriptContent::Tool(cell),

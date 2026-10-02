@@ -19,6 +19,25 @@ pub const MAX_RESULT_CONTENT_LENGTH: usize = 100_000;
 
 const TRUNCATION_MARKER: &str = "… [truncated]";
 
+/// Provider result metadata that closes the physical-effect boundary for a
+/// workspace-capable MCP invocation.  An MCP response/ACK alone is not this
+/// boundary: a provider may acknowledge before a child process or deferred
+/// write has settled.
+pub const WORKSPACE_EFFECT_METADATA_KEY: &str = "astra.workspace_effect";
+pub const WORKSPACE_EFFECT_SETTLED_FIELD: &str = "settled";
+
+/// Return whether a provider result explicitly proves that all workspace
+/// effects belonging to this invocation have settled.
+pub fn workspace_effect_is_settled(protocol_metadata: Option<&Value>) -> bool {
+    protocol_metadata
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(WORKSPACE_EFFECT_METADATA_KEY))
+        .and_then(Value::as_object)
+        .and_then(|effect| effect.get(WORKSPACE_EFFECT_SETTLED_FIELD))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 /// Tool call result fields that must survive beyond model-facing text output.
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpToolCallResult {
@@ -29,6 +48,10 @@ pub struct McpToolCallResult {
 }
 
 impl McpToolCallResult {
+    pub fn workspace_effect_is_settled(&self) -> bool {
+        workspace_effect_is_settled(self.protocol_metadata.as_ref())
+    }
+
     /// Convert the wire-specific MCP result into the provider-neutral outcome.
     /// The typed MCP flag is authoritative; result prose is never classified.
     pub fn into_provider_outcome(self) -> ProviderCallOutcome {
@@ -770,6 +793,71 @@ mod tests {
         assert_eq!(declaration.claims, ProviderToolClaims::default());
         assert_eq!(declaration.task_support, ProviderTaskSupport::Unspecified);
         assert!(declaration.extension_fields.is_empty());
+    }
+
+    #[test]
+    fn mcp_effect_uses_canonical_host_trust_resolution() {
+        use rmcp::model::ToolAnnotations;
+
+        let mut read = Tool::new("read", "Read", Arc::new(Map::new()));
+        read.annotations = Some(ToolAnnotations::from_raw(
+            None,
+            Some(true),
+            Some(false),
+            None,
+            None,
+        ));
+        let discovery = mcp_tools_to_provider_snapshot(
+            ProviderIdentity::new("server").unwrap(),
+            ProviderBindingRef::new("binding").unwrap(),
+            &[read],
+        )
+        .unwrap();
+        let aliases = std::collections::BTreeMap::from([(
+            NativeToolId::new("read").unwrap(),
+            astra_turn_types::PublicToolAlias::new("mcp__server__read").unwrap(),
+        )]);
+        let advisory = astra_turn_core::provider_resolution::resolve_provider_snapshot(
+            &discovery,
+            &astra_turn_core::provider_resolution::ProviderClaimTrustPolicy::default(),
+            &aliases,
+        )
+        .unwrap();
+        assert_eq!(
+            advisory.descriptors[0].semantic_baseline.effect,
+            astra_turn_types::ResolvedToolEffect::Unknown
+        );
+
+        let trusted = astra_turn_core::provider_resolution::resolve_provider_snapshot(
+            &discovery,
+            &astra_turn_core::provider_resolution::ProviderClaimTrustPolicy {
+                standard_protocols: std::collections::BTreeMap::from([(
+                    "mcp".to_string(),
+                    astra_turn_types::ProviderClaimTrust::Trusted,
+                )]),
+                ..Default::default()
+            },
+            &aliases,
+        )
+        .unwrap();
+        assert_eq!(
+            trusted.descriptors[0].semantic_baseline.effect,
+            astra_turn_types::ResolvedToolEffect::ReadOnly
+        );
+    }
+
+    #[test]
+    fn workspace_effect_settlement_is_typed_metadata_not_prose() {
+        let metadata = |settled| {
+            serde_json::json!({
+                "astra.workspace_effect": {"settled": settled}
+            })
+        };
+        assert!(workspace_effect_is_settled(Some(&metadata(true))));
+        assert!(!workspace_effect_is_settled(Some(&metadata(false))));
+        assert!(!workspace_effect_is_settled(Some(&serde_json::json!({
+            "text": "settled"
+        }))));
     }
 
     #[test]

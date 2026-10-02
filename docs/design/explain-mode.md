@@ -261,6 +261,17 @@ parallel graph formats. The version field is part of this schema's evolution,
 not a request to preserve superseded event shapes. Trace event schemas remain
 owned and versioned by the observation plane.
 
+A terminal blocked or rejected `admission` event may include a typed
+`decision_detail` when the existing execution path has bounded evidence that
+materially explains the decision. Delegated-model catalog resolution may report
+the requirement's zero-based position and the count of exact eligible matches
+from the already-loaded authorized catalog snapshot. It must not expose the
+user's quote, provider response, or candidate catalog entries, and this detail
+does not grant execution authority. The detail itself adds no event kind or
+database operation. A pre-execution rejection emits the existing Admission
+start and finish facts because that path previously bypassed this observation
+boundary.
+
 A terminal `turn` fact carries the producer's known `coverage_gaps`. The server
 measures Edge approval waits. Server-internal approval waits are not yet
 separately instrumented and remain part of dispatch-to-result wall time.
@@ -408,11 +419,27 @@ recovery. The canonical tool schema and catalog advertise the explicit selector:
   installed by the trusted lifecycle owner. Durable ordering remains
   updated time, created time, then run ID, all descending.
 - `introspect(explain={target:"run",run_id:"…"}, offset=0, max_bytes=65536)`
-  selects that exact Explain root after authenticated owner and active-session
-  checks. It never widens scope to another session.
-- Selection returns run, turn, execution-owner generation, capture status,
-  concrete opaque handle, first bounded window, and continuation together.
-  Subsequent pages use `introspect(artifact="…", offset=…, max_bytes=…)`;
+  selects that exact run after authenticated owner and active-session checks.
+  It never widens scope to another session. When Explain was not enabled,
+  it returns a durable event projection rather than an Explain artifact.
+  This projection reads at most 256 events across opening and latest windows,
+  bounded by the observed durable cursor, without reading checkpoint payloads.
+  The event window has a 1 MiB transfer bound, shared equally across requested
+  event slots; oversized payloads are omitted before database transfer.
+  It reports total, observed, and omitted event counts; it is not complete replay.
+  Text and JSON retain whole events within `max_bytes`, including the text
+  envelope. Ordinary-run projections have no pagination cursor. Producer-bounded
+  results avoid secondary artifacts caused solely by generic truncation during
+  journal recording. Genuinely large results still use ordinary artifact storage;
+  the producer-bounded model presentation remains intact.
+- Explain artifact selection defaults to a bounded fact summary with run, turn,
+  execution-owner generation, capture status, uncertainty and omission counts,
+  and a concrete opaque detail handle. Missing usage is not zero usage. Whole
+  node and auxiliary-attempt rows retain their measurement basis; terminal and
+  coverage facts remain present even when all optional rows are omitted.
+  `depth="diagnostic"` or `depth="forensic"` selects the first raw byte window
+  instead. Detail pages use `introspect(artifact="…", offset=…, max_bytes=…)`;
+  start at offset zero when moving from the summary to raw detail.
   the moving `previous` selector is never a pagination cursor.
 - `explain` and `artifact` are mutually exclusive; discovery requires offset
   zero. `live_only` and `local_only` exclude server snapshot discovery.
@@ -420,8 +447,9 @@ recovery. The canonical tool schema and catalog advertise the explicit selector:
   an explicit error. Existing local handle readers retain their source policy
   and active-session checks; neither boundary accepts arbitrary server paths.
 
-Readable discovery fetches the snapshot once and shares validation and UTF-8
-window formatting with the canonical handle reader. Byte-window completion is
+Readable discovery fetches the snapshot once and shares validation and the typed
+graph reducer with the canonical handle reader. Raw pages use UTF-8-safe byte
+windows. Byte-window completion is
 separate from capture completeness: partial facts, gaps, truncated coverage and
 unknown usage stay incomplete even after the final byte. Missing, corrupt,
 expired, mismatched or unavailable selected reports never fall back to older

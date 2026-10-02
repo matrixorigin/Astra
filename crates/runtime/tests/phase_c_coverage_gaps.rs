@@ -9,25 +9,15 @@
 //! * **Skill composition validation** — input-schema enum rejection, output
 //!   parse-and-validate, depth limit propagation, and child timeout inheritance
 //!   from the parent budget.
-//! * **Approval gate concurrency** — two disjoint approval requests routed
-//!   through the same gate must not cross-contaminate ledger entries, and
-//!   rejections must carry the correct per-request reason string.
 //!
 //! Any scenario already covered by a focused test in the source crate is
 //! intentionally skipped; each test below was placed because the audit
 //! identified a real behavior that no existing test asserts.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-
 use astra_skills::composition::{
     CompositionContext, CompositionError, MAX_COMPOSITION_DEPTH, validate_input, validate_output,
 };
-use astra_tools::{ApprovalDecision, ToolApprovalGate};
-use astra_turn_core::ws_approval_gate::WebSocketApprovalGate;
-use serde_json::{Value, json};
-use tokio::sync::{Mutex as TokioMutex, mpsc};
+use serde_json::json;
 
 // ── Skill composition: schema validation ────────────────────────────────────
 
@@ -188,100 +178,5 @@ fn composition_side_effects_accumulate_in_child() {
     assert_eq!(
         child.side_effects,
         vec!["wrote_file".to_string(), "ran_bash".to_string()]
-    );
-}
-
-// ── Approval gate: concurrent disjoint requests ─────────────────────────────
-
-#[tokio::test]
-async fn concurrent_disjoint_approval_requests_do_not_cross_contaminate() {
-    use astra_turn_core::edge_ledger::approval_callback_key;
-
-    let ledger: Arc<TokioMutex<HashMap<String, serde_json::Value>>> =
-        Arc::new(TokioMutex::new(HashMap::new()));
-    let (tx, mut rx) = mpsc::channel::<Value>(1);
-    let gate = Arc::new(WebSocketApprovalGate::new_with_journal_context(
-        "user-concurrent".into(),
-        "sess-concurrent".into(),
-        "run-concurrent".into(),
-        Some(1),
-        ledger.clone(),
-        tx,
-    ));
-
-    // Collect the two outbound requests and respond in reverse arrival order
-    // (second-in → Approved, first-in → Denied). This flushes out any bug
-    // that would match a response to the first pending request it sees.
-    let ledger_bg = ledger.clone();
-    let collector = tokio::spawn(async move {
-        let req_a = rx.recv().await.expect("first outbound request");
-        let req_b = rx.recv().await.expect("second outbound request");
-
-        // Fulfil request B first with Approved, then request A with Denied.
-        let key_b = approval_callback_key(
-            "user-concurrent",
-            req_b["session_id"].as_str().expect("req_b session"),
-            req_b["run_id"].as_str().expect("req_b run"),
-            req_b["request_id"].as_str().expect("req_b id"),
-        );
-        let key_a = approval_callback_key(
-            "user-concurrent",
-            req_a["session_id"].as_str().expect("req_a session"),
-            req_a["run_id"].as_str().expect("req_a run"),
-            req_a["request_id"].as_str().expect("req_a id"),
-        );
-        {
-            let mut g = ledger_bg.lock().await;
-            g.insert(key_b, json!({ "approved": true }));
-            g.insert(key_a, json!({ "approved": false, "reason": "A was risky" }));
-        }
-
-        (
-            req_a["tool"].as_str().unwrap().to_string(),
-            req_b["tool"].as_str().unwrap().to_string(),
-        )
-    });
-
-    let gate_a = gate.clone();
-    let task_a = tokio::spawn(async move {
-        gate_a
-            .request_approval("req-A", "bash", &json!({"command": "ls /"}))
-            .await
-    });
-    let gate_b = gate.clone();
-    let task_b = tokio::spawn(async move {
-        gate_b
-            .request_approval("req-B", "write_file", &json!({"path": "/tmp/x"}))
-            .await
-    });
-
-    let decision_a = tokio::time::timeout(Duration::from_secs(5), task_a)
-        .await
-        .expect("task A finishes promptly")
-        .expect("task A joined");
-    let decision_b = tokio::time::timeout(Duration::from_secs(5), task_b)
-        .await
-        .expect("task B finishes promptly")
-        .expect("task B joined");
-
-    let (tool_a_outbound, tool_b_outbound) = collector.await.expect("collector joined");
-    // Sanity: both distinct outbound tool names were seen.
-    let mut tools = [tool_a_outbound, tool_b_outbound];
-    tools.sort();
-    assert_eq!(tools, ["bash".to_string(), "write_file".to_string()]);
-
-    match decision_a {
-        ApprovalDecision::Denied { reason } => {
-            assert_eq!(
-                reason.as_deref(),
-                Some("A was risky"),
-                "request A must carry its own reason, not request B's verdict"
-            );
-        }
-        other => panic!("request A: expected Denied, got {other:?}"),
-    }
-    assert!(
-        matches!(decision_b, ApprovalDecision::Approved),
-        "request B must resolve to Approved, got {decision_b:?}"
     );
 }

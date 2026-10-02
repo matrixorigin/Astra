@@ -2,7 +2,8 @@
 
 use serde_json::{Value, json};
 
-use super::{IntrospectReport, observation::observation_priority_key};
+use super::IntrospectReport;
+use astra_core::observation_priority_key;
 
 impl IntrospectReport {
     /// Fit complete semantic units, never fragments of JSON or evidence identities.

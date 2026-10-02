@@ -122,11 +122,40 @@ impl ServerAgenticLoopHost {
                 .map_err(invalid)?;
             validate_pinned_treatment(&current, pinned, Utc::now()).map_err(invalid)?;
         }
+        let rebound_source = if let Some(saved) = decision.delegation_model_source.as_ref() {
+            let current = delegation_intent_source_from_state(state)
+                .ok_or_else(|| invalid("Auto child-model requirement lost its user intent"))?;
+            // A new run owner has a new generation. Every field identifying
+            // the user's instruction must still match before reusing its
+            // semantic judgment; a new instruction needs a new judgment.
+            if saved.user_id != self.user_id
+                || saved.user_id != current.user_id
+                || saved.session_id != current.session_id
+                || saved.run_id != current.run_id
+                || saved.turn_chain_id != current.turn_chain_id
+                || saved.applied_intent_id != current.applied_intent_id
+                || saved.session_turn != current.session_turn
+                || saved.user_intent_digest != current.user_intent_digest
+            {
+                return Err(invalid(
+                    "Auto child-model requirement belongs to a different user intent",
+                ));
+            }
+            Some(current)
+        } else {
+            None
+        };
         let admission = decision.work_admission.clone();
         let skill_revision = decision.work_admission_skill_revision;
+        let model_requirement = decision.delegation_model_requirement;
         routing.decision = Some(decision);
         if let Some(admission) = admission {
-            self.apply_work_admission_decision(admission);
+            self.apply_classified_work_admission(ClassifiedWorkAdmission {
+                decision: project_complete_admission_effect(admission),
+                delegation_model_requirement: model_requirement,
+                source: rebound_source,
+                work_handoff_pending: true,
+            });
             self.work_admission_attempted = true;
             self.work_admission_skill_revision = skill_revision;
         }
@@ -194,7 +223,7 @@ impl ServerAgenticLoopHost {
             // decision/task and continues to honor the disabled policy.
             self.start_work_admission_preflight(state, true, false)
                 .await;
-            self.resolve_pending_work_admission(true).await;
+            self.resolve_pending_work_admission(Some(state), true).await;
             self.flush_completed_work_admission_phase(state);
             if let Some(error) = self.work_admission_terminal_error() {
                 return Err(error);
@@ -218,7 +247,9 @@ impl ServerAgenticLoopHost {
                 .as_ref()
                 .and_then(|intent| intent.assessment);
             let read_only = astra_services::model_routing::routing_read_only_primary(
-                self.pending_work_admission.as_ref(),
+                self.pending_work_admission
+                    .as_ref()
+                    .map(|assessment| &assessment.decision),
             );
             let text_only_history = state.messages.iter().all(|message| {
                 message
@@ -264,8 +295,10 @@ impl ServerAgenticLoopHost {
             // Shadow checks the actual admission/contract boundary too, without
             // sending a second provider request or changing the baseline action.
             if wants_economy || rollout.is_some() {
-                let catalog = service.list_models(self.user_id.clone(), false).await;
-                let same_access = catalog.as_ref().is_ok_and(|catalog| {
+                // The catalog is owner-scoped; retaining the same access id
+                // prevents a policy from silently changing billing ownership.
+                let catalog = self.read_authorized_model_catalog().await;
+                let same_access = catalog.as_ref().is_some_and(|catalog| {
                     let strong = catalog.iter().find(|item| item.offering_id == policy.strong_offering_id && item.is_active);
                     let economy = catalog.iter().find(|item| item.offering_id == policy.economy_offering_id && item.is_active);
                     matches!((strong, economy), (Some(a), Some(b)) if a.access_id == b.access_id && a.access_kind == b.access_kind && a.execution_placement == b.execution_placement)
@@ -351,12 +384,26 @@ impl ServerAgenticLoopHost {
                     }
                 }
             }
+            let classified = self.pending_work_admission.as_ref();
+            let model_requirement =
+                classified.and_then(|assessment| assessment.delegation_model_requirement);
+            let model_source = classified.and_then(|assessment| assessment.source.clone());
+            if model_requirement.is_some() && model_source.is_none() {
+                return Err(invalid(
+                    "Auto child-model judgment has no authenticated user intent",
+                ));
+            }
             let decision = ModelRoutingDecision {
-                schema_version: 1,
+                schema_version: 2,
                 rollout,
                 features: Some(features),
-                work_admission: self.pending_work_admission.clone(),
+                work_admission: self
+                    .pending_work_admission
+                    .as_ref()
+                    .map(|assessment| assessment.decision.clone()),
                 work_admission_skill_revision: self.work_admission_skill_revision,
+                delegation_model_requirement: model_requirement,
+                delegation_model_source: model_requirement.and(model_source),
                 policy_version: if treatment {
                     astra_turn_types::model_routing::LEARNED_CANARY_ROUTING_POLICY_VERSION
                 } else {
@@ -406,7 +453,7 @@ impl ServerAgenticLoopHost {
         state.context_manifest_model_name = Some(execution.model_name.clone());
         state.hooks.admitted_model_execution = Some(execution.clone());
         if let Some(executor) = state.runtime_tool_executor.as_ref() {
-            executor.set_agent_model(&execution.model_name);
+            executor.set_agent_model_execution(&execution);
         }
         let tool_policy = astra_config::RuntimeConfig::cached()
             .tool_selection

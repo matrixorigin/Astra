@@ -9,7 +9,6 @@ import {
   Workflow,
   type LucideIcon,
 } from 'lucide-react';
-import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
 import { Composer } from '@/components/app/composer';
@@ -167,13 +166,6 @@ export function HomeScreen() {
               <p className="text-xs font-semibold uppercase tracking-[0.1em] text-text-muted">
                 Starting points
               </p>
-              <Link
-                href="/harnesses"
-                className="inline-flex items-center gap-1 text-xs font-medium text-text-muted hover:text-text"
-              >
-                Browse harnesses
-                <ArrowRight className="size-3.5" />
-              </Link>
             </div>
 
             <div className="mt-3 grid gap-2 sm:grid-cols-2">

@@ -1,4 +1,8 @@
 use super::types::{AgentStatus, agent_completion_is_interrupted, agent_finish_reason_text};
+use astra_tools::agent_tool_contract::{
+    AGENT_WAIT_MAX_MS, AgentControlOutcome, AgentToolResultFamily, AgentWaitReceipt,
+    agent_action_from_args,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::str::FromStr;
@@ -95,19 +99,131 @@ pub fn agent_tool_status_needs_recovery(status: AgentToolResultStatusKind) -> bo
 }
 
 pub fn agent_tool_result_looks_like(value: &Value) -> bool {
-    value.get("agent_id").is_some() && value.get("status").is_some()
+    value.get("result_family").is_some()
+        || (value.get("agent_id").is_some() && value.get("status").is_some())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentControlReceipt {
+    Spawn,
+    Wait(AgentWaitReceipt),
+    SendMessage,
+    List,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedAgentToolResult {
+    ControlReceipt(AgentControlReceipt),
+    ChildResult(AgentToolResultStatusKind),
+}
+
+/// Decode producer-owned facts only. Missing/unknown families and malformed
+/// receipts fail closed. The action/outcome pair must agree, and a control
+/// receipt cannot carry a child-result payload.
+pub fn decode_agent_tool_result(value: &Value) -> Option<DecodedAgentToolResult> {
+    let family: AgentToolResultFamily =
+        serde_json::from_value(value.get("result_family")?.clone()).ok()?;
+    let nonempty = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    match family {
+        AgentToolResultFamily::ChildResult => {
+            let status = value.get("status")?.as_str()?;
+            nonempty("agent_id").then(|| {
+                DecodedAgentToolResult::ChildResult(AgentToolResultStatusKind::parse_wire(status))
+            })
+        }
+        AgentToolResultFamily::ControlReceipt => {
+            if value.get("success").and_then(Value::as_bool) != Some(true)
+                || value.get("error").is_some()
+                || value.get("result").is_some()
+                || value.get("finish_reason").is_some()
+                || value.get("incomplete").is_some()
+            {
+                return None;
+            }
+            let outcome: AgentControlOutcome =
+                serde_json::from_value(value.get("status")?.clone()).ok()?;
+            if agent_action_from_args(value).ok()? != outcome.action() {
+                return None;
+            }
+            let receipt = match outcome {
+                AgentControlOutcome::SpawnLaunched
+                    if nonempty("parent_run_id") && nonempty("agent_id") && nonempty("run_id") =>
+                {
+                    AgentControlReceipt::Spawn
+                }
+                AgentControlOutcome::WaitAdmitted => {
+                    let receipt: AgentWaitReceipt =
+                        serde_json::from_value(value.get("wait_request")?.clone()).ok()?;
+                    if receipt.parent_run_id.trim().is_empty()
+                        || receipt.tool_call_id.trim().is_empty()
+                        || !(1..=AGENT_WAIT_MAX_MS).contains(&receipt.timeout_ms)
+                    {
+                        return None;
+                    }
+                    AgentControlReceipt::Wait(receipt)
+                }
+                AgentControlOutcome::MessageQueued
+                    if nonempty("run_id")
+                        && nonempty("message_id")
+                        && nonempty("target")
+                        && nonempty("message_type") =>
+                {
+                    // success=true is the sender's enqueue acknowledgement,
+                    // not proof that the recipient applied or completed work.
+                    match value.get("recipients")? {
+                        Value::Null => {}
+                        Value::Array(ids)
+                            if !ids.is_empty()
+                                && ids.iter().all(|id| {
+                                    id.as_str().is_some_and(|id| !id.trim().is_empty())
+                                }) => {}
+                        _ => return None,
+                    }
+                    AgentControlReceipt::SendMessage
+                }
+                AgentControlOutcome::ListObserved if nonempty("parent_run_id") => {
+                    let agents = value.get("agents")?.as_array()?;
+                    if !agents.iter().all(|agent| {
+                        ["agent_id", "run_id"].into_iter().all(|key| {
+                            agent
+                                .get(key)
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| !id.trim().is_empty())
+                        })
+                    }) {
+                        return None;
+                    }
+                    AgentControlReceipt::List
+                }
+                _ => return None,
+            };
+            Some(DecodedAgentToolResult::ControlReceipt(receipt))
+        }
+    }
 }
 
 pub fn agent_tool_structured_result_class(value: &Value) -> Option<&'static str> {
-    if value.get("incomplete").and_then(Value::as_bool) == Some(true) {
-        return Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE);
-    }
-
-    match value
-        .get("status")
-        .and_then(Value::as_str)
-        .map(AgentToolResultStatusKind::parse_wire)?
-    {
+    let status = match decode_agent_tool_result(value) {
+        Some(DecodedAgentToolResult::ControlReceipt(_)) => return None,
+        Some(DecodedAgentToolResult::ChildResult(status))
+            if !value
+                .get("incomplete")
+                .is_some_and(|v| v != &Value::Bool(false))
+                && !value
+                    .get("success")
+                    .is_some_and(|v| v != &Value::Bool(true))
+                && value.get("error").is_none() =>
+        {
+            status
+        }
+        _ => return Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE),
+    };
+    match status {
         AgentToolResultStatusKind::Completed
             if value
                 .get("result")
@@ -296,6 +412,17 @@ pub fn agent_fanout_structured_result_class(value: &Value) -> Option<&'static st
     }
 }
 
+/// Group termination and delivery of its complete result set are distinct facts.
+pub fn agent_fanout_results_delivered(value: &Value) -> bool {
+    let Some(results) = value.get("results").and_then(Value::as_array) else {
+        return false;
+    };
+    !results.is_empty()
+        && value.get("target_count").and_then(Value::as_u64) == Some(results.len() as u64)
+        && value.pointer("/provenance/all_slots_delivered") == Some(&Value::Bool(true))
+        && agent_fanout_structured_result_class(value) == Some(AGENT_RESULT_CLASS_SUCCESS)
+}
+
 pub fn agent_fanout_result_has_recoverable_issue(value: &Value) -> bool {
     const ISSUE_COUNT_FIELDS: &[&str] = &[
         "failed",
@@ -357,6 +484,8 @@ pub enum AgentToolWireOutcomeKind {
 #[derive(Debug, Clone, Copy)]
 pub struct AgentToolWireProjection<'a> {
     pub outcome: AgentToolWireOutcomeKind,
+    /// Observation/control failures do not establish child termination.
+    pub child_terminal: bool,
     pub finish_reason: Option<&'a str>,
     pub agent_id: Option<&'a str>,
     pub display_name_hint: Option<&'a str>,
@@ -372,36 +501,65 @@ pub fn project_agent_tool_wire<'a>(
     outer_tool_success: bool,
     parsed: Option<&'a Value>,
 ) -> AgentToolWireProjection<'a> {
-    let status_kind = parsed
-        .and_then(|value| value.get("status"))
-        .and_then(Value::as_str)
-        .map(AgentToolResultStatusKind::parse_wire);
+    let decoded = parsed.and_then(decode_agent_tool_result);
     let finish_reason = parsed
         .and_then(|value| value.get("finish_reason"))
         .and_then(Value::as_str);
     let has_result = parsed
         .and_then(|value| value.get("result"))
         .and_then(Value::as_str)
-        .is_some();
-    let outcome = match status_kind {
-        Some(AgentToolResultStatusKind::Completed) => AgentToolWireOutcomeKind::Completed,
-        Some(AgentToolResultStatusKind::Failed) => AgentToolWireOutcomeKind::Failed,
-        Some(AgentToolResultStatusKind::TimedOut) => AgentToolWireOutcomeKind::TimedOut,
-        Some(AgentToolResultStatusKind::Cancelled) => AgentToolWireOutcomeKind::Cancelled,
-        Some(AgentToolResultStatusKind::Interrupted) => AgentToolWireOutcomeKind::Interrupted,
-        Some(
+        .is_some_and(|result| !result.trim().is_empty());
+    let child_terminal = matches!(
+        &decoded,
+        Some(DecodedAgentToolResult::ChildResult(
+            AgentToolResultStatusKind::Completed
+                | AgentToolResultStatusKind::Failed
+                | AgentToolResultStatusKind::Cancelled
+                | AgentToolResultStatusKind::Interrupted
+        ))
+    );
+    let outcome = match decoded {
+        Some(DecodedAgentToolResult::ControlReceipt(AgentControlReceipt::Spawn))
+            if outer_tool_success =>
+        {
+            AgentToolWireOutcomeKind::Running
+        }
+        Some(DecodedAgentToolResult::ControlReceipt(_)) if outer_tool_success => {
+            AgentToolWireOutcomeKind::NoChange
+        }
+        Some(DecodedAgentToolResult::ChildResult(AgentToolResultStatusKind::Completed)) => {
+            if parsed.and_then(agent_tool_structured_result_class)
+                == Some(AGENT_RESULT_CLASS_SUCCESS)
+            {
+                AgentToolWireOutcomeKind::Completed
+            } else {
+                AgentToolWireOutcomeKind::Failed
+            }
+        }
+        Some(DecodedAgentToolResult::ChildResult(AgentToolResultStatusKind::Failed)) => {
+            AgentToolWireOutcomeKind::Failed
+        }
+        Some(DecodedAgentToolResult::ChildResult(AgentToolResultStatusKind::TimedOut)) => {
+            AgentToolWireOutcomeKind::TimedOut
+        }
+        Some(DecodedAgentToolResult::ChildResult(AgentToolResultStatusKind::Cancelled)) => {
+            AgentToolWireOutcomeKind::Cancelled
+        }
+        Some(DecodedAgentToolResult::ChildResult(AgentToolResultStatusKind::Interrupted)) => {
+            AgentToolWireOutcomeKind::Interrupted
+        }
+        Some(DecodedAgentToolResult::ChildResult(
             AgentToolResultStatusKind::Waiting
             | AgentToolResultStatusKind::StillRunning
             | AgentToolResultStatusKind::Launched,
-        ) => AgentToolWireOutcomeKind::Running,
-        Some(AgentToolResultStatusKind::Other) => AgentToolWireOutcomeKind::Failed,
-        _ if outer_tool_success && has_result => AgentToolWireOutcomeKind::Completed,
-        _ if !outer_tool_success => AgentToolWireOutcomeKind::Failed,
+        )) => AgentToolWireOutcomeKind::Running,
+        _ if parsed.is_some() || !outer_tool_success => AgentToolWireOutcomeKind::Failed,
         _ => AgentToolWireOutcomeKind::NoChange,
     };
 
     AgentToolWireProjection {
         outcome,
+        child_terminal,
         finish_reason,
         agent_id: parsed
             .and_then(|value| value.get("agent_id"))
@@ -431,17 +589,13 @@ pub fn agent_tool_interrupted_message(is_result_wait: bool, finish_reason: Optio
 }
 
 pub fn agent_tool_completed_result_text(parsed: &Value) -> Option<String> {
-    match parsed
-        .get("status")
-        .and_then(Value::as_str)
-        .map(AgentToolResultStatusKind::parse_wire)
-    {
-        Some(AgentToolResultStatusKind::Completed | AgentToolResultStatusKind::Interrupted) => {
-            parsed
-                .get("result")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        }
+    match decode_agent_tool_result(parsed) {
+        Some(DecodedAgentToolResult::ChildResult(
+            AgentToolResultStatusKind::Completed | AgentToolResultStatusKind::Interrupted,
+        )) => parsed
+            .get("result")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         _ => None,
     }
 }
@@ -597,24 +751,30 @@ pub fn render_completed_agent_result(
             "The child agent stopped before fully finishing. Treat this as incomplete and either continue it or report the interruption explicitly."
         );
     }
+    render_child_agent_result(body)
+}
+
+fn render_child_agent_result(mut body: Value) -> String {
+    body["result_family"] = json!(AgentToolResultFamily::ChildResult);
     body.to_string()
 }
+
+pub const PENDING_CHILD_RUNTIME_WAIT_GUIDANCE: &str = "This observation is not a terminal result. Continue only work needed for the user's request. For a pending direct child owned by this run, proposing a final answer lets the runtime wait and resume when continuation is available. Otherwise inspect the child's status or waiting reason. Do not busy-poll or use shell sleep solely to wait.";
 
 pub fn render_wait_timeout_outcome(
     agent_id: &str,
     live_status: Option<&AgentStatus>,
     timeout: Duration,
 ) -> String {
-    match live_status {
+    render_child_agent_result(match live_status {
         Some(status) if !status.is_terminal() => json!({
             "status": AgentToolResultStatusKind::StillRunning.as_str(),
             "agent_id": agent_id,
             "current_status": format!("{status:?}"),
             "waited_secs": timeout.as_secs(),
             "delivery": "asynchronous_parent_mailbox",
-            "hint": "The child agent is still working. Continue independent parent work; its terminal result will be delivered to the parent mailbox. Do not busy-poll, treat this as failure, or fabricate what the child would have returned.",
-        })
-        .to_string(),
+            "hint": PENDING_CHILD_RUNTIME_WAIT_GUIDANCE,
+        }),
         _ => json!({
             "status": AgentToolResultStatusKind::TimedOut.as_str(),
             "agent_id": agent_id,
@@ -622,17 +782,16 @@ pub fn render_wait_timeout_outcome(
                 "Agent '{agent_id}' did not complete within {}s and has no live state",
                 timeout.as_secs()
             ),
-        })
-        .to_string(),
-    }
+        }),
+    })
 }
 
 pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> String {
-    match status {
+    render_child_agent_result(match status {
         AgentStatus::Completed {
             result,
             finish_reason,
-        } => render_completed_agent_result(agent_id, result, finish_reason.as_deref()),
+        } => return render_completed_agent_result(agent_id, result, finish_reason.as_deref()),
         AgentStatus::Interrupted {
             partial_result,
             finish_reason,
@@ -646,20 +805,20 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
                 "incomplete": true,
                 "hint": "The child agent stopped before fully finishing. Treat this as incomplete and either continue it or report the interruption explicitly.",
             })
-            .to_string()
         }
         AgentStatus::Failed {
             error,
             finish_reason,
         } => {
-            let reason = finish_reason.as_deref().unwrap_or(AgentToolResultStatusKind::Failed.as_str());
+            let reason = finish_reason
+                .as_deref()
+                .unwrap_or(AgentToolResultStatusKind::Failed.as_str());
             json!({
                 "status": AgentToolResultStatusKind::Failed.as_str(),
                 "agent_id": agent_id,
                 "error": error,
                 "finish_reason": reason,
             })
-            .to_string()
         }
         AgentStatus::Waiting { reason } => json!({
             "status": AgentToolResultStatusKind::Waiting.as_str(),
@@ -670,8 +829,7 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
                 reason.clone()
             },
             "hint": "The child agent is waiting for external input or executor recovery. Do not fabricate its result.",
-        })
-        .to_string(),
+        }),
         AgentStatus::Cancelled { by_user, reason } => {
             let mut payload = json!({
                 "status": AgentToolResultStatusKind::Cancelled.as_str(),
@@ -697,31 +855,28 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
                      ask the user what to do next."
                 );
             }
-            payload.to_string()
+            payload
         }
         AgentStatus::Initializing => json!({
             "status": AgentToolResultStatusKind::Launched.as_str(),
             "agent_id": agent_id,
-        })
-        .to_string(),
+        }),
         AgentStatus::Running { activity } => json!({
             "status": AgentToolResultStatusKind::StillRunning.as_str(),
             "agent_id": agent_id,
             "current_status": "running",
             "activity": activity,
             "delivery": "asynchronous_parent_mailbox",
-            "hint": "The child agent is still working. Continue independent parent work; its terminal result will arrive through the parent mailbox. Do not busy-poll.",
-        })
-        .to_string(),
+            "hint": PENDING_CHILD_RUNTIME_WAIT_GUIDANCE,
+        }),
         AgentStatus::Idle => json!({
             "status": AgentToolResultStatusKind::StillRunning.as_str(),
             "agent_id": agent_id,
             "current_status": "idle",
             "delivery": "asynchronous_parent_mailbox",
-            "hint": "The child agent is still running. Continue independent parent work; its terminal result will arrive through the parent mailbox. Do not busy-poll.",
-        })
-        .to_string(),
-    }
+            "hint": PENDING_CHILD_RUNTIME_WAIT_GUIDANCE,
+        }),
+    })
 }
 
 pub fn render_unknown_agent_result(agent_id: &str, message: &str) -> String {
@@ -738,6 +893,8 @@ pub fn render_agent_tool_error_with_kind(
     error_kind: Option<astra_core::ErrorKind>,
 ) -> String {
     let mut body = json!({
+        "result_family": AgentToolResultFamily::ControlReceipt,
+        "success": false,
         "status": AgentToolResultStatusKind::Failed.as_str(),
         "error": message,
     });
@@ -828,34 +985,39 @@ fn one_line_preview(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    fn child(mut value: Value) -> Value {
+        value["result_family"] = json!(AgentToolResultFamily::ChildResult);
+        value
+    }
+
     #[test]
-    fn wire_projection_covers_interrupted_running_legacy_and_tool_failure_paths() {
-        let interrupted = json!({
+    fn wire_projection_covers_children_and_rejects_untyped_results() {
+        let interrupted = child(json!({
             "status": AgentToolResultStatusKind::Interrupted.as_str(),
             "agent_id": "a1",
             "finish_reason": "budget_exhausted",
             "result": "partial"
-        });
+        }));
         let projection = project_agent_tool_wire("get_result", true, Some(&interrupted));
         assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Interrupted);
         assert_eq!(projection.agent_id, Some("a1"));
         assert_eq!(projection.finish_reason, Some("budget_exhausted"));
         assert!(projection.has_result);
 
-        let launched = json!({
+        let launched = child(json!({
             "status": AgentToolResultStatusKind::Launched.as_str(),
             "agent_id": "a1"
-        });
+        }));
         let projection = project_agent_tool_wire("get_result", true, Some(&launched));
         assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Running);
 
-        let legacy = json!({"agent_id": "a1", "result": "done"});
-        let projection = project_agent_tool_wire("get_result", true, Some(&legacy));
-        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Completed);
+        let untyped = json!({"agent_id": "a1", "result": "done"});
+        let projection = project_agent_tool_wire("get_result", true, Some(&untyped));
+        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Failed);
 
         let empty_success = json!({"agent_id": "a1"});
         let projection = project_agent_tool_wire("get_result", true, Some(&empty_success));
-        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::NoChange);
+        assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Failed);
 
         let unknown_status = json!({"status": "mystery", "agent_id": "a1"});
         let projection = project_agent_tool_wire("get_result", true, Some(&unknown_status));
@@ -863,15 +1025,26 @@ mod tests {
 
         let tool_failed = project_agent_tool_wire("spawn", false, None);
         assert_eq!(tool_failed.outcome, AgentToolWireOutcomeKind::Failed);
+
+        for result in [Value::Null, json!(""), json!("  ")] {
+            let incomplete = child(json!({
+                "status": "completed", "agent_id": "a1", "result": result
+            }));
+            let projection = project_agent_tool_wire("get_result", true, Some(&incomplete));
+            assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Failed);
+            assert!(projection.child_terminal);
+            assert!(!projection.has_result);
+            assert!(agent_tool_result_needs_recovery(&incomplete));
+        }
     }
 
     #[test]
     fn waiting_status_projects_as_incomplete_running_wire() {
-        let waiting = json!({
+        let waiting = child(json!({
             "status": AgentToolResultStatusKind::Waiting.as_str(),
             "agent_id": "a1",
             "reason": "executor_offline"
-        });
+        }));
 
         let projection = project_agent_tool_wire("get_result", true, Some(&waiting));
         assert_eq!(projection.outcome, AgentToolWireOutcomeKind::Running);
@@ -884,41 +1057,41 @@ mod tests {
 
     #[test]
     fn structured_result_classification_is_shared_for_agent_and_fanout() {
-        let active_agent = json!({
+        let active_agent = child(json!({
             "status": AgentToolResultStatusKind::StillRunning.as_str(),
             "agent_id": "a1"
-        });
+        }));
         assert_eq!(
             agent_tool_structured_result_class(&active_agent),
             Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE)
         );
         assert!(agent_tool_result_needs_recovery(&active_agent));
 
-        let timeout_agent = json!({
+        let timeout_agent = child(json!({
             "status": "timed_out",
             "agent_id": "a1"
-        });
+        }));
         assert_eq!(
             agent_tool_structured_result_class(&timeout_agent),
             Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE)
         );
 
-        let completed_agent = json!({
+        let completed_agent = child(json!({
             "status": AgentToolResultStatusKind::Completed.as_str(),
             "agent_id": "a1",
             "result": "done"
-        });
+        }));
         assert_eq!(
             agent_tool_structured_result_class(&completed_agent),
             Some(AGENT_RESULT_CLASS_SUCCESS)
         );
         assert!(!agent_tool_result_needs_recovery(&completed_agent));
 
-        let empty_completed_agent = json!({
+        let empty_completed_agent = child(json!({
             "status": AgentToolResultStatusKind::Completed.as_str(),
             "agent_id": "a2",
             "result": "   "
-        });
+        }));
         assert_eq!(
             agent_tool_structured_result_class(&empty_completed_agent),
             Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE)
@@ -944,6 +1117,108 @@ mod tests {
         assert!(fanout_slot_status_is_recoverable_issue(
             "cancelled_by_runtime"
         ));
+    }
+
+    #[test]
+    fn control_receipts_are_neutral_only_with_complete_action_specific_facts() {
+        let controls = [
+            (
+                json!({"action":"spawn", "status":"launched", "parent_run_id":"p", "agent_id":"a", "run_id":"r"}),
+                "agent_id",
+            ),
+            (
+                json!({"action":"wait", "status":"wait_admitted", "wait_request":{"parent_run_id":"p", "tool_call_id":"call", "timeout_ms":1}}),
+                "wait_request",
+            ),
+            (
+                json!({"action":"send_message", "status":"queued", "run_id":"r", "message_id":"m", "target":"parent", "message_type":"text", "recipients":null}),
+                "message_id",
+            ),
+            (
+                json!({"action":"list", "status":"ok", "parent_run_id":"p", "agents":[]}),
+                "agents",
+            ),
+        ];
+        for (mut receipt, required_field) in controls {
+            receipt["result_family"] = json!(AgentToolResultFamily::ControlReceipt);
+            receipt["success"] = json!(true);
+            assert!(matches!(
+                decode_agent_tool_result(&receipt),
+                Some(DecodedAgentToolResult::ControlReceipt(_))
+            ));
+            assert_eq!(agent_tool_structured_result_class(&receipt), None);
+            assert!(!agent_tool_result_needs_recovery(&receipt));
+            // Metadata cannot promote a valid control to child success.
+            receipt["result_class"] = json!("success");
+            assert_eq!(agent_tool_structured_result_class(&receipt), None);
+            assert!(agent_tool_completed_result_text(&receipt).is_none());
+            for field in [
+                "result_family",
+                "action",
+                "status",
+                "success",
+                required_field,
+            ] {
+                let mut malformed = receipt.clone();
+                malformed.as_object_mut().unwrap().remove(field);
+                assert!(
+                    decode_agent_tool_result(&malformed).is_none(),
+                    "{malformed}"
+                );
+                assert_eq!(
+                    agent_tool_structured_result_class(&malformed),
+                    Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE)
+                );
+            }
+            for (field, invalid) in [
+                ("result_family", json!("unknown")),
+                ("action", json!("unknown")),
+                ("status", json!("unknown")),
+                ("status", json!("failed")),
+                ("status", json!("delivery_unknown")),
+                ("status", json!("completed")),
+                ("status", Value::Null),
+                ("success", json!(false)),
+                ("incomplete", json!(true)),
+                ("incomplete", json!(false)),
+                ("result", json!("")),
+                ("result", json!("child text")),
+                ("result", Value::Null),
+                ("finish_reason", json!("stop")),
+                ("error", json!("delivery uncertain")),
+            ] {
+                let mut malformed = receipt.clone();
+                malformed[field] = invalid;
+                assert!(
+                    decode_agent_tool_result(&malformed).is_none(),
+                    "{malformed}"
+                );
+                assert_eq!(
+                    agent_tool_structured_result_class(&malformed),
+                    Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE)
+                );
+            }
+            // A valid outcome for another action is not this action's receipt.
+            for status in ["launched", "wait_admitted", "queued", "ok"] {
+                if receipt["status"] == status {
+                    continue;
+                }
+                let mut wrong_action = receipt.clone();
+                wrong_action["status"] = json!(status);
+                assert!(
+                    decode_agent_tool_result(&wrong_action).is_none(),
+                    "{wrong_action}"
+                );
+            }
+        }
+        for request in [
+            json!({"parent_run_id":"p", "tool_call_id":"call", "timeout_ms":0}),
+            json!({"parent_run_id":"p", "tool_call_id":"call", "timeout_ms":AGENT_WAIT_MAX_MS + 1}),
+            json!({"parent_run_id":"p", "tool_call_id":"", "timeout_ms":1}),
+            json!({"parent_run_id":"", "tool_call_id":"call", "timeout_ms":1}),
+        ] {
+            assert!(decode_agent_tool_result(&json!({"result_family":"control_receipt", "action":"wait", "status":"wait_admitted", "success":true, "wait_request":request})).is_none());
+        }
     }
 
     #[test]
@@ -1125,11 +1400,31 @@ mod tests {
         assert_eq!(parsed["status"], "still_running");
         assert_eq!(parsed["waited_secs"], 1);
         assert_eq!(parsed["delivery"], "asynchronous_parent_mailbox");
+        assert_eq!(parsed["hint"], PENDING_CHILD_RUNTIME_WAIT_GUIDANCE);
+        assert!(PENDING_CHILD_RUNTIME_WAIT_GUIDANCE.contains("when continuation is available"));
+        assert!(PENDING_CHILD_RUNTIME_WAIT_GUIDANCE.contains("Do not busy-poll"));
+        assert!(PENDING_CHILD_RUNTIME_WAIT_GUIDANCE.contains("shell sleep"));
+        let idle: Value = serde_json::from_str(&render_wait_for_agent_status(
+            "reviewer",
+            &AgentStatus::Idle,
+        ))
+        .unwrap();
+        assert_eq!(idle["hint"], PENDING_CHILD_RUNTIME_WAIT_GUIDANCE);
+        let waiting: Value = serde_json::from_str(&render_wait_timeout_outcome(
+            "reviewer",
+            Some(&AgentStatus::Waiting {
+                reason: "needs user input".to_string(),
+            }),
+            Duration::from_secs(1),
+        ))
+        .unwrap();
         assert!(
-            parsed["hint"]
+            waiting["current_status"]
                 .as_str()
-                .is_some_and(|hint| hint.contains("Do not busy-poll"))
+                .unwrap()
+                .contains("needs user input")
         );
+        assert_eq!(waiting["hint"], PENDING_CHILD_RUNTIME_WAIT_GUIDANCE);
     }
 
     #[test]

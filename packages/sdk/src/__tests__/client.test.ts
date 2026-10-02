@@ -785,12 +785,12 @@ describe("AstraClient — Session lifecycle and reflect", () => {
   test("cancelSession preserves pending execution and run evidence", async () => {
     globalThis.fetch = mockFetch(202, {
       ...sessWire, status: "cancellation_requested", execution_settled: false,
-      workspace_blocker: "unresolved_tool",
+      execution_blocker: "unresolved_tool",
       runs: [{ run_id: "r1", status: "cancelled", execution_settled: false }],
     });
     const result = await createClient().cancelSession("sx");
     expect(result.executionSettled).toBe(false);
-    expect(result.workspaceBlocker).toBe("unresolved_tool");
+    expect(result.executionBlocker).toBe("unresolved_tool");
     expect(result.runs).toEqual([{ runId: "r1", status: "cancelled", executionSettled: false }]);
   });
 

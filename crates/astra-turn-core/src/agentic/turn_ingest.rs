@@ -98,6 +98,8 @@ pub fn agentic_turn_stream_snapshot_with_kind<'a>(
 
 /// Mutable agentic-loop fields updated by [`ingest_agentic_turn_stream`].
 pub struct AgenticTurnIngestMut<'a> {
+    pub model_item_id: Option<&'a str>,
+    pub final_text_model_item_id: &'a mut Option<String>,
     pub first_ttft_ms: &'a mut Option<u64>,
     pub current_session_id: &'a mut Option<String>,
     pub current_run_id: &'a mut Option<String>,
@@ -190,20 +192,24 @@ pub fn ingest_agentic_turn_stream(
     if !snap.full_text.is_empty()
         && !round_has_edge_work
         && !preserve_prior_final_after_runtime_scaffolding_retry
+        && snap.error_message.is_none()
     {
         *st.final_text = snap.full_text.to_string();
+        *st.final_text_model_item_id = st.model_item_id.map(str::to_string);
     }
 
     if !snap.full_text.is_empty()
         && !round_has_edge_work
         && !preserve_prior_final_after_runtime_scaffolding_retry
+        && snap.error_message.is_none()
     {
         let guard = apply_response_guards(st.final_text.as_str(), snap.tool_calls, &[], message);
         if let Some(replacement) = guard.replacement {
             agent_warn!("response_guard", "Guard triggered, replacing LLM output");
             *st.final_text = replacement;
+            *st.final_text_model_item_id = None;
             *st.last_finish_reason = Some(RESPONSE_GUARD_REDACTED_FINISH_REASON.to_string());
-            persist_final_assistant_message(st.messages, st.final_text.as_str());
+            persist_final_assistant_message(st.messages, st.final_text.as_str(), None);
             return AgenticTurnIngestOutcome::Break;
         }
         if guard.quality.has_fabrication_markers {
@@ -320,7 +326,11 @@ pub fn ingest_agentic_turn_stream(
 
     if !round_has_edge_work {
         if !snap.full_text.is_empty() && !preserve_prior_final_after_runtime_scaffolding_retry {
-            persist_final_assistant_message(st.messages, st.final_text.as_str());
+            persist_final_assistant_message(
+                st.messages,
+                st.final_text.as_str(),
+                st.final_text_model_item_id.as_deref(),
+            );
         }
         return AgenticTurnIngestOutcome::Break;
     }
@@ -334,14 +344,20 @@ fn insert_tool_used(target: &mut HashSet<String>, name: String) {
     }
 }
 
-fn persist_final_assistant_message(messages: &mut Vec<Value>, final_text: &str) {
+fn persist_final_assistant_message(
+    messages: &mut Vec<Value>,
+    final_text: &str,
+    model_item_id: Option<&str>,
+) {
     if final_text.is_empty() {
         return;
     }
-    messages.push(serde_json::json!({
+    let mut message = serde_json::json!({
         "role": "assistant",
         "content": final_text,
-    }));
+    });
+    astra_turn_types::mark_model_message(&mut message, model_item_id);
+    messages.push(message);
 }
 
 fn should_preserve_prior_final_after_runtime_scaffolding_retry(
@@ -376,6 +392,8 @@ mod tests {
     use serde_json::json;
 
     struct Pack {
+        model_item_id: Option<String>,
+        final_text_model_item_id: Option<String>,
         first_ttft_ms: Option<u64>,
         current_session_id: Option<String>,
         current_run_id: Option<String>,
@@ -398,6 +416,8 @@ mod tests {
     impl Pack {
         fn new() -> Self {
             Self {
+                model_item_id: None,
+                final_text_model_item_id: None,
                 first_ttft_ms: None,
                 current_session_id: None,
                 current_run_id: None,
@@ -425,6 +445,8 @@ mod tests {
 
         fn ingest_mut(&mut self) -> AgenticTurnIngestMut<'_> {
             AgenticTurnIngestMut {
+                model_item_id: self.model_item_id.as_deref(),
+                final_text_model_item_id: &mut self.final_text_model_item_id,
                 first_ttft_ms: &mut self.first_ttft_ms,
                 current_session_id: &mut self.current_session_id,
                 current_run_id: &mut self.current_run_id,
@@ -1318,6 +1340,51 @@ mod tests {
     }
 
     #[test]
+    fn model_item_identity_survives_partial_failure_and_distinguishes_equal_responses() {
+        let mut pack = Pack::new();
+        for (id, text, failed) in [
+            ("accepted-A", "same answer", false),
+            ("partial-P", "unfinished", true),
+            ("resume-B", "same answer", false),
+        ] {
+            pack.model_item_id = Some(id.into());
+            let accum = ChatTurnSseAccum {
+                full_text: text.into(),
+                error_message: failed.then(|| "transport interrupted".into()),
+                error_kind: failed.then_some(astra_core::ErrorKind::Network),
+                ..Default::default()
+            };
+            let snap = agentic_turn_stream_snapshot_from_sse_accum(&accum, None);
+            let outcome = ingest_agentic_turn_stream(
+                &snap,
+                0,
+                |_| unreachable!(),
+                "answer",
+                &[],
+                true,
+                pack.ingest_mut(),
+            );
+            if failed {
+                assert!(matches!(outcome, AgenticTurnIngestOutcome::Fatal(_)));
+                assert_eq!(pack.final_text, "same answer");
+                assert_eq!(pack.final_text_model_item_id.as_deref(), Some("accepted-A"));
+                assert_eq!(pack.messages.len(), 1);
+            }
+        }
+        assert_eq!(pack.final_text_model_item_id.as_deref(), Some("resume-B"));
+        assert_eq!(pack.messages.len(), 2);
+        assert_eq!(
+            astra_turn_types::model_item_id(&pack.messages[0]),
+            Some("accepted-A")
+        );
+        assert_eq!(
+            astra_turn_types::model_item_id(&pack.messages[1]),
+            Some("resume-B")
+        );
+        assert_eq!(pack.messages[0]["content"], pack.messages[1]["content"]);
+    }
+
+    #[test]
     fn no_tool_runtime_scaffolding_retry_preserves_prior_final_answer() {
         let prior_answer = "Final answer that satisfies the user's request.";
         let snap = AgenticTurnStreamSnapshot {
@@ -1339,6 +1406,8 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
+        pack.model_item_id = Some("retry-B".into());
+        pack.final_text_model_item_id = Some("accepted-A".into());
         pack.final_text = prior_answer.to_string();
         pack.messages.push(json!({
             "role": "assistant",
@@ -1367,6 +1436,7 @@ mod tests {
 
         assert_eq!(out, AgenticTurnIngestOutcome::Break);
         assert_eq!(pack.final_text, prior_answer);
+        assert_eq!(pack.final_text_model_item_id.as_deref(), Some("accepted-A"));
         assert_eq!(
             pack.messages.len(),
             3,

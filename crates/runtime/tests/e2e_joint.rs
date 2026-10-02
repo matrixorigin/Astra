@@ -19,7 +19,7 @@ use astra_services::runs::{
 };
 use astra_services::session_workspace::{WorkspaceMetadata, persist_remote_workspace};
 use astra_services::{
-    BubbleUpTarget, ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
+    ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
     DatabaseRunStateStore, DatabaseSessionArtifactStore, DatabaseStateProjectionStore,
     DelegationProjectionUpsert, SessionArtifactJsonRecord, SessionArtifactJsonStore,
 };
@@ -1876,7 +1876,7 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
 #[allow(unused_attributes)]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
 #[ignore = "e2e_joint"]
-async fn e2e_joint_4_s10_five_level_delegation_bubble_up_and_retry_node() {
+async fn e2e_joint_4_s10_five_level_delegation_and_retry_node() {
     let pool = setup_pool().await;
     let user_id = id("user");
     let session_id = id("session");
@@ -2034,54 +2034,6 @@ async fn e2e_joint_4_s10_five_level_delegation_bubble_up_and_retry_node() {
             .expect("S10 delegation projection upsert must persist table and state item rows");
     }
 
-    let original_item_id = insert_state_item(
-        &pool,
-        &user_id,
-        &session_id,
-        &l3_runs[1],
-        "finding",
-        "critical-executor-2",
-        1,
-    )
-    .await;
-    projection
-        .bubble_up_finding(
-            &user_id,
-            &l3_runs[1],
-            &original_item_id,
-            "critical",
-            "executor-2 found unsafe retry boundary",
-            &[
-                BubbleUpTarget {
-                    session_id: session_id.clone(),
-                    run_id: l4.clone(),
-                    depth: 4,
-                },
-                BubbleUpTarget {
-                    session_id: session_id.clone(),
-                    run_id: l3_runs[1].clone(),
-                    depth: 3,
-                },
-                BubbleUpTarget {
-                    session_id: session_id.clone(),
-                    run_id: l2.clone(),
-                    depth: 2,
-                },
-                BubbleUpTarget {
-                    session_id: session_id.clone(),
-                    run_id: l1.clone(),
-                    depth: 1,
-                },
-                BubbleUpTarget {
-                    session_id: session_id.clone(),
-                    run_id: l0.clone(),
-                    depth: 0,
-                },
-            ],
-        )
-        .await
-        .expect("S10 bubble_up_finding must insert all ancestor projection events");
-
     let retry_run = id("retry");
     insert_run_row(
         &pool,
@@ -2116,21 +2068,6 @@ async fn e2e_joint_4_s10_five_level_delegation_bubble_up_and_retry_node() {
     assert!(
         path == expected_l4_path,
         "S10 L4 ancestor_path mismatch; expected {expected_l4_path}, got {path}"
-    );
-    let bubble_count = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_state_item_events
-         WHERE session_id = ? AND user_id = ? AND mutation = 'bubble_up'",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("S10 bubble_up event count query must succeed")
-    .try_get::<i64, _>("c")
-    .unwrap_or_default();
-    assert!(
-        bubble_count == 5,
-        "S10 critical finding must bubble through 5 levels, got {bubble_count}"
     );
     let retry = sqlx::query("SELECT retry_of, retry_scope FROM agent_runs WHERE run_id = ?")
         .bind(&retry_run)

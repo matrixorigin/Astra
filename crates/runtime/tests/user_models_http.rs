@@ -195,6 +195,7 @@ impl ModelService for TestModelService {
 async fn model_access_matches_run_eligibility_across_catalog_pages() {
     use astra_services::{ModelAccessKind, ModelExecutionPlacement};
     let offering = |name: &str, kind: ModelAccessKind| ModelListItem {
+        thinking_protocol: None,
         offering_id: name.into(),
         access_id: if kind == ModelAccessKind::CloudByok {
             "cloud-byok"
@@ -218,6 +219,7 @@ async fn model_access_matches_run_eligibility_across_catalog_pages() {
         max_completion_tokens: None,
         architecture: None,
         thinking_capability: None,
+        pricing: None,
     };
     for (allows_deployment, catalog, expected) in [
         (
@@ -274,6 +276,7 @@ async fn catalog_purpose_is_applied_before_pagination_and_shared_by_model_access
     ]
     .into_iter()
     .map(|(id, provider, is_active)| ModelListItem {
+        thinking_protocol: None,
         offering_id: id.into(),
         access_id: "cloud-byok".into(),
         access_kind: ModelAccessKind::CloudByok,
@@ -287,6 +290,7 @@ async fn catalog_purpose_is_applied_before_pagination_and_shared_by_model_access
         max_completion_tokens: None,
         architecture: None,
         thinking_capability: None,
+        pricing: None,
     })
     .collect::<Vec<_>>();
     let service = TestModelService {

@@ -17,4 +17,7 @@ pub struct SendMessageRuntimeContext {
     pub run_id: String,
     /// Shared router used by the runtime-owned message handler.
     pub router: Arc<AgentMailboxRouter>,
+    /// Shared with this run's receive loop so questions block premature
+    /// completion without adding a second message protocol.
+    pub reply_obligations: Arc<astra_runtime::messaging::reply_obligations::ReplyObligations>,
 }

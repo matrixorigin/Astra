@@ -22,7 +22,7 @@ import { cn } from '@/lib/utils/cn';
 type NavItem = {
   href: string | null;
   label: string;
-  mark: 'chat' | 'now' | 'work' | 'project' | 'search' | 'harness';
+  mark: 'chat' | 'now' | 'work' | 'project' | 'search';
   disabled?: boolean;
   badge?: string;
 };
@@ -33,7 +33,6 @@ const nav: NavItem[] = [
   { href: '/works', label: 'Work', mark: 'work' },
   { href: '/chats', label: 'Chats', mark: 'chat' },
   { href: '/projects', label: 'Projects', mark: 'project' },
-  { href: '/harnesses', label: 'Harnesses', mark: 'harness' },
 ];
 
 const emptySidebar: SidebarData = {

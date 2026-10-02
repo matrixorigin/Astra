@@ -174,48 +174,14 @@ const SESSION_DELETE_SESSION_ORIGIN_TABLES: &[SessionDeleteStatement] = &[
     },
 ];
 
-const SESSION_DELETE_DERIVED_PARENT_TABLES: &[SessionDeleteStatement] = &[
-    SessionDeleteStatement {
-        label: "context_manifest_items",
-        sql: "DELETE FROM context_manifest_items
+const SESSION_DELETE_DERIVED_PARENT_TABLES: &[SessionDeleteStatement] = &[SessionDeleteStatement {
+    label: "context_manifest_items",
+    sql: "DELETE FROM context_manifest_items
              WHERE (user_id, manifest_id) IN (
                  SELECT user_id, manifest_id FROM context_manifests
                  WHERE session_id = ? AND user_id = ?
              )",
-    },
-    SessionDeleteStatement {
-        label: "harness_citations",
-        sql: "DELETE FROM harness_citations
-             WHERE harness_run_id IN (
-                 SELECT harness_run_id FROM harness_runs
-                 WHERE session_id = ? AND user_id = ?
-             )",
-    },
-    SessionDeleteStatement {
-        label: "harness_skill_rules",
-        sql: "DELETE FROM harness_skill_rules
-             WHERE harness_run_id IN (
-                 SELECT harness_run_id FROM harness_runs
-                 WHERE session_id = ? AND user_id = ?
-             )",
-    },
-    SessionDeleteStatement {
-        label: "harness_skill_drafts",
-        sql: "DELETE FROM harness_skill_drafts
-             WHERE harness_run_id IN (
-                 SELECT harness_run_id FROM harness_runs
-                 WHERE session_id = ? AND user_id = ?
-             )",
-    },
-    SessionDeleteStatement {
-        label: "harness_items",
-        sql: "DELETE FROM harness_items
-             WHERE harness_run_id IN (
-                 SELECT harness_run_id FROM harness_runs
-                 WHERE session_id = ? AND user_id = ?
-             )",
-    },
-];
+}];
 
 const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
@@ -287,10 +253,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "session_execution_switches",
         sql: "DELETE FROM session_execution_switches WHERE session_id = ? AND owner_user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "session_execution_workspace_claims",
-        sql: "DELETE FROM session_execution_workspace_claims WHERE session_id = ? AND owner_user_id = ?",
     },
     SessionDeleteStatement {
         label: "session_context_heads",
@@ -369,10 +331,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM harness_snapshots WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "harness_runs",
-        sql: "DELETE FROM harness_runs WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "skill_selection_events",
         sql: "DELETE FROM skill_selection_events WHERE session_id = ? AND user_id = ?",
     },
@@ -387,14 +345,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "wf_triggers",
         sql: "DELETE FROM wf_triggers WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "eval_user_feedback",
-        sql: "DELETE FROM eval_user_feedback WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "eval_calibration_assessments",
-        sql: "DELETE FROM eval_calibration_assessments WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
         label: "team_snapshots",
@@ -574,10 +524,6 @@ const SESSION_DELETE_TERMINAL_TABLES: &[SessionDeleteStatement] = &[
         label: "agent_sessions",
         sql: "DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?",
     },
-    SessionDeleteStatement {
-        label: "eval_quality_assessments",
-        sql: "DELETE FROM eval_quality_assessments WHERE target_id = ? AND user_id = ? AND level = 'session'",
-    },
 ];
 
 const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
@@ -586,7 +532,6 @@ const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
     ("session_context_heads", "owner_user_id"),
     ("session_execution_bindings", "owner_user_id"),
     ("session_execution_switches", "owner_user_id"),
-    ("session_execution_workspace_claims", "owner_user_id"),
     ("session_context_operation_receipts", "owner_user_id"),
     ("session_context_authority_events", "owner_user_id"),
     ("session_handoff_events", "owner_user_id"),
@@ -1991,11 +1936,8 @@ mod tests {
                 let session_owner_scoped = normalized.contains("session_id = ? AND user_id = ?")
                     || normalized.contains("session_id = ? AND owner_id = ?")
                     || normalized.contains("session_id = ? AND owner_user_id = ?");
-                let session_quality_scoped = statement.label == "eval_quality_assessments"
-                    && normalized.contains("target_id = ? AND user_id = ?")
-                    && normalized.contains("level = 'session'");
                 assert!(
-                    session_owner_scoped || session_quality_scoped,
+                    session_owner_scoped,
                     "{} must be scoped by session identity and its owner",
                     statement.label
                 );

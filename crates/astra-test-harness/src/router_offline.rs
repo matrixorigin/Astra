@@ -1,7 +1,7 @@
 //! Explicit local offline artifact boundary; never loads credentials or invokes
 //! a provider, executor, replay service, or subprocess.
 use anyhow::{Context, Result};
-use astra_services::evaluation::router::*;
+use astra_services::model_routing::offline::*;
 use astra_services::tuning::{RouterQualificationProtocol, router_evaluation_plan_sha256};
 use astra_turn_core::model_routing::offline::{RouterTrainingConfig, train_router};
 use astra_turn_core::model_routing::qualification::{qualify_router, shadow_router};

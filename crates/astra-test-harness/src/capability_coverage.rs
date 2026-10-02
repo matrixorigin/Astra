@@ -63,6 +63,7 @@ fn is_deterministic_product_oracle(criterion: &Criterion) -> bool {
         | Criterion::SessionEventCount {
             optional: false, ..
         }
+        | Criterion::SessionChildResultAdopted { .. }
         | Criterion::JournalTurnEvaluationSignalCount { .. }
         | Criterion::JournalToolCalled {
             optional: false, ..
@@ -272,6 +273,8 @@ mod tests {
             Criterion::SessionEventCount {
                 event_type: "turn".into(),
                 min: 1,
+                max: None,
+                json_match: None,
                 optional: true,
             },
         ];

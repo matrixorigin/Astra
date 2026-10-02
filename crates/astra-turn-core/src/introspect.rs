@@ -1525,12 +1525,12 @@ pub fn render_recent_rounds(s: &IntrospectSnapshot) -> String {
         .saturating_add(total_cached)
         .saturating_add(total_created);
     let pct = if input_total > 0 {
-        (total_cached as f64 / input_total as f64) * 100.0
+        format!("{:.0}%", (total_cached as f64 / input_total as f64) * 100.0)
     } else {
-        0.0
+        "unknown".to_string()
     };
     out.push_str(&format!(
-        "\nRing: {} rounds, prompt_cache_read_share={:.0}% (cached_read={}/input_total={}, cache_create={}).\n",
+        "\nRing: {} rounds, prompt_cache_read_share={} (cached_read={}/input_total={}, cache_create={}).\n",
         s.recent_rounds.len(),
         pct,
         total_cached,
@@ -3186,6 +3186,19 @@ mod tests {
         assert!(out.contains("prompt_cache_read_share"));
         assert!(out.contains("cached_read=14300/input_total=14600"));
         assert!(!out.contains("cache_hit="));
+    }
+
+    #[test]
+    fn recent_rounds_with_no_input_have_unknown_cache_share() {
+        let snap = IntrospectSnapshot {
+            recent_rounds: vec![RoundSnapshotEntry {
+                turn: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = render_recent_rounds(&snap);
+        assert!(out.contains("prompt_cache_read_share=unknown"));
     }
 
     #[test]

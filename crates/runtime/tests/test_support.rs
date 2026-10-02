@@ -115,6 +115,7 @@ impl ModelService for StaticTestModelService {
         Ok(ResolvedModelOffering {
             offering_id,
             model: ResolvedActiveLlmModel {
+                price_snapshot: None,
                 model_name: self.model_name.clone(),
                 wire_model_name: None,
                 api_key: "test-key".to_string(),

@@ -28,7 +28,6 @@ use crate::cli::{
     },
     session::session_state::SessionState,
     session::{session_continuation, session_projection, session_startup, session_state},
-    slash::slash_stats,
     stream::stream_render,
     theme,
 };
@@ -5568,7 +5567,7 @@ async fn apply_restored_session(
         Some(m) => {
             state.model = Some(m.to_string());
             let base = astra_turn_core::thinking_config::resolve_model_thinking(m).0;
-            state.cached_pricing = slash_stats::fallback_pricing(base);
+            state.cached_pricing = crate::cli::session::session_runtime::fallback_pricing(base);
             state.context_budget =
                 prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(base));
         }
@@ -5578,8 +5577,7 @@ async fn apply_restored_session(
                 prompts::ContextBudget::from_runtime_config(&state.runtime_config, None);
         }
     }
-    crate::cli::slash::slash_config::set_active_model_for_display(state.model.clone());
-    crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
+    crate::cli::session::session_runtime::set_active_offering_id_for_request(None);
 
     if use_typed_continuation {
         state.history = session_continuation::history_pairs_from_messages(restored_resume_messages);

@@ -68,7 +68,7 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 | `e2e_matrix_saas_events_and_audit_cross_user_isolation` | `journey_saas_platform_matrix.rs` | Foreign-user `GET /events`, session audit, and activity return 404; filtered global events do not leak the foreign session |
 | `e2e_matrix_team_crud_and_db` | `journey_team_crud_matrix.rs` | Team CRUD + upsert via second `POST /teams`, empty `GET .../executions`, SQL `team_definitions` |
 | `e2e_matrix_team_snapshots_and_db` | `journey_team_snapshots_matrix.rs` | `POST/GET .../snapshots`, `DELETE /teams/snapshots/{id}`, SQL `team_snapshots` |
-| `e2e_matrix_team_http_negative_paths` | `journey_team_http_negatives_matrix.rs` | Auth 401, GET/DELETE 404, validation 400 (empty members, duplicate roles, bad budget, adversarial size) |
+| `e2e_matrix_team_http_negative_paths` | `journey_team_http_negatives_matrix.rs` | Auth 401, GET/DELETE 404, validation 400 (empty members, duplicate roles, bad budget), schema rejection 422 (unsupported coordination strategy) |
 | `e2e_matrix_team_http_db_fidelity` | `journey_team_data_fidelity_matrix.rs` | `GET` detail vs `team_definitions` JSON columns; list `len` = SQL `COUNT(*)`; snapshot blob + list fields; `executions?limit=` |
 | `e2e_matrix_team_cross_user_isolation` | `journey_team_isolation_matrix.rs` | Second user: 404 on other user's team; list has no foreign team name |
 | `e2e_matrix_meta_health` | `journey_meta_matrix.rs` | `GET /`, `GET /health` (root metadata, DB connected, persist counters) |
@@ -109,17 +109,14 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Decisions | P0 | `/decisions`, audit | `ctx_decision_audits` | `product_matrix_*`, `e2e_matrix_context_decision_chain` |
 | Memory proxy | P1 | `/memory/*` | Memoria stub calls | `product_matrix_*` |
 | Edge §5.5 | P0 | `/agents/edge`, `/tools/result`, `/approval/respond` | `edge_agent_registry`, durable run events | `product_matrix_*`, `e2e_matrix_approval_respond_invalid_session_id`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_saas_edge_tool_result_success_path`, duplicate/mixed/out-of-order server-stream callback journeys, `e2e_matrix_duplicate_approval_response_idempotency`; legacy Task Lease claim/renew/release routes are not registered by runtime, so no live E2E is claimed |
-| Jobs | P1 | `/jobs`, `/jobs/webhook` | service persistence | `product_matrix_*` |
 | Sandbox | P1 | `/sandbox` | `infra_sandbox_metadata` | `product_matrix_*` |
 | Triggers | P1 | `/triggers`, fire, delete | `wf_triggers` | `product_matrix_*` |
 | Skills / introspection | P1 | `/skills`, `/introspection/*` | mixed | `product_matrix_*` |
-| Evaluation | P1 | `/evaluation/*` reads | — | `product_matrix_*`, `e2e_matrix_evaluation_reads` |
 | Evaluation (writes) | P1 | `POST` gate/validate, drift/run, loop | — | — (no system E2E; add when implementations return success) |
 | Marketplace | P1 | quality report, stats, search | marketplace stats tables | `product_matrix_*` |
 | Chat (server-owned SSE) | P0 | `POST /chat/stream` | `agent_events`, `session_transcript_items`, audit/session projections | `product_matrix_*`, `e2e_matrix_chat_stream_session_info`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_saas_edge_tool_result_success_path`, duplicate/mixed/out-of-order callback journeys |
 | Chat / runs | P0 | `POST /chat`, `/chat/stream`, `/chat/runs/*` | **In-memory** run store in `build_server_state` (not Matrix table today) | `e2e_matrix_chat_run_pause_resume_http`, `e2e_matrix_chat_stream_session_info` |
 | Platform | P1 | `GET /platform/snapshot` | — | `product_matrix_*` |
-| Workflows | P1 | `GET /workflows` | — | `product_matrix_*` |
 | Data versioning | P1 | lineage GETs | — | `product_matrix_*` |
 | Replay | P1 | `/sessions/{id}/replay` + `/sessions/{id}/replay/compare` | No replay rows or summary mutation; owned 501 / foreign or missing 404 | `product_matrix_*` + `e2e_matrix_saas_session_replay_*_unavailable_guardrail` |
 | Branches | P1 | `/branches/cost-estimate` (HTTP; no DDL in this journey) | — | `e2e_matrix_branches_cost_estimate_http` |
@@ -146,17 +143,15 @@ Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../crates/ru
 | agents | `/agents` | Yes | Includes edge register path |
 | events | `/events` | Yes | |
 | skills | `/skills` | Partial | List/status; not publish/config/resources E2E |
-| evaluation | `/evaluation/` | Partial | Reads in `product_matrix_*`; POST write paths not covered in system E2E until implemented; training-data extract/export not in system E2E |
 | introspection | `/introspection/` | Yes | |
 | branches | `/branches` | Partial | `POST /branches/cost-estimate` in `e2e_matrix_branches_cost_estimate_http`; create/merge/diff not in system E2E |
 | marketplace | `/marketplace/` | Partial | Quality report / stats / search; not full install/upgrade/rollback/credentials |
 | sandbox | `/sandbox` | Yes | |
-| workflows | `/workflows` | Partial | `GET /workflows` only |
 | platform | `/platform/` | Partial | `GET /platform/snapshot` in `product_matrix_*` |
 | runs | `/runs` | Partial | List in `product_matrix_*`; lifecycle in `e2e_matrix_chat_run_pause_resume_http` |
 | teams | `/teams` | Partial | CRUD + snapshots + negatives + `team_definitions` / `team_snapshots` in `e2e_matrix_team_*`; `POST .../execute` still covered only in offline `team_execute_http_integration` (mock executor) — not in system E2E |
 
-Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **context** (`/context`), **decisions** (`/decisions`), **models** (`/models`), **jobs** (`/jobs`), **triggers** (`/triggers`), **data-versioning** (`/data-versioning`), **replay guardrails** (`/sessions/.../replay`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
+Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **context** (`/context`), **decisions** (`/decisions`), **models** (`/models`), **triggers** (`/triggers`), **data-versioning** (`/data-versioning`), **replay guardrails** (`/sessions/.../replay`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
 
 ## Explicit coverage gaps
 
@@ -170,7 +165,7 @@ Additional route families in `router_builder` not named above: **memory** (`/mem
 ## Future work
 
 - **Runs + DB**: when `RunStateStore` is backed by Matrix for `build_server_state`, add SQL assertions alongside `e2e_matrix_chat_run_pause_resume_http`.
-- **Evaluation writes**: add a focused test when `validate_gate` / `run_drift_pipeline` / `run_closed_loop` return **200** with stable response shapes.
+- **Evaluation writes**: add a focused test when `validate_gate` / `run_drift_pipeline` return **200** with stable response shapes.
 - **Branches / admin HTTP** (beyond cost estimate + token list): optional deeper journeys when routes stabilize.
 - **`/chat/ws`**, **successful delegation execute** (long-running): optional fixtures; validation-only delegation is in `e2e_matrix_delegate_http_boundaries`.
 - **Teams execute**: optional `system_matrix_http_e2e` for `POST /teams/{name}/execute` with real `ServerSubRunExecutor` (long-running; not added by default). CRUD/snapshots/DB for `/teams` are in `e2e_matrix_team_*`.

@@ -51,7 +51,6 @@ pub use traits::{SkillError, SkillExecutor, SkillProvider, SkillResolver};
 // Runtime skill execution and management
 pub mod executor;
 pub mod improvement;
-pub mod verify;
 
 // Re-export key types
 pub use executor::{
@@ -59,7 +58,6 @@ pub use executor::{
     SubRunResult,
 };
 pub use improvement::{ImprovementProposal, ImprovementTracker, SkillImprovement, TURN_BATCH_SIZE};
-pub use verify::SkillVerifier;
 
 /// Detect inline shell command lines in skill instructions.
 pub fn has_inline_shell(instructions: &str) -> bool {

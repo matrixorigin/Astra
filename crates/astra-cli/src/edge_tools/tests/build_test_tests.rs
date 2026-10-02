@@ -1,63 +1,24 @@
-use std::path::PathBuf;
-
-use super::{ToolExecutor, test_executor};
+use super::ToolExecutor;
 use serde_json::json;
 
-// ── run_build_test tests ──────────────────────────────────────────────
-
 #[tokio::test]
-async fn run_build_test_requires_command() {
-    let executor = test_executor();
-    let result = executor.execute("run_build_test", &json!({})).await;
-    assert!(result.contains("Error"), "should require command: {result}");
-}
-
-#[tokio::test]
-async fn run_build_test_echo_passes() {
-    let executor = test_executor();
-    let result = executor
-        .execute("run_build_test", &json!({"command": "echo 'hello world'"}))
-        .await;
-    // echo should succeed
+async fn retired_run_build_test_is_rejected_without_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(dir.path());
     assert!(
-        result.contains("✓") || result.contains("hello"),
-        "should pass: {result}"
+        !executor
+            .tool_names()
+            .iter()
+            .any(|name| name == "run_build_test")
     );
-}
-
-#[tokio::test]
-async fn run_build_test_failing_command() {
-    let executor = test_executor();
-    let result = executor
-        .execute("run_build_test", &json!({"command": "false"}))
-        .await;
-    // false exits with code 1
-    assert!(
-        result.contains("✗") || result.contains("exit 1") || result.contains("failed"),
-        "should detect failure: {result}"
-    );
-}
-
-#[tokio::test]
-async fn run_build_test_cargo_in_repo() {
-    // Run a fast cargo metadata query in our own repo (no compilation)
-    let root = {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop(); // → crates/
-        p.pop(); // → rust/
-        p
-    };
-    let executor = ToolExecutor::new(root);
     let result = executor
         .execute(
             "run_build_test",
-            &json!({
-                "command": "cargo metadata --format-version=1 --no-deps 2>&1 | head -1"
-            }),
+            &json!({"command": "touch retired-tool-ran", "auto_fix": true}),
         )
         .await;
-    // Should report something meaningful
-    assert!(!result.is_empty(), "should produce output");
+    assert!(result.starts_with("Error:"), "{result}");
+    assert!(!dir.path().join("retired-tool-ran").exists());
 }
 
 #[tokio::test]
@@ -146,120 +107,8 @@ async fn call_graph_symbol_not_found() {
 }
 
 // call_graph, delete_file, multi_edit are no longer in the advertised schema set.
-// call_graph/run_build_test are internal tools still executable but not LLM-facing.
+// call_graph is an internal tool still executable but not LLM-facing.
 // delete_file and multi_edit are subsumed by the write_file and str_replace schemas.
-
-#[tokio::test]
-async fn run_build_test_iteration_tracking() {
-    let executor = test_executor();
-    // First call — no delta header
-    let r1 = executor
-        .execute("run_build_test", &json!({"command": "echo 'ok'"}))
-        .await;
-    assert!(
-        !r1.contains("Iteration"),
-        "first run should not show iteration: {r1}"
-    );
-
-    // Second call with same command — should show iteration 1
-    let r2 = executor
-        .execute("run_build_test", &json!({"command": "echo 'ok'"}))
-        .await;
-    // Both succeed with 0 errors, so delta should be empty (nothing to report)
-    assert!(
-        r2.contains("✓") || r2.contains("ok"),
-        "should still work: {r2}"
-    );
-}
-
-#[tokio::test]
-async fn run_build_test_different_command_resets_tracker() {
-    let executor = test_executor();
-    // Run one command
-    executor
-        .execute("run_build_test", &json!({"command": "echo 'build'"}))
-        .await;
-    // Run different command — should reset tracker, not show iteration
-    let r2 = executor
-        .execute("run_build_test", &json!({"command": "echo 'test'"}))
-        .await;
-    assert!(
-        !r2.contains("Iteration"),
-        "different command should reset: {r2}"
-    );
-}
-
-#[tokio::test]
-async fn run_build_test_auto_fix_false_same_as_default() {
-    let executor = test_executor();
-    let r1 = executor
-        .execute("run_build_test", &json!({"command": "echo ok"}))
-        .await;
-    let executor2 = test_executor();
-    let r2 = executor2
-        .execute(
-            "run_build_test",
-            &json!({"command": "echo ok", "auto_fix": false}),
-        )
-        .await;
-    // Both should produce similar output (no auto-fix sections)
-    assert!(
-        !r1.contains("Auto-Fix"),
-        "default should not auto-fix: {r1}"
-    );
-    assert!(
-        !r2.contains("Auto-Fix"),
-        "explicit false should not auto-fix: {r2}"
-    );
-}
-
-#[tokio::test]
-async fn run_build_test_auto_fix_on_success_no_effect() {
-    let executor = test_executor();
-    let result = executor
-        .execute(
-            "run_build_test",
-            &json!({
-                "command": "echo 'all tests passed'",
-                "auto_fix": true
-            }),
-        )
-        .await;
-    // Successful build = no errors = no fixes to apply
-    assert!(
-        !result.contains("Auto-Fix"),
-        "no errors = no auto-fix: {result}"
-    );
-}
-
-#[tokio::test]
-async fn run_build_test_auto_fix_creates_report() {
-    // Create a temp dir with a Rust file that has an "unused import" error pattern
-    let dir = tempfile::tempdir().unwrap();
-    let src = dir.path().join("test.rs");
-    std::fs::write(&src, "use std::io;\n\nfn main() {}\n").unwrap();
-
-    let executor = ToolExecutor::new(dir.path());
-    // Simulate a build that produces an unused import warning
-    // We use a command that outputs Rust-style warnings
-    let result = executor
-        .execute(
-            "run_build_test",
-            &json!({
-                "command": "echo 'warning: unused import: `std::io`\n --> test.rs:1:5'",
-                "auto_fix": true
-            }),
-        )
-        .await;
-    // Should contain auto-fix report since the warning matches unused import pattern
-    // and the file exists with the import
-    assert!(
-        result.contains("Auto-Fix") || !result.contains("error"),
-        "should attempt auto-fix or have no errors: {result}"
-    );
-}
-
-// run_build_test is no longer in the advertised schema set (internal tool only).
 
 // ── Tier 1 expiry regression (session f85a02bb) ──────────────────────
 //

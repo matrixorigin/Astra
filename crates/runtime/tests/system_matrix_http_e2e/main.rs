@@ -28,7 +28,6 @@ mod journey_admin_smoke_matrix;
 mod journey_branches_matrix;
 mod journey_context_decision_chain_matrix;
 mod journey_delegate_http_matrix;
-mod journey_evaluation_reads_matrix;
 mod journey_extended;
 mod journey_full;
 mod journey_full_capture_matrix;
@@ -323,11 +322,6 @@ matrix_test! {
     journey_session_artifacts_matrix::run_session_artifact_latest_route_uses_stable_tiebreaker
 }
 matrix_test! {
-    e2e_matrix_evaluation_reads, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_evaluation_reads_matrix::run_evaluation_read_http_smoke
-}
-matrix_test! {
     e2e_matrix_context_decision_chain, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_context_decision_chain_matrix::run_context_decision_chain_db
@@ -556,11 +550,6 @@ matrix_test! {
     e2e_matrix_saas_session_replay_post_unavailable_guardrail, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §6.1 replay POST guardrail",
     journey_saas_platform_matrix::run_saas_session_replay_post_unavailable_guardrail
-}
-matrix_test! {
-    e2e_matrix_saas_admin_feedback_stats_rbac, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.2 admin feedback stats",
-    journey_saas_platform_matrix::run_saas_admin_feedback_stats_rbac
 }
 matrix_test! {
     e2e_matrix_saas_run_projection_smoke, 2,

@@ -22,6 +22,10 @@ pub struct ChatTurnBasePayloadInput<'a> {
     /// the same round idempotent.
     pub round_index: u32,
     pub offering_id: Option<&'a str>,
+    /// Client-prepared exact model name for a child run. The server treats it
+    /// only as an expected-value assertion after fresh Offering admission;
+    /// it never grants execution authority.
+    pub expected_model_name: Option<&'a str>,
     pub interaction_mode: Option<&'a str>,
     pub explain_verbose: bool,
     pub explain_on: bool,
@@ -46,6 +50,7 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
         inference_purpose,
         round_index,
         offering_id,
+        expected_model_name,
         interaction_mode,
         explain_verbose,
         explain_on,
@@ -80,10 +85,19 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
             json!({"offering_id": offering_id}),
         );
     }
-    if thinking.is_enabled() {
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("thinking".to_string(), thinking.to_payload_value());
-        }
+    if let Some(expected_model_name) = expected_model_name
+        && let Some(obj) = payload.as_object_mut()
+    {
+        obj.insert(
+            "expected_model_name".to_string(),
+            json!(expected_model_name),
+        );
+    }
+    // Preserve the caller's exact intent across the CLI/server boundary.
+    // In particular, `off`, `model_default`, and absence are different:
+    // absence permits legacy model-suffix resolution on external callers.
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("thinking".to_string(), thinking.to_payload_value());
     }
     payload
 }
@@ -274,6 +288,7 @@ mod tests {
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             round_index: 7,
             offering_id: Some("offer-gpt-test"),
+            expected_model_name: Some("model-test"),
             interaction_mode: Some("auto"),
             explain_verbose: false,
             explain_on: true,
@@ -291,6 +306,7 @@ mod tests {
         assert_eq!(p["round_index"], 7);
         assert!(p.get("model").is_none());
         assert_eq!(p["model_selection"]["offering_id"], "offer-gpt-test");
+        assert_eq!(p["expected_model_name"], "model-test");
         assert_eq!(p["interaction_mode"], "auto");
         assert_eq!(p["explain"], json!(true));
         assert_eq!(p["edge_executor_id"], "edge-unit");
@@ -303,8 +319,7 @@ mod tests {
             p.get("runtime_bindings").is_none(),
             "request payloads must not carry execution endpoints or credentials"
         );
-        // thinking = Off → field absent
-        assert!(p.get("thinking").is_none());
+        assert_eq!(p["thinking"]["mode"], "off");
     }
 
     #[test]
@@ -317,6 +332,7 @@ mod tests {
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             round_index: 0,
             offering_id: None,
+            expected_model_name: None,
             interaction_mode: None,
             explain_verbose: true,
             explain_on: false,
@@ -367,6 +383,7 @@ mod tests {
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             round_index: 0,
             offering_id: None,
+            expected_model_name: None,
             interaction_mode: Some("non_interactive"),
             explain_verbose: false,
             explain_on: false,
@@ -383,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn base_payload_thinking_absent_when_off() {
+    fn base_payload_preserves_explicit_thinking_off() {
         let p = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: &[],
             user_intent: None,
@@ -392,6 +409,7 @@ mod tests {
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             round_index: 0,
             offering_id: None,
+            expected_model_name: None,
             interaction_mode: None,
             explain_verbose: false,
             explain_on: false,
@@ -401,7 +419,30 @@ mod tests {
             git_branch: None,
             thinking: crate::thinking_config::ThinkingConfig::Off,
         });
-        assert!(p.get("thinking").is_none());
+        assert_eq!(p["thinking"]["mode"], "off");
+    }
+
+    #[test]
+    fn base_payload_preserves_model_default() {
+        let p = chat_turn_base_payload(ChatTurnBasePayloadInput {
+            messages: &[],
+            user_intent: None,
+            session_id: None,
+            agent_id: None,
+            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+            round_index: 0,
+            offering_id: None,
+            expected_model_name: None,
+            interaction_mode: None,
+            explain_verbose: false,
+            explain_on: false,
+            edge_executor_id: "e",
+            capabilities: vec![],
+            project_root: Path::new("/"),
+            git_branch: None,
+            thinking: crate::thinking_config::ThinkingConfig::ModelDefault,
+        });
+        assert_eq!(p["thinking"]["mode"], "model_default");
     }
 
     #[test]

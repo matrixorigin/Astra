@@ -214,7 +214,7 @@ impl RuntimeSummaryClient {
     /// models cannot turn reasoning off but do offer an explicit low-effort
     /// control. Use only admitted capability facts or Astra's maintained
     /// canonical-provider transition contract; never infer from a model name.
-    fn thinking_for(purpose: InferencePurpose, route: &OwnedLlmExecutionRoute) -> ThinkingConfig {
+    fn thinking_for(_purpose: InferencePurpose, route: &OwnedLlmExecutionRoute) -> ThinkingConfig {
         let protocol = route.thinking_protocol.unwrap_or_else(|| {
             astra_core::model_wire::thinking::canonical_thinking_protocol(
                 &route.provider,
@@ -225,28 +225,24 @@ impl RuntimeSummaryClient {
                     .unwrap_or(&route.model_name),
             )
         });
-        match (purpose, route.thinking_capability) {
-            // A persisted EffortOnly value may predate the provider's typed
-            // suppression capability. The admitted endpoint protocol is the
-            // stronger fact for bounded auxiliary work, so prefer Off when
-            // the route can express it natively; the client will add the
-            // exact suppression field to the wire request.
-            (
-                InferencePurpose::Introspection,
-                Some(astra_services::models::ThinkingCapability::EffortOnly),
-            ) if protocol.can_disable() => ThinkingConfig::Off,
-            (
-                InferencePurpose::Introspection,
-                Some(astra_services::models::ThinkingCapability::EffortOnly),
-            ) if protocol
-                == astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort =>
-            {
-                ThinkingConfig::Adaptive {
-                    effort: ThinkingEffort::Low,
-                }
-            }
-            _ => ThinkingConfig::Off,
-        }
+        [
+            ThinkingConfig::Off,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Low,
+            },
+            ThinkingConfig::ModelDefault,
+        ]
+        .into_iter()
+        .find(|config| {
+            config.is_supported_by(
+                &route.provider,
+                route
+                    .thinking_capability
+                    .map(|capability| capability.as_str()),
+                protocol,
+            )
+        })
+        .expect("model default is always admissible")
     }
 
     fn configured_temperature(route: &OwnedLlmExecutionRoute) -> Result<Option<f64>, String> {
@@ -283,7 +279,12 @@ impl RuntimeSummaryClient {
                     SummaryTemperatureEmission::InheritRouteDefault,
                     SummaryGenerationPolicyProvenance::ExistingPurposePolicy,
                 )
-            } else if !thinking.is_off() {
+            } else if matches!(
+                thinking,
+                ThinkingConfig::Enabled { .. } | ThinkingConfig::Adaptive { .. }
+            ) && (!protocol.can_disable()
+                || matches!(route.provider.as_str(), "anthropic" | "bedrock"))
+            {
                 (
                     SummaryTemperatureEmission::Forbidden,
                     SummaryGenerationPolicyProvenance::OfferingCapability,
@@ -722,7 +723,9 @@ mod tests {
 
     fn summary_execution(base_url: String) -> astra_services::AdmittedModelExecution {
         astra_services::AdmittedModelExecution {
+            price_snapshot: None,
             offering_id: "summary-offering".to_string(),
+            source_identity: None,
             access_kind: astra_services::ModelAccessKind::SelfHosted,
             execution_placement: astra_services::ModelExecutionPlacement::Server,
             model_name: "summary-model".to_string(),
@@ -953,8 +956,8 @@ mod tests {
             route_with_capability(Some(astra_services::models::ThinkingCapability::EffortOnly));
         assert_eq!(
             RuntimeSummaryClient::thinking_for(InferencePurpose::Introspection, &effort_only),
-            ThinkingConfig::Off,
-            "legacy capability alone cannot prove an effort wire protocol"
+            ThinkingConfig::ModelDefault,
+            "unknown protocol cannot prove an explicit control"
         );
         effort_only.thinking_protocol =
             Some(astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort);
@@ -981,28 +984,35 @@ mod tests {
             Some(astra_services::models::ThinkingCapability::None),
         ] {
             let route = route_with_capability(capability);
+            let expected = if capability == Some(astra_services::models::ThinkingCapability::None) {
+                ThinkingConfig::Off
+            } else {
+                ThinkingConfig::ModelDefault
+            };
             assert_eq!(
                 RuntimeSummaryClient::thinking_for(InferencePurpose::Introspection, &route),
-                ThinkingConfig::Off,
-                "only an explicitly effort-only model may receive reasoning_effort"
+                expected,
+                "unknown protocol must not receive an invented control"
             );
             assert_eq!(
                 RuntimeSummaryClient::thinking_for(InferencePurpose::RequiredCompaction, &route),
-                ThinkingConfig::Off,
-                "the bounded auxiliary policy must not leak into unrelated inference"
+                expected,
+                "all auxiliary purposes share the admitted control contract"
             );
         }
     }
 
     #[test]
-    fn bounded_introspection_honors_typed_deepseek_suppression_even_with_stale_capability() {
+    fn bounded_introspection_preserves_effort_only_without_inventing_suppression() {
         assert_eq!(
             RuntimeSummaryClient::thinking_for(
                 InferencePurpose::Introspection,
                 &deepseek_effort_only_route(),
             ),
-            ThinkingConfig::Off,
-            "the endpoint protocol can disable DeepSeek V4 thinking even when an older DB probe says effort_only"
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Low
+            },
+            "an effort-only capability never authorizes Off"
         );
     }
 
@@ -1493,6 +1503,7 @@ mod tests {
         let execution = summary_execution(spawn_summary_test_server(app).await);
         let mut route = summary_route(&execution);
         route.model_name = "arbitrary-local-alias".into();
+        route.thinking_capability = Some(astra_services::models::ThinkingCapability::Both);
         route.thinking_protocol =
             Some(astra_core::model_wire::thinking::ThinkingProtocol::Moonshot);
         let client = RuntimeSummaryClient::new_direct_for_test(route, 1024);
@@ -1662,7 +1673,9 @@ mod tests {
         );
         let base_url = spawn_summary_test_server(app).await;
         let execution = astra_services::AdmittedModelExecution {
+            price_snapshot: None,
             offering_id: "summary-offering".to_string(),
+            source_identity: None,
             access_kind: astra_services::ModelAccessKind::SelfHosted,
             execution_placement: astra_services::ModelExecutionPlacement::Server,
             model_name: "summary-model".to_string(),

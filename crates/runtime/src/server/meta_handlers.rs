@@ -820,10 +820,6 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("# TYPE astra_interaction_ask_user_wait_total counter"),
-            "{text}"
-        );
-        assert!(
             text.contains("# TYPE astra_interaction_approval_lookup_total counter"),
             "{text}"
         );

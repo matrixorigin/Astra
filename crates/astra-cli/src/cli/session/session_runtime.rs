@@ -12,6 +12,22 @@ use astra_services::{
 use astra_text_utils::str_preview::prefix_chars;
 use crossterm::style::Stylize;
 use std::collections::HashSet;
+use std::sync::{OnceLock, RwLock};
+
+static ACTIVE_OFFERING_ID_FOR_REQUEST: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+pub(crate) fn set_active_offering_id_for_request(offering_id: Option<String>) {
+    let lock = ACTIVE_OFFERING_ID_FOR_REQUEST.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = offering_id;
+    }
+}
+
+pub(crate) fn active_offering_id_for_request() -> Option<String> {
+    ACTIVE_OFFERING_ID_FOR_REQUEST
+        .get()
+        .and_then(|lock| lock.read().ok().and_then(|guard| guard.clone()))
+}
 
 pub(crate) fn create_pipeline_modules(
     api: &astra_thin_client::ThinClient,
@@ -101,6 +117,9 @@ fn format_mcp_error(error: &crate::mcp_client::McpError) -> String {
         }
         crate::mcp_client::McpError::Service(e) => format!("service error — {e}"),
         crate::mcp_client::McpError::ToolNotFound(tool) => format!("tool '{tool}' not found"),
+        crate::mcp_client::McpError::ToolPolicyUnavailable(tool) => {
+            format!("tool '{tool}' has no resolved execution policy")
+        }
         crate::mcp_client::McpError::ServerNotConnected(name) => {
             format!("server '{name}' is not connected")
         }
@@ -325,6 +344,12 @@ pub(crate) struct ServerModelSelection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdmittedServerModel {
+    pub model: ServerModelSelection,
+    pub thinking: astra_turn_core::thinking_config::ThinkingConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ServerDefaultModel {
     Selected(ServerModelSelection),
     NoModels,
@@ -355,6 +380,167 @@ impl ModelCatalogError {
 
     pub(crate) fn is_transport_failure(&self) -> bool {
         matches!(self, Self::Request(error) if error.is_transport())
+    }
+}
+
+/// Fetch the exact public model catalog. Only active Offerings reach the
+/// picker; administration surfaces use the server catalog directly.
+pub(crate) async fn fetch_model_catalog(
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
+    let (models, _) = fetch_server_model_catalog(
+        api,
+        token,
+        astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+    )
+    .await?;
+    Ok(models
+        .into_iter()
+        .filter(|entry| model_list_entry_is_active(entry))
+        .collect())
+}
+
+/// Lookup a model entry by canonical Offering ID or display name.
+pub(crate) fn find_model_entry_by_name<'a>(
+    models: &'a [ModelListItemResponse],
+    name: &str,
+) -> Option<&'a ModelListItemResponse> {
+    models.iter().find(|entry| {
+        entry.offering_id == name
+            || model_list_entry_name(entry).is_some_and(|value| value.eq_ignore_ascii_case(name))
+    })
+}
+
+/// Built-in pricing table for known models (USD per token).
+/// Seeds the client estimate when restoring a session's model selection.
+/// Pricing from https://platform.claude.com/docs/en/about-claude/pricing
+/// and https://openai.com/api/pricing/
+pub(crate) fn fallback_pricing(model_name: &str) -> astra_services::models::PricingData {
+    use astra_services::models::PricingData;
+    let name = model_name.to_lowercase();
+
+    // Claude Opus 4/4.1: $15/$75 per Mtok
+    if name.contains("opus-4") && !name.contains("4.5") && !name.contains("4.6") {
+        return PricingData {
+            prompt: 0.000_015,
+            completion: 0.000_075,
+            cache_read: Some(0.000_001_5),
+            cache_write: Some(0.000_018_75),
+        };
+    }
+    // Claude Opus 4.5/4.6: $5/$25 per Mtok
+    if name.contains("opus") {
+        return PricingData {
+            prompt: 0.000_005,
+            completion: 0.000_025,
+            cache_read: Some(0.000_000_5),
+            cache_write: Some(0.000_006_25),
+        };
+    }
+    // Claude Sonnet (3.5/3.7/4/4.5/4.6): $3/$15 per Mtok
+    if name.contains("sonnet") {
+        return PricingData {
+            prompt: 0.000_003,
+            completion: 0.000_015,
+            cache_read: Some(0.000_000_3),
+            cache_write: Some(0.000_003_75),
+        };
+    }
+    // Claude Haiku 4.5: $1/$5 per Mtok
+    if name.contains("haiku") && (name.contains("4.5") || name.contains("4-5")) {
+        return PricingData {
+            prompt: 0.000_001,
+            completion: 0.000_005,
+            cache_read: Some(0.000_000_1),
+            cache_write: Some(0.000_001_25),
+        };
+    }
+    // Claude Haiku 3.5: $0.80/$4 per Mtok
+    if name.contains("haiku") {
+        return PricingData {
+            prompt: 0.000_000_8,
+            completion: 0.000_004,
+            cache_read: Some(0.000_000_08),
+            cache_write: Some(0.000_001),
+        };
+    }
+    // GPT-4o / GPT-4.1: $2.5/$10 per Mtok
+    if name.contains("gpt-4o") || name.contains("gpt-4.1") {
+        return PricingData {
+            prompt: 0.000_002_5,
+            completion: 0.000_01,
+            cache_read: Some(0.000_000_625),
+            cache_write: None,
+        };
+    }
+    // GPT-4o-mini / GPT-4.1-mini: $0.15/$0.60 per Mtok
+    if name.contains("4o-mini")
+        || name.contains("4.1-mini")
+        || name.contains("5-mini")
+        || name.contains("5.4-mini")
+    {
+        return PricingData {
+            prompt: 0.000_000_15,
+            completion: 0.000_000_6,
+            cache_read: Some(0.000_000_037_5),
+            cache_write: None,
+        };
+    }
+    // DeepSeek V3/R1: $0.27/$1.10 per Mtok (cache read $0.07)
+    if name.contains("deepseek") {
+        return PricingData {
+            prompt: 0.000_000_27,
+            completion: 0.000_001_1,
+            cache_read: Some(0.000_000_07),
+            cache_write: None,
+        };
+    }
+    // Qwen (DashScope): cache reads ≈ 40% of input, no cache_write premium.
+    // Per-Mtok varies widely by Qwen tier (qwen-plus, qwen-max, ...); leave
+    // prompt/completion for the yaml to populate and supply only the cache
+    // ratio so `extract_pricing_for_model` can blend it in.
+    if name.contains("qwen") {
+        return PricingData {
+            prompt: 0.000_000_8,
+            completion: 0.000_002,
+            cache_read: Some(0.000_000_32),
+            cache_write: None,
+        };
+    }
+    // MiniMax: cache reads discounted, no cache_write premium.
+    if name.contains("minimax") {
+        return PricingData {
+            prompt: 0.000_000_8,
+            completion: 0.000_008,
+            cache_read: Some(0.000_000_2),
+            cache_write: None,
+        };
+    }
+    // GLM / Zhipu: cache reads ~25% of input, no cache_write premium.
+    if name.contains("glm") {
+        return PricingData {
+            prompt: 0.000_000_5,
+            completion: 0.000_001_5,
+            cache_read: Some(0.000_000_125),
+            cache_write: None,
+        };
+    }
+    // Kimi (Moonshot): cache reads ~25%, no cache_write premium.
+    if name.contains("kimi") || name.contains("moonshot") {
+        return PricingData {
+            prompt: 0.000_003,
+            completion: 0.000_015,
+            cache_read: Some(0.000_000_75),
+            cache_write: None,
+        };
+    }
+    // Default: Sonnet pricing as safe fallback
+    PricingData {
+        prompt: 0.000_003,
+        completion: 0.000_015,
+        cache_read: Some(0.000_000_3),
+        cache_write: Some(0.000_003_75),
     }
 }
 
@@ -779,17 +965,6 @@ pub(crate) fn model_selection_for_name_from_catalog(
         .and_then(model_selection_from_list_entry)
 }
 
-pub(crate) fn model_selection_for_offering_from_catalog(
-    models: &[ModelListItemResponse],
-    offering_id: &str,
-) -> Option<ServerModelSelection> {
-    models
-        .iter()
-        .filter(|entry| model_list_entry_is_active(entry))
-        .find(|entry| entry.offering_id == offering_id)
-        .and_then(model_selection_from_list_entry)
-}
-
 pub(crate) async fn resolve_server_model_selection(
     api: &astra_thin_client::ThinClient,
     token: &str,
@@ -815,19 +990,100 @@ pub(crate) fn resolve_server_model_selection_from_catalog(
     ))
 }
 
+/// Resolve and admit a bounded batch of Offering IDs or exact configured-name
+/// selectors. Discovery and authorization stay on Server so a fanout does not
+/// need a catalog GET followed by a separate admission request.
+pub(crate) async fn admit_server_model_slots(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    request: astra_server_types::ModelAdmissionRequestV1,
+) -> Result<Vec<AdmittedServerModel>, String> {
+    if request.slots.is_empty() {
+        return Ok(Vec::new());
+    }
+    for slot in &request.slots {
+        slot.selector.validate().map_err(str::to_string)?;
+    }
+    let body = serde_json::to_value(&request).map_err(|error| error.to_string())?;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        api.post_bearer_path_json_text(token, astra_thin_client::paths::MODEL_ACCESS_ADMIT, &body),
+    )
+    .await
+    .map_err(|_| "model admission timed out before child launch".to_string())?
+    .map_err(|error| error.to_string())?;
+    let response: astra_server_types::ModelAdmissionResponseV1 = serde_json::from_str(&response)
+        .map_err(|error| format!("invalid model admission response: {error}"))?;
+    if response.slots.len() != request.slots.len() {
+        return Err("model admission response has incomplete slot coverage".to_string());
+    }
+    request
+        .slots
+        .iter()
+        .zip(response.slots)
+        .map(|(requested, admitted)| {
+            let selector_matches = match &requested.selector {
+                astra_turn_types::ModelSelector::OfferingId { offering_id } => {
+                    admitted.offering_id == *offering_id
+                }
+                astra_turn_types::ModelSelector::ConfiguredName { model_name, .. } => {
+                    admitted.model_name.eq_ignore_ascii_case(model_name)
+                }
+            };
+            let expected_reasoning = requested
+                .inherited_reasoning
+                .as_ref()
+                .filter(|inherited| inherited.offering_id == admitted.offering_id)
+                .map(|inherited| &inherited.reasoning)
+                .unwrap_or(&requested.reasoning);
+            if !selector_matches
+                || admitted.max_output_tokens != requested.max_output_tokens
+                || &admitted.reasoning != expected_reasoning
+                || admitted.model_name.trim().is_empty()
+                || admitted.context_window == Some(0)
+            {
+                return Err(
+                    "model admission response does not match the requested slot".to_string()
+                );
+            }
+            let reasoning = serde_json::from_value::<
+                astra_turn_core::orchestration_spawn_tool::ReasoningSelection,
+            >(admitted.reasoning)
+            .map_err(|error| format!("invalid admitted reasoning response: {error}"))?
+            .config();
+            Ok(AdmittedServerModel {
+                model: ServerModelSelection {
+                    name: admitted.model_name,
+                    context_window: admitted.context_window,
+                    offering_id: admitted.offering_id,
+                },
+                thinking: reasoning,
+            })
+        })
+        .collect()
+}
+
 pub(crate) async fn resolve_server_offering_selection(
     api: &astra_thin_client::ThinClient,
     token: &str,
     offering_id: &str,
 ) -> Result<ServerModelSelection, String> {
-    let (catalog, _) = load_server_model_catalog(
-        api,
-        token,
-        astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
-    )
-    .await?;
-    model_selection_for_offering_from_catalog(&catalog, offering_id)
-        .ok_or_else(|| format!("Offering '{offering_id}' is not active in the Server catalog"))
+    let request = astra_server_types::ModelAdmissionRequestV1 {
+        slots: vec![astra_server_types::ModelAdmissionSlotV1 {
+            selector: astra_turn_types::ModelSelector::OfferingId {
+                offering_id: offering_id.to_string(),
+            },
+            max_output_tokens: None,
+            reasoning: serde_json::json!({ "mode": "model_default" }),
+            inherited_reasoning: None,
+        }],
+    };
+    admit_server_model_slots(api, token, request)
+        .await?
+        .into_iter()
+        .next()
+        .map(|admitted| admitted.model)
+        .ok_or_else(|| "model admission returned no selected Offering".to_string())
 }
 
 /// Resolve the Server-governed default Offering when the user did not choose
@@ -887,9 +1143,7 @@ pub(crate) async fn ensure_state_default_model(
         .await
         {
             Ok(selection) => {
-                crate::cli::slash::slash_config::set_active_offering_id_for_request(Some(
-                    selection.offering_id,
-                ));
+                set_active_offering_id_for_request(Some(selection.offering_id));
                 if let Some(context_window) = selection.context_window {
                     state.context_budget = astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
                         &state.runtime_config,
@@ -913,9 +1167,7 @@ pub(crate) async fn ensure_state_default_model(
     match resolve_server_default_model(api, token).await {
         ServerDefaultModel::Selected(selection) => {
             state.model = Some(selection.name.clone());
-            crate::cli::slash::slash_config::set_active_offering_id_for_request(Some(
-                selection.offering_id.clone(),
-            ));
+            set_active_offering_id_for_request(Some(selection.offering_id.clone()));
             if let Some(context_window) = selection.context_window {
                 state.context_budget =
                     astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
@@ -2337,12 +2589,14 @@ mod tests {
     use super::{
         ACCESS_TOKEN_REFRESH_SKEW_SECS, BannerTextStyle, ModelCatalogError, RestoredSessionState,
         ServerDefaultModel, SilentRefreshError, access_token_needs_refresh,
-        applied_user_intents_from_turn_metadata, banner_session_display, banner_welcome_text,
-        current_access_token, current_git_root, default_model_selection_from_access,
-        ensure_state_default_model, fetch_server_model_catalog, fresh_access_token, git_root_from,
-        initialize_session_state, load_server_model_access, model_default_invalid_reason_message,
+        admit_server_model_slots, applied_user_intents_from_turn_metadata, banner_session_display,
+        banner_welcome_text, current_access_token, current_git_root,
+        default_model_selection_from_access, ensure_state_default_model,
+        fetch_server_model_catalog, fresh_access_token, git_root_from, initialize_session_state,
+        load_server_model_access, model_default_invalid_reason_message,
         model_selection_for_name_from_catalog, pending_recovery_status_line,
-        resolve_server_default_model, resolve_server_model_selection, restore_history_from_journal,
+        resolve_server_default_model, resolve_server_model_selection,
+        resolve_server_offering_selection, restore_history_from_journal,
         restore_session_state_from_journal, restored_journal_state,
         should_keep_credentials_on_refresh_error, style_banner_text,
     };
@@ -2431,6 +2685,7 @@ mod tests {
         context_window: i32,
     ) -> ModelListItemResponse {
         ModelListItemResponse {
+            thinking_protocol: None,
             offering_id: offering_id.to_string(),
             access_id: "self-hosted".to_string(),
             access_kind: ModelAccessKind::SelfHosted,
@@ -2444,7 +2699,47 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         }
+    }
+
+    #[test]
+    fn model_catalog_auth_classification_uses_http_status_not_body_text() {
+        let unauthorized =
+            super::ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                body: "arbitrary provider response".into(),
+            });
+        assert!(unauthorized.is_authentication_failure());
+
+        let misleading_body =
+            super::ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                body: "request failed (401): not actually an auth response".into(),
+            });
+        assert!(!misleading_body.is_authentication_failure());
+    }
+
+    #[test]
+    fn missing_token_is_an_authentication_failure() {
+        assert!(super::ModelCatalogError::NotAuthenticated.is_authentication_failure());
+    }
+
+    #[test]
+    fn catalog_lookup_preserves_offering_and_model_facts() {
+        let mut entry = catalog_entry("offer-coding", "Coding Model", true, 128000);
+        entry.thinking_capability = Some(astra_services::models::ThinkingCapability::Both);
+        let models = vec![entry];
+        let entry = super::find_model_entry_by_name(&models, "offer-coding").unwrap();
+        assert_eq!(entry.offering_id, "offer-coding");
+        assert_eq!(super::model_list_entry_name(entry), Some("Coding Model"));
+        assert_eq!(
+            entry.thinking_capability.map(|value| value.as_str()),
+            Some("both")
+        );
+        assert!(super::model_list_entry_is_active(entry));
+        assert!(super::find_model_entry_by_name(&models, "coding model").is_some());
+        assert!(super::find_model_entry_by_name(&models, "missing").is_none());
     }
 
     fn access_projection(
@@ -2580,6 +2875,97 @@ mod tests {
         .expect("active Offering");
         assert_eq!(selection.offering_id, "offer-deepseek-pro");
         assert_eq!(selection.context_window, Some(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn exact_offering_admission_requests_only_the_selected_slots() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/model-access/admit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "slots": [
+                    {"offering_id":"offer-a","reasoning":{"mode":"model_default"},"model_name":"model-a","context_window":8192},
+                    {"offering_id":"offer-b","reasoning":{"mode":"model_default"},"model_name":"model-b","context_window":128000}
+                ]
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+        let request = astra_server_types::ModelAdmissionRequestV1 {
+            slots: ["offer-a", "offer-b"]
+                .into_iter()
+                .map(|offering_id| astra_server_types::ModelAdmissionSlotV1 {
+                    selector: astra_turn_types::ModelSelector::OfferingId {
+                        offering_id: offering_id.to_string(),
+                    },
+                    max_output_tokens: None,
+                    reasoning: serde_json::json!({ "mode": "model_default" }),
+                    inherited_reasoning: None,
+                })
+                .collect(),
+        };
+
+        let admitted = admit_server_model_slots(&api, "token", request)
+            .await
+            .expect("exact batch admission");
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(admitted[0].model.offering_id, "offer-a");
+        assert_eq!(admitted[0].model.name, "model-a");
+        assert_eq!(admitted[1].model.offering_id, "offer-b");
+        assert_eq!(admitted[1].model.context_window, Some(128_000));
+
+        let requests = mock.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].url.path(), "/model-access/admit");
+        assert_eq!(
+            requests[0].body_json::<serde_json::Value>().unwrap()["slots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|slot| slot["selector"].clone())
+                .collect::<Vec<_>>(),
+            [
+                serde_json::json!({"kind":"offering_id", "offering_id":"offer-a"}),
+                serde_json::json!({"kind":"offering_id", "offering_id":"offer-b"}),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_offering_resolution_uses_admission_without_catalog_scan() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/model-access/admit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "slots": [{
+                    "offering_id":"offer-exact",
+                    "reasoning":{"mode":"model_default"},
+                    "model_name":"resolved-model",
+                    "context_window":64000
+                }]
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+
+        let selection = resolve_server_offering_selection(&api, "token", "offer-exact")
+            .await
+            .expect("exact Offering admission");
+        assert_eq!(selection.offering_id, "offer-exact");
+        assert_eq!(selection.name, "resolved-model");
+        assert_eq!(selection.context_window, Some(64_000));
+
+        let requests = mock.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].url.path(), "/model-access/admit");
+        assert_eq!(
+            requests[0].body_json::<serde_json::Value>().unwrap()["slots"][0]["selector"],
+            serde_json::json!({"kind":"offering_id", "offering_id":"offer-exact"})
+        );
     }
 
     #[tokio::test]

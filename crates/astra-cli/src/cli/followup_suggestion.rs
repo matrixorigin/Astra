@@ -48,21 +48,6 @@ mod tests {
         }
     }
 
-    fn result_with_git_action_commit_record(full_text: &str) -> StreamResult {
-        StreamResult {
-            full_text: full_text.to_string(),
-            tool_calls_count: 1,
-            tools_used: vec!["git".to_string()],
-            tool_call_records: vec![astra_services::session_journal::ToolCallRecord {
-                name: "git".to_string(),
-                ok: true,
-                args_full: Some(r#"{"action":"commit","message":"ship"}"#.to_string()),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn suggests_validation_after_edit_turn() {
         let suggestion = suggest_followup(
@@ -88,18 +73,15 @@ mod tests {
     }
 
     #[test]
-    fn suggests_commit_after_validated_edit_turn() {
+    fn bash_marker_does_not_certify_validation() {
         let suggestion = suggest_followup(
             "fix the bug",
             &base_state(),
-            &base_result(
-                vec!["str_replace", "run_build_test"],
-                "Patched and verified.",
-            ),
+            &base_result(vec!["str_replace", "bash"], "Patched the file."),
         )
-        .expect("suggestion");
-        assert_eq!(suggestion.text, "commit this");
-        assert_eq!(suggestion.kind, FollowupSuggestionKind::Commit);
+        .expect("validation remains outstanding");
+        assert_eq!(suggestion.kind, FollowupSuggestionKind::Validate);
+        assert_eq!(suggestion.text, "run the tests");
     }
 
     #[test]
@@ -125,21 +107,6 @@ mod tests {
             &base_result(Vec::new(), "已经定位到原因了，要我继续改吗？"),
         );
         assert_eq!(suggestion, None);
-    }
-
-    #[test]
-    fn suggests_commit_when_assistant_asks_about_commit() {
-        let suggestion = suggest_followup(
-            "修一下这个 bug",
-            &base_state(),
-            &base_result(
-                vec!["str_replace", "run_build_test"],
-                "已经修好并验证了，要我直接提交吗？",
-            ),
-        )
-        .expect("suggestion");
-        assert_eq!(suggestion.text, "提交一下");
-        assert_eq!(suggestion.kind, FollowupSuggestionKind::Commit);
     }
 
     #[test]

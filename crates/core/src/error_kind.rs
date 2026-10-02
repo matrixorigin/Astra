@@ -761,6 +761,9 @@ pub fn classify_model_resolution_error_message(message: &str) -> ErrorKind {
         "[genesis_credential_rejected]",
         "[moi_model_policy_unavailable]",
         "[uc_unavailable]",
+        "[model_catalog_unavailable]",
+        "[model_selection_changed]",
+        "[model_admission_incomplete]",
     ]
     .iter()
     .any(|code| lower.contains(code))
@@ -782,6 +785,13 @@ pub fn classify_model_resolution_error_message(message: &str) -> ErrorKind {
         || lower.contains("is inactive")
         || lower.contains(" is ambiguous")
         || lower.contains("empty model name")
+        || lower.contains("[model_selection_invalid]")
+        || lower.contains("[model_admission_batch_invalid]")
+        || lower.contains("[model_admission_batch_too_large]")
+        || lower.contains("[model_offering_not_found]")
+        || lower.contains("[model_offering_unavailable]")
+        || lower.contains("[model_reasoning_unsupported]")
+        || lower.contains("[model_purpose_unsupported]")
     {
         return ErrorKind::InvalidRequest;
     }
@@ -1420,6 +1430,18 @@ mod tests {
             (
                 "Model resolution failed: [moi_model_policy_unavailable] Policy unavailable.",
                 ErrorKind::ServerError,
+            ),
+            (
+                "[model_catalog_unavailable] The authorized model catalog is temporarily unavailable.",
+                ErrorKind::ServerError,
+            ),
+            (
+                "[model_selection_changed] The selected model changed during admission; retry delegation.",
+                ErrorKind::ServerError,
+            ),
+            (
+                "[model_offering_unavailable] The requested model is unavailable.",
+                ErrorKind::InvalidRequest,
             ),
             (
                 "Model resolution failed: DB query: error communicating with database: expected to read 4 bytes, got 0 bytes at EOF",

@@ -225,7 +225,7 @@ async fn build_test_router_keeps_representative_domain_routes_registered() {
         request("GET", "/evaluation/drift", auth_headers, Body::empty()),
     )
     .await;
-    assert_ne!(evaluation, StatusCode::NOT_FOUND);
+    assert_eq!(evaluation, StatusCode::NOT_FOUND);
 
     let introspection = request_status(
         app.clone(),

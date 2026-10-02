@@ -11,7 +11,7 @@ pub(crate) fn handle_bug_command(arg: &str, state: &SessionState) {
     let report = build_bug_report(state);
 
     match arg.trim() {
-        "copy" => match crate::cli::slash::slash_info::copy_to_clipboard(&report) {
+        "copy" => match crate::cli::clipboard::copy_to_clipboard(&report) {
             Ok(()) => cli_ok!("Bug report copied to clipboard."),
             Err(error) => {
                 cli_warn!("Could not copy to clipboard: {}", error);
@@ -90,7 +90,7 @@ fn build_bug_report(state: &SessionState) -> String {
     if let Some(cost) = state.total_session_cost {
         lines.push(format!(
             "- **Cost**: {}",
-            crate::cli::slash::slash_stats::format_cost(cost)
+            crate::cli::session::session_stats_scan::format_cost(cost)
         ));
     }
     lines.push(String::new());

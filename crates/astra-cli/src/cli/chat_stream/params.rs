@@ -155,11 +155,17 @@ pub enum StreamEvent {
     /// projection as policy authority.
     RuntimeFeedback(Box<astra_turn_core::context_feedback::RuntimeFeedbackFrame>),
     /// LLM token chunk.
-    Token(String),
+    Token {
+        model_item_id: Option<String>,
+        text: String,
+    },
     /// Model thinking/reasoning started or stopped.
     Thinking(bool),
     /// Thinking/reasoning preview chunk.
-    ThinkingChunk(String),
+    ThinkingChunk {
+        model_item_id: Option<String>,
+        text: String,
+    },
     /// Tool execution started. `tool_use_id` is a server-minted UUIDv7
     /// correlation key that round-trips through the tool's matching
     /// `ToolCompleted` and survives into SSE JSON. `parent_tool_use_id`

@@ -2,8 +2,7 @@ use crate::TransactionConnection;
 use crate::auth::DatabaseUserRecord;
 use crate::auth::session::SessionRecord;
 use astra_core::{
-    ErrorResponse, MatrixOneSettings, connect_matrixone, identity::USER_ID_MAX_LEN, internal_error,
-    release_global_connections,
+    ErrorResponse, MatrixOneSettings, connect_matrixone, internal_error, release_global_connections,
 };
 use axum::{Json, http::StatusCode};
 use sha2::Digest;
@@ -107,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-27-v90";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-29-v91";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -502,21 +501,6 @@ fn agent_events_create_sql() -> String {
         )"
     )
 }
-
-const EVAL_CALIBRATION_ASSESSMENTS_CREATE_SQL: &str =
-    "CREATE TABLE IF NOT EXISTS eval_calibration_assessments (
-            calibration_id VARCHAR(64) NOT NULL,
-            user_id        VARCHAR(128) NOT NULL,
-            agent_id       VARCHAR(255),
-            session_id     VARCHAR(64) NOT NULL,
-            confidence     DECIMAL(5,4) NOT NULL,
-            quality_score  DECIMAL(5,4) NOT NULL,
-            created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, calibration_id),
-            INDEX idx_eval_calibration_user_created (user_id, created_at),
-            INDEX idx_eval_calibration_user_agent_created (user_id, agent_id, created_at),
-            INDEX idx_eval_calibration_session (user_id, session_id, created_at)
-        )";
 
 struct CoreSchemaDatabaseLease {
     pool: sqlx::Pool<MySql>,
@@ -3767,27 +3751,6 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
-        "session_execution_workspace_claims",
-        "CREATE TABLE IF NOT EXISTS session_execution_workspace_claims (
-            isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL,
-            workspace_identity_hash CHAR(64) NOT NULL,
-            workspace_identity VARCHAR(8192) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            branch_id VARCHAR(128) NOT NULL,
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (isolation_domain, owner_user_id, workspace_identity_hash),
-            UNIQUE KEY uq_session_execution_workspace_claim_session
-                (isolation_domain, owner_user_id, session_id, branch_id),
-            INDEX idx_session_execution_workspace_claim_owner_session
-                (owner_user_id, session_id, branch_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
         "session_execution_switches",
         "CREATE TABLE IF NOT EXISTS session_execution_switches (
             isolation_domain VARCHAR(128) NOT NULL,
@@ -4813,7 +4776,7 @@ async fn ensure_core_schema_while_leased(
             request_id VARCHAR(128) NULL,
             trace_id VARCHAR(128) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            CONSTRAINT chk_state_item_event_mutation CHECK (mutation IN ('insert', 'update', 'replace', 'archive', 'delete', 'bubble_up', 'apply_suggestion', 'activate')),
+            CONSTRAINT chk_state_item_event_mutation CHECK (mutation IN ('insert', 'update', 'replace', 'archive', 'delete', 'apply_suggestion', 'activate')),
             PRIMARY KEY (user_id, event_id),
             INDEX idx_state_events_item_created (item_id, created_at, event_id),
             INDEX idx_state_events_owner_session_created (user_id, session_id, created_at, event_id),
@@ -4893,139 +4856,6 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_harness_owner_session_created (user_id, session_id, created_at),
             INDEX idx_harness_owner_session_turn (user_id, session_id, turn_number),
             INDEX idx_harness_owner_chain (user_id, causal_chain_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    // Product harness workflow state. This is separate from the diagnostic
-    // `harness_snapshots` table above: these rows are the durable product model
-    // for reusable user workflows such as Skillify.
-    core_schema_create!(
-        pool,
-        "harness_runs",
-        "CREATE TABLE IF NOT EXISTS harness_runs (
-            harness_run_id VARCHAR(128) PRIMARY KEY,
-            harness_id VARCHAR(128) NOT NULL,
-            version_id VARCHAR(128) NOT NULL,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NULL,
-            workflow_run_id VARCHAR(128) NULL,
-            agent_run_id VARCHAR(128) NULL,
-            parent_agent_run_id VARCHAR(128) NULL,
-            status VARCHAR(64) NOT NULL,
-            input_json LONGTEXT NOT NULL,
-            output_json LONGTEXT NOT NULL,
-            error TEXT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_harness_runs_user_status_updated (user_id, status, updated_at),
-            INDEX idx_harness_runs_harness_user (harness_id, user_id, updated_at),
-            INDEX idx_harness_runs_owner_session_updated (user_id, session_id, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "harness_items",
-        "CREATE TABLE IF NOT EXISTS harness_items (
-            item_id VARCHAR(128) PRIMARY KEY,
-            harness_run_id VARCHAR(128) NOT NULL,
-            parent_item_id VARCHAR(128) NULL,
-            item_type VARCHAR(64) NOT NULL,
-            locator_json LONGTEXT NOT NULL,
-            input_json LONGTEXT NOT NULL,
-            proposed_output_json LONGTEXT NOT NULL,
-            final_output_json LONGTEXT NOT NULL,
-            decision_history_json LONGTEXT NULL,
-            status VARCHAR(64) NOT NULL,
-            confidence DOUBLE NULL,
-            assigned_to VARCHAR(128) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_harness_items_run_status (harness_run_id, status, updated_at),
-            INDEX idx_harness_items_assigned (assigned_to, status, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "harness_skill_drafts",
-        "CREATE TABLE IF NOT EXISTS harness_skill_drafts (
-            skill_draft_id VARCHAR(128) PRIMARY KEY,
-            harness_run_id VARCHAR(128) NOT NULL,
-            candidate_name VARCHAR(128) NOT NULL,
-            description TEXT NOT NULL,
-            target_scope VARCHAR(32) NOT NULL,
-            publish_visibility VARCHAR(32) NOT NULL,
-            content_markdown LONGTEXT NOT NULL,
-            source_summary_json LONGTEXT NOT NULL,
-            decision_history_json LONGTEXT NULL,
-            status VARCHAR(64) NOT NULL,
-            confidence DOUBLE NULL,
-            created_by_node_id VARCHAR(128) NULL,
-            revision BIGINT NOT NULL DEFAULT 1,
-            published_version_id VARCHAR(128) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_harness_skill_drafts_run_status (harness_run_id, status, updated_at),
-            INDEX idx_harness_skill_drafts_run_revision (harness_run_id, revision)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "harness_skill_rules",
-        "CREATE TABLE IF NOT EXISTS harness_skill_rules (
-            skill_rule_id VARCHAR(128) PRIMARY KEY,
-            skill_draft_id VARCHAR(128) NOT NULL,
-            harness_run_id VARCHAR(128) NOT NULL,
-            rule_type VARCHAR(64) NOT NULL,
-            statement TEXT NOT NULL,
-            rationale TEXT NOT NULL,
-            decision_history_json LONGTEXT NULL,
-            status VARCHAR(64) NOT NULL,
-            confidence DOUBLE NULL,
-            source_count BIGINT NOT NULL DEFAULT 0,
-            created_by_node_id VARCHAR(128) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_harness_skill_rules_draft_status (skill_draft_id, status, updated_at),
-            INDEX idx_harness_skill_rules_run_status (harness_run_id, status, updated_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "harness_citations",
-        "CREATE TABLE IF NOT EXISTS harness_citations (
-            citation_id VARCHAR(128) PRIMARY KEY,
-            harness_run_id VARCHAR(128) NOT NULL,
-            item_id VARCHAR(128) NOT NULL,
-            skill_draft_id VARCHAR(128) NULL,
-            skill_rule_id VARCHAR(128) NULL,
-            source_id VARCHAR(128) NULL,
-            source_locator_json LONGTEXT NOT NULL,
-            source_snapshot_ref VARCHAR(128) NULL,
-            source_content_hash VARCHAR(128) NULL,
-            source_metadata_json LONGTEXT NULL,
-            artifact_id VARCHAR(128) NULL,
-            quote_hash VARCHAR(128) NULL,
-            evidence_text_preview TEXT NULL,
-            relevance_score DOUBLE NULL,
-            created_by_node_id VARCHAR(128) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_harness_citations_item (item_id, created_at),
-            INDEX idx_harness_citations_skill_rule (skill_rule_id, created_at),
-            INDEX idx_harness_citations_run (harness_run_id, created_at)
         )",
     )
     .execute(&pool)
@@ -5170,10 +5000,9 @@ async fn ensure_core_schema_while_leased(
         "CREATE TABLE IF NOT EXISTS inference_routes (
             route_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NULL,
+            session_id VARCHAR(64) NOT NULL,
             scope_kind VARCHAR(16) NOT NULL,
             run_id VARCHAR(64) NULL,
-            harness_run_id VARCHAR(128) NULL,
             offering_id VARCHAR(64) NOT NULL,
             resolved_model_name VARCHAR(255) NOT NULL,
             upstream_model_name VARCHAR(255) NOT NULL,
@@ -5181,20 +5010,16 @@ async fn ensure_core_schema_while_leased(
             execution_placement VARCHAR(32) NOT NULL,
             access_kind VARCHAR(32) NOT NULL,
             purpose VARCHAR(64) NOT NULL,
+            price_snapshot_json JSON NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, route_id),
             CONSTRAINT chk_inference_routes_scope_kind
-                CHECK (scope_kind IN ('run', 'session', 'harness_run')),
+                CHECK (scope_kind IN ('run', 'session')),
             CONSTRAINT chk_inference_routes_scope_owner
-                CHECK ((scope_kind = 'run' AND session_id IS NOT NULL
-                        AND run_id IS NOT NULL AND harness_run_id IS NULL)
-                    OR (scope_kind = 'session' AND session_id IS NOT NULL
-                        AND run_id IS NULL AND harness_run_id IS NULL)
-                    OR (scope_kind = 'harness_run' AND session_id IS NULL
-                        AND run_id IS NULL AND harness_run_id IS NOT NULL)),
+                CHECK ((scope_kind = 'run' AND run_id IS NOT NULL)
+                    OR (scope_kind = 'session' AND run_id IS NULL)),
             INDEX idx_inference_routes_owner_session_created (user_id, session_id, created_at, route_id),
             INDEX idx_inference_routes_owner_run_created (user_id, run_id, created_at, route_id),
-            INDEX idx_inference_routes_owner_harness_created (user_id, harness_run_id, created_at, route_id),
             INDEX idx_inference_routes_offering_created (offering_id, created_at, route_id)
         )",
     )
@@ -5206,16 +5031,15 @@ async fn ensure_core_schema_while_leased(
             invocation_id VARCHAR(64) NOT NULL,
             route_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NULL,
+            session_id VARCHAR(64) NOT NULL,
             scope_kind VARCHAR(16) NOT NULL,
             run_id VARCHAR(64) NULL,
-            harness_run_id VARCHAR(128) NULL,
             admission_token CHAR(32) NOT NULL,
             owner_token CHAR(32) NOT NULL,
             owner_generation BIGINT NOT NULL,
             owner_lease_expires_at DATETIME(6) NOT NULL,
-            turn_index BIGINT NULL,
-            round_index BIGINT NULL,
+            turn_index BIGINT NOT NULL,
+            round_index BIGINT NOT NULL,
             operation_id VARCHAR(64) NOT NULL,
             logical_attempt BIGINT NOT NULL,
             purpose VARCHAR(64) NOT NULL,
@@ -5234,17 +5058,10 @@ async fn ensure_core_schema_while_leased(
             terminal_at DATETIME(6) NULL,
             PRIMARY KEY (user_id, invocation_id),
             CONSTRAINT chk_inference_invocations_scope_kind
-                CHECK (scope_kind IN ('run', 'session', 'harness_run')),
+                CHECK (scope_kind IN ('run', 'session')),
             CONSTRAINT chk_inference_invocations_scope_owner
-                CHECK ((scope_kind = 'run' AND session_id IS NOT NULL
-                        AND run_id IS NOT NULL AND harness_run_id IS NULL
-                        AND turn_index IS NOT NULL AND round_index IS NOT NULL)
-                    OR (scope_kind = 'session' AND session_id IS NOT NULL
-                        AND run_id IS NULL AND harness_run_id IS NULL
-                        AND turn_index IS NOT NULL AND round_index IS NOT NULL)
-                    OR (scope_kind = 'harness_run' AND session_id IS NULL
-                        AND run_id IS NULL AND harness_run_id IS NOT NULL
-                        AND turn_index IS NULL AND round_index IS NULL)),
+                CHECK ((scope_kind = 'run' AND run_id IS NOT NULL)
+                    OR (scope_kind = 'session' AND run_id IS NULL)),
             CONSTRAINT chk_inference_invocations_status
                 CHECK (status IN ('admitted', 'succeeded', 'failed', 'cancelled', 'delivery_unknown')),
             CONSTRAINT chk_inference_invocations_usage_status
@@ -5255,9 +5072,8 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_inference_invocations_owner_session_created (user_id, session_id, created_at, invocation_id),
             INDEX idx_inference_invocations_owner_turn (user_id, session_id, turn_index, purpose, invocation_id),
             INDEX idx_inference_invocations_owner_run_created (user_id, run_id, created_at, invocation_id),
-            INDEX idx_inference_invocations_owner_harness_created (user_id, harness_run_id, created_at, invocation_id),
             INDEX idx_inference_invocations_logical_cursor
-                (user_id, scope_kind, session_id, run_id, harness_run_id,
+                (user_id, scope_kind, session_id, run_id,
                  turn_index, round_index, operation_id, purpose, logical_attempt),
             INDEX idx_inference_invocations_owner_lease
                 (owner_lease_expires_at, user_id, invocation_id)
@@ -5271,9 +5087,8 @@ async fn ensure_core_schema_while_leased(
             attempt_id VARCHAR(64) NOT NULL,
             invocation_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NULL,
+            session_id VARCHAR(64) NOT NULL,
             run_id VARCHAR(64) NULL,
-            harness_run_id VARCHAR(128) NULL,
             attempt_index BIGINT NOT NULL,
             provider VARCHAR(64) NOT NULL,
             admission_token CHAR(32) NOT NULL,
@@ -5297,10 +5112,6 @@ async fn ensure_core_schema_while_leased(
             terminal_at DATETIME(6) NULL,
             context_expired_at DATETIME(6) NULL,
             PRIMARY KEY (user_id, attempt_id),
-            CONSTRAINT chk_inference_provider_attempts_scope_owner
-                CHECK ((session_id IS NOT NULL AND harness_run_id IS NULL)
-                    OR (session_id IS NULL AND run_id IS NULL
-                        AND harness_run_id IS NOT NULL)),
             CONSTRAINT chk_inference_provider_attempts_status
                 CHECK (status IN ('started', 'succeeded', 'failed', 'cancelled', 'delivery_unknown')),
             CONSTRAINT chk_inference_provider_attempts_usage_status
@@ -5310,8 +5121,7 @@ async fn ensure_core_schema_while_leased(
                     AND provider_wire_bytes > 0),
             UNIQUE KEY uq_inference_provider_attempt (user_id, invocation_id, attempt_index),
             INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),
-            INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id),
-            INDEX idx_inference_attempts_owner_harness_started (user_id, harness_run_id, started_at, attempt_id)
+            INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id)
         )",
     )
     .execute(&pool)
@@ -5437,9 +5247,8 @@ async fn ensure_core_schema_while_leased(
             user_id VARCHAR(128) NOT NULL,
             attempt_id VARCHAR(64) NOT NULL,
             invocation_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NULL,
+            session_id VARCHAR(64) NOT NULL,
             run_id VARCHAR(64) NULL,
-            harness_run_id VARCHAR(128) NULL,
             event_stage VARCHAR(16) NOT NULL,
             terminal_status VARCHAR(32) NULL,
             topology VARCHAR(32) NOT NULL,
@@ -5463,8 +5272,6 @@ async fn ensure_core_schema_while_leased(
                 (user_id, attempt_id, event_stage),
             INDEX idx_model_request_context_owner_session_created
                 (user_id, session_id, created_at, event_id),
-            INDEX idx_model_request_context_owner_harness_created
-                (user_id, harness_run_id, created_at, event_id),
             INDEX idx_model_request_context_created_event
                 (created_at, event_id),
             INDEX idx_model_request_context_metrics
@@ -5520,8 +5327,7 @@ async fn ensure_core_schema_while_leased(
         "CREATE TABLE IF NOT EXISTS inference_invocation_settlement_debts (
             user_id VARCHAR(128) NOT NULL,
             invocation_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NULL,
-            harness_run_id VARCHAR(128) NULL,
+            session_id VARCHAR(64) NOT NULL,
             terminal_status VARCHAR(32) NOT NULL,
             terminal_fingerprint CHAR(64) NOT NULL,
             usage_status VARCHAR(32) NOT NULL DEFAULT 'unavailable',
@@ -5541,13 +5347,8 @@ async fn ensure_core_schema_while_leased(
             PRIMARY KEY (user_id, invocation_id),
             INDEX idx_inference_settlement_owner_session_created
                 (user_id, session_id, created_at, invocation_id),
-            INDEX idx_inference_settlement_owner_harness_created
-                (user_id, harness_run_id, created_at, invocation_id),
             INDEX idx_inference_settlement_recovery_ready
                 (reconciliation_status, next_retry_at, user_id, invocation_id),
-            CONSTRAINT chk_inference_invocation_settlement_debts_scope_owner
-                CHECK ((session_id IS NOT NULL AND harness_run_id IS NULL)
-                    OR (session_id IS NULL AND harness_run_id IS NOT NULL)),
             CONSTRAINT chk_inference_invocation_settlement_debts_status
                 CHECK (terminal_status IN ('succeeded', 'failed', 'cancelled', 'delivery_unknown')),
             CONSTRAINT chk_inference_invocation_settlement_debts_usage_status
@@ -6330,96 +6131,6 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
-    // ─── Evaluation tables ───────────────────────────────────────────────────────
-
-    core_schema_create!(
-        pool,
-        "eval_gate_results",
-        "CREATE TABLE IF NOT EXISTS eval_gate_results (
-            gate_id         VARCHAR(36) PRIMARY KEY,
-            user_id         VARCHAR(128) NULL,
-            change_type     VARCHAR(64) NOT NULL,
-            change_id       VARCHAR(64) NOT NULL,
-            sessions_tested INT NOT NULL DEFAULT 0,
-            error_rate      DECIMAL(5,4),
-            score_delta     DECIMAL(5,4),
-            passed          SMALLINT NOT NULL DEFAULT 0,
-            created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_egr_user_created (user_id, created_at),
-            INDEX idx_egr_change (change_type, change_id),
-            INDEX idx_egr_passed (passed)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "eval_quality_assessments",
-        "CREATE TABLE IF NOT EXISTS eval_quality_assessments (
-            assessment_id VARCHAR(64) PRIMARY KEY,
-            user_id       VARCHAR(128) NULL,
-            target_id     VARCHAR(64) NOT NULL,
-            score         DECIMAL(5,4) NOT NULL,
-            step_count    INT NOT NULL DEFAULT 0,
-            level         VARCHAR(32) NOT NULL DEFAULT 'unknown',
-            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            INDEX idx_eqa_user_level_updated (user_id, level, updated_at),
-            INDEX idx_eqa_target (target_id),
-            INDEX idx_eqa_level (level),
-            INDEX idx_eqa_user_level_target (user_id, level, target_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "eval_calibration_assessments",
-        EVAL_CALIBRATION_ASSESSMENTS_CREATE_SQL
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(pool, "eval_training_datasets",
-        "CREATE TABLE IF NOT EXISTS eval_training_datasets (
-            dataset_id        VARCHAR(36) PRIMARY KEY,
-            user_id           VARCHAR(128) NOT NULL,
-            request_json      JSON NULL,
-            dataset_json      LONGTEXT NOT NULL,
-            sample_count      INT NOT NULL DEFAULT 0,
-            quality_threshold DECIMAL(5,4) NOT NULL DEFAULT 0.7000,
-            status            VARCHAR(32) NOT NULL DEFAULT 'ready',
-            created_at        DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at        DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-            INDEX idx_eval_training_datasets_user_created (user_id, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "eval_user_feedback",
-        "CREATE TABLE IF NOT EXISTS eval_user_feedback (
-            feedback_id   VARCHAR(36) PRIMARY KEY,
-            user_id       VARCHAR(128) NOT NULL,
-            agent_id      VARCHAR(255),
-            session_id    VARCHAR(36),
-            turn_id       VARCHAR(36),
-            feedback_type VARCHAR(64) NOT NULL,
-            rating        INT,
-            comment       TEXT,
-            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_euf_user (user_id),
-            INDEX idx_euf_agent_created (agent_id, created_at),
-            INDEX idx_euf_created (created_at),
-            INDEX idx_euf_owner_session_created (user_id, session_id, created_at),
-            INDEX idx_euf_type_created (feedback_type, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // ─── Team definitions ───────────────────────────────────────────────────────
 
     core_schema_create!(
@@ -6616,7 +6327,6 @@ async fn verify_core_schema_shape(
             "inference_invocation_settlement_debts",
             &[
                 "session_id",
-                "harness_run_id",
                 "provider_attempt_id",
                 "usage_status",
                 "provider_delivery_state",
@@ -7429,12 +7139,6 @@ async fn verify_core_schema_shape(
     ] {
         ensure_index_shape(&indexes, "harness_snapshots", index, expected_columns)?;
     }
-    ensure_index_shape(
-        &indexes,
-        "harness_runs",
-        "idx_harness_runs_owner_session_updated",
-        &["user_id", "session_id", "updated_at"],
-    )?;
     fail_if_varchar_columns_shorter_than(
         pool,
         database,
@@ -7499,7 +7203,6 @@ async fn verify_core_schema_shape(
             "scope_kind",
             "session_id",
             "run_id",
-            "harness_run_id",
             "turn_index",
             "round_index",
             "operation_id",
@@ -7519,20 +7222,10 @@ async fn verify_core_schema_shape(
         "idx_model_request_context_created_event",
         &["created_at", "event_id"],
     )?;
-    ensure_index_shape(
-        &indexes,
-        "model_request_context_events",
-        "idx_model_request_context_owner_harness_created",
-        &["user_id", "harness_run_id", "created_at", "event_id"],
-    )?;
     for (index, columns) in [
         (
             "idx_inference_settlement_owner_session_created",
             &["user_id", "session_id", "created_at", "invocation_id"][..],
-        ),
-        (
-            "idx_inference_settlement_owner_harness_created",
-            &["user_id", "harness_run_id", "created_at", "invocation_id"][..],
         ),
         (
             "idx_inference_settlement_recovery_ready",
@@ -7582,32 +7275,12 @@ async fn verify_core_schema_shape(
     verify_inference_canonical_transition_head_schema_contract(pool, database).await?;
     verify_inference_canonical_transition_wal_schema_contract(pool, database).await?;
     for (table, nullable_columns) in [
-        (
-            "inference_routes",
-            &["session_id", "run_id", "harness_run_id"][..],
-        ),
-        (
-            "inference_invocations",
-            &[
-                "session_id",
-                "run_id",
-                "harness_run_id",
-                "turn_index",
-                "round_index",
-            ][..],
-        ),
-        (
-            "inference_provider_attempts",
-            &["session_id", "run_id", "harness_run_id"][..],
-        ),
+        ("inference_routes", &["run_id"][..]),
+        ("inference_invocations", &["run_id"][..]),
+        ("inference_provider_attempts", &["run_id"][..]),
         (
             "inference_invocation_settlement_debts",
-            &[
-                "session_id",
-                "harness_run_id",
-                "provider_attempt_id",
-                "quarantine_reason",
-            ][..],
+            &["provider_attempt_id", "quarantine_reason"][..],
         ),
     ] {
         fail_if_required_columns_missing_or_not_nullable(pool, database, table, nullable_columns)
@@ -7988,25 +7661,6 @@ async fn verify_core_schema_shape(
         &["idx_si_scope_target", "idx_si_auto_activate"],
     )
     .await?;
-    fail_if_varchar_columns_shorter_than(
-        pool,
-        database,
-        "eval_calibration_assessments",
-        &[("user_id", USER_ID_MAX_LEN as u64)],
-    )
-    .await?;
-    ensure_index_shape(
-        &indexes,
-        "eval_calibration_assessments",
-        "PRIMARY",
-        &["user_id", "calibration_id"],
-    )?;
-    ensure_index_shape(
-        &indexes,
-        "eval_user_feedback",
-        "idx_euf_owner_session_created",
-        &["user_id", "session_id", "created_at"],
-    )?;
     Ok(())
 }
 

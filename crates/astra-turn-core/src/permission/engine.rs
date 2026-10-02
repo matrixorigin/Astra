@@ -476,6 +476,48 @@ pub fn evaluate_permission_with_provider_policy(
         "no deny rule matched",
     );
 
+    let provably_read_only = provider_policy.map_or_else(
+        || is_read_only_tool_with_args(tool_name, Some(args)),
+        |policy| policy.is_read_only(),
+    );
+    // Work lifecycle transitions are control-plane capabilities. Their
+    // durable state changes are validated by the Work executor, so they must
+    // remain usable in a read-only child even though they are not ordinary
+    // read tools. Keep this classification in the canonical runtime tool
+    // contract instead of extending a permission-name allowlist here.
+    let contract_read_only = provider_policy.is_none()
+        && astra_runtime_env::builtin_tool_is_read_only_execution_capability(tool_name);
+    let coordination_or_consultation = provider_policy.is_none()
+        && (is_internal_orchestration_control(tool_name, args)
+            || crate::tool::categories::classify(tool_name, Some(args)).category
+                == crate::tool::categories::ToolCategory::Consultative
+            || contract_read_only);
+    if ctx.inherited.read_only_execution
+        && (tool_name == "bash"
+            || tool_name == "lsp"
+            || (tool_name != "bash" && !provably_read_only && !coordination_or_consultation))
+    {
+        let reason = "read-only agent cannot execute a shell, LSP, or non-read-only tool";
+        let decision = HardDecision::Deny {
+            reason: reason.to_string(),
+        };
+        push_matched(
+            &mut trace,
+            EvaluationStep::SafetyMiddleware,
+            &decision,
+            reason,
+        );
+        return envelope(
+            decision,
+            DecisionSource::SafetyMiddleware {
+                reason: reason.to_string(),
+            },
+            trace,
+            will_save,
+            risk_tags,
+        );
+    }
+
     match evaluate_tool_safety_request(tool_name, args) {
         SafetyMiddlewareDecision::Allow => {
             push_skipped(
@@ -1548,9 +1590,13 @@ fn accept_edits_auto_allows(tool_name: &str, args: &Value) -> bool {
 
 fn is_internal_orchestration_control(tool_name: &str, args: &Value) -> bool {
     match tool_name {
+        "send_message" => true,
         "agent" => matches!(
             agent_action_from_args(args),
-            Ok(AgentAction::Spawn | AgentAction::GetResult | AgentAction::SendMessage)
+            Ok(AgentAction::Spawn
+                | AgentAction::GetResult
+                | AgentAction::Wait
+                | AgentAction::SendMessage)
         ),
         "agent_fanout" => matches!(
             agent_fanout_action_from_args(args),
@@ -3452,5 +3498,101 @@ mod tests {
                 DecisionSource::InternalOrchestration
             ));
         }
+    }
+
+    #[test]
+    fn read_only_child_ceiling_precedes_auto_mode_and_allow_rules() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Auto,
+                read_only_execution: true,
+                allow_rules: vec![crate::permission::types::PermissionRule::tool("bash")],
+                ..Default::default()
+            },
+        );
+
+        for command in [
+            "git checkout -q HEAD~1 && cargo test; git checkout -q main",
+            "git checkout HEAD~1",
+            "touch changed.txt",
+            "unknown-helper changed.txt",
+            "git show HEAD",
+            "git diff HEAD~1 HEAD",
+            "git status --short",
+            "test -v 'BASH_VERSINFO[$(touch ./marker)0]'",
+        ] {
+            let decision =
+                evaluate_permission("bash", &serde_json::json!({"command": command}), &ctx);
+            assert!(
+                matches!(decision.decision, HardDecision::Deny { .. }),
+                "{command}"
+            );
+        }
+        let coordination = evaluate_permission(
+            "agent",
+            &serde_json::json!({"action": "send_message", "agent_id": "child", "message": "status?"}),
+            &ctx,
+        );
+        assert!(matches!(coordination.decision, HardDecision::Allow));
+        for tool in ["start_work", "run_next_work_item", "settle_work_item"] {
+            let decision = evaluate_permission(tool, &serde_json::json!({}), &ctx);
+            assert!(
+                matches!(decision.decision, HardDecision::Allow),
+                "read-only Work lifecycle must remain executable: {tool}: {decision:?}"
+            );
+        }
+        let lsp = evaluate_permission(
+            "lsp",
+            &serde_json::json!({"operation": "rename", "dry_run": true}),
+            &ctx,
+        );
+        assert!(matches!(lsp.decision, HardDecision::Deny { .. }));
+        let script = evaluate_permission(
+            "run_script",
+            &serde_json::json!({"script": "open('changed.txt', 'w').write('x')"}),
+            &ctx,
+        );
+        assert!(matches!(script.decision, HardDecision::Deny { .. }));
+        for (tool, args) in [
+            ("read_file", serde_json::json!({"path": "README.md"})),
+            ("grep", serde_json::json!({"pattern": "agent", "path": "."})),
+            ("glob", serde_json::json!({"pattern": "**/*.rs"})),
+        ] {
+            let decision = evaluate_permission(tool, &args, &ctx);
+            assert!(
+                matches!(decision.decision, HardDecision::Allow),
+                "read-only child should retain typed {tool} access: {decision:?}"
+            );
+        }
+        let dynamic_read = provider_policy(
+            astra_turn_types::ResolvedToolEffect::ReadOnly,
+            true,
+            crate::provider_resolution::ProviderApprovalBaseline::NoAdditionalApproval,
+        );
+        assert!(matches!(
+            evaluate_permission_with_provider_policy(
+                "mcp__provider__read",
+                &serde_json::json!({}),
+                &ctx,
+                Some(&dynamic_read),
+            )
+            .decision,
+            HardDecision::Allow
+        ));
+        let disguised_write = provider_policy(
+            astra_turn_types::ResolvedToolEffect::Mutating,
+            false,
+            crate::provider_resolution::ProviderApprovalBaseline::NoAdditionalApproval,
+        );
+        assert!(matches!(
+            evaluate_permission_with_provider_policy(
+                "read_file",
+                &serde_json::json!({"path": "x"}),
+                &ctx,
+                Some(&disguised_write),
+            )
+            .decision,
+            HardDecision::Deny { .. }
+        ));
     }
 }

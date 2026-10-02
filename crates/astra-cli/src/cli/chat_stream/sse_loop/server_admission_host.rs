@@ -358,7 +358,8 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// Token suffix retained by the SSE host after interactive observation
     /// backpressure. It is delivered before the settled marker so the TUI can
     /// reconcile the complete answer in stream order.
-    pub deferred_token_projection: Option<String>,
+    pub deferred_token_projection:
+        Option<std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>>,
     /// Request-scoped live lane for every child run, including `delegate`
     /// coordination. This is distinct from parent stream events so
     /// child activity cannot delay parent completion.
@@ -755,7 +756,9 @@ async fn emit_final_output_ready(
     pending_ordered: &mut std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
     pending_explain_analyze_snapshot: &mut Option<crate::cli::chat_stream::StreamEvent>,
     pending_artifact_publication: &mut Option<astra_turn_types::ArtifactPublicationV1>,
-    deferred_token_projection: &mut Option<String>,
+    deferred_token_projection: &mut Option<
+        std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
+    >,
 ) -> (bool, bool) {
     let Some(tx) = stream_event_tx else {
         return (true, false);
@@ -821,22 +824,19 @@ async fn emit_final_output_ready(
             }
         }
     }
-    if let Some(text) = deferred_token_projection
+    let token_drain_deadline = tokio::time::Instant::now() + TERMINAL_STREAM_DRAIN_TIMEOUT;
+    while let Some(event) = deferred_token_projection
         .as_ref()
-        .filter(|text| !text.is_empty())
-        .cloned()
+        .and_then(|events| events.front().cloned())
     {
-        match tokio::time::timeout(
-            TERMINAL_STREAM_DRAIN_TIMEOUT,
-            tx.send(crate::cli::chat_stream::StreamEvent::Token(text)),
-        )
-        .await
-        {
+        match tokio::time::timeout_at(token_drain_deadline, tx.send(event)).await {
             Ok(Ok(())) => {
                 // Clear the suffix only after the receiver accepted it. If a
                 // prior ordered event or this send fails, the caller transfers
                 // the still-owned suffix to the bounded reconciliation lane.
-                *deferred_token_projection = None;
+                if let Some(events) = deferred_token_projection.as_mut() {
+                    events.pop_front();
+                }
             }
             Ok(Err(error)) => {
                 tracing::debug!(%error, "deferred token projection receiver closed during terminal drain");
@@ -848,6 +848,7 @@ async fn emit_final_output_ready(
             }
         }
     }
+    *deferred_token_projection = None;
     let retry = crate::cli::chat_stream::StreamEvent::AssistantOutputSettled;
     match tokio::time::timeout(TERMINAL_STREAM_DRAIN_TIMEOUT, tx.send(retry)).await {
         Ok(Ok(())) => (true, explain_snapshot_delivered),
@@ -871,7 +872,9 @@ async fn reconcile_terminal_stream_projection(
     mut pending_ordered: std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
     pending_explain_analyze_snapshot: Option<crate::cli::chat_stream::StreamEvent>,
     pending_artifact_publication: Option<astra_turn_types::ArtifactPublicationV1>,
-    deferred_token_projection: Option<String>,
+    deferred_token_projection: Option<
+        std::collections::VecDeque<crate::cli::chat_stream::StreamEvent>,
+    >,
     warning: Option<String>,
 ) -> (bool, bool) {
     let deadline = tokio::time::Instant::now() + TERMINAL_STREAM_RECONCILIATION_TIMEOUT;
@@ -925,10 +928,10 @@ async fn reconcile_terminal_stream_projection(
     {
         return (false, explain_snapshot_delivered);
     }
-    if let Some(text) = deferred_token_projection.filter(|text| !text.is_empty())
-        && !send(crate::cli::chat_stream::StreamEvent::Token(text)).await
-    {
-        return (false, explain_snapshot_delivered);
+    for event in deferred_token_projection.into_iter().flatten() {
+        if !send(event).await {
+            return (false, explain_snapshot_delivered);
+        }
     }
     (
         send(crate::cli::chat_stream::StreamEvent::AssistantOutputSettled).await,
@@ -997,6 +1000,13 @@ fn append_permission_mode_change_audit(
 
 #[async_trait]
 impl AgenticLoopHost for CliServerAdmissionHost<'_> {
+    fn parent_model_reasoning_snapshot(
+        &self,
+        _state: &AgenticLoopState,
+    ) -> Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning> {
+        self.executor.parent_model_reasoning_snapshot()
+    }
+
     fn is_pre_admission_rejection(&self) -> bool {
         is_pre_admission_rejection(
             self.last_error_code.as_deref(),
@@ -1011,6 +1021,25 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         } else {
             ContinuationAuthority::Runtime
         }
+    }
+
+    fn direct_child_completion_owner(
+        &self,
+        _state: &AgenticLoopState,
+    ) -> Option<Arc<astra_runtime::orchestration::FanoutParentAdmission>> {
+        Some(Arc::clone(
+            &self.executor.spawn_context.as_ref()?.fanout_admission,
+        ))
+    }
+
+    fn execution_time_budget_remaining(&self) -> Option<Duration> {
+        Some(
+            self.executor
+                .spawn_context
+                .as_ref()?
+                .execution_deadline?
+                .remaining(),
+        )
     }
 
     fn injects_round_guidance(&self) -> bool {
@@ -1178,6 +1207,9 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             state.skills.execution.sandbox_policy.clone(),
             self.perm_manager.mode(),
         );
+        if let Some(context) = self.executor.spawn_context.as_ref() {
+            state.messaging.reply_obligations = Arc::clone(&context.reply_obligations);
+        }
         let send_message_context = state
             .messaging
             .mailbox
@@ -1190,6 +1222,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                         .clone()
                         .unwrap_or_else(|| mailbox.address.run_id.clone()),
                     router: mailbox.router(),
+                    reply_obligations: Arc::clone(&state.messaging.reply_obligations),
                 },
             )
             .or_else(|| self.root_send_message_context.clone())
@@ -1197,6 +1230,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                 if let Some(run_id) = state.current_run_id.clone() {
                     context.run_id = run_id;
                 }
+                context.reply_obligations = Arc::clone(&state.messaging.reply_obligations);
                 context
             });
         self.executor.set_send_message_context(send_message_context);
@@ -1900,6 +1934,13 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             return Vec::new();
         };
 
+        let mut agent_ids = agent_ids.to_vec();
+        for child in spawn_context.fanout_admission.pending_direct_children() {
+            if !child.status.is_terminal() && !agent_ids.contains(&child.agent_id) {
+                agent_ids.push(child.agent_id);
+            }
+        }
+
         // A tool receipt is not the lifecycle owner. Fanout may be admitted
         // before its result commits, so the known-id list can be empty when
         // the parent is interrupted. Cancel and fence the producer run tree
@@ -1912,7 +1953,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         }
 
         let mut cancelled = Vec::new();
-        for agent_id in agent_ids {
+        for agent_id in &agent_ids {
             let transfer = match origin {
                 astra_runtime::orchestration::CancellationOrigin::User => {
                     astra_runtime::orchestration::CancellationTransferOutcome::NotFound
@@ -1979,7 +2020,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         );
     }
 
-    fn render_final_text(&mut self, text: &str) {
+    fn render_final_text(&mut self, text: &str, _model_item_id: Option<&str>) {
         if self.render_policy.suppress_final_text() {
             return;
         }
@@ -2179,7 +2220,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         let provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
         let raw_provider = provider.raw_provider_name().to_owned();
         let capture_thinking =
-            astra_turn_core::thinking_config::resolve_model_thinking(model_selector).1;
+            astra_turn_core::thinking_config::resolve_model_thinking_request(model_selector).1;
         // Canonical prefix bytes: JSON-serialize the messages as-is.
         // This is the format `fork_reconstruct::reconstruct_messages`
         // expects on the consuming end. System prompts and tool
@@ -2396,26 +2437,6 @@ mod tests {
         incomplete.tool_ledger_receipt.result_classes = Default::default();
         incomplete.tool_ledger_receipt.digest = incomplete.tool_ledger_receipt.canonical_digest();
         assert!(server_terminal_requires_unverified(Some(&incomplete)));
-    }
-
-    #[test]
-    fn mixed_workspace_claim_frame_with_physical_run_is_not_pre_admission() {
-        let metadata = json!({"admission_state": "rejected"});
-        assert!(is_pre_admission_rejection(
-            Some("execution_workspace_claimed"),
-            Some(&metadata),
-            None,
-        ));
-        assert!(!is_pre_admission_rejection(
-            Some("execution_workspace_claimed"),
-            Some(&metadata),
-            Some("run-admitted"),
-        ));
-        assert!(is_pre_admission_rejection(
-            Some("conversation_authority_fenced"),
-            Some(&metadata),
-            None,
-        ));
     }
 
     #[test]
@@ -2815,8 +2836,10 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         tx.try_send(StreamEvent::StatusLine("already buffered".into()))
             .expect("queue fixture");
-        let mut pending =
-            std::collections::VecDeque::from([StreamEvent::Token("terminal suffix".into())]);
+        let mut pending = std::collections::VecDeque::from([StreamEvent::Token {
+            model_item_id: None,
+            text: "terminal suffix".into(),
+        }]);
         let mut pending_publication = None;
         let mut deferred = None;
 
@@ -2837,7 +2860,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert!(matches!(
             pending.front(),
-            Some(StreamEvent::Token(text)) if text == "terminal suffix"
+            Some(StreamEvent::Token { text, .. }) if text == "terminal suffix"
         ));
     }
 
@@ -2862,7 +2885,10 @@ mod tests {
         };
         let mut pending = std::collections::VecDeque::new();
         let mut pending_publication = Some(publication);
-        let mut deferred = Some("answer suffix".to_string());
+        let mut deferred = Some(std::collections::VecDeque::from([StreamEvent::Token {
+            model_item_id: Some("retained-response".into()),
+            text: "answer suffix".into(),
+        }]));
 
         let (delivered, _) = tokio::time::timeout(
             std::time::Duration::from_millis(1_500),
@@ -2880,7 +2906,11 @@ mod tests {
         assert!(!delivered);
         assert!(pending.is_empty());
         assert!(pending_publication.is_some());
-        assert_eq!(deferred.as_deref(), Some("answer suffix"));
+        assert!(
+            matches!(deferred.as_ref().and_then(|events| events.front()),
+            Some(StreamEvent::Token { model_item_id: Some(id), text })
+                if id == "retained-response" && text == "answer suffix")
+        );
     }
 
     #[tokio::test]
@@ -2909,7 +2939,10 @@ mod tests {
             pending,
             Some(snapshot),
             Some(publication.clone()),
-            Some("answer suffix".into()),
+            Some(std::collections::VecDeque::from([StreamEvent::Token {
+                model_item_id: None,
+                text: "answer suffix".into(),
+            }])),
             Some("display warning".into()),
         )
         .await;
@@ -2933,7 +2966,7 @@ mod tests {
         ));
         assert!(matches!(
             rx.recv().await,
-            Some(StreamEvent::Token(text)) if text == "answer suffix"
+            Some(StreamEvent::Token { text, .. }) if text == "answer suffix"
         ));
         assert!(matches!(
             rx.recv().await,
@@ -3034,7 +3067,10 @@ mod tests {
             pending,
             Some(snapshot),
             Some(publication.clone()),
-            Some("answer suffix".into()),
+            Some(std::collections::VecDeque::from([StreamEvent::Token {
+                model_item_id: None,
+                text: "answer suffix".into(),
+            }])),
             Some("display warning".into()),
         ));
 
@@ -3074,7 +3110,7 @@ mod tests {
                     {
                         publication_seen = true;
                     }
-                    TuiAppEvent::Token(text) if text == "answer suffix" => {
+                    TuiAppEvent::Token { text, .. } if text == "answer suffix" => {
                         answer_seen = true;
                     }
                     TuiAppEvent::AssistantOutputSettled => settled_seen = true,

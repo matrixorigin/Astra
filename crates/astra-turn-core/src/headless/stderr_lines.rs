@@ -4,7 +4,6 @@
 fn friendly_tool_name(tool_name: &str) -> &str {
     match tool_name {
         "read_file" => "Reading",
-        "run_build_test" => "Running build/test",
         "powershell" => "PowerShell",
         "rollback_database_snapshots" | "rollback_file_edits" => "Reverting",
         "rollback_session_state" => "Reverting session state",

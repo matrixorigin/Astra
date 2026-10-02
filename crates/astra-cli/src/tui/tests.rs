@@ -343,11 +343,17 @@ mod stream_bridge_tests {
 
         // Send two tokens then drop the sender (simulates turn end)
         stream_tx
-            .send(StreamEvent::Token("hello ".to_string()))
+            .send(StreamEvent::Token {
+                model_item_id: None,
+                text: "hello ".to_string(),
+            })
             .await
             .unwrap();
         stream_tx
-            .send(StreamEvent::Token("world".to_string()))
+            .send(StreamEvent::Token {
+                model_item_id: None,
+                text: "world".to_string(),
+            })
             .await
             .unwrap();
         drop(stream_tx);
@@ -360,7 +366,7 @@ mod stream_bridge_tests {
         let mut stream_closed = false;
         while let Some(evt) = tui_rx.recv().await {
             match evt {
-                TuiAppEvent::Token(text) => {
+                TuiAppEvent::Token { text, .. } => {
                     token_batches += 1;
                     token_text.push_str(&text);
                 }

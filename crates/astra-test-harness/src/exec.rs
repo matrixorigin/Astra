@@ -275,6 +275,7 @@ struct MachineEventObservation {
     event_count: u64,
     invalid: Option<String>,
     explain: crate::explain_capture::ExplainCapture,
+    stream: Option<crate::runner::StreamCapture>,
 }
 
 impl MachineEventObservation {
@@ -295,6 +296,9 @@ impl MachineEventObservation {
         };
         self.event_count = self.event_count.saturating_add(1);
         self.explain.observe(&value);
+        if let Some(stream) = &mut self.stream {
+            stream.observe(&value, self.event_count);
+        }
         let observed = match event_type {
             "session_bound" => session_id_from_stream_event(line).map(|id| (true, id)),
             "run_bound" => run_id_from_stream_event(line).map(|id| (false, id)),
@@ -662,6 +666,7 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
                 interruption_kind: None,
                 error_kind: None,
                 explain_capture: None,
+                stream_capture: None,
                 tool_result_class_counts: std::collections::BTreeMap::new(),
                 tool_calls_count: 0,
                 tools_used: vec![],
@@ -669,6 +674,7 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
                 prompt_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_tokens: 0,
+                token_usage_coverage: None,
                 duration_ms: start.elapsed().as_millis() as u64,
                 turn_rounds: 0,
                 cache_hits: 0,
@@ -681,7 +687,10 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     let child_group_id = child.id();
     let stdout = child.stdout.take().expect("piped stdout is present");
     let stderr = child.stderr.take().expect("piped stderr is present");
-    let machine_observation = Arc::new(Mutex::new(MachineEventObservation::default()));
+    let machine_observation = Arc::new(Mutex::new(MachineEventObservation {
+        stream: cfg.artifacts_dir.as_ref().map(|_| Default::default()),
+        ..Default::default()
+    }));
     let machine_observer_done = tokio_util::sync::CancellationToken::new();
     let mut machine_event_reader = tokio::spawn(observe_machine_event_file(
         stream_event_path,
@@ -949,7 +958,7 @@ fn retain_machine_capture(
     observation: &Arc<Mutex<MachineEventObservation>>,
 ) {
     let mut capture = crate::explain_capture::ExplainCapture::default();
-    if let Ok(observed) = observation.lock() {
+    if let Ok(mut observed) = observation.lock() {
         capture = observed.explain.clone();
         if observed.invalid.is_some() {
             capture.diagnose("invalid_machine_stream");
@@ -962,6 +971,22 @@ fn retain_machine_capture(
         } else {
             None
         });
+        if let Some(mut stream) = observed.stream.take() {
+            stream.session_id = observed.session_id.clone();
+            stream.root_run_id = observed.run_id.clone();
+            stream.identity_verified =
+                observed.invalid.is_none() && binding_matches && observed.run_id.is_some();
+            if observed.invalid.is_some() {
+                stream.diagnose("invalid_machine_stream");
+            }
+            if !stream.identity_verified {
+                stream.diagnose("unverified_run_scope");
+            }
+            if outcome.exit_code != 0 || outcome.final_state.as_deref() != Some("completed") {
+                stream.diagnose("execution_incomplete");
+            }
+            outcome.stream_capture = Some(stream);
+        }
     } else {
         capture.diagnose("capture_reader_unavailable");
     }
@@ -1255,6 +1280,7 @@ pub(crate) mod test_support {
                     prompt_tokens: 0,
                     cached_input_tokens: 0,
                     cache_creation_tokens: 0,
+                    token_usage_coverage: None,
                     duration_ms: 0,
                     turn_rounds: 0,
                     cache_hits: 0,
@@ -1264,6 +1290,7 @@ pub(crate) mod test_support {
                     interruption_kind: None,
                     error_kind: None,
                     explain_capture: None,
+                    stream_capture: None,
                     tool_result_class_counts: std::collections::BTreeMap::new(),
                 })
         }
@@ -1305,6 +1332,10 @@ mod tests {
             r#"{"type":"run_bound","run_id":"8a0dcb50-38a7-4402-bef3-2c1aee9a4e85"}"#,
         );
         assert!(observation.invalid.is_none());
+        assert!(
+            observation.stream.is_none(),
+            "raw capture requires artifact opt-in"
+        );
         assert_eq!(
             observation.session_id.as_deref(),
             Some("550e8400-e29b-41d4-a716-446655440000")
@@ -1322,14 +1353,27 @@ mod tests {
 
     #[test]
     fn incomplete_execution_retains_explain_facts_without_certifying_identity() {
-        let mut observed = MachineEventObservation::default();
+        let mut observed = MachineEventObservation {
+            stream: Some(Default::default()),
+            ..Default::default()
+        };
         observed.observe_line(r#"{"type":"explain_analyze","schema_version":1,"event_id":"e","run_id":"foreign","turn_id":"t","node_id":"n","producer_id":"p","clock_domain_id":"c","kind":"admission","label":"Admission","transition":"started","elapsed_ms":0}"#);
+        observed.observe_line(r#"{"type":"agent_live","event":{"run_id":"child","agent_id":"agent","kind":{"type":"output_delta","model_item_id":null,"text":"partial\n"}}}"#);
         observed.observe_line("corrupt trailing evidence");
         let mut outcome = RunOutcome {
             exit_code: 124,
             ..Default::default()
         };
         retain_machine_capture(&mut outcome, &Arc::new(Mutex::new(observed)));
+        let stream = outcome.stream_capture.unwrap();
+        assert_eq!(stream.records.len(), 1);
+        assert!(!stream.identity_verified);
+        assert!(
+            stream
+                .diagnostics
+                .contains(&"invalid_machine_stream".into())
+        );
+        assert!(stream.diagnostics.contains(&"execution_incomplete".into()));
         let capture = outcome.explain_capture.unwrap();
         assert_eq!(capture.events.len(), 1);
         assert!(!capture.identity_verified);
@@ -1339,6 +1383,49 @@ mod tests {
                 .contains(&"invalid_machine_stream".into())
         );
         assert!(capture.diagnostics.contains(&"execution_incomplete".into()));
+    }
+
+    #[test]
+    fn stream_capture_bounds_and_gaps_do_not_invalidate_explain() {
+        use crate::runner::{MAX_STREAM_CAPTURE_BYTES, MAX_STREAM_CAPTURE_RECORDS, StreamCapture};
+
+        let mut observed = MachineEventObservation {
+            stream: Some(Default::default()),
+            ..Default::default()
+        };
+        observed.explain.observe(&serde_json::json!({
+            "type":"explain_analyze_snapshot", "delivery_degraded":false,
+            "events":[{"schema_version":1,"event_id":"e","run_id":"r","turn_id":"t",
+                "node_id":"n","producer_id":"p","clock_domain_id":"c",
+                "kind":"admission","label":"Admission","transition":"started","elapsed_ms":0}]
+        }));
+        observed.explain.bind(Some("r"));
+        let mut wire = serde_json::json!({"type":"agent_live","event":{
+            "run_id":"child","agent_id":"agent","kind":{
+                "type":"output_delta","model_item_id":"item","text":"界".repeat(MAX_STREAM_CAPTURE_BYTES / 6)
+            }
+        }});
+        for _ in 0..3 {
+            observed.observe_line(&wire.to_string());
+        }
+        observed.observe_line(r#"{"type":"agent_live","event":{}}"#);
+        observed.observe_line(r#"{"type":"agent_live_gap","gap":{"run_id":"child","agent_id":"agent","dropped_event_count":1}}"#);
+        let stream = observed.stream.unwrap();
+        assert!(stream.diagnostics.contains(&"capture_truncated".into()));
+        assert!(stream.diagnostics.contains(&"invalid_agent_live".into()));
+        assert!(stream.diagnostics.contains(&"agent_live_gap".into()));
+        assert!(serde_json::to_vec(&stream).unwrap().len() <= MAX_STREAM_CAPTURE_BYTES);
+        assert!(observed.invalid.is_none());
+        assert!(observed.explain.canonical_graph().is_some());
+
+        wire["event"]["kind"]["text"] = serde_json::json!("x");
+        let mut stream = StreamCapture::default();
+        for index in 0..=MAX_STREAM_CAPTURE_RECORDS {
+            stream.observe(&wire, index as u64);
+        }
+        assert_eq!(stream.records.len(), MAX_STREAM_CAPTURE_RECORDS);
+        assert!(stream.diagnostics.contains(&"capture_truncated".into()));
+        assert!(serde_json::to_vec(&stream).unwrap().len() <= MAX_STREAM_CAPTURE_BYTES);
     }
 
     #[tokio::test]
@@ -1395,22 +1482,89 @@ mod tests {
     async fn machine_event_file_observer_reads_dedicated_jsonl_before_shutdown() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        let observation = Arc::new(Mutex::new(MachineEventObservation::default()));
+        let observation = Arc::new(Mutex::new(MachineEventObservation {
+            stream: Some(Default::default()),
+            ..Default::default()
+        }));
         let done = tokio_util::sync::CancellationToken::new();
         let mut reader = tokio::spawn(observe_machine_event_file(
             path.clone(),
             Arc::clone(&observation),
             done.clone(),
         ));
-        tokio::fs::write(
-            path,
-            concat!(
+        let mut events = concat!(
                 "{\"type\":\"session_bound\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\"}\n",
                 "{\"type\":\"run_bound\",\"run_id\":\"8a0dcb50-38a7-4402-bef3-2c1aee9a4e85\"}\n",
+            ).to_string();
+        for (run_id, kind) in [
+            (
+                "child-a",
+                serde_json::json!({"type":"signal","signal":"run_started",
+                "parent_run_id":"8a0dcb50-38a7-4402-bef3-2c1aee9a4e85","depth":1,
+                "spawn_tool_call_id":"spawn-a","transcript_location":"durable_server"}),
             ),
-        )
-        .await
-        .unwrap();
+            (
+                "child-a",
+                serde_json::json!({"type":"output_delta","model_item_id":"item-a","text":"4"}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"thinking_delta","model_item_id":null,"text":"excluded-secret"}),
+            ),
+            (
+                "child-b",
+                serde_json::json!({"type":"signal","signal":"run_started",
+                "parent_run_id":"child-a","depth":2,"spawn_tool_call_id":"spawn-b",
+                "transcript_location":"local_journal"}),
+            ),
+            (
+                "child-b",
+                serde_json::json!({"type":"output_delta","model_item_id":"item-b","text":"other"}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"output_delta","model_item_id":"item-a","text":"4"}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"output_delta","model_item_id":"item-c","text":"2\n"}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"status","text":"excluded-secret"}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"tool_completed","name":"read_file",
+                "description":"excluded-secret","status":"completed","duration_ms":0,
+                "output_summary":null,"output":"excluded-secret","tool_use_id":"tool"}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"signal","signal":"ask_user_prompted",
+                "request_id":"ask","prompt":{"text":"excluded-secret"}}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"signal","signal":"transcript_committed",
+                "model_item_id":null,"source_event_id":"response:child-a:turn-1",
+                "transcript_location":"durable_server"}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"agent_terminated","termination":"completed",
+                "duration_ms":3,"reason":null}),
+            ),
+        ] {
+            events.push_str(
+                &serde_json::json!({"type":"agent_live","event":{
+                    "run_id":run_id,"agent_id":"shared-agent","kind":kind
+                }})
+                .to_string(),
+            );
+            events.push('\n');
+        }
+        tokio::fs::write(path, events).await.unwrap();
 
         let (session_id, run_id) = finish_machine_event_observer(done, &mut reader, &observation)
             .await
@@ -1424,6 +1578,53 @@ mod tests {
             run_id.as_deref(),
             Some("8a0dcb50-38a7-4402-bef3-2c1aee9a4e85")
         );
+        let mut outcome = RunOutcome::new("m")
+            .with_session_id(session_id.unwrap())
+            .with_final_state("completed");
+        outcome.run_id = run_id;
+        retain_machine_capture(&mut outcome, &observation);
+        directory.close().unwrap();
+        let stream = outcome.stream_capture.as_ref().unwrap();
+        assert!(stream.identity_verified);
+        assert!(stream.diagnostics.is_empty());
+        let records = serde_json::to_value(&stream.records).unwrap();
+        assert_eq!(stream.records.len(), 8);
+        assert_eq!(records[2]["event"]["kind"]["parent_run_id"], "child-a");
+        assert_eq!(records[3]["event"]["run_id"], "child-b");
+        assert_eq!(
+            records[1]["event"]["kind"]["text"],
+            records[4]["event"]["kind"]["text"]
+        );
+        assert_eq!(records[5]["event"]["kind"]["model_item_id"], "item-c");
+        assert_eq!(records[5]["event"]["kind"]["text"], "2\n");
+        assert_eq!(
+            records[6]["event"]["kind"]["source_event_id"],
+            "response:child-a:turn-1"
+        );
+        assert!(records[6]["event"]["kind"]["model_item_id"].is_null());
+        assert_eq!(records[7]["event"]["kind"]["termination"], "completed");
+        assert!(
+            !serde_json::to_string(stream)
+                .unwrap()
+                .contains("excluded-secret")
+        );
+        assert!(
+            serde_json::to_value(&outcome)
+                .unwrap()
+                .get("stream_capture")
+                .is_none()
+        );
+        let mut mismatched = outcome.clone();
+        mismatched.run_id = Some("foreign".into());
+        observation.lock().unwrap().stream = outcome.stream_capture.clone();
+        retain_machine_capture(&mut mismatched, &observation);
+        let stream = mismatched.stream_capture.unwrap();
+        assert!(!stream.identity_verified);
+        assert_eq!(
+            stream.root_run_id.as_deref(),
+            Some("8a0dcb50-38a7-4402-bef3-2c1aee9a4e85")
+        );
+        assert_eq!(stream.records.len(), 8);
     }
 
     #[tokio::test]
@@ -1817,12 +2018,15 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
                 "printf '%s\\n' '{\"type\":\"run_bound\",\"run_id\":\"550e8400-e29b-41d4-a716-446655440001\"}' >> \"$events\"\n",
                 r#"printf '%s\n' '{"type":"explain_analyze","schema_version":1,"event_id":"e","run_id":"550e8400-e29b-41d4-a716-446655440001","turn_id":"t","node_id":"n","producer_id":"p","clock_domain_id":"c","kind":"admission","label":"Admission","transition":"started","elapsed_ms":0}' >> "$events""#,
                 "\n",
+                r#"printf '%s\n' '{"type":"agent_live","event":{"run_id":"child","agent_id":"agent","kind":{"type":"output_delta","model_item_id":"item","text":"partial"}}}' >> "$events""#,
+                "\n",
                 "sleep 10\n",
             ),
         )
         .expect("write shim");
 
-        let cfg = RunnerConfig::new(shim.clone());
+        let mut cfg = RunnerConfig::new(shim.clone());
+        cfg.artifacts_dir = Some(tmp.path().join("artifacts"));
         let exec = AstraCliExecutor::new(cfg);
         let case = Case {
             name: "timeout_probe".into(),
@@ -1866,6 +2070,13 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             "timeout didn't kill subprocess — elapsed {}s",
             elapsed.as_secs()
         );
+        let stream = outcome
+            .stream_capture
+            .as_ref()
+            .expect("timeout retains child evidence");
+        assert_eq!(stream.records.len(), 1);
+        assert!(stream.identity_verified);
+        assert!(stream.diagnostics.contains(&"execution_incomplete".into()));
         // Synthetic outcome: POSIX 124 + explanatory text. This is
         // the contract downstream report rendering + reproducer
         // hinting rely on.
@@ -1924,6 +2135,8 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
                 "done\n",
                 "printf '%s\\n' '{\"type\":\"session_bound\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\"}' > \"$events\"\n",
                 "printf '%s\\n' '{\"type\":\"run_bound\",\"run_id\":\"550e8400-e29b-41d4-a716-446655440001\"}' >> \"$events\"\n",
+                r#"printf '%s\n' '{"type":"agent_live","event":{"run_id":"child","agent_id":"agent","kind":{"type":"output_delta","model_item_id":"item","text":"partial"}}}' >> "$events""#,
+                "\n",
                 "touch \"$HARNESS_READY_PATH\"\n",
                 "sleep 10\n",
             ),
@@ -1933,6 +2146,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut cfg = RunnerConfig::new(shim);
         cfg.cancel_flag = Some(flag.clone());
+        cfg.artifacts_dir = Some(tmp.path().join("artifacts"));
         let exec = AstraCliExecutor::new(cfg);
         let mut case = simple_case();
         case.timeout_seconds = 15;
@@ -1964,6 +2178,13 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             Some("550e8400-e29b-41d4-a716-446655440001")
         );
         assert!(outcome.text.contains("observed session cancelled"));
+        let stream = outcome
+            .stream_capture
+            .as_ref()
+            .expect("cancel retains stream evidence");
+        assert_eq!(stream.records.len(), 1);
+        assert!(stream.identity_verified);
+        assert!(stream.diagnostics.contains(&"execution_incomplete".into()));
     }
 
     #[tokio::test]
@@ -2131,6 +2352,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             prompt_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_tokens: 0,
+            token_usage_coverage: None,
             duration_ms: 0,
             turn_rounds: 0,
             cache_hits: 0,
@@ -2140,6 +2362,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             interruption_kind: None,
             error_kind: None,
             explain_capture: None,
+            stream_capture: None,
             tool_result_class_counts: std::collections::BTreeMap::new(),
         };
         seed.exit_code = 0;

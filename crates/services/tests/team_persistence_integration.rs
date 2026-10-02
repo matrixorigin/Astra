@@ -91,7 +91,12 @@ async fn team_crud_roundtrip() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
     let store = MatrixOneTeamStore::new(pool.clone());
-    let team = test_team("crud", TeamCoordination::Pipeline);
+    let team = test_team(
+        "crud",
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
+    );
     cleanup_team(&pool, &team.team_id).await;
 
     // Save
@@ -108,7 +113,12 @@ async fn team_crud_roundtrip() {
     assert_eq!(loaded.members[0].role, "coder");
     assert_eq!(loaded.members[1].agent_id, Some("custom-tester".into()));
     assert_eq!(loaded.worktree_mode, WorktreeMode::Isolated);
-    assert_eq!(loaded.coordination, TeamCoordination::Pipeline);
+    assert_eq!(
+        loaded.coordination,
+        TeamCoordination::Sequential {
+            stop_on_success: false
+        }
+    );
     assert!(loaded.budget.is_none());
     assert_eq!(loaded.max_parallel, 0);
 
@@ -149,14 +159,24 @@ async fn save_team_rejects_primary_key_collision_with_different_logical_team() {
     let pool = shared.get().clone();
     let store = MatrixOneTeamStore::new(pool.clone());
 
-    let original = test_team("pk-conflict-a", TeamCoordination::Pipeline);
+    let original = test_team(
+        "pk-conflict-a",
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
+    );
     cleanup_team(&pool, &original.team_id).await;
     store
         .save_team(&original)
         .await
         .expect("save original team");
 
-    let mut conflicting = test_team("pk-conflict-b", TeamCoordination::Pipeline);
+    let mut conflicting = test_team(
+        "pk-conflict-b",
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
+    );
     conflicting.team_id = original.team_id.clone();
 
     let err = store
@@ -292,12 +312,10 @@ async fn coordination_variants_roundtrip() {
     let store = MatrixOneTeamStore::new(pool.clone());
 
     let variants = [
-        ("pipeline", TeamCoordination::Pipeline),
         (
-            "adversarial",
-            TeamCoordination::Adversarial {
-                max_rounds: 5,
-                threshold: 0.9,
+            "ordered",
+            TeamCoordination::Sequential {
+                stop_on_success: false,
             },
         ),
         (
@@ -343,7 +361,12 @@ async fn budget_and_max_parallel_roundtrip() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
     let store = MatrixOneTeamStore::new(pool.clone());
-    let mut team = test_team("budget-rt", TeamCoordination::Pipeline);
+    let mut team = test_team(
+        "budget-rt",
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
+    );
     team.budget = Some(TeamBudget {
         max_cost_usd: 12.5,
         max_tokens: 500_000,
@@ -391,7 +414,12 @@ async fn load_team_rejects_corrupt_context_json_on_live_matrixone() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
     let store = MatrixOneTeamStore::new(pool.clone());
-    let team = test_team("badctx", TeamCoordination::Pipeline);
+    let team = test_team(
+        "badctx",
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
+    );
     cleanup_team(&pool, &team.team_id).await;
 
     store.save_team(&team).await.expect("save_team");
@@ -420,7 +448,12 @@ async fn record_execution_complete_rejects_invalid_result_json_on_live_matrixone
     let shared = setup_pool().await;
     let pool = shared.get().clone();
     let store = MatrixOneTeamStore::new(pool.clone());
-    let team = test_team("bad-result", TeamCoordination::Pipeline);
+    let team = test_team(
+        "bad-result",
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
+    );
     cleanup_team(&pool, &team.team_id).await;
 
     store.save_team(&team).await.expect("save_team");
@@ -536,7 +569,12 @@ async fn ensure_builtins_preserves_existing_owner_customization() {
     let pool = shared.get().clone();
     let store = MatrixOneTeamStore::new(pool.clone());
     let user_id = format!("it-builtins-custom-{}", Uuid::new_v4());
-    let mut customized = test_team("builtin-custom", TeamCoordination::Pipeline);
+    let mut customized = test_team(
+        "builtin-custom",
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
+    );
     customized.user_id = user_id.clone();
     customized.name = "review".to_string();
     customized.description = "owner-defined review workflow".to_string();

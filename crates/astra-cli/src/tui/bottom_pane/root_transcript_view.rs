@@ -212,6 +212,7 @@ impl RootTranscriptView {
         }
         self.next_before_seq = page.next_before_seq;
         self.has_more = page.has_more;
+        self.reconcile_local_live();
         self.loading = false;
         self.error = None;
         self.transcript
@@ -237,6 +238,28 @@ impl RootTranscriptView {
             self.request_terminal_refresh();
         } else if self.export_pending {
             self.continue_export();
+        }
+    }
+
+    fn reconcile_local_live(&mut self) {
+        if self.local_live.as_ref().is_some_and(|live| {
+            live.item.model_identity().is_some_and(|(id, kind)| {
+                self.items.iter().any(|item| {
+                    item.model_item_id.as_deref() == Some(id)
+                        && item.role == "assistant"
+                        && match kind {
+                            super::transcript_view::TranscriptItemKind::Assistant => {
+                                !item.content.is_empty()
+                            }
+                            super::transcript_view::TranscriptItemKind::Reasoning => {
+                                item.reasoning.as_ref().is_some_and(|text| !text.is_empty())
+                            }
+                            _ => false,
+                        }
+                })
+            })
+        }) {
+            self.local_live = None;
         }
     }
 
@@ -368,6 +391,7 @@ impl RootTranscriptView {
             }
             (None, Some(_)) | (None, None) => return,
         };
+        self.reconcile_local_live();
         // Server and local runners attempt canonical transcript persistence
         // before their root turn settles. This typed view action fetches that
         // page asynchronously; if it fails, the visibly labelled local suffix
@@ -595,6 +619,7 @@ mod tests {
         astra_thin_client::SessionTranscriptPage {
             session_id: "session-1".into(),
             items: vec![astra_thin_client::SessionTranscriptItem {
+                model_item_id: None,
                 session_id: "session-1".into(),
                 item_seq: 10,
                 run_id: Some("root-run-1".into()),
@@ -789,6 +814,44 @@ mod tests {
                 ..
             }) if session_id == "session-1"
         ));
+    }
+
+    #[test]
+    fn canonical_model_identity_reconciles_live_output_in_either_delivery_order() {
+        for page_first in [false, true] {
+            for id in [None, Some("A"), Some("B")] {
+                let mut view = RootTranscriptView::loading("session-1".into(), 80, 24);
+                let mut canonical = page();
+                canonical.items[0].model_item_id = Some("A".into());
+                let mut cell = crate::tui::history_cell::assistant::AssistantCell::new_streaming();
+                cell.model_item_id = id.map(str::to_owned);
+                cell.push_delta("durable root answer");
+                let live = TranscriptItem::committed(
+                    TranscriptItemId::from_widget_id(44),
+                    std::sync::Arc::new(cell),
+                    1,
+                );
+                if !page_first {
+                    view.refresh_root_transcript_live(Some(live.clone()));
+                }
+                view.refresh_root_transcript(RootTranscriptUpdate::Loaded {
+                    session_id: "session-1".into(),
+                    page: canonical,
+                    replace: true,
+                    source: RootTranscriptSource::DurableServer,
+                });
+                view.refresh_root_transcript_live(Some(live));
+                let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+                let mut buffer = ratatui::buffer::Buffer::empty(area);
+                view.render(area, &mut buffer);
+                let text = crate::tui::testing::render::buffer_to_string(&buffer);
+                assert_eq!(
+                    text.matches("durable root answer").count(),
+                    if id == Some("A") { 1 } else { 2 },
+                    "{text}"
+                );
+            }
+        }
     }
 
     #[test]

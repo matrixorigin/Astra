@@ -3237,8 +3237,11 @@ fn build_provider_request_body_with_cache_capability(
     request_body_overrides: Option<&Map<String, Value>>,
     cache_capability: Option<CacheCapability>,
 ) -> Value {
-    let sanitized_overrides =
-        sanitize_request_body_overrides_for_thinking(thinking, request_body_overrides);
+    let sanitized_overrides = sanitize_request_body_overrides_for_generation(
+        thinking,
+        max_output_tokens,
+        request_body_overrides,
+    );
     // Project runtime roles once for the final provider protocol.
     let projected_messages;
     let needs_role_projection = messages
@@ -3450,39 +3453,9 @@ fn build_provider_request_body_with_cache_capability(
                 body["stream_options"] = json!({"include_usage": true});
             }
             if let Some(max_out) = max_output_tokens {
-                // When thinking is active, providers like DeepSeek allocate a
-                // thinking_budget that must be LESS than the output token limit.
-                // If max_out is too small, the request will 400. Bump to at
-                // least thinking_budget + a headroom for the visible answer.
-                //
-                // We honor the user's configured ceiling when it already exceeds
-                // the required floor (respects deliberate budget caps) and only
-                // bump when the configured value is demonstrably too low.
-                let effective_max = if !thinking.is_off() {
-                    let required_floor: usize = match thinking {
-                        ThinkingConfig::Enabled { budget_tokens } => {
-                            (*budget_tokens as usize).saturating_add(8192)
-                        }
-                        _ => 65536,
-                    };
-                    if max_out < required_floor {
-                        tracing::debug!(
-                            user_max = max_out,
-                            bumped_to = required_floor,
-                            "output token limit bumped to fit thinking budget"
-                        );
-                        required_floor
-                    } else {
-                        max_out
-                    }
-                } else {
-                    max_out
-                };
-                astra_core::model_wire::apply_chat_output_token_limit(
-                    &mut body,
-                    provider,
-                    effective_max,
-                );
+                // Output policy is resolved and validated before serialization.
+                // Adapters must never enlarge an admitted ceiling.
+                astra_core::model_wire::apply_chat_output_token_limit(&mut body, provider, max_out);
             }
             if let Some(temp) = temperature {
                 body["temperature"] = json!(temp);
@@ -3499,32 +3472,7 @@ fn build_provider_request_body_with_cache_capability(
                 body["tools"] = Value::Array(wire_tools);
                 body["tool_choice"] = Value::String("auto".to_string());
             }
-            if provider_uses_dashscope_thinking(provider) {
-                // DashScope/Qwen uses a binary `enable_thinking` flag; there is no
-                // equivalent of `reasoning_effort`.
-                match thinking {
-                    ThinkingConfig::Off => {
-                        // Native thinkers (Qwen3, Qwen3.5) think by default.
-                        // Explicitly suppress to avoid wasting tokens on reasoning
-                        // when the caller requested Off.
-                        body["enable_thinking"] = json!(false);
-                    }
-                    ThinkingConfig::Enabled { .. } => {
-                        body["enable_thinking"] = json!(true);
-                    }
-                    ThinkingConfig::Adaptive { effort } => {
-                        tracing::warn!(
-                            provider,
-                            effort = ?effort,
-                            "DashScope/Qwen does not support `reasoning_effort`; \
-                             Adaptive mode mapped to `enable_thinking: true` — effort level ignored"
-                        );
-                        body["enable_thinking"] = json!(true);
-                    }
-                }
-            } else {
-                thinking.apply_openai(&mut body);
-            }
+            thinking.apply_openai(&mut body);
             apply_request_body_overrides(&mut body, sanitized_overrides.as_deref());
             reconcile_authoritative_temperature(
                 &mut body,
@@ -3737,17 +3685,30 @@ fn reconcile_authoritative_temperature(
     }
 }
 
-fn sanitize_request_body_overrides_for_thinking<'a>(
+fn sanitize_request_body_overrides_for_generation<'a>(
     thinking: &ThinkingConfig,
+    max_output_tokens: Option<usize>,
     request_body_overrides: Option<&'a Map<String, Value>>,
 ) -> Option<Cow<'a, Map<String, Value>>> {
     let overrides = request_body_overrides?;
-    if !thinking.is_off() {
+    if matches!(thinking, ThinkingConfig::ModelDefault) && max_output_tokens.is_none() {
         return Some(Cow::Borrowed(overrides));
     }
     let mut sanitized = overrides.clone();
-    for path in THINKING_OVERRIDE_STRIP_PATHS {
-        strip_override_path(&mut sanitized, path);
+    if !matches!(thinking, ThinkingConfig::ModelDefault) {
+        for path in THINKING_OVERRIDE_STRIP_PATHS {
+            strip_override_path(&mut sanitized, path);
+        }
+    }
+    if max_output_tokens.is_some() {
+        for path in [
+            &["max_tokens"][..],
+            &["max_completion_tokens"][..],
+            &["max_output_tokens"][..],
+            &["inferenceConfig", "maxTokens"][..],
+        ] {
+            strip_override_path(&mut sanitized, path);
+        }
     }
     if sanitized.is_empty() {
         None
@@ -3777,6 +3738,9 @@ fn strip_override_path(target: &mut Map<String, Value>, path: &[&str]) {
         return;
     }
     let Some(Value::Object(child)) = target.get_mut(*head) else {
+        // Replacing an owned field's ancestor with a scalar would erase the
+        // admitted control just as surely as replacing the field itself.
+        target.remove(*head);
         return;
     };
     strip_override_path(child, tail);
@@ -3889,6 +3853,7 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
             object.remove(astra_turn_types::APPEND_ONLY_RUNTIME_AUTHORITY_POLICY_FIELD);
             object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
             object.remove(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD);
+            object.remove(astra_turn_types::MODEL_ITEM_ID_FIELD);
             object.remove("_compact_boundary");
             // These fields are compaction/checkpoint bookkeeping. They are
             // useful in runtime history, but are not part of the provider
@@ -15324,6 +15289,23 @@ mod tests {
     }
 
     #[test]
+    fn model_item_projection_identity_never_changes_provider_wire_or_cache_input() {
+        for provider in ["openai", "anthropic", "google"] {
+            let first =
+                json!({"role": "assistant", "content": "same answer", "model_item_id": "A"});
+            let second =
+                json!({"role": "assistant", "content": "same answer", "model_item_id": "B"});
+            let a = consolidate_system_messages_for_provider(&[first], provider, None);
+            let b = consolidate_system_messages_for_provider(&[second], provider, None);
+            assert_eq!(a, b);
+            assert!(
+                a.iter()
+                    .all(|message| message.get(astra_turn_types::MODEL_ITEM_ID_FIELD).is_none())
+            );
+        }
+    }
+
+    #[test]
     fn provider_projection_strips_runtime_ownership_and_boundary_metadata() {
         let mut runtime = astra_turn_types::runtime_owned_message(
             "user",
@@ -18090,53 +18072,6 @@ mod tests {
         assert_eq!(body["messages"][1]["reasoning_content"], "");
     }
 
-    /// Qwen models served through the *DashScope* provider use `enable_thinking`.
-    /// The provider name (not model name) is the discriminator — the same Qwen model
-    /// served through a generic vLLM/Ollama proxy with provider="openai" must NOT
-    /// receive `enable_thinking` because those proxies reject unknown top-level fields.
-    #[test]
-    fn build_dashscope_qwen_body_with_thinking_enabled() {
-        let messages = vec![json!({"role": "user", "content": "hello"})];
-        let body = build_provider_request_body(
-            &messages,
-            &[],
-            "qwen3.6-plus",
-            "dashscope",
-            Some(4096),
-            Some(0.7),
-            true,
-            &ThinkingConfig::Enabled {
-                budget_tokens: 10_000,
-            },
-        );
-
-        assert_eq!(body["model"], "qwen3.6-plus");
-        assert_eq!(body["enable_thinking"], true);
-        assert!(body.get("reasoning_effort").is_none());
-        assert_eq!(body["temperature"], 0.7);
-    }
-
-    /// ThinkingConfig::Off must explicitly suppress thinking for DashScope
-    /// native thinkers (Qwen3, Qwen3.5) — otherwise they think by default.
-    #[test]
-    fn build_dashscope_body_with_thinking_off_suppresses() {
-        let messages = vec![json!({"role": "user", "content": "hello"})];
-        let body = build_provider_request_body(
-            &messages,
-            &[],
-            "qwen3.5-flash",
-            "dashscope",
-            Some(200),
-            Some(0.0),
-            false,
-            &ThinkingConfig::Off,
-        );
-
-        assert_eq!(body["model"], "qwen3.5-flash");
-        assert_eq!(body["enable_thinking"], false);
-        assert!(body.get("reasoning_effort").is_none());
-    }
-
     /// Same Qwen model through a generic OpenAI-compatible proxy must NOT get
     /// `enable_thinking` — the proxy does not know about that field and may 400.
     #[test]
@@ -18440,24 +18375,34 @@ mod tests {
             assert!(body.get("enable_thinking").is_none());
         }
 
-        // ── Row: DashScope/Qwen + Thinking::Enabled ──
-        // Qwen uses a binary `enable_thinking` flag, not budget/effort.
+        // Binary thinking is emitted only by the admitted protocol, after overrides.
         #[test]
-        fn dashscope_thinking_enabled_sends_binary_flag() {
+        fn admitted_binary_thinking_preserves_exact_control_after_overrides() {
             let messages = vec![user("hi")];
-            let body = build_provider_request_body(
-                &messages,
-                &[],
-                "qwen3-max",
-                "dashscope",
-                Some(4096),
-                Some(0.7),
-                true,
-                &ThinkingConfig::Enabled {
-                    budget_tokens: 1024,
-                },
-            );
-            assert_eq!(body["enable_thinking"], true);
+            for thinking in [ThinkingConfig::On {}, ThinkingConfig::Off] {
+                let mut body = build_provider_request_body(
+                    &messages,
+                    &[],
+                    "qwen3-max",
+                    "dashscope",
+                    Some(4096),
+                    Some(0.7),
+                    true,
+                    &thinking,
+                );
+                body["reasoning_effort"] = json!("high");
+                body["enable_thinking"] = json!(!thinking.is_enabled());
+                apply_admitted_openai_protocol(
+                    &mut body,
+                    astra_core::model_wire::thinking::ThinkingProtocol::EnableThinking,
+                    &thinking,
+                    Some(0.7),
+                    None,
+                );
+                assert_eq!(body["enable_thinking"], thinking.is_enabled());
+                assert!(body.get("reasoning_effort").is_none());
+                assert_eq!(body["temperature"], 0.7);
+            }
         }
     }
 
@@ -18749,95 +18694,34 @@ mod tests {
             ),
         ] {
             for streaming in [false, true] {
-                let body = build_provider_request_body(
-                    &[json!({"role": "user", "content": "hi"})],
-                    &[],
-                    model,
-                    provider,
-                    Some(4096),
-                    None,
-                    streaming,
-                    &ThinkingConfig::Off,
-                );
-                assert_eq!(
-                    body[limit], 4096,
-                    "{provider}, streaming={streaming}: {body}"
-                );
-                assert!(body.get(forbidden).is_none(), "{provider}: {body}");
+                for thinking in [
+                    ThinkingConfig::Off,
+                    ThinkingConfig::ModelDefault,
+                    ThinkingConfig::Enabled {
+                        budget_tokens: 1024,
+                    },
+                    ThinkingConfig::Adaptive {
+                        effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+                    },
+                ] {
+                    let body = build_provider_request_body(
+                        &[json!({"role": "user", "content": "hi"})],
+                        &[],
+                        model,
+                        provider,
+                        Some(4096),
+                        None,
+                        streaming,
+                        &thinking,
+                    );
+                    assert_eq!(
+                        body[limit], 4096,
+                        "{provider}, streaming={streaming}: {body}"
+                    );
+                    assert!(body.get(forbidden).is_none(), "{provider}: {body}");
+                }
             }
         }
-    }
-
-    // --- Regression: output-limit bump respects user's ceiling ---
-    #[test]
-    fn deepseek_max_tokens_honors_user_when_above_floor() {
-        use astra_turn_core::thinking_config::ThinkingConfig;
-        // User sets 128K, thinking budget is 32K → floor = 40K → must keep 128K.
-        let thinking = ThinkingConfig::Enabled {
-            budget_tokens: 32_000,
-        };
-        let body = build_provider_request_body(
-            &[json!({"role": "user", "content": "hi"})],
-            &[],
-            "deepseek-chat",
-            "deepseek",
-            Some(128_000),
-            None,
-            false,
-            &thinking,
-        );
-        assert_eq!(
-            body["max_tokens"].as_u64(),
-            Some(128_000),
-            "user ceiling above floor must not be bumped"
-        );
-        assert!(body.get("max_completion_tokens").is_none());
-    }
-
-    #[test]
-    fn deepseek_max_tokens_bumps_when_user_below_floor() {
-        use astra_turn_core::thinking_config::ThinkingConfig;
-        // User sets 8K, thinking budget is 32K → floor = 32K + 8K = 40K → bump to 40K.
-        let thinking = ThinkingConfig::Enabled {
-            budget_tokens: 32_000,
-        };
-        let body = build_provider_request_body(
-            &[json!({"role": "user", "content": "hi"})],
-            &[],
-            "deepseek-chat",
-            "deepseek",
-            Some(8_000),
-            None,
-            false,
-            &thinking,
-        );
-        assert_eq!(
-            body["max_tokens"].as_u64(),
-            Some(40_192),
-            "configured max below thinking_budget+headroom must be bumped to floor"
-        );
-        assert!(body.get("max_completion_tokens").is_none());
-    }
-
-    #[test]
-    fn deepseek_max_tokens_unchanged_when_thinking_off() {
-        use astra_turn_core::thinking_config::ThinkingConfig;
-        let body = build_provider_request_body(
-            &[json!({"role": "user", "content": "hi"})],
-            &[],
-            "deepseek-chat",
-            "deepseek",
-            Some(4_096),
-            None,
-            false,
-            &ThinkingConfig::Off,
-        );
-        assert_eq!(
-            body["max_tokens"].as_u64(),
-            Some(4_096),
-            "thinking=off must never bump user's max"
-        );
-        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]
@@ -19309,12 +19193,94 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_request_body_overrides_borrows_when_thinking_not_off() {
-        let overrides = Map::from_iter([("reasoningMode".to_string(), json!("compact"))]);
-        let sanitized = sanitize_request_body_overrides_for_thinking(
+    fn route_overrides_cannot_change_admitted_generation_controls() {
+        use astra_turn_core::thinking_config::ThinkingEffort;
+        for (provider, thinking, mut overrides, limit_path, thinking_path, expected) in [
+            (
+                "anthropic",
+                ThinkingConfig::Enabled {
+                    budget_tokens: 2048,
+                },
+                json!({"max_tokens":65536,"thinking":{"type":"enabled","budget_tokens":1024}}),
+                "/max_tokens",
+                "/thinking/budget_tokens",
+                json!(2048),
+            ),
+            (
+                "bedrock",
+                ThinkingConfig::Enabled {
+                    budget_tokens: 2048,
+                },
+                json!({"inferenceConfig":{"maxTokens":65536},"additionalModelRequestFields":{"thinking":{"type":"disabled"}}}),
+                "/inferenceConfig/maxTokens",
+                "/additionalModelRequestFields/thinking/budget_tokens",
+                json!(2048),
+            ),
+            (
+                "deepseek",
+                ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::High,
+                },
+                json!({"max_tokens":65536,"max_completion_tokens":65536,"reasoning_effort":"low"}),
+                "/max_tokens",
+                "/reasoning_effort",
+                json!("high"),
+            ),
+        ] {
+            overrides["custom_option"] = json!("retained");
+            for streaming in [false, true] {
+                let body = build_provider_request_body_with_overrides(
+                    &[json!({"role":"user","content":"inspect"})],
+                    &[],
+                    "model",
+                    provider,
+                    Some(4096),
+                    None,
+                    streaming,
+                    &thinking,
+                    overrides.as_object(),
+                );
+                assert_eq!(
+                    body.pointer(limit_path),
+                    Some(&json!(4096)),
+                    "{provider}: {body}"
+                );
+                assert_eq!(
+                    body.pointer(thinking_path),
+                    Some(&expected),
+                    "{provider}: {body}"
+                );
+                assert_eq!(body["custom_option"], "retained");
+            }
+        }
+        let overrides =
+            json!({"inferenceConfig":"invalid","additionalModelRequestFields":"invalid"});
+        let body = build_provider_request_body_with_overrides(
+            &[json!({"role":"user","content":"inspect"})],
+            &[],
+            "model",
+            "bedrock",
+            Some(4096),
+            None,
+            false,
             &ThinkingConfig::Enabled {
-                budget_tokens: 1024,
+                budget_tokens: 2048,
             },
+            overrides.as_object(),
+        );
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 4096);
+        assert_eq!(
+            body["additionalModelRequestFields"]["thinking"]["budget_tokens"],
+            2048
+        );
+    }
+
+    #[test]
+    fn sanitize_request_body_overrides_borrows_for_unconstrained_defaults() {
+        let overrides = Map::from_iter([("reasoningMode".to_string(), json!("compact"))]);
+        let sanitized = sanitize_request_body_overrides_for_generation(
+            &ThinkingConfig::ModelDefault,
+            None,
             Some(&overrides),
         );
         match sanitized {

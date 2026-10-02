@@ -1,8 +1,7 @@
 use super::encryption::FernetTokenEncryptor;
 use super::jwt::decode_jwt_claims;
 use crate::admin::{
-    AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer,
-    AdminFeedbackStatsFilter, AdminFeedbackStatsReader, AdminFeedbackStatsRecord, AdminInitRecord,
+    AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer, AdminInitRecord,
     AdminInitializer, AdminTokenCreateRequestData, AdminTokenFilter, AdminTokenReader,
     AdminTokenRecord, AdminTokenWriter, AdminUserRoleManager, AdminUserRoleRecord,
     AdminUserRoleRequestData, AuthenticatedUser,
@@ -37,15 +36,6 @@ fn required_admin_string(
         });
     }
     Ok(value)
-}
-
-fn required_admin_string_response(
-    row: &sqlx::mysql::MySqlRow,
-    table: &'static str,
-    column: &'static str,
-) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    required_admin_string(row, table, column)
-        .map_err(|err| internal_error(format!("invalid {table}.{column}: {err}")))
 }
 
 #[derive(Clone, Debug)]
@@ -265,33 +255,6 @@ impl DatabaseAdminAuditReader {
         crate::require_shared_pool(
             self.pool.as_ref(),
             "DatabaseAdminAuditReader",
-            &self.matrixone,
-        )
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct DatabaseAdminFeedbackStatsReader {
-    matrixone: MatrixOneSettings,
-    pool: Option<SharedPool>,
-}
-
-impl DatabaseAdminFeedbackStatsReader {
-    pub fn new(matrixone: MatrixOneSettings) -> Self {
-        Self {
-            matrixone,
-            pool: None,
-        }
-    }
-    pub fn with_pool(mut self, pool: SharedPool) -> Self {
-        self.pool = Some(pool);
-        self
-    }
-
-    async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        crate::require_shared_pool(
-            self.pool.as_ref(),
-            "DatabaseAdminFeedbackStatsReader",
             &self.matrixone,
         )
     }
@@ -591,87 +554,6 @@ impl AdminAuditReader for DatabaseAdminAuditReader {
 }
 
 #[async_trait]
-impl AdminFeedbackStatsReader for DatabaseAdminFeedbackStatsReader {
-    async fn read_feedback_stats(
-        &self,
-        filter: AdminFeedbackStatsFilter,
-    ) -> Result<AdminFeedbackStatsRecord, (StatusCode, Json<ErrorResponse>)> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-
-        let mut summary_query = QueryBuilder::<MySql>::new(
-            "SELECT COUNT(feedback_id) AS total_feedback, \
-             CAST(COALESCE(SUM(IF(rating >= 4, 1, 0)), 0) AS SIGNED) AS positive_feedback, \
-             CAST(COALESCE(SUM(IF(rating <= 2, 1, 0)), 0) AS SIGNED) AS negative_feedback, \
-             AVG(rating) AS avg_rating \
-             FROM eval_user_feedback",
-        );
-        let mut type_query = QueryBuilder::<MySql>::new(
-            "SELECT feedback_type, COUNT(feedback_id) AS type_count \
-             FROM eval_user_feedback WHERE feedback_type IS NOT NULL",
-        );
-
-        let has_summary_where = filter.agent_id.is_some();
-        if let Some(agent_id) = filter.agent_id {
-            summary_query.push(" WHERE agent_id = ");
-            summary_query.push_bind(agent_id.clone());
-
-            type_query.push(" AND agent_id = ");
-            type_query.push_bind(agent_id);
-        }
-        if let Some(since) = filter.since {
-            summary_query.push(if has_summary_where {
-                " AND created_at >= "
-            } else {
-                " WHERE created_at >= "
-            });
-            summary_query.push_bind(since.clone());
-            type_query.push(" AND created_at >= ");
-            type_query.push_bind(since);
-        }
-
-        type_query.push(" GROUP BY feedback_type");
-
-        let summary_row = summary_query
-            .build()
-            .fetch_one(&pool)
-            .await
-            .map_err(internal_error)?;
-        let type_rows = type_query
-            .build()
-            .fetch_all(&pool)
-            .await
-            .map_err(internal_error)?;
-
-        let mut feedback_by_type = serde_json::Map::new();
-        for row in type_rows {
-            let feedback_type =
-                required_admin_string_response(&row, "eval_user_feedback", "feedback_type")?;
-            let count: i64 = row.try_get("type_count").map_err(internal_error)?;
-            feedback_by_type.insert(feedback_type, serde_json::Value::from(count));
-        }
-
-        let total_feedback: i64 = summary_row
-            .try_get("total_feedback")
-            .map_err(internal_error)?;
-        let positive_feedback: Option<i64> = summary_row
-            .try_get("positive_feedback")
-            .map_err(internal_error)?;
-        let negative_feedback: Option<i64> = summary_row
-            .try_get("negative_feedback")
-            .map_err(internal_error)?;
-        let avg_rating: Option<f64> = summary_row.try_get("avg_rating").map_err(internal_error)?;
-
-        Ok(AdminFeedbackStatsRecord {
-            total_feedback,
-            positive_feedback: positive_feedback.unwrap_or(0),
-            negative_feedback: negative_feedback.unwrap_or(0),
-            avg_rating,
-            feedback_by_type,
-        })
-    }
-}
-
-#[async_trait]
 impl AdminInitializer for DatabaseAdminInitializer {
     async fn initialize(&self) -> Result<AdminInitRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
@@ -890,22 +772,6 @@ impl AdminAuditReader for UnconfiguredAdminAuditReader {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Admin audit reader not configured",
-        ))
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct UnconfiguredAdminFeedbackStatsReader;
-
-#[async_trait]
-impl AdminFeedbackStatsReader for UnconfiguredAdminFeedbackStatsReader {
-    async fn read_feedback_stats(
-        &self,
-        _filter: AdminFeedbackStatsFilter,
-    ) -> Result<AdminFeedbackStatsRecord, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "Admin feedback stats reader not configured",
         ))
     }
 }

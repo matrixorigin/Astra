@@ -4,6 +4,7 @@ pub mod conflict_resolver;
 #[cfg(feature = "server")]
 pub mod edge_connection_pool;
 pub mod edge_ws_protocol;
+mod model_admission;
 pub mod session_run_tree;
 #[cfg(feature = "server")]
 pub mod team_orchestrator_traits;
@@ -24,11 +25,11 @@ use astra_services::auth::{
 use astra_services::auth::{SessionActivityCursor, SessionActivityRecord, SessionListCursor};
 #[cfg(feature = "server")]
 use astra_services::{
-    AdminAuditRecord, AdminFeedbackStatsRecord, AdminInitRecord, AdminTokenRecord,
-    AdminUserRoleRecord, AuthTokenRecord, AuthUserRecord, CancelRunRecord, ChatRequestData,
-    ChatRunRecord, RunContinuationRecord, RunListCursor, RunListRecord, RunMutationDisposition,
-    RunMutationRecord, RunStatusRecord, SessionArtifactListCursor, SessionListRecord,
-    SessionRecord, run_list_cursor_db_updated_at, run_list_cursor_run_id,
+    AdminAuditRecord, AdminInitRecord, AdminTokenRecord, AdminUserRoleRecord, AuthTokenRecord,
+    AuthUserRecord, CancelRunRecord, ChatRequestData, ChatRunRecord, RunContinuationRecord,
+    RunListCursor, RunListRecord, RunMutationDisposition, RunMutationRecord, RunStatusRecord,
+    SessionArtifactListCursor, SessionListRecord, SessionRecord, run_list_cursor_db_updated_at,
+    run_list_cursor_run_id,
 };
 #[cfg(feature = "server")]
 use astra_tools::AskUserPrompt;
@@ -43,6 +44,10 @@ pub use completions::{
 pub use edge_ws_protocol::{
     EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EDGE_TOOL_RESULT_GRACE_SECS,
     EDGE_TOOL_TIMEOUT_SECS, EdgeClientMessage, EdgeServerMessage, MAX_EDGE_TOOL_TIMEOUT_SECS,
+};
+pub use model_admission::{
+    ModelAdmissionReasoningInheritanceV1, ModelAdmissionRequestV1, ModelAdmissionResponseV1,
+    ModelAdmissionResultV1, ModelAdmissionSlotV1,
 };
 pub use session_run_tree::{
     SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunLifecycleStatus, SessionRunNode,
@@ -1353,6 +1358,14 @@ pub struct ChatRequest {
     pub agent_id: Option<String>,
     #[serde(default)]
     pub model_selection: Option<astra_turn_types::ModelSelection>,
+    /// Original model behavior requested by the caller, kept separate from
+    /// the exact Offering identity used for Server admission.
+    #[serde(default)]
+    pub requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
+    /// Expected resolved name from preflighted CLI sub-runs. Used only to
+    /// reject identity drift after fresh server-side admission.
+    #[serde(default)]
+    pub expected_model_name: Option<String>,
     #[serde(default)]
     pub resolved_model_selection: Option<astra_services::runs::ResolvedModelSelection>,
     #[serde(default)]
@@ -1733,8 +1746,8 @@ pub struct CancelSessionResponse {
     pub execution_settled: bool,
     pub runs: Vec<CancelRunResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_blocker:
-        Option<astra_services::session_context_coordinator::WorkspaceReuseBlocker>,
+    pub execution_blocker:
+        Option<astra_services::session_context_coordinator::SessionExecutionBlocker>,
 }
 
 #[cfg(feature = "server")]
@@ -1932,13 +1945,6 @@ pub struct FeedbackExportResponse {
 
 #[cfg(feature = "server")]
 #[derive(Deserialize)]
-pub struct AdminFeedbackStatsQuery {
-    pub agent_id: Option<String>,
-    pub since: Option<String>,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
 pub struct AdminAuditListQuery {
     pub user_id: Option<String>,
     pub since: Option<String>,
@@ -1967,16 +1973,6 @@ pub struct AdminAuditResponse {
     pub resource_id: Option<String>,
     pub timestamp: String,
     pub details: Option<serde_json::Value>,
-}
-
-#[cfg(feature = "server")]
-#[derive(Serialize, PartialEq)]
-pub struct AdminFeedbackStatsResponse {
-    pub total_feedback: i64,
-    pub positive_feedback: i64,
-    pub negative_feedback: i64,
-    pub avg_rating: Option<f64>,
-    pub feedback_by_type: serde_json::Map<String, serde_json::Value>,
 }
 
 #[cfg(feature = "server")]
@@ -2330,19 +2326,6 @@ impl From<AdminAuditRecord> for AdminAuditResponse {
 }
 
 #[cfg(feature = "server")]
-impl From<AdminFeedbackStatsRecord> for AdminFeedbackStatsResponse {
-    fn from(value: AdminFeedbackStatsRecord) -> Self {
-        Self {
-            total_feedback: value.total_feedback,
-            positive_feedback: value.positive_feedback,
-            negative_feedback: value.negative_feedback,
-            avg_rating: value.avg_rating,
-            feedback_by_type: value.feedback_by_type,
-        }
-    }
-}
-
-#[cfg(feature = "server")]
 impl From<AdminInitRecord> for AdminInitResponse {
     fn from(value: AdminInitRecord) -> Self {
         Self {
@@ -2559,6 +2542,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
             .map(|ea| ea.id.clone())
     });
     ChatRequestData {
+        model_catalog_reader: None,
         message: request.message,
         user_intent: request.user_intent,
         parts: request.parts,
@@ -2572,8 +2556,10 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         full_llm_capture: false,
         agent_id: request.agent_id,
         model: None,
+        expected_model_name: request.expected_model_name,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: request.model_selection,
+        requested_model_policy: request.requested_model_policy,
         resolved_model_selection: request.resolved_model_selection,
         admitted_model_execution: None,
         capability_descriptors: request.capability_descriptors,

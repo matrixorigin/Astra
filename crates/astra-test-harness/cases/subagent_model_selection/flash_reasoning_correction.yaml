@@ -1,0 +1,69 @@
+name: flash_reasoning_correction
+description: |
+  A later user correction must supersede the earlier reasoning setting for
+  the same child, without an extra judge or a lexical correction table.
+prompt: |
+  请让一个子代理用 high 思考完成一个只返回标记的任务。
+  等等，改成 medium 思考，再让它开始。子代理只能回答
+  REASONING-CORRECTION-OK，不要调用任何工具；完成后告诉我结果。
+  本用例不指定模型，子代理应继承当前模型；父代理调用 agent 时不要填写
+  requested_model_policy。
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: deepseek-v4-flash
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/thinking/effort
+      equals: medium
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
+    json_match:
+      path: /metadata/model_configuration/thinking/effort
+      equals: high
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    json_match:
+      path: /payload/model
+      equals: deepseek-v4-flash
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: grep
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: read_file
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0
+  - type: journal_tool_outcome_count
+    name: agent
+    ok: false
+    min: 0
+    max: 0
+  - type: text_contains
+    needle: REASONING-CORRECTION-OK

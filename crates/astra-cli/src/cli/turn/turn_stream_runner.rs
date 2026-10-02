@@ -140,7 +140,7 @@ fn build_turn_stream_params<'a>(
         semantic_query_override: input.semantic_query_override,
         session_id: Some(input.session_id),
         explain_analyze_terminal_degraded: input.explain_analyze_terminal_degraded,
-        offering_id: crate::cli::slash::slash_config::active_offering_id_for_request(),
+        offering_id: crate::cli::session::session_runtime::active_offering_id_for_request(),
         model: astra_core::model_override::normalize_model_override(state.model.as_deref()),
         provider: None,
         explain: state.explain,

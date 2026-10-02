@@ -20,7 +20,6 @@ pub mod session_tool_contract;
 pub mod web_fetch;
 pub mod web_search;
 
-pub mod bash_cache_safety;
 pub mod build_test;
 pub mod credential_redaction;
 // run_script is the programmatic tool-calling / code execution RPC bridge.
@@ -323,6 +322,11 @@ impl ToolResult {
 /// failure. Keep the envelope in the shared tools crate so CLI, edge, and
 /// server-local executors cannot drift into different plain-text contracts.
 pub const TOOL_ERROR_KIND_CANCELLED: &str = "cancelled";
+pub const TOOL_ERROR_KIND_WORKSPACE_UNAVAILABLE: &str = "workspace_unavailable";
+pub const TOOL_ERROR_KIND_WORKSPACE_OWNERSHIP_UNSETTLED: &str = "workspace_ownership_unsettled";
+pub const TOOL_ERROR_KIND_WORKSPACE_BINDING_UNAVAILABLE: &str = "workspace_binding_unavailable";
+pub const TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED: &str = "workspace_effect_unsettled";
+pub const TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNDECLARED: &str = "workspace_effect_undeclared";
 
 pub fn cancelled_tool_result(name: &str, execution_started: bool) -> ToolResult {
     let message = if execution_started {
@@ -358,6 +362,146 @@ pub fn cancelled_tool_result(name: &str, execution_started: bool) -> ToolResult 
         is_error: true,
         exit_semantics: Some(exit_semantics::ExitSemantics::ExecutionError),
     }
+}
+
+/// A workspace lease admission failure is a fact about scheduling, not a
+/// failed tool invocation.  Keep it structured so the invocation ledger can
+/// record “not executed, retryable” without every transport inventing its own
+/// prose-only variant.
+pub fn workspace_lease_unavailable_tool_result(name: &str) -> ToolResult {
+    workspace_lease_result(
+        TOOL_ERROR_KIND_WORKSPACE_UNAVAILABLE,
+        format!(
+            "Tool '{name}' was not executed because its workspace is temporarily unavailable; retry after the active workspace operation finishes"
+        ),
+        true,
+    )
+}
+
+/// Preserve the reason for a failed workspace admission. Contention is safe
+/// to retry; an unsettled owner or a missing binding is not. This keeps the
+/// model-facing contract typed without making every lease caller duplicate
+/// the classification logic.
+pub fn workspace_lease_unavailable_tool_result_for_workspace(
+    name: &str,
+    workspace_root: &Path,
+) -> ToolResult {
+    match workspace_observation::classify_workspace_lease_failure(workspace_root) {
+        workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled => workspace_lease_result(
+            TOOL_ERROR_KIND_WORKSPACE_OWNERSHIP_UNSETTLED,
+            format!(
+                "Tool '{name}' was not executed because a previous workspace owner did not settle; inspect or re-bind the workspace before continuing, and do not replay the call"
+            ),
+            false,
+        ),
+        workspace_observation::WorkspaceLeaseFailure::BindingUnavailable => workspace_lease_result(
+            TOOL_ERROR_KIND_WORKSPACE_BINDING_UNAVAILABLE,
+            format!(
+                "Tool '{name}' was not executed because its workspace binding is unavailable; repair or re-bind the workspace before continuing"
+            ),
+            false,
+        ),
+        workspace_observation::WorkspaceLeaseFailure::Contended => {
+            workspace_lease_unavailable_tool_result(name)
+        }
+    }
+}
+
+fn workspace_lease_result(error_kind: &str, message: String, retryable: bool) -> ToolResult {
+    ToolResult {
+        output: json!({
+            "status": "rejected",
+            "error_kind": error_kind,
+            "error": &message,
+            "execution_started": false,
+            "disposition": "rejected",
+            "execution_fact": "not_executed",
+            "retryable": retryable,
+        })
+        .to_string(),
+        metadata: Some(Map::from_iter([
+            (
+                "error_kind".to_string(),
+                Value::String(error_kind.to_string()),
+            ),
+            ("execution_started".to_string(), Value::Bool(false)),
+            (
+                "disposition".to_string(),
+                Value::String("rejected".to_string()),
+            ),
+            (
+                "execution_fact".to_string(),
+                Value::String("not_executed".to_string()),
+            ),
+            ("retryable".to_string(), Value::Bool(retryable)),
+        ])),
+        is_error: true,
+        exit_semantics: Some(exit_semantics::ExitSemantics::ExecutionError),
+    }
+}
+
+pub fn mcp_workspace_effect_undeclared_tool_result(name: &str) -> ToolResult {
+    let message = format!(
+        "MCP tool '{name}' was not executed because its workspace effect was not declared; the provider must declare readOnlyHint=true or return the workspace settlement contract"
+    );
+    ToolResult {
+        output: json!({
+            "status": "rejected",
+            "error_kind": TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNDECLARED,
+            "error": message,
+            "execution_started": false,
+            "disposition": "rejected",
+            "execution_fact": "not_executed",
+            "retryable": false,
+        })
+        .to_string(),
+        metadata: Some(Map::from_iter([
+            (
+                "error_kind".to_string(),
+                Value::String(TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNDECLARED.to_string()),
+            ),
+            ("execution_started".to_string(), Value::Bool(false)),
+            (
+                "disposition".to_string(),
+                Value::String("rejected".to_string()),
+            ),
+            (
+                "execution_fact".to_string(),
+                Value::String("not_executed".to_string()),
+            ),
+            ("retryable".to_string(), Value::Bool(false)),
+        ])),
+        is_error: true,
+        exit_semantics: Some(exit_semantics::ExitSemantics::ExecutionError),
+    }
+}
+
+/// A workspace-capable provider call returned without proving that its
+/// physical effects have settled.  The caller must quarantine the workspace;
+/// this result is deliberately non-retryable because replay could duplicate
+/// an effect that is still in flight.
+pub fn workspace_effect_unsettled_tool_result(name: &str, mut result: ToolResult) -> ToolResult {
+    let message = format!(
+        "Tool '{name}' returned before its workspace effects were proven settled; the workspace was quarantined and the call must not be replayed"
+    );
+    result.output = if result.output.is_empty() {
+        message.clone()
+    } else {
+        format!("{}\n\nError: {message}", result.output)
+    };
+    result.is_error = true;
+    let metadata = result.metadata.get_or_insert_with(Map::new);
+    metadata.extend(Map::from_iter([
+        (
+            "error_kind".to_string(),
+            Value::String(TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED.to_string()),
+        ),
+        ("execution_started".to_string(), Value::Bool(true)),
+        ("side_effects_maybe".to_string(), Value::Bool(true)),
+        ("retryable".to_string(), Value::Bool(false)),
+        ("workspace_effect_settled".to_string(), Value::Bool(false)),
+    ]));
+    result
 }
 
 /// Trait for executing tools. Implementations provide the actual tool logic
@@ -482,7 +626,7 @@ impl SandboxConfig {
 /// Unified execution context passed to all tool modules.
 ///
 /// Replaces ad-hoc parameter passing with a single struct that carries
-/// everything a tool needs to run: paths, identity, sandbox rules, and logging.
+/// the paths, identity, sandbox rules, and cancellation needed for execution.
 #[derive(Clone)]
 pub struct ToolContext {
     /// Primary project directory (git root).
@@ -495,21 +639,8 @@ pub struct ToolContext {
     pub session_id: String,
     /// Sandbox enforcement rules.
     pub sandbox: SandboxConfig,
-    /// Shared HTTP client for tools that make network requests (GitHub, web_search).
-    pub http_client: Option<reqwest::Client>,
-    /// Logger for tool-level diagnostics (replaces eprintln! in extracted modules).
-    pub logger: std::sync::Arc<dyn ToolLogger>,
     /// Optional cooperative cancellation for long-running async tools.
     pub cancel_token: Option<Arc<CancellationToken>>,
-    /// Optional renewable detach slot for the bash tool. When set,
-    /// the runner takes the contained
-    /// [`crate::detach::DetachShellHandle`] on entry; on the
-    /// signal it transfers child + streams through the embedded
-    /// one-shot channel. The TUI refills the slot before each tool
-    /// call so each bash invocation gets a fresh one-shot.
-    /// `None` means the host did not make this bash invocation
-    /// background-promotable.
-    pub detach_shell_handle: Option<crate::detach::DetachShellSlot>,
 }
 
 impl ToolContext {
@@ -522,10 +653,7 @@ impl ToolContext {
             project_root: root,
             user_id: "test-user".into(),
             session_id: "test-session".into(),
-            http_client: None,
-            logger: std::sync::Arc::new(TracingLogger),
             cancel_token: None,
-            detach_shell_handle: None,
         }
     }
 }
@@ -540,85 +668,6 @@ impl std::fmt::Debug for ToolContext {
             .field("sandbox_mode", &self.sandbox.mode)
             .finish()
     }
-}
-
-// ─── Tool logger ────────────────────────────────────────────────────────────
-
-/// Trait-based logging for tool modules.
-///
-/// Extracted tool code must NOT use `eprintln!` (breaks server mode).
-/// Instead, tools receive a `&dyn ToolLogger` via [`ToolContext`] and log
-/// through it.  The CLI provides [`StderrLogger`], the server provides
-/// [`TracingLogger`] (default).
-pub trait ToolLogger: Send + Sync {
-    fn debug(&self, msg: &str);
-    fn info(&self, msg: &str);
-    fn warn(&self, msg: &str);
-    fn error(&self, msg: &str);
-}
-
-/// Logger that routes to the `tracing` crate (server default).
-#[derive(Debug, Clone, Copy)]
-pub struct TracingLogger;
-
-impl ToolLogger for TracingLogger {
-    fn debug(&self, msg: &str) {
-        tracing::debug!("{}", msg);
-    }
-    fn info(&self, msg: &str) {
-        tracing::info!("{}", msg);
-    }
-    fn warn(&self, msg: &str) {
-        tracing::warn!("{}", msg);
-    }
-    fn error(&self, msg: &str) {
-        tracing::error!("{}", msg);
-    }
-}
-
-/// Logger that writes to stderr (CLI backward compat).
-#[derive(Debug, Clone, Copy)]
-pub struct StderrLogger;
-
-impl ToolLogger for StderrLogger {
-    fn debug(&self, msg: &str) {
-        eprintln!("[DEBUG] {msg}");
-    }
-    fn info(&self, msg: &str) {
-        eprintln!("[INFO] {msg}");
-    }
-    fn warn(&self, msg: &str) {
-        eprintln!("[WARN] {msg}");
-    }
-    fn error(&self, msg: &str) {
-        eprintln!("[ERROR] {msg}");
-    }
-}
-
-// ─── Journal traits ─────────────────────────────────────────────────────────
-
-/// Trait for recording file edit history (undo support).
-pub trait FileEditJournal: Send + Sync {
-    /// Record the before-state of a file about to be edited.
-    fn record_before(&mut self, path: &Path, tool_call_id: &str, turn_index: u32);
-    /// Record the after-state of a file that was just written.
-    fn record_after(&mut self, path: &Path, tool_call_id: &str, content: &[u8]);
-    /// Undo all edits to a specific file.
-    fn undo_file(&mut self, path: &Path) -> Result<Vec<PathBuf>, String>;
-    /// Undo all edits from a specific turn.
-    fn undo_turn(&mut self, turn_index: u32) -> Result<Vec<PathBuf>, String>;
-}
-
-/// Trait for recording git operations (rollback support).
-pub trait GitRollbackJournal: Send + Sync {
-    /// Record a commit that was just created (for potential revert).
-    fn record_commit(&mut self, commit_hash: &str, message: &str);
-    /// Record a stash that was just created (for potential restore).
-    fn record_stash(&mut self, stash_ref: &str, message: &str);
-    /// Revert the most recent recorded commit.
-    fn revert_last_commit(&mut self) -> Result<String, String>;
-    /// Restore the most recent recorded stash.
-    fn restore_last_stash(&mut self) -> Result<String, String>;
 }
 
 // ─── Tool approval gate ─────────────────────────────────────────────────────
@@ -922,6 +971,27 @@ mod tests {
         assert!(r.output.is_empty());
         assert!(!r.is_error);
         assert!(r.metadata.is_none());
+    }
+
+    #[test]
+    fn workspace_lease_result_distinguishes_missing_binding_from_contention() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let missing = root.path().join("missing-workspace");
+        let unavailable = workspace_lease_unavailable_tool_result_for_workspace("bash", &missing);
+        let unavailable_fields = unavailable.metadata.as_ref().unwrap();
+        assert_eq!(
+            unavailable_fields["error_kind"],
+            TOOL_ERROR_KIND_WORKSPACE_BINDING_UNAVAILABLE
+        );
+        assert_eq!(unavailable_fields["retryable"], false);
+
+        let contended = workspace_lease_unavailable_tool_result_for_workspace("bash", root.path());
+        let contended_fields = contended.metadata.as_ref().unwrap();
+        assert_eq!(
+            contended_fields["error_kind"],
+            TOOL_ERROR_KIND_WORKSPACE_UNAVAILABLE
+        );
+        assert_eq!(contended_fields["retryable"], true);
     }
 
     #[test]

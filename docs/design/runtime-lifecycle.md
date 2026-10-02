@@ -441,7 +441,7 @@ Only HTTP 200 with `status: "cancelled"` and `execution_settled: true` reports
 convergence. Pending responses do not write a cancelled Session projection.
 Clients may repeat the same owner-scoped endpoint; a deadline, missing proof,
 or storage failure must not become cancellation success.
-Pending responses may include `workspace_blocker`, the typed result of the
+Pending responses may include `execution_blocker`, the typed result of the
 latest canonical idle proof. Missing proof is not an inferred blocker or
 success. The database Run store publishes all currently active Runs' existing
 cancellation markers in one owner/Session-scoped atomic write, with a bounded,
@@ -455,9 +455,9 @@ their own hard deadline.
 Active-run enumeration is insufficient: terminal runs can retain live
 executors, owner leases, tool invocations or canonical turn authority. Retries
 rediscover that retained authority and preserve the targets observed while
-waiting. The coordinator owns one fenced idle proof shared with checkout
-reuse, including slots, active execution, generation-scoped durable settlement
-fences (started without finished or accounting-finalized), writer/reservation authority,
+waiting. The coordinator owns one fenced Session execution-settlement proof,
+including slots, active execution, generation-scoped durable settlement fences
+(started without finished or accounting-finalized), writer/reservation authority,
 unresolved invocations and unfinished execution-binding switches. Run statuses
 remain truthful when completion wins a cancellation race.
 
@@ -473,11 +473,12 @@ Cancellation invokes the existing terminal tool reconciler promptly. A
 prepared invocation with no dispatch attempts becomes a durable rejection;
 dispatched or unknown outcomes retain their safety obligations. Lease expiry,
 disconnect, terminal status and cancellation intent cannot prove external
-effects stopped. `execution_settled: true` requires this Session no longer to
-block checkout reuse; it does not reserve the checkout against another Session
-or prohibit a later explicitly admitted turn. Session history and execution
-bindings are retained, and new-conversation admission performs its own claim
-check.
+effects stopped. `execution_settled: true` requires this Session to have no
+remaining execution debt for its own cancellation or binding transition; it
+does not reserve the checkout against another Session or prohibit a later
+explicitly admitted turn. Session history and execution bindings are retained,
+and the executor lease—not a database claim row—serializes conflicting
+physical operations.
 
 ## Recovery
 

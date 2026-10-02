@@ -14,9 +14,10 @@ use astra_services::{
     },
 };
 use astra_tools::patch_materialization::{
-    GitPatchMaterializationOutcome, GitPatchNotAppliedCode, materialize_git_patch,
-    observe_git_worktree_revision,
+    GitPatchMaterializationOutcome, GitPatchNotAppliedCode, GitWorkspaceObservationError,
+    materialize_git_patch_with_workspace_lease, observe_git_worktree_revision_with_workspace_lease,
 };
+use astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options;
 use futures_util::{StreamExt, stream};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -73,8 +74,9 @@ pub(crate) fn spawn_work_patch_materialization_recovery(
             stream::iter(pending)
                 .for_each_concurrent(RECOVERY_CONCURRENCY, |item| {
                     let pool = pool.clone();
+                    let cancel = cancel.clone();
                     async move {
-                        if let Err(error) = drive_materialization(pool, item.clone()).await
+                        if let Err(error) = drive_materialization(pool, item.clone(), &cancel).await
                             && !matches!(
                                 error,
                                 WorkPatchMaterializationError::ExecutorConflict
@@ -103,17 +105,21 @@ pub(crate) fn spawn_work_patch_materialization_recovery(
 async fn drive_materialization(
     pool: SharedPool,
     item: WorkPatchMaterializationRecoveryItem,
+    cancel: &CancellationToken,
 ) -> Result<(), WorkPatchMaterializationError> {
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     let service = DatabaseWorkPatchMaterializationService::new(pool.clone());
     match item.operation.phase {
         WorkPatchMaterializationPhase::AwaitingDispatch => {
-            drive_awaiting_dispatch(&service, &pool, &item).await
+            drive_awaiting_dispatch(&service, &pool, &item, cancel).await
         }
         WorkPatchMaterializationPhase::Applying | WorkPatchMaterializationPhase::Reconciling => {
-            drive_reconciliation(&service, &pool, &item).await
+            drive_reconciliation(&service, &pool, &item, cancel).await
         }
         WorkPatchMaterializationPhase::Verifying => {
-            drive_verification(&service, &pool, &item).await
+            drive_verification(&service, &pool, &item, cancel).await
         }
         WorkPatchMaterializationPhase::Complete => Ok(()),
     }
@@ -123,16 +129,39 @@ async fn drive_verification(
     service: &DatabaseWorkPatchMaterializationService,
     pool: &SharedPool,
     item: &WorkPatchMaterializationRecoveryItem,
+    cancel: &CancellationToken,
 ) -> Result<(), WorkPatchMaterializationError> {
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     let workspace = match resolve_workspace(pool, item).await {
         Ok(workspace) => workspace,
         Err(_) => {
-            defer_recovery(service, item).await?;
+            if !cancel.is_cancelled() {
+                defer_recovery(service, item).await?;
+            }
             return Ok(());
         }
     };
-    let Ok(observed_revision) = observe_git_worktree_revision(&workspace).await else {
+    let Some(workspace_lease) = acquire_workspace_mutation_lease_with_options(
+        &workspace,
+        Some(cancel),
+        Duration::from_secs(120),
+    )
+    .await
+    else {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         defer_recovery(service, item).await?;
+        return Ok(());
+    };
+    let Ok(observed_revision) =
+        observe_git_worktree_revision_with_workspace_lease(&workspace, &workspace_lease).await
+    else {
+        if !cancel.is_cancelled() {
+            defer_recovery(service, item).await?;
+        }
         return Ok(());
     };
     if observed_revision != item.operation.result_subject_revision {
@@ -176,12 +205,19 @@ async fn drive_awaiting_dispatch(
     service: &DatabaseWorkPatchMaterializationService,
     pool: &SharedPool,
     item: &WorkPatchMaterializationRecoveryItem,
+    cancel: &CancellationToken,
 ) -> Result<(), WorkPatchMaterializationError> {
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     let executor_token = format!("server-materializer-{}", Uuid::now_v7());
     let invocation = provider_invocation_ref(item);
     let workspace = match resolve_workspace(pool, item).await {
         Ok(workspace) => workspace,
         Err(WorkspaceResolutionError::Definitive(code)) => {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
             service
                 .claim_applying(
                     &item.owner_id,
@@ -200,10 +236,15 @@ async fn drive_awaiting_dispatch(
                 %error,
                 "Work patch workspace resolution will be retried before dispatch"
             );
-            defer_recovery(service, item).await?;
+            if !cancel.is_cancelled() {
+                defer_recovery(service, item).await?;
+            }
             return Ok(());
         }
     };
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     let patch = match service
         .load_patch_payload(
             &item.owner_id,
@@ -219,10 +260,15 @@ async fn drive_awaiting_dispatch(
                 %error,
                 "Work patch payload read will be retried before dispatch"
             );
-            defer_recovery(service, item).await?;
+            if !cancel.is_cancelled() {
+                defer_recovery(service, item).await?;
+            }
             return Ok(());
         }
         Err(error) => {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
             service
                 .claim_applying(
                     &item.owner_id,
@@ -248,6 +294,24 @@ async fn drive_awaiting_dispatch(
             return Ok(());
         }
     };
+    let Some(workspace_lease) = acquire_workspace_mutation_lease_with_options(
+        &workspace,
+        Some(cancel),
+        Duration::from_secs(120),
+    )
+    .await
+    else {
+        // No provider invocation has started. Keep the durable operation in
+        // its dispatch phase; the recovery scanner will retry without
+        // fabricating a terminal no-op result.
+        if !cancel.is_cancelled() {
+            defer_recovery(service, item).await?;
+        }
+        return Ok(());
+    };
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     service
         .claim_applying(
             &item.owner_id,
@@ -257,7 +321,14 @@ async fn drive_awaiting_dispatch(
             &invocation,
         )
         .await?;
-    match materialize_git_patch(&workspace, &item.operation.base_subject_revision, &patch).await {
+    match materialize_git_patch_with_workspace_lease(
+        &workspace,
+        &item.operation.base_subject_revision,
+        &patch,
+        &workspace_lease,
+    )
+    .await
+    {
         GitPatchMaterializationOutcome::Applied { observed_revision } => {
             record_observed(service, item, executor_token, invocation, observed_revision).await?;
         }
@@ -275,14 +346,16 @@ async fn drive_awaiting_dispatch(
             record_observed(service, item, executor_token, invocation, observed_revision).await?;
         }
         GitPatchMaterializationOutcome::NotApplied { code, .. } => {
-            record_not_applied(
-                service,
-                item,
-                executor_token,
-                invocation,
-                map_not_applied(code),
-            )
-            .await?;
+            if code != GitPatchNotAppliedCode::WorkspaceUnavailable {
+                record_not_applied(
+                    service,
+                    item,
+                    executor_token,
+                    invocation,
+                    map_not_applied(code),
+                )
+                .await?;
+            }
         }
         GitPatchMaterializationOutcome::UnknownEffect {
             observed_revision: None,
@@ -299,12 +372,32 @@ async fn drive_reconciliation(
     service: &DatabaseWorkPatchMaterializationService,
     pool: &SharedPool,
     item: &WorkPatchMaterializationRecoveryItem,
+    cancel: &CancellationToken,
 ) -> Result<(), WorkPatchMaterializationError> {
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     let invocation =
         item.operation.apply_invocation_ref.clone().ok_or_else(|| {
             WorkPatchMaterializationError::NeedsRepair("missing invocation".into())
         })?;
     let executor_token = format!("server-reconciler-{}", Uuid::now_v7());
+    let workspace = match resolve_workspace(pool, item).await {
+        Ok(workspace) => workspace,
+        Err(_) => return Ok(()),
+    };
+    let Some(workspace_lease) = acquire_workspace_mutation_lease_with_options(
+        &workspace,
+        Some(cancel),
+        Duration::from_secs(120),
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     service
         .claim_reconciliation(
             &item.owner_id,
@@ -314,12 +407,30 @@ async fn drive_reconciliation(
             &invocation,
         )
         .await?;
-    let workspace = match resolve_workspace(pool, item).await {
-        Ok(workspace) => workspace,
+    let observed_revision = match observe_git_worktree_revision_with_workspace_lease(
+        &workspace,
+        &workspace_lease,
+    )
+    .await
+    {
+        Ok(observed_revision) => observed_revision,
+        Err(
+            error @ (GitWorkspaceObservationError::NotWorktreeRoot
+            | GitWorkspaceObservationError::ObservationRejected
+            | GitWorkspaceObservationError::UnsafePath),
+        ) => {
+            let _ = error;
+            record_not_applied(
+                service,
+                item,
+                executor_token,
+                invocation,
+                WorkPatchMaterializationFailureCode::InvalidWorkspace,
+            )
+            .await?;
+            return Ok(());
+        }
         Err(_) => return Ok(()),
-    };
-    let Ok(observed_revision) = observe_git_worktree_revision(&workspace).await else {
-        return Ok(());
     };
     if observed_revision == item.operation.base_subject_revision {
         record_not_applied(
@@ -479,6 +590,9 @@ fn map_not_applied(code: GitPatchNotAppliedCode) -> WorkPatchMaterializationFail
         }
         GitPatchNotAppliedCode::WorkspaceUnavailable | GitPatchNotAppliedCode::BaseChanged => {
             WorkPatchMaterializationFailureCode::WorkspaceUnavailable
+        }
+        GitPatchNotAppliedCode::InvalidWorkspace => {
+            WorkPatchMaterializationFailureCode::InvalidWorkspace
         }
         GitPatchNotAppliedCode::PatchRejected => WorkPatchMaterializationFailureCode::PatchRejected,
     }

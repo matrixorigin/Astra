@@ -842,23 +842,6 @@ fn admin_init_response_serializes() {
 }
 
 #[test]
-fn admin_feedback_stats_response_serializes() {
-    let mut by_type = Map::new();
-    by_type.insert("thumbs_up".into(), json!(10));
-    let resp = AdminFeedbackStatsResponse {
-        total_feedback: 20,
-        positive_feedback: 15,
-        negative_feedback: 5,
-        avg_rating: Some(4.2),
-        feedback_by_type: by_type,
-    };
-    let v = serde_json::to_value(&resp).unwrap();
-    assert_eq!(v["total_feedback"], 20);
-    assert_eq!(v["avg_rating"], 4.2);
-    assert_eq!(v["feedback_by_type"]["thumbs_up"], 10);
-}
-
-#[test]
 fn admin_user_role_response_serializes() {
     let resp = AdminUserRoleResponse {
         username: "alice".into(),
@@ -943,34 +926,6 @@ fn admin_audit_record_to_response() {
     let resp: AdminAuditResponse = record.into();
     assert!(resp.resource_id.is_none());
     assert!(resp.details.is_none());
-}
-
-#[test]
-fn admin_feedback_stats_record_to_response() {
-    // with avg_rating
-    let mut by_type = Map::new();
-    by_type.insert("rating".into(), json!(10));
-    let record = AdminFeedbackStatsRecord {
-        total_feedback: 100,
-        positive_feedback: 80,
-        negative_feedback: 20,
-        avg_rating: Some(4.5),
-        feedback_by_type: by_type.clone(),
-    };
-    let resp: AdminFeedbackStatsResponse = record.into();
-    assert_eq!(resp.total_feedback, 100);
-    assert_eq!(resp.avg_rating, Some(4.5));
-
-    // none avg_rating
-    let record = AdminFeedbackStatsRecord {
-        total_feedback: 0,
-        positive_feedback: 0,
-        negative_feedback: 0,
-        avg_rating: None,
-        feedback_by_type: Map::new(),
-    };
-    let resp: AdminFeedbackStatsResponse = record.into();
-    assert!(resp.avg_rating.is_none());
 }
 
 #[test]
@@ -1574,9 +1529,16 @@ fn chat_request_into_data_maps_all_fields() {
         model_selection: Some(astra_turn_types::ModelSelection {
             offering_id: "offer-gpt-4".into(),
         }),
+        requested_model_policy: Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::OfferingId {
+                offering_id: "offer-gpt-4".into(),
+            },
+        }),
+        expected_model_name: Some("gpt-4".into()),
         resolved_model_selection: Some(astra_services::runs::ResolvedModelSelection {
             offering_id: "offer-gpt-4".into(),
             model_name: "gpt-4".into(),
+            source_identity: None,
         }),
         capability_descriptors: None,
         agent_bindings: Vec::new(),
@@ -1649,11 +1611,20 @@ fn chat_request_into_data_maps_all_fields() {
         data.model.is_none(),
         "wire conversion must not resolve routes"
     );
+    assert_eq!(data.expected_model_name.as_deref(), Some("gpt-4"));
     assert_eq!(
         data.model_selection
             .as_ref()
             .map(|selection| selection.offering_id.as_str()),
         Some("offer-gpt-4")
+    );
+    assert_eq!(
+        data.requested_model_policy,
+        Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::OfferingId {
+                offering_id: "offer-gpt-4".into(),
+            },
+        })
     );
     assert_eq!(
         data.resolved_model_selection.as_ref().map(|selection| (
@@ -1761,6 +1732,8 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         work_binding: None,
         agent_id: None,
         model_selection: None,
+        requested_model_policy: None,
+        expected_model_name: None,
         resolved_model_selection: None,
         capability_descriptors: None,
         agent_bindings: Vec::new(),

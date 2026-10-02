@@ -711,12 +711,21 @@ async fn authenticated_work_user(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(WorkOwnerId, astra_services::AuthUserRecord), (StatusCode, Json<WorkApiErrorV1>)> {
-    let user = state
+    authenticated_work_principal(state, headers)
+        .await
+        .map(|(owner, principal)| (owner, principal.user))
+}
+
+async fn authenticated_work_principal(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(WorkOwnerId, astra_services::AuthPrincipal), (StatusCode, Json<WorkApiErrorV1>)> {
+    let principal = state
         .auth_service
-        .current_user(headers)
+        .current_principal(headers)
         .await
         .map_err(map_auth_error)?;
-    let owner_id = WorkOwnerId::parse(user.user_id.clone()).map_err(|error| {
+    let owner_id = WorkOwnerId::parse(principal.user.user_id.clone()).map_err(|error| {
         tracing::error!(error = %error, "authenticated owner identity violates Work contract");
         work_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -726,7 +735,7 @@ async fn authenticated_work_user(
             Vec::new(),
         )
     })?;
-    Ok((owner_id, user))
+    Ok((owner_id, principal))
 }
 
 fn work_digest(domain: &str, fields: &[&str]) -> String {
@@ -3860,7 +3869,7 @@ pub(super) async fn post_work_branch_turn_handler(
             Vec::new(),
         )
     })?;
-    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let (owner_id, principal) = authenticated_work_principal(&state, &headers).await?;
     let work_id = WorkId::parse(work_id).map_err(|_| {
         work_error(
             StatusCode::BAD_REQUEST,
@@ -3937,6 +3946,11 @@ pub(super) async fn post_work_branch_turn_handler(
         .flatten();
     let expected_run_id = turn.start_idempotency.run_id().to_string();
     let request = ChatRequestData {
+        model_catalog_reader: Some(astra_services::models::AuthorizedModelCatalogReader::new(
+            state.model_service.clone(),
+            state.auth_service.clone(),
+            principal,
+        )),
         message: turn.message,
         user_intent: None,
         parts: Vec::new(),
@@ -3958,8 +3972,10 @@ pub(super) async fn post_work_branch_turn_handler(
         full_llm_capture: false,
         agent_id: None,
         model: None,
+        expected_model_name: None,
         model_selection_mode: ModelSelectionMode::ServerDefault,
         model_selection: None,
+        requested_model_policy: None,
         resolved_model_selection: None,
         admitted_model_execution: None,
         capability_descriptors: None,
@@ -5062,7 +5078,6 @@ fn map_execution_switch_error(
         ),
         astra_services::SessionContextCoordinatorError::ExecutionBindingFenced { .. }
         | astra_services::SessionContextCoordinatorError::ExecutionBindingBusy
-        | astra_services::SessionContextCoordinatorError::ExecutionWorkspaceClaimed { .. }
         | astra_services::SessionContextCoordinatorError::ExecutionBindingNotReady(_) => {
             work_error(
                 StatusCode::CONFLICT,

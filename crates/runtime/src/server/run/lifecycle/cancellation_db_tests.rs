@@ -314,13 +314,13 @@ async fn db_cancel_session_retains_unknown_tool_external_writer_and_preadmission
         for _ in 0..2 {
             let pending = fixture.cancel().await;
             assert!(!pending.execution_settled, "{case}: {pending:?}");
-            use astra_services::session_context_coordinator::WorkspaceReuseBlocker;
+            use astra_services::session_context_coordinator::SessionExecutionBlocker;
             assert_eq!(
-                pending.workspace_blocker,
+                pending.execution_blocker,
                 Some(match case {
-                    "unknown" => WorkspaceReuseBlocker::UnresolvedTool,
-                    "switching" => WorkspaceReuseBlocker::BindingNotReady,
-                    _ => WorkspaceReuseBlocker::WriterOrReservation,
+                    "unknown" => SessionExecutionBlocker::UnresolvedTool,
+                    "switching" => SessionExecutionBlocker::BindingNotReady,
+                    _ => SessionExecutionBlocker::WriterOrReservation,
                 }),
                 "{case}: {pending:?}"
             );
@@ -451,7 +451,7 @@ async fn db_cancel_session_writer_release_rechecks_generation_and_new_lease() {
 #[tokio::test]
 #[ignore = "requires disposable MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn db_cancel_session_cross_pod_retains_open_settlement_without_lease() {
-    use astra_services::session_context_coordinator::WorkspaceReuseBlocker;
+    use astra_services::session_context_coordinator::SessionExecutionBlocker;
     for closure in ["finished", "accounting"] {
         let fixture = CancellationFixture::new(false, true).await;
         fixture.orphan().await;
@@ -507,8 +507,8 @@ async fn db_cancel_session_cross_pod_retains_open_settlement_without_lease() {
                 .await);
             assert!(!pending.execution_settled, "{pending:?}");
             assert_eq!(
-                pending.workspace_blocker,
-                Some(WorkspaceReuseBlocker::SettlementPending)
+                pending.execution_blocker,
+                Some(SessionExecutionBlocker::SettlementPending)
             );
             assert_eq!(pending.runs.len(), 1);
             assert!(!pending.runs[0].execution_settled);
@@ -540,7 +540,7 @@ async fn db_cancel_session_cross_pod_retains_open_settlement_without_lease() {
                 .execution_reuse_blocker(&fixture.key)
                 .await
                 .unwrap(),
-            Some(WorkspaceReuseBlocker::SettlementPending)
+            Some(SessionExecutionBlocker::SettlementPending)
         );
         let event = if closure == "finished" {
             AgenticRunLifecycleService::settlement_finished_event(generation)

@@ -14,7 +14,9 @@
 //!
 //! The runtime treats data snapshot references as opaque locators — only the
 //! data layer (MatrixOne adapter) knows how to materialise or restore from them.
-//! The business layer declares bindings via [`SnapshotSpec`].
+//! Callers construct reference bundles with [`CompositeSnapshotBuilder`];
+//! this module does not execute data or Git restoration.
+
 //!
 //! ## Timestamp formats
 //!
@@ -27,8 +29,6 @@
 //! keeps lookups zero-cost.
 
 use serde::{Deserialize, Serialize};
-use std::future::Future;
-use std::pin::Pin;
 
 /// A typed reference to one dimension of state at a point in time.
 ///
@@ -161,23 +161,8 @@ pub struct CompositeSnapshotDiff {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompositeSnapshotError {
-    SessionMismatch {
-        expected: String,
-        found: String,
-    },
-    VersionConflict {
-        expected: u64,
-        found: u64,
-    },
-    ApplySourceMismatch {
-        expected_snapshot_id: String,
-        found_snapshot_id: String,
-    },
-    MergeConflict {
-        dimension: SnapshotDimension,
-        left: Box<SnapshotRef>,
-        right: Box<SnapshotRef>,
-    },
+    SessionMismatch { expected: String, found: String },
+    VersionConflict { expected: u64, found: u64 },
 }
 
 impl std::fmt::Display for CompositeSnapshotError {
@@ -195,16 +180,6 @@ impl std::fmt::Display for CompositeSnapshotError {
                     "snapshot version conflict: expected next version {expected}, found {found}"
                 )
             }
-            Self::ApplySourceMismatch {
-                expected_snapshot_id,
-                found_snapshot_id,
-            } => write!(
-                f,
-                "snapshot diff source mismatch: expected {expected_snapshot_id}, found {found_snapshot_id}"
-            ),
-            Self::MergeConflict { dimension, .. } => {
-                write!(f, "snapshot merge conflict on {dimension:?}")
-            }
         }
     }
 }
@@ -213,11 +188,8 @@ impl std::error::Error for CompositeSnapshotError {}
 
 pub trait StateDiff: Sized {
     type Diff;
-    type Error;
 
     fn diff(&self, target: &Self) -> Self::Diff;
-    fn apply(&self, diff: &Self::Diff) -> Result<Self, Self::Error>;
-    fn merge(&self, other: &Self) -> Result<Self, Self::Error>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,7 +309,6 @@ impl CompositeSnapshot {
 
 impl StateDiff for CompositeSnapshot {
     type Diff = CompositeSnapshotDiff;
-    type Error = CompositeSnapshotError;
 
     fn diff(&self, target: &Self) -> Self::Diff {
         let ref_changes = ordered_dimensions()
@@ -357,90 +328,6 @@ impl StateDiff for CompositeSnapshot {
             to: target.identity(),
             ref_changes,
         }
-    }
-
-    fn apply(&self, diff: &Self::Diff) -> Result<Self, Self::Error> {
-        if self.snapshot_id != diff.from.snapshot_id {
-            return Err(CompositeSnapshotError::ApplySourceMismatch {
-                expected_snapshot_id: diff.from.snapshot_id.clone(),
-                found_snapshot_id: self.snapshot_id.clone(),
-            });
-        }
-        if self.session_id != diff.from.session_id || self.session_id != diff.to.session_id {
-            return Err(CompositeSnapshotError::SessionMismatch {
-                expected: diff.from.session_id.clone(),
-                found: self.session_id.clone(),
-            });
-        }
-
-        let refs = ordered_dimensions()
-            .into_iter()
-            .filter_map(|dimension| {
-                diff.ref_changes
-                    .iter()
-                    .find(|change| change.dimension == dimension)
-                    .map(|change| change.after.clone())
-                    .unwrap_or_else(|| self.ref_for_dimension(dimension).cloned())
-            })
-            .collect();
-
-        Ok(CompositeSnapshot {
-            snapshot_id: diff.to.snapshot_id.clone(),
-            session_id: diff.to.session_id.clone(),
-            turn: diff.to.turn,
-            created_at: diff.to.created_at.clone(),
-            version: diff.to.version,
-            label: diff.to.label.clone(),
-            refs,
-        })
-    }
-
-    fn merge(&self, other: &Self) -> Result<Self, Self::Error> {
-        if self.session_id != other.session_id {
-            return Err(CompositeSnapshotError::SessionMismatch {
-                expected: self.session_id.clone(),
-                found: other.session_id.clone(),
-            });
-        }
-
-        let mut refs = Vec::new();
-        for dimension in ordered_dimensions() {
-            match (
-                self.ref_for_dimension(dimension).cloned(),
-                other.ref_for_dimension(dimension).cloned(),
-            ) {
-                (Some(left), Some(right)) if left != right => {
-                    return Err(CompositeSnapshotError::MergeConflict {
-                        dimension,
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    });
-                }
-                (Some(reference), _) | (_, Some(reference)) => refs.push(reference),
-                (None, None) => {}
-            }
-        }
-
-        let label = match (&self.label, &other.label) {
-            (Some(left), Some(right)) if left == right => Some(left.clone()),
-            (Some(left), Some(right)) => Some(format!("merge:{left}|{right}")),
-            (Some(label), None) | (None, Some(label)) => Some(label.clone()),
-            (None, None) => None,
-        };
-
-        Ok(CompositeSnapshot {
-            snapshot_id: format!(
-                "merge-{}-{}",
-                &self.snapshot_id[..8.min(self.snapshot_id.len())],
-                &other.snapshot_id[..8.min(other.snapshot_id.len())]
-            ),
-            session_id: self.session_id.clone(),
-            turn: self.turn.max(other.turn),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            version: self.version.max(other.version).saturating_add(1),
-            label,
-            refs,
-        })
     }
 }
 
@@ -543,192 +430,9 @@ impl CompositeSnapshotIndex {
     }
 }
 
-/// Specification of which state dimensions to include when creating a composite snapshot.
-///
-/// The business layer fills this in based on context — a tuning experiment wants
-/// data + memory + git, while a quick debug fork only needs session state.
-#[derive(Debug, Clone, Default)]
-pub struct SnapshotSpec {
-    /// Heavy checkpoint reference (e.g. `"000005-heavy.json"`).
-    /// When `Some`, a `SessionState` ref is added with this value.
-    /// When `None`, session state is omitted.
-    pub session_state_ref: Option<String>,
-    /// Include data snapshot reference (caller provides snapshot locator).
-    pub data_snapshot: Option<DataSnapshotRef>,
-    /// Include memory/learning snapshot reference.
-    pub memory_snapshot: Option<MemorySnapshotRef>,
-    /// Include git commit SHA (caller provides).
-    pub git_commit: Option<String>,
-    /// Include workspace state reference.
-    pub include_workspace: bool,
-}
-
-impl SnapshotSpec {
-    /// Build a `CompositeSnapshot` from this spec.
-    pub fn build(
-        &self,
-        snapshot_id: String,
-        session_id: String,
-        turn: u32,
-        label: Option<String>,
-    ) -> CompositeSnapshot {
-        let mut refs = Vec::new();
-        if let Some(ref checkpoint_ref) = self.session_state_ref {
-            refs.push(SnapshotRef::SessionState(checkpoint_ref.clone()));
-        }
-        if let Some(ds) = &self.data_snapshot {
-            refs.push(SnapshotRef::DataSnapshot(ds.clone()));
-        }
-        if let Some(ms) = &self.memory_snapshot {
-            refs.push(SnapshotRef::MemorySnapshot(ms.clone()));
-        }
-        if let Some(sha) = &self.git_commit {
-            refs.push(SnapshotRef::GitCommit(sha.clone()));
-        }
-        if self.include_workspace {
-            refs.push(SnapshotRef::WorkspaceState(session_id.clone()));
-        }
-        let created_at = chrono::Utc::now().to_rfc3339();
-        CompositeSnapshot {
-            snapshot_id,
-            session_id,
-            turn,
-            created_at,
-            version: 0,
-            label,
-            refs,
-        }
-    }
-}
-
-// ─── Data Snapshot Provider Trait ─────────────────────────────────────────────
-
-/// Abstraction for the business/data layer to participate in composite snapshots.
-///
-/// The runtime knows nothing about MatrixOne snapshots, branches, or databases.
-/// Instead, it calls this trait when a composite snapshot is being created or
-/// restored, and the implementor decides:
-///
-/// - **Which databases/tables** belong to the current session context
-/// - **How to create a snapshot** (e.g. `CREATE SNAPSHOT ... FOR ACCOUNT`)
-/// - **How to restore** from a `DataSnapshotRef` (e.g. `RESTORE ... FROM SNAPSHOT`)
-///
-/// # Lifecycle
-///
-/// ```text
-/// create_snapshot()  ──→  DataSnapshotRef   ──→  stored in CompositeSnapshot
-///                                                  │
-///                         restore_snapshot() ◄─────┘  (on rollback/fork/resume)
-/// ```
-///
-/// # Binding Strategy
-///
-/// The provider decides the binding between session context and data:
-///
-/// 1. **Session-scoped**: one snapshot per session (simple, broad)
-/// 2. **Turn-scoped**: snapshot after each successful turn (fine-grained, expensive)
-/// 3. **Explicit**: only snapshot when the user or plan requests it
-/// 4. **Task-scoped**: snapshot at plan/subtask boundaries
-///
-/// The runtime doesn't prescribe the strategy — it just calls the trait.
-pub trait DataSnapshotProvider: Send + Sync {
-    /// Create a snapshot of the data state relevant to this session.
-    ///
-    /// Returns a `DataSnapshotRef` that can be stored in a `CompositeSnapshot`.
-    /// The `context` provides session metadata so the provider can decide
-    /// which databases to include and how to name the snapshot.
-    ///
-    /// Returning `Ok(None)` means "no data to snapshot" (perfectly valid).
-    fn create_snapshot(
-        &self,
-        context: &SnapshotContext,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<DataSnapshotRef>, String>> + Send + '_>>;
-
-    /// Restore data state from a previously created snapshot reference.
-    ///
-    /// The provider translates the `DataSnapshotRef` back into the
-    /// appropriate SQL commands (e.g. `RESTORE ACCOUNT {acc} DATABASE {db} FROM SNAPSHOT`).
-    fn restore_snapshot(
-        &self,
-        snapshot: &DataSnapshotRef,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
-
-    /// Check if a snapshot still exists and is restorable.
-    fn snapshot_exists(
-        &self,
-        snapshot: &DataSnapshotRef,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
-
-    /// List databases that this provider manages for the given session.
-    ///
-    /// Used to pre-fill `SnapshotSpec.data_snapshot.databases` when
-    /// the caller doesn't specify them explicitly.
-    fn bound_databases(
-        &self,
-        session_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>>;
-}
-
-/// Context passed to `DataSnapshotProvider` when creating a snapshot.
-///
-/// Carries enough session metadata for the provider to decide *what* to snapshot
-/// and *how* to name it.
-#[derive(Debug, Clone)]
-pub struct SnapshotContext {
-    /// Current session ID.
-    pub session_id: String,
-    /// Current turn number.
-    pub turn: u32,
-    /// Optional label (e.g. "pre-fork", "tuning-baseline").
-    pub label: Option<String>,
-    /// Task type hint (helps provider decide scope).
-    pub task_type: Option<String>,
-    /// Explicit list of databases to include (overrides provider's default).
-    pub databases: Option<Vec<String>>,
-}
-
-/// A no-op provider for environments without data snapshot support.
-///
-/// Always returns `None` for snapshots, making the data dimension
-/// absent from any `CompositeSnapshot`.
-#[cfg(test)]
-pub struct NoopDataSnapshotProvider;
-
-#[cfg(test)]
-impl DataSnapshotProvider for NoopDataSnapshotProvider {
-    fn create_snapshot(
-        &self,
-        _context: &SnapshotContext,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<DataSnapshotRef>, String>> + Send + '_>> {
-        Box::pin(async { Ok(None) })
-    }
-
-    fn restore_snapshot(
-        &self,
-        _snapshot: &DataSnapshotRef,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn snapshot_exists(
-        &self,
-        _snapshot: &DataSnapshotRef,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>> {
-        Box::pin(async { Ok(false) })
-    }
-
-    fn bound_databases(
-        &self,
-        _session_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
-        Box::pin(async { Vec::new() })
-    }
-}
-
 // ─── Composite Snapshot Builder ──────────────────────────────────────────────
 
-/// Builder for constructing a `CompositeSnapshot` from a mix of
-/// synchronous refs and async provider calls.
+/// Builder for constructing a `CompositeSnapshot` from opaque state references.
 pub struct CompositeSnapshotBuilder {
     session_id: String,
     turn: u32,
@@ -795,61 +499,6 @@ impl CompositeSnapshotBuilder {
             label: self.label,
             refs: self.refs,
         }
-    }
-}
-
-// ─── Restore Selector ────────────────────────────────────────────────────────
-
-/// Which dimensions to restore from a `CompositeSnapshot`.
-///
-/// By default, all present dimensions are restored. Callers can selectively
-/// disable dimensions they don't want.
-#[derive(Debug, Clone)]
-pub struct RestoreSelector {
-    pub restore_session_state: bool,
-    pub restore_data: bool,
-    pub restore_memory: bool,
-    pub restore_git: bool,
-    pub restore_workspace: bool,
-}
-
-impl Default for RestoreSelector {
-    fn default() -> Self {
-        Self {
-            restore_session_state: true,
-            restore_data: true,
-            restore_memory: true,
-            restore_git: true,
-            restore_workspace: true,
-        }
-    }
-}
-
-impl RestoreSelector {
-    /// Only restore session state (fast, no side effects on data/git).
-    pub fn session_only() -> Self {
-        Self {
-            restore_session_state: true,
-            restore_data: false,
-            restore_memory: false,
-            restore_git: false,
-            restore_workspace: false,
-        }
-    }
-
-    /// Filter a snapshot's refs to only the selected dimensions.
-    pub fn filter_refs<'a>(&self, snapshot: &'a CompositeSnapshot) -> Vec<&'a SnapshotRef> {
-        snapshot
-            .refs
-            .iter()
-            .filter(|r| match r {
-                SnapshotRef::SessionState(_) => self.restore_session_state,
-                SnapshotRef::DataSnapshot(_) => self.restore_data,
-                SnapshotRef::MemorySnapshot(_) => self.restore_memory,
-                SnapshotRef::GitCommit(_) => self.restore_git,
-                SnapshotRef::WorkspaceState(_) => self.restore_workspace,
-            })
-            .collect()
     }
 }
 
@@ -924,64 +573,6 @@ mod tests {
 
         let dims = snap.dimensions();
         assert_eq!(dims, vec!["session", "git"]);
-    }
-
-    #[test]
-    fn snapshot_spec_builds_correctly() {
-        let spec = SnapshotSpec {
-            session_state_ref: Some("000003-heavy.json".to_string()),
-            data_snapshot: Some(DataSnapshotRef {
-                snapshot_name: "snap1".to_string(),
-                databases: vec![],
-                timestamp: None,
-                branch_name: None,
-            }),
-            memory_snapshot: None,
-            git_commit: Some("deadbeef".to_string()),
-            include_workspace: false,
-        };
-        let snap = spec.build("id1".into(), "sess1".into(), 3, Some("test".into()));
-        assert_eq!(snap.snapshot_id, "id1");
-        assert_eq!(snap.session_id, "sess1");
-        assert_eq!(snap.turn, 3);
-        assert_eq!(snap.version, 0);
-        assert_eq!(snap.refs.len(), 3); // session + data + git
-        assert!(snap.has_session_state());
-        assert_eq!(snap.session_state(), Some("000003-heavy.json"));
-        assert!(snap.has_data_snapshot());
-        assert!(snap.has_git_commit());
-        assert!(!snap.has_memory_snapshot());
-    }
-
-    #[test]
-    fn restore_selector_session_only() {
-        let snap = CompositeSnapshotBuilder::new("s1", 1)
-            .session_state("cp")
-            .git_commit("abc")
-            .data_snapshot(DataSnapshotRef {
-                snapshot_name: "sn".to_string(),
-                databases: vec![],
-                timestamp: None,
-                branch_name: None,
-            })
-            .build();
-
-        let selector = RestoreSelector::session_only();
-        let filtered = selector.filter_refs(&snap);
-        assert_eq!(filtered.len(), 1);
-        assert!(matches!(filtered[0], SnapshotRef::SessionState(_)));
-    }
-
-    #[test]
-    fn restore_selector_default_returns_all() {
-        let snap = CompositeSnapshotBuilder::new("s1", 1)
-            .session_state("cp")
-            .git_commit("abc")
-            .build();
-
-        let selector = RestoreSelector::default();
-        let filtered = selector.filter_refs(&snap);
-        assert_eq!(filtered.len(), 2);
     }
 
     #[test]
@@ -1112,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_and_apply_recreate_target_snapshot() {
+    fn diff_identifies_target_snapshot_and_changed_dimensions() {
         let mut base = CompositeSnapshotBuilder::new("s1", 1)
             .session_state("000001-heavy.json")
             .workspace_state("s1")
@@ -1134,75 +725,7 @@ mod tests {
         let diff = base.diff(&target);
         assert_eq!(diff.ref_changes.len(), 2);
 
-        let applied = base.apply(&diff).unwrap();
-        assert_eq!(applied, target);
-    }
-
-    #[test]
-    fn merge_combines_non_conflicting_dimensions() {
-        let mut left = CompositeSnapshotBuilder::new("s1", 1)
-            .session_state("000001-heavy.json")
-            .build();
-        left.snapshot_id = "left".into();
-        left.version = 2;
-
-        let mut right = CompositeSnapshotBuilder::new("s1", 3)
-            .git_commit("deadbeef")
-            .workspace_state("s1")
-            .build();
-        right.snapshot_id = "right".into();
-        right.version = 4;
-
-        let merged = left.merge(&right).unwrap();
-        assert_eq!(merged.session_state(), Some("000001-heavy.json"));
-        assert_eq!(merged.git_commit(), Some("deadbeef"));
-        assert_eq!(merged.workspace_state(), Some("s1"));
-        assert_eq!(merged.version, 5);
-    }
-
-    #[test]
-    fn merge_rejects_conflicting_dimensions() {
-        let mut left = CompositeSnapshotBuilder::new("s1", 1)
-            .git_commit("abc")
-            .build();
-        left.snapshot_id = "left".into();
-        let mut right = CompositeSnapshotBuilder::new("s1", 1)
-            .git_commit("def")
-            .build();
-        right.snapshot_id = "right".into();
-
-        let err = left.merge(&right).unwrap_err();
-        assert!(matches!(
-            err,
-            CompositeSnapshotError::MergeConflict {
-                dimension: SnapshotDimension::Git,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn noop_provider_returns_none() {
-        let provider = NoopDataSnapshotProvider;
-        let ctx = SnapshotContext {
-            session_id: "s1".into(),
-            turn: 1,
-            label: None,
-            task_type: None,
-            databases: None,
-        };
-        let result = provider.create_snapshot(&ctx).await.unwrap();
-        assert!(result.is_none());
-        assert!(
-            !provider
-                .snapshot_exists(&DataSnapshotRef {
-                    snapshot_name: "x".into(),
-                    databases: vec![],
-                    timestamp: None,
-                    branch_name: None,
-                })
-                .await
-                .unwrap()
-        );
+        assert_eq!(diff.from, base.identity());
+        assert_eq!(diff.to, target.identity());
     }
 }

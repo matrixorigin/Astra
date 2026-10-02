@@ -132,7 +132,6 @@ pub(crate) struct AdminState {
     pub(crate) token_reader: Arc<dyn AdminTokenReader>,
     pub(crate) token_writer: Arc<dyn AdminTokenWriter>,
     pub(crate) audit_reader: Arc<dyn AdminAuditReader>,
-    pub(crate) feedback_stats_reader: Arc<dyn AdminFeedbackStatsReader>,
     pub(crate) user_role_manager: Arc<dyn AdminUserRoleManager>,
     pub(crate) config_service: Arc<dyn astra_services::AdminConfigService>,
 }
@@ -145,7 +144,6 @@ impl Default for AdminState {
             token_reader: Arc::new(auth::UnconfiguredAdminTokenReader),
             token_writer: Arc::new(auth::UnconfiguredAdminTokenWriter),
             audit_reader: Arc::new(auth::UnconfiguredAdminAuditReader),
-            feedback_stats_reader: Arc::new(auth::UnconfiguredAdminFeedbackStatsReader),
             user_role_manager: Arc::new(auth::UnconfiguredAdminUserRoleManager),
             config_service: Arc::new(astra_services::UnconfiguredAdminConfigService),
         }
@@ -180,10 +178,7 @@ pub struct AppState {
     pub(crate) context_service: Arc<dyn ContextService>,
     pub(crate) decision_service: Arc<dyn DecisionService>,
     pub(crate) model_service: Arc<dyn ModelService>,
-    pub(crate) job_service: Arc<dyn JobService>,
     pub(crate) trigger_service: Arc<dyn TriggerService>,
-    pub(crate) workflow_service: Arc<dyn WorkflowService>,
-    pub(crate) harness_service: Arc<dyn HarnessService>,
     pub(crate) sandbox_service: Arc<dyn SandboxService>,
     pub(crate) branch_service: Arc<dyn BranchService>,
     pub(crate) data_versioning_service: Arc<dyn DataVersioningService>,
@@ -197,7 +192,6 @@ pub struct AppState {
     pub(crate) agent_binding_service: Arc<dyn astra_services::AgentBindingService>,
     pub(crate) llm_trusted_domain_service:
         Arc<dyn astra_services::llm_trusted_domains::LlmTrustedDomainService>,
-    pub(crate) evaluation_service: Arc<dyn EvaluationService>,
     pub(crate) introspection_service: Arc<dyn IntrospectionService>,
     pub(crate) reflect_service: Arc<dyn ReflectService>,
     pub(crate) fernet_encryptor: FernetTokenEncryptor,
@@ -297,10 +291,7 @@ impl AppState {
             context_service: Arc::new(UnconfiguredContextService),
             decision_service: Arc::new(UnconfiguredDecisionService),
             model_service: Arc::new(UnconfiguredModelService),
-            job_service: Arc::new(UnconfiguredJobService),
             trigger_service: Arc::new(UnconfiguredTriggerService),
-            workflow_service: Arc::new(UnconfiguredWorkflowService),
-            harness_service: Arc::new(UnconfiguredHarnessService),
             sandbox_service: Arc::new(UnconfiguredSandboxService),
             branch_service: Arc::new(UnconfiguredBranchService),
             data_versioning_service: Arc::new(UnconfiguredDataVersioningService),
@@ -315,7 +306,6 @@ impl AppState {
             llm_trusted_domain_service: Arc::new(
                 astra_services::llm_trusted_domains::UnconfiguredLlmTrustedDomainService,
             ),
-            evaluation_service: Arc::new(UnconfiguredEvaluationService),
             introspection_service: Arc::new(UnconfiguredIntrospectionService),
             reflect_service: Arc::new(UnconfiguredReflectService),
             fernet_encryptor: FernetTokenEncryptor::new("dev-key-not-for-production")
@@ -540,23 +530,8 @@ impl AppState {
         self
     }
 
-    pub fn with_job_service(mut self, job_service: Arc<dyn JobService>) -> Self {
-        self.job_service = job_service;
-        self
-    }
-
     pub fn with_trigger_service(mut self, trigger_service: Arc<dyn TriggerService>) -> Self {
         self.trigger_service = trigger_service;
-        self
-    }
-
-    pub fn with_workflow_service(mut self, workflow_service: Arc<dyn WorkflowService>) -> Self {
-        self.workflow_service = workflow_service;
-        self
-    }
-
-    pub fn with_harness_service(mut self, harness_service: Arc<dyn HarnessService>) -> Self {
-        self.harness_service = harness_service;
         self
     }
 
@@ -646,14 +621,6 @@ impl AppState {
 
     pub fn with_fernet_encryptor(mut self, encryptor: FernetTokenEncryptor) -> Self {
         self.fernet_encryptor = encryptor;
-        self
-    }
-
-    pub fn with_evaluation_service(
-        mut self,
-        evaluation_service: Arc<dyn EvaluationService>,
-    ) -> Self {
-        self.evaluation_service = evaluation_service;
         self
     }
 
@@ -791,14 +758,6 @@ impl AppState {
         admin_audit_reader: Arc<dyn AdminAuditReader>,
     ) -> Self {
         self.admin.audit_reader = admin_audit_reader;
-        self
-    }
-
-    pub fn with_admin_feedback_stats_reader(
-        mut self,
-        admin_feedback_stats_reader: Arc<dyn AdminFeedbackStatsReader>,
-    ) -> Self {
-        self.admin.feedback_stats_reader = admin_feedback_stats_reader;
         self
     }
 

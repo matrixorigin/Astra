@@ -8,7 +8,6 @@
 //! poison isolation so one bad record cannot block later records forever.
 
 use crate::session_journal::{JournalEvent, JournalEventType};
-use crate::sync_engine::SyncDomain;
 use crate::{OwnerScope, SessionArtifactStore};
 use astra_core::canonical_json_string;
 use fs2::FileExt;
@@ -20,6 +19,27 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Payload domain recorded by the durable outbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncDomain {
+    Events,
+    Tasks,
+    Templates,
+    Preferences,
+}
+
+impl std::fmt::Display for SyncDomain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Events => "events",
+            Self::Tasks => "tasks",
+            Self::Templates => "templates",
+            Self::Preferences => "preferences",
+        })
+    }
+}
 
 pub const SYNC_OUTBOX_SCHEMA_VERSION: u32 = 2;
 pub const SYNC_OUTBOX_MAX_ATTEMPTS: u32 = 5;

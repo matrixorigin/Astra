@@ -224,12 +224,18 @@ mod tests {
             AgentLiveEvent {
                 run_id: "test-run".into(),
                 agent_id: "agent-1".into(),
-                kind: AgentLiveEventKind::OutputDelta("first".into()),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("test-model-item".into()),
+                    text: "first".into(),
+                },
             },
             AgentLiveEvent {
                 run_id: "test-run".into(),
                 agent_id: "agent-1".into(),
-                kind: AgentLiveEventKind::OutputDelta("second".into()),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("test-model-item".into()),
+                    text: "second".into(),
+                },
             },
         ]);
 
@@ -273,7 +279,10 @@ mod tests {
         let output = TuiAppEvent::AgentLive(AgentLiveEvent {
             run_id: "run-child".into(),
             agent_id: "reviewer@run-child".into(),
-            kind: AgentLiveEventKind::OutputDelta("child_evidence_visible".into()),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("test-model-item".into()),
+                text: "child_evidence_visible".into(),
+            },
         });
         chat_widget.handle_event(chat_widget::AppEvent::wire(
             chat_widget::WireEvent::AgentLive(match &output {

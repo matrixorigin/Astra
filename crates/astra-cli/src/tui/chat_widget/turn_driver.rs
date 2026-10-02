@@ -61,12 +61,14 @@ fn canonical_turn_commits_every_cell_kind_in_order() {
     )));
 
     // Model reasons first.
-    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta(
-        "user wants X. ".into(),
-    )));
-    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta(
-        "I'll do Y.".into(),
-    )));
+    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta {
+        model_item_id: None,
+        text: "user wants X. ".into(),
+    }));
+    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta {
+        model_item_id: None,
+        text: "I'll do Y.".into(),
+    }));
     w.handle_event(AppEvent::wire(WireEvent::ReasoningDone));
 
     // Tool invocation mid-turn.
@@ -88,12 +90,14 @@ fn canonical_turn_commits_every_cell_kind_in_order() {
     }));
 
     // Answer streams in two chunks.
-    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
-        "Here is the plan:\n\n".into(),
-    )));
-    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
-        "- step one\n- step two\n".into(),
-    )));
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+        model_item_id: None,
+        text: "Here is the plan:\n\n".into(),
+    }));
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+        model_item_id: None,
+        text: "- step one\n- step two\n".into(),
+    }));
 
     // Turn ends — widget emits the summary.
     w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::new(
@@ -151,9 +155,10 @@ fn canonical_turn_snapshots_full_scrollback() {
         tool_use_id: "tu_drv_2".into(),
         parent_tool_use_id: None,
     }));
-    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
-        "There are 3 files.".into(),
-    )));
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+        model_item_id: None,
+        text: "There are 3 files.".into(),
+    }));
     w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::new(
         TurnStats {
             elapsed_ms: Some(1_200),
@@ -182,10 +187,14 @@ fn interleaved_reasoning_and_answer_collapses_reasoning_first() {
     // Assistant ✓ (not a single mixed cell).
     let mut w = ChatWidget::new("");
     w.handle_event(AppEvent::User(UserEvent::Submit("hi".into())));
-    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta(
-        "some thought".into(),
-    )));
-    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta("answer".into())));
+    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta {
+        model_item_id: None,
+        text: "some thought".into(),
+    }));
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+        model_item_id: None,
+        text: "answer".into(),
+    }));
     w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::new(
         TurnStats {
             elapsed_ms: Some(500),
@@ -241,9 +250,10 @@ fn two_back_to_back_tools_both_commit() {
 fn turn_error_mid_stream_commits_partial_assistant_then_error() {
     let mut w = ChatWidget::new("");
     w.handle_event(AppEvent::User(UserEvent::Submit("hi".into())));
-    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
-        "half an answer".into(),
-    )));
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta {
+        model_item_id: None,
+        text: "half an answer".into(),
+    }));
     w.handle_event(AppEvent::wire(WireEvent::TurnError("rate limited".into())));
 
     // User + partial Assistant + SystemError. No summary on
@@ -271,7 +281,10 @@ async fn partial_interruption_keeps_answer_once_and_renders_safe_notice_separate
     let user_message = "Execution did not reach a verified terminal state. Progress is saved. Review the saved progress, then continue to reconcile the unfinished work.";
 
     stream_tx
-        .send(StreamEvent::Token(assistant_text.into()))
+        .send(StreamEvent::Token {
+            model_item_id: None,
+            text: assistant_text.into(),
+        })
         .await
         .expect("partial assistant text should enter the ordered stream");
     stream_tx

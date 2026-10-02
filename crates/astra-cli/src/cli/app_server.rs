@@ -1006,9 +1006,12 @@ async fn write_stream_notification(writer: &JsonWriter, event: StreamEvent) -> R
 
 fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value)> {
     match event {
-        StreamEvent::Token(delta) if !delta.is_empty() => Some((
+        StreamEvent::Token {
+            model_item_id,
+            text: delta,
+        } if !delta.is_empty() => Some((
             "item/agentMessage/delta",
-            serde_json::json!({"delta": delta}),
+            serde_json::json!({"model_item_id": model_item_id, "delta": delta}),
         )),
         StreamEvent::Thinking(true) => Some((
             "item/started",
@@ -1018,9 +1021,12 @@ fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value
             "item/completed",
             serde_json::json!({"item": {"type": "reasoning"}}),
         )),
-        StreamEvent::ThinkingChunk(text) if !text.is_empty() => Some((
+        StreamEvent::ThinkingChunk {
+            model_item_id,
+            text,
+        } if !text.is_empty() => Some((
             "item/reasoning/textDelta",
-            serde_json::json!({"delta": text}),
+            serde_json::json!({"model_item_id": model_item_id, "delta": text}),
         )),
         StreamEvent::RuntimeFeedback(frame) => Some((
             "turn/runtimeFeedback",
@@ -1925,6 +1931,7 @@ mod tests {
             start_elapsed_ms: None,
             duration_ms: None,
             outcome: None,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),

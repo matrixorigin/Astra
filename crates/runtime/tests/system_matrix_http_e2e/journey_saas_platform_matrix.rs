@@ -1532,40 +1532,6 @@ pub async fn run_saas_session_replay_post_unavailable_guardrail() {
     ctx.close().await;
 }
 
-/// GET /admin/feedback/stats RBAC + filter query (§5.2).
-pub async fn run_saas_admin_feedback_stats_rbac() {
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-    let user_id = ctx.user_id.as_str();
-
-    revoke_astra_admin_role(pool, user_id).await;
-    let (st_denied, _) = get_json(app, "/admin/feedback/stats", Some(auth), &[]).await;
-    assert_eq!(
-        st_denied,
-        StatusCode::FORBIDDEN,
-        "feedback stats without admin"
-    );
-
-    grant_astra_admin_role(pool, user_id).await;
-    let (st_ok, stats_j) = get_json(app, "/admin/feedback/stats", Some(auth), &[]).await;
-    assert_eq!(st_ok, StatusCode::OK, "feedback stats: {stats_j}");
-    assert!(stats_j.get("total_feedback").is_some(), "shape: {stats_j}");
-
-    let (st_filt, filt_j) = get_json(
-        app,
-        "/admin/feedback/stats?agent_id=saas-e2e-agent&since=2020-01-01%2000:00:00",
-        Some(auth),
-        &[],
-    )
-    .await;
-    assert_eq!(st_filt, StatusCode::OK, "filtered stats: {filt_j}");
-
-    ctx.close().await;
-}
-
 /// GET /chat/runs/{id}/projection after POST /chat (§4.3).
 pub async fn run_saas_run_projection_smoke() {
     let b = bootstrap().await;

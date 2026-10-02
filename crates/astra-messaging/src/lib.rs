@@ -4,9 +4,7 @@
 //! hierarchy. Supports in-process (tokio channels) and database-backed
 //! transports.
 
-pub mod ack_tracker;
 pub mod db_transport;
-pub mod dead_letter;
 pub mod delegation;
 pub mod in_process;
 pub mod metrics;
@@ -15,7 +13,6 @@ pub mod transport;
 pub mod types;
 
 // Re-export key types for convenience.
-pub use ack_tracker::{AckConfig, AckOutcome, PendingAckTracker};
 pub use astra_turn_types::{
     AGENT_COMMUNICATION_SCHEMA_VERSION, AgentCommunicationDirection, AgentCommunicationEvent,
     AgentCommunicationParty, AgentCommunicationTarget,
@@ -23,7 +20,6 @@ pub use astra_turn_types::{
 pub use db_transport::{
     CleanupScheduler, DatabaseTransport, TransportMetrics as DbTransportMetrics,
 };
-pub use dead_letter::{DeadLetter, DeadLetterQueue, DeadLetterReason, DeadLetterSummary};
 pub use delegation::{DelegationLookup, SubRunInfo};
 pub use in_process::{InProcessMetrics, InProcessTransport};
 pub use metrics::{

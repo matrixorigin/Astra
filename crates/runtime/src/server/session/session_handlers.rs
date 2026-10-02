@@ -256,6 +256,7 @@ pub(crate) struct TranscriptResponse {
 
 #[derive(Serialize)]
 pub(crate) struct TranscriptItemResponse {
+    pub model_item_id: Option<String>,
     pub session_id: String,
     pub item_seq: i64,
     pub run_id: Option<String>,
@@ -841,6 +842,7 @@ fn decode_transcript_item(row: &impl RowExt) -> Result<TranscriptItemResponse, S
         .map_err(|error| format!("decode transcript payload: {error}"))?
         .unwrap_or_default();
     Ok(TranscriptItemResponse {
+        model_item_id: payload.model_item_id,
         session_id: session_row_string(row, "session_id")?,
         item_seq: session_row_i64(row, "item_seq")?,
         run_id,
@@ -3043,7 +3045,7 @@ fn session_cancellation_response(
         Json(CancelSessionResponse {
             session,
             execution_settled: cancellation.execution_settled,
-            workspace_blocker: cancellation.workspace_blocker,
+            execution_blocker: cancellation.execution_blocker,
             runs: cancellation
                 .runs
                 .into_iter()
@@ -3800,7 +3802,7 @@ mod tests {
                 astra_services::runs::CancelSessionRecord {
                     runs: vec![],
                     execution_settled: settled,
-                    workspace_blocker: (!settled).then_some(astra_services::session_context_coordinator::WorkspaceReuseBlocker::UnresolvedTool),
+                    execution_blocker: (!settled).then_some(astra_services::session_context_coordinator::SessionExecutionBlocker::UnresolvedTool),
                 },
             );
             let wire = serde_json::to_value(body).unwrap();
@@ -3824,9 +3826,9 @@ mod tests {
             assert_eq!(wire["execution_settled"], settled);
             assert_eq!(wire["runs"], json!([]));
             if settled {
-                assert!(wire.get("workspace_blocker").is_none());
+                assert!(wire.get("execution_blocker").is_none());
             } else {
-                assert_eq!(wire["workspace_blocker"], "unresolved_tool");
+                assert_eq!(wire["execution_blocker"], "unresolved_tool");
             }
         }
     }
@@ -3848,6 +3850,7 @@ mod tests {
 
     fn transcript_item(run_id: &str, item_seq: i64, content: &str) -> TranscriptItemResponse {
         TranscriptItemResponse {
+            model_item_id: None,
             session_id: "session-1".to_string(),
             item_seq,
             run_id: Some(run_id.to_string()),
@@ -3972,7 +3975,7 @@ mod tests {
                 "canonical_root_hash" => Some("a".repeat(64)),
                 "source_event_id" => None,
                 "payload_json" => Some(
-                    r#"{"reasoning":"thinking","reasoning_status":"complete","tool_calls":[{"tool_use_id":"call-1","name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}]}"#
+                    r#"{"model_item_id":"accepted-A","reasoning":"thinking","reasoning_status":"complete","tool_calls":[{"tool_use_id":"call-1","name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}]}"#
                         .to_string(),
                 ),
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
@@ -4669,6 +4672,7 @@ mod tests {
         assert_eq!(item.run_id.as_deref(), Some("run-1"));
         assert_eq!(item.role, "assistant");
         assert_eq!(item.content, "answer");
+        assert_eq!(item.model_item_id.as_deref(), Some("accepted-A"));
         assert_eq!(item.reasoning.as_deref(), Some("thinking"));
         assert_eq!(item.reasoning_status.as_deref(), Some("complete"));
         assert_eq!(item.tool_calls.len(), 1);

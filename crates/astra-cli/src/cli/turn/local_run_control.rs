@@ -89,13 +89,23 @@ struct LocalRunControlState {
 /// runs use this turn-scoped provider so the same runtime polling paths can
 /// observe user cancellation and active-run guidance without requiring a server-side
 /// workspace executor.
-#[derive(Default)]
 pub(crate) struct LocalRunControl {
     // This lock is only held for short in-memory queue mutations and never
     // across an `.await`, so a std::sync::Mutex keeps the local TUI hot path
     // simple without introducing async lock wakeups.
     state: Mutex<LocalRunControlState>,
     remote_disposition_notify: Arc<tokio::sync::Notify>,
+    input_wake: tokio::sync::watch::Sender<i64>,
+}
+
+impl Default for LocalRunControl {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(LocalRunControlState::default()),
+            remote_disposition_notify: Arc::new(tokio::sync::Notify::new()),
+            input_wake: tokio::sync::watch::channel(-1).0,
+        }
+    }
 }
 
 impl LocalRunControl {
@@ -400,6 +410,12 @@ impl LocalRunControl {
             event_index,
             input,
         });
+        let watermark = i64::try_from(event_index).unwrap_or(i64::MAX);
+        self.input_wake.send_if_modified(|current| {
+            let changed = watermark > *current;
+            *current = (*current).max(watermark);
+            changed
+        });
         UserIntentReceipt {
             run_id: None,
             intent_id,
@@ -433,6 +449,10 @@ impl RunStatusProvider for LocalRunControl {
 
 #[async_trait::async_trait]
 impl UserIntentProvider for LocalRunControl {
+    fn input_wake(&self) -> Option<tokio::sync::watch::Receiver<i64>> {
+        Some(self.input_wake.subscribe())
+    }
+
     fn has_pending_inputs(&self) -> bool {
         !recover_mutex_lock(&self.state).intents.is_empty()
     }
@@ -576,6 +596,26 @@ impl UserIntentProvider for LocalRunControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn accepted_local_input_wakes_the_shared_loop_without_extra_polling() {
+        let provider = LocalRunControl::default();
+        let mut wake = provider.input_wake().expect("local input readiness");
+        assert_eq!(*wake.borrow_and_update(), -1);
+        provider
+            .accept_runtime_notification("child finished")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.changed())
+            .await
+            .expect("input wake")
+            .unwrap();
+        assert_eq!(*wake.borrow_and_update(), 1);
+        let observed = provider
+            .poll_user_intents("local-user", "run-local", 0)
+            .await;
+        assert_eq!(observed.inputs.len(), 1);
+        assert_eq!(observed.next_cursor, 1);
+    }
 
     #[tokio::test]
     async fn local_run_control_polls_runtime_notifications_after_cursor() {

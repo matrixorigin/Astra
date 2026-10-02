@@ -10,7 +10,6 @@ use crate::cli::cloud_sync::{
 };
 use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::cli::session::session_state::SessionState;
-use crate::cli::slash::{slash_health, slash_router::handle_slash_command};
 use crate::tests::isolate_credentials;
 use astra_services::SyncOutboxStore;
 use astra_services::session_journal::{self, JournalDirGuard, ProcessJournalDirGuard};
@@ -92,102 +91,6 @@ fn install_test_cloud_auth(access_token: Option<&str>) -> TestCloudAuth {
         _identity: identity,
         _credentials: credentials,
     }
-}
-
-// ── slash_health::format_sync_age tests ────────────────────────────────────────────
-
-#[test]
-fn format_sync_age_rfc3339() {
-    let now = chrono::Utc::now();
-    let ts = now.to_rfc3339();
-    let age = slash_health::format_sync_age(&ts);
-    // Should be "just now" or "0s ago" or "1s ago"
-    assert!(
-        age.contains("s ago") || age == "just now",
-        "unexpected age for just-now timestamp: {age}"
-    );
-}
-
-#[test]
-fn format_sync_age_minutes_ago() {
-    let now = chrono::Utc::now();
-    let five_min_ago = now - chrono::Duration::minutes(5);
-    let ts = five_min_ago.to_rfc3339();
-    let age = slash_health::format_sync_age(&ts);
-    assert!(
-        age.contains("m ago"),
-        "expected minutes-ago format, got: {age}"
-    );
-}
-
-#[test]
-fn format_sync_age_hours_ago() {
-    let now = chrono::Utc::now();
-    let two_hours_ago = now - chrono::Duration::hours(2);
-    let ts = two_hours_ago.to_rfc3339();
-    let age = slash_health::format_sync_age(&ts);
-    assert!(
-        age.contains("h ago"),
-        "expected hours-ago format, got: {age}"
-    );
-}
-
-#[test]
-fn format_sync_age_days_ago() {
-    let now = chrono::Utc::now();
-    let three_days_ago = now - chrono::Duration::days(3);
-    let ts = three_days_ago.to_rfc3339();
-    let age = slash_health::format_sync_age(&ts);
-    assert!(
-        age.contains("d ago"),
-        "expected days-ago format, got: {age}"
-    );
-}
-
-#[test]
-fn format_sync_age_mysql_datetime() {
-    // MySQL DATETIME without timezone — should parse as UTC
-    let age = slash_health::format_sync_age("2020-01-01 00:00:00");
-    assert!(
-        age.contains("d ago"),
-        "expected days-ago for old mysql datetime, got: {age}"
-    );
-}
-
-#[test]
-fn format_sync_age_unparseable_returns_raw() {
-    let raw = "not-a-timestamp";
-    let age = slash_health::format_sync_age(raw);
-    assert_eq!(age, raw, "unparseable should return raw string");
-}
-
-#[test]
-fn display_sync_status_no_crash_all_none() {
-    let status = astra_services::SyncStatus::default();
-    // Just verify no panic — output goes to stderr
-    slash_health::display_sync_status(&status);
-}
-
-#[test]
-fn display_sync_status_no_crash_full_data() {
-    let status = astra_services::SyncStatus {
-        preferences_last_sync: Some(chrono::Utc::now().to_rfc3339()),
-        pending_pushes: 2,
-        last_error: Some("connection reset by peer".into()),
-        ..Default::default()
-    };
-    slash_health::display_sync_status(&status);
-}
-
-#[serial_test::serial]
-#[tokio::test]
-async fn slash_health_offline_shows_cloud_section() {
-    let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-    let mut state = SessionState::default();
-    let exit = handle_slash_command("/health", &api, None, &mut state, None)
-        .await
-        .unwrap();
-    assert!(!exit);
 }
 
 // ── Cloud sync regression tests ─────────────────────────────────────

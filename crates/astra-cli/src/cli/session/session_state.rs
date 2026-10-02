@@ -426,8 +426,6 @@ pub(crate) struct SessionState {
     pub project_instructions: Option<String>,
     /// Shared messaging metrics (populated when delegation is active).
     pub messaging_metrics: Option<std::sync::Arc<astra_messaging::MessagingMetrics>>,
-    /// Shared dead letter queue (populated when delegation is active).
-    pub dead_letter_queue: Option<std::sync::Arc<astra_messaging::dead_letter::DeadLetterQueue>>,
     /// Dynamic agent spawner for runtime agent creation.
     pub agent_spawner: Option<std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Session-scoped typed authority for every asynchronous work kind. Model
@@ -683,9 +681,6 @@ impl Default for SessionState {
             project_instructions: None,
             // Create shared messaging infrastructure eagerly so /messaging always has data
             messaging_metrics: Some(std::sync::Arc::new(astra_messaging::MessagingMetrics::new())),
-            dead_letter_queue: Some(std::sync::Arc::new(
-                astra_messaging::dead_letter::DeadLetterQueue::new(),
-            )),
             agent_spawner: None, // Created lazily when agent spawning is first used
             active_work_registry: std::sync::Arc::new(
                 astra_core::work_unit::ActiveWorkRegistry::default(),
@@ -912,10 +907,9 @@ impl SessionState {
     pub async fn unregister_root_mailbox(&mut self) {
         if let Some(mailbox) = self.root_mailbox.take() {
             let addr = mailbox.address.clone();
-            let router = mailbox.router();
-            if let Err(e) = router.unregister(&addr).await {
+            if let Err(e) = mailbox.retire().await {
                 eprintln!(
-                    "astra: failed to unregister root mailbox run_id={} agent_id={}: {e}",
+                    "astra: failed to retire root mailbox run_id={} agent_id={}: {e}",
                     addr.run_id, addr.agent_id
                 );
             }

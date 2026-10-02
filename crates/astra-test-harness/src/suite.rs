@@ -624,7 +624,7 @@ impl<'a> SuiteRunner<'a> {
         }
     }
 
-    async fn run_one(&self, case: &Case, model: &str) -> CaseRunReport {
+    async fn run_one(&self, case: &Case, model: &str, run_index: u32) -> CaseRunReport {
         if let Some(report) = self.skip_for_unsupported_cache_scope(case, model) {
             eprintln!(
                 "[astra-test] [UNAVAILABLE] {} × {} (unsupported cache scope)",
@@ -816,6 +816,7 @@ impl<'a> SuiteRunner<'a> {
                 // Evidence remains on attempts/steps. The aggregate is not a
                 // physical execution scope and must not inherit one capture.
                 outcome.explain_capture = None;
+                outcome.stream_capture = None;
                 outcome.completion_tokens += step_outcome.completion_tokens;
                 outcome.prompt_tokens += step_outcome.prompt_tokens;
                 outcome.cached_input_tokens += step_outcome.cached_input_tokens;
@@ -899,6 +900,7 @@ impl<'a> SuiteRunner<'a> {
                     .duration_ms
                     .saturating_add(first_attempt.duration_ms);
                 outcome.explain_capture = None;
+                outcome.stream_capture = None;
                 if !first_attempt.stderr.is_empty() {
                     outcome.stderr = format!(
                         "[attempt 0 stderr]\n{}\n[attempt 1 stderr]\n{}",
@@ -1189,6 +1191,25 @@ impl<'a> SuiteRunner<'a> {
             None
         };
         let mut cleanup_errors: Vec<String> = teardown_error.into_iter().collect();
+        let stream_archive_ready = match self.runner_cfg.artifacts_dir.as_deref() {
+            Some(dir) => match crate::artifacts::persist_stream_capture(
+                dir,
+                &case.name,
+                model,
+                run_index,
+                &attempts,
+                &step_results,
+            ) {
+                Ok(()) => true,
+                Err(error) => {
+                    cleanup_errors.push(format!(
+                        "stream evidence persistence failed; owned sessions retained: {error}"
+                    ));
+                    false
+                }
+            },
+            None => true,
+        };
         cleanup_errors.extend(
             self.cleanup_session_owned_memories(case, session.as_ref())
                 .await,
@@ -1201,7 +1222,7 @@ impl<'a> SuiteRunner<'a> {
             let (ready_ids, capture_errors) =
                 cleanup_ready_session_ids(&owned_session_ids, &cleanup_captures);
             cleanup_errors.extend(capture_errors);
-            for session_id in ready_ids {
+            for session_id in ready_ids.into_iter().filter(|_| stream_archive_ready) {
                 if let Err(error) = delete_server_session(
                     &self.runner_cfg.astra_bin,
                     self.runner_cfg.profile.as_deref(),
@@ -1260,7 +1281,7 @@ impl<'a> SuiteRunner<'a> {
             } else {
                 CaseRunStatus::Failed
             },
-            run_index: 0, // overwritten by caller
+            run_index,
             capability: case.capability.clone(),
             weight: case.weight,
             difficulty: case.difficulty,
@@ -1292,7 +1313,7 @@ impl<'a> SuiteRunner<'a> {
         run_index: u32,
     ) -> CaseRunReport {
         let started = Instant::now();
-        let mut execution = Box::pin(self.run_one(case, model));
+        let mut execution = Box::pin(self.run_one(case, model, run_index));
         let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
         // Consume interval's immediate first tick so the first heartbeat is
         // a real five-second observation rather than a duplicate start event.
@@ -1991,6 +2012,7 @@ mod tests {
             prompt_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_tokens: 0,
+            token_usage_coverage: None,
             duration_ms: 12,
             turn_rounds: 1,
             cache_hits: 0,
@@ -2000,6 +2022,7 @@ mod tests {
             interruption_kind: None,
             error_kind: None,
             explain_capture: None,
+            stream_capture: None,
             tool_result_class_counts: std::collections::BTreeMap::new(),
         }
     }
@@ -3266,7 +3289,12 @@ mod tests {
         let exec = FakeExecutor::new();
         let judger = FixedJudger { score: 1.0 };
         let loader = NoopSessionLoader;
-        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked = tmp.path().join("blocked");
+        std::fs::write(&blocked, "not a directory").unwrap();
+        let mut cfg =
+            RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        cfg.artifacts_dir = Some(blocked);
         let runner = SuiteRunner {
             executor: &exec,
             judger: &judger,
@@ -3290,7 +3318,105 @@ mod tests {
             report.runs[0].failure_class,
             Some(FailureClass::PlatformSetupFailed)
         );
-        assert_eq!(report.runs[0].cleanup_errors.len(), 1);
+        assert_eq!(report.runs[0].cleanup_errors.len(), 2);
+        assert!(
+            report.runs[0]
+                .cleanup_errors
+                .iter()
+                .any(|error| error.contains("stream evidence persistence failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_archive_precedes_deletion_and_failure_retains_session() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        for blocked in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let shim = tmp.path().join("astra-delete-shim");
+            crate::test_support::write_executable_shim(&shim, concat!(
+                "#!/bin/sh\n",
+                "[ -s \"${0%/*}/artifacts/archive/m/0/stream-events.json\" ] || exit 88\n",
+                "if [ \"$1\" = session ] && [ \"$2\" = cancel ]; then\n",
+                "  printf '%s\\n' '{\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"status\":\"cancelled\",\"execution_settled\":true}'\n",
+                "elif [ \"$1\" = session ] && [ \"$2\" = delete ]; then\n",
+                "  touch \"${0%/*}/deleted\"\n",
+                "else exit 89; fi\n",
+            )).unwrap();
+            let mut outcomes = Vec::new();
+            for run_id in ["root", "step"] {
+                let mut outcome = outcome_ok("m", "answer", &[]).with_final_state("completed");
+                outcome.run_id = Some(run_id.into());
+                let mut capture = crate::runner::StreamCapture::default();
+                capture.session_id = outcome.session_id.clone();
+                capture.root_run_id = outcome.run_id.clone();
+                outcome.stream_capture = Some(capture);
+                outcomes.push(outcome);
+            }
+            let exec = SequenceExecutor {
+                outcomes: std::sync::Mutex::new(outcomes),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let judger = FixedJudger { score: 1.0 };
+            let loader = FixedSessionLoader {
+                capture: SessionCapture {
+                    session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+                    ..Default::default()
+                },
+            };
+            let mut cfg = RunnerConfig::new(shim).with_fallback_models(vec!["m".into()]);
+            cfg.cleanup_created_sessions = true;
+            cfg.artifacts_dir = Some(tmp.path().join("artifacts"));
+            if blocked {
+                std::fs::write(cfg.artifacts_dir.as_ref().unwrap(), "blocked").unwrap();
+            }
+            let runner = SuiteRunner {
+                executor: &exec,
+                judger: &judger,
+                session_loader: &loader,
+                digest_collector: None,
+                runner_cfg: cfg,
+                no_judger: true,
+                session_mode: SessionCaptureMode::Never,
+                suite_cfg: SuiteConfig::default(),
+                dashboard_tx: None,
+                run_id: String::new(),
+                cancel_flag: None,
+            };
+            let mut case = case_with("archive", vec![Criterion::ExitCode { code: 0 }]);
+            case.steps.push(crate::case::CaseStep {
+                prompt: "excluded follow-up prompt".into(),
+                criteria: vec![],
+                timeout_seconds: None,
+            });
+            let report = runner.run_all(&[case]).await;
+            let run = &report.runs[0];
+            assert_eq!(tmp.path().join("deleted").exists(), !blocked);
+            assert_eq!(run.is_passed(), !blocked);
+            assert!(
+                run.outcome.stream_capture.is_none(),
+                "aggregate has no physical stream"
+            );
+            if blocked {
+                assert_eq!(run.failure_class, Some(FailureClass::HarnessCleanupFailed));
+                assert!(
+                    run.cleanup_errors
+                        .iter()
+                        .any(|error| error.contains("owned sessions retained"))
+                );
+                assert!(run.criteria.iter().all(|criterion| criterion.passed));
+            } else {
+                let saved: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(tmp.path().join("artifacts/archive/m/0/stream-events.json"))
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(saved[0]["capture"]["root_run_id"], "root");
+                assert_eq!(saved[1]["capture"]["root_run_id"], "step");
+                assert_eq!(saved[1]["kind"], "step");
+            }
+        }
     }
 
     #[tokio::test]

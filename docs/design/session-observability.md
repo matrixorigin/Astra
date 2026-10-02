@@ -57,6 +57,14 @@ Progress should be derived from durable events:
 - checkpoint saved;
 - stream cursor advanced.
 
+The explicit CLI `journal digest` reads the complete authorized profile and
+attached account journals. Terminal turn usage is the qualified accounting
+source; `LlmRound` tokens are a separate diagnostic observation. The JSON
+`usage_coverage` and round-conflict fields identify unknown buckets and
+excluded contradictions. Root-plus-child observed totals mix sources and are
+never a bill or proof of complete session cost. No journal cursor grants
+access to another owner's file.
+
 ## Stuck detection
 
 A run may appear stuck because of:
@@ -76,6 +84,18 @@ The projection should expose the specific reason and next action.
 ## Stream events
 
 Stream events are transport projections of durable or near-durable facts. They should carry enough information to repair UI state after reconnect.
+
+Model output and reasoning carry `model_item_id`, the identity of their physical
+model message, separately from run, request, and transcript receipt identities.
+Live buffering, deferred delivery, durable projection, and replay preserve that
+identity. It is observation metadata, not provider-facing prompt content.
+
+A durable assistant item retires only live fragments with the same model item
+identity and a represented part: output does not retire unpersisted reasoning.
+Equal text from different model items remains distinct. Missing identity is not
+permission to reconcile by text, completion status, or the latest commit cursor.
+This reconciliation uses the existing transcript page; it requires no extra
+database lookup. Parent and child views apply the same identity contract.
 
 Tool terminal projections preserve execution facts independently of display
 previews. `executed` describes this call: `false` means no execution, `true`

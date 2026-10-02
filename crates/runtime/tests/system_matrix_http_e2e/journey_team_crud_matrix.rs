@@ -12,7 +12,7 @@ fn minimal_team_payload(name: &str, description: &str) -> Value {
     json!({
         "name": name,
         "description": description,
-        "coordination": { "type": "pipeline" },
+        "coordination": { "type": "sequential", "stop_on_success": false },
         "members": [
             {
                 "role": "coder",

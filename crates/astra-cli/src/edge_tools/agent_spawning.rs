@@ -21,6 +21,10 @@ pub async fn handle_agent_get_result_action(
     astra_runtime::orchestration::handle_agent_get_result_action(args, ctx).await
 }
 
+pub async fn handle_agent_list_action(args: &Value, ctx: Option<&AgentActionContext>) -> String {
+    astra_runtime::orchestration::handle_agent_list_action(args, ctx).await
+}
+
 /// Handle `agent(action='send_message')` using the same mailbox contract as
 /// the server tool surface.
 pub async fn handle_agent_send_message_action(
@@ -42,6 +46,7 @@ pub async fn handle_agent_send_message_action(
         mailbox_ctx.router.as_ref(),
         &mailbox_ctx.run_id,
         &mailbox_ctx.agent_id,
+        mailbox_ctx.reply_obligations.as_ref(),
     )
     .await
 }

@@ -178,8 +178,16 @@ slash_dispatch::dispatch("/model", ctx)
 The bare `/` popup always lists every TUI-native root command. Featured
 commands sort first, but the primary marker never filters the list. `/help`
 opens a Featured tab plus task-group tabs whose combined contents are the full
-TUI catalog. Line-mode-only commands stay out of both discovery surfaces and
-show an unavailable message if typed in the workbench.
+TUI catalog. Commands without native workbench actions stay out of both
+discovery surfaces and show an unavailable message if typed. Non-interactive
+CLI commands use `command_router`; there is no console slash frontend.
+
+Catalog lookup and request Offering identity are owned by `session_runtime`.
+Cost presentation uses `session_stats_scan`; MCP command parsing and completions
+live in `slash_dispatch`. Typed workbench inspection lives in `inspection`,
+separate from panel rendering. Clipboard process handling is shared through
+`cli::clipboard`. CLI workspace review/search use `cli::workspace_inspection`,
+not an interactive fallback dispatcher.
 
 ## Resume flow (startup or `/resume`)
 

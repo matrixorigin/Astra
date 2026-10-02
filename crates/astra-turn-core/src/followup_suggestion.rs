@@ -1,7 +1,6 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FollowupSuggestionKind {
     Validate,
-    Commit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,23 +25,15 @@ pub fn suggest_followup(
 
     let lexicon = suggestion_lexicon(trimmed, assistant_text);
     let edited = tool_markers.iter().any(|tool| is_edit_tool(tool));
-    let validated = tool_markers.iter().any(|tool| is_validation_tool(tool));
 
     if let Some(question_reply) =
-        suggest_reply_to_assistant_question(assistant_text, edited, validated, &lexicon)
+        suggest_reply_to_assistant_question(assistant_text, edited, &lexicon)
     {
         return Some(question_reply);
     }
 
     if assistant_requests_reply(assistant_text) {
         return None;
-    }
-
-    if edited && validated {
-        return Some(FollowupSuggestion {
-            text: lexicon.commit.to_string(),
-            kind: FollowupSuggestionKind::Commit,
-        });
     }
 
     if edited {
@@ -57,19 +48,16 @@ pub fn suggest_followup(
 
 struct SuggestionLexicon {
     validate: &'static str,
-    commit: &'static str,
 }
 
 fn suggestion_lexicon(line: &str, assistant_text: &str) -> SuggestionLexicon {
     if prefers_chinese(line) || prefers_chinese(assistant_text) {
         SuggestionLexicon {
             validate: "跑一下测试",
-            commit: "提交一下",
         }
     } else {
         SuggestionLexicon {
             validate: "run the tests",
-            commit: "commit this",
         }
     }
 }
@@ -84,10 +72,6 @@ fn is_edit_tool(tool: &str) -> bool {
         tool,
         "write_file" | "str_replace" | "multi_edit" | "create_file" | "delete_file" | "move_file"
     )
-}
-
-fn is_validation_tool(tool: &str) -> bool {
-    matches!(tool, "run_build_test")
 }
 
 fn assistant_requests_reply(full_text: &str) -> bool {
@@ -117,7 +101,6 @@ fn assistant_requests_reply(full_text: &str) -> bool {
 fn suggest_reply_to_assistant_question(
     full_text: &str,
     edited: bool,
-    validated: bool,
     lexicon: &SuggestionLexicon,
 ) -> Option<FollowupSuggestion> {
     if !assistant_requests_reply(full_text) {
@@ -125,13 +108,6 @@ fn suggest_reply_to_assistant_question(
     }
 
     let lower = full_text.to_ascii_lowercase();
-
-    if edited && validated && mentions_commit_question(&lower, full_text) {
-        return Some(FollowupSuggestion {
-            text: lexicon.commit.to_string(),
-            kind: FollowupSuggestionKind::Commit,
-        });
-    }
 
     if edited && mentions_test_question(&lower, full_text) {
         return Some(FollowupSuggestion {
@@ -151,10 +127,6 @@ fn mentions_test_question(lower: &str, full_text: &str) -> bool {
         || lower.contains("verify it")
         || full_text.contains("测试")
         || full_text.contains("验证")
-}
-
-fn mentions_commit_question(lower: &str, full_text: &str) -> bool {
-    lower.contains("commit") || full_text.contains("提交")
 }
 
 fn assistant_looks_incomplete(full_text: &str) -> bool {

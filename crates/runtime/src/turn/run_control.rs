@@ -17,6 +17,16 @@ pub enum RunControlStatus {
     Paused,
 }
 
+/// One narrow control read. The event index is only a wake hint; the intent
+/// provider still owns pagination, apply acknowledgement and execution fences.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunControlObservation {
+    pub status: Option<RunControlStatus>,
+    pub last_event_idx: Option<i64>,
+    pub session_id: Option<String>,
+    pub run_generation: Option<u64>,
+}
+
 /// Authority presented when changing current-run guidance admission.
 ///
 /// Keeping local ownership and durable lease ownership as distinct variants
@@ -192,6 +202,20 @@ pub trait RunStatusProvider: Send + Sync {
         run_id: &str,
     ) -> Result<Option<RunControlStatus>, String>;
 
+    /// Observe control and the run's event watermark in the same read when a
+    /// durable provider supports it. Other providers retain status-only
+    /// behavior without inventing a watermark.
+    async fn control_observation(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<RunControlObservation, String> {
+        Ok(RunControlObservation {
+            status: self.control_status(user_id, run_id).await?,
+            ..RunControlObservation::default()
+        })
+    }
+
     /// Resolve the canonical origin for an observed cancellation. Providers
     /// without durable user-request evidence treat status/token cancellation
     /// as runtime-owned; lookup failures must be returned so callers can
@@ -208,6 +232,12 @@ pub trait RunStatusProvider: Send + Sync {
 /// Polls durable user intents accepted while a run is executing.
 #[async_trait]
 pub trait UserIntentProvider: Send + Sync {
+    /// Optional process-local readiness signal. It carries no input payload
+    /// or authority; the ordinary poll/apply path remains the sole consumer.
+    fn input_wake(&self) -> Option<tokio::sync::watch::Receiver<i64>> {
+        None
+    }
+
     /// Cheap local wake hint. Durable providers may keep the default and use
     /// the bounded poll cadence; in-process providers override it so newly
     /// queued guidance/runtime facts reach the very next model boundary.

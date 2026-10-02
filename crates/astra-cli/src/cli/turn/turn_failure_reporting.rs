@@ -101,76 +101,13 @@ pub(crate) fn report_admission_rejection(
         ui.show_error(&message);
         return;
     }
-    if failure.partial.error_code.as_deref() == Some("execution_workspace_claimed") {
-        let owner = metadata
-            .and_then(|value| value.get("owner_session_id"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.trim().is_empty());
-        // Keep the newly-created Session attached. It is a real, empty
-        // Session whose execution has not been admitted; clearing only the
-        // local identity would leave the remote row and long-lived producers
-        // out of sync. The owner is retained as an explicit recovery target
-        // for `/session` and `/resume`, never auto-restored.
-        if state.turn == 0
-            && state.history.is_empty()
-            && let Some(owner) = owner
-        {
-            state.pending_recovery = Some(owner.to_string());
-        }
-        let mut message = admission_rejection_message(draft_restored, true);
-        message.push_str(&workspace_claim_guidance(
-            owner,
-            workspace_recovery_action(metadata),
-        ));
-        message.push_str("  No model or tool ran.");
-        ui.show_error(&message);
-        return;
-    }
-    let mut message = admission_rejection_message(draft_restored, false);
+    let mut message = admission_rejection_message(draft_restored);
     message.push_str("  No model or tool ran.");
     ui.show_error(&message);
 }
 
-fn workspace_recovery_action(metadata: Option<&serde_json::Value>) -> Option<&str> {
-    let action = metadata
-        .and_then(|value| value.get("recovery_action"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|action| !action.is_empty());
-    if action.is_some() {
-        return action;
-    }
-    match metadata
-        .and_then(|value| value.get("workspace_blocker"))
-        .and_then(serde_json::Value::as_str)
-    {
-        Some("execution_slot" | "active_run") => Some("wait_or_cancel_session"),
-        Some("writer_or_reservation" | "claim_changed") => Some("retry_session"),
-        Some(
-            "settlement_pending" | "binding_not_ready" | "unresolved_tool" | "owner_unavailable",
-        ) => Some("inspect_session"),
-        _ => None,
-    }
-}
-
-fn workspace_claim_guidance(owner: Option<&str>, recovery_action: Option<&str>) -> String {
-    let owner = owner.unwrap_or("the previous session");
-    match recovery_action {
-        Some("wait_or_cancel_session") => format!(
-            "  Session {owner} still holds this directory.\n  Wait for it to finish, or stop it with `astra session cancel {owner}` and retry.\n  Use another worktree for concurrent work.\n"
-        ),
-        Some("retry_session") => "  A conversation write is still settling. Retry this message; do not cancel the session.\n".to_string(),
-        _ => format!(
-            "  Session {owner} still has unfinished execution state.\n  Inspect it with `astra session show {owner}` before retrying.\n  Use another worktree for concurrent work.\n"
-        ),
-    }
-}
-
-fn admission_rejection_message(draft_restored: bool, workspace_claimed: bool) -> String {
-    let mut message = if workspace_claimed {
-        String::from("Workspace is already in use\n")
-    } else {
-        String::from("Session execution is busy\n")
-    };
+fn admission_rejection_message(draft_restored: bool) -> String {
+    let mut message = String::from("Session execution is busy\n");
     if draft_restored {
         message.push_str("  Your message was not sent; the draft is back in the composer.\n");
     } else {
@@ -485,7 +422,7 @@ mod tests {
             "draft",
             Some("session-current"),
         ));
-        let message = admission_rejection_message(false, true);
+        let message = admission_rejection_message(false);
         assert!(message.contains("retry it after the conflict clears"));
         assert!(!message.contains("back in the composer"));
     }
@@ -997,88 +934,6 @@ mod tests {
         assert!(shown.contains("do not cancel"));
         assert!(!shown.contains("astra session cancel"));
         assert!(!shown.contains("astra --resume"));
-    }
-
-    #[test]
-    fn workspace_claim_guidance_follows_the_server_recovery_action() {
-        for (action, expected, forbidden) in [
-            (
-                "wait_or_cancel_session",
-                "astra session cancel owner-session",
-                "/resume",
-            ),
-            ("retry_session", "do not cancel the session", "/resume"),
-            (
-                "inspect_session",
-                "astra session show owner-session",
-                "/resume",
-            ),
-        ] {
-            let mut state = SessionState::default();
-            let failure = crate::TurnFailure {
-                error: "workspace is busy".into(),
-                partial: crate::PartialTurnData {
-                    error_code: Some("execution_workspace_claimed".into()),
-                    error_metadata: Some(serde_json::json!({
-                        "admission_state": "rejected",
-                        "recovery_action": action,
-                        "workspace_blocker": "execution_slot",
-                        "owner_session_id": "owner-session"
-                    })),
-                    admission_rejected: true,
-                    ..Default::default()
-                },
-            };
-            let mut ui = crate::tests::TestUi::default();
-            report_admission_rejection(&mut state, "draft", &failure, &mut ui);
-            let shown = ui.errors.join("\n");
-            assert!(shown.contains("Workspace is already in use"), "{shown}");
-            assert!(shown.contains(expected), "{action}: {shown}");
-            assert!(!shown.contains(forbidden), "{action}: {shown}");
-            assert_eq!(ui.restored_inputs, vec!["draft"]);
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn admission_rejection_keeps_the_previous_recovery_pointer() {
-        let _credentials = crate::tests::isolate_credentials();
-        let mut credentials = crate::cli::cli_config::cli_utils::CredentialsFile::default();
-        credentials.profiles.insert(
-            "default".to_string(),
-            crate::cli::cli_config::cli_utils::Profile {
-                last_session_id: Some("previous-session".to_string()),
-                ..Default::default()
-            },
-        );
-        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
-
-        let mut state = SessionState::default();
-        let failure = crate::TurnFailure {
-            error: "workspace is busy".into(),
-            partial: crate::PartialTurnData {
-                session_id: Some("draft-session".into()),
-                error_code: Some("execution_workspace_claimed".into()),
-                error_metadata: Some(serde_json::json!({
-                    "admission_state": "rejected",
-                    "owner_session_id": "owner-session"
-                })),
-                admission_rejected: true,
-                ..Default::default()
-            },
-        };
-        let mut ui = crate::tests::TestUi::default();
-
-        report_admission_rejection(&mut state, "draft", &failure, &mut ui);
-
-        assert_eq!(
-            crate::cli::cli_config::cli_utils::load_credentials().profiles["default"]
-                .last_session_id
-                .as_deref(),
-            Some("previous-session"),
-            "a rejected draft must never replace the last resumable session"
-        );
-        assert_eq!(ui.restored_inputs, vec!["draft"]);
     }
 
     #[test]

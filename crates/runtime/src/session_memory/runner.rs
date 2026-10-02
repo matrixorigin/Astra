@@ -2254,49 +2254,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_extraction_rejects_harness_scope_before_provider_or_memoria_io() {
-        let purposes = Arc::new(Mutex::new(Vec::new()));
-        let scopes = Arc::new(Mutex::new(Vec::new()));
-        let client = CapturingMemoryInference {
-            purposes: Arc::clone(&purposes),
-            scopes: Arc::clone(&scopes),
-            deadlines: Arc::new(Mutex::new(Vec::new())),
-        };
-        let memoria = Arc::new(CapturingMemoria::default());
-        let memoria_port = Arc::clone(&memoria) as Arc<dyn MemoriaPort>;
-        let scope = astra_turn_types::InferenceInvocationScope::HarnessRun {
-            harness_run_id: "harness-not-a-session".to_string(),
-            operation_id: "skill_synthesis".to_string(),
-            logical_attempt: 0,
-        };
-
-        let artifacts = run_extraction(
-            &memoria_port,
-            &scope,
-            &sample_messages(),
-            1,
-            "",
-            &SessionFacts::default(),
-            &[client],
-            Duration::from_secs(3),
-            512,
-        )
-        .await;
-
-        assert!(matches!(
-            artifacts,
-            ExtractionArtifacts::PersistFailed {
-                error_reason: SessionMemoryExtractionErrorReason::InvalidScope,
-                ..
-            }
-        ));
-        assert!(purposes.lock().unwrap().is_empty());
-        assert!(scopes.lock().unwrap().is_empty());
-        assert!(memoria.operations.lock().unwrap().is_empty());
-        assert!(memoria.stored.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn run_extraction_attributes_the_call_as_memory_extraction() {
         let purposes = Arc::new(Mutex::new(Vec::new()));
         let scopes = Arc::new(Mutex::new(Vec::new()));

@@ -219,11 +219,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_retries_typed_pending_until_settled_or_total_deadline() {
-        use std::os::unix::fs::PermissionsExt;
-
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("astra-cancel-shim");
-        std::fs::write(
+        crate::test_support::write_executable_shim(
             &executable,
             r#"#!/bin/sh
 attempt_file="${0}.attempts"
@@ -239,9 +237,6 @@ printf '{"session_id":"%s","status":"cancelled","execution_settled":true}\n' "$3
 "#,
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions).unwrap();
 
         cancel_server_session(&executable, None, SESSION_ID)
             .await
@@ -267,15 +262,12 @@ printf '{"session_id":"%s","status":"cancelled","execution_settled":true}\n' "$3
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_total_timeout_kills_a_stuck_cli_process() {
-        use std::os::unix::fs::PermissionsExt;
         use std::time::Duration;
 
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("astra-cancel-stuck-shim");
-        std::fs::write(&executable, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
-        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions).unwrap();
+        crate::test_support::write_executable_shim(&executable, "#!/bin/sh\nwhile :; do :; done\n")
+            .unwrap();
 
         let started = tokio::time::Instant::now();
         let error = cancel_server_session_with_timeout(
@@ -294,18 +286,13 @@ printf '{"session_id":"%s","status":"cancelled","execution_settled":true}\n' "$3
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_does_not_retry_non_pending_failure() {
-        use std::os::unix::fs::PermissionsExt;
-
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("astra-cancel-failure-shim");
-        std::fs::write(
+        crate::test_support::write_executable_shim(
             &executable,
             "#!/bin/sh\nprintf x >> \"${0}.attempts\"\nprintf 'unauthorized\\n' >&2\nexit 3\n",
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions).unwrap();
 
         let error = cancel_server_session(&executable, None, SESSION_ID)
             .await

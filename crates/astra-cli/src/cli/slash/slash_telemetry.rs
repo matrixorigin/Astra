@@ -10,9 +10,8 @@ use crossterm::style::Stylize;
 /// - `drift`      Check focus drift analysis
 /// - `decisions`  List tool surface decisions with confidence
 ///
-/// Retention: fallback handler for `/telemetry` — called from slash_router.rs.
-/// In TUI mode this stays on the text fallback path.
-/// Kept for headless / non-interactive execution paths.
+/// Used by the non-interactive telemetry bridge in `command_router`.
+/// The workbench does not hand terminal ownership to this printer.
 pub(crate) fn handle_telemetry_command(arg: &str, state: &SessionState) {
     let (sub_cmd, sub_arg) = match arg.find(char::is_whitespace) {
         Some(pos) => (arg[..pos].trim(), arg[pos..].trim()),

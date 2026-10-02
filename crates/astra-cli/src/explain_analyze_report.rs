@@ -5,7 +5,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::explain_analyze_format::{alpha_label, diagnostic_label, format_ms, format_tokens};
+use crate::explain_analyze_format::{
+    alpha_label, decision_detail_line, diagnostic_label, format_ms, format_tokens,
+};
 use astra_turn_types::{
     ExplainAnalyzeEventV1, ExplainAnalyzeGraphV1, ExplainAnalyzeNodeKindV1,
     ExplainAnalyzeOutcomeV1, ExplainAnalyzeUsageBasisV1,
@@ -182,6 +184,13 @@ fn append_tree(
                 "{tree}{} · {duration} · {state}{round}{attempt} · {offset}",
                 safe_label(&node.label),
             ));
+            if let Some(detail) = &node.decision_detail {
+                lines.push(format!(
+                    "{}{}",
+                    detail_prefix(&ancestor_has_sibling, last),
+                    decision_detail_line(detail)
+                ));
+            }
 
             if let Some(usage) = &node.usage {
                 lines.push(format!(
@@ -493,6 +502,7 @@ mod tests {
             start_elapsed_ms: (transition == ExplainAnalyzeTransitionV1::Finished).then_some(start),
             duration_ms: duration,
             outcome,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),

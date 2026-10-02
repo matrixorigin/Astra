@@ -5,12 +5,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use astra_core::{
-    ObservationActionHint, ObservationBudgetOmitted, ObservationBudgetResult,
-    ObservationConfidence, ObservationDataCoverage, ObservationEvidence, ObservationFailureCluster,
-    ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
-    ObservationGraphNodeKind, ObservationGraphSlice, ObservationProviderCoverage,
-    ObservationRecord, ObservationView, SourcePolicy, Urn, classify_event_kind, push_graph_edge,
-    push_graph_node, truncate_graph_summary,
+    ObservationActionHint, ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage,
+    ObservationEvidence, ObservationFailureCluster, ObservationGraphEdgeKind,
+    ObservationGraphLayer, ObservationGraphNode, ObservationGraphNodeKind, ObservationGraphSlice,
+    ObservationProviderCoverage, ObservationRecord, ObservationView, SourcePolicy, Urn,
+    classify_event_kind, push_graph_edge, push_graph_node, truncate_graph_summary,
 };
 
 use super::{
@@ -283,8 +282,13 @@ pub fn build_introspect_report(
     }
 
     let mut action_hints = build_introspect_action_hints(snapshot, &observations);
-    let budget_result =
-        apply_report_budget(request, &mut observations, &mut evidence, &mut action_hints);
+    let budget_result = astra_core::budget_observation_support(
+        request.depth,
+        &mut observations,
+        &mut evidence,
+        &mut action_hints,
+        &BTreeSet::new(),
+    );
     let covered_facets = delivered_covered_facets(request, &budget_result);
 
     let graph_slice =
@@ -843,76 +847,6 @@ fn introspect_data_coverage(
         providers,
         warnings,
     }
-}
-
-fn apply_report_budget(
-    request: &IntrospectRequest,
-    observations: &mut Vec<ObservationRecord>,
-    evidence: &mut Vec<ObservationEvidence>,
-    action_hints: &mut Vec<ObservationActionHint>,
-) -> ObservationBudgetResult {
-    let (max_observations, max_evidence, max_hints) = request.depth.report_limits();
-
-    // Sort by priority before truncation so high-value observations survive.
-    observations.sort_by_key(|o| std::cmp::Reverse(observation_priority_key(o)));
-
-    let omitted_observations = truncate_by_priority(observations, max_observations);
-    let retained_observation_refs = observations
-        .iter()
-        .map(|observation| observation.ref_id.as_str())
-        .collect::<BTreeSet<_>>();
-    let hints_before_ref_filter = action_hints.len();
-    action_hints.iter_mut().for_each(|hint| {
-        hint.observation_refs
-            .retain(|ref_id| retained_observation_refs.contains(ref_id.as_str()));
-    });
-    action_hints.retain(|hint| !hint.observation_refs.is_empty());
-    let omitted_dangling_hints = hints_before_ref_filter.saturating_sub(action_hints.len()) as i64;
-    let omitted_evidence = truncate_by_priority(evidence, max_evidence);
-    let omitted_hints = truncate_by_priority(action_hints, max_hints);
-    ObservationBudgetResult {
-        truncated: omitted_observations > 0
-            || omitted_evidence > 0
-            || omitted_hints > 0
-            || omitted_dangling_hints > 0,
-        next_cursor: None,
-        omitted: ObservationBudgetOmitted {
-            evidence_previews: omitted_evidence,
-            observations: omitted_observations,
-            action_hints: omitted_hints + omitted_dangling_hints,
-            ..Default::default()
-        },
-    }
-}
-
-/// Priority key for sorting observations before budget truncation.
-/// Higher = more important. warning > info; higher confidence > lower; system > detail.
-pub(super) fn observation_priority_key(o: &ObservationRecord) -> i64 {
-    let severity_score = match o.severity.as_str() {
-        "critical" => 1000,
-        "error" => 800,
-        "warning" => 600,
-        _ => 0,
-    };
-    let confidence_score = (o.confidence.evidence.unwrap_or(0.5)
-        + o.confidence.classification.unwrap_or(0.0)
-        + o.confidence.causal.unwrap_or(0.0))
-        * 100.0;
-    let kind_score =
-        if o.kind.contains("alert") || o.kind.contains("stall") || o.kind.contains("failure") {
-            200
-        } else if o.kind.contains("health") || o.kind.contains("error") {
-            100
-        } else {
-            0
-        };
-    severity_score + confidence_score as i64 + kind_score
-}
-
-fn truncate_by_priority<T>(items: &mut Vec<T>, max: usize) -> i64 {
-    let omitted = items.len().saturating_sub(max) as i64;
-    items.truncate(max);
-    omitted
 }
 
 fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest) -> String {

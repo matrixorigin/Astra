@@ -9,7 +9,7 @@
 //!
 //! Architecture
 //! ============
-//! - [`TurnIntentJudge`] — async trait, sibling of [`crate::LlmJudge`].
+//! - [`TurnIntentJudge`] — async semantic judgment boundary.
 //!   Implementations call an LLM (typically via the server's
 //!   `/v1/chat/completions` proxy) and produce a structured
 //!   [`TurnIntent`].

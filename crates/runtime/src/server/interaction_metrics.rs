@@ -14,7 +14,6 @@ pub(crate) fn register_interaction_metrics(registry: &MetricsRegistry) {
         METRIC_APPROVAL_INTERACTION_RESOLUTION_TOTAL,
         "Durable approval interaction resolutions by low-cardinality outcome.",
     );
-    astra_turn_core::ws_user_prompt_gate::register_ws_user_prompt_metrics(registry);
 }
 
 pub(crate) fn record_approval_interaction_lookup(

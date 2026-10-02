@@ -14,8 +14,6 @@ use crate::server::tool_transport::{
     TOOL_ERROR_KIND_EXECUTOR_OFFLINE, TOOL_ERROR_KIND_ROUTE_MISMATCH,
     TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
 };
-use astra_services::EvaluationService;
-use astra_services::evaluation::SessionQualityAssessmentRequest;
 use astra_services::runs::ToolOutputBatchItem;
 use astra_services::session_journal::ToolCallRecord;
 
@@ -233,24 +231,72 @@ fn provider_tool_call_facts(tool_calls: &[Value]) -> (u32, Vec<String>) {
     )
 }
 
-/// A non-retryable admission rejection is a terminal execution boundary for
-/// the current tool-shaped response. If every requested call was rejected
-/// before dispatch, give the model one text-only repair opportunity; repeated
-/// tool requests must become an interruption instead of an unbounded loop or
-/// a falsely completed turn.
+/// Only exact, recorded non-execution receipts can close the batch. A
+/// pre-resolved result alone is not proof that a skill or edge callback had no
+/// side effect; the terminal tool ledger owns that distinction.
 fn all_requested_calls_rejected_non_retryable(
     requested: &[Value],
-    admission: &super::host::ToolCallAdmission,
+    records: &[ToolCallRecord],
 ) -> bool {
     !requested.is_empty()
-        && admission.admitted.is_empty()
-        && admission.rejected.len() == requested.len()
-        && admission.rejected.iter().all(|rejected| {
-            serde_json::from_str::<Value>(&rejected.result)
-                .ok()
-                .and_then(|result| result.get("retryable").and_then(Value::as_bool))
-                == Some(false)
+        && records.iter().all(|record| !record.was_executed())
+        && requested.iter().all(|call| {
+            let Some(id) = call.get("id").and_then(Value::as_str) else {
+                return false;
+            };
+            let mut matches = records
+                .iter()
+                .filter(|record| record.tool_call_id.as_deref() == Some(id));
+            let Some(record) = matches.next() else {
+                return false;
+            };
+            matches.next().is_none()
+                && !record.ok
+                && record.disposition
+                    == Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+                && record
+                    .runtime_model_result_full
+                    .as_deref()
+                    .or(record.result_full.as_deref())
+                    .and_then(|result| serde_json::from_str::<Value>(result).ok())
+                    .and_then(|value| value.get("retryable").and_then(Value::as_bool))
+                    == Some(false)
         })
+}
+
+/// Reconcile the terminal tool batch without overriding a typed action that
+/// Work or completion recovery has already authorized from those same facts.
+pub(crate) fn settle_non_retryable_tool_rejections(
+    state: &mut AgenticLoopState,
+    requested: &[Value],
+    round_records_start: usize,
+    edge_results_present: bool,
+    active_work_attempt: bool,
+    pending_run_dependency: bool,
+) {
+    if edge_results_present
+        || super::execution_phase::completion_action_window_requires_followup(state)
+        // A rejected operation cannot terminate the turn while this run still
+        // owns an unfinished child or correlated reply. The request remains
+        // rejected, but existing communication authority must survive.
+        || (pending_run_dependency && !active_work_attempt)
+        || !all_requested_calls_rejected_non_retryable(
+            requested,
+            &state.stall.tool_call_records[round_records_start..],
+        )
+    {
+        return;
+    }
+    engage_non_retryable_admission_boundary(state, active_work_attempt, requested.len());
+}
+
+fn has_pending_run_dependency<H: AgenticLoopHost>(host: &H, state: &AgenticLoopState) -> bool {
+    let Some(run_id) = state.current_run_id.as_deref() else {
+        return false;
+    };
+    host.direct_child_completion_owner(state)
+        .is_some_and(|owner| owner.parent_run_id() == run_id && owner.has_pending_direct_children())
+        || state.messaging.reply_obligations.has_pending(run_id)
 }
 
 /// Select the terminal repair boundary for a provider batch that could not
@@ -858,60 +904,6 @@ async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
             tool_call_id,
             recovery_kind,
             "{recovery_kind}"
-        );
-    }
-}
-
-fn build_runtime_session_quality_assessment(
-    session_id: &str,
-    quality: f64,
-    total_tools: usize,
-) -> SessionQualityAssessmentRequest {
-    SessionQualityAssessmentRequest {
-        session_id: session_id.to_string(),
-        score: quality,
-        step_count: i32::try_from(total_tools).unwrap_or(i32::MAX),
-    }
-}
-
-async fn refresh_runtime_promotion_signals_from_db(state: &mut AgenticLoopState) {
-    let (session_id, persistence) = match (
-        state.current_session_id.as_deref(),
-        state.telemetry.evaluation_persistence.clone(),
-    ) {
-        (Some(session_id), Some(persistence)) if !session_id.is_empty() => {
-            (session_id.to_string(), persistence)
-        }
-        _ => return,
-    };
-    let verdict_warning =
-        crate::server::run::lifecycle::has_turn_verdict_warning(&state.stall.verdict_events);
-    let evaluation = astra_turn_core::evaluation::evaluate_tool_call_records_with_thresholds(
-        &state.message,
-        &state.recent_tools,
-        &state.stall.tool_call_records,
-        state.stall.events.len(),
-        verdict_warning,
-        state.telemetry.first_budget_pressure,
-        crate::turn::runtime_policy::configured_evaluation_thresholds(),
-    );
-    let assessment = build_runtime_session_quality_assessment(
-        &session_id,
-        evaluation.quality,
-        state.step_recorder.summary().total_tools,
-    );
-
-    if let Err((status, response)) = persistence
-        .evaluation_service
-        .record_session_quality_assessment(&persistence.user_id, assessment)
-        .await
-    {
-        astra_core::agent_warn!(
-            "promotion-signals",
-            "Failed to persist session quality assessment for {}: {} {}",
-            session_id,
-            status,
-            response.0.detail
         );
     }
 }
@@ -2105,16 +2097,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         &admission,
     )
     .map_err(|error| format!("tool admission contract violation: {error}"))?;
-    if all_requested_calls_rejected_non_retryable(&turn_result.accum.tool_calls, &admission) {
-        let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
-            crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
-        );
-        engage_non_retryable_admission_boundary(
-            state,
-            active_work_attempt,
-            admission.rejected.len(),
-        );
-    }
 
     // Edge callbacks may already have executed while the stream was open.
     // Correlate their typed tool/argument receipt with the same action frame.
@@ -2201,17 +2183,41 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         }
         state.hooks.completion_settlement.text_only = true;
     }
-    let admitted_tool_calls = admission.admitted;
-    let admitted_logical_calls = admitted_tool_calls
+    let mut admitted_tool_calls = admission.admitted;
+    let mut admitted_logical_calls = admitted_tool_calls
         .iter()
         .map(|call| call.logical_target_call().clone())
         .collect::<Vec<_>>();
     let mut admitted_tool_call_control = super::host::AdmittedToolCallControl::Continue;
+    let mut delegation_model_admissions = std::collections::HashMap::new();
     if !admitted_logical_calls.is_empty() {
         let delivered = host
             .handle_admitted_tool_invocations(state, &admitted_tool_calls)
             .await;
         admitted_tool_call_control = delivered.control;
+        delegation_model_admissions = delivered.delegation_model_admissions;
+        if !delivered.pre_execution_rejections.is_empty() {
+            let rejected_ids = delivered
+                .pre_execution_rejections
+                .iter()
+                .map(|rejected| rejected.provider_call_id().to_string())
+                .collect::<HashSet<_>>();
+            admitted_tool_calls.retain(|call| {
+                call.provider_call_id()
+                    .is_none_or(|id| !rejected_ids.contains(id))
+            });
+            admitted_logical_calls.retain(|call| {
+                call.get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|id| !rejected_ids.contains(id))
+            });
+            admission
+                .rejected
+                .extend(delivered.pre_execution_rejections);
+        }
+        if let Some(usage) = delivered.auxiliary_usage {
+            state.settle_admitted_auxiliary_usage(usage);
+        }
         record_trusted_client_pipeline_skills(state, &admitted_logical_calls, &delivered.results);
         turn_result.edge_tool_round.extend(delivered.results);
     }
@@ -2461,6 +2467,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     }
                 },
             ),
+            delegation_model_admissions: Some(&delegation_model_admissions),
             physical_tool_calls,
             logical_tool_calls: all_tool_calls,
             deferred_activations_by_call_id: &deferred_activations_by_call_id,
@@ -2505,6 +2512,23 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     };
     if superseded_before_action {
         tool_round_superseded = true;
+    }
+    for message in &mut state.messages[transcript_append_start..] {
+        if message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
+            && !astra_turn_types::is_runtime_owned_message(message)
+        {
+            astra_turn_types::mark_model_message(
+                message,
+                turn_result
+                    .accum
+                    .model_item_id
+                    .as_deref()
+                    .or(state.current_model_item_id.as_deref()),
+            );
+        }
     }
     state.record_appended_prompt_history_from(transcript_append_start);
     // Freeze schema-addressed selection evidence before post-tool policy or
@@ -2779,11 +2803,14 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     if tool_round_superseded {
         if !superseding_guidance_applied {
-            let applied =
-                super::execution_phase::inject_polled_user_intents_before_action(host, state)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            if !applied {
+            let observed = super::execution_phase::runtime_input_boundary(
+                host,
+                state,
+                super::execution_phase::RuntimeInputBoundary::Action,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            if !observed.durable_guidance_applied {
                 return Err(
                     "edge action authority changed but no durable guidance could be applied"
                         .to_string(),
@@ -2851,43 +2878,24 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         reconciliation_boundary.as_deref(),
     );
 
+    // Admission and server preflight are one causal boundary. The latter can
+    // reject an admitted call non-retryably; wait until its terminal result,
+    // tool ledger, output batch, and Work reconciliation are settled before
+    // constraining the next provider round.
+    let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
+        crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
+    );
+    let pending_run_dependency = has_pending_run_dependency(host, state);
+    settle_non_retryable_tool_rejections(
+        state,
+        &turn_result.accum.tool_calls,
+        round_records_start,
+        !edge_tool_round.is_empty(),
+        active_work_attempt,
+        pending_run_dependency,
+    );
+
     let waiting_reason = execution_boundary_blocked_wait_reason(&new_tool_results);
-
-    let _ = evo_records_before;
-
-    if state.step_signal_collector.is_some() || state.tactical_adapter.is_some() {
-        let new_records = &state.stall.tool_call_records[evo_records_before..];
-        let mut step_actions: Vec<astra_turn_core::liquid_tactical::TacticalAction> = Vec::new();
-
-        for rec in new_records {
-            let outcome = astra_turn_core::liquid_step_signals::StepOutcome {
-                tool_name: rec.name.clone(),
-                ok: rec.ok,
-                latency_ms: rec.ms,
-                tokens_used: (rec.input_bytes.unwrap_or(0) + rec.output_bytes.unwrap_or(0)) as u64,
-                error_hint: rec.error.clone(),
-            };
-            let triggers = if let Some(ref mut collector) = state.step_signal_collector {
-                collector.record(outcome)
-            } else {
-                vec![]
-            };
-            if !triggers.is_empty()
-                && let Some(ref mut adapter) = state.tactical_adapter
-            {
-                let actions = adapter.evaluate(&triggers);
-                for action in actions {
-                    if !matches!(
-                        action,
-                        astra_turn_core::liquid_tactical::TacticalAction::NoOp
-                    ) {
-                        step_actions.push(action);
-                    }
-                }
-                adapter.advance_step();
-            }
-        }
-    }
 
     if let Some(ref emitter) = state.messaging.progress_emitter {
         for rec in &state.stall.tool_call_records {
@@ -2922,6 +2930,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             .stall
             .work_unit_observations
             .repeatedly_unchanged_without_wake(2);
+        state.final_text_model_item_id = None;
         state.final_text = if caller_owned_ids.is_empty() {
             format!(
                 "Work {work_ids} has not materially changed. No further live-status reads will run in this turn; the runtime owns its next meaningful update."
@@ -2964,6 +2973,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 .take()
                 .unwrap_or(completion);
             if let Some(final_text) = completion.final_text {
+                state.final_text_model_item_id = None;
                 state.final_text = final_text;
                 state.final_text_streamed = false;
             }
@@ -2974,7 +2984,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             );
             state.step_recorder.end_turn(false);
             finalize_and_render(host, state).await;
-            refresh_runtime_promotion_signals_from_db(state).await;
             return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
         }
     }
@@ -2992,6 +3001,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             .take()
     {
         if let Some(final_text) = completion.final_text {
+            state.final_text_model_item_id = None;
             state.final_text = final_text;
             state.final_text_streamed = false;
         }
@@ -3002,14 +3012,12 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         );
         state.step_recorder.end_turn(false);
         finalize_and_render(host, state).await;
-        refresh_runtime_promotion_signals_from_db(state).await;
         return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
     }
 
     if let Some(reason) = waiting_reason {
         state.step_recorder.end_turn(false);
         finalize_turn_trace(state).await;
-        refresh_runtime_promotion_signals_from_db(state).await;
         return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(
             reason,
         )));
@@ -3100,29 +3108,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         state.clear_volatile(super::host::VolatileKind::SourceRecoveryAdvisory);
     }
 
-    if let Some(ref gate) = state.checkpoint_gate {
-        let freq = gate.checkpoint_frequency();
-        if freq > 0 && (turn_index as u32 + 1).is_multiple_of(freq) {
-            let run_id = state.current_run_id.as_deref().unwrap_or("unknown");
-            match gate
-                .check(run_id, turn_index as u32, state.total_tool_calls)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    observe_gate_cancelled(state, turn_index, prep.turn_start_time, &turn_result);
-                    state.step_recorder.end_turn(true);
-                    finalize_turn_trace(state).await;
-                    refresh_runtime_promotion_signals_from_db(state).await;
-                    return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Cancelled));
-                }
-                Err(e) => {
-                    eprintln!("[checkpoint-gate] check error: {e}");
-                }
-            }
-        }
-    }
-
     apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
         run_execution_budget: state.run_execution_budget_snapshot(),
         run_execution_control: state.run_execution_control_snapshot(),
@@ -3194,7 +3179,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     state.step_recorder.end_turn(false);
     finalize_turn_trace(state).await;
-    refresh_runtime_promotion_signals_from_db(state).await;
     if let Some(hub) = state.telemetry.observability_hub.as_ref() {
         let high_failure = state.turn_guard.health.high_failure_tools(3, 0.5);
         if !high_failure.is_empty() {
@@ -3230,31 +3214,58 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     if let Some(policy_feedback) = policy_update {
         state.stall.active_policy_feedback = policy_feedback;
     }
-    Ok(TurnToolPhaseControl::ContinueLoop)
-}
 
-fn observe_gate_cancelled(
-    state: &mut AgenticLoopState,
-    _turn_index: usize,
-    turn_start_time: std::time::Instant,
-    turn_result: &super::host::HostTurnResult,
-) {
-    if let (Some(hub), Some(session)) = (
-        state.telemetry.observability_hub.as_ref(),
-        state.telemetry.observability_session.as_ref(),
-    ) {
-        let total_ms = turn_start_time.elapsed().as_millis() as u64;
-        let timing = crate::observability::TurnTiming {
-            turn: session_turn_number(state),
-            context_assembly_ms: 0,
-            ttft_ms: turn_result.ttft_ms.unwrap_or(0),
-            llm_total_ms: total_ms,
-            tool_execution_ms: 0,
-            total_ms,
-        };
-        let mut session_guard = astra_core::sync_poison::recover_rwlock_write(session);
-        crate::observability::on_turn_end(hub, &mut session_guard, timing);
+    // A question is a synchronization edge, not ordinary progress text. Once
+    // the send has been accepted, do not start another provider round before
+    // the exact responder's answer is observed. Reuse the same bounded
+    // mailbox barrier used by finalization so a reply wakes this run without
+    // adding a second wait state or another storage path.
+    let run_id = state.current_run_id.as_deref().unwrap_or_default();
+    let admitted_wait = round_tool_calls
+        .iter()
+        .filter(|record| record.ok && record.was_executed() && record.name == "agent")
+        .filter_map(|record| {
+            let args = serde_json::from_str::<Value>(record.authoritative_args_full()?).ok()?;
+            if astra_tools::agent_tool_contract::agent_action_from_args(&args).ok()?
+                != astra_tools::agent_tool_contract::AgentAction::Wait
+            {
+                return None;
+            }
+            let result =
+                serde_json::from_str::<Value>(record.runtime_model_result_full.as_deref()?).ok()?;
+            use astra_turn_core::orchestration::agent_result_wire::{
+                AgentControlReceipt, DecodedAgentToolResult, decode_agent_tool_result,
+            };
+            let DecodedAgentToolResult::ControlReceipt(AgentControlReceipt::Wait(receipt)) =
+                decode_agent_tool_result(&result)?
+            else {
+                return None;
+            };
+            (receipt.parent_run_id == run_id
+                && record.tool_call_id.as_deref() == Some(receipt.tool_call_id.as_str()))
+            .then_some(receipt)
+        })
+        .min_by_key(|receipt| receipt.timeout_ms);
+    let reply_pending = state.messaging.reply_obligations.has_pending(run_id);
+    if reply_pending || admitted_wait.is_some() {
+        let continue_after_reply = super::execution_phase::await_runtime_activity(
+            host,
+            state,
+            super::host::ContinuationAuthority::Runtime,
+            // An unanswered exact question retains its synchronization
+            // obligation; a sibling observation timeout cannot bypass it.
+            admitted_wait.as_ref().filter(|_| !reply_pending),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        try_write_heavy_checkpoint(state);
+        return Ok(if continue_after_reply.should_continue() {
+            TurnToolPhaseControl::ContinueLoop
+        } else {
+            TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed)
+        });
     }
+    Ok(TurnToolPhaseControl::ContinueLoop)
 }
 
 #[cfg(test)]
@@ -3333,6 +3344,7 @@ mod tests {
                 "tool_call_id": "search-1",
                 "content": json!({
                     "mode": "select",
+                    "status": "completed",
                     "query": "select:web_fetch",
                     "requested": ["web_fetch"],
                     "resolved": ["web_fetch"],
@@ -3562,6 +3574,59 @@ mod tests {
             projected_without_owner_snapshot.is_empty(),
             "a rejected journal disposition cannot override the typed terminal owner"
         );
+    }
+
+    #[test]
+    fn server_preflight_rejection_has_one_record_and_reliable_terminal_owner() {
+        let mut state = make_state();
+        let call = json!({
+            "id": "blocked-fanout",
+            "type": "function",
+            "function": {"name": "agent_fanout", "arguments": "{}"}
+        });
+        let rejection = super::super::host::RejectedToolCall::ordinary(
+            call.clone(),
+            json!({
+                "status": "failed",
+                "error_kind": "delegation_model_scope_unresolved",
+                "retryable": false,
+                "advisory": {"executed": false},
+                "error": "Model requirement assessment did not complete."
+            })
+            .to_string(),
+        );
+        let (_, pre_resolved) =
+            crate::turn::agentic::tool_interception::record_pre_execution_rejections(
+                &mut state,
+                vec![rejection],
+            );
+        assert_eq!(pre_resolved.len(), 1);
+        assert_eq!(pre_resolved[0].call_id, "blocked-fanout");
+        let records = &state.stall.tool_call_records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].disposition,
+            Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+        );
+        assert!(!records[0].was_executed());
+        assert!(all_requested_calls_rejected_non_retryable(
+            std::slice::from_ref(&call),
+            records
+        ));
+        assert_eq!(
+            pre_resolved_server_tool_terminal_records(records, &[], &HashSet::new(), &[]).len(),
+            1
+        );
+        settle_non_retryable_tool_rejections(
+            &mut state,
+            std::slice::from_ref(&call),
+            0,
+            false,
+            false,
+            false,
+        );
+        assert!(state.hooks.completion_settlement.text_only);
+        assert!(!state.hooks.completion_settlement.work_settlement_only);
     }
 
     fn publish_test_feedback(
@@ -4398,30 +4463,6 @@ mod tests {
     }
 
     #[test]
-    fn observe_gate_cancelled_records_outer_session_turn() {
-        let mut state = make_state();
-        state.session_turn = 6;
-        state.max_turns = 20;
-        state.remaining_turns = 4;
-        let hub = ObservabilityHub::new();
-        let session = hub.start_session("u1", "s1");
-        state.telemetry.observability_hub = Some(Arc::new(hub));
-        state.telemetry.observability_session = Some(session.clone());
-        let turn_result = text_result("cancelled", 10, 3, Some(2));
-
-        observe_gate_cancelled(
-            &mut state,
-            16,
-            Instant::now() - Duration::from_millis(25),
-            &turn_result,
-        );
-
-        let guard = session.read().unwrap();
-        assert_eq!(guard.turn_timings.len(), 1);
-        assert_eq!(guard.turn_timings[0].turn, 6);
-    }
-
-    #[test]
     fn blocked_tool_records_still_mark_rejected() {
         let mut rec = summary_tool_record(
             false,
@@ -4604,19 +4645,157 @@ mod tests {
             ],
             completion_action_applied: true,
         };
+        let mut state = make_state();
+        crate::turn::agentic::tool_interception::record_pre_execution_rejections(
+            &mut state,
+            admission.rejected,
+        );
         assert!(all_requested_calls_rejected_non_retryable(
-            &requested, &admission
+            &requested,
+            &state.stall.tool_call_records
         ));
 
-        let mut retryable = admission.clone();
-        retryable.rejected[1].result = json!({
-            "status":"rejected",
-            "retryable":true,
-            "error_kind":"tool_validation"
-        })
-        .to_string();
+        state.stall.tool_call_records[1].result_full = Some(
+            json!({
+                "status":"rejected",
+                "retryable":true,
+                "error_kind":"tool_validation"
+            })
+            .to_string(),
+        );
         assert!(!all_requested_calls_rejected_non_retryable(
-            &requested, &retryable
+            &requested,
+            &state.stall.tool_call_records
+        ));
+    }
+
+    #[test]
+    fn pending_run_dependency_preserves_communication_after_non_retryable_rejection() {
+        let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "parent-run",
+            "child-agent",
+        );
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            agent_id: "child-agent".into(),
+            run_id: "child-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            status: crate::orchestration::AgentStatus::Running {
+                activity: "working".into(),
+            },
+        });
+        let mut host = MockHost::new(Vec::new());
+        host.direct_child_owner = Some(Arc::clone(&owner));
+        let mut state = make_state();
+        state.current_run_id = Some("parent-run".into());
+        assert!(has_pending_run_dependency(&host, &state));
+
+        let call =
+            json!({"id":"bad-settle","function":{"name":"settle_work_item","arguments":"{}"}});
+        crate::turn::agentic::tool_interception::record_pre_execution_rejections(
+            &mut state,
+            vec![super::super::host::RejectedToolCall::ordinary(
+                call.clone(),
+                json!({"status":"rejected","retryable":false,"error_kind":"canonical_work_attempt_required"}).to_string(),
+            )],
+        );
+        assert!(all_requested_calls_rejected_non_retryable(
+            std::slice::from_ref(&call),
+            &state.stall.tool_call_records
+        ));
+        let pending_run_dependency = has_pending_run_dependency(&host, &state);
+        settle_non_retryable_tool_rejections(
+            &mut state,
+            std::slice::from_ref(&call),
+            0,
+            false,
+            false,
+            pending_run_dependency,
+        );
+        assert!(!state.hooks.completion_settlement.text_only);
+        assert!(!state.hooks.completion_settlement.work_settlement_only);
+
+        state.current_run_id = Some("foreign-run".into());
+        assert!(!has_pending_run_dependency(&host, &state));
+        state.current_run_id = Some("parent-run".into());
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            agent_id: "child-agent".into(),
+            run_id: "child-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            status: crate::orchestration::AgentStatus::Completed {
+                result: "done".into(),
+                finish_reason: None,
+            },
+        });
+        assert!(has_pending_run_dependency(&host, &state));
+        assert_eq!(owner.take_completed_direct_children().len(), 1);
+        assert!(!has_pending_run_dependency(&host, &state));
+
+        state
+            .messaging
+            .reply_obligations
+            .reserve(
+                "parent-run",
+                "question-1",
+                astra_messaging::types::AgentAddress::new("peer-run", "peer-agent"),
+            )
+            .expect("current-run question");
+        assert!(has_pending_run_dependency(&host, &state));
+        state
+            .messaging
+            .reply_obligations
+            .reject("parent-run", "question-1");
+        assert!(!has_pending_run_dependency(&host, &state));
+    }
+
+    #[test]
+    fn pending_child_does_not_bypass_active_work_settlement_boundary() {
+        let call = json!({"id":"rejected-call","function":{"name":"read_file","arguments":"{}"}});
+        let mut state = make_state();
+        crate::turn::agentic::tool_interception::record_pre_execution_rejections(
+            &mut state,
+            vec![super::super::host::RejectedToolCall::ordinary(
+                call.clone(),
+                json!({"status":"rejected","retryable":false,"error_kind":"work_policy_denied"})
+                    .to_string(),
+            )],
+        );
+        settle_non_retryable_tool_rejections(&mut state, &[call], 0, false, true, true);
+        assert!(state.hooks.completion_settlement.work_settlement_only);
+        assert!(!state.hooks.completion_settlement.text_only);
+    }
+
+    #[test]
+    fn post_admission_preflight_rejection_is_a_terminal_non_retryable_receipt() {
+        use astra_services::session_journal::ToolCallDisposition;
+
+        let requested = vec![json!({"id":"spawn","function":{"name":"agent","arguments":"{}"}})];
+        let mut records = vec![ToolCallRecord {
+            tool_call_id: Some("spawn".into()),
+            name: "agent".into(),
+            ok: false,
+            disposition: Some(ToolCallDisposition::Rejected),
+            result_full: Some(
+                json!({
+                    "status":"failed",
+                    "error_kind":"delegation_model_scope_unresolved",
+                    "retryable":false,
+                    "advisory":{"executed":false}
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        }];
+        assert!(all_requested_calls_rejected_non_retryable(
+            &requested, &records
+        ));
+        records[0].disposition = Some(ToolCallDisposition::Executed);
+        assert!(!all_requested_calls_rejected_non_retryable(
+            &requested, &records
+        ));
+        records[0].disposition = Some(ToolCallDisposition::Rejected);
+        records[0].tool_call_id = Some("other".into());
+        assert!(!all_requested_calls_rejected_non_retryable(
+            &requested, &records
         ));
     }
 
@@ -4731,8 +4910,8 @@ mod tests {
                 "terminal":2,
                 "completed":2,
                 "results":[
-                    {"slot_index":0,"result":{"status":"completed","result":"a"}},
-                    {"slot_index":1,"result":{"status":"completed","result":"b"}}
+                    {"slot_index":0,"result":{"result_family":"child_result","agent_id":"child-0","status":"completed","result":"a"}},
+                    {"slot_index":1,"result":{"result_family":"child_result","agent_id":"child-1","status":"completed","result":"b"}}
                 ]
             })
             .to_string(),
@@ -5011,7 +5190,7 @@ mod tests {
             output: json!({
                 "group_id":"group-paged","target_count":2,"active":0,"terminal":2,
                 "result_read":{"slot_index":0,"offset":4096,"max_bytes":8192},
-                "results":[{"slot_index":0,"result_start_offset":4096,"result_end_offset":5000,"result_bytes":5000,"result":"tail","result_truncated":true}]
+                "results":[{"slot_index":0,"result_start_offset":4096,"result_end_offset":5000,"result_bytes":5000,"result":{"result_family":"child_result","agent_id":"child-0","status":"completed","result":"tail"},"result_truncated":true}]
             })
             .to_string(),
             tool_result_fields: None,
@@ -5043,7 +5222,7 @@ mod tests {
             output: json!({
                 "group_id":"group-paged","target_count":2,"active":0,"terminal":2,
                 "result_read":{"slot_index":1,"offset":2048,"max_bytes":8192},
-                "results":[{"slot_index":1,"result_start_offset":2048,"result_end_offset":3000,"result_bytes":3000,"result":"tail-1","result_truncated":true}]
+                "results":[{"slot_index":1,"result_start_offset":2048,"result_end_offset":3000,"result_bytes":3000,"result":{"result_family":"child_result","agent_id":"child-1","status":"completed","result":"tail-1"},"result_truncated":true}]
             })
             .to_string(),
             tool_result_fields: None,
@@ -5463,26 +5642,6 @@ mod tests {
         })];
 
         assert!(execution_boundary_blocked_wait_reason(&results).is_none());
-    }
-
-    #[test]
-    fn runtime_session_quality_assessment_uses_session_score_and_tools() {
-        assert_eq!(
-            build_runtime_session_quality_assessment("sess-9", 0.63, 7),
-            SessionQualityAssessmentRequest {
-                session_id: "sess-9".to_string(),
-                score: 0.63,
-                step_count: 7,
-            }
-        );
-    }
-
-    #[test]
-    fn runtime_session_quality_assessment_saturates_large_tool_counts() {
-        assert_eq!(
-            build_runtime_session_quality_assessment("sess-9", 0.63, usize::MAX).step_count,
-            i32::MAX
-        );
     }
 
     #[test]
@@ -6180,7 +6339,7 @@ esac
 
         // LiveRuntimeProvider
         assert_eq!(provider.token_pressure(), 0.0);
-        assert_eq!(provider.cache_hit_ratio(), 0.0);
+        assert_eq!(provider.cache_hit_ratio(), None);
         assert_eq!(provider.current_error_rate(), 0.0);
         assert_eq!(provider.budget_remaining(), 10);
         assert_eq!(provider.budget_max(), 10);

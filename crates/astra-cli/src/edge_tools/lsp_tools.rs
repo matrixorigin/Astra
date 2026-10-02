@@ -1420,6 +1420,12 @@ impl ToolExecutor {
     /// Prefers a real stdio LSP backend when one is available for the workspace/file,
     /// then falls back to the existing symbol/AST-based implementations.
     pub(crate) fn lsp(&self, args: &Value) -> String {
+        if self.read_only_execution {
+            return json!({
+                "error": "LSP execution is unavailable in a read-only child; use typed read tools instead"
+            })
+            .to_string();
+        }
         let operation = match args.get("operation").and_then(Value::as_str) {
             Some(op) => op,
             None => return json!({

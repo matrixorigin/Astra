@@ -49,11 +49,12 @@ pub use error::ThinClientError;
 pub use protocol::{
     ApprovalDecision, ApprovalKind, ApprovalRespondRequest, ChatStreamRequest,
     EdgeHeartbeatReplayPolicy, EdgeHeartbeatRequest, EdgeHeartbeatResponse, EdgeRegisterRequest,
-    ModelSelection, ProviderInteractionRespondRequest, RunUserIntentRequest, RunUserIntentResponse,
-    SessionCreateRequest, SessionTranscriptItem, SessionTranscriptPage, SessionTranscriptReadScope,
-    SessionTranscriptToolCall, SessionTranscriptToolResult, SessionUpdateRequest, StreamEvent,
-    ToolResultHashParts, ToolResultRequest, ToolResultRequestParts, UserPromptRespondRequest,
-    classify_stream_event, tool_result_status_is_error,
+    ModelSelection, ProviderInteractionRespondRequest, RequestedModelPolicy, RunUserIntentRequest,
+    RunUserIntentResponse, SessionCreateRequest, SessionTranscriptItem, SessionTranscriptPage,
+    SessionTranscriptReadScope, SessionTranscriptToolCall, SessionTranscriptToolResult,
+    SessionUpdateRequest, StreamEvent, ToolResultHashParts, ToolResultRequest,
+    ToolResultRequestParts, UserPromptRespondRequest, classify_stream_event,
+    tool_result_status_is_error,
 };
 /// SSE / buffered HTTP response from a Server-owned developer loop.
 pub use reqwest::Response as HttpResponse;

@@ -42,7 +42,7 @@ pub struct InferenceInvocationInput {
     pub scope: InferenceInvocationScope,
     /// Exact durable execution capability for a run-scoped invocation.
     ///
-    /// Session/harness work has its own owner boundary and must leave this
+    /// Session work has its own owner boundary and must leave this
     /// empty. A run-scoped provider admission is executable only while all of
     /// these immutable facts still match in the same transaction that inserts
     /// the invocation row.
@@ -76,6 +76,9 @@ pub struct InferenceInvocationPlan {
     owner_token: String,
     owner_generation: u64,
     input: InferenceInvocationInput,
+    // Serialized once from validated admission material. Pricing is evidence,
+    // not part of invocation identity: a catalog update cannot authorize replay.
+    price_snapshot_json: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -130,6 +133,20 @@ pub struct InferenceProviderWireIdentity {
 }
 
 impl InferenceInvocationPlan {
+    pub fn with_price_snapshot(
+        mut self,
+        snapshot: Option<&crate::models::InferencePriceSnapshot>,
+    ) -> ServiceResult<Self> {
+        self.price_snapshot_json =
+            snapshot
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| {
+                    ServiceError::invalid(format!("serialize inference price: {error}"))
+                })?;
+        Ok(self)
+    }
+
     #[must_use]
     pub fn route_id(&self) -> &str {
         &self.route_id
@@ -989,9 +1006,6 @@ pub fn plan_inference_invocation(
     if let Some(run_id) = input.scope.run_id() {
         validate_identity(run_id, "run_id", 64)?;
     }
-    if let Some(harness_run_id) = input.scope.harness_run_id() {
-        validate_identity(harness_run_id, "harness_run_id", 128)?;
-    }
     validate_identity(input.scope.operation_id(), "operation_id", 64)?;
     match (&input.scope, &input.run_authority) {
         (InferenceInvocationScope::Run { .. }, Some(authority)) => {
@@ -1016,7 +1030,7 @@ pub fn plan_inference_invocation(
         }
         (_, Some(_)) => {
             return Err(ServiceError::invalid(
-                "run execution authority cannot cross a session or harness scope",
+                "run execution authority cannot cross a session scope",
             ));
         }
         (_, None) => {}
@@ -1038,7 +1052,6 @@ pub fn plan_inference_invocation(
         input.scope.kind(),
         input.scope.session_id().unwrap_or(""),
         input.scope.run_id().unwrap_or(""),
-        input.scope.harness_run_id().unwrap_or(""),
         turn.as_deref().unwrap_or(""),
         round.as_deref().unwrap_or(""),
         input.scope.operation_id(),
@@ -1060,6 +1073,7 @@ pub fn plan_inference_invocation(
         owner_token: new_admission_token(),
         owner_generation: 1,
         input,
+        price_snapshot_json: None,
     })
 }
 
@@ -1087,7 +1101,6 @@ pub async fn load_existing_inference_operation_ids_for_route(
            AND invocation.scope_kind = ?
            AND invocation.session_id <=> ?
            AND invocation.run_id <=> ?
-           AND invocation.harness_run_id <=> ?
            AND invocation.turn_index <=> ?
            AND invocation.purpose = ?
            AND route.offering_id = ?
@@ -1102,7 +1115,6 @@ pub async fn load_existing_inference_operation_ids_for_route(
     .bind(input.scope.kind())
     .bind(input.scope.session_id())
     .bind(input.scope.run_id())
-    .bind(input.scope.harness_run_id())
     .bind(input.scope.turn().map(i64::from))
     .bind(input.purpose.as_str())
     .bind(&input.offering_id)
@@ -1150,7 +1162,6 @@ pub async fn next_inference_logical_attempt_pair_base(
            AND scope_kind = ?
            AND session_id <=> ?
            AND run_id <=> ?
-           AND harness_run_id <=> ?
            AND turn_index <=> ?
            AND round_index <=> ?
            AND operation_id = ?
@@ -1160,7 +1171,6 @@ pub async fn next_inference_logical_attempt_pair_base(
     .bind(input.scope.kind())
     .bind(input.scope.session_id())
     .bind(input.scope.run_id())
-    .bind(input.scope.harness_run_id())
     .bind(input.scope.turn().map(i64::from))
     .bind(input.scope.round().map(i64::from))
     .bind(input.scope.operation_id())
@@ -1592,7 +1602,6 @@ fn model_request_event(
             owner_scope: input.user_id.clone(),
             session_id: input.scope.session_id().map(str::to_string),
             run_id: input.scope.run_id().map(str::to_string),
-            harness_run_id: input.scope.harness_run_id().map(str::to_string),
             turn: input.scope.turn(),
             round: attempt
                 .request_context
@@ -1778,20 +1787,18 @@ async fn insert_model_request_context_event_with_expiry(
     if context_expired_at.is_none() {
         let session_id = attempt.invocation_input.scope.session_id();
         let run_id = attempt.invocation_input.scope.run_id();
-        let harness_run_id = attempt.invocation_input.scope.harness_run_id();
         let terminal_status = event.terminal_status.as_deref();
         let usage_present = usage.is_some();
         let insert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO model_request_context_events
-         (event_id, user_id, attempt_id, invocation_id, session_id, run_id, harness_run_id,
+         (event_id, user_id, attempt_id, invocation_id, session_id, run_id,
           event_stage, terminal_status, topology, provider, model_family, purpose,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
           event_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
             [
                 session_id.is_some(),
                 run_id.is_some(),
-                harness_run_id.is_some(),
                 terminal_status.is_some(),
                 usage_present,
                 usage_present,
@@ -1806,7 +1813,6 @@ async fn insert_model_request_context_event_with_expiry(
             .bind(&attempt.invocation_id)
             .bind(session_id)
             .bind(run_id)
-            .bind(harness_run_id)
             .bind(stage.as_str())
             .bind(terminal_status)
             .bind(event.identity.topology.as_str())
@@ -1843,9 +1849,6 @@ async fn insert_model_request_context_event_with_expiry(
             InferenceInvocationScope::Run { session_id, .. }
             | InferenceInvocationScope::Session { session_id, .. } => {
                 ModelRequestContextScope::Session(session_id)
-            }
-            InferenceInvocationScope::HarnessRun { harness_run_id, .. } => {
-                ModelRequestContextScope::HarnessRun(harness_run_id)
             }
         };
         // A normal request appends an accepted/terminal pair. Compact once at
@@ -2036,15 +2039,14 @@ async fn insert_recovered_model_request_terminal_tx(
     }
     let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO model_request_context_events
-         (event_id, user_id, attempt_id, invocation_id, session_id, run_id, harness_run_id,
+         (event_id, user_id, attempt_id, invocation_id, session_id, run_id,
           event_stage, terminal_status, topology, provider, model_family, purpose,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
           event_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'terminal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+         VALUES (?, ?, ?, ?, ?, ?, 'terminal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         [
             event.identity.session_id.is_some(),
             event.identity.run_id.is_some(),
-            event.identity.harness_run_id.is_some(),
             observed_usage.is_some(),
             observed_usage.is_some(),
             observed_usage.is_some(),
@@ -2058,7 +2060,6 @@ async fn insert_recovered_model_request_terminal_tx(
         .bind(invocation_id)
         .bind(event.identity.session_id.as_deref())
         .bind(event.identity.run_id.as_deref())
-        .bind(event.identity.harness_run_id.as_deref())
         .bind(&terminal.status)
         .bind(event.identity.topology.as_str())
         .bind(&event.identity.provider)
@@ -2321,27 +2322,6 @@ async fn lock_invocation_scope_authority(
                 }
             }
         }
-        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => {
-            let status = sqlx::query_scalar::<_, String>(
-                "SELECT status FROM harness_runs
-                 WHERE user_id = ? AND harness_run_id = ? LIMIT 1 FOR UPDATE",
-            )
-            .bind(&input.user_id)
-            .bind(harness_run_id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "verify inference harness scope",
-                    error,
-                )
-            })?;
-            match status.as_deref() {
-                Some("running") => InvocationScopeAuthority::Live,
-                Some(_) | None => InvocationScopeAuthority::Unavailable,
-            }
-        }
     };
     Ok(authority)
 }
@@ -2597,8 +2577,8 @@ async fn insert_inference_invocation_admission(
             "INSERT INTO inference_routes
                  (route_id, user_id, session_id, scope_kind, run_id,
                   offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, ?, 'run', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+                  execution_placement, access_kind, purpose, price_snapshot_json, created_at)
+                 VALUES (?, ?, ?, 'run', ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
@@ -2608,22 +2588,12 @@ async fn insert_inference_invocation_admission(
             "INSERT INTO inference_routes
                  (route_id, user_id, session_id, scope_kind,
                   offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, ?, 'session', ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+                  execution_placement, access_kind, purpose, price_snapshot_json, created_at)
+                 VALUES (?, ?, ?, 'session', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
         .bind(session_id),
-        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => sqlx::query(
-            "INSERT INTO inference_routes
-                 (route_id, user_id, scope_kind, harness_run_id,
-                  offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, 'harness_run', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        )
-        .bind(&plan.route_id)
-        .bind(&plan.input.user_id)
-        .bind(harness_run_id),
     };
     route_query
         .bind(&plan.input.offering_id)
@@ -2633,6 +2603,7 @@ async fn insert_inference_invocation_admission(
         .bind(plan.input.execution_placement.as_str())
         .bind(plan.input.access_kind.as_str())
         .bind(plan.input.purpose.as_str())
+        .bind(&plan.price_snapshot_json)
         .execute(&mut *connection)
         .await
         .map_err(|error| {
@@ -2675,20 +2646,6 @@ async fn insert_inference_invocation_admission(
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
         .bind(session_id),
-        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => sqlx::query(
-            "INSERT INTO inference_invocations
-                 (invocation_id, route_id, user_id, scope_kind, harness_run_id,
-                  admission_token, owner_token, owner_generation, owner_lease_expires_at,
-                  operation_id, logical_attempt, purpose, status, terminal_fingerprint,
-                  usage_status, provider_delivery_state, created_at, terminal_at)
-                 VALUES (?, ?, ?, 'harness_run', ?, ?, ?, ?,
-                         DATE_ADD(NOW(6), INTERVAL 60 SECOND), ?, ?, ?,
-                         'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
-        )
-        .bind(&plan.invocation_id)
-        .bind(&plan.route_id)
-        .bind(&plan.input.user_id)
-        .bind(harness_run_id),
     };
     let invocation_query = invocation_query
         .bind(&plan.admission_token)
@@ -2701,7 +2658,6 @@ async fn insert_inference_invocation_admission(
         | InferenceInvocationScope::Session { turn, round, .. } => invocation_query
             .bind(i64::from(*turn))
             .bind(i64::from(*round)),
-        InferenceInvocationScope::HarnessRun { .. } => invocation_query,
     };
     invocation_query
         .bind(plan.input.scope.operation_id())
@@ -3758,12 +3714,12 @@ async fn insert_inference_provider_attempt_admission(
     freeze_tool_result_projection_decisions(connection, attempt).await?;
     let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO inference_provider_attempts
-         (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
+         (attempt_id, invocation_id, user_id, session_id, run_id, attempt_index,
           provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
           canonical_transition_id, canonical_parent_transition_id,
           canonical_transition_hash,
           status, usage_status, started_at, terminal_at)
-         SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
+         SELECT ?, invocation_id, user_id, session_id, run_id,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
@@ -4534,12 +4490,12 @@ pub async fn begin_inference_provider_attempt(
     }
     let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO inference_provider_attempts
-         (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
+         (attempt_id, invocation_id, user_id, session_id, run_id, attempt_index,
           provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
           canonical_transition_id, canonical_parent_transition_id,
           canonical_transition_hash,
           status, usage_status, started_at, terminal_at)
-         SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
+         SELECT ?, invocation_id, user_id, session_id, run_id,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
@@ -6296,13 +6252,13 @@ async fn write_inference_settlement_debt(
     })?;
     sqlx::query(
         "INSERT IGNORE INTO inference_invocation_settlement_debts
-         (user_id, invocation_id, session_id, harness_run_id,
+         (user_id, invocation_id, session_id,
           terminal_status, terminal_fingerprint, usage_status,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
           provider_response_id, error_kind, error_message, provider_attempt_id,
           provider_delivery_state)
          SELECT invocation.user_id, invocation.invocation_id,
-                invocation.session_id, invocation.harness_run_id,
+                invocation.session_id,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          FROM inference_invocations AS invocation
          WHERE invocation.user_id = ? AND invocation.invocation_id = ?",
@@ -8392,7 +8348,7 @@ fn projected_cache_read_share(
         .then(|| usage.input.cache_read_tokens as f64 / total as f64)
 }
 
-fn projected_auxiliary_usage(
+pub(crate) fn projected_auxiliary_usage(
     protocol: &str,
     status: &str,
     counts: [i64; 4],
@@ -8519,8 +8475,11 @@ pub async fn load_session_auxiliary_capture(
     } else {
         "SELECT a.attempt_id, a.provider, a.provider_protocol, r.offering_id, r.upstream_model_name, i.purpose, i.operation_id, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens"
     };
+    // Delegation/model-selector judgments use request-specific operation IDs;
+    // classify their usage by the admitted introspection purpose instead of
+    // attempting to enumerate hashed operation identities.
     let rows = sqlx::query(&format!(
-        "{select} FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND (i.operation_id IN ('request_judgment', 'skill_auto_route', 'work_plan', 'memory_relevance', 'memory_feedback', 'verification_judge', 'completion_proxy:turn_intent', 'completion_proxy:tool_result_rerank') OR i.purpose IN ('memory_retrieval_rerank', 'tool_result_rerank', 'verification_judge')) ORDER BY a.attempt_id LIMIT ?"
+        "{select} FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND (i.operation_id IN ('request_judgment', 'skill_auto_route', 'work_plan', 'memory_relevance', 'memory_feedback', 'verification_judge', 'completion_proxy:turn_intent', 'completion_proxy:tool_result_rerank') OR i.purpose IN ('introspection', 'memory_retrieval_rerank', 'tool_result_rerank', 'verification_judge')) ORDER BY a.attempt_id LIMIT ?"
     ))
         .bind(user_id)
         .bind(session_id)
@@ -8677,6 +8636,100 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and a current-schema MatrixOne database"]
+    async fn inference_price_snapshot_survives_persisted_replay_and_recovery() {
+        let _ = dotenvy::dotenv();
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let mut settings = astra_core::MatrixOneSettings::from_env();
+        settings.db_pool_max_connections = 2;
+        settings.db_pool_min_connections = 0;
+        let catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        crate::storage::ensure_core_schema(&settings, &catalog)
+            .await
+            .unwrap();
+        let pool = SharedPool::new(&settings).await.unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let user_id = format!("price-snapshot-{suffix}");
+        let session_id = format!("price-snapshot-{suffix}");
+        sqlx::query("INSERT INTO agent_sessions (session_id, user_id, status, event_count, project_retention_policy, created_at, updated_at, last_active_at) VALUES (?, ?, 'active', 0, 'session', NOW(6), NOW(6), NOW(6))")
+            .bind(&session_id).bind(&user_id).execute(pool.get()).await.unwrap();
+        let mut input = input();
+        input.user_id = user_id.clone();
+        input.run_authority = None;
+        input.scope = InferenceInvocationScope::Session {
+            session_id: session_id.clone(),
+            turn: 0,
+            round: 0,
+            operation_id: "price_snapshot".into(),
+            logical_attempt: 0,
+        };
+        let snapshot = |rate| {
+            crate::models::InferencePriceSnapshot::from_stored(
+                &json!({
+                    "calculation_version": 1,
+                    "currency": "USD", "unit": "per_token", "source": "configured",
+                    "prompt": rate, "completion": rate,
+                    "configuration_updated_at": "2026-09-27",
+                })
+                .to_string(),
+            )
+            .unwrap()
+        };
+        let original = plan_inference_invocation(input.clone())
+            .unwrap()
+            .with_price_snapshot(Some(&snapshot(0.000001)))
+            .unwrap();
+        admit_inference_invocation(&pool, &original).await.unwrap();
+        let replay = plan_inference_invocation(input)
+            .unwrap()
+            .with_price_snapshot(Some(&snapshot(0.000002)))
+            .unwrap();
+        assert_eq!(original.route_id(), replay.route_id());
+        assert_eq!(original.invocation_id(), replay.invocation_id());
+        assert_ne!(original.price_snapshot_json, replay.price_snapshot_json);
+        assert!(admit_inference_invocation(&pool, &replay).await.is_err());
+        let recovery = original
+            .clone()
+            .with_price_snapshot(Some(&snapshot(0.000002)))
+            .unwrap();
+        let terminal = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::Cancelled,
+            usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
+            provider_response_id: None,
+            error_kind: Some("cancelled".into()),
+            error_message: None,
+        };
+        assert_eq!(
+            settle_uncertain_inference_admission(&pool, &recovery, &terminal)
+                .await
+                .unwrap(),
+            InferenceInvocationAdmissionResolution::Settled,
+        );
+        let retained: String = sqlx::query_scalar(
+            "SELECT CAST(price_snapshot_json AS CHAR) FROM inference_routes WHERE user_id = ? AND route_id = ?",
+        )
+        .bind(&user_id).bind(original.route_id()).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(
+            crate::models::InferencePriceSnapshot::from_stored(&retained),
+            Some(snapshot(0.000001))
+        );
+        for table in [
+            "inference_invocation_settlement_debts",
+            "inference_invocations",
+            "inference_routes",
+            "agent_sessions",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
+                .bind(&user_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+    }
+
     #[test]
     fn invocation_identity_changes_with_inference_purpose() {
         let primary = plan_inference_invocation(input()).expect("primary plan");
@@ -8772,19 +8825,8 @@ mod tests {
         };
         session_input.run_authority = None;
         let session = plan_inference_invocation(session_input).expect("session plan");
-        let mut harness_input = input();
-        harness_input.scope = InferenceInvocationScope::HarnessRun {
-            harness_run_id: "harness-run-1".to_string(),
-            operation_id: "skillify_extract".to_string(),
-            logical_attempt: 0,
-        };
-        harness_input.run_authority = None;
-        harness_input.purpose = InferencePurpose::SkillSynthesis;
-        let harness = plan_inference_invocation(harness_input).expect("harness plan");
 
         assert_ne!(run.invocation_id(), session.invocation_id());
-        assert_ne!(run.invocation_id(), harness.invocation_id());
-        assert_ne!(session.invocation_id(), harness.invocation_id());
     }
 
     #[test]

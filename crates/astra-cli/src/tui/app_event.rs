@@ -36,10 +36,16 @@ pub(crate) enum TuiAppEvent {
     ContextSystemPromptTokens(u32),
     ContextWindowMeasured(Option<u64>),
     RequestTokenUsage(Option<astra_turn_types::RequestTokenUsage>),
-    Token(String),
+    Token {
+        model_item_id: Option<String>,
+        text: String,
+    },
     ThinkingStarted,
     ThinkingStopped,
-    ThinkingChunk(String),
+    ThinkingChunk {
+        model_item_id: Option<String>,
+        text: String,
+    },
     ToolStarted {
         name: String,
         description: String,

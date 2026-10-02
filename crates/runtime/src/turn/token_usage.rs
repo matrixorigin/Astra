@@ -41,7 +41,7 @@ pub struct TokenUsage {
     pub output_tokens: u64,
 }
 
-/// Records which normalized lanes the provider actually supplied. A zero
+/// Records which normalized lanes the provider evidence proves. A zero
 /// value is meaningful only when its lane is present here; absent lanes are
 /// unavailable and must not be rendered as zero by Explain Analyze.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -453,7 +453,16 @@ fn parse_openai_usage(
     input_invalid |= same_frame_aliases && alias_conflict;
     let inclusive = native_partition || nested_read.is_some() || nested_write.is_some();
     let cached = hit.or(nested_read).or(top_read);
-    let creation = nested_write.or(top_write);
+    let creation = nested_write.or(top_write).or_else(|| {
+        // Explicit fresh/read buckets exhausting the inclusive total prove a
+        // zero creation bucket. Never use a derived fresh value for this proof.
+        match (prompt, hit, miss) {
+            (Some(total), Some(read), Some(fresh)) if read.checked_add(fresh) == Some(total) => {
+                Some(0)
+            }
+            _ => None,
+        }
+    });
     let cache_total = cached.unwrap_or(0).checked_add(creation.unwrap_or(0));
     let fresh = if native_partition {
         miss.or_else(|| prompt.and_then(|p| cache_total.and_then(|cache| p.checked_sub(cache))))
@@ -1309,12 +1318,44 @@ mod tests {
             "prompt_cache_hit_tokens": 800,
             "prompt_cache_miss_tokens": 200
         }));
-        let t = extract_usage(UsageDialect::OpenAi, &u).unwrap();
+        let (t, presence) = parse_usage(UsageDialect::OpenAi, &u).unwrap();
         assert_eq!(t.input_tokens, 200);
         assert_eq!(t.cached_input_tokens, 800);
         assert_eq!(t.cache_creation_tokens, 0);
         assert_eq!(t.output_tokens, 50);
         assert_eq!(t.input_tokens + t.cached_input_tokens, 1000);
+        assert!(presence.cache_creation_tokens);
+        assert_eq!(
+            t.to_qualified_json_map(presence)["cache_creation_tokens"],
+            0
+        );
+        let zero = obj(
+            json!({"prompt_tokens":0,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":0}),
+        );
+        let (usage, presence) = parse_usage(UsageDialect::OpenAi, &zero).unwrap();
+        assert!(presence.cache_creation_tokens);
+        assert_eq!(
+            usage.to_qualified_json_map(presence)["cache_creation_tokens"],
+            0
+        );
+        for raw in [
+            json!({"prompt_tokens":1000,"prompt_cache_hit_tokens":800}),
+            json!({"prompt_tokens":1000,"prompt_cache_miss_tokens":200}),
+            json!({"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200}),
+            json!({"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":800}}),
+            json!({"prompt_tokens":1000,"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":201}),
+            json!({"prompt_tokens":1000,"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200,"cache_creation_input_tokens":"invalid"}),
+            json!({"prompt_tokens":1000,"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200,"cache_creation_input_tokens":1}),
+            json!({"prompt_tokens":1000,"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200,"prompt_tokens_details":{"cached_tokens":799}}),
+        ] {
+            let (usage, presence) = parse_usage(UsageDialect::OpenAi, &obj(raw)).unwrap();
+            assert!(!presence.cache_creation_tokens);
+            assert!(
+                !usage
+                    .to_qualified_json_map(presence)
+                    .contains_key("cache_creation_tokens")
+            );
+        }
     }
 
     #[test]

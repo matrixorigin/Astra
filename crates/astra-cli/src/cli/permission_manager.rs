@@ -2385,6 +2385,16 @@ impl PermissionManager {
         astra_turn_core::permission::engine::evaluate_permission(name, args, &ctx)
     }
 
+    fn evaluate_permission_envelope_with_read_only_ceiling(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> DecisionEnvelope {
+        let mut ctx = self.evaluation_context();
+        ctx.inherited.read_only_execution = true;
+        astra_turn_core::permission::engine::evaluate_permission(name, args, &ctx)
+    }
+
     /// Check if a file path targets a dangerous location.
     fn check_dangerous_path(name: &str, args: &serde_json::Value) -> Option<&'static str> {
         if let Some(ref path) = path_hint_from_args(args)
@@ -3380,14 +3390,38 @@ impl PermissionManager {
         name: &str,
         args: &serde_json::Value,
     ) -> GateOutcome {
-        let decision = self.check_nonblocking_inner(name, args);
+        self.check_nonblocking_inner(name, args, false)
+    }
+
+    /// Check a request under an inherited immutable execution ceiling while
+    /// using the same evaluator and audit path as ordinary requests.
+    pub(crate) fn check_nonblocking_read_only(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> GateOutcome {
+        self.check_nonblocking_inner(name, args, true)
+    }
+
+    fn check_nonblocking_inner(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        read_only_execution: bool,
+    ) -> GateOutcome {
+        let decision = self.check_nonblocking_unrecorded(name, args, read_only_execution);
         if let GateOutcome::Deny(reason) = &decision {
             self.record_rejection(name, reason);
         }
         decision
     }
 
-    fn check_nonblocking_inner(&mut self, name: &str, args: &serde_json::Value) -> GateOutcome {
+    fn check_nonblocking_unrecorded(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        read_only_execution: bool,
+    ) -> GateOutcome {
         fn trim_sandbox_reason_for_ui(raw: &str) -> String {
             const INSTRUCTION: &str =
                 "Ask the user for permission before accessing files outside the project.";
@@ -3399,7 +3433,11 @@ impl PermissionManager {
                 + "."
         }
 
-        let envelope = self.evaluate_permission_envelope(name, args);
+        let envelope = if read_only_execution {
+            self.evaluate_permission_envelope_with_read_only_ceiling(name, args)
+        } else {
+            self.evaluate_permission_envelope(name, args)
+        };
         astra_turn_core::permission::audit::record_evaluated_envelope_for_session(
             self.active_session_id(),
             name,
@@ -4091,6 +4129,62 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("write_file")
         );
+    }
+
+    #[test]
+    fn read_only_check_reuses_audit_and_does_not_change_parent_policy() {
+        let journal_dir = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
+        let session_id = format!("perm-manager-read-only-{}", uuid::Uuid::new_v4());
+        let project_dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, project_dir.path());
+        pm.set_active_session_id(&session_id);
+        let read_args = serde_json::json!({"path": "README.md"});
+        let write_args = serde_json::json!({"path": "marker", "content": "blocked"});
+
+        assert!(matches!(
+            pm.check_nonblocking_read_only("read_file", &read_args),
+            GateOutcome::Allow
+        ));
+        assert!(matches!(
+            pm.check_nonblocking_read_only("write_file", &write_args),
+            GateOutcome::Deny(reason) if reason.contains("read-only")
+        ));
+        assert!(
+            !pm.runtime_permission_context()
+                .inherited
+                .read_only_execution
+        );
+
+        let audits = astra_services::session_journal::read_journal(&session_id)
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event.event_type
+                    == astra_services::session_journal::JournalEventType::PermissionAudit
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            audits.len(),
+            2,
+            "each ceiling check is audited exactly once"
+        );
+        assert!(audits.iter().any(|event| {
+            event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("decision"))
+                .and_then(serde_json::Value::as_str)
+                == Some("allow")
+        }));
+        assert!(audits.iter().any(|event| {
+            event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("decision"))
+                .and_then(serde_json::Value::as_str)
+                == Some("deny")
+        }));
     }
 
     #[test]

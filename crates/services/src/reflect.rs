@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use astra_core::{
-    ErrorResponse, MatrixOneSettings, ObservationActionHint, ObservationBudgetOmitted,
-    ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage, ObservationEvidence,
-    ObservationFailureCluster, ObservationGraphEdgeKind, ObservationGraphLayer,
-    ObservationGraphNode, ObservationGraphNodeKind, ObservationGraphSlice, ObservationRecord,
-    ObservationView, SharedPool, classify_event_kind, error_response, internal_error,
-    push_graph_edge, push_graph_node, truncate_graph_summary,
+    ErrorResponse, MatrixOneSettings, ObservationActionHint, ObservationBudgetResult,
+    ObservationConfidence, ObservationDataCoverage, ObservationEvidence, ObservationFailureCluster,
+    ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
+    ObservationGraphNodeKind, ObservationGraphSlice, ObservationRecord, ObservationView,
+    SharedPool, classify_event_kind, error_response, internal_error, push_graph_edge,
+    push_graph_node, truncate_graph_summary,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
@@ -72,6 +72,9 @@ pub struct ReflectReport {
     pub source_policy: String,
     pub include_context: bool,
     pub data_coverage: ObservationDataCoverage,
+    /// Captured request-ledger coverage and terminal usage facts. Empty or
+    /// unavailable capture is not evidence that no child inference occurred.
+    pub model_requests: ModelRequestCapture,
     /// Physical inference attempts for internal decisions, scoped to this
     /// authenticated session. Missing coverage is explicit, never zero usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +147,92 @@ impl JudgmentUsageScope {
 fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRequestCaptureCoverage {
+    /// This source does not capture model-request records (for example a local
+    /// journal-only reflection).
+    #[default]
+    NotCaptured,
+    /// The bounded ledger query succeeded and returned no rows. This does not
+    /// establish that no inference occurred.
+    NoRecordsObserved,
+    /// Some rows were observed below the query limit; this is still a bounded
+    /// retained window, not complete session billing.
+    WindowObserved,
+    /// The query reached its row limit, so captured counts may be lower bounds.
+    WindowLimitReached,
+    /// The request ledger could not be read.
+    SourceUnavailable,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelRequestCapture {
+    pub coverage: ModelRequestCaptureCoverage,
+    /// Raw accepted and terminal event rows returned by the bounded query.
+    pub records_observed: u64,
+    pub accepted_records_observed: u64,
+    /// Aggregated terminal records only; accepted records do not prove that a
+    /// provider request was dispatched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<ModelRequestSummary>,
+}
+
+impl ModelRequestCapture {
+    fn from_records(records: &[ModelRequestContextRecord], limit_reached: bool) -> Self {
+        Self {
+            coverage: if records.is_empty() {
+                ModelRequestCaptureCoverage::NoRecordsObserved
+            } else if limit_reached {
+                ModelRequestCaptureCoverage::WindowLimitReached
+            } else {
+                ModelRequestCaptureCoverage::WindowObserved
+            },
+            records_observed: records.len() as u64,
+            accepted_records_observed: records
+                .iter()
+                .filter(|record| record.stage == ModelRequestEventStage::Accepted)
+                .count() as u64,
+            terminal: ModelRequestSummary::from_records(records),
+        }
+    }
+
+    fn render_compact(&self) -> String {
+        let mut rendered = match self.coverage {
+            ModelRequestCaptureCoverage::NotCaptured => {
+                "Model-request capture was not available from this source; absence does not establish zero inference.".to_string()
+            }
+            ModelRequestCaptureCoverage::NoRecordsObserved => {
+                "No model-request records were observed in the bounded ledger window; this does not establish zero inference.".to_string()
+            }
+            ModelRequestCaptureCoverage::WindowObserved => format!(
+                "Observed {} model-request ledger row(s) in a bounded window; this is not complete session billing.",
+                self.records_observed
+            ),
+            ModelRequestCaptureCoverage::WindowLimitReached => format!(
+                "Model-request ledger window reached its {}-row limit; counts are lower bounds and not complete session billing.",
+                MODEL_REQUEST_CAPTURE_LIMIT
+            ),
+            ModelRequestCaptureCoverage::SourceUnavailable => {
+                "Model-request ledger source is unavailable; absence does not establish zero inference.".to_string()
+            }
+        };
+        if self.accepted_records_observed > 0 {
+            rendered.push_str(&format!(
+                " Accepted-stage records observed: {}; accepted stage alone is not provider-response evidence.",
+                self.accepted_records_observed
+            ));
+        }
+        if let Some(terminal) = &self.terminal {
+            rendered.push(' ');
+            rendered.push_str(&terminal.render());
+        }
+        rendered
+    }
+}
+
+const MODEL_REQUEST_CAPTURE_LIMIT: u32 = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JudgmentUsageGroup {
@@ -508,12 +597,71 @@ pub struct AgentDeliveryRollup {
 /// Bounded, content-free performance facts sourced from the per-request
 /// context ledger. Keeping this separate from error diagnoses prevents
 /// reflection from guessing latency or cache behavior from tool names/prose.
-#[derive(Debug, Clone, Default, PartialEq)]
-struct ModelRequestSummary {
-    terminal_requests: u64,
-    input: astra_turn_types::NormalizedPromptCacheUsage,
-    output_tokens: u64,
-    cache_invalidations: u64,
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelRequestSummary {
+    pub terminal_requests: u64,
+    pub conflicting_requests: u64,
+    pub input: astra_turn_types::NormalizedPromptCacheUsage,
+    pub output_tokens: u64,
+    pub cache_invalidations: u64,
+    pub usage_observations: u64,
+    pub cache_usage_observations: u64,
+    pub usage_coverage: ModelRequestUsageCoverage,
+    pub terminal_statuses: ModelRequestTerminalStatusCounts,
+    pub provider_response_id_observations: u64,
+    pub groups: Vec<ModelRequestGroup>,
+    pub omitted_groups: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelRequestUsageCoverage {
+    pub exact: u64,
+    pub partial: u64,
+    pub unavailable: u64,
+    pub unknown: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelRequestTerminalStatusCounts {
+    pub succeeded: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+    pub delivery_unknown: u64,
+    pub unknown: u64,
+}
+
+impl ModelRequestTerminalStatusCounts {
+    fn observe(&mut self, status: Option<&str>) {
+        let count = match status {
+            Some("succeeded") => &mut self.succeeded,
+            Some("failed") => &mut self.failed,
+            Some("cancelled") => &mut self.cancelled,
+            Some("delivery_unknown") => &mut self.delivery_unknown,
+            _ => &mut self.unknown,
+        };
+        *count = count.saturating_add(1);
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelRequestGroup {
+    pub run_id: Option<String>,
+    pub parent_run_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub offering_id: String,
+    pub provider: String,
+    pub model: String,
+    pub upstream_model: Option<String>,
+    pub purpose: String,
+    pub terminal_requests: u64,
+    pub terminal_statuses: ModelRequestTerminalStatusCounts,
+    /// Count of captured request records that include a provider response ID.
+    /// Missing IDs are not evidence that the provider was never contacted.
+    pub provider_response_id_observations: u64,
+    pub input: astra_turn_types::NormalizedPromptCacheUsage,
+    pub output_tokens: u64,
+    pub usage_observations: u64,
+    pub usage_coverage: ModelRequestUsageCoverage,
 }
 
 /// Bounded latency facts from durable `llm_round` events. This is deliberately
@@ -572,37 +720,124 @@ fn llm_round_latency_summary_from_row(
 
 impl ModelRequestSummary {
     fn from_records(records: &[ModelRequestContextRecord]) -> Option<Self> {
+        const MAX_GROUPS: usize = 8;
         let mut summary = Self::default();
+        let mut requests: BTreeMap<&str, Option<&ModelRequestContextRecord>> = BTreeMap::new();
         for record in records {
             if record.stage != ModelRequestEventStage::Terminal {
                 continue;
             }
+            // request_id is already the canonical physical-attempt ID. Keep
+            // conflicts sticky so input order cannot select an identity or
+            // usage payload, even if a later row repeats the first version.
+            requests
+                .entry(record.event.identity.request_id.as_str())
+                .and_modify(|existing| {
+                    if existing.is_some_and(|first| {
+                        first.event.identity != record.event.identity
+                            || first.event.route != record.event.route
+                            || first.event.usage != record.event.usage
+                            || first.event.usage_status != record.event.usage_status
+                            || first.event.cache != record.event.cache
+                            || first.event.terminal_status != record.event.terminal_status
+                            || first.terminal_status != record.terminal_status
+                    }) {
+                        *existing = None;
+                    }
+                })
+                .or_insert(Some(record));
+        }
+        let mut groups = BTreeMap::new();
+        for record in requests.into_values() {
             summary.terminal_requests = summary.terminal_requests.saturating_add(1);
+            let Some(record) = record else {
+                summary.conflicting_requests += 1;
+                summary.usage_coverage.observe(None);
+                summary.terminal_statuses.observe(None);
+                continue;
+            };
+            let identity = &record.event.identity;
+            summary
+                .usage_coverage
+                .observe(record.event.usage_status.as_deref());
+            summary
+                .terminal_statuses
+                .observe(record.terminal_status.as_deref());
+            if identity.provider_response_id.is_some() {
+                summary.provider_response_id_observations =
+                    summary.provider_response_id_observations.saturating_add(1);
+            }
+            let key = (
+                identity.run_id.clone(),
+                identity.parent_run_id.clone(),
+                identity.agent_id.clone(),
+                identity.offering_id.clone(),
+                identity.provider.clone(),
+                identity.model.clone(),
+                record
+                    .event
+                    .route
+                    .as_ref()
+                    .map(|route| route.upstream_model.clone()),
+                identity.inference_purpose.clone(),
+            );
+            let group = groups
+                .entry(key.clone())
+                .or_insert_with(|| ModelRequestGroup {
+                    run_id: key.0,
+                    parent_run_id: key.1,
+                    agent_id: key.2,
+                    offering_id: key.3,
+                    provider: key.4,
+                    model: key.5,
+                    upstream_model: key.6,
+                    purpose: key.7,
+                    ..ModelRequestGroup::default()
+                });
+            group.terminal_requests = group.terminal_requests.saturating_add(1);
+            group
+                .terminal_statuses
+                .observe(record.terminal_status.as_deref());
+            if identity.provider_response_id.is_some() {
+                group.provider_response_id_observations =
+                    group.provider_response_id_observations.saturating_add(1);
+            }
+            group
+                .usage_coverage
+                .observe(record.event.usage_status.as_deref());
             if let Some(usage) = record.event.usage.as_ref() {
-                summary.input.fresh_input_tokens = summary
-                    .input
-                    .fresh_input_tokens
-                    .saturating_add(usage.input.fresh_input_tokens);
+                summary.usage_observations = summary.usage_observations.saturating_add(1);
+                // The producer owns cache coverage (System One, for example,
+                // reports input/output but no cache buckets). Do not infer it
+                // from normalized zero buckets or an exact input/output status.
+                if record.event.cache.cache_read_share.is_some()
+                    || usage.input.total_input_tokens() == 0
+                {
+                    summary.cache_usage_observations += 1;
+                }
+                group.usage_observations = group.usage_observations.saturating_add(1);
+                add_prompt_cache_usage(&mut summary.input, &usage.input);
                 summary.output_tokens = summary.output_tokens.saturating_add(usage.output_tokens);
-                summary.input.cache_read_tokens = summary
-                    .input
-                    .cache_read_tokens
-                    .saturating_add(usage.input.cache_read_tokens);
-                summary.input.cache_creation_tokens = summary
-                    .input
-                    .cache_creation_tokens
-                    .saturating_add(usage.input.cache_creation_tokens);
+                add_prompt_cache_usage(&mut group.input, &usage.input);
+                group.output_tokens = group.output_tokens.saturating_add(usage.output_tokens);
             }
             if !record.event.cache.invalidation_reasons.is_empty() {
                 summary.cache_invalidations = summary.cache_invalidations.saturating_add(1);
             }
         }
+        summary.omitted_groups = groups.len().saturating_sub(MAX_GROUPS);
+        summary.groups = groups.into_values().take(MAX_GROUPS).collect();
         (summary.terminal_requests > 0).then_some(summary)
     }
 
     fn render(&self) -> String {
         let total_input_tokens = self.input.total_input_tokens();
-        let cache_share = if total_input_tokens == 0 {
+        let cache_share = if self.terminal_requests == 0
+            || self.usage_observations != self.terminal_requests
+            || self.cache_usage_observations != self.terminal_requests
+            || self.usage_coverage.exact != self.terminal_requests
+            || total_input_tokens == 0
+        {
             "unknown".to_string()
         } else {
             format!(
@@ -610,17 +845,112 @@ impl ModelRequestSummary {
                 self.input.cache_read_tokens as f64 / total_input_tokens as f64 * 100.0
             )
         };
-        format!(
-            "Model requests: {} terminal; cache read {cache_share} ({}/{} total input; {} fresh, {} cache write), {} model-context invalidation record(s), {} output tokens. Pipeline cache-break alerts, when present, are reported separately as session issues.",
+        let mut rendered = format!(
+            "Captured terminal model-request records (not a dispatch count or complete session billing): {}; known cache read {cache_share} ({}/{} known input; {} fresh, {} cache write), {} model-context invalidation record(s), observed output tokens: {}; usage coverage exact={}, partial={}, unavailable={}, unknown={}; terminal status succeeded={}, failed={}, cancelled={}, delivery_unknown={}, unknown={}; provider response IDs observed={}.",
             self.terminal_requests,
-            self.input.cache_read_tokens,
-            total_input_tokens,
-            self.input.fresh_input_tokens,
-            self.input.cache_creation_tokens,
+            render_known_usage(self.usage_observations, self.input.cache_read_tokens),
+            render_known_usage(self.usage_observations, total_input_tokens),
+            render_known_usage(self.usage_observations, self.input.fresh_input_tokens),
+            render_known_usage(self.usage_observations, self.input.cache_creation_tokens),
             self.cache_invalidations,
-            self.output_tokens,
-        )
+            render_known_usage(self.usage_observations, self.output_tokens),
+            self.usage_coverage.exact,
+            self.usage_coverage.partial,
+            self.usage_coverage.unavailable,
+            self.usage_coverage.unknown,
+            self.terminal_statuses.succeeded,
+            self.terminal_statuses.failed,
+            self.terminal_statuses.cancelled,
+            self.terminal_statuses.delivery_unknown,
+            self.terminal_statuses.unknown,
+            self.provider_response_id_observations,
+        );
+        if self.conflicting_requests > 0 {
+            rendered.push_str(&format!(
+                " {} conflicting request record group(s) counted as unknown; their usage, status, and identity groups are excluded.",
+                self.conflicting_requests,
+            ));
+        }
+        for group in &self.groups {
+            rendered.push_str(&format!(
+                "\n- run={} parent_run={} agent={} offering={} provider={} model={} upstream_model={} purpose={} terminal_records={} known_input={} known_output={} usage(exact={}, partial={}, unavailable={}, unknown={}) status(succeeded={}, failed={}, cancelled={}, delivery_unknown={}, unknown={}) provider_response_ids_observed={}",
+                render_model_request_identity(group.run_id.as_deref()),
+                render_model_request_identity(group.parent_run_id.as_deref()),
+                render_model_request_identity(group.agent_id.as_deref()),
+                render_model_request_identity(Some(&group.offering_id)),
+                render_model_request_identity(Some(&group.provider)),
+                render_model_request_identity(Some(&group.model)),
+                render_model_request_identity(group.upstream_model.as_deref()),
+                render_model_request_identity(Some(&group.purpose)),
+                group.terminal_requests,
+                render_known_usage(group.usage_observations, group.input.total_input_tokens()),
+                render_known_usage(group.usage_observations, group.output_tokens),
+                group.usage_coverage.exact,
+                group.usage_coverage.partial,
+                group.usage_coverage.unavailable,
+                group.usage_coverage.unknown,
+                group.terminal_statuses.succeeded,
+                group.terminal_statuses.failed,
+                group.terminal_statuses.cancelled,
+                group.terminal_statuses.delivery_unknown,
+                group.terminal_statuses.unknown,
+                group.provider_response_id_observations,
+            ));
+        }
+        if self.omitted_groups > 0 {
+            rendered.push_str(&format!(
+                "\n- {0} additional model identity group(s) omitted",
+                self.omitted_groups
+            ));
+        }
+        rendered.push_str(" Pipeline cache-break alerts, when present, are reported separately as session issues.");
+        rendered
     }
+}
+
+impl ModelRequestUsageCoverage {
+    fn observe(&mut self, status: Option<&str>) {
+        match status {
+            Some("provider_exact") => self.exact = self.exact.saturating_add(1),
+            Some("provider_partial") => self.partial = self.partial.saturating_add(1),
+            Some("unavailable") => self.unavailable = self.unavailable.saturating_add(1),
+            _ => self.unknown = self.unknown.saturating_add(1),
+        }
+    }
+}
+
+fn add_prompt_cache_usage(
+    total: &mut astra_turn_types::NormalizedPromptCacheUsage,
+    usage: &astra_turn_types::NormalizedPromptCacheUsage,
+) {
+    total.fresh_input_tokens = total
+        .fresh_input_tokens
+        .saturating_add(usage.fresh_input_tokens);
+    total.cache_read_tokens = total
+        .cache_read_tokens
+        .saturating_add(usage.cache_read_tokens);
+    total.cache_creation_tokens = total
+        .cache_creation_tokens
+        .saturating_add(usage.cache_creation_tokens);
+}
+
+fn render_known_usage(observations: u64, value: u64) -> String {
+    if observations == 0 {
+        "unknown".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn render_model_request_identity(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "unknown".to_string();
+    };
+    let mut bounded = value.chars().take(128).collect::<String>();
+    if value.chars().nth(128).is_some() {
+        bounded.push('…');
+    }
+    serde_json::to_string(&bounded).expect("string serialization cannot fail")
 }
 
 impl AgentDeliveryRollup {
@@ -697,7 +1027,6 @@ pub(crate) enum InsightKind {
     ToolConcentration { tool: String },
     ModelFanout { decision_type: String },
     EmptySession,
-    DecisionStall,
 }
 
 impl InsightKind {
@@ -708,7 +1037,6 @@ impl InsightKind {
             Self::ToolConcentration { .. } => "tool_concentration",
             Self::ModelFanout { .. } => "model_fanout",
             Self::EmptySession => "empty_session",
-            Self::DecisionStall => "decision_stall",
         }
     }
 }
@@ -763,7 +1091,7 @@ struct EvidenceDecision {
     created_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct EvidenceEvent {
     event_id: String,
     event_type: String,
@@ -772,6 +1100,392 @@ struct EvidenceEvent {
     parent_event_id: Option<String>,
     causal_chain_id: Option<String>,
     created_at: String,
+    run_id: Option<String>,
+    parent_run_id: Option<String>,
+    agent_id: Option<String>,
+    tool_call_id: Option<String>,
+    trace_kind: Option<String>,
+    metadata: Option<serde_json::Value>,
+    metadata_omitted: bool,
+}
+
+const EXECUTION_SPINE_SUMMARY: &str = "Captured execution facts only; task completion is not established. Missing spawn, terminal or adoption facts remain unknown outside this bounded capture.";
+const EXECUTION_SPINE_FACT_LIMIT: usize = 8;
+const EXECUTION_FACT_CHILD_LIMIT: usize = 8;
+const EXECUTION_SPINE_BYTE_LIMIT: usize = 4096;
+
+/// Only these identity/status fields cross the Reflect boundary. In particular,
+/// child output, prompts, descriptions and arbitrary trace attributes do not.
+#[derive(Debug, Clone, Serialize)]
+struct ExecutionChild {
+    agent_id: String,
+    run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_truncated: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CapturedToolOutcome {
+    tool_name: String,
+    disposition: crate::session_journal::ToolCallDisposition,
+    ok: bool,
+    result_class: Option<String>,
+    exit_semantics: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExecutionFact {
+    event_id: String,
+    parent_event_id: Option<String>,
+    created_at: String,
+    kind: String,
+    run_id: Option<String>,
+    parent_run_id: Option<String>,
+    agent_id: Option<String>,
+    outcome: Option<String>,
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_outcome: Option<CapturedToolOutcome>,
+    children: Vec<ExecutionChild>,
+    omitted_children: usize,
+    metadata_available: bool,
+    metadata_omitted: bool,
+}
+
+fn execution_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)?
+        .as_str()
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .map(str::to_owned)
+}
+
+impl EvidenceEvent {
+    fn is_tool_terminal(&self) -> bool {
+        matches!(
+            self.event_type.as_str(),
+            "tool_call_completed"
+                | "tool_call_failed"
+                | "tool_call_rejected"
+                | "tool_call_reused"
+                | "tool_call_suppressed"
+                | "tool_call_deferred"
+        )
+    }
+
+    fn is_execution_fact(&self) -> bool {
+        self.is_tool_terminal()
+            || matches!(
+                self.event_type.as_str(),
+                "agent_spawned"
+                    | "agent_terminated"
+                    | "agent_completed"
+                    | "agent_failed"
+                    | "agent_cancelled"
+                    | "agent_interrupted"
+                    | "agent_waiting"
+            )
+            || (self.event_type == "trace_span"
+                && (self.trace_kind.as_deref() == Some("agent_dependency_boundary")
+                    || self.metadata_omitted
+                    || self
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("name"))
+                        .and_then(|v| v.as_str())
+                        == Some("agent_dependency_boundary")))
+    }
+
+    fn execution_fact(&self) -> Option<ExecutionFact> {
+        if !self.is_execution_fact() {
+            return None;
+        }
+        // Unattributed tool events remain ordinary graph evidence. Do not
+        // invent a separate execution spine from each transport event ID.
+        if self.is_tool_terminal() && self.run_id.is_none() {
+            return None;
+        }
+        let metadata = self.metadata.as_ref().unwrap_or(&serde_json::Value::Null);
+        let dependency = self.event_type == "trace_span";
+        let attrs = &metadata["attrs"];
+        let metadata_agent_id = execution_string(metadata, "agent_id");
+        let agent_id = self.agent_id.clone().or_else(|| metadata_agent_id.clone());
+        let tool_call_id = if dependency {
+            execution_string(attrs, "tool_call_id")
+        } else {
+            self.tool_call_id.clone()
+        };
+        let parent_run_id = if dependency {
+            execution_string(attrs, "parent_run_id")
+        } else {
+            execution_string(metadata, "parent_run_id").or_else(|| self.parent_run_id.clone())
+        };
+        let run_id = if dependency {
+            parent_run_id.clone().or_else(|| self.run_id.clone())
+        } else {
+            execution_string(metadata, "run_id").or_else(|| self.run_id.clone())
+        };
+        // A mismatched producer run must not publish adoption for another run.
+        let scope_valid = if dependency {
+            parent_run_id.is_some()
+                && self
+                    .run_id
+                    .as_ref()
+                    .is_none_or(|id| Some(id) == parent_run_id.as_ref())
+                && execution_string(metadata, "trace_id")
+                    .as_ref()
+                    .is_none_or(|id| Some(id) == parent_run_id.as_ref())
+        } else {
+            run_id.is_some()
+                && agent_id.is_some()
+                && self.agent_id.as_ref().is_none_or(|id| {
+                    metadata_agent_id
+                        .as_ref()
+                        .is_none_or(|metadata_id| metadata_id == id)
+                })
+                && self
+                    .run_id
+                    .as_ref()
+                    .is_none_or(|id| Some(id) == run_id.as_ref())
+                && self
+                    .parent_run_id
+                    .as_ref()
+                    .is_none_or(|id| Some(id) == parent_run_id.as_ref())
+        };
+        let raw_children = attrs
+            .get("children")
+            .and_then(|v| v.as_str())
+            .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(json).ok());
+        let mut children = Vec::new();
+        let tool_outcome = if self.is_tool_terminal()
+            && scope_valid
+            && self.run_id.is_some()
+            && self.agent_id.is_some()
+            && tool_call_id.is_some()
+        {
+            self.skill_name
+                .as_ref()
+                .filter(|name| !name.is_empty() && name.len() <= 128)
+                .and_then(|name| {
+                    let disposition: crate::session_journal::ToolCallDisposition =
+                        serde_json::from_value(metadata.get("disposition")?.clone()).ok()?;
+                    let ok = metadata.get("ok")?.as_bool()?;
+                    if disposition.terminal_event_type(ok) != self.event_type {
+                        return None;
+                    }
+                    Some(CapturedToolOutcome {
+                        tool_name: name.clone(),
+                        disposition,
+                        ok,
+                        result_class: metadata
+                            .get("result_class")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|value| value.len() <= 40)
+                            .map(str::to_owned),
+                        exit_semantics: metadata
+                            .get("exit_semantics")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|value| value.len() <= 40)
+                            .map(str::to_owned),
+                    })
+                })
+        } else {
+            None
+        };
+        if scope_valid && let Some(raw) = &raw_children {
+            for child in raw.iter().take(EXECUTION_FACT_CHILD_LIMIT) {
+                if let (Some(agent_id), Some(run_id)) = (
+                    execution_string(child, "agent_id"),
+                    execution_string(child, "run_id"),
+                ) {
+                    children.push(ExecutionChild {
+                        agent_id,
+                        run_id,
+                        status: execution_string(child, "status"),
+                        result_sha256: execution_string(child, "result_sha256").filter(|hash| {
+                            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        }),
+                        result_truncated: child.get("result_truncated").and_then(|v| v.as_bool()),
+                    });
+                }
+            }
+        }
+        Some(ExecutionFact {
+            event_id: self.event_id.clone(),
+            parent_event_id: self.parent_event_id.clone(),
+            created_at: self.created_at.clone(),
+            kind: if dependency {
+                "agent_dependency_boundary".into()
+            } else {
+                self.event_type.clone()
+            },
+            run_id: if scope_valid {
+                run_id
+            } else {
+                self.run_id.clone()
+            },
+            parent_run_id: if scope_valid { parent_run_id } else { None },
+            agent_id: if scope_valid { agent_id } else { None },
+            outcome: if !scope_valid {
+                None
+            } else if dependency {
+                execution_string(attrs, "outcome")
+            } else {
+                execution_string(metadata, "status")
+            },
+            tool_call_id: if scope_valid { tool_call_id } else { None },
+            omitted_children: raw_children
+                .as_ref()
+                .map_or(0, |raw| raw.len().saturating_sub(children.len())),
+            metadata_available: self.metadata.is_some()
+                && !self.metadata_omitted
+                && scope_valid
+                && (!self.is_tool_terminal() || tool_outcome.is_some())
+                && (!dependency
+                    || (raw_children.is_some() && execution_string(attrs, "outcome").is_some())),
+            metadata_omitted: self.metadata_omitted,
+            tool_outcome,
+            children,
+        })
+    }
+}
+
+fn is_execution_spine(node: &ObservationGraphNode) -> bool {
+    node.metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.get("execution_spine").is_some())
+}
+
+/// Compact related facts once, before either graph or presentation budgets.
+/// Identity is exact (parent run, child run, agent), never result text. These are
+/// captured facts, not a reconstruction of lifecycle state or a completion verdict.
+fn execution_spines(
+    events: &[EvidenceEvent],
+) -> (Vec<ObservationGraphNode>, BTreeMap<String, String>) {
+    let facts: Vec<_> = events
+        .iter()
+        .filter_map(EvidenceEvent::execution_fact)
+        .collect();
+    let mut child_parents: BTreeMap<(&str, &str), BTreeSet<&String>> = BTreeMap::new();
+    for fact in &facts {
+        let Some(parent) = fact.parent_run_id.as_ref() else {
+            continue;
+        };
+        if fact.kind == "agent_spawned"
+            && let (Some(run), Some(agent)) = (&fact.run_id, &fact.agent_id)
+        {
+            child_parents
+                .entry((run, agent))
+                .or_default()
+                .insert(parent);
+        }
+        for child in &fact.children {
+            child_parents
+                .entry((&child.run_id, &child.agent_id))
+                .or_default()
+                .insert(parent);
+        }
+    }
+    let mut groups: BTreeMap<String, Vec<&ExecutionFact>> = BTreeMap::new();
+    for fact in &facts {
+        let parent = fact.parent_run_id.as_ref().or_else(|| {
+            if !matches!(
+                fact.kind.as_str(),
+                "agent_terminated"
+                    | "agent_completed"
+                    | "agent_failed"
+                    | "agent_cancelled"
+                    | "agent_interrupted"
+                    | "agent_waiting"
+            ) {
+                return None;
+            }
+            // Terminal facts need not carry their parent. Resolve only from an
+            // exact captured spawn/dependency identity, never a digest or agent alone.
+            let parents =
+                child_parents.get(&(fact.run_id.as_deref()?, fact.agent_id.as_deref()?))?;
+            (parents.len() == 1).then(|| *parents.first().expect("one parent"))
+        });
+        let scope = parent.or(fact.run_id.as_ref()).unwrap_or(&fact.event_id);
+        groups.entry(scope.clone()).or_default().push(fact);
+    }
+    let mut nodes = Vec::new();
+    let mut event_refs = BTreeMap::new();
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_by(|a, b| {
+        b.1.iter()
+            .map(|fact| &fact.created_at)
+            .max()
+            .cmp(&a.1.iter().map(|fact| &fact.created_at).max())
+    });
+    for (run_id, mut facts) in groups {
+        facts.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.event_id.cmp(&a.event_id))
+        });
+        let ref_id = astra_core::Urn::new("artifact", "graph", "reflect")
+            .seg("execution")
+            .seg(&run_id)
+            .build();
+        for fact in &facts {
+            event_refs.insert(fact.event_id.clone(), ref_id.clone());
+        }
+        // Retain phase diversity before repeated observations of the same phase.
+        let mut phases = BTreeSet::new();
+        let mut selected = Vec::new();
+        for fact in &facts {
+            if phases.insert((&fact.kind, &fact.outcome))
+                && selected.len() < EXECUTION_SPINE_FACT_LIMIT
+            {
+                selected.push(*fact);
+            }
+        }
+        for fact in &facts {
+            if selected.len() < EXECUTION_SPINE_FACT_LIMIT
+                && !selected.iter().any(|kept| kept.event_id == fact.event_id)
+            {
+                selected.push(*fact);
+            }
+        }
+        let mut metadata = serde_json::json!({"execution_spine": {
+            "run_id": facts.iter().any(|fact| fact.run_id.is_some() || fact.parent_run_id.is_some()).then_some(run_id),
+            "coverage": "partial", "missing_facts": "unknown",
+            "task_completion": "not_established", "facts": selected,
+            "omitted_facts": facts.len().saturating_sub(selected.len()),
+            "truncated": selected.len() < facts.len() || facts.iter().any(|fact| fact.omitted_children > 0 || fact.metadata_omitted),
+        }});
+        // Complete source facts only: never cut an identity, digest or JSON
+        // fragment to fit. Counts alone would allow four very large spines.
+        while serde_json::to_vec(&metadata).expect("JSON value").len() > EXECUTION_SPINE_BYTE_LIMIT
+            && !selected.is_empty()
+        {
+            selected.pop();
+            metadata["execution_spine"]["facts"] = serde_json::json!(selected);
+            metadata["execution_spine"]["omitted_facts"] =
+                serde_json::json!(facts.len() - selected.len());
+            metadata["execution_spine"]["truncated"] = serde_json::json!(true);
+        }
+        selected.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
+        metadata["execution_spine"]["facts"] = serde_json::json!(selected);
+        nodes.push(ObservationGraphNode {
+            ref_id,
+            layer: ObservationGraphLayer::Runtime,
+            kind: ObservationGraphNodeKind::Evidence,
+            label: "execution_spine".into(),
+            summary: Some(EXECUTION_SPINE_SUMMARY.into()),
+            metadata: Some(metadata),
+        });
+    }
+    (nodes, event_refs)
 }
 
 fn build_evidence_graph(
@@ -783,7 +1497,7 @@ fn build_evidence_graph(
         return None;
     }
 
-    let mut nodes = Vec::new();
+    let (mut nodes, execution_refs) = execution_spines(events);
     let mut edges = Vec::new();
     let mut event_node_ids = std::collections::HashSet::new();
     let mut event_refs = std::collections::HashMap::new();
@@ -811,9 +1525,15 @@ fn build_evidence_graph(
     }
 
     for event in events {
-        let ref_id = graph_event_ref(&event.event_id);
+        let ref_id = execution_refs
+            .get(&event.event_id)
+            .cloned()
+            .unwrap_or_else(|| graph_event_ref(&event.event_id));
         event_node_ids.insert(event.event_id.clone());
         event_refs.insert(event.event_id.clone(), ref_id.clone());
+        if execution_refs.contains_key(&event.event_id) {
+            continue;
+        }
         nodes.push(ObservationGraphNode {
             ref_id,
             layer: ObservationGraphLayer::Runtime,
@@ -858,6 +1578,7 @@ fn build_evidence_graph(
                     event_refs.get(parent_event_id.as_str()),
                     event_refs.get(event.event_id.as_str()),
                 )
+                && from != to
             {
                 push_graph_edge(
                     &mut edges,
@@ -887,10 +1608,18 @@ fn build_evidence_graph(
         }
     }
 
+    let truncated = nodes.iter().any(|node| {
+        node.metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata["execution_spine"]["truncated"] == true)
+    });
     Some(ObservationGraphSlice {
         nodes,
         edges,
-        budget_result: ObservationBudgetResult::default(),
+        budget_result: ObservationBudgetResult {
+            truncated,
+            ..Default::default()
+        },
     })
 }
 pub type ServiceResult<T> = Result<T, (StatusCode, Json<ErrorResponse>)>;
@@ -1104,6 +1833,10 @@ fn evidence_decision_from_row(row: &impl ReflectRow) -> ServiceResult<EvidenceDe
 
 fn evidence_event_from_row(row: &impl ReflectRow) -> ServiceResult<EvidenceEvent> {
     let context = "evidence_event_row";
+    let metadata = reflect_row_optional_string(row, context, "metadata_json")?
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|error| reflect_decode_error(context, "metadata_json", error))?;
     Ok(EvidenceEvent {
         event_id: reflect_row_required_non_empty_string(row, context, "event_id")?,
         event_type: reflect_row_required_non_empty_string(row, context, "event_type")?,
@@ -1112,6 +1845,13 @@ fn evidence_event_from_row(row: &impl ReflectRow) -> ServiceResult<EvidenceEvent
         parent_event_id: reflect_row_optional_string(row, context, "parent_event_id")?,
         causal_chain_id: reflect_row_optional_string(row, context, "causal_chain_id")?,
         created_at: reflect_row_required_non_empty_string(row, context, "created_at")?,
+        run_id: reflect_row_optional_string(row, context, "run_id")?,
+        parent_run_id: reflect_row_optional_string(row, context, "parent_run_id")?,
+        agent_id: reflect_row_optional_string(row, context, "agent_id")?,
+        tool_call_id: reflect_row_optional_string(row, context, "tool_call_id")?,
+        trace_kind: reflect_row_optional_string(row, context, "trace_kind")?,
+        metadata,
+        metadata_omitted: reflect_row_i64(row, context, "metadata_omitted")? != 0,
     })
 }
 
@@ -1387,15 +2127,6 @@ pub(crate) fn generate_insights(
         });
     }
 
-    if overview.total_events > 20 && overview.total_decisions == 0 {
-        insights.push(Insight {
-            severity: "warning".into(),
-            kind: InsightKind::DecisionStall,
-            message: "Many events but no decisions — possible routing issue".into(),
-            evidence: format!("{} events, 0 decisions", overview.total_events),
-        });
-    }
-
     insights
 }
 
@@ -1426,9 +2157,6 @@ pub(crate) fn generate_recommendations(
             InsightKind::ToolConcentration { .. } => {
                 Some("Consider using more diverse tools for better coverage")
             }
-            InsightKind::DecisionStall => {
-                Some("Review agent routing — events without decisions may be misconfigured")
-            }
             InsightKind::ErrorRate
             | InsightKind::ToolFailure { .. }
             | InsightKind::ModelFanout { .. }
@@ -1454,6 +2182,44 @@ pub(crate) fn generate_recommendations(
 
     recs.dedup();
     recs
+}
+
+fn mark_model_request_usage_unavailable(
+    summary: &mut String,
+    coverage: &mut ObservationDataCoverage,
+) {
+    summary.insert_str(
+        0,
+        "Model-request usage unavailable; this does not establish zero requests. ",
+    );
+    coverage.overall = "partial".into();
+    coverage.providers.insert(
+        "model_request_context".into(),
+        astra_core::ObservationProviderCoverage {
+            status: "missing".into(),
+            freshness_ms: None,
+            reason: Some("source_unavailable".into()),
+        },
+    );
+    coverage.warnings.push(
+        "Model-request usage is unavailable; absence of records does not establish zero requests."
+            .into(),
+    );
+}
+
+fn summarize_model_request_result<E>(
+    result: Result<Vec<ModelRequestContextRecord>, E>,
+) -> ModelRequestCapture {
+    match result {
+        Ok(records) => {
+            let limit_reached = records.len() >= MODEL_REQUEST_CAPTURE_LIMIT as usize;
+            ModelRequestCapture::from_records(&records, limit_reached)
+        }
+        Err(_) => ModelRequestCapture {
+            coverage: ModelRequestCaptureCoverage::SourceUnavailable,
+            ..ModelRequestCapture::default()
+        },
+    }
 }
 
 // ── Database implementation ──────────────────────────────────────────────────
@@ -1521,11 +2287,25 @@ impl DatabaseReflectService {
             "SELECT event_id, event_type, \
                SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 180) AS content, \
                COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, '')) AS skill_name, \
-               parent_event_id, causal_chain_id, \
-               DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+               parent_event_id, causal_chain_id, run_id, parent_run_id, agent_id, tool_call_id, trace_kind, \
+               CASE WHEN event_type IN ('tool_call_completed', 'tool_call_failed', 'tool_call_rejected', 'tool_call_reused', 'tool_call_suppressed', 'tool_call_deferred') \
+                    THEN CAST(JSON_OBJECT( \
+                         'ok', CASE WHEN OCTET_LENGTH(CAST(JSON_EXTRACT(metadata, '$.ok') AS CHAR)) <= 8 THEN JSON_EXTRACT(metadata, '$.ok') ELSE NULL END, \
+                         'disposition', CASE WHEN OCTET_LENGTH(CAST(JSON_EXTRACT(metadata, '$.disposition') AS CHAR)) <= 32 THEN JSON_EXTRACT(metadata, '$.disposition') ELSE NULL END, \
+                         'result_class', CASE WHEN OCTET_LENGTH(CAST(JSON_EXTRACT(metadata, '$.result_class') AS CHAR)) <= 40 THEN JSON_EXTRACT(metadata, '$.result_class') ELSE NULL END, \
+                         'exit_semantics', CASE WHEN OCTET_LENGTH(CAST(JSON_EXTRACT(metadata, '$.exit_semantics') AS CHAR)) <= 40 THEN JSON_EXTRACT(metadata, '$.exit_semantics') ELSE NULL END) AS CHAR) \
+                    WHEN event_type IN ('agent_spawned', 'agent_terminated', 'agent_completed', 'agent_failed', 'agent_cancelled', 'agent_interrupted', 'agent_waiting') \
+                    OR (event_type = 'trace_span' AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.name')) = 'agent_dependency_boundary') \
+                    THEN CASE WHEN OCTET_LENGTH(CAST(metadata AS CHAR)) <= 16384 \
+                         THEN CAST(metadata AS CHAR) ELSE NULL END ELSE NULL END AS metadata_json, \
+               CASE WHEN (event_type IN ('agent_spawned', 'agent_terminated', 'agent_completed', 'agent_failed', 'agent_cancelled', 'agent_interrupted', 'agent_waiting') \
+                    OR (event_type = 'trace_span' AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.name')) = 'agent_dependency_boundary')) \
+                    AND OCTET_LENGTH(CAST(metadata AS CHAR)) > 16384 \
+                    THEN 1 ELSE 0 END AS metadata_omitted, \
+               DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? \
-             ORDER BY created_at DESC LIMIT ?",
+             ORDER BY created_at DESC, event_id DESC LIMIT ?",
         )
         .bind(session_id)
         .bind(user_id)
@@ -1583,7 +2363,8 @@ fn filter_evidence_events_for_graph(
     recent_events
         .into_iter()
         .filter(|event| {
-            event.event_type == "tool_invocation_run_reconciled"
+            event.is_execution_fact()
+                || event.event_type == "tool_invocation_run_reconciled"
                 || event.event_type == "tool_invocation_compaction_deferred"
                 || decision_event_ids.contains(&event.event_id)
                 || event
@@ -1673,29 +2454,29 @@ impl ReflectService for DatabaseReflectService {
         // source for prompt-cache accounting. Read a bounded session window
         // only for an explicit reflection request; this keeps the hot turn
         // path untouched while making cache misses explainable to the user.
-        let model_request_summary = if let Some(shared_pool) = self.pool.as_ref() {
-            match crate::model_request_context::list_model_request_context_events(
+        let model_requests = if let Some(shared_pool) = self.pool.as_ref() {
+            let result = crate::model_request_context::list_model_request_context_events(
                 shared_pool,
                 user_id,
                 session_id,
-                500,
+                MODEL_REQUEST_CAPTURE_LIMIT,
             )
-            .await
-            {
-                Ok(records) => ModelRequestSummary::from_records(&records),
-                Err(error) => {
-                    tracing::warn!(
-                        target: "astra_services::reflect",
-                        user_id = %user_id,
-                        session_id = %session_id,
-                        error = %error,
-                        "model request context unavailable during reflection"
-                    );
-                    None
-                }
+            .await;
+            if let Err(error) = &result {
+                tracing::warn!(
+                    target: "astra_services::reflect",
+                    user_id = %user_id,
+                    session_id = %session_id,
+                    error = %error,
+                    "model request context unavailable during reflection"
+                );
             }
+            summarize_model_request_result(result)
         } else {
-            None
+            ModelRequestCapture {
+                coverage: ModelRequestCaptureCoverage::SourceUnavailable,
+                ..ModelRequestCapture::default()
+            }
         };
 
         let include_semantic_execution = matches!(
@@ -2011,10 +2792,8 @@ impl ReflectService for DatabaseReflectService {
             summary.push(' ');
             summary.push_str(&agent_delivery);
         }
-        if let Some(model_request_summary) = model_request_summary {
-            summary.push(' ');
-            summary.push_str(&model_request_summary.render());
-        }
+        summary.push(' ');
+        summary.push_str(&model_requests.render_compact());
         summary.push(' ');
         summary.push_str(&judgment_usage.render_compact());
         if let Some(semantics) = &semantic_judgments {
@@ -2037,6 +2816,36 @@ impl ReflectService for DatabaseReflectService {
             &budget_result,
         );
         let mut view = request.view(overview.total_events, overview.total_decisions);
+        if model_requests.coverage == ModelRequestCaptureCoverage::SourceUnavailable {
+            mark_model_request_usage_unavailable(&mut summary, &mut view.data_coverage);
+        } else {
+            let (status, reason) = match model_requests.coverage {
+                ModelRequestCaptureCoverage::NoRecordsObserved => {
+                    ("missing", "no_records_observed_not_zero_inference")
+                }
+                ModelRequestCaptureCoverage::WindowObserved => (
+                    "partial",
+                    "bounded_retained_window_not_complete_session_billing",
+                ),
+                ModelRequestCaptureCoverage::WindowLimitReached => (
+                    "partial",
+                    "bounded_window_limit_reached_counts_are_lower_bounds",
+                ),
+                ModelRequestCaptureCoverage::NotCaptured => {
+                    ("missing", "source_does_not_capture_model_request_context")
+                }
+                ModelRequestCaptureCoverage::SourceUnavailable => unreachable!(),
+            };
+            view.data_coverage.providers.insert(
+                "model_request_context".into(),
+                astra_core::ObservationProviderCoverage {
+                    status: status.into(),
+                    freshness_ms: None,
+                    reason: Some(reason.into()),
+                },
+            );
+            view.data_coverage.overall = "partial".into();
+        }
         if let Some(semantics) = &semantic_judgments {
             view.data_coverage.providers.insert(
                 "semantic_judgment_trace".into(),
@@ -2098,7 +2907,7 @@ impl ReflectService for DatabaseReflectService {
         let data_coverage = view.data_coverage.clone();
 
         Ok(ReflectReport {
-            schema_version: 1,
+            schema_version: 2,
             tool: "reflect".to_string(),
             session_id: session_id.to_string(),
             analysis_view: request.analysis_view,
@@ -2109,6 +2918,7 @@ impl ReflectService for DatabaseReflectService {
             source_policy: request.source_policy.as_str().to_string(),
             include_context: request.include_context,
             data_coverage,
+            model_requests,
             judgment_usage: Some(judgment_usage),
             semantic_judgments,
             tool_result_judgments,
@@ -2150,18 +2960,12 @@ fn budget_reflect_evidence_graph(
         });
     }
 
-    (
-        Some(graph),
-        ObservationBudgetResult {
-            truncated: omitted_nodes > 0,
-            next_cursor: None,
-            omitted: ObservationBudgetOmitted {
-                nodes: omitted_nodes,
-                evidence_previews: omitted_nodes,
-                ..Default::default()
-            },
-        },
-    )
+    let mut budget = graph.budget_result.clone();
+    budget.truncated |= omitted_nodes > 0;
+    budget.omitted.nodes += omitted_nodes;
+    budget.omitted.evidence_previews += omitted_nodes;
+    graph.budget_result = budget.clone();
+    (Some(graph), budget)
 }
 
 fn build_reflect_graph_slice(
@@ -2537,15 +3341,13 @@ mod tests {
         assert!(!summary.contains("validated"), "{summary}");
     }
 
-    #[test]
-    fn model_request_summary_uses_terminal_typed_cache_facts() {
+    fn model_request_test_record() -> ModelRequestContextRecord {
         let identity = ModelRequestIdentity {
             request_id: "request-1".into(),
             provider_response_id: Some("response-1".into()),
             owner_scope: "user-1".into(),
             session_id: Some("session-1".into()),
             run_id: Some("run-1".into()),
-            harness_run_id: None,
             turn: Some(1),
             round: Some(0),
             logical_attempt: 0,
@@ -2585,6 +3387,7 @@ mod tests {
             wire_composition: ModelRequestWireComposition::default(),
             tool_result_projections: Vec::new(),
             cache: ModelRequestCache {
+                cache_read_share: Some(950.0 / 1050.0),
                 invalidation_reasons: vec!["tool_schemas_changed".into()],
                 ..Default::default()
             },
@@ -2593,7 +3396,7 @@ mod tests {
             usage_status: Some("provider_exact".into()),
             error_kind: None,
         };
-        let record = ModelRequestContextRecord {
+        ModelRequestContextRecord {
             event_id: "event-1".into(),
             stage: ModelRequestEventStage::Terminal,
             terminal_status: Some("succeeded".into()),
@@ -2601,23 +3404,323 @@ mod tests {
             created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
                 .unwrap()
                 .naive_utc(),
-        };
+        }
+    }
 
-        let summary =
-            ModelRequestSummary::from_records(&[record]).expect("terminal request summary");
+    #[test]
+    fn model_request_summary_uses_terminal_typed_cache_facts() {
+        let record = model_request_test_record();
+        let summary = ModelRequestSummary::from_records(std::slice::from_ref(&record))
+            .expect("terminal request summary");
         assert_eq!(summary.terminal_requests, 1);
         assert_eq!(
             summary.input,
             astra_turn_types::NormalizedPromptCacheUsage::new(50, 950, 50)
         );
         assert_eq!(summary.cache_invalidations, 1);
+        assert_eq!(summary.usage_coverage.exact, 1);
+        assert_eq!(summary.groups.len(), 1);
+        assert_eq!(summary.groups[0].run_id.as_deref(), Some("run-1"));
+        assert_eq!(summary.groups[0].offering_id, "offering-1");
         assert!(
-            summary
-                .render()
-                .contains("cache read 90.5% (950/1050 total input; 50 fresh, 50 cache write)"),
+            summary.render().contains(
+                "known cache read 90.5% (950/1050 known input; 50 fresh, 50 cache write)"
+            ),
             "{}",
             summary.render()
         );
+        assert!(summary.render().contains("usage coverage exact=1"));
+
+        let mut no_cache_evidence = record.clone();
+        no_cache_evidence.event.identity.request_id = "request-systemone".into();
+        no_cache_evidence.event.identity.provider_protocol = "typesafe_systemone".into();
+        no_cache_evidence.event.cache.cache_read_share = None;
+        no_cache_evidence.event.usage.as_mut().unwrap().input =
+            astra_turn_types::NormalizedPromptCacheUsage::new(100, 0, 0);
+        for records in [
+            vec![no_cache_evidence.clone()],
+            vec![record.clone(), no_cache_evidence],
+        ] {
+            let no_cache_evidence = ModelRequestSummary::from_records(&records).unwrap();
+            assert!(
+                no_cache_evidence
+                    .render()
+                    .contains("known cache read unknown")
+            );
+        }
+
+        let mut child = record.clone();
+        child.event_id = "event-2".into();
+        child.event.identity.request_id = "request-2".into();
+        child.event.identity.run_id = Some("child-run".into());
+        child.event.identity.agent_id = Some("child-agent".into());
+        child.event.identity.parent_run_id = Some("run-1".into());
+        child.event.identity.offering_id = "offering-2".into();
+        child.event.identity.inference_purpose = "sub_agent".into();
+        child.event.usage_status = Some("provider_partial".into());
+        let mut retry = child.clone();
+        retry.event_id = "event-3".into();
+        retry.event.identity.request_id = "request-3".into();
+        retry.event.identity.physical_attempt = 1;
+        retry.event.usage = None;
+        retry.event.usage_status = Some("unavailable".into());
+        let duplicate_retry = retry.clone();
+        let mut cancelled = child.clone();
+        cancelled.event.identity.request_id = "request-cancelled".into();
+        cancelled.event.identity.provider_response_id = None;
+        cancelled.event.terminal_status = Some("cancelled".into());
+        cancelled.terminal_status = Some("cancelled".into());
+        cancelled.event.usage = None;
+        cancelled.event.usage_status = Some("unavailable".into());
+        let unavailable = ModelRequestSummary::from_records(std::slice::from_ref(&retry))
+            .expect("unavailable request summary");
+        assert!(unavailable.render().contains("known_input=unknown"));
+        assert!(unavailable.render().contains("known_output=unknown"));
+
+        let mut exact_zero = record.clone();
+        exact_zero.event.identity.request_id = "request-zero".into();
+        exact_zero.event.usage = Some(ModelRequestUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::default(),
+            output_tokens: 0,
+        });
+        let exact_zero = ModelRequestSummary::from_records(std::slice::from_ref(&exact_zero))
+            .expect("measured-zero request summary");
+        assert!(exact_zero.render().contains("known_input=0"));
+        assert!(exact_zero.render().contains("known_output=0"));
+
+        let mut same_run_other_parent = child.clone();
+        same_run_other_parent.event.identity.request_id = "request-other-parent".into();
+        same_run_other_parent.event.identity.parent_run_id = Some("parent-run-2".into());
+        let mixed = ModelRequestSummary::from_records(&[
+            record,
+            child,
+            retry,
+            duplicate_retry,
+            cancelled,
+            same_run_other_parent,
+        ])
+        .expect("mixed parent and child request summary");
+        assert_eq!(
+            mixed.terminal_requests, 5,
+            "duplicate terminal facts collapse"
+        );
+        assert_eq!(mixed.groups.len(), 3, "parent identity separates groups");
+        assert_eq!(mixed.usage_coverage.exact, 1);
+        assert_eq!(mixed.usage_coverage.partial, 2);
+        assert_eq!(mixed.usage_coverage.unavailable, 2);
+        assert_eq!(mixed.terminal_statuses.succeeded, 4);
+        assert_eq!(mixed.terminal_statuses.cancelled, 1);
+        assert_eq!(mixed.provider_response_id_observations, 4);
+        let child_group = mixed
+            .groups
+            .iter()
+            .find(|group| {
+                group.run_id.as_deref() == Some("child-run")
+                    && group.parent_run_id.as_deref() == Some("run-1")
+            })
+            .expect("child identity group");
+        assert_eq!(child_group.offering_id, "offering-2");
+        assert_eq!(child_group.terminal_requests, 3);
+        assert_eq!(child_group.terminal_statuses.cancelled, 1);
+        assert_eq!(child_group.provider_response_id_observations, 2);
+        assert_eq!(child_group.usage_coverage.partial, 1);
+        assert_eq!(child_group.usage_coverage.unavailable, 2);
+        assert!(mixed.groups.iter().any(|group| {
+            group.run_id.as_deref() == Some("child-run")
+                && group.parent_run_id.as_deref() == Some("parent-run-2")
+        }));
+        let rendered = mixed.render();
+        assert!(
+            rendered.contains("run=\"child-run\" parent_run=\"run-1\" agent=\"child-agent\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("partial=1, unavailable=2"), "{rendered}");
+        assert!(rendered.contains("known cache read unknown"), "{rendered}");
+        assert_eq!(
+            render_model_request_identity(Some("model\nforged")),
+            "\"model\\nforged\""
+        );
+        let long_identity = "x".repeat(200);
+        let rendered_identity = render_model_request_identity(Some(&long_identity));
+        assert!(rendered_identity.contains('…'));
+        assert!(rendered_identity.chars().count() <= 131);
+    }
+
+    #[test]
+    fn model_request_capture_distinguishes_empty_unavailable_and_bounded() {
+        let empty = summarize_model_request_result::<&str>(Ok(Vec::new()));
+        assert_eq!(
+            empty.coverage,
+            ModelRequestCaptureCoverage::NoRecordsObserved
+        );
+        assert!(empty.terminal.is_none());
+        assert!(
+            empty
+                .render_compact()
+                .contains("does not establish zero inference")
+        );
+
+        let unavailable = summarize_model_request_result::<&str>(Err("read failed"));
+        assert_eq!(
+            unavailable.coverage,
+            ModelRequestCaptureCoverage::SourceUnavailable
+        );
+        assert!(unavailable.terminal.is_none());
+        assert!(
+            unavailable
+                .render_compact()
+                .contains("does not establish zero inference")
+        );
+
+        let mut accepted = model_request_test_record();
+        accepted.stage = ModelRequestEventStage::Accepted;
+        accepted.terminal_status = None;
+        accepted.event.stage = ModelRequestEventStage::Accepted;
+        accepted.event.terminal_status = None;
+        accepted.event.usage = None;
+        accepted.event.usage_status = None;
+        let observed = summarize_model_request_result::<&str>(Ok(vec![accepted.clone()]));
+        assert_eq!(
+            observed.coverage,
+            ModelRequestCaptureCoverage::WindowObserved
+        );
+        assert_eq!(observed.records_observed, 1);
+        assert_eq!(observed.accepted_records_observed, 1);
+        assert!(observed.terminal.is_none());
+        assert!(
+            observed
+                .render_compact()
+                .contains("accepted stage alone is not provider-response evidence")
+        );
+
+        let limit_reached = summarize_model_request_result::<&str>(Ok(vec![
+            accepted;
+            MODEL_REQUEST_CAPTURE_LIMIT
+                as usize
+        ]));
+        assert_eq!(
+            limit_reached.coverage,
+            ModelRequestCaptureCoverage::WindowLimitReached
+        );
+        assert_eq!(
+            limit_reached.records_observed,
+            MODEL_REQUEST_CAPTURE_LIMIT as u64
+        );
+        assert!(
+            limit_reached
+                .render_compact()
+                .contains("counts are lower bounds")
+        );
+    }
+
+    #[test]
+    fn model_request_duplicates_quarantine_conflicts_independently_of_order() {
+        let original = model_request_test_record();
+        let mut changed_index = original.clone();
+        changed_index.event.identity.physical_attempt += 1;
+        let mut changed_identity = original.clone();
+        changed_identity.event.identity.offering_id = "conflicting-offering".into();
+        changed_identity.event.identity.run_id = Some("conflicting-run".into());
+        let mut changed_usage = original.clone();
+        changed_usage.event.usage.as_mut().unwrap().output_tokens += 1;
+        let mut changed_coverage = original.clone();
+        changed_coverage.event.usage_status = Some("provider_partial".into());
+        let mut changed_cache = original.clone();
+        changed_cache.event.cache.cache_read_share = None;
+
+        let mut retry = original.clone();
+        retry.event.identity.request_id = "distinct-retry".into();
+        retry.event.identity.physical_attempt += 1;
+        let retry_summary =
+            ModelRequestSummary::from_records(std::slice::from_ref(&retry)).unwrap();
+
+        for conflicting in [
+            changed_index,
+            changed_identity,
+            changed_usage,
+            changed_coverage,
+            changed_cache,
+            {
+                let mut changed_parent = original.clone();
+                changed_parent.event.identity.parent_run_id = Some("other-parent".into());
+                changed_parent
+            },
+        ] {
+            let mut expected = retry_summary.clone();
+            expected.terminal_requests += 1;
+            expected.conflicting_requests = 1;
+            expected.usage_coverage.unknown = 1;
+            expected.terminal_statuses.unknown = 1;
+            for records in [
+                vec![
+                    original.clone(),
+                    conflicting.clone(),
+                    original.clone(),
+                    retry.clone(),
+                ],
+                vec![
+                    conflicting.clone(),
+                    original.clone(),
+                    retry.clone(),
+                    original.clone(),
+                ],
+                vec![
+                    retry.clone(),
+                    original.clone(),
+                    original.clone(),
+                    conflicting.clone(),
+                ],
+            ] {
+                let summary = ModelRequestSummary::from_records(&records).unwrap();
+                assert_eq!(summary, expected);
+                assert_eq!(summary.render(), expected.render());
+                assert!(summary.render().contains("known cache read unknown"));
+                assert!(
+                    summary
+                        .render()
+                        .contains("1 conflicting request record group(s)")
+                );
+            }
+            let all_conflicted =
+                ModelRequestSummary::from_records(&[original.clone(), conflicting]).unwrap();
+            assert_eq!(all_conflicted.terminal_requests, 1);
+            assert_eq!(all_conflicted.usage_coverage.unknown, 1);
+            assert_eq!(all_conflicted.terminal_statuses.unknown, 1);
+            assert!(all_conflicted.groups.is_empty());
+            assert_eq!(all_conflicted.usage_observations, 0);
+            assert!(
+                all_conflicted
+                    .render()
+                    .contains("observed output tokens: unknown")
+            );
+        }
+    }
+
+    #[test]
+    fn model_request_duplicates_count_once_but_distinct_retry_ids_count_separately() {
+        let original = model_request_test_record();
+        let mut duplicate = original.clone();
+        // Capture metadata is not physical identity or usage evidence.
+        duplicate.event_id = "replayed-event".into();
+        duplicate.created_at += chrono::Duration::seconds(1);
+        let mut retry = original.clone();
+        retry.event.identity.request_id = "retry-request".into();
+        retry.event.identity.physical_attempt += 1;
+        let expected =
+            ModelRequestSummary::from_records(&[original.clone(), retry.clone()]).unwrap();
+        assert_eq!(expected.terminal_requests, 2);
+        assert_eq!(expected.conflicting_requests, 0);
+        assert_eq!(expected.output_tokens, 20);
+        assert_eq!(expected.groups[0].terminal_requests, 2);
+        for records in [
+            vec![original.clone(), duplicate.clone(), retry.clone()],
+            vec![retry, duplicate, original],
+        ] {
+            assert_eq!(
+                ModelRequestSummary::from_records(&records).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -2627,14 +3730,54 @@ mod tests {
             input: astra_turn_types::NormalizedPromptCacheUsage::new(222, 76_800, 0),
             output_tokens: 176,
             cache_invalidations: 0,
+            usage_observations: 3,
+            cache_usage_observations: 3,
+            usage_coverage: ModelRequestUsageCoverage {
+                exact: 3,
+                ..Default::default()
+            },
+            ..ModelRequestSummary::default()
         };
 
         let rendered = summary.render();
         assert!(
-            rendered.contains("cache read 99.7% (76800/77022 total input; 222 fresh"),
+            rendered.contains("known cache read 99.7% (76800/77022 known input; 222 fresh"),
             "{rendered}"
         );
         assert!(!rendered.contains("34594"), "{rendered}");
+
+        for coverage in [
+            ModelRequestUsageCoverage {
+                exact: 2,
+                partial: 1,
+                ..Default::default()
+            },
+            ModelRequestUsageCoverage {
+                exact: 2,
+                unavailable: 1,
+                ..Default::default()
+            },
+            ModelRequestUsageCoverage {
+                exact: 2,
+                unknown: 1,
+                ..Default::default()
+            },
+        ] {
+            let incomplete = ModelRequestSummary {
+                usage_coverage: coverage,
+                ..summary.clone()
+            };
+            assert!(incomplete.render().contains("known cache read unknown"));
+        }
+        let missing_payload = ModelRequestSummary {
+            usage_observations: 2,
+            ..summary
+        };
+        assert!(
+            missing_payload
+                .render()
+                .contains("known cache read unknown")
+        );
     }
 
     #[test]
@@ -2762,12 +3905,19 @@ mod tests {
                 "skill_name" => self.skill_name.map(str::to_string),
                 "parent_event_id" => self.parent_event_id.map(str::to_string),
                 "causal_chain_id" => self.causal_chain_id.map(str::to_string),
+                "run_id" => Some("run-1".into()),
+                "parent_run_id" | "agent_id" | "tool_call_id" | "trace_kind" | "metadata_json" => {
+                    None
+                }
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             })
         }
 
         fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
             self.fail_if_needed(column)?;
+            if column == "metadata_omitted" {
+                return Ok(0);
+            }
             Err(sqlx::Error::ColumnNotFound(column.to_string()))
         }
     }
@@ -3255,14 +4405,11 @@ mod tests {
     }
 
     #[test]
-    fn insight_stall_many_events_no_decisions() {
+    fn missing_context_decision_audits_do_not_imply_routing_failure() {
         let overview = make_overview(50, 0, vec![], 0, None);
         let insights = generate_insights(&overview, &[], &[]);
-        assert!(
-            insights
-                .iter()
-                .any(|i| i.kind == InsightKind::DecisionStall)
-        );
+        assert!(insights.is_empty());
+        assert!(generate_recommendations(&overview, &[], &insights).is_empty());
     }
 
     #[test]
@@ -3326,24 +4473,8 @@ mod tests {
             affected_tool: "bash".into(),
             fix_hint: "   ".into(),
         }];
-        let insights = vec![Insight {
-            severity: "warning".into(),
-            kind: InsightKind::DecisionStall,
-            message: "Many events but no decisions — possible routing issue".into(),
-            evidence: "50 events, 0 decisions".into(),
-        }];
-
-        let recs = generate_recommendations(&overview, &diagnoses, &insights);
-
-        assert_eq!(
-            recs[0].summary,
-            "Review agent routing — events without decisions may be misconfigured"
-        );
-        assert_eq!(
-            recs[0].source,
-            ReflectRecommendationSource::Insight(InsightKind::DecisionStall)
-        );
-        assert!(recs.iter().all(|rec| !rec.summary.trim().is_empty()));
+        let recs = generate_recommendations(&overview, &diagnoses, &[]);
+        assert!(recs.is_empty());
     }
 
     #[test]
@@ -3568,22 +4699,14 @@ mod tests {
             "how is the session going?",
         );
         let overview = make_overview(80, 0, vec![("bash".into(), 64)], 0, Some(8.0));
-        let insights = vec![
-            Insight {
-                severity: "warning".into(),
-                kind: InsightKind::DecisionStall,
-                message: "Many events but no decisions - possible routing issue".into(),
-                evidence: "80 events, 0 decisions".into(),
+        let insights = vec![Insight {
+            severity: "info".into(),
+            kind: InsightKind::ToolConcentration {
+                tool: "bash".into(),
             },
-            Insight {
-                severity: "info".into(),
-                kind: InsightKind::ToolConcentration {
-                    tool: "bash".into(),
-                },
-                message: "Over-reliance on bash: 80%".into(),
-                evidence: "64/80".into(),
-            },
-        ];
+            message: "Over-reliance on bash: 80%".into(),
+            evidence: "64/80".into(),
+        }];
         let recommendations = generate_recommendations(&overview, &[], &insights);
 
         let (_, observations, _, action_hints, failure_clusters) = build_observation_envelope(
@@ -3597,17 +4720,11 @@ mod tests {
         );
 
         assert_eq!(observations[0].topic, "execution");
-        assert_eq!(observations[0].facet, "stall");
-        assert_eq!(observations[1].topic, "execution");
-        assert_eq!(observations[1].facet, "tools");
-        assert_eq!(action_hints.len(), 2);
+        assert_eq!(observations[0].facet, "tools");
+        assert_eq!(action_hints.len(), 1);
         assert_eq!(
             action_hints[0].observation_refs,
             vec![observations[0].ref_id.clone()]
-        );
-        assert_eq!(
-            action_hints[1].observation_refs,
-            vec![observations[1].ref_id.clone()]
         );
         assert!(
             failure_clusters.is_empty(),
@@ -3671,7 +4788,8 @@ mod tests {
         let (summary, observations, evidence, action_hints, failure_clusters) =
             build_observation_envelope("sess-healthy", &request, &overview, &[], &[], &[], None);
 
-        assert!(summary.contains("Session healthy"));
+        assert!(summary.contains("No classified error events observed"));
+        assert!(summary.contains("task completion is not established"));
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].kind, "session_health");
         assert_eq!(observations[0].severity, "info");
@@ -3958,7 +5076,7 @@ mod tests {
             warnings: vec![],
         };
         let report = ReflectReport {
-            schema_version: 1,
+            schema_version: 2,
             tool: "reflect".into(),
             session_id: "test-sess".into(),
             analysis_view: "overview".into(),
@@ -3969,6 +5087,7 @@ mod tests {
             source_policy: "auto".into(),
             include_context: false,
             data_coverage: data_coverage.clone(),
+            model_requests: ModelRequestCapture::default(),
             judgment_usage: None,
             semantic_judgments: None,
             tool_result_judgments: None,
@@ -4029,7 +5148,7 @@ mod tests {
         );
         let json = serde_json::to_string(&report).unwrap();
         let json_value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(json_value["schema_version"], 1);
+        assert_eq!(json_value["schema_version"], 2);
         assert_eq!(json_value["tool"], "reflect");
         assert_eq!(json_value["topic"], json_value["view"]["topic"]);
         assert_eq!(json_value["facet"], json_value["view"]["facet"]);
@@ -4069,8 +5188,24 @@ mod tests {
         );
         let mut parsed: ReflectReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, parsed);
-        // Old reports omit the new optional field; new unavailable captures
-        // carry unknown counts rather than inventing zero semantic calls.
+        let mut unavailable = report.clone();
+        unavailable.model_requests.coverage = ModelRequestCaptureCoverage::SourceUnavailable;
+        unavailable.depth = "hint".into();
+        unavailable.summary = "long preceding summary ".repeat(50);
+        let view = unavailable.view.as_mut().unwrap();
+        view.depth = "hint".into();
+        mark_model_request_usage_unavailable(&mut unavailable.summary, &mut view.data_coverage);
+        unavailable.data_coverage = view.data_coverage.clone();
+        let projected_unavailable = unavailable.project_lightweight();
+        assert!(projected_unavailable.summary.starts_with(
+            "Model-request usage unavailable; this does not establish zero requests."
+        ));
+        assert_eq!(projected_unavailable.data_coverage.overall, "partial");
+        assert_eq!(
+            projected_unavailable.data_coverage,
+            projected_unavailable.view.unwrap().data_coverage
+        );
+        // An uncaptured optional evidence section is absent, not a zero count.
         assert!(parsed.semantic_judgments.is_none());
         let view = crate::semantic_judgment_observation::SemanticJudgmentView::unavailable(
             crate::semantic_judgment_observation::SemanticJudgmentCoverage::SourceExcluded,
@@ -4086,6 +5221,40 @@ mod tests {
             serde_json::from_value::<ReflectReport>(value).unwrap(),
             projected
         );
+    }
+
+    #[test]
+    fn model_request_read_failure_is_not_an_empty_usage_window() {
+        let unavailable = summarize_model_request_result::<&str>(Err("read failed"));
+        assert_eq!(
+            unavailable.coverage,
+            ModelRequestCaptureCoverage::SourceUnavailable
+        );
+        assert!(unavailable.terminal.is_none());
+
+        let mut coverage = ObservationDataCoverage {
+            overall: "fresh".into(),
+            source: "server_db".into(),
+            events: 1,
+            decisions: 0,
+            providers: Default::default(),
+            warnings: vec![],
+        };
+        let mut report_summary = "long preceding summary ".repeat(50);
+        mark_model_request_usage_unavailable(&mut report_summary, &mut coverage);
+        assert!(report_summary.starts_with("Model-request usage unavailable"));
+        assert_eq!(coverage.overall, "partial");
+        let provider = &coverage.providers["model_request_context"];
+        assert_eq!(provider.status, "missing");
+        assert_eq!(provider.reason.as_deref(), Some("source_unavailable"));
+        assert!(coverage.warnings[0].contains("does not establish zero requests"));
+
+        let empty = summarize_model_request_result::<&str>(Ok(Vec::new()));
+        assert_eq!(
+            empty.coverage,
+            ModelRequestCaptureCoverage::NoRecordsObserved
+        );
+        assert!(empty.terminal.is_none());
     }
 
     #[test]
@@ -4106,6 +5275,7 @@ mod tests {
                 parent_event_id: None,
                 causal_chain_id: Some("chain-1".into()),
                 created_at: "2026-04-12T10:00:00".into(),
+                ..Default::default()
             },
             EvidenceEvent {
                 event_id: "evt-tool".into(),
@@ -4115,6 +5285,7 @@ mod tests {
                 parent_event_id: Some("evt-user".into()),
                 causal_chain_id: Some("chain-1".into()),
                 created_at: "2026-04-12T10:00:02".into(),
+                ..Default::default()
             },
         ];
         let parent_id_map = std::collections::HashMap::from([(
@@ -4147,6 +5318,7 @@ mod tests {
                 parent_event_id: None,
                 causal_chain_id: Some("chain-1".into()),
                 created_at: "2026-04-12T10:00:00".into(),
+                ..Default::default()
             },
             EvidenceEvent {
                 event_id: "evt-error".into(),
@@ -4156,6 +5328,7 @@ mod tests {
                 parent_event_id: Some("evt-call".into()),
                 causal_chain_id: Some("chain-1".into()),
                 created_at: "2026-04-12T10:00:01".into(),
+                ..Default::default()
             },
         ];
         let parent_id_map = std::collections::HashMap::from([(
@@ -4195,6 +5368,7 @@ mod tests {
             parent_event_id: None,
             causal_chain_id: None,
             created_at: "2026-07-16T10:00:01".into(),
+            ..Default::default()
         };
         let filtered = filter_evidence_events_for_graph(
             &decisions,

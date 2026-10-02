@@ -682,6 +682,18 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn shipped_subagent_model_cases_parse_with_strict_criteria() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/subagent_model_selection");
+        let cases = Case::load_dir(&dir).expect("shipped DeepSeek Flash cases");
+        assert!(cases.iter().all(|case| !case.criteria.is_empty()));
+        assert!(
+            cases
+                .iter()
+                .any(|case| case.name == "flash_spawn_natural_language_glm")
+        );
+    }
+
+    #[test]
     fn loads_minimal_case() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("c.yaml");
@@ -856,6 +868,53 @@ criteria:
             .criteria
             .iter()
             .any(|criterion| matches!(criterion, crate::criteria::Criterion::JournalToolCallCount { name, min: 1, max: 1, .. } if name == "reflect")));
+    }
+
+    #[test]
+    fn bundled_subagent_model_selection_cases_keep_natural_language_contracts() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/subagent_model_selection");
+        let cases = Case::load_dir(&dir).expect("subagent model cases must parse");
+
+        assert!(!cases.is_empty());
+        assert!(cases.iter().all(|case| case.debug_log));
+        let natural_language = cases
+            .iter()
+            .find(|case| case.name == "flash_spawn_natural_language_glm")
+            .expect("natural-language intent case must be in the shipped suite");
+        assert!(natural_language.criteria.iter().any(|criterion| matches!(
+            criterion,
+            crate::criteria::Criterion::JournalToolCallCount {
+                name,
+                min: 1,
+                max: 1,
+                root_only: false,
+                ok: None,
+                document: Some(crate::criteria::JournalToolDocument::Arguments),
+                path: Some(path),
+                equals: Some(equals),
+            } if name == "agent"
+                && path == "/action"
+                && equals == "spawn"
+        )));
+        assert!(natural_language.criteria.iter().any(|criterion| matches!(
+            criterion,
+            crate::criteria::Criterion::JournalToolJson {
+                name,
+                document: crate::criteria::JournalToolDocument::Arguments,
+                path,
+                equals,
+                where_match: Some(crate::criteria::JournalJsonPredicate {
+                    document: crate::criteria::JournalToolDocument::Arguments,
+                    path: where_path,
+                    equals: where_equals,
+                }),
+                allow_missing: true,
+            } if name == "agent"
+                && path == "/requested_model_policy"
+                && equals.is_null()
+                && where_path == "/action"
+                && where_equals == "spawn"
+        )));
     }
 
     #[test]

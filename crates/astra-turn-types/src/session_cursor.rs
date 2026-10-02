@@ -115,9 +115,26 @@ pub fn json_serialized_len<T: Serialize + ?Sized>(value: &T) -> Result<u64, serd
     Ok(counter.bytes)
 }
 
+/// Measure a JSON payload without allocation, stopping when its budget is exceeded.
+pub fn json_serialized_fits<T: Serialize + ?Sized>(
+    value: &T,
+    max_bytes: u64,
+) -> Result<bool, serde_json::Error> {
+    let mut counter = CountingWriter {
+        max_bytes: Some(max_bytes),
+        ..Default::default()
+    };
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => Ok(true),
+        Err(_) if counter.bytes > max_bytes => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Default)]
 struct CountingWriter {
     bytes: u64,
+    max_bytes: Option<u64>,
 }
 
 impl Write for CountingWriter {
@@ -126,6 +143,9 @@ impl Write for CountingWriter {
             .bytes
             .checked_add(buffer.len() as u64)
             .ok_or_else(|| io::Error::other("canonical JSON length overflow"))?;
+        if self.max_bytes.is_some_and(|limit| self.bytes > limit) {
+            return Err(io::Error::other("JSON byte budget exceeded"));
+        }
         Ok(buffer.len())
     }
 
@@ -235,5 +255,9 @@ mod tests {
             json_serialized_len(&payload).unwrap(),
             serde_json::to_vec(&payload).unwrap().len() as u64
         );
+        let bytes = json_serialized_len(&payload).unwrap();
+        assert!(super::json_serialized_fits(&payload, bytes).unwrap());
+        assert!(!super::json_serialized_fits(&payload, bytes - 1).unwrap());
+        assert!(!super::json_serialized_fits(&json!("x".repeat(1024 * 1024)), 16).unwrap());
     }
 }

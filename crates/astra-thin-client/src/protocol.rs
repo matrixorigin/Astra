@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 pub use astra_turn_types::ExplainAnalyzeEventV1;
-pub use astra_turn_types::ModelSelection;
+pub use astra_turn_types::{ModelSelection, ModelSelector, RequestedModelPolicy};
 
 /// `POST /chat/stream` body — superset of server `ChatRequest` plus optional edge fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -24,6 +24,8 @@ pub struct ChatStreamRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     pub model_selection: ModelSelection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model_policy: Option<RequestedModelPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interaction_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,6 +78,7 @@ impl ChatStreamRequest {
             session_id: None,
             agent_id: None,
             model_selection,
+            requested_model_policy: None,
             interaction_mode: None,
             context: None,
             execution_budget: None,
@@ -136,6 +139,8 @@ pub struct RunUserIntentResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionTranscriptItem {
+    /// Physical model response represented by this item, not a stream watermark.
+    pub model_item_id: Option<String>,
     pub session_id: String,
     pub item_seq: i64,
     pub run_id: Option<String>,
@@ -537,18 +542,23 @@ pub enum StreamEvent {
         run_id: Option<String>,
     },
     TextDelta {
+        model_item_id: Option<String>,
         content: Value,
     },
     TextDone {
+        model_item_id: Option<String>,
         full_text: Value,
     },
     ReasoningMessageContent {
+        model_item_id: Option<String>,
         content: Value,
     },
     ReasoningDelta {
+        model_item_id: Option<String>,
         content: Value,
     },
     ThinkingDelta {
+        model_item_id: Option<String>,
         content: Value,
     },
     ThinkingDone,
@@ -695,7 +705,7 @@ pub enum StreamEvent {
         raw: Value,
     },
     /// Canonical measured execution fact used by Explain Analyze consumers.
-    ExplainAnalyze(ExplainAnalyzeEventV1),
+    ExplainAnalyze(Box<ExplainAnalyzeEventV1>),
     ArtifactPublication(astra_turn_types::ArtifactPublicationV1),
     Ping,
     Done {
@@ -756,18 +766,38 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
                 .map(std::string::ToString::to_string),
         },
         "text_delta" => StreamEvent::TextDelta {
+            model_item_id: obj
+                .get("model_item_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             content: obj.get("content").cloned().unwrap_or(Value::Null),
         },
         "text_done" => StreamEvent::TextDone {
+            model_item_id: obj
+                .get("model_item_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             full_text: obj.get("full_text").cloned().unwrap_or(Value::Null),
         },
         "reasoning_message_content" => StreamEvent::ReasoningMessageContent {
+            model_item_id: obj
+                .get("model_item_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             content: obj.get("content").cloned().unwrap_or(Value::Null),
         },
         "reasoning_delta" => StreamEvent::ReasoningDelta {
+            model_item_id: obj
+                .get("model_item_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             content: obj.get("content").cloned().unwrap_or(Value::Null),
         },
         "thinking_delta" => StreamEvent::ThinkingDelta {
+            model_item_id: obj
+                .get("model_item_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             content: obj.get("content").cloned().unwrap_or(Value::Null),
         },
         "thinking_done" => StreamEvent::ThinkingDone,
@@ -967,7 +997,7 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
         astra_turn_types::EXPLAIN_ANALYZE_EVENT_TYPE => {
             let fact = astra_turn_types::decode_explain_analyze_wire(&raw)
                 .map_err(|reason| crate::error::ThinClientError::SseParse(reason.to_string()))?;
-            StreamEvent::ExplainAnalyze(fact)
+            StreamEvent::ExplainAnalyze(Box::new(fact))
         }
         "artifact_publication" => StreamEvent::ArtifactPublication(
             astra_turn_types::ArtifactPublicationV1::from_wire(&raw)
@@ -1129,6 +1159,11 @@ mod tests {
             model_selection: ModelSelection {
                 offering_id: "offer-m".into(),
             },
+            requested_model_policy: Some(RequestedModelPolicy::Fixed {
+                selector: ModelSelector::OfferingId {
+                    offering_id: "offer-m".into(),
+                },
+            }),
             interaction_mode: Some("auto".into()),
             context: None,
             execution_budget: Some(ExecutionBudget {
@@ -1464,7 +1499,7 @@ mod tests {
         }))
         .unwrap()
         {
-            StreamEvent::ReasoningDelta { content } => assert_eq!(content, "thinking"),
+            StreamEvent::ReasoningDelta { content, .. } => assert_eq!(content, "thinking"),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -1557,7 +1592,6 @@ mod tests {
             "payload_kind": "text",
             "summary": "Please review the patch",
             "timestamp_ms": 42,
-            "requires_ack": true
         });
 
         let StreamEvent::AgentCommunication(event) = classify_stream_event(value).unwrap() else {
@@ -2231,6 +2265,32 @@ mod tests {
 
         let heartbeat = r#"{"edge_agent_id":"ea1","pending_request_count":0,"last_seen_request_ids":[],"pending_requests":[]}"#;
         assert!(serde_json::from_str::<EdgeHeartbeatRequest>(heartbeat).is_err());
+    }
+
+    #[test]
+    fn model_deltas_and_pages_preserve_identity_without_inventing_unknown_ids() {
+        let event = classify_stream_event(serde_json::json!({"type":"text_delta", "model_item_id":"accepted-A", "content":"same answer"})).unwrap();
+        assert!(
+            matches!(event, StreamEvent::TextDelta { model_item_id: Some(id), .. } if id == "accepted-A")
+        );
+        let event = classify_stream_event(
+            serde_json::json!({"type":"reasoning_delta", "content":"unknown reasoning"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            StreamEvent::ReasoningDelta {
+                model_item_id: None,
+                ..
+            }
+        ));
+        let item: SessionTranscriptItem = serde_json::from_value(serde_json::json!({
+            "session_id":"s", "item_seq":1, "run_id":"run", "role":"assistant", "content":"same answer",
+            "model_item_id":"accepted-A", "source_event_id":"physical-receipt", "created_at":"now"
+        })).unwrap();
+        assert_eq!(item.model_item_id.as_deref(), Some("accepted-A"));
+        assert_eq!(item.source_event_id.as_deref(), Some("physical-receipt"));
+        assert!(item.reasoning.is_none());
     }
 
     #[test]

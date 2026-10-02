@@ -92,8 +92,8 @@ pub struct EdgeConnection {
     /// edge agent (e.g. a sandbox edge that connected via a service account).
     pub workspace_id: Option<String>,
     /// Stable database registration identity for this materialization. This is
-    /// the only durable identity suitable for workspace claims; hostnames and
-    /// executor ids are user-facing labels and may be reused.
+    /// the only durable identity suitable for physical workspace coordination;
+    /// hostnames and executor ids are user-facing labels and may be reused.
     pub registry_id: Option<String>,
     /// Stable identity persisted beside the Edge checkout. Unlike a registry
     /// row or socket generation, this survives reconnects and agent-label

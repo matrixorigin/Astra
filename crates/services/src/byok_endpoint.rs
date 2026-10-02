@@ -127,12 +127,92 @@ pub async fn require_endpoint_policy(
     pool: &sqlx::Pool<sqlx::MySql>,
     raw: &str,
 ) -> Result<(), String> {
+    let policy = configured_endpoint_policy()?;
+    require_endpoint_policy_with_mode(pool, raw, policy).await
+}
+
+fn configured_endpoint_policy() -> Result<EndpointPolicy, String> {
     let policy = match std::env::var(ENDPOINT_POLICY_ENV) {
         Ok(value) => EndpointPolicy::parse(Some(&value))?,
         Err(std::env::VarError::NotPresent) => EndpointPolicy::parse(None)?,
         Err(_) => return Err(format!("Invalid {ENDPOINT_POLICY_ENV}")),
     };
-    require_endpoint_policy_with_mode(pool, raw, policy).await
+    Ok(policy)
+}
+
+/// Validate a fanout's distinct compatible BYOK endpoints with at most one
+/// trusted-domain read. Public HTTPS mode performs no database read.
+pub async fn require_endpoint_policies(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    raws: &[&str],
+) -> Result<(), String> {
+    if raws.is_empty() {
+        return Ok(());
+    }
+    let policy = configured_endpoint_policy()?;
+    require_endpoint_policies_with_mode(pool, raws, policy).await
+}
+
+async fn require_endpoint_policies_with_mode(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    raws: &[&str],
+    policy: EndpointPolicy,
+) -> Result<(), String> {
+    let urls = raws
+        .iter()
+        .map(|raw| parse_endpoint(raw))
+        .collect::<Result<Vec<_>, _>>()?;
+    if policy == EndpointPolicy::PublicHttps {
+        return Ok(());
+    }
+    use sqlx::Row;
+    let hosts = urls
+        .iter()
+        .map(|url| url.host_str().expect("validated endpoint host"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "SELECT domain_host, domain_port FROM runtime_llm_trusted_domains WHERE is_enabled = 1 AND domain_host IN (",
+    );
+    {
+        let mut separated = query.separated(", ");
+        for host in hosts {
+            separated.push_bind(host);
+        }
+    }
+    query.push(')');
+    let rows = query
+        .build()
+        .fetch_all(pool)
+        .await
+        .map_err(|_| "Unable to check the model endpoint policy")?;
+    let allowed = rows
+        .iter()
+        .map(|row| {
+            let host: String = row
+                .try_get("domain_host")
+                .map_err(|_| "Unable to check the model endpoint policy")?;
+            let port: Option<i32> = row
+                .try_get("domain_port")
+                .map_err(|_| "Unable to check the model endpoint policy")?;
+            Ok((host, port))
+        })
+        .collect::<Result<Vec<_>, &str>>()?;
+    for url in urls {
+        let host = url.host_str().expect("validated endpoint host");
+        let port = i32::from(
+            url.port_or_known_default()
+                .expect("validated endpoint port"),
+        );
+        if !allowed.iter().any(|(allowed_host, allowed_port)| {
+            allowed_host.eq_ignore_ascii_case(host)
+                && (*allowed_port == Some(port) || (allowed_port.unwrap_or(0) == 0 && port == 443))
+        }) {
+            return Err(format!(
+                "This deployment requires an approved model endpoint; {host}:{port} is not enabled. Contact the administrator."
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Applies the configured policy without relaxing URL or outbound DNS checks.
@@ -141,29 +221,7 @@ pub async fn require_endpoint_policy_with_mode(
     raw: &str,
     policy: EndpointPolicy,
 ) -> Result<(), String> {
-    let url = parse_endpoint(raw)?;
-    if policy == EndpointPolicy::PublicHttps {
-        return Ok(());
-    }
-    let permitted: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM runtime_llm_trusted_domains WHERE domain_host = ? \
-         AND is_enabled = 1 AND (domain_port = ? OR \
-         (IFNULL(domain_port, 0) = 0 AND ? = 443))",
-    )
-    .bind(url.host_str().unwrap())
-    .bind(i32::from(url.port_or_known_default().unwrap()))
-    .bind(i32::from(url.port_or_known_default().unwrap()))
-    .fetch_one(pool)
-    .await
-    .map_err(|_| "Unable to check the model endpoint policy")?;
-    if permitted == 0 {
-        return Err(format!(
-            "This deployment requires an approved model endpoint; {}:{} is not enabled. Contact the administrator.",
-            url.host_str().unwrap(),
-            url.port_or_known_default().unwrap()
-        ));
-    }
-    Ok(())
+    require_endpoint_policies_with_mode(pool, &[raw], policy).await
 }
 
 fn transport_builder() -> reqwest::ClientBuilder {

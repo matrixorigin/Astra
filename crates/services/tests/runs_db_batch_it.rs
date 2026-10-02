@@ -1226,6 +1226,49 @@ async fn single_event_append_uses_batch_path() {
         "genesis plus three appended events must be stored"
     );
 
+    for (limit, expected) in [(1, 1), (2, 2), (4, 4), (64, 4)] {
+        let observation = store
+            .load_run_observation(&user_id, &run_id, limit)
+            .await
+            .unwrap()
+            .expect("existing run observation");
+        assert_eq!(observation.total_event_count, 4);
+        assert_eq!(observation.run.events.len(), expected);
+        assert_eq!(observation.run.events[0]["event_type"], "run_created");
+        if limit > 1 {
+            assert_eq!(
+                observation.run.events.last().unwrap()["event_type"],
+                "run_finished"
+            );
+        }
+    }
+    assert!(
+        store
+            .load_run_observation("unrelated-owner", &run_id, 4)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store.append_event(&user_id, &session_id, &run_id, make_event(
+        "agent_progress",
+        json!({"large_payload": "x".repeat(astra_services::runs::MAX_RUN_OBSERVATION_BYTES / 4 + 1)}),
+    )).await.unwrap();
+    let observation = store
+        .load_run_observation(&user_id, &run_id, 4)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observation.total_event_count, 5);
+    assert_eq!(observation.run.events.len(), 3);
+    assert!(
+        observation
+            .run
+            .events
+            .iter()
+            .all(|event| event.get("large_payload").is_none()
+                && event.pointer("/data/large_payload").is_none())
+    );
+
     // Cleanup
     let _ = sqlx::query("DELETE FROM agent_run_events WHERE run_id = ?")
         .bind(&run_id)
@@ -2020,7 +2063,7 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
     use astra_turn_types::model_routing::{AutoModelRoutingPolicy, ModelRoutingReason};
     let decision = ModelRoutingDecision {
         rollout: None,
-        schema_version: 1,
+        schema_version: 2,
         features: None,
         policy_version: "easy-read-only-v1".into(),
         policy: AutoModelRoutingPolicy {
@@ -2034,6 +2077,8 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
         assessment: None, reason: ModelRoutingReason::EasyReadOnly,
         work_admission: Some(astra_services::parse_work_admission_response(r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary"}"#).unwrap()),
         work_admission_skill_revision: 0,
+        delegation_model_requirement: None,
+        delegation_model_source: None,
     };
     let event =
         json!({"event_type": EVENT_TYPE, "idempotency_key": DECISION_KEY, "data": decision});

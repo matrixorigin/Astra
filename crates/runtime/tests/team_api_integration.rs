@@ -191,7 +191,7 @@ fn dev_team_payload() -> Value {
     json!({
         "name": "dev-cycle",
         "description": "Full dev cycle: plan, implement, test, review",
-        "coordination": { "type": "pipeline" },
+        "coordination": { "type": "sequential", "stop_on_success": false },
         "members": [
             {
                 "role": "planner",
@@ -244,14 +244,13 @@ fn dev_team_payload() -> Value {
     })
 }
 
-fn adversarial_review_payload() -> Value {
+fn ordered_review_payload() -> Value {
     json!({
-        "name": "adversarial-review",
-        "description": "Producer writes code, reviewer challenges it for 5 rounds",
+        "name": "ordered-review",
+        "description": "Produce an output and review it in order",
         "coordination": {
-            "type": "adversarial",
-            "max_rounds": 5,
-            "threshold": 0.85
+            "type": "sequential",
+            "stop_on_success": false
         },
         "members": [
             {
@@ -363,7 +362,7 @@ async fn scenario_full_team_lifecycle() {
     // ── Create 4 teams with different coordination patterns ──
     let teams = [
         ("dev-cycle", dev_team_payload()),
-        ("adversarial-review", adversarial_review_payload()),
+        ("ordered-review", ordered_review_payload()),
         ("parallel-research", fanout_research_payload()),
         ("db-migration", sequential_migration_payload()),
     ];
@@ -385,7 +384,7 @@ async fn scenario_full_team_lifecycle() {
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     assert!(names.contains(&"dev-cycle"));
-    assert!(names.contains(&"adversarial-review"));
+    assert!(names.contains(&"ordered-review"));
     assert!(names.contains(&"parallel-research"));
     assert!(names.contains(&"db-migration"));
     assert!(names.contains(&"review"));
@@ -396,7 +395,7 @@ async fn scenario_full_team_lifecycle() {
     let dev_summary = team_list.iter().find(|t| t["name"] == "dev-cycle").unwrap();
     assert_eq!(dev_summary["max_parallel"], 2);
     assert_eq!(dev_summary["budget"]["max_cost_usd"], 25.0);
-    assert_eq!(dev_summary["coordination"]["type"], "pipeline");
+    assert_eq!(dev_summary["coordination"]["type"], "sequential");
     assert_eq!(dev_summary["worktree_mode"], "isolated");
     let migration_summary = team_list
         .iter()
@@ -416,14 +415,13 @@ async fn scenario_full_team_lifecycle() {
     assert_eq!(budget["max_tokens"], 2_000_000);
     assert_eq!(budget["max_duration_secs"], 1800);
     assert_eq!(body["worktree_mode"], "isolated");
-    assert_eq!(body["coordination"]["type"], "pipeline");
+    assert_eq!(body["coordination"]["type"], "sequential");
 
-    // ── Get detail for adversarial-review ──
-    let (status, body) = get(app.clone(), "/teams/adversarial-review", user).await;
+    // ── Get detail for ordered-review ──
+    let (status, body) = get(app.clone(), "/teams/ordered-review", user).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["coordination"]["type"], "adversarial");
-    assert_eq!(body["coordination"]["max_rounds"], 5);
-    assert_eq!(body["coordination"]["threshold"], 0.85);
+    assert_eq!(body["coordination"]["type"], "sequential");
+    assert_eq!(body["coordination"]["stop_on_success"], false);
     assert_eq!(body["members"].as_array().unwrap().len(), 2);
 
     // ── Update dev-cycle: change budget and add max_parallel ──
@@ -546,21 +544,21 @@ async fn scenario_validation_rejects_bad_teams() {
         json!({
             "name": "empty-team",
             "description": "no members",
-            "coordination": { "type": "pipeline" },
+            "coordination": { "type": "sequential", "stop_on_success": false },
             "members": []
         }),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "empty members: {body}");
 
-    // Adversarial with wrong member count (needs exactly 2)
+    // Retired coordination strategy is rejected, not silently translated
     let (status, body) = post(
         app.clone(),
         "/teams",
         user,
         json!({
             "name": "bad-adversarial",
-            "description": "3 members for adversarial",
+            "description": "unsupported coordination strategy",
             "coordination": { "type": "adversarial", "max_rounds": 3, "threshold": 0.8 },
             "members": [
                 { "role": "a", "skills": [], "mcp_servers": [] },
@@ -572,8 +570,8 @@ async fn scenario_validation_rejects_bad_teams() {
     .await;
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
-        "adversarial 3 members: {body}"
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "retired strategy schema rejection: {body}"
     );
 
     // Duplicate roles
@@ -584,7 +582,7 @@ async fn scenario_validation_rejects_bad_teams() {
         json!({
             "name": "dup-roles",
             "description": "duplicate role names",
-            "coordination": { "type": "pipeline" },
+            "coordination": { "type": "sequential", "stop_on_success": false },
             "members": [
                 { "role": "coder", "skills": [], "mcp_servers": [] },
                 { "role": "coder", "skills": [], "mcp_servers": [] }
@@ -602,7 +600,7 @@ async fn scenario_validation_rejects_bad_teams() {
         json!({
             "name": "neg-budget",
             "description": "negative cost",
-            "coordination": { "type": "pipeline" },
+            "coordination": { "type": "sequential", "stop_on_success": false },
             "members": [
                 { "role": "coder", "skills": [], "mcp_servers": [] }
             ],
@@ -879,7 +877,7 @@ async fn scenario_minimal_team_defaults() {
         json!({
             "name": "bare-minimum",
             "description": "No budget, no max_parallel, shared worktree",
-            "coordination": { "type": "pipeline" },
+            "coordination": { "type": "sequential", "stop_on_success": false },
             "members": [
                 { "role": "worker", "skills": [], "mcp_servers": [] }
             ]
@@ -954,7 +952,7 @@ async fn scenario_execution_history_and_limit_clamp() {
         json!({
             "name": "exec-history-team",
             "description": "for execution listing",
-            "coordination": { "type": "pipeline" },
+            "coordination": { "type": "sequential", "stop_on_success": false },
             "members": [{ "role": "solo", "skills": [], "mcp_servers": [] }]
         }),
     )

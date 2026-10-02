@@ -380,7 +380,9 @@ impl RuntimeFeedbackFrame {
 
     #[must_use]
     pub fn cache_hit_ratio(&self) -> Option<f64> {
-        self.request_usage.map(|usage| usage.cache_hit_ratio())
+        self.request_usage
+            .filter(|usage| usage.total_input() > 0)
+            .map(|usage| usage.cache_hit_ratio())
     }
 
     /// Compare provider-reported cache reads with the estimated stable prefix.
@@ -554,6 +556,11 @@ mod tests {
             policy_feedback: RuntimePolicyFeedbackSet::NotEvaluated,
         };
         frame.context.estimated_cache_eligible_tokens = Some(100);
+        assert_eq!(frame.cache_hit_ratio(), None);
+        frame.request_usage = Some(TokenAccounting::default());
+        assert_eq!(frame.cache_hit_ratio(), None);
+        frame.request_usage = Some(TokenAccounting::from_fields(20, 0, 0, 5));
+        assert_eq!(frame.cache_hit_ratio(), Some(0.0));
         frame.request_usage = Some(TokenAccounting::from_fields(20, 80, 0, 0));
 
         assert_eq!(frame.cache_read_vs_eligible_ratio(), Some(0.8));

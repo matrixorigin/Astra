@@ -1,4 +1,4 @@
-use astra_services::evaluation::router::*;
+use astra_services::model_routing::offline::*;
 use std::{fs, process::Command};
 
 fn prepare(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {

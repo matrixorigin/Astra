@@ -112,7 +112,7 @@ enum StartupUiEffect {
 /// structured through the handoff so picking a model does not trigger a
 /// second remote fetch just to recover provider/thinking metadata.
 enum ModelCatalogEffect {
-    Ready(Result<Vec<crate::cli::slash::slash_router::ModelCatalogEntry>, String>),
+    Ready(Result<Vec<astra_services::ModelListItemResponse>, String>),
 }
 
 enum LoginEffect {
@@ -727,7 +727,7 @@ async fn execute_work_continue(
             }
         }
         match &event {
-            astra_thin_client::StreamEvent::TextDelta { content } => {
+            astra_thin_client::StreamEvent::TextDelta { content, .. } => {
                 if !text_done_seen {
                     if let Some(content) = content.as_str() {
                         text.push_str(content);
@@ -752,7 +752,7 @@ async fn execute_work_continue(
                     }
                 }
             }
-            astra_thin_client::StreamEvent::TextDone { full_text } => {
+            astra_thin_client::StreamEvent::TextDone { full_text, .. } => {
                 if let Some(content) = full_text.as_str() {
                     // `text_done` is the durable answer boundary. It may be
                     // the only answer event in a replay, or it may correct a
@@ -1099,13 +1099,13 @@ fn apply_model_catalog_effect(
     state: &crate::cli::session::session_state::SessionState,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
-    cached_catalog: &mut Option<Vec<crate::cli::slash::slash_router::ModelCatalogEntry>>,
+    cached_catalog: &mut Option<Vec<astra_services::ModelListItemResponse>>,
 ) -> bool {
     match effect {
         ModelCatalogEffect::Ready(Ok(catalog)) => {
             let names = catalog
                 .iter()
-                .filter_map(crate::cli::slash::slash_router::entry_model_name)
+                .filter_map(crate::cli::session::session_runtime::model_list_entry_name)
                 .map(ToOwned::to_owned)
                 .collect();
             *cached_catalog = Some(catalog);
@@ -1331,7 +1331,7 @@ fn dispatch_slash_background_read(
                 success_message,
             } => SlashBackgroundReadEffect::Clipboard {
                 success_message,
-                result: crate::cli::slash::slash_info::copy_to_clipboard_async(text).await,
+                result: crate::cli::clipboard::copy_to_clipboard_async(text).await,
             },
             slash_dispatch::SlashBackgroundRead::Worktrees => {
                 match tokio::task::spawn_blocking(load_worktree_entries).await {
@@ -2486,7 +2486,6 @@ async fn sync_default_model_after_auth(
                 return None;
             }
         };
-    crate::cli::slash::slash_config::set_active_model_for_display(Some(model.clone()));
     bottom_pane.footer.model = Some(model.clone());
     Some(model)
 }
@@ -4497,25 +4496,119 @@ fn apply_tui_control_event(
                 UserIntentProjection::None
             }
         }
-        TuiAppEvent::AgentCommunication(event)
-            if event.direction == astra_turn_types::AgentCommunicationDirection::Received =>
-        {
-            if let Some(intent) = bottom_pane.remove_agent_guide(&event.message_id) {
-                let agent_name = match intent.target {
-                    bottom_pane::PendingUserIntentTarget::AgentRun { agent_name, .. } => agent_name,
-                    bottom_pane::PendingUserIntentTarget::ActiveRun => {
-                        return UserIntentProjection::None;
-                    }
-                };
-                chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-                    "Guidance received by {agent_name}: {}",
-                    intent.text
-                )));
+        TuiAppEvent::AgentCommunication(event) => {
+            apply_agent_communication_event(event, bottom_pane, chat_widget);
+            UserIntentProjection::None
+        }
+        TuiAppEvent::AgentLive(event) => {
+            if let astra_turn_core::agent_live_event::AgentLiveEventKind::Signal(
+                astra_turn_core::agent_live_event::AgentLiveSignal::AgentCommunication(event),
+            ) = &event.kind
+            {
+                apply_agent_communication_event(event, bottom_pane, chat_widget);
+            }
+            UserIntentProjection::None
+        }
+        TuiAppEvent::AgentLiveBatch(events) => {
+            for event in events {
+                if let astra_turn_core::agent_live_event::AgentLiveEventKind::Signal(
+                    astra_turn_core::agent_live_event::AgentLiveSignal::AgentCommunication(
+                        communication,
+                    ),
+                ) = &event.kind
+                {
+                    apply_agent_communication_event(communication, bottom_pane, chat_widget);
+                }
             }
             UserIntentProjection::None
         }
         _ => UserIntentProjection::None,
     }
+}
+
+/// Project communication through the same parent-facing reducer regardless
+/// of whether it arrived as a standalone server event or inside a local
+/// child live stream. Execution output, thinking, and child tool activity do
+/// not enter this path; only a typed parent-directed message gets a bounded
+/// receipt in the parent transcript.
+fn apply_agent_communication_event(
+    event: &astra_turn_types::AgentCommunicationEvent,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+) {
+    if let Some(notice) = parent_agent_communication_notice(event)
+        && chat_widget.claim_parent_communication_notice(&event.message_id)
+    {
+        chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(notice));
+    }
+    if event.direction != astra_turn_types::AgentCommunicationDirection::Received {
+        return;
+    }
+    if let Some(intent) = bottom_pane.remove_agent_guide(&event.message_id) {
+        let agent_name = match intent.target {
+            bottom_pane::PendingUserIntentTarget::AgentRun { agent_name, .. } => agent_name,
+            bottom_pane::PendingUserIntentTarget::ActiveRun => return,
+        };
+        chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
+            "Guidance received by {agent_name}: {}",
+            intent.text
+        )));
+    }
+}
+
+/// Render the one piece of child activity that belongs in the parent
+/// transcript: a durable message explicitly addressed to the parent. The
+/// summary is already bounded by the messaging contract; this additional
+/// display cap keeps an accidental large payload from taking over scrollback.
+fn parent_agent_communication_notice(
+    event: &astra_turn_types::AgentCommunicationEvent,
+) -> Option<String> {
+    let parent_directed = matches!(
+        &event.to,
+        astra_turn_types::AgentCommunicationTarget::Parent
+    );
+    let parent_observed =
+        event.direction == astra_turn_types::AgentCommunicationDirection::Received;
+    let child_reported = event.direction == astra_turn_types::AgentCommunicationDirection::Sent
+        && (!event.observed_by.run_id.is_empty() || !event.observed_by.agent_id.is_empty())
+        && event.observed_by.run_id == event.from.run_id
+        && event.observed_by.agent_id == event.from.agent_id;
+    if !parent_directed
+        || (!parent_observed && !child_reported)
+        || event.payload_kind == astra_turn_types::AgentCommunicationPayloadKind::Progress
+    {
+        return None;
+    }
+
+    const MAX_PARENT_MESSAGE_PREVIEW_CHARS: usize = 240;
+    let sender = if event.from.agent_id.trim().is_empty() {
+        "child agent"
+    } else {
+        event.from.agent_id.as_str()
+    };
+    let mut notice = format!("Message from {sender} · {}", event.payload_kind);
+    if let Some(summary) = event
+        .summary
+        .as_deref()
+        .filter(|summary| !summary.trim().is_empty())
+    {
+        let mut preview = summary
+            .chars()
+            .take(MAX_PARENT_MESSAGE_PREVIEW_CHARS)
+            .collect::<String>();
+        if summary.chars().count() > MAX_PARENT_MESSAGE_PREVIEW_CHARS {
+            preview.push('…');
+        }
+        notice.push_str(" · ");
+        notice.push_str(&preview);
+    } else if let Some(accepted) = event.response_accepted {
+        notice.push_str(if accepted {
+            " · accepted"
+        } else {
+            " · declined"
+        });
+    }
+    Some(notice)
 }
 
 fn apply_active_turn_tui_control_event(
@@ -5242,6 +5335,64 @@ fn local_transcript_tool_result(
     })
 }
 
+/// Recover an omitted result name from the same journal lane before applying
+/// pagination. Tool-call IDs are run-scoped; no additional storage read is needed.
+fn local_transcript_tool_names(
+    events: &[astra_services::session_journal::JournalEvent],
+    target_run_id: Option<&str>,
+) -> std::collections::HashMap<(String, String), String> {
+    let mut names = std::collections::HashMap::new();
+    for payload in events
+        .iter()
+        .filter_map(|event| event.transcript_item.as_ref())
+    {
+        if target_run_id.is_some_and(|run_id| payload.run_id != run_id) {
+            continue;
+        }
+        for call in payload
+            .message
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = call.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(name) = call
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let arguments = call
+                .get("function")
+                .and_then(|function| function.get("arguments"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let logical_name = crate::tui::agent_control_status::delegation_target(name, arguments)
+                .unwrap_or_else(|| name.to_string());
+            names.insert((payload.run_id.clone(), id.to_string()), logical_name);
+        }
+    }
+    names
+}
+
+fn recover_local_tool_result_name(
+    item: &mut astra_thin_client::SessionTranscriptItem,
+    names: &std::collections::HashMap<(String, String), String>,
+) {
+    if let Some(result) = item.tool_result.as_mut()
+        && result.name.is_none()
+        && let Some(run_id) = item.run_id.as_deref()
+    {
+        result.name = names
+            .get(&(run_id.to_string(), result.tool_use_id.clone()))
+            .cloned();
+    }
+}
+
 fn local_transcript_item(
     session_id: &str,
     payload: astra_services::session_journal::JournalTranscriptItem,
@@ -5265,9 +5416,10 @@ fn local_transcript_item(
         .get("evidence")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok());
-    let source_event_id = (!payload.source_event_id.trim().is_empty())
-        .then(|| format!("journal:{}", payload.source_event_id));
+    let source_event_id =
+        (!payload.source_event_id.trim().is_empty()).then_some(payload.source_event_id);
     Some(astra_thin_client::SessionTranscriptItem {
+        model_item_id: payload.model_item_id,
         session_id: session_id.to_string(),
         item_seq,
         run_id: Some(payload.run_id),
@@ -5290,6 +5442,7 @@ fn project_local_agent_transcript_page(
     before_seq: Option<i64>,
     limit: usize,
 ) -> astra_thin_client::SessionTranscriptPage {
+    let tool_names = local_transcript_tool_names(&events, Some(run_id));
     let mut items = events
         .into_iter()
         .filter_map(|event| {
@@ -5301,7 +5454,9 @@ fn project_local_agent_transcript_page(
             if before_seq.is_some_and(|before| item_seq >= before) {
                 return None;
             }
-            local_transcript_item(session_id, payload, item_seq, event.ts)
+            let mut item = local_transcript_item(session_id, payload, item_seq, event.ts)?;
+            recover_local_tool_result_name(&mut item, &tool_names);
+            Some(item)
         })
         .collect::<Vec<_>>();
     items.sort_by_key(|item| item.item_seq);
@@ -5332,6 +5487,7 @@ fn project_local_root_transcript_page(
     before_seq: Option<i64>,
     limit: usize,
 ) -> astra_thin_client::SessionTranscriptPage {
+    let tool_names = local_transcript_tool_names(&events, None);
     let mut source_ids = std::collections::HashSet::new();
     let mut root_seq = 0i64;
     let mut items = Vec::new();
@@ -5354,7 +5510,8 @@ fn project_local_root_transcript_page(
         if before_seq.is_some_and(|before| root_seq >= before) {
             continue;
         }
-        if let Some(item) = local_transcript_item(session_id, payload, root_seq, event.ts) {
+        if let Some(mut item) = local_transcript_item(session_id, payload, root_seq, event.ts) {
+            recover_local_tool_result_name(&mut item, &tool_names);
             items.push(item);
         }
     }
@@ -6418,7 +6575,7 @@ async fn dispatch_bottom_pane_view_action(
         } => {
             let outcome_tx = backends.agent_workbench_tx.clone();
             tokio::spawn(async move {
-                let result = crate::cli::slash::slash_info::copy_to_clipboard_async(text).await;
+                let result = crate::cli::clipboard::copy_to_clipboard_async(text).await;
                 let _ = outcome_tx
                     .send(AgentWorkbenchOutcome::Clipboard {
                         success_message,
@@ -7040,7 +7197,7 @@ pub(crate) async fn run_tui_session(
         startup_observation_tasks.push(tokio::spawn(async move {
             let completions = {
                 let manager = mcp_manager.read().await;
-                crate::cli::slash::slash_mcp::build_mcp_extra_subcommands(&manager)
+                slash_dispatch::build_mcp_extra_subcommands(&manager)
             };
             let _ = startup_effect_tx
                 .send(StartupUiEffect::McpCompletions(completions))
@@ -8473,7 +8630,7 @@ pub(crate) async fn run_tui_session(
                                     if text.starts_with("/mcp") {
                                         let mcp_extras = {
                                             let mgr = state.mcp_manager.read().await;
-                                            crate::cli::slash::slash_mcp::build_mcp_extra_subcommands(&mgr)
+                                            slash_dispatch::build_mcp_extra_subcommands(&mgr)
                                         };
                                         bottom_pane.update_mcp_completions(mcp_extras);
                                     }
@@ -10148,7 +10305,7 @@ pub(crate) async fn run_tui_session(
                                                     );
                                                     let mcp_extras = {
                                                         let manager = mcp_manager.read().await;
-                                                        crate::cli::slash::slash_mcp::build_mcp_extra_subcommands(&manager)
+                                                        slash_dispatch::build_mcp_extra_subcommands(&manager)
                                                     };
                                                     bottom_pane.update_mcp_completions(mcp_extras);
                                                     let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
@@ -10951,28 +11108,27 @@ pub(crate) async fn run_tui_session(
                                     if let bottom_pane::view::ViewResult::Model { name: base_model } = &result {
                                         let base_model = base_model.clone();
                                         let raw = model_catalog_cache.clone().unwrap_or_default();
-                                        let entry = crate::cli::slash::slash_router::find_model_entry_by_name(
+                                        let entry = crate::cli::session::session_runtime::find_model_entry_by_name(
                                             &raw,
                                             &base_model,
                                         );
                                         let thinking_cap = entry
-                                            .and_then(crate::cli::slash::slash_router::entry_thinking_capability);
-                                        let provider =
-                                            entry.and_then(crate::cli::slash::slash_router::entry_provider);
+                                            .and_then(|model| model.thinking_capability.map(|value| value.as_str()));
+                                        let provider = entry.and_then(|model| {
+                                            let provider = model.provider.trim();
+                                            (!provider.is_empty()).then_some(provider)
+                                        });
                                         let offering_id = entry
-                                            .map(crate::cli::slash::slash_router::entry_offering_id)
+                                            .map(|model| model.offering_id.as_str())
                                             .map(ToOwned::to_owned);
-                                        let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
-                                            &base_model,
+                                        let opts = astra_turn_core::thinking_config::thinking_options(
                                             provider,
                                             thinking_cap,
+                                            entry.and_then(|model| model.thinking_protocol).unwrap_or_default(),
                                         );
                                         if opts.is_empty() {
                                             state.model = Some(base_model.clone());
-                                            crate::cli::slash::slash_config::set_active_model_for_display(
-                                                Some(base_model.clone()),
-                                            );
-                                            crate::cli::slash::slash_config::set_active_offering_id_for_request(
+                                            crate::cli::session::session_runtime::set_active_offering_id_for_request(
                                                 offering_id,
                                             );
                                             bottom_pane.footer.model = Some(base_model.clone());
@@ -11035,20 +11191,17 @@ pub(crate) async fn run_tui_session(
                                         config,
                                     } = &result {
                                         let raw = model_catalog_cache.clone().unwrap_or_default();
-                                        let entry = crate::cli::slash::slash_router::find_model_entry_by_name(
+                                        let entry = crate::cli::session::session_runtime::find_model_entry_by_name(
                                             &raw,
                                             &base_model,
                                         );
                                         let offering_id = entry
-                                            .map(crate::cli::slash::slash_router::entry_offering_id)
+                                            .map(|model| model.offering_id.as_str())
                                             .map(ToOwned::to_owned);
                                         let suffix = astra_turn_core::thinking_config::thinking_suffix_for(config);
                                         let composed = format!("{base_model}{suffix}");
                                         state.model = Some(composed.clone());
-                                        crate::cli::slash::slash_config::set_active_model_for_display(
-                                            Some(composed.clone()),
-                                        );
-                                        crate::cli::slash::slash_config::set_active_offering_id_for_request(
+                                        crate::cli::session::session_runtime::set_active_offering_id_for_request(
                                             offering_id,
                                         );
                                         bottom_pane.footer.model = Some(composed.clone());
@@ -11518,7 +11671,7 @@ pub(crate) async fn run_tui_session(
                 );
                 let mcp_extras = {
                     let manager = mcp_manager.read().await;
-                    crate::cli::slash::slash_mcp::build_mcp_extra_subcommands(&manager)
+                    slash_dispatch::build_mcp_extra_subcommands(&manager)
                 };
                 bottom_pane.update_mcp_completions(mcp_extras);
                 let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
@@ -12179,9 +12332,9 @@ fn handle_app_event(
     let now = std::time::Instant::now();
     let is_turn_progress = matches!(
         ev,
-        TuiAppEvent::Token(_)
+        TuiAppEvent::Token { .. }
             | TuiAppEvent::ThinkingStarted
-            | TuiAppEvent::ThinkingChunk(_)
+            | TuiAppEvent::ThinkingChunk { .. }
             | TuiAppEvent::ThinkingStopped
             | TuiAppEvent::WaitingForModel
             | TuiAppEvent::ModelResponding
@@ -12224,7 +12377,7 @@ fn handle_app_event(
         TuiAppEvent::RequestTokenUsage(usage) => {
             bottom_pane.footer.set_request_token_usage(*usage);
         }
-        TuiAppEvent::Token(text) => {
+        TuiAppEvent::Token { text, .. } => {
             // Bump the per-turn token approximation so the
             // StatusIndicator shows `↓ N tokens` climbing.
             status_indicator.bump_stream_chars(text.chars().count());
@@ -12239,7 +12392,7 @@ fn handle_app_event(
             status_indicator
                 .set_state(status_indicator::IndicatorState::Thinking { started_at: now });
         }
-        TuiAppEvent::ThinkingChunk(_) => {
+        TuiAppEvent::ThinkingChunk { .. } => {
             // ChatWidget handles the cell update; nothing to do
             // in the bottom pane. The indicator stays `Thinking`.
         }
@@ -12323,7 +12476,9 @@ fn handle_app_event(
 fn starts_model_output(event: &TuiAppEvent) -> bool {
     matches!(
         event,
-        TuiAppEvent::Token(_) | TuiAppEvent::ThinkingChunk(_) | TuiAppEvent::ToolStarted { .. }
+        TuiAppEvent::Token { .. }
+            | TuiAppEvent::ThinkingChunk { .. }
+            | TuiAppEvent::ToolStarted { .. }
     )
 }
 
@@ -13162,6 +13317,7 @@ mod tests {
             start_elapsed_ms: None,
             duration_ms: None,
             outcome: None,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),
@@ -13509,9 +13665,10 @@ mod tests {
         let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
         let (stream_tx, bridge) = stream_bridge::create_controlled_per_turn_bridge(tui_tx);
         stream_tx
-            .send(crate::cli::chat_stream::StreamEvent::Token(
-                "accepted-before-terminal-io-error".into(),
-            ))
+            .send(crate::cli::chat_stream::StreamEvent::Token {
+                model_item_id: None,
+                text: "accepted-before-terminal-io-error".into(),
+            })
             .await
             .expect("bridge open");
         let mut ready: Option<Result<(), String>> = None;
@@ -13524,7 +13681,7 @@ mod tests {
 
         assert!(matches!(
             tui_rx.recv().await,
-            Some(TuiAppEvent::Token(text)) if text == "accepted-before-terminal-io-error"
+            Some(TuiAppEvent::Token { text, .. }) if text == "accepted-before-terminal-io-error"
         ));
         assert!(matches!(
             tui_rx.recv().await,
@@ -13676,10 +13833,14 @@ mod tests {
 
     #[test]
     fn ttft_starts_on_first_model_content_not_only_answer_text() {
-        assert!(starts_model_output(&TuiAppEvent::ThinkingChunk(
-            "reasoning".into()
-        )));
-        assert!(starts_model_output(&TuiAppEvent::Token("answer".into())));
+        assert!(starts_model_output(&TuiAppEvent::ThinkingChunk {
+            model_item_id: None,
+            text: "reasoning".into()
+        }));
+        assert!(starts_model_output(&TuiAppEvent::Token {
+            model_item_id: None,
+            text: "answer".into()
+        }));
         assert!(starts_model_output(&TuiAppEvent::ToolStarted {
             name: "read_file".into(),
             description: "Read a file".into(),
@@ -14899,6 +15060,7 @@ mod tests {
         content: &str,
     ) -> astra_thin_client::SessionTranscriptItem {
         astra_thin_client::SessionTranscriptItem {
+            model_item_id: None,
             session_id: "session-1".into(),
             item_seq,
             run_id: Some("root".into()),
@@ -14996,6 +15158,14 @@ mod tests {
         );
         assert!(recent.has_more);
         assert_eq!(recent.next_before_seq, Some(2));
+        assert_eq!(
+            recent.items[0].source_event_id.as_deref(),
+            events[2]
+                .transcript_item
+                .as_ref()
+                .map(|item| item.source_event_id.as_str()),
+            "page identity must be the writer's exact commit receipt"
+        );
         assert!(recent.items[0].content.is_empty());
         assert_eq!(recent.items[0].tool_calls.len(), 1);
         assert_eq!(recent.items[0].tool_calls[0].name, "read");
@@ -15019,6 +15189,48 @@ mod tests {
         assert_eq!(older.items.len(), 1);
         assert_eq!(older.items[0].content, "Review the scheduler");
         assert!(!older.has_more);
+        astra_services::session_journal::set_journal_content_redact_override(None);
+    }
+
+    #[test]
+    #[serial_test::serial(astra_journal_content_redact_env)]
+    fn paginated_local_tool_result_recovers_its_run_scoped_name() {
+        astra_services::session_journal::set_journal_content_redact_override(Some(false));
+        let event = |seq, message| {
+            astra_services::session_journal::JournalEvent::transcript_item(
+                "session-1",
+                "run-child",
+                "child",
+                seq,
+                &message,
+            )
+            .unwrap()
+        };
+        let call = event(
+            1,
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{"id": "call-1", "function": {"name": "invoke_tool", "arguments": "{\"name\":\"agent\",\"arguments\":{\"action\":\"spawn\"}}"}}]
+            }),
+        );
+        let result = event(
+            2,
+            serde_json::json!({
+                "role": "tool", "tool_call_id": "call-1", "content": "child result"
+            }),
+        );
+        let page = project_local_agent_transcript_page(
+            "session-1",
+            "run-child",
+            vec![call, result],
+            None,
+            1,
+        );
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            page.items[0].tool_result.as_ref().unwrap().name.as_deref(),
+            Some("agent")
+        );
         astra_services::session_journal::set_journal_content_redact_override(None);
     }
 
@@ -15170,6 +15382,7 @@ mod tests {
         let local_page = astra_thin_client::SessionTranscriptPage {
             session_id: "session-1".into(),
             items: vec![astra_thin_client::SessionTranscriptItem {
+                model_item_id: None,
                 session_id: "session-1".into(),
                 item_seq: 7,
                 run_id: Some("root-run".into()),
@@ -15323,6 +15536,7 @@ mod tests {
         let local_page = astra_thin_client::SessionTranscriptPage {
             session_id: "session-1".into(),
             items: vec![astra_thin_client::SessionTranscriptItem {
+                model_item_id: None,
                 session_id: "session-1".into(),
                 item_seq: 7,
                 run_id: Some("run-review".into()),
@@ -15461,7 +15675,6 @@ mod tests {
             related_message_id: None,
             timestamp_ms: 42,
             correlation_id: None,
-            requires_ack: false,
         };
         let event = astra_services::session_journal::JournalEvent::transcript_evidence(
             "parent-session",
@@ -15570,7 +15783,10 @@ mod tests {
             chat_widget::WireEvent::AgentLive(AgentLiveEvent {
                 run_id: "test-run".into(),
                 agent_id: agent_id.into(),
-                kind: AgentLiveEventKind::OutputDelta("initial output".into()),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("test-model-item".into()),
+                    text: "initial output".into(),
+                },
             }),
         ));
         let mut bottom_pane = BottomPane::new();
@@ -15612,7 +15828,10 @@ mod tests {
             chat_widget::WireEvent::AgentLive(AgentLiveEvent {
                 run_id: "test-run".into(),
                 agent_id: "agent-visible".into(),
-                kind: AgentLiveEventKind::OutputDelta("reviewing changes".into()),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("test-model-item".into()),
+                    text: "reviewing changes".into(),
+                },
             }),
         ));
         let mut bottom_pane = BottomPane::new();
@@ -15736,7 +15955,10 @@ mod tests {
             chat_widget::WireEvent::AgentLive(AgentLiveEvent {
                 run_id: "run-reviewer".into(),
                 agent_id: "agent-reviewer".into(),
-                kind: AgentLiveEventKind::OutputDelta("reviewing".into()),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("test-model-item".into()),
+                    text: "reviewing".into(),
+                },
             }),
         ));
         let mut bottom_pane = BottomPane::new();
@@ -15859,6 +16081,8 @@ mod tests {
             parent_run_id: "root".to_string(),
             parent_agent_id: "root".to_string(),
             resolved_model_name: None,
+            delegation_model_admission: None,
+            parent_model_reasoning: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             working_dir: PathBuf::from("/tmp"),
@@ -16826,9 +17050,10 @@ mod tests {
                 astra_turn_core::agent_live_event::AgentLiveEvent {
                     run_id: "run-review".into(),
                     agent_id: "reviewer@run-review".into(),
-                    kind: astra_turn_core::agent_live_event::AgentLiveEventKind::OutputDelta(
-                        "reviewing".into(),
-                    ),
+                    kind: astra_turn_core::agent_live_event::AgentLiveEventKind::OutputDelta {
+                        model_item_id: Some("test-model-item".into()),
+                        text: "reviewing".into(),
+                    },
                 },
             ),
         ));
@@ -18388,7 +18613,6 @@ mod tests {
             related_message_id: None,
             timestamp_ms: 42,
             correlation_id: None,
-            requires_ack: true,
         });
 
         apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget);
@@ -18401,6 +18625,148 @@ mod tests {
             rendered.contains("inspect the storage race"),
             "{rendered:?}"
         );
+    }
+
+    #[test]
+    fn parent_tui_shows_parent_message_without_child_execution_log() {
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = chat_widget::ChatWidget::new(String::new());
+        let event = TuiAppEvent::AgentCommunication(astra_turn_types::AgentCommunicationEvent {
+            schema_version: astra_turn_types::AGENT_COMMUNICATION_SCHEMA_VERSION.into(),
+            observed_by: astra_turn_types::AgentCommunicationParty {
+                run_id: "run-root".into(),
+                agent_id: "root".into(),
+            },
+            direction: astra_turn_types::AgentCommunicationDirection::Received,
+            message_id: "child-message-1".into(),
+            from: astra_turn_types::AgentCommunicationParty {
+                run_id: "run-child".into(),
+                agent_id: "reviewer".into(),
+            },
+            to: astra_turn_types::AgentCommunicationTarget::Parent,
+            payload_kind: astra_turn_types::AgentCommunicationPayloadKind::Text,
+            summary: Some("The storage race is reproduced".into()),
+            response_accepted: None,
+            related_message_id: None,
+            timestamp_ms: 42,
+            correlation_id: None,
+        });
+
+        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget);
+
+        let rendered = rendered_transcript_overlay(&chat_widget, 100);
+        assert!(
+            rendered.contains("Message from reviewer · text"),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.contains("The storage race is reproduced"),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered.contains("read_file"),
+            "child tool details leaked: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("thinking"),
+            "child runtime leaked: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn parent_tui_projects_local_child_message_without_child_execution_log() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal,
+        };
+
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = chat_widget::ChatWidget::new(String::new());
+        let communication = astra_turn_types::AgentCommunicationEvent {
+            schema_version: astra_turn_types::AGENT_COMMUNICATION_SCHEMA_VERSION.into(),
+            observed_by: astra_turn_types::AgentCommunicationParty {
+                run_id: "run-child".into(),
+                agent_id: "reviewer".into(),
+            },
+            // Local child streams preserve the child's perspective. The
+            // parent still receives the event through AgentLive, so this is
+            // the path that must be projected into the parent UI.
+            direction: astra_turn_types::AgentCommunicationDirection::Sent,
+            message_id: "child-message-local-1".into(),
+            from: astra_turn_types::AgentCommunicationParty {
+                run_id: "run-child".into(),
+                agent_id: "reviewer".into(),
+            },
+            to: astra_turn_types::AgentCommunicationTarget::Parent,
+            payload_kind: astra_turn_types::AgentCommunicationPayloadKind::Text,
+            summary: Some("The local child found the lock owner".into()),
+            response_accepted: None,
+            related_message_id: None,
+            timestamp_ms: 42,
+            correlation_id: None,
+        };
+        let event = TuiAppEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-child".into(),
+            agent_id: "reviewer".into(),
+            kind: AgentLiveEventKind::Signal(AgentLiveSignal::AgentCommunication(
+                communication.clone(),
+            )),
+        });
+
+        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget);
+        // A later durable observation of the same message must not duplicate
+        // the parent receipt.
+        apply_tui_control_event(
+            &TuiAppEvent::AgentCommunication(communication),
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
+
+        let rendered = rendered_transcript_overlay(&chat_widget, 100);
+        assert_eq!(
+            rendered.matches("Message from reviewer · text").count(),
+            1,
+            "one logical child message should produce one parent receipt: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("The local child found the lock owner"),
+            "parent should see the child interaction: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("read_file") && !rendered.contains("thinking"),
+            "child execution details must remain in the child transcript: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn parent_tui_does_not_promote_child_progress_to_scrollback() {
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = chat_widget::ChatWidget::new(String::new());
+        let event = TuiAppEvent::AgentCommunication(astra_turn_types::AgentCommunicationEvent {
+            schema_version: astra_turn_types::AGENT_COMMUNICATION_SCHEMA_VERSION.into(),
+            observed_by: astra_turn_types::AgentCommunicationParty {
+                run_id: "run-root".into(),
+                agent_id: "root".into(),
+            },
+            direction: astra_turn_types::AgentCommunicationDirection::Received,
+            message_id: "child-progress-1".into(),
+            from: astra_turn_types::AgentCommunicationParty {
+                run_id: "run-child".into(),
+                agent_id: "reviewer".into(),
+            },
+            to: astra_turn_types::AgentCommunicationTarget::Parent,
+            payload_kind: astra_turn_types::AgentCommunicationPayloadKind::Progress,
+            summary: Some("still reading 12 files".into()),
+            response_accepted: None,
+            related_message_id: None,
+            timestamp_ms: 42,
+            correlation_id: None,
+        });
+
+        apply_tui_control_event(&event, &mut bottom_pane, &mut chat_widget);
+
+        let rendered = rendered_transcript_overlay(&chat_widget, 100);
+        assert!(!rendered.contains("still reading 12 files"), "{rendered:?}");
+        assert!(!rendered.contains("Message from reviewer"), "{rendered:?}");
     }
 
     #[test]
@@ -18475,7 +18841,10 @@ mod tests {
         );
 
         chat_widget.handle_event(chat_widget::AppEvent::wire(
-            chat_widget::WireEvent::AnswerDelta("live durable-root output".into()),
+            chat_widget::WireEvent::AnswerDelta {
+                model_item_id: None,
+                text: "live durable-root output".into(),
+            },
         ));
         assert!(refresh_open_transcript_view(
             &chat_widget,
@@ -18828,9 +19197,10 @@ mod tests {
     fn transcript_expansion_survives_reasoning_live_to_committed_transition() {
         let mut chat_widget = chat_widget::ChatWidget::new(String::new());
         chat_widget.handle_event(chat_widget::AppEvent::wire(
-            chat_widget::WireEvent::ReasoningDelta(
-                "one\ntwo\nthree\nfour\nfive\nsix\nseven".to_string(),
-            ),
+            chat_widget::WireEvent::ReasoningDelta {
+                model_item_id: None,
+                text: "one\ntwo\nthree\nfour\nfive\nsix\nseven".to_string(),
+            },
         ));
         let mut bottom_pane = BottomPane::new();
         toggle_local_root_transcript_fallback(&chat_widget, &mut bottom_pane, 80, 30);
@@ -19220,14 +19590,20 @@ mod tests {
             chat_widget::WireEvent::AgentLive(AgentLiveEvent {
                 run_id: "test-run".into(),
                 agent_id: "agent-a".into(),
-                kind: AgentLiveEventKind::OutputDelta("a".into()),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("test-model-item".into()),
+                    text: "a".into(),
+                },
             }),
         ));
         chat_widget.handle_event(chat_widget::AppEvent::wire(
             chat_widget::WireEvent::AgentLive(AgentLiveEvent {
                 run_id: "test-run".into(),
                 agent_id: "agent-b".into(),
-                kind: AgentLiveEventKind::OutputDelta("b".into()),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("test-model-item".into()),
+                    text: "b".into(),
+                },
             }),
         ));
 
@@ -19241,7 +19617,10 @@ mod tests {
         let unrelated = TuiAppEvent::AgentLive(AgentLiveEvent {
             run_id: "test-run".into(),
             agent_id: "agent-b".into(),
-            kind: AgentLiveEventKind::OutputDelta("more b".into()),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("test-model-item".into()),
+                text: "more b".into(),
+            },
         });
         assert!(
             !refresh_open_agent_detail_for_event(&unrelated, &chat_widget, &mut bottom_pane),
@@ -19251,7 +19630,10 @@ mod tests {
         let related = TuiAppEvent::AgentLive(AgentLiveEvent {
             run_id: "test-run".into(),
             agent_id: "agent-a".into(),
-            kind: AgentLiveEventKind::OutputDelta("more a".into()),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("test-model-item".into()),
+                text: "more a".into(),
+            },
         });
         assert!(
             refresh_open_agent_detail_for_event(&related, &chat_widget, &mut bottom_pane),
@@ -19268,14 +19650,20 @@ mod tests {
             chat_widget::WireEvent::AgentLive(AgentLiveEvent {
                 run_id: "test-run".into(),
                 agent_id: "agent-a".into(),
-                kind: AgentLiveEventKind::OutputDelta("a".into()),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("test-model-item".into()),
+                    text: "a".into(),
+                },
             }),
         ));
 
         let event = TuiAppEvent::AgentLive(AgentLiveEvent {
             run_id: "test-run".into(),
             agent_id: "agent-a".into(),
-            kind: AgentLiveEventKind::OutputDelta("more a".into()),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("test-model-item".into()),
+                text: "more a".into(),
+            },
         });
         let mut bottom_pane = BottomPane::new();
         assert!(
@@ -19316,7 +19704,10 @@ mod tests {
         let token = TuiAppEvent::AgentLive(AgentLiveEvent {
             run_id: "test-run".into(),
             agent_id: "agent-a".into(),
-            kind: AgentLiveEventKind::OutputDelta("token".into()),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("test-model-item".into()),
+                text: "token".into(),
+            },
         });
         assert!(
             !refresh_open_agent_monitor_for_event(&token, &chat_widget, &mut bottom_pane),
@@ -19999,7 +20390,10 @@ mod tests {
             "review".into(),
         )));
         w.handle_event(chat_widget::AppEvent::wire(
-            chat_widget::WireEvent::AnswerDelta("still working".into()),
+            chat_widget::WireEvent::AnswerDelta {
+                model_item_id: None,
+                text: "still working".into(),
+            },
         ));
 
         let rendered = rendered_transcript_overlay(&w, 80);
@@ -20014,11 +20408,12 @@ mod tests {
     fn open_transcript_keeps_a_long_live_reply_to_its_visible_tail() {
         let mut w = chat_widget::ChatWidget::new("");
         w.handle_event(chat_widget::AppEvent::wire(
-            chat_widget::WireEvent::AnswerDelta(
-                (0..2_000)
+            chat_widget::WireEvent::AnswerDelta {
+                model_item_id: None,
+                text: (0..2_000)
                     .map(|index| format!("live-line-{index}\n"))
                     .collect(),
-            ),
+            },
         ));
 
         let rendered = rendered_transcript_overlay(&w, 80);

@@ -1,13 +1,13 @@
-//! Verification contracts and execution shared by Work, skills, and harnesses.
+//! Acceptance-check contracts and the canonical skill verification runner.
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 
 // ─── Verification Criterion ─────────────────────────────────────────────────
 
 /// Machine-executable acceptance criterion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationCriterion {
     pub id: String,
     pub description: String,
@@ -18,10 +18,6 @@ pub struct VerificationCriterion {
     /// Max seconds for this verification to run
     #[serde(default = "default_timeout")]
     pub timeout_sec: u32,
-    /// If true, only runs during global verification (not per-subtask).
-    /// Used for expensive checks like full build/test/lint.
-    #[serde(default)]
-    pub global_only: bool,
 }
 
 fn default_true() -> bool {
@@ -77,12 +73,6 @@ pub enum VerifierKind {
         #[serde(default)]
         not_contains: Vec<String>,
     },
-    /// LLM-based semantic judgment (can run on cloud, no local fs needed)
-    LlmJudge {
-        prompt: String,
-        #[serde(default = "default_pass_threshold")]
-        pass_threshold: f64,
-    },
     /// Composite: AND/OR of sub-criteria
     Composite {
         criteria: Vec<VerificationCriterion>,
@@ -93,9 +83,6 @@ pub enum VerifierKind {
 
 fn default_min_pass_rate() -> f64 {
     1.0
-}
-fn default_pass_threshold() -> f64 {
-    0.7
 }
 
 // ─── Verification Result ────────────────────────────────────────────────────
@@ -112,40 +99,64 @@ pub struct VerificationResult {
     pub error: Option<String>,
 }
 
-/// Report for all verifications on a subtask.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubtaskVerificationReport {
-    pub subtask_id: String,
-    pub all_required_passed: bool,
-    pub results: Vec<VerificationResult>,
-    pub timestamp: String,
-}
-
-/// Semantic verifier supplied by a trusted model boundary.
-#[async_trait]
-pub trait LlmJudge: Send + Sync {
-    async fn evaluate(&self, prompt: &str, context: &str) -> Result<f64, String>;
-}
-
 /// Executes one typed verification criterion inside a fixed work directory.
 pub struct VerificationRunner {
     pub work_dir: std::path::PathBuf,
-    pub llm_judge: Option<Arc<dyn LlmJudge>>,
 }
 
 impl VerificationRunner {
     pub fn new(work_dir: std::path::PathBuf) -> Self {
-        Self {
-            work_dir,
-            llm_judge: None,
-        }
+        Self { work_dir }
     }
 
-    pub fn with_llm_judge(work_dir: std::path::PathBuf, judge: Arc<dyn LlmJudge>) -> Self {
-        Self {
-            work_dir,
-            llm_judge: Some(judge),
+    /// Parse the complete batch before observing files. Command criteria must
+    /// run through an authorized tool provider, never through this runner.
+    pub async fn run_criteria(
+        &self,
+        values: &[serde_json::Value],
+    ) -> (bool, Vec<VerificationResult>) {
+        let criteria: Vec<VerificationCriterion> = match values
+            .iter()
+            .map(|value| serde_json::from_value(value.clone()))
+            .collect::<Result<_, _>>()
+        {
+            Ok(criteria) => criteria,
+            Err(error) => {
+                return (
+                    false,
+                    vec![VerificationResult {
+                        criterion_id: "invalid_criteria".into(),
+                        passed: false,
+                        evidence: String::new(),
+                        expected: "valid verification criteria".into(),
+                        duration_ms: 0,
+                        error: Some(error.to_string()),
+                    }],
+                );
+            }
+        };
+        let mut results = Vec::with_capacity(criteria.len());
+        for criterion in &criteria {
+            if verifier_requires_shell(&criterion.verifier) {
+                results.push(VerificationResult {
+                    criterion_id: criterion.id.clone(),
+                    passed: false,
+                    evidence: String::new(),
+                    expected: "verification without shell execution".into(),
+                    duration_ms: 0,
+                    error: Some(
+                        "command-backed verification requires an authorized tool provider".into(),
+                    ),
+                });
+            } else {
+                results.push(self.run_criterion(criterion).await);
+            }
         }
+        let passed = criteria
+            .iter()
+            .zip(&results)
+            .all(|(criterion, result)| !criterion.required || result.passed);
+        (passed, results)
     }
 
     pub async fn run_criterion(&self, criterion: &VerificationCriterion) -> VerificationResult {
@@ -187,28 +198,11 @@ impl VerificationRunner {
 
     async fn execute(&self, verifier: &VerifierKind) -> Result<(bool, String, String), String> {
         match verifier {
-            VerifierKind::Command { cmd, expected_exit } => {
-                let (code, stdout, stderr) = run_command(cmd, &self.work_dir).await?;
-                let evidence = combined_output(&stdout, &stderr);
-                Ok((
-                    code == *expected_exit,
-                    truncate(&evidence, 4096),
-                    format!("exit code == {expected_exit}"),
-                ))
-            }
-            VerifierKind::CommandOutput {
-                cmd,
-                contains,
-                not_contains,
-            } => {
-                let (_, stdout, _) = run_command(cmd, &self.work_dir).await?;
-                let passed = contains.iter().all(|value| stdout.contains(value))
-                    && not_contains.iter().all(|value| !stdout.contains(value));
-                Ok((
-                    passed,
-                    truncate(&stdout, 4096),
-                    format!("contains: {contains:?}, not_contains: {not_contains:?}"),
-                ))
+            VerifierKind::Command { .. }
+            | VerifierKind::CommandOutput { .. }
+            | VerifierKind::BuildPass { .. }
+            | VerifierKind::TestPass { .. } => {
+                Err("command-backed verification requires an authorized tool provider".into())
             }
             VerifierKind::FileExists { paths } => {
                 let missing = paths
@@ -268,61 +262,6 @@ impl VerificationRunner {
                     format!("contains: {contains:?}, not_contains: {not_contains:?}"),
                 ))
             }
-            VerifierKind::BuildPass { cmd } => {
-                let (code, _, stderr) = run_command(cmd, &self.work_dir).await?;
-                Ok((
-                    code == 0,
-                    truncate(&stderr, 4096),
-                    "exit code == 0".to_string(),
-                ))
-            }
-            VerifierKind::TestPass { cmd, min_pass_rate } => {
-                let (code, stdout, stderr) = run_command(cmd, &self.work_dir).await?;
-                let output = combined_output(&stdout, &stderr);
-                let (passed, evidence) = match parse_test_counts(&output) {
-                    Some((passed_count, failed_count)) => {
-                        let total = passed_count + failed_count;
-                        let ratio = if total == 0 {
-                            0.0
-                        } else {
-                            passed_count as f64 / total as f64
-                        };
-                        (
-                            ratio >= *min_pass_rate,
-                            format!(
-                                "{passed_count} passed, {failed_count} failed ({:.1}%)",
-                                ratio * 100.0
-                            ),
-                        )
-                    }
-                    None => (
-                        code == 0,
-                        format!("exit code {code}; test counts unavailable"),
-                    ),
-                };
-                Ok((
-                    passed,
-                    format!("{evidence}\n{}", truncate(&output, 3800)),
-                    format!("pass rate >= {:.1}%", min_pass_rate * 100.0),
-                ))
-            }
-            VerifierKind::LlmJudge {
-                prompt,
-                pass_threshold,
-            } => {
-                let Some(judge) = &self.llm_judge else {
-                    return Err("LLM judge not configured".to_string());
-                };
-                let score = judge.evaluate(prompt, &self.judge_context()).await?;
-                if !score.is_finite() || !(0.0..=1.0).contains(&score) {
-                    return Err("LLM judge returned an invalid score".to_string());
-                }
-                Ok((
-                    score >= *pass_threshold,
-                    format!("LLM score: {score:.2}"),
-                    format!("score >= {pass_threshold:.2}"),
-                ))
-            }
             VerifierKind::Composite {
                 criteria,
                 require_all,
@@ -352,43 +291,21 @@ impl VerificationRunner {
             }
         }
     }
-
-    fn judge_context(&self) -> String {
-        let entries = std::fs::read_dir(&self.work_dir)
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .take(30)
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        format!(
-            "Work directory: {}\nEntries: {}",
-            self.work_dir.display(),
-            entries.join(", ")
-        )
-    }
 }
 
-async fn run_command(cmd: &str, work_dir: &Path) -> Result<(i32, String, String), String> {
-    let cmd = cmd.to_string();
-    let work_dir = work_dir.to_path_buf();
-    let task = tokio::task::spawn_blocking(move || {
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .current_dir(work_dir)
-            .output()
-            .map_err(|error| format!("command failed: {error}"))?;
-        Ok::<_, String>((
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ))
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(600), task)
-        .await
-        .map_err(|_| "command timed out after 600s".to_string())?
-        .map_err(|error| format!("command task failed: {error}"))?
+fn verifier_requires_shell(verifier: &VerifierKind) -> bool {
+    match verifier {
+        VerifierKind::Command { .. }
+        | VerifierKind::CommandOutput { .. }
+        | VerifierKind::BuildPass { .. }
+        | VerifierKind::TestPass { .. } => true,
+        VerifierKind::Composite { criteria, .. } => criteria
+            .iter()
+            .any(|criterion| verifier_requires_shell(&criterion.verifier)),
+        VerifierKind::FileExists { .. }
+        | VerifierKind::GrepCheck { .. }
+        | VerifierKind::ReadFileContains { .. } => false,
+    }
 }
 
 fn resolve_existing_path(root: &Path, value: &str) -> Option<std::path::PathBuf> {
@@ -431,54 +348,9 @@ fn resolve_existing_path(root: &Path, value: &str) -> Option<std::path::PathBuf>
     None
 }
 
-fn combined_output(stdout: &str, stderr: &str) -> String {
-    if stderr.is_empty() {
-        stdout.to_string()
-    } else {
-        format!("{stdout}\n--- stderr ---\n{stderr}")
-    }
-}
-
-fn parse_test_counts(output: &str) -> Option<(u64, u64)> {
-    output.lines().rev().find_map(|line| {
-        let passed = number_before(line, "passed");
-        let failed = number_before(line, "failed");
-        (passed.is_some() || failed.is_some()).then_some((passed.unwrap_or(0), failed.unwrap_or(0)))
-    })
-}
-
-fn number_before(line: &str, marker: &str) -> Option<u64> {
-    let prefix = line.split(marker).next()?;
-    prefix
-        .split(|character: char| !character.is_ascii_digit())
-        .rfind(|part| !part.is_empty())?
-        .parse()
-        .ok()
-}
-
-fn truncate(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        value.to_string()
-    } else {
-        format!(
-            "{}…[truncated]",
-            value.chars().take(max_chars).collect::<String>()
-        )
-    }
-}
-
 #[cfg(test)]
 mod runner_tests {
     use super::*;
-
-    struct InvalidJudge;
-
-    #[async_trait]
-    impl LlmJudge for InvalidJudge {
-        async fn evaluate(&self, _prompt: &str, _context: &str) -> Result<f64, String> {
-            Ok(1.5)
-        }
-    }
 
     fn criterion(verifier: VerifierKind) -> VerificationCriterion {
         VerificationCriterion {
@@ -487,7 +359,88 @@ mod runner_tests {
             verifier,
             required: true,
             timeout_sec: 5,
-            global_only: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn verification_batches_preserve_required_checks_without_shell_execution() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("output.txt"), "ready").unwrap();
+        let runner = VerificationRunner::new(root.path().to_path_buf());
+        {
+            assert_eq!(runner.run_criteria(&[]).await, (true, Vec::new()));
+            for (path, required, expected) in [
+                ("output.txt", true, true),
+                ("missing", true, false),
+                ("missing", false, true),
+            ] {
+                let mut check = criterion(VerifierKind::FileExists {
+                    paths: vec![path.into()],
+                });
+                check.required = required;
+                let (passed, results) = runner
+                    .run_criteria(&[serde_json::to_value(check).unwrap()])
+                    .await;
+                assert_eq!(passed, expected);
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].passed, path == "output.txt");
+            }
+        }
+        for verifier in [
+            VerifierKind::Command {
+                cmd: "touch marker".into(),
+                expected_exit: 0,
+            },
+            VerifierKind::Composite {
+                criteria: vec![criterion(VerifierKind::Command {
+                    cmd: "touch marker".into(),
+                    expected_exit: 0,
+                })],
+                require_all: true,
+            },
+        ] {
+            let (passed, results) = runner
+                .run_criteria(&[serde_json::to_value(criterion(verifier)).unwrap()])
+                .await;
+            assert!(!passed);
+            assert!(results[0].error.is_some());
+            assert!(!root.path().join("marker").exists());
+        }
+        let check = criterion(VerifierKind::CommandOutput {
+            cmd: "printf ready".into(),
+            contains: vec!["ready".into()],
+            not_contains: vec!["failed".into()],
+        });
+        let (passed, results) = runner
+            .run_criteria(&[serde_json::to_value(check).unwrap()])
+            .await;
+        assert!(!passed && results[0].error.is_some());
+    }
+
+    #[tokio::test]
+    async fn malformed_batch_cannot_skip_validation_and_execute_a_valid_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let runner = VerificationRunner::new(root.path().to_path_buf());
+        let valid = serde_json::to_value(criterion(VerifierKind::FileExists {
+            paths: vec!["missing".into()],
+        }))
+        .unwrap();
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!({"id": "unknown", "description": "unsupported verifier", "verifier": {"kind": "unknown"}}),
+        ] {
+            {
+                let (passed, results) =
+                    runner.run_criteria(&[valid.clone(), invalid.clone()]).await;
+                assert!(!passed);
+                assert!(
+                    results
+                        .iter()
+                        .any(|result| result.error.is_some() && !result.passed)
+                );
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].criterion_id, "invalid_criteria");
+            }
         }
     }
 
@@ -506,24 +459,5 @@ mod runner_tests {
 
         assert!(!result.passed);
         assert!(result.error.is_some());
-    }
-
-    #[tokio::test]
-    async fn semantic_judge_score_must_be_finite_probability() {
-        let root = tempfile::tempdir().unwrap();
-        let runner =
-            VerificationRunner::with_llm_judge(root.path().to_path_buf(), Arc::new(InvalidJudge));
-        let result = runner
-            .run_criterion(&criterion(VerifierKind::LlmJudge {
-                prompt: "verify".to_string(),
-                pass_threshold: 0.9,
-            }))
-            .await;
-
-        assert!(!result.passed);
-        assert_eq!(
-            result.error.as_deref(),
-            Some("LLM judge returned an invalid score")
-        );
     }
 }

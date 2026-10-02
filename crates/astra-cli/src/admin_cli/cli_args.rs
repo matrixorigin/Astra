@@ -273,16 +273,7 @@ pub struct PromptOptimizeArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum FeedbackCmd {
-    Stats(FeedbackStatsArgs),
     Export(FeedbackExportArgs),
-}
-
-#[derive(Args, Debug)]
-pub struct FeedbackStatsArgs {
-    #[arg(long)]
-    pub agent_id: Option<String>,
-    #[arg(long)]
-    pub since: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -297,6 +288,18 @@ pub struct FeedbackExportArgs {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn retired_feedback_stats_is_not_a_command() {
+        assert!(Cli::try_parse_from(["admin", "feedback", "stats"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["admin", "feedback", "export"])
+                .unwrap()
+                .args
+                .command,
+            Some(Command::Feedback(FeedbackCmd::Export(_)))
+        ));
+    }
 
     #[test]
     fn parse_simple_commands() {

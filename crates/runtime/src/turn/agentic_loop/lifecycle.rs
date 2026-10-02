@@ -33,20 +33,370 @@ use astra_turn_core::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
 const CHILD_AGENT_CANCEL_TIMEOUT: Duration = Duration::from_secs(3);
 const PAUSE_LOOP_LOCAL_CHECK_INTERVAL: Duration = Duration::from_millis(25);
 const PAUSED_RUN_DURABLE_CONTROL_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const MAILBOX_MODEL_PREVIEW_CHARS: usize = 4_000;
+const MAX_MAILBOX_CONTEXT_CHARS: usize = 24_000;
+const MAX_RETAINED_MAILBOX_MESSAGES: usize = 128;
+const MAX_RETAINED_MAILBOX_BYTES: usize = 128 * 1024;
 
-fn push_mailbox_model_preview(parts: &mut Vec<String>, value: String) {
-    let mut chars = value.chars();
-    let preview = chars
-        .by_ref()
-        .take(MAILBOX_MODEL_PREVIEW_CHARS)
-        .collect::<String>();
-    if chars.next().is_some() {
-        parts.push(format!(
-            "{preview}… [message preview truncated; use agent.get_result for a full child terminal result]"
-        ));
-    } else {
-        parts.push(preview);
+fn retained_mailbox_usage(pending: &[super::host::VolatileInjection]) -> (usize, usize) {
+    pending
+        .iter()
+        .filter(|injection| super::host::is_retained_mailbox_context(injection))
+        .fold((0, 0), |(count, bytes), injection| {
+            (
+                count + 1,
+                bytes.saturating_add(injection.payload.to_string().len()),
+            )
+        })
+}
+
+/// One mailbox consumption owner for ordinary turns and waits. A transport
+/// wake is not permission to call the model; only injected context is.
+pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) -> Result<bool, astra_core::ClassifiedError> {
+    let mut model_context_changed = false;
+    let reply_obligations = Arc::clone(&state.messaging.reply_obligations);
+    const MAX_MAILBOX_DRAIN_PER_TURN: usize = 64;
+    let (mut retained_mailbox_messages, mut retained_mailbox_bytes) =
+        retained_mailbox_usage(&state.volatile_pending);
+    for _ in 0..MAX_MAILBOX_DRAIN_PER_TURN {
+        let Some(mailbox) = state.messaging.mailbox.as_mut() else {
+            break;
+        };
+        // A one-envelope lease prevents a later permission or transport await
+        // from rolling back messages that were already adopted or answered.
+        let lease = mailbox.lease_bounded(1);
+        let Some(msg) = lease.messages().first().cloned() else {
+            lease.commit();
+            break;
+        };
+        let has_more = lease.has_more();
+        let address = &lease.mailbox().address;
+        let mut parts = Vec::new();
+        let self_echo = msg.from == *address
+            && matches!(
+                msg.to,
+                astra_messaging::types::MessageTarget::Broadcast { .. }
+            );
+        if !self_echo {
+            let from_label = &msg.from.agent_id;
+            let is_transient_progress = matches!(
+                msg.payload,
+                astra_messaging::types::MessagePayload::Progress { .. }
+            );
+            if !is_transient_progress {
+                host.on_agent_communication(astra_messaging::agent_communication_event(
+                    address,
+                    astra_messaging::AgentCommunicationDirection::Received,
+                    &msg,
+                ));
+            }
+            if let Some(ref metrics) = state.messaging.metrics {
+                metrics.messages_received.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let mut handled_permission = false;
+            if let Some(ref handler) = state.permission_handler
+                && let Some((correlation_id, response)) = handler.process_message(&msg).await
+            {
+                handled_permission = true;
+                let response_msg = response.to_message(address, &msg.from, &correlation_id);
+                if let Err(error) = lease.mailbox().send(response_msg.clone()).await {
+                    astra_core::agent_warn!(
+                        "mailbox",
+                        "Failed to send permission response: {error}"
+                    );
+                    if !matches!(
+                        error,
+                        astra_messaging::types::MailboxError::AgentNotFound(_)
+                            | astra_messaging::types::MailboxError::ChannelClosed
+                    ) {
+                        // An uncertain send may have delivered the answer.
+                        // Keep this request and stop rather than retrying it
+                        // into a second permission decision.
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ToolOutcomeUnknown,
+                            format!("permission response delivery uncertain: {error}"),
+                        ));
+                    }
+                    // The child is definitively gone: no permission was
+                    // granted. Consume the obsolete request so an unrelated
+                    // parent task can continue without replaying it forever.
+                } else {
+                    host.on_agent_communication(astra_messaging::agent_communication_event(
+                        address,
+                        astra_messaging::AgentCommunicationDirection::Sent,
+                        &response_msg,
+                    ));
+                }
+            }
+
+            if !handled_permission {
+                match &msg.payload {
+                    astra_messaging::types::MessagePayload::Text { content, .. } => {
+                        parts.push(format!("[{from_label}]: {content}"));
+                    }
+                    astra_messaging::types::MessagePayload::Progress { .. } => {}
+                    astra_messaging::types::MessagePayload::Request { request_type, data } => {
+                        let data = (!data.is_null()).then(|| format!(" · {data}"));
+                        parts.push(format!(
+                            "[{from_label} request id={}]: {request_type:?}{}",
+                            msg.id,
+                            data.as_deref().unwrap_or("")
+                        ));
+                    }
+                    astra_messaging::types::MessagePayload::Response {
+                        request_id,
+                        accepted,
+                        data,
+                    } => {
+                        if reply_obligations.should_expose_response(
+                            state.current_run_id.as_deref().unwrap_or_default(),
+                            &msg,
+                        ) {
+                            let data = data.as_ref().map(|data| format!(" · {data}"));
+                            parts.push(format!(
+                                "[{from_label} response to {request_id}]: accepted={accepted}{}",
+                                data.as_deref().unwrap_or("")
+                            ));
+                        }
+                    }
+                    astra_messaging::types::MessagePayload::Signal(sig) => {
+                        let signal = format!("[{from_label} signal]: {sig:?}");
+                        let preview = signal.chars().take(4_000).collect::<String>();
+                        parts.push(if preview.len() < signal.len() {
+                            format!("{preview}… [signal preview truncated]")
+                        } else {
+                            preview
+                        });
+                    }
+                }
+            }
+        }
+        let mut defer_ack = false;
+        let mut retain_delivery = false;
+        let mut retry_after_provider = false;
+        let staged = if parts.is_empty() {
+            None
+        } else {
+            let display = format!(
+                "📬 Message id={} from another agent:\n{}",
+                msg.id,
+                parts.join("\n")
+            );
+            if display.chars().count() > MAX_MAILBOX_CONTEXT_CHARS {
+                retain_delivery = true;
+                Some((
+                    super::host::VolatileKind::ContextPressure,
+                    serde_json::Value::String(format!(
+                        "📬 Message id={} was received but not injected because it exceeds the {}-character model context limit; ask the sender for a concise follow-up or an artifact reference.",
+                        msg.id, MAX_MAILBOX_CONTEXT_CHARS
+                    )),
+                ))
+            } else {
+                let semantic = matches!(
+                    msg.payload,
+                    astra_messaging::types::MessagePayload::Text { .. }
+                        | astra_messaging::types::MessagePayload::Request {
+                            request_type: astra_messaging::types::RequestType::Shutdown
+                                | astra_messaging::types::RequestType::ContextShare
+                                | astra_messaging::types::RequestType::Custom(_),
+                            ..
+                        }
+                        | astra_messaging::types::MessagePayload::Response { .. }
+                );
+                if semantic {
+                    let payload_digest = format!(
+                        "{:x}",
+                        Sha256::digest(
+                            serde_json::to_vec(&msg.payload)
+                                .expect("agent message payload must serialize"),
+                        )
+                    );
+                    let message_kind = match msg.payload {
+                        astra_messaging::types::MessagePayload::Text { .. } => "text",
+                        astra_messaging::types::MessagePayload::Request { .. } => "request",
+                        astra_messaging::types::MessagePayload::Response { .. } => "response",
+                        _ => unreachable!(
+                            "semantic mailbox payload must be text, request, or response"
+                        ),
+                    };
+                    let payload = serde_json::json!({
+                        "schema": super::host::RETAINED_MAILBOX_CONTEXT_SCHEMA,
+                        "receiver": address,
+                        "sender": msg.from,
+                        "message_id": msg.id,
+                        "correlation_id": msg.correlation_id,
+                        "message_kind": message_kind,
+                        "response_request_id": match &msg.payload {
+                            astra_messaging::types::MessagePayload::Response { request_id, .. } => Some(request_id),
+                            _ => None,
+                        },
+                        "payload_digest": payload_digest,
+                        "delivery_count": 0,
+                        "display": display,
+                    });
+                    let prior = state.volatile_pending.iter().find(|injection| {
+                        injection.kind == super::host::VolatileKind::Mailbox
+                            && injection.payload["schema"]
+                                == super::host::RETAINED_MAILBOX_CONTEXT_SCHEMA
+                            && injection.payload["receiver"] == payload["receiver"]
+                            && injection.payload["sender"] == payload["sender"]
+                            && injection.payload["message_id"] == payload["message_id"]
+                    });
+                    if let Some(prior) = prior {
+                        if prior.payload["payload_digest"] != payload["payload_digest"]
+                            || prior.payload["display"] != payload["display"]
+                            || prior.payload["response_request_id"]
+                                != payload["response_request_id"]
+                        {
+                            return Err(astra_core::ClassifiedError::new(
+                                astra_core::ErrorKind::ContractViolation,
+                                "mailbox message identity conflicts with retained semantic input",
+                            ));
+                        }
+                        defer_ack = true;
+                        None
+                    } else {
+                        let payload_bytes = payload.to_string().len();
+                        while retained_mailbox_messages >= MAX_RETAINED_MAILBOX_MESSAGES
+                            || retained_mailbox_bytes.saturating_add(payload_bytes)
+                                > MAX_RETAINED_MAILBOX_BYTES
+                        {
+                            let evict = state
+                                .volatile_pending
+                                .iter()
+                                .position(|injection| {
+                                    super::host::is_retained_mailbox_context(injection)
+                                        && injection.payload["observed_by_provider"] == true
+                                        && injection.payload["message_kind"] != "request"
+                                })
+                                .or_else(|| {
+                                    state.volatile_pending.iter().position(|injection| {
+                                        super::host::is_retained_mailbox_context(injection)
+                                            && injection.payload["observed_by_provider"] == true
+                                    })
+                                });
+                            let Some(index) = evict else {
+                                break;
+                            };
+                            let removed = state.volatile_pending.remove(index);
+                            retained_mailbox_messages = retained_mailbox_messages.saturating_sub(1);
+                            retained_mailbox_bytes = retained_mailbox_bytes
+                                .saturating_sub(removed.payload.to_string().len());
+                        }
+                        if retained_mailbox_messages >= MAX_RETAINED_MAILBOX_MESSAGES
+                            || retained_mailbox_bytes.saturating_add(payload_bytes)
+                                > MAX_RETAINED_MAILBOX_BYTES
+                        {
+                            // The notice is useful to the current provider
+                            // attempt, but it is not adoption of the message
+                            // itself. Keep the original envelope in transport
+                            // custody and retry after an existing context
+                            // entry has been consumed.
+                            retain_delivery = true;
+                            retry_after_provider = true;
+                            Some((
+                                super::host::VolatileKind::ContextPressure,
+                                serde_json::Value::String(format!(
+                                    "📬 Message id={} was received but not retained because the mailbox context budget is full; inspect the communication trace or ask the sender to resend only the essential detail.",
+                                    msg.id
+                                )),
+                            ))
+                        } else {
+                            retained_mailbox_messages += 1;
+                            retained_mailbox_bytes =
+                                retained_mailbox_bytes.saturating_add(payload_bytes);
+                            defer_ack = true;
+                            Some((super::host::VolatileKind::Mailbox, payload))
+                        }
+                    }
+                } else {
+                    defer_ack = true;
+                    Some((
+                        super::host::VolatileKind::Mailbox,
+                        serde_json::Value::String(display),
+                    ))
+                }
+            }
+        };
+
+        if retain_delivery {
+            // Park the exact envelope outside the ready queue. This lets later
+            // messages proceed while preserving transport custody; capacity-
+            // blocked deliveries are released after a successful provider
+            // boundary, while permanently oversized ones stay parked.
+            lease.defer(retry_after_provider);
+            if let Some((kind, payload)) = staged {
+                state.push_volatile_payload(kind, payload);
+                model_context_changed = true;
+            }
+            if !has_more {
+                break;
+            }
+            continue;
+        }
+
+        lease.commit();
+        // No await separates releasing process-local ownership from staging
+        // this exact envelope for the next model request.
+        if let Some((kind, payload)) = staged {
+            state.push_volatile_payload(kind, payload);
+            model_context_changed = true;
+        }
+        if defer_ack {
+            if let Some(mailbox) = state.messaging.mailbox.as_mut() {
+                mailbox.defer_acknowledgement(msg);
+            }
+        } else if let Some(mailbox) = state.messaging.mailbox.as_ref()
+            && let Err(error) = mailbox
+                .acknowledge_received(std::slice::from_ref(&msg))
+                .await
+        {
+            astra_core::agent_warn!(
+                "mailbox",
+                "failed to confirm consumed message; transport may redeliver it: {error}"
+            );
+        }
+        if !has_more {
+            break;
+        }
+    }
+
+    Ok(model_context_changed)
+}
+
+/// Confirm mailbox deliveries after a successful provider decision consumed
+/// their staged context. Before that boundary, `queued` means only
+/// transport custody; acknowledging earlier can lose a message during context
+/// pressure, provider failure, or process recovery.
+pub(crate) async fn acknowledge_adopted_mailbox_messages(state: &mut AgenticLoopState) {
+    let pending = {
+        let Some(mailbox) = state.messaging.mailbox.as_mut() else {
+            return;
+        };
+        mailbox.take_adopted_acknowledgements()
+    };
+    if pending.is_empty() {
+        return;
+    }
+    // Completion obligations are settled by the successful attempt's typed
+    // context lease, independently of these process-local transport envelopes.
+    let (retry, error) = {
+        let Some(mailbox) = state.messaging.mailbox.as_ref() else {
+            return;
+        };
+        mailbox.acknowledge_received_with_failures(&pending).await
+    };
+    if let Some(error) = error {
+        astra_core::agent_warn!(
+            "mailbox",
+            "failed to confirm adopted messages; transport may redeliver them: {error}"
+        );
+    }
+    if let Some(mailbox) = state.messaging.mailbox.as_mut() {
+        mailbox.restore_adopted_acknowledgements(retry);
     }
 }
 
@@ -3013,6 +3363,7 @@ pub(crate) fn interruption_diagnosis_summary(state: &AgenticLoopState) -> Option
 }
 
 pub(crate) fn mark_work_settlement_incomplete(state: &mut AgenticLoopState) {
+    state.final_text_model_item_id = None;
     state.final_text = super::host::WORK_SETTLEMENT_CONTRACT_FAILURE_TEXT.to_string();
     state.final_text_streamed = false;
     state.interruption = Some(InterruptionRecord::new(
@@ -3030,6 +3381,13 @@ pub(crate) async fn run_loop_preamble(state: &mut AgenticLoopState) {
     // agentic loop returns. Reset it when a new turn actually starts, not
     // during finalization, so prefix rewrites remain observable to commit.
     state.context_compression_triggered = false;
+
+    if let Some(context) = state.permission_context.as_ref()
+        && context.read().await.inherited.read_only_execution
+    {
+        state.skills.tool_event_hooks.disable_execution();
+        state.skills.session_event_hooks.disable_execution();
+    }
 
     if state
         .skills
@@ -3413,6 +3771,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     CancellationOrigin::Runtime,
                 )
                 .await;
+                state.final_text_model_item_id = None;
                 state.final_text.clear();
                 state.interruption = None;
             } else {
@@ -3424,6 +3783,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 )
                 .await;
                 if state.interruption.is_none() {
+                    state.final_text_model_item_id = None;
                     state.final_text = "The execution deadline arrived before the remaining verification could be safely completed. Progress is preserved, but the requested result is incomplete.".into();
                     state.final_text_streamed = false;
                     state.interruption = Some(InterruptionRecord::new(
@@ -3482,6 +3842,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     "↻ Continuing — verified progress is still advancing.".to_string(),
                 );
             }
+            state.final_text_model_item_id = None;
             state.final_text.clear();
             state.interruption = None;
         } else if begin_budget_settlement(state) {
@@ -3492,11 +3853,13 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 CancellationOrigin::Runtime,
             )
             .await;
+            state.final_text_model_item_id = None;
             state.final_text.clear();
             state.interruption = None;
         } else if let Ok(Some(action)) = super::execution_phase::pending_completion_action(state)
             && !super::execution_phase::completion_action_window_is_batchable(state, &action)
         {
+            state.final_text_model_item_id = None;
             state.final_text =
                 "The requested verification chain could not be completed within one bounded settlement boundary; no completion claim is being made."
                     .to_string();
@@ -3545,6 +3908,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 CancellationOrigin::Runtime,
             )
             .await;
+            state.final_text_model_item_id = None;
             state.final_text = budget_exhaustion_completion_text(state, &cancelled_agents);
             state.final_text_streamed = false;
             if !quiet {
@@ -3606,6 +3970,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                         ),
                     );
                 }
+                state.final_text_model_item_id = None;
                 state.final_text = format!(
                     "[Rate limit cooldown active ({}). \
                      {} completed tool call(s) preserved. \
@@ -3656,13 +4021,6 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     state
         .step_recorder
         .begin_turn_with_context(session_turn_number(state), turn_index as u32);
-
-    if let Some(ref mut adapter) = state.tactical_adapter {
-        adapter.reset_turn();
-    }
-    if let Some(ref mut collector) = state.step_signal_collector {
-        collector.reset(state.max_turn_input_tokens);
-    }
 
     let turn_start_time = Instant::now();
     tracing::debug!(
@@ -3808,190 +4166,12 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         state.permission_handler = Some(crate::orchestration::PermissionRequestHandler::new(ctx));
     }
 
-    const MAX_MAILBOX_DRAIN_PER_TURN: usize = 64;
-    if let Some(ref mut mailbox) = state.messaging.mailbox {
-        let (pending, has_more) = mailbox.drain_bounded(MAX_MAILBOX_DRAIN_PER_TURN);
-        if !pending.is_empty() {
-            let mut parts = Vec::with_capacity(pending.len());
-            let mut delivered_count = 0usize;
-            for msg in &pending {
-                // Transport-level broadcast groups include every subscriber,
-                // including the sender. `broadcast` is a peer-coordination
-                // intent, so consume/ack the sender echo without reinjecting
-                // its own guidance or generating a meaningless self-ack.
-                if msg.from == mailbox.address
-                    && matches!(
-                        msg.to,
-                        astra_messaging::types::MessageTarget::Broadcast { .. }
-                    )
-                {
-                    continue;
-                }
-                let from_label = &msg.from.agent_id;
-                let is_transient_progress = matches!(
-                    msg.payload,
-                    astra_messaging::types::MessagePayload::Progress { .. }
-                );
-                if !is_transient_progress {
-                    delivered_count += 1;
-                    host.on_agent_communication(astra_messaging::agent_communication_event(
-                        &mailbox.address,
-                        astra_messaging::AgentCommunicationDirection::Received,
-                        msg,
-                    ));
-                }
-
-                match &msg.payload {
-                    astra_messaging::types::MessagePayload::Ack { message_id } => {
-                        if let Some(ref tracker) = state.messaging.ack_tracker {
-                            tracker.acknowledge(message_id).await;
-                        }
-                        if let Some(ref metrics) = state.messaging.metrics {
-                            metrics.acks_received.fetch_add(1, Ordering::Relaxed);
-                        }
-                        parts.push(format!(
-                            "[{from_label} applied]: message {message_id} reached the receiver model boundary"
-                        ));
-                        continue;
-                    }
-                    astra_messaging::types::MessagePayload::Nack { message_id, reason } => {
-                        if let Some(ref tracker) = state.messaging.ack_tracker
-                            && let Some(astra_messaging::ack_tracker::AckOutcome::Rejected {
-                                message,
-                                ..
-                            }) = tracker.reject(message_id, reason.clone()).await
-                        {
-                            eprintln!(
-                                "  ⚠ messaging: nack for message {}: {}",
-                                message_id,
-                                reason.as_deref().unwrap_or("no reason")
-                            );
-                            if let Some(ref dlq) = state.messaging.dead_letter_queue {
-                                dlq.store(
-                                    Arc::clone(&message),
-                                    astra_messaging::dead_letter::DeadLetterReason::Rejected {
-                                        reason: reason.clone(),
-                                    },
-                                    1,
-                                )
-                                .await;
-                            }
-                            if let Some(ref metrics) = state.messaging.metrics {
-                                metrics.dead_letters.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        if let Some(ref metrics) = state.messaging.metrics {
-                            metrics.nacks_received.fetch_add(1, Ordering::Relaxed);
-                        }
-                        let r = reason.as_deref().unwrap_or("no reason");
-                        parts.push(format!(
-                            "[{from_label} nack]: message {message_id} rejected — {r}"
-                        ));
-                        continue;
-                    }
-                    _ => {}
-                }
-
-                if let Some(ref metrics) = state.messaging.metrics {
-                    metrics.messages_received.fetch_add(1, Ordering::Relaxed);
-                }
-
-                if msg.requires_ack {
-                    let ack_reply = msg.make_ack(mailbox.address.clone());
-                    if let Err(e) = mailbox.send(ack_reply.clone()).await {
-                        astra_core::agent_warn!("mailbox", "Failed to send ack: {e}");
-                    } else {
-                        host.on_agent_communication(astra_messaging::agent_communication_event(
-                            &mailbox.address,
-                            astra_messaging::AgentCommunicationDirection::Sent,
-                            &ack_reply,
-                        ));
-                    }
-                    if let Some(ref metrics) = state.messaging.metrics {
-                        metrics.acks_sent.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-
-                if let Some(ref handler) = state.permission_handler
-                    && let Some((correlation_id, response)) = handler.process_message(msg).await
-                {
-                    let response_msg =
-                        response.to_message(&mailbox.address, &msg.from, &correlation_id);
-                    if let Err(e) = mailbox.send(response_msg.clone()).await {
-                        astra_core::agent_warn!(
-                            "mailbox",
-                            "Failed to send permission response: {e}"
-                        );
-                    } else {
-                        host.on_agent_communication(astra_messaging::agent_communication_event(
-                            &mailbox.address,
-                            astra_messaging::AgentCommunicationDirection::Sent,
-                            &response_msg,
-                        ));
-                    }
-                    continue;
-                }
-
-                match &msg.payload {
-                    astra_messaging::types::MessagePayload::Text { content, .. } => {
-                        push_mailbox_model_preview(
-                            &mut parts,
-                            format!("[{from_label}]: {content}"),
-                        );
-                    }
-                    astra_messaging::types::MessagePayload::Progress { .. } => {}
-                    astra_messaging::types::MessagePayload::Request { request_type, data } => {
-                        let data = (!data.is_null()).then(|| format!(" · {data}"));
-                        push_mailbox_model_preview(
-                            &mut parts,
-                            format!(
-                                "[{from_label} request]: {request_type:?}{}",
-                                data.as_deref().unwrap_or("")
-                            ),
-                        );
-                    }
-                    astra_messaging::types::MessagePayload::Response {
-                        request_id,
-                        accepted,
-                        data,
-                    } => {
-                        let data = data.as_ref().map(|data| format!(" · {data}"));
-                        push_mailbox_model_preview(
-                            &mut parts,
-                            format!(
-                                "[{from_label} response to {request_id}]: accepted={accepted}{}",
-                                data.as_deref().unwrap_or("")
-                            ),
-                        );
-                    }
-                    astra_messaging::types::MessagePayload::Signal(sig) => {
-                        push_mailbox_model_preview(
-                            &mut parts,
-                            format!("[{from_label} signal]: {sig:?}"),
-                        );
-                    }
-                    astra_messaging::types::MessagePayload::Ack { .. } => {}
-                    astra_messaging::types::MessagePayload::Nack { .. } => {}
-                }
-            }
-            if let Err(error) = mailbox.acknowledge_received(&pending).await {
-                astra_core::agent_warn!(
-                    "mailbox",
-                    "failed to confirm consumed messages; transport may redeliver them: {error}"
-                );
-            }
-            if !parts.is_empty() {
-                let mailbox_text = format!(
-                    "📬 Messages from other agents ({}{}):\n{}",
-                    delivered_count,
-                    if has_more { "+, more queued" } else { "" },
-                    parts.join("\n")
-                );
-                state.push_volatile(super::host::VolatileKind::Mailbox, mailbox_text);
-            }
-        }
-    }
-
+    let _ = super::execution_phase::runtime_input_boundary(
+        host,
+        state,
+        super::execution_phase::RuntimeInputBoundary::Preparation,
+    )
+    .await?;
     if let Some(resolver) = &state.skills.resolver {
         // Phase-9: skill listing moves from per-turn volatile to
         // session-stable. The full skill catalog is rendered via
@@ -4360,7 +4540,7 @@ mod tests {
         state.hooks.stop_hook_runs = 2;
         state.hooks.teammate_idle_hooks = vec![hook.clone()];
         state.hooks.teammate_idle_hook_runs = 1;
-        let expected_control = astra_pipeline::step_protocol::RunExecutionControl::V2 {
+        let expected_control = astra_pipeline::step_protocol::RunExecutionControl::V3 {
             completion_settlement: state.hooks.completion_settlement.clone(),
             hook_obligations: astra_turn_types::StopHookObligations {
                 stop_hooks: vec![hook.clone()],
@@ -4368,6 +4548,11 @@ mod tests {
                 teammate_idle_hooks: vec![hook],
                 teammate_idle_hook_runs: 1,
             },
+            reply_obligations: state
+                .messaging
+                .reply_obligations
+                .snapshot("same-budget-run", 3)
+                .unwrap(),
             budget_wrapup_injected: true,
             budget_wrapup_ignored_rounds: 1,
         };
@@ -4433,6 +4618,33 @@ mod tests {
         run_loop_preamble(&mut state).await;
 
         assert!(!state.context_compression_triggered);
+    }
+
+    #[tokio::test]
+    async fn read_only_child_preamble_disables_project_hook_execution() {
+        let mut state = make_state();
+        let mut permissions = astra_turn_core::permission::types::InheritedPermissions::default();
+        permissions.read_only_execution = true;
+        state.permission_context =
+            Some(astra_turn_core::permission::types::PermissionSyncContext::shared(permissions));
+        state.skills.session_event_hooks =
+            crate::skills::hooks::SessionEventHookRegistry::new(vec![
+                astra_skills::hooks::SessionEventHook {
+                    event: crate::skills::hooks::SessionEvent::SessionStart,
+                    action: astra_skills::hooks::HookAction::SetEnv {
+                        key: "ASTRA_READ_ONLY_HOOK_TEST".into(),
+                        value: "must_not_apply".into(),
+                    },
+                    timeout_secs: 5,
+                    is_async: false,
+                    condition: None,
+                    once: false,
+                    priority: 0,
+                },
+            ]);
+        run_loop_preamble(&mut state).await;
+        assert!(state.skills.session_event_hooks.is_empty());
+        assert!(state.skills.tool_event_hooks.is_empty());
     }
 
     fn agent_record(

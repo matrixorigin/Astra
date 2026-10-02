@@ -71,10 +71,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(crate::service_handlers::triggers::fire_webhook_handler),
         )
         .route(
-            "/workflows",
-            get(crate::service_handlers::workflows::list_workflows_handler),
-        )
-        .route(
             "/sandbox",
             post(crate::service_handlers::sandbox::create_sandbox_handler)
                 .get(crate::service_handlers::sandbox::list_sandboxes_handler),

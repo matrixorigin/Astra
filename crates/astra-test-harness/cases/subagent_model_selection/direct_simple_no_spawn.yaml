@@ -1,0 +1,24 @@
+name: direct_simple_no_spawn
+description: |
+  Minimal direct-execution control. Run with both DeepSeek Flash and GLM 5.2.
+prompt: 算一下 17×19−281 是多少。只输出结果这个整数，不要解释或标点。
+debug_log: true
+capability: delegation
+timeout_seconds: 90
+criteria:
+  - type: exit_code
+    code: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
+  - type: text_equals
+    expected: "42"
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: read_file
+    min: 0
+    max: 0

@@ -14,7 +14,6 @@ use std::sync::{Arc, RwLock};
 
 use crate::coordination::{
     AgentProfile, AgentTier, AggregationStrategy, CoordinationPattern, DelegationRequest,
-    PipelineStage,
 };
 
 const MAX_TEAM_LIST_ROWS: usize = 200;
@@ -157,14 +156,10 @@ impl From<TeamAggregation> for AggregationStrategy {
 
 /// Coordination strategy for a team — maps to [`CoordinationPattern`] at execution time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TeamCoordination {
-    /// Producer + reviewer loop.
-    Adversarial { max_rounds: u32, threshold: f64 },
     /// Parallel dispatch with aggregation.
     FanOut { aggregation: TeamAggregation },
-    /// Sequential chain: output of member N feeds member N+1.
-    Pipeline,
     /// One-by-one with optional early exit.
     Sequential { stop_on_success: bool },
 }
@@ -282,9 +277,7 @@ pub fn resolve_member_to_profile(member: &TeamMemberDef, team: &TeamDefinition) 
 /// Validation errors for a team definition.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TeamValidationError {
-    /// Adversarial requires exactly 2 members.
-    AdversarialMemberCount(usize),
-    /// Pipeline/Sequential requires at least 1 member.
+    /// A team requires at least 1 member.
     EmptyMembers,
     /// Duplicate role names within the same team.
     DuplicateRoles(Vec<String>),
@@ -297,12 +290,6 @@ pub enum TeamValidationError {
 impl std::fmt::Display for TeamValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AdversarialMemberCount(n) => {
-                write!(
-                    f,
-                    "adversarial coordination requires exactly 2 members, got {n}"
-                )
-            }
             Self::EmptyMembers => write!(f, "team must have at least one member"),
             Self::DuplicateRoles(roles) => {
                 write!(f, "duplicate roles: {}", roles.join(", "))
@@ -321,7 +308,6 @@ impl std::fmt::Display for TeamValidationError {
 ///
 /// Checks:
 /// - Non-empty member list
-/// - Adversarial coordination requires exactly 2 members
 /// - No duplicate roles
 /// - No duplicate agent IDs (after resolution)
 pub fn validate_team(team: &TeamDefinition) -> Result<(), Vec<TeamValidationError>> {
@@ -330,13 +316,6 @@ pub fn validate_team(team: &TeamDefinition) -> Result<(), Vec<TeamValidationErro
     if team.members.is_empty() {
         errors.push(TeamValidationError::EmptyMembers);
         return Err(errors);
-    }
-
-    if matches!(team.coordination, TeamCoordination::Adversarial { .. }) && team.members.len() != 2
-    {
-        errors.push(TeamValidationError::AdversarialMemberCount(
-            team.members.len(),
-        ));
     }
 
     // Check duplicate roles
@@ -454,40 +433,10 @@ fn build_coordination_pattern(
     profiles: &[AgentProfile],
 ) -> CoordinationPattern {
     match coordination {
-        TeamCoordination::Adversarial {
-            max_rounds,
-            threshold,
-        } => {
-            let producer_id = profiles
-                .first()
-                .map(|p| p.agent_id.clone())
-                .unwrap_or_default();
-            let reviewer_id = profiles
-                .get(1)
-                .map(|p| p.agent_id.clone())
-                .unwrap_or_default();
-            CoordinationPattern::AdversarialReview {
-                producer_id,
-                reviewer_id,
-                max_rounds: *max_rounds,
-                acceptance_threshold: *threshold,
-                timeout_sec: 0,
-            }
-        }
         TeamCoordination::FanOut { aggregation } => CoordinationPattern::FanOut {
             agent_ids: profiles.iter().map(|p| p.agent_id.clone()).collect(),
             aggregation: (*aggregation).into(),
             timeout_sec: 300,
-        },
-        TeamCoordination::Pipeline => CoordinationPattern::Pipeline {
-            stages: profiles
-                .iter()
-                .map(|p| PipelineStage {
-                    agent_id: p.agent_id.clone(),
-                    output_transform: None,
-                })
-                .collect(),
-            timeout_sec: 0,
         },
         TeamCoordination::Sequential { stop_on_success } => CoordinationPattern::Sequential {
             agent_ids: profiles.iter().map(|p| p.agent_id.clone()).collect(),
@@ -1838,18 +1787,14 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
             team_id: format!("bt-rev-{user_id}"),
             user_id: user_id.to_string(),
             name: "review".to_string(),
-            description: "Adversarial code review: one agent writes, another reviews".to_string(),
-            coordination: TeamCoordination::Adversarial {
-                max_rounds: 3,
-                threshold: 0.8,
-            },
+            description: "Independent code reviews with aggregated findings".to_string(),
+            coordination: TeamCoordination::FanOut { aggregation: TeamAggregation::AllResults },
             members: vec![
                 TeamMemberDef {
-                    role: "producer".to_string(),
+                    role: "correctness_reviewer".to_string(),
                     agent_id: None,
                     system_prompt: Some(
-                        "You write or modify code to fulfil the task. \
-                         Incorporate reviewer feedback in subsequent rounds."
+                        "Review the task for correctness and provide evidence-backed findings. Do not modify code."
                             .to_string(),
                     ),
                     skills: vec!["review-changes".to_string()],
@@ -1886,7 +1831,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
             name: "research".to_string(),
             description: "Deep research: explorer gathers info, synthesizer produces report"
                 .to_string(),
-            coordination: TeamCoordination::Pipeline,
+            coordination: TeamCoordination::Sequential { stop_on_success: false },
             members: vec![
                 TeamMemberDef {
                     role: "explorer".to_string(),
@@ -1929,7 +1874,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
             description:
                 "Full development cycle: planner decomposes, implementer codes, tester verifies"
                     .to_string(),
-            coordination: TeamCoordination::Pipeline,
+            coordination: TeamCoordination::Sequential { stop_on_success: false },
             members: vec![
                 TeamMemberDef {
                     role: "planner".to_string(),
@@ -1998,7 +1943,9 @@ mod tests {
             user_id: "user-1".to_string(),
             name: "test-team".to_string(),
             description: "A test team".to_string(),
-            coordination: TeamCoordination::Pipeline,
+            coordination: TeamCoordination::Sequential {
+                stop_on_success: false,
+            },
             members: vec![
                 TeamMemberDef {
                     role: "coder".to_string(),
@@ -2263,21 +2210,28 @@ mod tests {
     // ── Builtins ──
 
     #[test]
-    fn builtin_review_team_is_adversarial() {
+    fn builtin_review_team_uses_parallel_execution() {
         let teams = builtin_teams("u1", "2026-01-01T00:00:00Z");
         let review = teams.iter().find(|t| t.name == "review").unwrap();
         assert!(matches!(
             review.coordination,
-            TeamCoordination::Adversarial { .. }
+            TeamCoordination::FanOut {
+                aggregation: TeamAggregation::AllResults
+            }
         ));
         assert_eq!(review.members.len(), 2);
     }
 
     #[test]
-    fn builtin_dev_team_is_pipeline_with_isolated_worktree() {
+    fn builtin_dev_team_is_ordered_with_isolated_worktree() {
         let teams = builtin_teams("u1", "2026-01-01T00:00:00Z");
         let dev = teams.iter().find(|t| t.name == "dev").unwrap();
-        assert_eq!(dev.coordination, TeamCoordination::Pipeline);
+        assert_eq!(
+            dev.coordination,
+            TeamCoordination::Sequential {
+                stop_on_success: false
+            }
+        );
         assert_eq!(dev.worktree_mode, WorktreeMode::Isolated);
         assert_eq!(dev.members.len(), 3);
     }
@@ -2291,30 +2245,15 @@ mod tests {
     }
 
     #[test]
-    fn team_coordination_serde_roundtrip() {
-        let coord = TeamCoordination::Adversarial {
-            max_rounds: 3,
-            threshold: 0.8,
-        };
-        let json = serde_json::to_string(&coord).unwrap();
-        let parsed: TeamCoordination = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, coord);
-    }
-
-    // ── MatrixOne serialization helpers ──
-
-    #[test]
     fn coordination_json_roundtrips_through_matrixone_format() {
         // Simulate what MatrixOneTeamStore does: serialize to JSON text, store, deserialize
         let coords = vec![
-            TeamCoordination::Adversarial {
-                max_rounds: 5,
-                threshold: 0.85,
-            },
             TeamCoordination::FanOut {
                 aggregation: TeamAggregation::Consensus,
             },
-            TeamCoordination::Pipeline,
+            TeamCoordination::Sequential {
+                stop_on_success: false,
+            },
             TeamCoordination::Sequential {
                 stop_on_success: true,
             },
@@ -2593,41 +2532,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_team_adversarial_wrong_count() {
-        let mut team = test_team();
-        team.coordination = TeamCoordination::Adversarial {
-            max_rounds: 3,
-            threshold: 0.8,
-        };
-        // test_team has 2 members, add a third
-        team.members.push(TeamMemberDef {
-            role: "observer".to_string(),
-            agent_id: None,
-            system_prompt: None,
-            skills: vec![],
-            model_selection: None,
-            mcp_servers: vec![],
-            can_delegate: false,
-            max_delegation_depth: 0,
-        });
-        let err = validate_team(&team).unwrap_err();
-        assert!(
-            err.iter()
-                .any(|e| matches!(e, TeamValidationError::AdversarialMemberCount(3)))
-        );
-    }
-
-    #[test]
-    fn validate_team_adversarial_exact_two_ok() {
-        let mut team = test_team();
-        team.coordination = TeamCoordination::Adversarial {
-            max_rounds: 3,
-            threshold: 0.8,
-        };
-        assert!(validate_team(&team).is_ok());
-    }
-
-    #[test]
     fn validate_team_duplicate_roles() {
         let mut team = test_team();
         // Make both members have the same role
@@ -2893,41 +2797,19 @@ mod tests {
     // ─── T-2: build_coordination_pattern via resolve_team ──────────────────
 
     #[test]
-    fn resolve_team_pipeline_pattern_stages() {
-        let team = test_team(); // Pipeline coordination
+    fn resolve_team_sequential_member_order() {
+        let team = test_team();
         let (request, _) = resolve_team(&team, "task", "run-1", "test-session").unwrap();
         match &request.pattern {
-            CoordinationPattern::Pipeline { stages, .. } => {
-                assert_eq!(stages.len(), 2);
-                assert_eq!(stages[0].agent_id, "coder-agent");
-                assert_eq!(stages[1].agent_id, "team-test-team-reviewer");
-            }
-            _ => panic!("expected Pipeline pattern"),
-        }
-    }
-
-    #[test]
-    fn resolve_team_adversarial_pattern() {
-        let mut team = test_team();
-        team.coordination = TeamCoordination::Adversarial {
-            max_rounds: 5,
-            threshold: 0.9,
-        };
-        let (request, _) = resolve_team(&team, "task", "run-1", "test-session").unwrap();
-        match &request.pattern {
-            CoordinationPattern::AdversarialReview {
-                producer_id,
-                reviewer_id,
-                max_rounds,
-                acceptance_threshold,
+            CoordinationPattern::Sequential {
+                agent_ids,
+                stop_on_success,
                 ..
             } => {
-                assert_eq!(producer_id, "coder-agent");
-                assert_eq!(reviewer_id, "team-test-team-reviewer");
-                assert_eq!(*max_rounds, 5);
-                assert!((acceptance_threshold - 0.9).abs() < f64::EPSILON);
+                assert!(!stop_on_success);
+                assert_eq!(agent_ids, &["coder-agent", "team-test-team-reviewer"]);
             }
-            _ => panic!("expected AdversarialReview pattern"),
+            _ => panic!("expected Sequential pattern"),
         }
     }
 
@@ -2951,12 +2833,13 @@ mod tests {
     }
 
     #[test]
-    fn team_coordination_rejects_unimplemented_aggregation_on_deserialize() {
-        let result = serde_json::from_value::<TeamCoordination>(serde_json::json!({
-            "type": "fan_out",
-            "aggregation": "merge"
-        }));
-        assert!(result.is_err());
+    fn team_coordination_rejects_unsupported_controls() {
+        for value in [
+            serde_json::json!({"type":"fan_out","aggregation":"merge"}),
+            serde_json::json!({"type":"adversarial","max_rounds":1,"threshold":0.9}),
+        ] {
+            assert!(serde_json::from_value::<TeamCoordination>(value).is_err());
+        }
     }
 
     // ── Execution Recording ──

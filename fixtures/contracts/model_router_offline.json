@@ -29,7 +29,7 @@
       "owner_id": "synthetic-owner",
       "decision_at": "2024-01-01T00:00:00Z",
       "decision": {
-        "schema_version": 1,
+        "schema_version": 2,
         "features": {
           "schema_version": 1,
           "assessment_present": true,
@@ -57,6 +57,8 @@
           }
         },
         "work_admission_skill_revision": 0,
+        "delegation_model_requirement": null,
+        "delegation_model_source": null,
         "policy_version": "easy-read-only-v1",
         "policy": {
           "revision": "synthetic-pair-v1",

@@ -269,21 +269,29 @@ pub(super) fn agent_live_event_to_work_surface_sse(
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     let mut value = match &event.kind {
-        AgentLiveEventKind::OutputDelta(content) => json!({
+        AgentLiveEventKind::OutputDelta {
+            model_item_id,
+            text: content,
+        } => json!({
+            "model_item_id": model_item_id,
             "type": "agent_live_event",
             "agent_id": event.agent_id.as_str(),
             "event_kind": "output_delta",
             "content": content,
             "timestamp": timestamp,
         }),
-        AgentLiveEventKind::ThinkingDelta(content) => json!({
+        AgentLiveEventKind::ThinkingDelta {
+            model_item_id,
+            text: content,
+        } => json!({
+            "model_item_id": model_item_id,
             "type": "agent_live_event",
             "agent_id": event.agent_id.as_str(),
             "event_kind": "thinking_delta",
             "content": content,
             "timestamp": timestamp,
         }),
-        AgentLiveEventKind::Status(content) => json!({
+        AgentLiveEventKind::Status { text: content } => json!({
             "type": "agent_live_event",
             "agent_id": event.agent_id.as_str(),
             "event_kind": "status",
@@ -596,7 +604,9 @@ mod tests {
         AgentLiveEvent {
             run_id: run_id.to_string(),
             agent_id: agent_id.to_string(),
-            kind: AgentLiveEventKind::Status(content.to_string()),
+            kind: AgentLiveEventKind::Status {
+                text: content.to_string(),
+            },
         }
     }
 

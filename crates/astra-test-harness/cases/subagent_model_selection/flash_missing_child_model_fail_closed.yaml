@@ -1,0 +1,50 @@
+name: flash_missing_child_model_fail_closed
+description: |
+  An unavailable fixed model must not silently fall back to the parent model.
+prompt: |
+  下一步必须只调用一次 agent(action="spawn")，请求 glm-99.99 模型的子代理
+  回答 ASTRA-MISSING-MODEL-MUST-NOT-RUN。这个 spawn 应由运行时 admission
+  拒绝；不要先调用 model_catalog，不要换模型，不要重试，也不要用文字模拟
+  拒绝。最终如实说明失败原因，并包含 ASTRA-MISSING-MODEL-NOT-AVAILABLE。
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: spawn
+  - type: journal_tool_outcome_count
+    name: agent
+    ok: false
+    min: 1
+    max: 1
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /error_kind
+    equals: delegation_model_scope_unresolved
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /status
+    equals: failed
+  - type: text_contains
+    needle: ASTRA-MISSING-MODEL-NOT-AVAILABLE
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

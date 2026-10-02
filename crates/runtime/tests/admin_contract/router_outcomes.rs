@@ -41,6 +41,7 @@ impl OutcomeFixture {
             offering_id: "strong".into(),
         });
         context.resolved_model_selection = Some(astra_services::runs::ResolvedModelSelection {
+            source_identity: None,
             offering_id: "strong".into(),
             model_name: "strong-model".into(),
         });
@@ -49,7 +50,7 @@ impl OutcomeFixture {
             .await
             .unwrap();
         let mut decision =
-            serde_json::from_str::<astra_services::evaluation::router::RouterDatasetInput>(
+            serde_json::from_str::<astra_services::model_routing::offline::RouterDatasetInput>(
                 include_str!("../../../../fixtures/contracts/model_router_offline.json"),
             )
             .unwrap()

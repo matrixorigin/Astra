@@ -1646,8 +1646,13 @@ mod tests {
             remaining_iterations: 48,
             effective_hard_turn_limit: None,
         });
-        heavy.run_execution_control = Some(crate::step_protocol::RunExecutionControl::V2 {
+        heavy.run_execution_control = Some(crate::step_protocol::RunExecutionControl::V3 {
             hook_obligations: astra_turn_types::StopHookObligations::default(),
+            reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
+                run_id: "run".into(),
+                producer_owner_generation: 3,
+                pending: Vec::new(),
+            },
             completion_settlement: astra_turn_types::CompletionSettlementState {
                 text_only: true,
                 outcome_reconciliation_retries: 1,

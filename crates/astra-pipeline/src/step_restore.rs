@@ -23,8 +23,8 @@ use std::collections::HashMap;
 
 use crate::step_checkpoint::{FileBackedEventStore, read_latest_heavy_checkpoint};
 use crate::step_protocol::{
-    HeavyCheckpoint, PROTOCOL_VERSION, SlotState, StepEvent, StepEventType, VersionPolicy,
-    check_protocol_version_with_policy, persisted_cache_key_is_context_bound,
+    HeavyCheckpoint, PROTOCOL_VERSION, SlotState, StepEvent, StepEventType, check_protocol_version,
+    persisted_cache_key_is_context_bound,
 };
 
 pub const CACHE_RESTORE_REPORT_VERSION: u32 = 2;
@@ -159,15 +159,6 @@ pub fn restore_session(
     user_id: &str,
     session_id: &str,
 ) -> Result<Option<RestoredSession>, RestoreError> {
-    restore_session_with_policy(user_id, session_id, VersionPolicy::Compatible)
-}
-
-/// Restore with explicit version policy.
-pub fn restore_session_with_policy(
-    user_id: &str,
-    session_id: &str,
-    policy: VersionPolicy,
-) -> Result<Option<RestoredSession>, RestoreError> {
     // Step 1: Load latest heavy checkpoint
     let heavy = match read_latest_heavy_checkpoint(user_id, session_id) {
         Ok(Some(h)) => h,
@@ -176,7 +167,7 @@ pub fn restore_session_with_policy(
     };
 
     // Step 2: Validate protocol version
-    validate_checkpoint_version(&heavy, policy)?;
+    validate_checkpoint_version(&heavy)?;
 
     // Step 3: Extract resume turn and completed-tool audit history.
     build_restored_session(user_id, session_id, heavy)
@@ -188,6 +179,14 @@ fn build_restored_session(
     session_id: &str,
     heavy: HeavyCheckpoint,
 ) -> Result<Option<RestoredSession>, RestoreError> {
+    if let Some(control) = &heavy.run_execution_control {
+        let budget = heavy.run_execution_budget.as_ref().ok_or_else(|| {
+            RestoreError::InvalidCheckpoint("execution control has no paired run budget".into())
+        })?;
+        control
+            .validate_budget(budget)
+            .map_err(|error| RestoreError::InvalidCheckpoint(error.into()))?;
+    }
     if let Some(quarantine) = heavy.workspace_observation_quarantine.as_ref()
         && !quarantine.is_valid()
     {
@@ -244,11 +243,8 @@ fn build_restored_session(
     }))
 }
 
-/// Validate that the checkpoint's protocol version is compatible.
-fn validate_checkpoint_version(
-    heavy: &HeavyCheckpoint,
-    policy: VersionPolicy,
-) -> Result<(), RestoreError> {
+/// Require the exact current checkpoint protocol.
+fn validate_checkpoint_version(heavy: &HeavyCheckpoint) -> Result<(), RestoreError> {
     let cp_version = heavy.light.protocol_version;
 
     if cp_version == 0 {
@@ -257,7 +253,7 @@ fn validate_checkpoint_version(
         ));
     }
 
-    match check_protocol_version_with_policy(cp_version, policy) {
+    match check_protocol_version(cp_version) {
         Ok(_verdict) => Ok(()),
         Err(_) => Err(RestoreError::VersionMismatch {
             checkpoint_version: cp_version,
@@ -560,7 +556,7 @@ mod tests {
     #[test]
     fn validate_version_accepts_current() {
         let heavy = make_heavy_checkpoint(3, vec![], vec![]);
-        let result = validate_checkpoint_version(&heavy, VersionPolicy::Strict);
+        let result = validate_checkpoint_version(&heavy);
         assert!(result.is_ok());
     }
 
@@ -568,7 +564,7 @@ mod tests {
     fn validate_version_rejects_zero() {
         let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
         heavy.light.protocol_version = 0;
-        let result = validate_checkpoint_version(&heavy, VersionPolicy::Strict);
+        let result = validate_checkpoint_version(&heavy);
         assert!(matches!(result, Err(RestoreError::InvalidCheckpoint(_))));
     }
 
@@ -576,25 +572,18 @@ mod tests {
     fn validate_version_strict_rejects_mismatch() {
         let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
         heavy.light.protocol_version = 999; // different version
-        let result = validate_checkpoint_version(&heavy, VersionPolicy::Strict);
+        let result = validate_checkpoint_version(&heavy);
         assert!(matches!(result, Err(RestoreError::VersionMismatch { .. })));
     }
 
     #[test]
-    fn validate_version_compatible_accepts_same_major() {
+    fn validate_version_rejects_same_major_mismatch() {
         let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
-        // Same major (2xxx), different minor
         heavy.light.protocol_version = PROTOCOL_VERSION + 1;
-        let result = validate_checkpoint_version(&heavy, VersionPolicy::Compatible);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn validate_version_compatible_rejects_different_major() {
-        let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
-        heavy.light.protocol_version = 1000; // major 1, current is major 2
-        let result = validate_checkpoint_version(&heavy, VersionPolicy::Compatible);
-        assert!(matches!(result, Err(RestoreError::VersionMismatch { .. })));
+        assert!(matches!(
+            validate_checkpoint_version(&heavy),
+            Err(RestoreError::VersionMismatch { .. })
+        ));
     }
 
     #[test]

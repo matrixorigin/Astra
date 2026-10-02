@@ -13,6 +13,13 @@ Durable agent runs define how agent execution survives long tasks, reconnects, c
 - Terminal outcomes must be explicit.
 - Sub-runs and delegation preserve lineage.
 
+Background creation and incremental streaming share one owned execution runner.
+Streaming supplies its existing bounded delivery bridges; background execution
+does not allocate an unused observer channel. The durable fanout acknowledgement,
+not first-hop queue admission, determines which streamed tool terminals require
+settlement repair. Both paths retain generation-fenced settlement, cancellation,
+usage accounting and shutdown ownership independently of observer attachment.
+
 ## Run record
 
 A run should capture:
@@ -35,6 +42,10 @@ updated_at
 ```
 
 ## Checkpoint contract
+
+The execution checkpoint reader accepts only the exact current protocol version.
+Same-major versions are not implicitly compatible; a mismatch fails restoration
+before execution. There is no version-negotiation or migration path.
 
 Checkpoint must include enough information to resume safely:
 
@@ -180,6 +191,14 @@ must not be interpreted as permission to use Server defaults. Credentials are
 not persisted in this descriptor.
 This record is not complete reconstruction authorization; restoring consumed
 rounds and automatically reconstructing the same run remain unimplemented.
+The initial `run_started` event also records effective generation controls:
+reasoning mode, an explicitly nullable first-round output cap, and whether
+the host preserves the effective control against runtime overrides. Root
+omission and explicit `Off` are distinct. Child retries compare these controls
+against the already loaded event and reject drift; execution uses the recorded
+controls. This is an admission snapshot, not authorization to replay an
+in-flight inference or
+to reset round position during recovery.
 Execution heavy checkpoints additionally carry versioned run-budget facts:
 producer run and owner generation, actual charged iterations, current grant,
 remaining iterations, and an explicitly present nullable effective hard limit.
@@ -191,10 +210,12 @@ frontier reconciliation, and settlement-only control restoration remain required
 Execution checkpoints also carry versioned control facts using the canonical
 completion-settlement type: terminal action windows, their consumed attempts,
 retry counters, pagination obligations, and settlement-only restrictions, plus
-the loop's wrap-up flag and ignored-round count. Control V2 also requires both
-sets of stop-hook obligations and their consumed execution counts. It contains
+the loop's wrap-up flag and ignored-round count. Control V3 also requires both
+sets of stop-hook obligations and their consumed execution counts, plus the
+run/producer-generation-bound question obligations (at most 16 exact request
+identities and canonical responders). It contains
 no request headers or model credentials. Missing obligations cannot decode as
-an empty set, and V1 is not upgraded by supplying defaults. All execution writers use one
+an empty set, and earlier versions are not upgraded by supplying defaults. All execution writers use one
 projection; restore passes it through without granting execution. These controls
 must be validated at the same frontier as budget consumption before a recovery
 owner may authorize another action. Missing control state must not default to
@@ -378,9 +399,30 @@ Custody and execution decoding are separate: an owner-fenced handoff whose
 inner control schema is unsupported still retains its original bytes and the
 explicit continuation path. Recovery reports whether the runtime can decode
 that state, without claiming it reconstructed execution. Cancellation still
-wins. Control V2 is not yet a complete reconstruction contract: ledger-verified
+wins. Control V3 is not yet a complete reconstruction contract: ledger-verified
 tool evidence, intent and remaining execution obligations must be restored
 before an automatic executor may run.
+
+Question obligations are captured by the shared control projection, not by a
+second messaging ledger. Staged answers remain in the original loop facts'
+bounded pending context, carrying typed `Response.request_id` and canonical
+sender identity independently of optional envelope correlation. Only a
+successful provider decision consuming that exact context lease clears the
+obligation; failed attempts, staging and transport acknowledgement do not.
+The ordinary session warm-start entrypoint rejects same-run execution facts
+before executor wiring, including when a claim advanced the generation. It
+cannot replace execution adoption/frontier validation with a fresh messaging
+owner. The recovery scanner continues to preserve and pause handoff custody;
+automatic reconstructed execution is not supplied by this contract.
+
+Queued and delivery-unknown question outcomes contain the exact pending-reply
+identity, including the resolved responder even when the display target is
+`parent`. Existing durable invocation outcomes may retain that evidence, but
+a send can precede outcome persistence and a checkpoint can precede observation.
+Without existing owner-fenced evidence, dispatched/outcome-unknown custody
+remains unresolved: do not infer a UUID, re-resolve a parent or resend with a
+new identity. This adds no tables, database reads or separate send-time writes,
+and does not claim recovery of volatile in-process envelopes after process loss.
 
 ## Test obligations
 

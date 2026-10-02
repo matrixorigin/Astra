@@ -58,6 +58,11 @@ fn terminal_tool_result(
         status: status.to_string(),
         tool_result_fields: Some(Map::from_iter([
             ("status".to_string(), Value::String(status.to_string())),
+            ("execution_started".to_string(), Value::Bool(false)),
+            (
+                "disposition".to_string(),
+                Value::String("rejected".to_string()),
+            ),
             (
                 "error_kind".to_string(),
                 Value::String(error_kind.to_string()),
@@ -644,6 +649,7 @@ pub fn sse_maps_through_tool_request(
     identity: &EdgeDispatchIdentity,
     execution_timeout_ms: u64,
     execution_deadline_unix_ms: u64,
+    read_only_execution: bool,
 ) -> Vec<Map<String, Value>> {
     let Some(tc_map) = tc.as_object() else {
         return vec![];
@@ -655,6 +661,7 @@ pub fn sse_maps_through_tool_request(
             identity,
             execution_timeout_ms,
             execution_deadline_unix_ms,
+            read_only_execution,
         ),
     ]
 }
@@ -1020,7 +1027,7 @@ async fn deliver_read_only_block(
         }
         let deadline = current_unix_ms().saturating_add(300_000);
         out.sse_maps.extend(sse_maps_through_tool_request(
-            tc, &identity, 300_000, deadline,
+            tc, &identity, 300_000, deadline, false,
         ));
         extend_delivery(
             &mut out,
@@ -1067,7 +1074,7 @@ async fn deliver_approval_block(
         }
         let deadline = current_unix_ms().saturating_add(300_000);
         out.sse_maps.extend(sse_maps_through_tool_request(
-            tc, &identity, 300_000, deadline,
+            tc, &identity, 300_000, deadline, false,
         ));
         dispatched_calls.push(tc);
     }
@@ -1108,7 +1115,7 @@ async fn deliver_read_only_block_concurrent(
         }
         let deadline = current_unix_ms().saturating_add(300_000);
         out.sse_maps.extend(sse_maps_through_tool_request(
-            tc, &identity, 300_000, deadline,
+            tc, &identity, 300_000, deadline, false,
         ));
         dispatched_calls.push(tc);
     }
@@ -1180,7 +1187,7 @@ async fn deliver_approval_block_concurrent(
         }
         let deadline = current_unix_ms().saturating_add(300_000);
         out.sse_maps.extend(sse_maps_through_tool_request(
-            tc, &identity, 300_000, deadline,
+            tc, &identity, 300_000, deadline, false,
         ));
         dispatched_calls.push(tc);
     }
@@ -1465,6 +1472,7 @@ mod tests {
             &test_identity("test-user", request_id),
             300_000,
             1_700_000_300_000,
+            false,
         )
     }
 
@@ -2127,6 +2135,11 @@ mod tests {
             let fields = result.tool_result_fields.expect("terminal result fields");
             assert_eq!(result.status, status);
             assert_eq!(fields.get("status").and_then(Value::as_str), Some(status));
+            assert_eq!(fields.get("execution_started"), Some(&Value::Bool(false)));
+            assert_eq!(
+                fields.get("disposition").and_then(Value::as_str),
+                Some("rejected")
+            );
             assert_eq!(
                 fields.get("error_kind").and_then(Value::as_str),
                 Some(error_kind)

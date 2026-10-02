@@ -26,7 +26,7 @@ from journal events and tracker-visible records over inferred architecture diagr
 
 | Concern | Source |
 | --- | --- |
-| Engine, tracker, state transitions, verification/checkpoint gates | `crates/runtime/src/server/delegation/engine.rs` |
+| Engine, tracker, state transitions, verification | `crates/runtime/src/server/delegation/engine.rs` |
 | HTTP handlers for delegate/list/pause/resume | `crates/runtime/src/server/delegation/handlers.rs` |
 | Patterns, tiers, request/result types, aggregation | `crates/services/src/coordination.rs` |
 | Journal event builders and metadata fields | `crates/services/src/session_journal.rs` |

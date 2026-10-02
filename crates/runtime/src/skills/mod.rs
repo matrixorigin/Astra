@@ -56,7 +56,6 @@ pub use astra_skills::version::{Dependency, Version, VersionConstraint};
 
 pub use astra_skills::improvement::{ImprovementProposal, ImprovementTracker, SkillImprovement};
 pub use astra_skills::providers::DatabaseSkillProvider;
-pub use astra_skills::verify::SkillVerifier;
 pub use registry::{
     SharedSkillRegistry, SkillDiscoveryFailure, SkillDiscoveryReport, SkillHealthInputs,
     UnifiedSkillRegistry, UnifiedSkillResolver,

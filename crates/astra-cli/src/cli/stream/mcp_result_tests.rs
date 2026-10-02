@@ -191,6 +191,7 @@ async fn callback_through_pipeline(
         current_run_id: Some(&callback.run_id),
         current_turn_chain_id: Some(&callback.turn_chain_id),
         durable_dispatch_admission: None,
+        delegation_model_admissions: None,
         physical_tool_calls: &calls,
         logical_tool_calls: &calls,
         deferred_activations_by_call_id: &HashMap::new(),

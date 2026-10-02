@@ -49,6 +49,7 @@ pub struct ToolInvocationMetadata<'a> {
     /// Durable user-intent epoch used by the invocation's atomic action
     /// admission. Provider arguments cannot populate this field.
     pub expected_control_epoch: Option<i64>,
+    pub delegation_model_admission: Option<&'a astra_turn_types::DelegationModelAdmission>,
 }
 
 #[async_trait]
@@ -443,6 +444,7 @@ mod tests {
                     tool_call_id: Some("call-1"),
                     admission_source: Some(ToolInvocationAdmissionSource::Policy),
                     expected_control_epoch: None,
+                    delegation_model_admission: None,
                 },
                 None,
             )

@@ -1157,11 +1157,10 @@ fn fanout_result_child_run_ids(raw: &serde_json::Value, parent_run_id: &str) -> 
         {
             continue;
         }
-        // A response has exactly one canonical per-agent projection. New
-        // launch receipts use `agents`, result collection uses `results`,
-        // and older control responses use `fanout.slots`. Never concatenate
-        // these views: a response that carries both a compatibility list and
-        // its canonical list must still authorize each child once.
+        // A response has exactly one canonical per-agent projection: launch
+        // receipts use `agents`, while result collection uses `results`.
+        // Never concatenate these views when a producer accidentally includes
+        // both; each child must still be authorized once.
         let per_agent_entries = result
             .get("agents")
             .and_then(serde_json::Value::as_array)
@@ -1171,8 +1170,7 @@ fn fanout_result_child_run_ids(raw: &serde_json::Value, parent_run_id: &str) -> 
                     .get("results")
                     .and_then(serde_json::Value::as_array)
                     .filter(|entries| !entries.is_empty())
-            })
-            .or_else(|| fanout.get("slots").and_then(serde_json::Value::as_array));
+            });
         let Some(per_agent_entries) = per_agent_entries else {
             continue;
         };
@@ -3500,17 +3498,14 @@ mod tests {
     }
 
     #[test]
-    fn fanout_child_identity_extraction_prefers_one_canonical_launch_projection() {
+    fn fanout_child_identity_extraction_prefers_one_canonical_projection() {
         let raw = serde_json::json!({
             "event_type": "ToolCallCompleted",
             "payload": {
                 "tool_name": "agent_fanout",
                 "is_error": false,
                 "output": serde_json::json!({
-                    "fanout": {
-                        "parent_run_id": "parent-run",
-                        "slots": [{"slot_index": 0, "run_id": "legacy-child"}]
-                    },
+                    "fanout": {"parent_run_id": "parent-run"},
                     "agents": [
                         {"slot_index": 0, "run_id": "child-a"},
                         {"slot_index": 1, "run_id": "child-b"}

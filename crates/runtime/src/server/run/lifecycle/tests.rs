@@ -1,4 +1,5 @@
 use super::*;
+use crate::orchestration::ProgressEventType;
 
 #[path = "trace_ingestion_tests.rs"]
 mod trace_ingestion_tests;
@@ -36,6 +37,25 @@ fn cursor_conflict_without_a_live_writer_asks_for_retry() {
     assert_eq!(metadata["admission_state"], "rejected");
     assert_eq!(metadata["recovery_action"], "retry_session");
     assert_eq!(metadata["session_id"], "sess-active");
+}
+
+#[test]
+fn model_admission_errors_keep_safe_messages_and_known_codes() {
+    let hidden = safe_model_service_error_with_code(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Some("private-backend-secret"),
+    );
+    assert_eq!(
+        hidden,
+        "The authorized model catalog is temporarily unavailable."
+    );
+
+    let known =
+        safe_model_service_error_with_code(StatusCode::CONFLICT, Some("model_selection_changed"));
+    assert_eq!(
+        known,
+        "[model_selection_changed] The selected model changed during admission; retry delegation."
+    );
 }
 
 #[test]
@@ -354,6 +374,46 @@ async fn run_admission_preserves_execution_restrictions_for_reconstruction() {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(
+            crate::server::run::engine::durable_run_generation_controls(&durable).unwrap(),
+            crate::server::run::engine::RunGenerationControls {
+                thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+                first_output_max_tokens: None,
+                preserve_thinking: false,
+            }
+        );
+        let mut explicit = request.clone();
+        let explicit_context = explicit.context.get_or_insert_with(serde_json::Map::new);
+        explicit_context.insert("thinking".into(), serde_json::json!({"mode": "off"}));
+        explicit_context.insert("max_output_tokens".into(), serde_json::json!(2048));
+        service
+            .persist_run_start(
+                "explicit-controls-run",
+                "user-1",
+                "explicit-controls-session",
+                &explicit,
+                None,
+                None,
+                None,
+                None,
+                mode,
+            )
+            .await
+            .expect("persist explicit root generation controls");
+        let explicit_run = service
+            .run_engine
+            .load_run("user-1", "explicit-controls-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::server::run::engine::durable_run_generation_controls(&explicit_run).unwrap(),
+            crate::server::run::engine::RunGenerationControls {
+                thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+                first_output_max_tokens: Some(2048),
+                preserve_thinking: true,
+            }
+        );
         let decoded = durable
             .execution_restrictions()
             .unwrap()
@@ -2406,12 +2466,16 @@ impl UserIntentProvider for StaticRunControlProvider {
 
 struct ActiveTestModelService {
     base_url: String,
+    batch_requests: StdMutex<Vec<Vec<String>>>,
+    catalog_requests: StdMutex<usize>,
 }
 
 impl ActiveTestModelService {
     fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
+            batch_requests: StdMutex::new(Vec::new()),
+            catalog_requests: StdMutex::new(0),
         }
     }
 }
@@ -2430,6 +2494,7 @@ fn test_resolved_model_offering_at(base_url: &str) -> astra_services::ResolvedMo
     astra_services::ResolvedModelOffering {
         offering_id: "model-test-model".to_string(),
         model: astra_services::ResolvedActiveLlmModel {
+            price_snapshot: None,
             model_name: "test-model".to_string(),
             wire_model_name: None,
             api_key: "test-provider-secret".to_string(),
@@ -2479,6 +2544,44 @@ fn test_model_record_at(name: String, base_url: &str) -> astra_services::ModelRe
 
 #[async_trait]
 impl astra_services::ModelService for ActiveTestModelService {
+    async fn admit_model_offerings(
+        &self,
+        _user_id: String,
+        offering_ids: Vec<String>,
+    ) -> Result<Vec<astra_services::AdmittedModelExecution>, (StatusCode, Json<ErrorResponse>)>
+    {
+        self.batch_requests
+            .lock()
+            .unwrap()
+            .push(offering_ids.clone());
+        offering_ids
+            .into_iter()
+            .map(|offering_id| {
+                if offering_id == "invalid" {
+                    return Err(error_response_coded(
+                        StatusCode::NOT_FOUND,
+                        "Offering is not available",
+                        "model_offering_not_found",
+                    ));
+                }
+                let mut offering = test_resolved_model_offering_at(&self.base_url);
+                offering.offering_id = offering_id.clone();
+                offering.model.model_name = if offering_id == "model-test-model" {
+                    "test-model".to_string()
+                } else {
+                    offering_id
+                };
+                astra_services::AdmittedModelExecution::from_offering(offering).map_err(|error| {
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        error,
+                        "model_catalog_unavailable",
+                    )
+                })
+            })
+            .collect()
+    }
+
     async fn create_model(
         &self,
         _user_id: String,
@@ -2492,7 +2595,9 @@ impl astra_services::ModelService for ActiveTestModelService {
         _user_id: String,
         _is_admin: bool,
     ) -> Result<Vec<astra_services::ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
+        *self.catalog_requests.lock().unwrap() += 1;
         Ok(vec![astra_services::ModelListItem {
+            thinking_protocol: None,
             offering_id: "model-test-model".to_string(),
             access_id: "self-hosted".to_string(),
             access_kind: astra_services::ModelAccessKind::SelfHosted,
@@ -2506,6 +2611,7 @@ impl astra_services::ModelService for ActiveTestModelService {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         }])
     }
 
@@ -3325,6 +3431,95 @@ async fn csl_persist_after_restore_keeps_current_user_message() {
 }
 
 #[test]
+fn session_warm_start_cannot_reconstruct_same_run_even_after_generation_advance() {
+    use astra_pipeline::step_protocol::{RunExecutionBudget, RunExecutionControl};
+    for (run_id, generation) in [("questioner", 3), ("questioner", 4), ("new-run", 4)] {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.current_run_id = Some(run_id.into());
+        state.current_run_owner_generation = Some(generation);
+        state.recent_tools = vec!["untouched".into()];
+        let staged_response = json!({
+            "schema": crate::turn::agentic_loop::host::RETAINED_MAILBOX_CONTEXT_SCHEMA,
+            "message_kind":"response", "message_id":"answer-envelope",
+            "response_request_id":"q1",
+            "sender":{"run_id":"parent-mailbox", "agent_id":"orchestrator"},
+            "receiver":{"run_id":"questioner", "agent_id":"worker"},
+            "display":"Use JSON.", "delivery_count":0,
+        });
+        if run_id == "questioner" {
+            state.push_volatile_payload(
+                crate::turn::agentic_loop::host::VolatileKind::Mailbox,
+                staged_response.clone(),
+            );
+        }
+        let source = crate::messaging::reply_obligations::ReplyObligations::default();
+        source
+            .reserve(
+                "questioner",
+                "q1",
+                astra_messaging::AgentAddress::new("parent-mailbox", "orchestrator"),
+            )
+            .unwrap();
+        let restored = astra_pipeline::step_restore::RestoredSession {
+            run_execution_budget: Some(RunExecutionBudget::V1 {
+                run_id: "questioner".into(),
+                producer_owner_generation: 3,
+                charged_iterations: 1,
+                granted_iteration_boundary: 10,
+                remaining_iterations: 9,
+                effective_hard_turn_limit: None,
+            }),
+            run_execution_control: Some(RunExecutionControl::V3 {
+                completion_settlement: Default::default(),
+                hook_obligations: Default::default(),
+                reply_obligations: source.snapshot("questioner", 3).unwrap(),
+                budget_wrapup_injected: false,
+                budget_wrapup_ignored_rounds: 0,
+            }),
+            conversation_cursor: None,
+            messages: Vec::new(),
+            budget_remaining_tokens: 0,
+            budget_remaining_rounds: 9,
+            blocked_tools: Vec::new(),
+            recent_tools: vec!["must-not-apply".into()],
+            deferred_tool_activations: Vec::new(),
+            resume_turn: 1,
+            protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
+            completed_tool_results: HashMap::new(),
+            interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
+            compaction_state: None,
+            pipeline_state: None,
+            workspace_observation_quarantine: None,
+            cache_restore_report: Default::default(),
+        };
+        let result = restore_step_checkpoint_runtime_state(restored, "2026-10-02", &mut state);
+        if run_id == "questioner" {
+            assert_eq!(
+                result.unwrap_err().kind,
+                astra_core::ErrorKind::ContractViolation
+            );
+            assert_eq!(state.recent_tools, vec!["untouched"]);
+            assert_eq!(state.volatile_pending.len(), 1);
+            assert_eq!(state.volatile_pending[0].payload, staged_response);
+            assert!(!state.volatile_pending[0].attempt_leased);
+            assert!(source.has_pending("questioner"));
+        } else {
+            result.unwrap();
+            assert_eq!(state.recent_tools, vec!["must-not-apply"]);
+            assert!(
+                state.volatile_pending.is_empty(),
+                "new-run history cannot adopt the old answer"
+            );
+            assert!(!state.messaging.reply_obligations.has_pending("new-run"));
+            assert!(!state.messaging.reply_obligations.has_pending("questioner"));
+        }
+        assert!(state.runtime_tool_executor.is_none());
+    }
+}
+
+#[test]
 fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_rederives_tool_policy() {
     let svc = test_service();
     let request = test_request("resume");
@@ -3379,7 +3574,7 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_rederives_tool_
         },
     };
 
-    restore_step_checkpoint_runtime_state(restored, "2026-06-13", &mut state);
+    restore_step_checkpoint_runtime_state(restored, "2026-06-13", &mut state).unwrap();
 
     assert!(
         state.restricted_tools.is_empty(),
@@ -3835,6 +4030,8 @@ async fn idle_spawner_prune_revalidates_touch_and_pending_owner_before_remove() 
     }
 
     let context = crate::orchestration::SpawnContext {
+        delegation_model_admission: None,
+        parent_model_reasoning: None,
         parent_run_id: "prune-root".to_string(),
         parent_agent_id: "root-agent".to_string(),
         resolved_model_name: None,
@@ -3962,6 +4159,8 @@ async fn shutdown_fence_reports_pending_session_child_reconciliation_after_root_
         },
     );
     let context = crate::orchestration::SpawnContext {
+        delegation_model_admission: None,
+        parent_model_reasoning: None,
         parent_run_id: "shutdown-root".to_string(),
         parent_agent_id: "root-agent".to_string(),
         resolved_model_name: None,
@@ -4048,6 +4247,8 @@ async fn shutdown_stays_bounded_while_stalled_child_control_remains_pending() {
         },
     );
     let context = crate::orchestration::SpawnContext {
+        delegation_model_admission: None,
+        parent_model_reasoning: None,
         parent_run_id: "shutdown-root".to_string(),
         parent_agent_id: "root-agent".to_string(),
         resolved_model_name: None,
@@ -4129,6 +4330,8 @@ async fn missing_agent_lifecycle_stream_uses_spawner_archive() {
         "transport": "server_local"
     });
     let context = crate::orchestration::SpawnContext {
+        delegation_model_admission: None,
+        parent_model_reasoning: None,
         parent_run_id: "root-run".to_string(),
         parent_agent_id: "root-agent".to_string(),
         resolved_model_name: None,
@@ -4211,6 +4414,8 @@ async fn missing_agent_lifecycle_stream_reconstructs_waiting_child() {
     let spawner =
         DynamicAgentSpawner::new(router).with_executor(Arc::new(WaitingLifecycleExecutor));
     let context = crate::orchestration::SpawnContext {
+        delegation_model_admission: None,
+        parent_model_reasoning: None,
         parent_run_id: "root-run".to_string(),
         parent_agent_id: "root-agent".to_string(),
         resolved_model_name: None,
@@ -4293,7 +4498,10 @@ fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
         &AgentLiveEvent {
             run_id: "test-run".into(),
             agent_id: "agent-1".to_string(),
-            kind: AgentLiveEventKind::OutputDelta("child output".to_string()),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("model-1".into()),
+                text: "child output".to_string(),
+            },
         },
         Some(&metadata),
     );
@@ -4429,6 +4637,8 @@ fn tool_trace_events_populate_columns_and_redacted_payloads() {
         ms: 42,
         args_preview: Some("agent(action='spawn'): child".to_string()),
         result_preview: Some("launched child".to_string()),
+        result_class: Some("success".into()),
+        exit_semantics: Some("success".into()),
         round: Some(2),
         args_full: Some(r#"{"action":"spawn","token":"secret"}"#.to_string()),
         result_full: Some(
@@ -4460,6 +4670,8 @@ fn tool_trace_events_populate_columns_and_redacted_payloads() {
     assert_eq!(events[1].event_type, "tool_call_completed");
     assert_eq!(events[1].meta_duration_ms, Some(42));
     assert_eq!(events[1].metadata["action"], "spawn");
+    assert_eq!(events[1].metadata["result_class"], "success");
+    assert_eq!(events[1].metadata["exit_semantics"], "success");
     assert_eq!(events[1].metadata["child_run_id"], "child-run");
     assert_eq!(
         events[0].created_at,
@@ -4488,6 +4700,8 @@ fn failed_tool_trace_event_persists_searchable_error_content() {
         ok: false,
         ms: 9,
         error: Some("unknown_tool: bash".to_string()),
+        result_class: Some("env_failure".into()),
+        exit_semantics: Some("execution_error".into()),
         ..Default::default()
     };
 
@@ -4502,6 +4716,8 @@ fn failed_tool_trace_event_persists_searchable_error_content() {
     );
 
     assert_eq!(events[1].event_type, "tool_call_failed");
+    assert_eq!(events[1].metadata["result_class"], "env_failure");
+    assert_eq!(events[1].metadata["exit_semantics"], "execution_error");
     assert_eq!(events[1].content.as_deref(), Some("unknown_tool: bash"));
 }
 
@@ -4751,6 +4967,7 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
     let permission_context =
         crate::orchestration::PermissionSyncContext::shared(inherited_permissions.clone());
     SpawnRunConfig {
+        max_output_tokens: None,
         run_id: "child-run".to_string(),
         cancellation_binding_id: "test-child-binding".to_string(),
         agent_id: "child@1234".to_string(),
@@ -4760,6 +4977,11 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
         description: "Test child task".to_string(),
         task: "do work".to_string(),
         system_prompt_addendum: String::new(),
+        requested_model_policy: None,
+        resolved_model_selection: None,
+        delegated_model_requirements: Default::default(),
+        fanout_slot: None,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
         model: None,
         initial_turns: 3,
         hard_turn_limit: None,
@@ -4795,6 +5017,8 @@ fn only_work_item_children_receive_the_typed_settlement_contract() {
     let ordinary_prompt = spawn_system_prompt(&ordinary);
     assert!(!ordinary_prompt.contains("settle_work_item"));
     assert!(!ordinary_prompt.contains(&ordinary.agent_id));
+    assert!(ordinary_prompt.contains("Complete the entire delegated brief"));
+    assert!(ordinary_prompt.contains("Do not return an intermediate result"));
 
     let mut assigned = ordinary;
     assigned.work_item = Some(
@@ -4819,6 +5043,7 @@ fn test_spawn_runtime_context(parent_run_id: &str, user_id: &str) -> ServerSpawn
     let execution_owner_generation = Arc::new(ExecutionOwnerGenerationSink::preparing(0));
     execution_owner_generation.publish(0);
     ServerSpawnRuntimeContext {
+        model_catalog_reader: None,
         parent_run_id: parent_run_id.to_string(),
         runtime_context_id: Uuid::new_v4().to_string(),
         publication_capability: Arc::new(RuntimeContextPublicationCapability::new(
@@ -4843,6 +5068,28 @@ fn test_spawn_runtime_context(parent_run_id: &str, user_id: &str) -> ServerSpawn
         test_child_llm_rounds: Vec::new(),
         #[cfg(feature = "harness")]
         harness_sink: None,
+    }
+}
+
+fn test_spawn_context(parent_run_id: &str) -> crate::orchestration::SpawnContext {
+    crate::orchestration::SpawnContext {
+        delegation_model_admission: None,
+        parent_model_reasoning: None,
+        parent_run_id: parent_run_id.into(),
+        parent_agent_id: "root-agent".into(),
+        resolved_model_name: None,
+        recursion_depth: 0,
+        parent_is_fork_child: false,
+        inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
+        inherited_skills: Vec::new(),
+        working_dir: PathBuf::from("/workspace"),
+        live_event_sink: None,
+        client_tool_delivery_tx: None,
+        trace_context: None,
+        spawn_tool_call_id: None,
+        execution_metadata: None,
+        workspace_mutation: Default::default(),
+        delegation_chain: Vec::new(),
     }
 }
 
@@ -4931,7 +5178,11 @@ async fn auto_spawn_context_reauthorizes_service_backed_genesis_offering() {
         .await
         .err()
         .unwrap();
-    assert!(error.contains("Genesis Offering unavailable"), "{error}");
+    assert!(
+        error.contains("[model_offering_not_found]")
+            || error.contains("[model_offering_unavailable]"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -5217,6 +5468,7 @@ async fn terminal_root_wiring_fails_before_installing_the_agent_provider() {
             1,
             &test_request("must not execute"),
             &[],
+            None,
             workspace.path(),
             None,
             None,
@@ -5299,6 +5551,7 @@ async fn closed_root_publication_fence_returns_before_installing_the_agent_provi
             1,
             &test_request("must not execute"),
             &[],
+            None,
             workspace.path(),
             None,
             None,
@@ -6688,9 +6941,17 @@ async fn server_dynamic_child_becomes_a_valid_parent_for_grandchildren() {
         "root-agent",
     ));
     let root = executor.runtime_context_for_config(&child).await.unwrap();
-    let child_constraints = spawn_child_request_constraints(&root.request_constraints, &child);
+    let child_constraints =
+        spawn_child_request_constraints(&root.request_constraints, &child).unwrap();
     executor
-        .register_child_runtime_context(&root, &child, child_constraints)
+        .register_child_runtime_context(
+            &root,
+            &child,
+            child_constraints,
+            root.admitted_model_execution
+                .clone()
+                .expect("root model admission"),
+        )
         .await
         .expect("publish child runtime context");
 
@@ -6731,18 +6992,635 @@ async fn server_dynamic_child_becomes_a_valid_parent_for_grandchildren() {
 }
 
 #[tokio::test]
-async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propagates() {
+async fn server_spawn_inheritance_reuses_parent_model_admission_without_lookup() {
+    use astra_turn_core::thinking_config::ThinkingConfig;
+
     let executor = ServerSpawnAgentExecutor::new(
         test_settings(),
         test_encryptor(),
         Arc::new(TokioMutex::new(HashMap::new())),
     );
+    let parent = test_spawn_runtime_context("root-run", "user-a");
+    let expected = parent
+        .admitted_model_execution
+        .clone()
+        .expect("parent model admission");
+
+    let inherited = executor
+        .prepare_spawn_model(&parent, None, &ThinkingConfig::ModelDefault)
+        .await
+        .expect("omitted selection inherits");
+    let explicit_same = executor
+        .prepare_spawn_model(
+            &parent,
+            Some(&ModelSelection {
+                offering_id: expected.offering_id.clone(),
+            }),
+            &ThinkingConfig::ModelDefault,
+        )
+        .await
+        .expect("same Offering reuses admission");
+
+    assert_eq!(inherited, expected);
+    assert_eq!(explicit_same, expected);
+    assert!(
+        executor
+            .prepare_spawn_model(&parent, None, &ThinkingConfig::Off)
+            .await
+            .is_err(),
+        "batch preparation must reject unsupported reasoning before child creation"
+    );
+}
+
+#[tokio::test]
+async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
+    use astra_turn_core::orchestration_spawn_tool::SpawnAgentInput;
+
+    let executor = Arc::new(ServerSpawnAgentExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    ));
+    executor
+        .set_runtime_context(test_spawn_runtime_context("root-run", "user-a"))
+        .await;
+    let context = crate::orchestration::SpawnContext {
+        delegation_model_admission: None,
+        parent_model_reasoning: None,
+        parent_run_id: "root-run".to_string(),
+        parent_agent_id: "root-agent".to_string(),
+        resolved_model_name: None,
+        recursion_depth: 0,
+        parent_is_fork_child: false,
+        inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
+        inherited_skills: Vec::new(),
+        working_dir: PathBuf::from("/tmp/astra"),
+        live_event_sink: None,
+        client_tool_delivery_tx: None,
+        trace_context: None,
+        spawn_tool_call_id: None,
+        execution_metadata: None,
+        workspace_mutation: Default::default(),
+        delegation_chain: Vec::new(),
+    };
+    let inputs: Vec<_> = (0..2)
+        .map(|slot_index| SpawnAgentInput {
+            description: format!("review slot {slot_index}"),
+            prompt: "review".to_string(),
+            fanout_group_id: Some("model-batch".to_string()),
+            fanout_target_count: Some(2),
+            fanout_slot_index: Some(slot_index),
+            ..Default::default()
+        })
+        .collect();
+    let prepared = Arc::clone(&executor)
+        .prepare_batch(&inputs, &context, None)
+        .await
+        .expect("inherited Offering is prepared without a catalog lookup");
+    assert_eq!(prepared.len(), 2);
+
+    // Omission inherits an exact parent setting instead of silently dropping
+    // it. This fixture has unknown reasoning capability, so admission fails
+    // before any child starts. Explicit model-default opts out of inheritance.
+    let mut inherited_context = context.clone();
+    inherited_context.parent_model_reasoning = Some(
+        astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+            selection: ModelSelection {
+                offering_id: test_admitted_model_execution().offering_id,
+            },
+            resolved_model_name: Some(test_admitted_model_execution().model_name),
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+        },
+    );
+    assert!(
+        Arc::clone(&executor)
+            .prepare_batch(&inputs, &inherited_context, None)
+            .await
+            .is_err()
+    );
+    let mut explicit_default = inputs.clone();
+    for input in &mut explicit_default {
+        input.reasoning =
+            Some(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::ModelDefault);
+    }
+    assert!(
+        Arc::clone(&executor)
+            .prepare_batch(&explicit_default, &inherited_context, None)
+            .await
+            .is_ok()
+    );
+
+    let model_service = Arc::new(ActiveTestModelService::default());
+    let batch_executor = Arc::new(
+        ServerSpawnAgentExecutor::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        )
+        .with_model_service(Some(model_service.clone())),
+    );
+    batch_executor
+        .set_runtime_context(test_spawn_runtime_context("root-run", "user-a"))
+        .await;
+    Arc::clone(&batch_executor)
+        .prepare_batch(&inputs, &context, None)
+        .await
+        .expect("inherited slots do not query the model service");
+    assert!(model_service.batch_requests.lock().unwrap().is_empty());
+    assert_eq!(*model_service.catalog_requests.lock().unwrap(), 0);
+    let mut heterogeneous = inputs.clone();
+    let mut repeated = inputs[0].clone();
+    repeated.fanout_slot_index = Some(2);
+    heterogeneous.push(repeated);
+    for input in &mut heterogeneous {
+        input.fanout_target_count = Some(3);
+    }
+    for (input, offering_id) in heterogeneous
+        .iter_mut()
+        .zip(["model-b", "model-c", "model-b"])
+    {
+        input.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::OfferingId {
+                offering_id: offering_id.into(),
+            },
+        });
+    }
+    let prepared = Arc::clone(&batch_executor)
+        .prepare_batch(&heterogeneous, &context, None)
+        .await
+        .expect("distinct Offerings are admitted together");
+    assert_eq!(prepared.len(), 3);
+    assert_eq!(
+        model_service.batch_requests.lock().unwrap().as_slice(),
+        &[vec!["model-b".to_string(), "model-c".to_string()]]
+    );
+    heterogeneous[2].requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::OfferingId {
+            offering_id: "invalid".into(),
+        },
+    });
+    assert!(
+        Arc::clone(&batch_executor)
+            .prepare_batch(&heterogeneous, &context, None)
+            .await
+            .is_err()
+    );
+
+    let mut mismatched = test_spawn_run_config(vec![], true);
+    mismatched.parent_address = Some(astra_messaging::types::AgentAddress::new(
+        "root-run",
+        "root-agent",
+    ));
+    mismatched.fanout_slot = inputs[0].fanout_slot_identity().unwrap();
+    let error = prepared
+        .into_iter()
+        .nth(1)
+        .unwrap()
+        .execute(mismatched)
+        .await
+        .expect_err("a prepared slot must not execute another slot");
+    assert!(error.contains("does not match"), "{error}");
+
+    let mut unsupported = inputs;
+    unsupported[1].reasoning =
+        Some(astra_turn_core::orchestration_spawn_tool::ReasoningSelection::Off);
+    assert!(
+        Arc::clone(&executor)
+            .prepare_batch(&unsupported, &context, None)
+            .await
+            .is_err(),
+        "one unsupported reasoning control must reject the whole batch"
+    );
+
+    let mut invalid_offering = unsupported;
+    invalid_offering[1].reasoning = None;
+    invalid_offering[1].requested_model_policy =
+        Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::OfferingId {
+                offering_id: String::new(),
+            },
+        });
+    assert!(
+        Arc::clone(&executor)
+            .prepare_batch(&invalid_offering, &context, None)
+            .await
+            .is_err(),
+        "an invalid final-slot Offering must reject the whole batch"
+    );
+
+    let name_service = Arc::new(ActiveTestModelService::default());
+    let catalog_principal = || {
+        astra_services::AuthPrincipal::internal(astra_services::AuthUserRecord {
+            user_id: "user-a".into(),
+            username: "owner".into(),
+            email: String::new(),
+            display_name: None,
+        })
+    };
+    let name_executor = Arc::new(
+        ServerSpawnAgentExecutor::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        )
+        .with_model_service(Some(name_service.clone())),
+    );
+    let catalog_reader = astra_services::models::AuthorizedModelCatalogReader::new(
+        name_service.clone(),
+        Arc::new(astra_services::auth::UnconfiguredAuthService),
+        catalog_principal(),
+    );
+    let mut named_inputs = heterogeneous.iter().take(2).cloned().collect::<Vec<_>>();
+    for input in &mut named_inputs {
+        input.fanout_target_count = Some(2);
+        input.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::ConfiguredName {
+                model_name: "test-model".into(),
+                source: None,
+            },
+        });
+    }
+
+    let cold_service = Arc::new(ActiveTestModelService::default());
+    let cold_reader = astra_services::models::AuthorizedModelCatalogReader::new(
+        cold_service.clone(),
+        Arc::new(astra_services::auth::UnconfiguredAuthService),
+        catalog_principal(),
+    );
+    let cold_executor = Arc::new(
+        ServerSpawnAgentExecutor::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        )
+        .with_model_service(Some(cold_service.clone())),
+    );
+    let mut cold_context = test_spawn_runtime_context("root-run", "user-a");
+    cold_context.model_catalog_reader = Some(cold_reader);
+    cold_executor.set_runtime_context(cold_context).await;
+    Arc::clone(&cold_executor)
+        .prepare_batch(&named_inputs, &context, None)
+        .await
+        .expect("cold admission keeps the canonical service path");
+    assert_eq!(
+        *cold_service.catalog_requests.lock().unwrap(),
+        1,
+        "a cold snapshot must not add a second catalog read"
+    );
+    catalog_reader
+        .read_snapshot()
+        .await
+        .expect("prewarm the request-scoped catalog snapshot");
+    let mut named_context = test_spawn_runtime_context("root-run", "user-a");
+    named_context.model_catalog_reader = Some(catalog_reader);
+    name_executor.set_runtime_context(named_context).await;
+    let named_prepared = Arc::clone(&name_executor)
+        .prepare_batch(&named_inputs, &context, None)
+        .await
+        .expect("one exact configured name resolves and admits the full batch");
+    assert_eq!(named_prepared.len(), 2);
+    assert_eq!(
+        *name_service.catalog_requests.lock().unwrap(),
+        1,
+        "child admission must reuse the already-read authorized snapshot"
+    );
+    assert_eq!(
+        name_service.batch_requests.lock().unwrap().as_slice(),
+        &[vec!["model-test-model".to_string()]],
+        "duplicate selectors share one batched Offering admission"
+    );
+    for prepared in named_prepared {
+        let identity = prepared.model_identity().expect("admitted model identity");
+        assert_eq!(identity.offering_id, "model-test-model");
+        assert_eq!(identity.model_name, "test-model");
+    }
+}
+
+#[tokio::test]
+async fn server_subrun_batch_admits_distinct_offerings_once_and_reuses_parent() {
+    use crate::server::delegation::engine::{SubRunExecutor, SubRunModelRequest};
+    use astra_turn_core::thinking_config::ThinkingConfig;
+
+    let parent_execution = test_admitted_model_execution();
+    let parent_selection = astra_turn_types::ModelSelection {
+        offering_id: parent_execution.offering_id.clone(),
+    };
+    let model_service = Arc::new(ActiveTestModelService::default());
+    let executor = ServerSubRunExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    )
+    .with_model_service(Some(model_service.clone()))
+    .with_admitted_model_execution(Some(parent_execution.clone()));
+
+    let request = |offering_id: Option<&str>| SubRunModelRequest {
+        user_id: "user-a".to_string(),
+        selection: offering_id.map(|offering_id| astra_turn_types::ModelSelection {
+            offering_id: offering_id.to_string(),
+        }),
+        parent_model_reasoning: Some(
+            astra_turn_core::orchestration_spawn_tool::ParentModelReasoning {
+                selection: parent_selection.clone(),
+                resolved_model_name: Some(parent_execution.model_name.clone()),
+                thinking: ThinkingConfig::ModelDefault,
+            },
+        ),
+        inherited_execution: Some(parent_execution.clone()),
+        provider_scope_bound: false,
+        thinking: ThinkingConfig::ModelDefault,
+        max_output_tokens: None,
+    };
+    let requests = vec![
+        request(Some("model-b")),
+        request(Some("model-c")),
+        request(Some("model-b")),
+        request(None),
+    ];
+
+    let prepared = executor
+        .prepare_model_batch(&requests)
+        .await
+        .expect("selected child Offerings are pre-admitted as one batch");
+
+    assert_eq!(prepared.len(), requests.len());
+    assert_eq!(
+        model_service.batch_requests.lock().unwrap().as_slice(),
+        &[vec!["model-b".to_string(), "model-c".to_string()]],
+        "duplicate children share one admission and inheritance performs no lookup"
+    );
+    let identities = prepared
+        .iter()
+        .map(|prepared| {
+            let prepared = prepared.as_ref().expect("each slot has an exact Offering");
+            (prepared.offering_id.as_str(), prepared.model_name.as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        identities,
+        [
+            ("model-b", "model-b"),
+            ("model-c", "model-c"),
+            ("model-b", "model-b"),
+            ("model-test-model", "test-model"),
+        ]
+    );
+
+    let mut provider_request = request(Some("model-b"));
+    provider_request.provider_scope_bound = true;
+    let error = match executor.prepare_model_batch(&[provider_request]).await {
+        Ok(_) => panic!("shared executors must reject provider-scoped model switches"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("provider-scoped child model selection"),
+        "{error}"
+    );
+    executor
+        .prepare_model_batch(&[request(Some("model-b"))])
+        .await
+        .expect("one provider request must not poison later user requests");
+}
+
+#[tokio::test]
+async fn server_spawn_cannot_inherit_when_parent_has_no_model_admission() {
+    let executor = ServerSpawnAgentExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    );
+    let mut parent = test_spawn_runtime_context("root-run", "user-a");
+    parent.admitted_model_execution = None;
+
+    let error = executor
+        .select_spawn_model_execution(&parent, None)
+        .await
+        .expect_err("missing parent admission must fail closed");
+
+    assert!(error.contains("missing parent model admission"), "{error}");
+}
+
+#[test]
+fn server_spawn_reasoning_validation_is_capability_strict() {
+    use astra_core::model_wire::thinking::ThinkingProtocol;
+    use astra_services::models::ThinkingCapability;
+    use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+
+    let mut execution = test_admitted_model_execution();
+    execution.provider = "anthropic".into();
+    execution.thinking_capability = Some(ThinkingCapability::Both);
+    execution.max_completion_tokens = Some(8000);
+    assert!(
+        crate::server::model_execution_admission::validate_reasoning_control(
+            &execution,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 8000
+            }
+        )
+        .is_err()
+    );
+    execution.max_completion_tokens = Some(8001);
+    assert!(
+        crate::server::model_execution_admission::validate_reasoning_control(
+            &execution,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 8000
+            }
+        )
+        .is_ok()
+    );
+    execution.provider = "openai".into();
+    execution.max_completion_tokens = None;
+    let fallback =
+        crate::prompts::capped_output_tokens(&crate::prompts::budget_for_model_with_metadata(
+            Some(&execution.model_name),
+            execution.context_window,
+            None,
+        ));
+    execution.provider = "anthropic".into();
+    assert!(
+        crate::server::model_execution_admission::validate_reasoning_control(
+            &execution,
+            &ThinkingConfig::Enabled {
+                budget_tokens: fallback as u32
+            }
+        )
+        .is_err(),
+        "unknown catalog ceiling still uses the canonical fallback output budget"
+    );
+    execution.provider = "openai".into();
+    execution.thinking_capability = Some(ThinkingCapability::EffortOnly);
+    execution.thinking_protocol = Some(ThinkingProtocol::ReasoningEffort);
+    assert!(
+        crate::server::model_execution_admission::validate_reasoning_control(
+            &execution,
+            &ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+        )
+        .is_ok()
+    );
+    assert!(
+        crate::server::model_execution_admission::validate_reasoning_control(
+            &execution,
+            &ThinkingConfig::Off,
+        )
+        .is_err(),
+        "an always-thinking Offering cannot promise explicit off"
+    );
+
+    execution.thinking_capability = None;
+    assert!(
+        crate::server::model_execution_admission::validate_reasoning_control(
+            &execution,
+            &ThinkingConfig::ModelDefault,
+        )
+        .is_ok(),
+        "unknown capability may preserve its own default"
+    );
+    assert!(
+        crate::server::model_execution_admission::validate_reasoning_control(
+            &execution,
+            &ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+        )
+        .is_err(),
+        "unknown capability is not evidence that high is supported"
+    );
+}
+
+#[test]
+fn initial_output_limit_requires_a_positive_typed_integer() {
+    assert_eq!(
+        AgenticRunLifecycleService::initial_output_limit_from_chat_context(&None).unwrap(),
+        None
+    );
+    for value in [
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!("8000"),
+        json!(null),
+        json!(4294967296_u64),
+    ] {
+        let context = Some(Map::from_iter([("max_output_tokens".into(), value)]));
+        assert!(
+            AgenticRunLifecycleService::initial_output_limit_from_chat_context(&context).is_err()
+        );
+    }
+    let context = Some(Map::from_iter([("max_output_tokens".into(), json!(8001))]));
+    assert_eq!(
+        AgenticRunLifecycleService::initial_output_limit_from_chat_context(&context).unwrap(),
+        Some(8001)
+    );
+}
+
+#[test]
+fn root_generation_controls_preserve_explicitness_and_effective_reasoning() {
+    use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+
+    let mut request = test_request("snapshot root controls");
+    request.model = None;
+    request.context = None;
+    let omitted = AgenticRunLifecycleService::root_generation_controls(&request).unwrap();
+    assert_eq!(omitted.thinking, ThinkingConfig::Off);
+    assert_eq!(omitted.first_output_max_tokens, None);
+    assert!(!omitted.preserve_thinking);
+
+    for (value, expected) in [
+        (json!({"mode": "off"}), ThinkingConfig::Off),
+        (
+            json!({"mode": "model_default"}),
+            ThinkingConfig::ModelDefault,
+        ),
+        (
+            json!({"mode": "adaptive", "effort": "high"}),
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+        ),
+        (
+            json!({"mode": "enabled", "budget_tokens": 2048}),
+            ThinkingConfig::Enabled {
+                budget_tokens: 2048,
+            },
+        ),
+    ] {
+        request.context = Some(Map::from_iter([
+            ("thinking".into(), value),
+            ("max_output_tokens".into(), json!(4096)),
+        ]));
+        let controls = AgenticRunLifecycleService::root_generation_controls(&request).unwrap();
+        assert_eq!(controls.thinking, expected);
+        assert_eq!(controls.first_output_max_tokens, Some(4096));
+        assert_eq!(
+            controls.preserve_thinking,
+            expected != ThinkingConfig::ModelDefault
+        );
+    }
+}
+
+#[tokio::test]
+async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propagates() {
+    use astra_turn_core::orchestration_spawn_tool::SpawnAgentInput;
+
+    let executor = Arc::new(ServerSpawnAgentExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    ));
     let root_pause_flag = Arc::new(AtomicBool::new(false));
     let root_cancel_token = Arc::new(CancellationToken::new());
     let mut root_context = test_spawn_runtime_context("root-run", "user-a");
+    let catalog_reader = astra_services::models::AuthorizedModelCatalogReader::new(
+        Arc::new(astra_services::UnconfiguredModelService),
+        Arc::new(astra_services::auth::UnconfiguredAuthService),
+        astra_services::AuthPrincipal {
+            user: astra_services::AuthUserRecord {
+                user_id: "user-a".into(),
+                username: "owner".into(),
+                email: "".into(),
+                display_name: None,
+            },
+            session_id: None,
+            origin: astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(
+                astra_services::AuthProviderAuthorizedRequestContext {
+                    provider_id: "provider".into(),
+                    external_subject: "subject".into(),
+                    provider_scope_id: "restricted".into(),
+                    request_authorization_id: "authorization".into(),
+                    edge_agent_id: Some("edge".into()),
+                },
+            ),
+        },
+    );
+    root_context.model_catalog_reader = Some(catalog_reader.clone());
     root_context.pause_flag = Some(root_pause_flag.clone());
     root_context.cancel_token = Some(root_cancel_token.clone());
     executor.set_runtime_context(root_context).await;
+
+    let edge_selection_result = Arc::clone(&executor)
+        .prepare_batch(
+            &[SpawnAgentInput {
+                description: "attempt an edge-scoped model switch".into(),
+                prompt: "run the child".into(),
+                requested_model_policy: Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                    selector: astra_turn_types::ModelSelector::ConfiguredName {
+                        model_name: "owner-only-model".into(),
+                        source: None,
+                    },
+                }),
+                ..Default::default()
+            }],
+            &test_spawn_context("root-run"),
+            None,
+        )
+        .await;
+    assert!(matches!(
+        edge_selection_result,
+        Err(error) if error.contains("provider-scoped child model selection")
+    ));
 
     let mut child = test_spawn_run_config(vec!["read_file"], false);
     child.run_id = "child-run".to_string();
@@ -6751,14 +7629,62 @@ async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propa
         "root-agent",
     ));
     let parent = executor.runtime_context_for_config(&child).await.unwrap();
+    let unprepared_edge_switch = executor
+        .select_spawn_model_execution(
+            &parent,
+            Some(&ModelSelection {
+                offering_id: "owner-only-model".into(),
+            }),
+        )
+        .await;
+    assert!(matches!(
+        unprepared_edge_switch,
+        Err(error) if error.contains("provider-scoped child model selection")
+    ));
+
+    // Provider scope remains fail-closed when request catalog discovery is
+    // unavailable (for example after recovery). Cache presence must never be
+    // the authorization boundary.
+    let mut readerless_provider = test_spawn_runtime_context("provider-root", "user-a");
+    readerless_provider.provider_run_owner = Some(astra_services::runs::ProviderRunOwner {
+        provider_id: "provider".into(),
+        provider_scope_id: "restricted".into(),
+    });
+    let provider_parent = readerless_provider.clone();
+    executor.set_runtime_context(readerless_provider).await;
+    let readerless_edge_switch = executor
+        .select_spawn_model_execution(
+            &provider_parent,
+            Some(&ModelSelection {
+                offering_id: "owner-only-model".into(),
+            }),
+        )
+        .await;
+    assert!(matches!(
+        readerless_edge_switch,
+        Err(error) if error.contains("provider-scoped child model selection")
+    ));
+
     let (child_context, _child_generation_guard) = executor
         .register_child_runtime_context(
             &parent,
             &child,
-            spawn_child_request_constraints(&parent.request_constraints, &child),
+            spawn_child_request_constraints(&parent.request_constraints, &child).unwrap(),
+            parent
+                .admitted_model_execution
+                .clone()
+                .expect("parent model admission"),
         )
         .await
         .expect("publish child runtime context");
+    assert_eq!(
+        child_context.model_catalog_reader.as_ref(),
+        Some(&catalog_reader)
+    );
+    assert_eq!(
+        child_context.model_catalog_reader.as_ref().unwrap().scope(),
+        "edge_registration"
+    );
     let child_pause_flag = child_context.pause_flag.expect("child pause flag");
     let child_cancel_token = child_context
         .cancel_token
@@ -6783,7 +7709,11 @@ async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propa
         .register_child_runtime_context(
             &parent,
             &sibling,
-            spawn_child_request_constraints(&parent.request_constraints, &sibling),
+            spawn_child_request_constraints(&parent.request_constraints, &sibling).unwrap(),
+            parent
+                .admitted_model_execution
+                .clone()
+                .expect("parent model admission"),
         )
         .await
         .expect("publish sibling runtime context");
@@ -7644,7 +8574,7 @@ fn spawn_child_constraints_intersect_parent_and_agent_allowlists() {
     );
     let config = test_spawn_run_config(vec!["bash", "read_file"], true);
 
-    let constraints = spawn_child_request_constraints(&parent, &config);
+    let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
 
     assert_eq!(
         constraints.allowed_tools.unwrap(),
@@ -7709,17 +8639,18 @@ fn spawn_child_constraints_preserve_parent_when_child_allows_all() {
         None,
         None,
     );
-    let config = test_spawn_run_config(vec!["*"], false);
-
-    let constraints = spawn_child_request_constraints(&parent, &config);
-
-    assert_eq!(
-        constraints.allowed_tools.unwrap(),
-        ["bash", "write_file"]
-            .into_iter()
-            .map(String::from)
-            .collect()
-    );
+    for read_only in [false, true] {
+        let config = test_spawn_run_config(vec!["*"], read_only);
+        let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
+        assert_eq!(
+            constraints.allowed_tools.unwrap(),
+            ["bash", "write_file"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            "read_only={read_only} must preserve the parent's explicit tool scope"
+        );
+    }
 }
 
 #[test]
@@ -7733,7 +8664,7 @@ fn assigned_work_child_keeps_only_its_execution_tools_and_mandatory_settlement()
         },
     );
 
-    let constraints = spawn_child_request_constraints(&parent, &config);
+    let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
     assert_eq!(
         constraints.allowed_tools.unwrap(),
         ["settle_work_item", "web_fetch"]
@@ -7744,20 +8675,16 @@ fn assigned_work_child_keeps_only_its_execution_tools_and_mandatory_settlement()
 }
 
 #[test]
-fn spawn_child_constraints_read_only_wildcard_gets_read_only_tools() {
+fn spawn_child_constraints_read_only_wildcard_inherits_parent_tool_scope() {
     let parent = RequestConstraints::default();
     let config = test_spawn_run_config(vec!["*"], true);
 
-    let constraints = spawn_child_request_constraints(&parent, &config);
-    let allowed = constraints.allowed_tools.as_ref().unwrap();
+    let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
 
-    assert!(allowed.contains("read_file"));
-    assert!(allowed.contains("grep"));
-    assert!(allowed.contains("web_fetch"));
-    assert!(allowed.contains("web_search"));
-    assert!(!allowed.contains("write_file"));
-    assert!(!allowed.contains("str_replace"));
-    assert!(delegated_edge_tool_schema_names(&constraints).contains(&"web_fetch".to_string()));
+    assert!(
+        constraints.allowed_tools.is_none(),
+        "workspace read-only authority must not silently remove discovery or coordination tools"
+    );
 }
 
 #[test]
@@ -7770,12 +8697,11 @@ fn spawn_child_constraints_read_only_wildcard_keeps_only_enabled_network_reads()
     );
     let config = test_spawn_run_config(vec!["*"], true);
 
-    let constraints = spawn_child_request_constraints(&parent, &config);
-    let allowed = constraints.allowed_tools.as_ref().unwrap();
-
-    assert!(allowed.contains("web_fetch"));
-    assert!(!allowed.contains("web_search"));
+    let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
+    assert!(constraints.allowed_tools.is_none());
+    assert_eq!(constraints.enabled_tools, parent.enabled_tools);
     assert!(delegated_edge_tool_schema_names(&constraints).contains(&"web_fetch".to_string()));
+    assert!(!delegated_edge_tool_schema_names(&constraints).contains(&"web_search".to_string()));
 }
 
 #[test]
@@ -7783,11 +8709,15 @@ fn spawn_child_constraints_read_only_wildcard_respects_explicit_network_disable(
     let parent = RequestConstraints::new(None, Some(HashSet::new()), None, None);
     let config = test_spawn_run_config(vec!["*"], true);
 
-    let constraints = spawn_child_request_constraints(&parent, &config);
-    let allowed = constraints.allowed_tools.as_ref().unwrap();
-
-    assert!(!allowed.contains("web_fetch"));
-    assert!(!allowed.contains("web_search"));
+    let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
+    assert!(constraints.allowed_tools.is_none());
+    assert!(
+        constraints
+            .enabled_tools
+            .as_ref()
+            .is_some_and(HashSet::is_empty)
+    );
+    assert!(delegated_edge_tool_schema_names(&constraints).is_empty());
 }
 
 #[test]
@@ -8363,6 +9293,17 @@ impl RunStateStore for FaultInjectedRunStateStore {
             .expect("status snapshot counter lock")
             .status_snapshot_calls += 1;
         self.inner.load_run_status_snapshot(user_id, run_id).await
+    }
+
+    async fn load_run_observation(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        event_limit: usize,
+    ) -> Result<Option<astra_services::runs::DurableRunObservation>, String> {
+        self.inner
+            .load_run_observation(user_id, run_id, event_limit)
+            .await
     }
 
     async fn load_run_delegation_projection_target(
@@ -9046,8 +9987,13 @@ async fn spawn_terminal_test_llm() -> TerminalTestLlm {
     }
 
     let requests = Arc::new(AtomicUsize::new(0));
+    async fn missing_route(State(requests): State<Arc<AtomicUsize>>) -> StatusCode {
+        requests.fetch_add(1, Ordering::SeqCst);
+        StatusCode::NOT_FOUND
+    }
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .fallback(missing_route)
         .with_state(requests.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -9267,13 +10213,14 @@ fn chat_stream_event_status(event: &Value) -> Option<&str> {
 
 async fn terminal_test_service() -> (AgenticRunLifecycleService, TerminalTestLlm) {
     let llm = spawn_terminal_test_llm().await;
-    let service = AgenticRunLifecycleService::new(
+    let mut service = AgenticRunLifecycleService::new(
         test_settings(),
         test_encryptor(),
         Arc::new(TokioMutex::new(HashMap::new())),
         RunEngine::new(Arc::new(InMemoryRunStateStore::new())),
     )
     .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())));
+    service.test_inference_ledger = Some(Default::default());
     (service, llm)
 }
 
@@ -10505,6 +11452,57 @@ fn db_backed_test_service(
     .with_model_service(Arc::new(ActiveTestModelService::default()))
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires disposable MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_run_start_generation_controls_survive_a_fresh_reader() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let suffix = Uuid::new_v4();
+    let user_id = format!("generation-controls-owner-{suffix}");
+    let session_id = format!("generation-controls-session-{suffix}");
+    let run_id = format!("generation-controls-run-{suffix}");
+    crate::server::run::insert_active_run_session_fixture(&pool, &user_id, &session_id).await;
+    let controls = crate::server::run::engine::RunGenerationControls {
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Enabled {
+            budget_tokens: 2048,
+        },
+        first_output_max_tokens: Some(4096),
+        preserve_thinking: true,
+    };
+    db_backed_test_service(&pool, "generation-controls-writer")
+        .run_engine
+        .start_run_with_context(
+            &run_id,
+            &user_id,
+            &session_id,
+            crate::server::run::engine::RunStartContext {
+                generation_controls: Some(controls.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("persist controlled run start");
+
+    let reader = db_backed_test_service(&pool, "generation-controls-reader");
+    let durable = reader
+        .run_engine
+        .load_run(&user_id, &run_id)
+        .await
+        .expect("load persisted run")
+        .expect("run exists");
+    assert_eq!(
+        crate::server::run::engine::durable_run_generation_controls(&durable).unwrap(),
+        controls
+    );
+    assert_eq!(
+        durable
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == "run_started")
+            .count(),
+        1
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
@@ -10940,7 +11938,6 @@ async fn cleanup_lifecycle_execution_binding(
 ) {
     for table in [
         "session_execution_switches",
-        "session_execution_workspace_claims",
         "session_execution_bindings",
         "session_context_heads",
     ] {
@@ -11270,6 +12267,7 @@ async fn seed_lifecycle_run_for_pause_resume_it(
 
 fn test_request(message: &str) -> ChatRequestData {
     ChatRequestData {
+        model_catalog_reader: None,
         message: message.to_string(),
         conversation_authority: None,
         user_intent: None,
@@ -11284,10 +12282,12 @@ fn test_request(message: &str) -> ChatRequestData {
         full_llm_capture: false,
         agent_id: None,
         model: Some("test-model".to_string()),
+        expected_model_name: None,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: Some(ModelSelection {
             offering_id: "model-test-model".to_string(),
         }),
+        requested_model_policy: None,
         resolved_model_selection: None,
         admitted_model_execution: None,
         capability_descriptors: None,
@@ -11521,6 +12521,7 @@ async fn work_runtime_binding_validation_is_explicit_owner_safe_and_branch_exact
     .with_run_engine(service.run_engine.clone())
     .with_pool(pool.clone());
     let mut child_config = SubRunConfig {
+        max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: child_run_id.clone(),
@@ -11533,13 +12534,15 @@ async fn work_runtime_binding_validation_is_explicit_owner_safe_and_branch_exact
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: None,
+        prepared_model: None,
+        requested_model_policy: None,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
         recursion_depth: 1,
         max_turns: Some(1),
         initial_turns: None,
         pause_flag: None,
-        checkpoint_gate: None,
         mailbox: None,
         progress_emitter: None,
         live_event_sink: None,
@@ -11835,6 +12838,7 @@ fn prepared_test_request(message: &str) -> ChatRequestData {
     request.resolved_model_selection = Some(ResolvedModelSelection {
         offering_id: "model-test-model".to_string(),
         model_name: "test-model".to_string(),
+        source_identity: None,
     });
     request.admitted_model_execution = Some(test_admitted_model_execution());
     request
@@ -12110,8 +13114,11 @@ fn server_root_permissions_default_to_auto_for_server_approval_gate() {
     request.interaction_mode = Some(RequestedTurnInteractionMode::Prompt);
     let constraints = RequestConstraints::default();
 
-    let inherited =
-        AgenticRunLifecycleService::inherited_permissions_from_request(&request, &constraints);
+    let inherited = AgenticRunLifecycleService::inherited_permissions_from_request(
+        &request,
+        &constraints,
+        None,
+    );
 
     assert_eq!(inherited.mode, PermissionMode::Auto);
     assert!(inherited.allowed_tools.is_none());
@@ -12126,8 +13133,11 @@ fn server_root_permissions_map_deny_and_preserve_tool_allowlist() {
         ..Default::default()
     };
 
-    let inherited =
-        AgenticRunLifecycleService::inherited_permissions_from_request(&request, &constraints);
+    let inherited = AgenticRunLifecycleService::inherited_permissions_from_request(
+        &request,
+        &constraints,
+        None,
+    );
 
     assert_eq!(inherited.mode, PermissionMode::Deny);
     assert!(
@@ -12136,6 +13146,28 @@ fn server_root_permissions_map_deny_and_preserve_tool_allowlist() {
             .as_ref()
             .is_some_and(|tools| tools.contains("read_file"))
     );
+}
+
+#[test]
+fn server_root_permissions_inherit_read_only_execution_binding() {
+    let mut request = test_request("inspect the workspace");
+    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+        display_name: None,
+        root: None,
+        source: None,
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadOnly),
+    });
+    let (workspace, executor) =
+        resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
+    let snapshot = ExecutionBindingSnapshot::inferred(workspace, executor);
+    let inherited = AgenticRunLifecycleService::inherited_permissions_from_request(
+        &request,
+        &RequestConstraints::default(),
+        Some(&snapshot),
+    );
+
+    assert!(inherited.read_only_execution);
 }
 
 #[test]
@@ -12181,6 +13213,7 @@ fn test_executable_subrun_config(
     admitted_model_execution: astra_services::AdmittedModelExecution,
 ) -> SubRunConfig {
     SubRunConfig {
+        max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: run_id.to_string(),
@@ -12193,13 +13226,15 @@ fn test_executable_subrun_config(
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: Some(admitted_model_execution),
+        prepared_model: None,
+        requested_model_policy: None,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::new(Some(HashSet::new()), None, None, None),
         recursion_depth: 1,
         max_turns: Some(1),
         initial_turns: Some(1),
         pause_flag: None,
-        checkpoint_gate: None,
         mailbox: None,
         progress_emitter: None,
         live_event_sink: None,
@@ -12211,6 +13246,69 @@ fn test_executable_subrun_config(
         #[cfg(feature = "harness")]
         harness_sink: None,
     }
+}
+
+#[tokio::test]
+async fn durable_subrun_model_policy_conflict_is_rejected_before_activation() {
+    let admitted = astra_services::AdmittedModelExecution::from_endpoint(
+        "model-test-model".to_string(),
+        "test-model".to_string(),
+        "openai".to_string(),
+        "http://127.0.0.1:1/chat/completions".to_string(),
+        "Bearer test".to_string(),
+        None,
+        128_000,
+    );
+    let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    run_engine
+        .start_run("authority-parent-run", "user-1", "session-1")
+        .await
+        .expect("durable parent");
+    let executor = ServerSubRunExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    )
+    .with_run_engine(run_engine.clone());
+
+    let mut original = test_executable_subrun_config("policy-replay", admitted.clone());
+    original.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::OfferingId {
+            offering_id: "model-test-model".to_string(),
+        },
+    });
+    let authority = executor
+        .ensure_durable_subrun_started(&original, original.admitted_model_execution.as_ref())
+        .await
+        .expect("create original durable child")
+        .expect("durable execution authority");
+    let before = run_engine
+        .load_run("user-1", "policy-replay")
+        .await
+        .expect("read original child")
+        .expect("original durable child");
+
+    let mut conflicting_retry = test_executable_subrun_config("policy-replay", admitted);
+    conflicting_retry.execution_owner_generation = Some(authority.owner_generation);
+    conflicting_retry.requested_model_policy = None;
+    let error = executor
+        .ensure_durable_subrun_started(
+            &conflicting_retry,
+            conflicting_retry.admitted_model_execution.as_ref(),
+        )
+        .await
+        .expect_err("same-generation retry cannot rewrite its original model request");
+    assert!(
+        error.contains("changed its requested model policy"),
+        "{error}"
+    );
+
+    let after = run_engine
+        .load_run("user-1", "policy-replay")
+        .await
+        .expect("read child after rejected replay")
+        .expect("original child remains present");
+    assert_eq!(after, before, "rejected replay must not mutate the run");
 }
 
 #[test]
@@ -12848,6 +13946,7 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
                 resolved_model_selection: Some(ResolvedModelSelection {
                     offering_id: "model-test-model".to_string(),
                     model_name: "test-model".to_string(),
+                    source_identity: None,
                 }),
                 ..Default::default()
             },
@@ -12861,6 +13960,7 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
     )
     .with_run_engine(run_engine.clone());
     let mut config = SubRunConfig {
+        max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: "child-run".to_string(),
@@ -12873,13 +13973,15 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: Some(test_admitted_model_execution()),
+        prepared_model: None,
+        requested_model_policy: None,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Auto,
         request_constraints: RequestConstraints::default(),
         recursion_depth: 1,
         max_turns: Some(1),
         initial_turns: None,
         pause_flag: None,
-        checkpoint_gate: None,
         mailbox: None,
         progress_emitter: None,
         live_event_sink: None,
@@ -12906,8 +14008,42 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
     assert_eq!(child.model_offering_id.as_deref(), Some("model-test-model"));
     assert_eq!(child.resolved_model_name.as_deref(), Some("test-model"));
     assert_eq!(
+        crate::server::run::engine::durable_run_generation_controls(&child).unwrap(),
+        crate::server::run::engine::RunGenerationControls {
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
+            first_output_max_tokens: None,
+            preserve_thinking: true,
+        }
+    );
+    assert_eq!(
         child.events[0]["data"]["interaction_mode"], "auto",
         "child durable start must record the effective interaction policy"
+    );
+    let (materialized, controls) = executor
+        .materialize_durable_subrun_execution(
+            &config,
+            config.admitted_model_execution.as_ref(),
+            Some(&child),
+        )
+        .await
+        .expect("the shared durable row must supply execution controls");
+    assert_eq!(
+        materialized
+            .as_ref()
+            .map(|execution| execution.offering_id.as_str()),
+        child.model_offering_id.as_deref()
+    );
+    assert_eq!(controls.thinking, config.thinking);
+    assert!(
+        executor
+            .materialize_durable_subrun_execution(
+                &config,
+                config.admitted_model_execution.as_ref(),
+                None,
+            )
+            .await
+            .expect_err("a missing durable row cannot become inherited execution material")
+            .contains("disappeared before model materialization")
     );
 
     config.interaction_mode = RequestedTurnInteractionMode::Headless;
@@ -12917,6 +14053,78 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
         .expect_err("durable retry cannot reinterpret its interaction policy");
     assert!(policy_error.contains("changed its interaction policy"));
     config.interaction_mode = RequestedTurnInteractionMode::Auto;
+
+    config.thinking = astra_turn_core::thinking_config::ThinkingConfig::ModelDefault;
+    let thinking_error = executor
+        .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
+        .await
+        .expect_err("durable retry cannot change reasoning controls");
+    assert!(thinking_error.contains("changed its generation controls"));
+    config.thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+
+    config.max_output_tokens = Some(4096);
+    let cap_error = executor
+        .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
+        .await
+        .expect_err("durable retry cannot add a first-round output limit");
+    assert!(cap_error.contains("changed its generation controls"));
+    config.max_output_tokens = None;
+    executor
+        .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
+        .await
+        .expect("unchanged controls retain the existing durable child");
+    assert_eq!(
+        run_engine
+            .load_run("user-1", "child-run")
+            .await
+            .unwrap()
+            .unwrap()
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == "run_started")
+            .count(),
+        1
+    );
+
+    // ModelDefault is a real delegated execution setting, not the same as
+    // explicit Off. Its durable preservation bit must match the executor's
+    // retry/materialization validation without introducing a compatibility
+    // fallback.
+    config.run_id = "model-default-child-run".to_string();
+    config.execution_owner_generation = None;
+    config.thinking = astra_turn_core::thinking_config::ThinkingConfig::ModelDefault;
+    let default_authority = executor
+        .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
+        .await
+        .expect("ModelDefault child admission")
+        .expect("durable ModelDefault child authority");
+    config.execution_owner_generation = Some(default_authority.owner_generation);
+    let default_child = run_engine
+        .load_run("user-1", "model-default-child-run")
+        .await
+        .expect("load ModelDefault child")
+        .expect("durable ModelDefault child");
+    let default_controls =
+        crate::server::run::engine::durable_run_generation_controls(&default_child).unwrap();
+    assert_eq!(
+        default_controls,
+        crate::server::run::engine::RunGenerationControls {
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
+            first_output_max_tokens: None,
+            preserve_thinking: false,
+        }
+    );
+    executor
+        .materialize_durable_subrun_execution(
+            &config,
+            config.admitted_model_execution.as_ref(),
+            Some(&default_child),
+        )
+        .await
+        .expect("ModelDefault durable controls pass executor validation");
+    config.run_id = "child-run".to_string();
+    config.execution_owner_generation = Some(authority.owner_generation);
+    config.thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
 
     config.admitted_model_execution = Some(AdmittedModelExecution::from_endpoint(
         "model-other".to_string(),
@@ -12932,6 +14140,7 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
             .materialize_durable_subrun_execution(
                 &config,
                 config.admitted_model_execution.as_ref(),
+                Some(&child),
             )
             .await
             .is_err(),
@@ -12971,6 +14180,7 @@ async fn generic_subrun_does_not_inherit_parent_canonical_work_identity() {
     )
     .with_run_engine(run_engine.clone());
     let mut config = SubRunConfig {
+        max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: "generic-child-run".to_string(),
@@ -12983,13 +14193,15 @@ async fn generic_subrun_does_not_inherit_parent_canonical_work_identity() {
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: None,
+        prepared_model: None,
+        requested_model_policy: None,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
         recursion_depth: 1,
         max_turns: Some(1),
         initial_turns: None,
         pause_flag: None,
-        checkpoint_gate: None,
         mailbox: None,
         progress_emitter: None,
         live_event_sink: None,
@@ -13067,6 +14279,7 @@ async fn server_subrun_rejects_work_item_without_parent_work_before_child_insert
     )
     .with_run_engine(run_engine.clone());
     let config = SubRunConfig {
+        max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: "child-run".to_string(),
@@ -13079,13 +14292,15 @@ async fn server_subrun_rejects_work_item_without_parent_work_before_child_insert
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: None,
+        prepared_model: None,
+        requested_model_policy: None,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
         recursion_depth: 1,
         max_turns: Some(1),
         initial_turns: None,
         pause_flag: None,
-        checkpoint_gate: None,
         mailbox: None,
         progress_emitter: None,
         live_event_sink: None,
@@ -13547,6 +14762,7 @@ async fn server_subrun_error_after_durable_start_commits_exact_failed_terminal()
     )
     .with_run_engine(run_engine.clone());
     let config = SubRunConfig {
+        max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: "child-safe".to_string(),
@@ -13559,13 +14775,15 @@ async fn server_subrun_error_after_durable_start_commits_exact_failed_terminal()
         context: HashMap::new(),
         forward_headers: HashMap::new(),
         admitted_model_execution: Some(test_admitted_model_execution()),
+        prepared_model: None,
+        requested_model_policy: None,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         interaction_mode: RequestedTurnInteractionMode::Headless,
         request_constraints: RequestConstraints::default(),
         recursion_depth: 1,
         max_turns: Some(1),
         initial_turns: None,
         pause_flag: None,
-        checkpoint_gate: None,
         mailbox: None,
         progress_emitter: None,
         live_event_sink: None,
@@ -14777,6 +15995,33 @@ async fn validate_request_constraints_rejects_removed_or_malformed_thinking_shap
 }
 
 #[tokio::test]
+async fn validate_request_constraints_rejects_unsupported_explicit_thinking() {
+    let service = test_service();
+    let mut request = prepared_test_request("hello");
+    let mut execution = test_admitted_model_execution();
+    execution.thinking_capability = None;
+    execution.thinking_protocol = None;
+    request.admitted_model_execution = Some(execution);
+    request.context.get_or_insert_with(Default::default).insert(
+        "thinking".to_string(),
+        json!({"mode": "adaptive", "effort": "high"}),
+    );
+
+    let error = service
+        .validate_request_constraints("u1", &request)
+        .await
+        .expect_err("unsupported explicit thinking must fail before inference");
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert!(
+        error
+            .1
+            .0
+            .detail
+            .contains("cannot execute requested reasoning")
+    );
+}
+
+#[tokio::test]
 async fn server_request_omission_explicitly_disables_optional_tools() {
     let service = test_service();
     let request = prepared_test_request("hello");
@@ -15052,6 +16297,195 @@ async fn server_default_model_mode_uses_existing_model_access_default() {
 }
 
 #[tokio::test]
+async fn prepare_chat_request_rejects_preflight_model_identity_drift() {
+    let service = test_service();
+    let mut matching = test_request("child work");
+    matching.model = None;
+    matching.expected_model_name = Some("test-model".into());
+    let prepared = service
+        .prepare_chat_request("u1", matching)
+        .await
+        .expect("exact preflight identity survives fresh admission");
+    assert_eq!(prepared.model.as_deref(), Some("test-model"));
+
+    let mut drifted = test_request("child work");
+    drifted.model = None;
+    drifted.expected_model_name = Some("old-configured-model".into());
+    let error = service
+        .prepare_chat_request("u1", drifted)
+        .await
+        .expect_err("a changed Offering resolution must not silently execute");
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("model_identity_changed")
+    );
+}
+
+#[tokio::test]
+async fn prepare_chat_request_rejects_unavailable_or_conflicting_model_policy_before_admission() {
+    let service = test_service();
+    let mut automatic = test_request("delegate this task");
+    automatic.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Auto {
+        strategy: astra_turn_types::AutoModelStrategy::Balanced,
+    });
+    automatic.model_selection = None;
+    let error = service
+        .prepare_chat_request("u1", automatic)
+        .await
+        .expect_err("automatic routing without a concrete Offering must fail closed");
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("model_routing_unavailable")
+    );
+
+    let mut admitted_automatic = test_request("delegate this task");
+    admitted_automatic.requested_model_policy =
+        Some(astra_turn_types::RequestedModelPolicy::Auto {
+            strategy: astra_turn_types::AutoModelStrategy::Balanced,
+        });
+    let prepared = service
+        .prepare_chat_request("u1", admitted_automatic)
+        .await
+        .expect("a concrete Offering may retain Auto as caller-policy provenance");
+    assert_eq!(
+        prepared
+            .admitted_model_execution
+            .as_ref()
+            .map(|execution| execution.offering_id.as_str()),
+        Some("model-test-model")
+    );
+
+    let mut mismatched_fixed = test_request("delegate this task");
+    mismatched_fixed.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::OfferingId {
+            offering_id: "other-offering".to_string(),
+        },
+    });
+    let error = service
+        .prepare_chat_request("u1", mismatched_fixed)
+        .await
+        .expect_err("requested and admitted Offering identities must agree");
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("model_selection_invalid")
+    );
+
+    let mut unprepared_name = test_request("delegate this task");
+    unprepared_name.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::ConfiguredName {
+            model_name: "test-model".into(),
+            source: None,
+        },
+    });
+    unprepared_name.model_selection = None;
+    let error = service
+        .prepare_chat_request("u1", unprepared_name)
+        .await
+        .expect_err("the root chat endpoint cannot consume an unprepared configured name");
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("model_selection_invalid")
+    );
+
+    let matching_policy = astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::ConfiguredName {
+            model_name: "TEST-MODEL".into(),
+            source: Some("openai".into()),
+        },
+    };
+    let mut prepared_name = test_request("delegate this task");
+    prepared_name.requested_model_policy = Some(matching_policy.clone());
+    let prepared = service
+        .prepare_chat_request("u1", prepared_name)
+        .await
+        .expect("an explicitly admitted Offering may carry configured-name provenance");
+    assert_eq!(prepared.requested_model_policy, Some(matching_policy));
+    assert_eq!(prepared.model.as_deref(), Some("test-model"));
+
+    let mut matching_access_label = test_request("delegate this task");
+    matching_access_label.requested_model_policy =
+        Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::ConfiguredName {
+                model_name: "test-model".into(),
+                source: Some("Self-hosted".into()),
+            },
+        });
+    service
+        .prepare_chat_request("u1", matching_access_label)
+        .await
+        .expect("the admitted Offering's access label is a valid source qualifier");
+
+    let mut drifted_name = test_request("delegate this task");
+    drifted_name.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::ConfiguredName {
+            model_name: "other-model".into(),
+            source: None,
+        },
+    });
+    let error = service
+        .prepare_chat_request("u1", drifted_name)
+        .await
+        .expect_err("a name that no longer identifies the admitted Offering must fail closed");
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("model_identity_changed")
+    );
+
+    let mut mismatched_source = test_request("delegate this task");
+    mismatched_source.requested_model_policy =
+        Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::ConfiguredName {
+                model_name: "test-model".into(),
+                source: Some("anthropic".into()),
+            },
+        });
+    let error = service
+        .prepare_chat_request("u1", mismatched_source)
+        .await
+        .expect_err("a matching name cannot override a conflicting source qualifier");
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("model_identity_changed")
+    );
+}
+
+#[test]
+fn delegated_model_handoff_requires_authenticated_user_and_session() {
+    let source = astra_turn_types::DelegationUserRequirementSource {
+        user_id: "user-1".into(),
+        session_id: "session-1".into(),
+        session_turn: 3,
+        applied_intent_id: None,
+        command_intent_id: Some("6bca9f9c-6d18-4579-bce1-2b45f573a098".into()),
+        user_intent_digest: "sha256:task".into(),
+    };
+    let mut request = test_request("child work");
+    request.session_id = Some("session-1".into());
+    let mut context = serde_json::Map::new();
+    context.insert(
+        astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY.into(),
+        serde_json::to_value(
+            astra_turn_types::DelegationIntentRequirements::Unconstrained { source },
+        )
+        .unwrap(),
+    );
+    request.context = Some(context);
+    let constraints = AgenticRunLifecycleService::try_request_constraints(&request).unwrap();
+
+    assert!(validate_delegated_model_handoff("user-1", &request, &constraints).is_ok());
+    assert!(validate_delegated_model_handoff("other-user", &request, &constraints).is_err());
+
+    request.session_id = Some("other-session".into());
+    assert!(validate_delegated_model_handoff("user-1", &request, &constraints).is_err());
+}
+
+#[tokio::test]
 async fn prepare_chat_request_accepts_structured_user_intent_when_prompt_message_is_empty() {
     let service = test_service();
     let mut request = test_request("   ");
@@ -15116,6 +16550,7 @@ async fn prepare_chat_request_rejects_wire_resolution_without_provider_authoriza
     request.resolved_model_selection = Some(ResolvedModelSelection {
         offering_id: "model-test-model".to_string(),
         model_name: "attacker-model".to_string(),
+        source_identity: None,
     });
 
     let err = service
@@ -15441,6 +16876,122 @@ async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_
             .as_ref()
             .map(|execution| execution.model_name.as_str()),
         Some("test-model")
+    );
+}
+
+#[tokio::test]
+async fn prepare_chat_request_rejects_mismatched_configured_source_for_provider_runtime() {
+    let service = test_service();
+    for conflicting_source in ["openai", "This device", "anthropic"] {
+        let mut request = prepared_test_request("hello");
+        request.provider_runtime_authorized = true;
+        request.admitted_model_execution = None;
+        request
+            .resolved_model_selection
+            .as_mut()
+            .expect("authenticated provider context carries the resolved selection")
+            .source_identity = Some(astra_services::runs::ResolvedModelSourceIdentity {
+            provider: "deepseek".into(),
+            access_label: "Genesis".into(),
+        });
+        request.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::ConfiguredName {
+                model_name: "test-model".into(),
+                source: Some(conflicting_source.into()),
+            },
+        });
+        request.runtime_auth = Some(RuntimeAuthRequest {
+            authorization: "Bearer runtime-grant".to_string(),
+        });
+        request.capability_descriptors =
+            Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+                model_gateway: Some(test_runtime_descriptor(
+                    "moi-model-gateway",
+                    "model_gateway",
+                    "http://127.0.0.1/model-gateway",
+                )),
+                mcp: None,
+                skills: None,
+                edge_agent: None,
+                discovery_snapshot: None,
+            });
+
+        let error = service
+            .prepare_chat_request("u1", request)
+            .await
+            .expect_err("gateway transport must not impersonate Offering source identity");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some("model_identity_changed")
+        );
+    }
+}
+
+#[tokio::test]
+async fn prepare_chat_request_preserves_trusted_source_across_provider_gateway_transport() {
+    let service = test_service();
+    let mut request = prepared_test_request("hello");
+    request.provider_runtime_authorized = true;
+    request.admitted_model_execution = None;
+    request
+        .resolved_model_selection
+        .as_mut()
+        .expect("authenticated provider context carries the resolved selection")
+        .source_identity = Some(astra_services::runs::ResolvedModelSourceIdentity {
+        provider: "deepseek".into(),
+        access_label: "Genesis".into(),
+    });
+    request.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::ConfiguredName {
+            model_name: "test-model".into(),
+            source: Some("Genesis".into()),
+        },
+    });
+    request.runtime_auth = Some(RuntimeAuthRequest {
+        authorization: "Bearer runtime-grant".to_string(),
+    });
+    request.capability_descriptors =
+        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+            model_gateway: Some(test_runtime_descriptor(
+                "moi-model-gateway",
+                "model_gateway",
+                "http://127.0.0.1/model-gateway",
+            )),
+            mcp: None,
+            skills: None,
+            edge_agent: None,
+            discovery_snapshot: None,
+        });
+
+    let prepared = service
+        .prepare_chat_request("u1", request)
+        .await
+        .expect("trusted Genesis source remains valid through OpenAI-compatible gateway");
+    assert_eq!(
+        prepared
+            .admitted_model_execution
+            .as_ref()
+            .map(|execution| execution.provider.as_str()),
+        Some("openai"),
+        "gateway protocol is transport provenance, not Offering source"
+    );
+    assert_eq!(
+        prepared
+            .admitted_model_execution
+            .as_ref()
+            .and_then(|execution| execution.source_identity.as_ref())
+            .map(|source| source.access_label.as_str()),
+        Some("Genesis"),
+        "trusted Offering provenance must travel with the admitted execution"
+    );
+    assert_eq!(
+        prepared
+            .resolved_model_selection
+            .as_ref()
+            .and_then(|resolved| resolved.source_identity.as_ref())
+            .map(|source| source.access_label.as_str()),
+        Some("Genesis")
     );
 }
 
@@ -16059,6 +17610,186 @@ fn build_runtime_turn_evaluation_event_respects_settled_status_and_preserves_too
     let metadata = event.metadata.expect("turn evaluation metadata");
     assert_eq!(metadata["tool_evaluation_success"], false);
     assert_eq!(metadata["success"], false);
+}
+
+#[tokio::test]
+async fn completed_direct_child_supersedes_launch_receipt_in_final_evaluation() {
+    use astra_turn_types::task_resolution::{EdgeDispatchCompletionRef, ToolExecutionEvidenceRef};
+
+    let svc = test_service();
+    let request = test_request("delegate one check");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    let completion = ToolExecutionEvidenceRef::EdgeDispatch(EdgeDispatchCompletionRef {
+        identity: astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "session-1",
+            "run-1",
+            "chain-1",
+            "spawn-call",
+        )
+        .unwrap(),
+        edge_agent_id: "edge-1".into(),
+        result_hash: "sha256:test".into(),
+    });
+    state.stall.tool_call_records.push(ToolCallRecord {
+        name: "agent".into(),
+        ok: true,
+        disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+        execution_completion: Some(completion),
+        args_full: Some(r#"{"action":"spawn","description":"check","prompt":"check"}"#.into()),
+        result_full: Some(r#"{"status":"launched","agent_id":"child@run"}"#.into()),
+        ..Default::default()
+    });
+    let evaluate = |state: &AgenticLoopState| {
+        build_runtime_turn_evaluation_event("session-1", "server_runtime", state, STATUS_COMPLETED)
+            .metadata
+            .unwrap()
+    };
+    assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+    state.push_volatile_payload(
+        crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+        serde_json::json!({
+            "schema": "direct_child_completion.v1",
+            "parent_run_id": "run-1",
+            "observed_by_provider": true,
+            "children": [{"agent_id":"child@run","status":"completed"}]
+        }),
+    );
+    let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
+    host.direct_child_owner = Some(
+        crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "run-1",
+            "child@run",
+        ),
+    );
+    crate::turn::agentic_loop::execution_phase::fence_direct_child_finalization(
+        &mut host, &mut state,
+    )
+    .await;
+    assert!(
+        state.volatile_pending.is_empty(),
+        "terminal context was retired"
+    );
+    let settled = evaluate(&state);
+    assert_eq!(settled["tool_evaluation_success"], true);
+    assert_eq!(settled["success"], true);
+    state.current_run_id = Some("other-run".into());
+    assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+}
+
+#[tokio::test]
+async fn completed_direct_child_is_resolved_even_with_unrelated_interruption() {
+    use astra_turn_types::task_resolution::{EdgeDispatchCompletionRef, ToolExecutionEvidenceRef};
+
+    let svc = test_service();
+    let request = test_request("delegate one check");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    let completion = ToolExecutionEvidenceRef::EdgeDispatch(EdgeDispatchCompletionRef {
+        identity: astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "session-1",
+            "run-1",
+            "chain-1",
+            "spawn-call",
+        )
+        .unwrap(),
+        edge_agent_id: "edge-1".into(),
+        result_hash: "sha256:test".into(),
+    });
+    state.stall.tool_call_records.push(ToolCallRecord {
+        name: "agent".into(),
+        ok: true,
+        disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+        execution_completion: Some(completion),
+        args_full: Some(r#"{"action":"spawn","description":"check","prompt":"check"}"#.into()),
+        result_full: Some(r#"{"status":"launched","agent_id":"child@run"}"#.into()),
+        ..Default::default()
+    });
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        InterruptionKind::ExecutionIncomplete,
+        ResumeAction::ContinueImmediately,
+        Default::default(),
+    ));
+    state.push_volatile_payload(
+        crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+        serde_json::json!({
+            "schema": "direct_child_completion.v1",
+            "parent_run_id": "run-1",
+            "observed_by_provider": true,
+            "children": [{"agent_id":"child@run","status":"completed"}]
+        }),
+    );
+    let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
+    host.direct_child_owner = Some(
+        crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "run-1",
+            "child@run",
+        ),
+    );
+
+    crate::turn::agentic_loop::execution_phase::fence_direct_child_finalization(
+        &mut host, &mut state,
+    )
+    .await;
+
+    assert!(
+        state.stall.terminal_child_evaluation_refs.is_some(),
+        "an unrelated interruption must not hide an already observed child completion"
+    );
+}
+
+#[tokio::test]
+async fn mismatched_child_owner_cannot_retire_terminal_notification() {
+    let svc = test_service();
+    let request = test_request("delegate one check");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "other-run",
+        None,
+        None,
+        None,
+    );
+    state.push_volatile_payload(
+        crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+        serde_json::json!({
+            "schema": "direct_child_completion.v1",
+            "parent_run_id": "run-1",
+            "observed_by_provider": true,
+            "children": [{"agent_id":"child@run","status":"completed"}]
+        }),
+    );
+    let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
+    host.direct_child_owner = Some(
+        crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "run-1",
+            "child@run",
+        ),
+    );
+    crate::turn::agentic_loop::execution_phase::fence_direct_child_finalization(
+        &mut host, &mut state,
+    )
+    .await;
+    assert_eq!(state.volatile_pending.len(), 1);
+    assert!(state.stall.terminal_child_evaluation_refs.is_none());
+    assert!(state.interruption.is_some());
 }
 
 #[test]
@@ -17201,7 +18932,6 @@ fn agent_communication_is_a_durable_replay_boundary() {
         "payload_kind": "text",
         "summary": "review this",
         "timestamp_ms": 42,
-        "requires_ack": false
     });
 
     assert!(live_delta_event_for_persistence(&event));
@@ -17219,7 +18949,6 @@ fn agent_communication_is_a_durable_replay_boundary() {
         "payload_kind": "progress",
         "summary": "working",
         "timestamp_ms": 43,
-        "requires_ack": false
     });
     assert!(!live_delta_event_for_persistence(&progress));
     assert!(!streaming_event_for_persistence(&progress));
@@ -17260,6 +18989,38 @@ fn explain_analyze_facts_are_durable_replay_boundaries() {
 }
 
 #[test]
+fn terminal_explain_recovery_coalesces_retained_facts_without_losing_repair_authority() {
+    let gap_tracker = server_loop_host::HostEventGapTracker::default();
+    let fact =
+        json!({"type": "explain_analyze", "event_id": "queued-fact", "outcome": "succeeded"});
+    assert!(gap_tracker.track_explain_analyze_event(fact.clone()));
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tx.try_send(fact.clone()).unwrap();
+    drop(rx);
+    // The first channel accepted the event, but its downstream bridge stopped
+    // before acknowledging it. Recovery retains the same physical fact.
+    gap_tracker.record_explain_analyze_drop(fact.clone());
+    let (_, recovered, _) = gap_tracker.take_recovery_snapshot();
+    let gap = stream_delivery_gap_event("run-1", 1);
+    let terminal = json!({"type": "run_finished", "status": "completed"});
+    let mut final_events = vec![fact.clone(), terminal.clone()];
+    let ids = merge_terminal_explain_recovery(&mut final_events, recovered, Some(gap.clone()));
+    assert!(ids.contains("queued-fact"));
+    assert_eq!(final_events, vec![fact.clone(), gap, terminal]);
+    let mut conflicting = fact.clone();
+    conflicting["outcome"] = json!("failed");
+    merge_terminal_explain_recovery(&mut final_events, vec![conflicting.clone()], None);
+    assert!(
+        final_events.contains(&conflicting),
+        "conflicting evidence must remain visible"
+    );
+    assert_eq!(
+        final_events.iter().filter(|event| **event == fact).count(),
+        1
+    );
+}
+
+#[test]
 fn explain_recovery_gap_survives_terminal_batch_compaction() {
     let budget = DurableRunEventBatchBudget::default();
     let mut events: Vec<Value> = (0..(budget.row_budget + 100))
@@ -17294,6 +19055,7 @@ fn active_run_live_event_projection_excludes_transient_agent_activity() {
         cancel_flag: Arc::new(AtomicBool::new(false)),
         pause_flag: Arc::new(AtomicBool::new(false)),
         llm_cancel_token: Arc::new(CancellationToken::new()),
+        input_wake: tokio::sync::watch::channel(-1).0,
         live_tx: None,
         attached_event_tx: None,
         waiting_for: None,
@@ -17676,6 +19438,7 @@ fn merge_cancelled_run_events_preserves_order_and_usage() {
         cancel_flag,
         pause_flag: Arc::new(AtomicBool::new(false)),
         llm_cancel_token: cancel_token,
+        input_wake: tokio::sync::watch::channel(-1).0,
         live_tx: None,
         attached_event_tx: None,
         waiting_for: None,
@@ -18081,6 +19844,21 @@ fn provider_task_ref_fingerprint_tracks_semantic_routing_but_not_credential_rota
         .expect("valid provider identity")
         .expect("provider identity");
 
+    request.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+        selector: astra_turn_types::ModelSelector::OfferingId {
+            offering_id: "selected-offering".to_string(),
+        },
+    });
+    let changed_model_policy = svc
+        .provider_idempotency_identity("user-1", &request)
+        .expect("valid provider identity")
+        .expect("provider identity");
+    assert_ne!(
+        original.request_fingerprint(),
+        changed_model_policy.request_fingerprint()
+    );
+
+    request.requested_model_policy = None;
     request
         .forward_headers
         .insert("authorization".to_string(), "Bearer token-two".to_string());
@@ -18230,6 +20008,17 @@ async fn provider_task_ref_rejects_a_changed_request() {
         .expect("seed provider run");
 
     request.message = "changed request".to_string();
+    let error = err(svc.stream_chat("user-1".to_string(), request.clone()).await);
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("provider_task_ref_request_mismatch")
+    );
+
+    request.message = "original request".to_string();
+    request.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Auto {
+        strategy: astra_turn_types::AutoModelStrategy::Balanced,
+    });
     let error = err(svc.stream_chat("user-1".to_string(), request).await);
     assert_eq!(error.0, StatusCode::CONFLICT);
     assert_eq!(
@@ -21858,10 +23647,14 @@ async fn active_run_control_watcher_cancels_token_after_slow_durable_poll() {
     let _watcher = start_active_run_control_watcher(
         Some(run_control),
         "user-1".to_string(),
+        "session-1".to_string(),
         "run-1".to_string(),
+        None,
         cancel_flag.clone(),
         pause_flag.clone(),
         cancel_token.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tokio::sync::watch::channel(-1).0,
     )
     .expect("watcher");
 
@@ -21898,10 +23691,14 @@ async fn active_run_control_watcher_sets_pause_without_cancelling_token() {
     let _watcher = start_active_run_control_watcher(
         Some(run_control),
         "user-1".to_string(),
+        "session-1".to_string(),
         "run-1".to_string(),
+        None,
         cancel_flag.clone(),
         pause_flag.clone(),
         cancel_token.clone(),
+        Arc::new(AtomicBool::new(false)),
+        tokio::sync::watch::channel(-1).0,
     )
     .expect("watcher");
 
@@ -21931,10 +23728,14 @@ async fn active_run_control_watcher_times_out_a_hung_provider_and_polls_again() 
     let _watcher = start_active_run_control_watcher(
         Some(run_control),
         "user-1".to_string(),
+        "session-1".to_string(),
         "run-1".to_string(),
+        None,
         cancel_flag,
         pause_flag,
         cancel_token,
+        Arc::new(AtomicBool::new(false)),
+        tokio::sync::watch::channel(-1).0,
     )
     .expect("watcher");
 
@@ -22576,6 +24377,7 @@ fn extract_edge_tools_from_context() {
         json!([{"function": {"name": "bash"}}]),
     );
     let req = ChatRequestData {
+        model_catalog_reader: None,
         message: "hi".into(),
         conversation_authority: None,
         user_intent: None,
@@ -22590,8 +24392,10 @@ fn extract_edge_tools_from_context() {
         full_llm_capture: false,
         agent_id: None,
         model: None,
+        expected_model_name: None,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: None,
+        requested_model_policy: None,
         resolved_model_selection: None,
         admitted_model_execution: None,
         capability_descriptors: None,
@@ -22665,6 +24469,7 @@ fn extract_edge_profile_from_context() {
         }),
     );
     let req = ChatRequestData {
+        model_catalog_reader: None,
         message: "hi".into(),
         conversation_authority: None,
         user_intent: None,
@@ -22679,8 +24484,10 @@ fn extract_edge_profile_from_context() {
         full_llm_capture: false,
         agent_id: None,
         model: None,
+        expected_model_name: None,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: None,
+        requested_model_policy: None,
         resolved_model_selection: None,
         admitted_model_execution: None,
         capability_descriptors: None,
@@ -22757,6 +24564,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
             "same-run",
             None,
             &edge,
+            &constraints,
         )
         .unwrap();
     let messages = vec![
@@ -22766,6 +24574,17 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     facts.messages = messages.clone();
     facts.original.message = "original task".to_string();
     facts.original.user_intent = "original structured intent".to_string();
+    facts.original.delegated_model_requirements =
+        astra_turn_types::DelegationIntentRequirements::Unconstrained {
+            source: astra_turn_types::DelegationUserRequirementSource {
+                user_id: "test-user".into(),
+                session_id: "same-session".into(),
+                session_turn: 7,
+                applied_intent_id: None,
+                command_intent_id: None,
+                user_intent_digest: "original-digest".into(),
+            },
+        };
     facts.original.session_turn = 7;
     facts.original.canonical_turn_chain_id = Some("original-chain".to_string());
     facts.original.root_user_query_event_id = Some("original-query".to_string());
@@ -22883,6 +24702,22 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     assert_eq!(state.messages, messages);
     assert_eq!(state.message, "original task");
     assert_eq!(state.user_intent, "original structured intent");
+    assert_eq!(
+        state
+            .skills
+            .request_constraints
+            .delegated_model_requirements,
+        astra_turn_types::DelegationIntentRequirements::Unconstrained {
+            source: astra_turn_types::DelegationUserRequirementSource {
+                user_id: "test-user".into(),
+                session_id: "same-session".into(),
+                session_turn: 7,
+                applied_intent_id: None,
+                command_intent_id: None,
+                user_intent_digest: "original-digest".into(),
+            },
+        }
+    );
     assert_eq!(state.session_turn, 7);
     assert_eq!(
         state.canonical_turn_chain_id.as_deref(),
@@ -22979,7 +24814,15 @@ fn build_initial_state_shared_assembly_preserves_restored_workspace_evidence() {
     let edge = AgenticRunLifecycleService::extract_edge_context(&request).unwrap();
     let constraints = RequestConstraints::default();
     let mut facts = svc
-        .prepare_initial_execution_facts("user", &request, "session", "run", None, &edge)
+        .prepare_initial_execution_facts(
+            "user",
+            &request,
+            "session",
+            "run",
+            None,
+            &edge,
+            &constraints,
+        )
         .unwrap();
     facts.hooks.workspace_root_hint = Some("/app".into());
     facts.original.canonical_turn_chain_id = Some("chain".into());
@@ -26393,8 +28236,10 @@ async fn durable_create_run_persists_to_store() {
 
 #[tokio::test]
 async fn durable_create_run_eventually_persists_terminal_event() {
-    let (svc, _llm) = terminal_test_service().await;
-    let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
+    let (svc, llm) = terminal_test_service().await;
+    let mut request = test_request("hello");
+    request.interactive_client = true;
+    let run = ok(svc.create_run("user-1".into(), request).await);
 
     let engine = &svc.run_engine;
     let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -26417,12 +28262,54 @@ async fn durable_create_run_eventually_persists_terminal_event() {
     })
     .await
     .expect("timeout waiting for durable run to persist terminal event");
+    assert_eq!(
+        durable.status, STATUS_COMPLETED,
+        "error_code={:?}, error_message={:?}",
+        durable.error_code, durable.error_message
+    );
+    assert!(svc.drain_background_tasks(Duration::from_secs(1)).await);
+    assert!(svc.approval_channels.lock().await.is_empty());
+    assert!(svc.user_prompt_channels.lock().await.is_empty());
+    assert!(svc.progress_channels.lock().await.is_empty());
+    assert!(llm.requests.load(Ordering::SeqCst) > 0);
+    svc.test_inference_ledger
+        .as_ref()
+        .unwrap()
+        .assert_quiescent();
     assert!(
         durable
             .events
             .iter()
             .any(|event| event["event_type"] == "run_finished")
     );
+}
+
+#[tokio::test]
+async fn interactive_provider_failure_cleans_run_channels() {
+    let (svc, llm) = terminal_test_service().await;
+    let svc = svc.with_model_service(Arc::new(ActiveTestModelService::new(format!(
+        "{}/missing",
+        llm.base_url
+    ))));
+    let mut request = test_request("hello");
+    request.interactive_client = true;
+    let run = ok(svc.create_run("user-1".into(), request).await);
+    assert!(svc.drain_background_tasks(Duration::from_secs(10)).await);
+    let durable = svc
+        .run_engine
+        .load_run("user-1", &run.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_FAILED);
+    assert!(svc.approval_channels.lock().await.is_empty());
+    assert!(svc.user_prompt_channels.lock().await.is_empty());
+    assert!(svc.progress_channels.lock().await.is_empty());
+    assert!(llm.requests.load(Ordering::SeqCst) > 0);
+    svc.test_inference_ledger
+        .as_ref()
+        .unwrap()
+        .assert_quiescent();
 }
 
 #[tokio::test]
@@ -28824,14 +30711,17 @@ async fn create_run_token_budget_reject_persists_terminal_events() {
     let svc = test_service()
         .with_resource_governor(Arc::new(DenyTokenBudgetGovernor))
         .with_run_concurrency_limit(1);
-    let run = ok(svc
-        .create_run("user-1".into(), test_request("over budget"))
-        .await);
+    let mut request = test_request("over budget");
+    request.interactive_client = true;
+    let run = ok(svc.create_run("user-1".into(), request).await);
 
     assert!(
         svc.drain_background_tasks(Duration::from_secs(1)).await,
         "budget rejection task should finish promptly"
     );
+    assert!(svc.approval_channels.lock().await.is_empty());
+    assert!(svc.user_prompt_channels.lock().await.is_empty());
+    assert!(svc.progress_channels.lock().await.is_empty());
     let durable = svc
         .run_engine
         .load_run("user-1", &run.run_id)
@@ -28925,9 +30815,9 @@ async fn stream_chat_token_budget_reject_sends_sse_terminal_events() {
     let svc = test_service()
         .with_resource_governor(Arc::new(DenyTokenBudgetGovernor))
         .with_run_concurrency_limit(1);
-    let mut stream = ok(svc
-        .stream_chat("user-1".into(), test_request("over budget"))
-        .await);
+    let mut request = test_request("over budget");
+    request.interactive_client = true;
+    let mut stream = ok(svc.stream_chat("user-1".into(), request).await);
     let mut rx = stream.event_rx.take().expect("stream event receiver");
     let events = tokio::time::timeout(Duration::from_secs(1), async move {
         let mut events = Vec::new();
@@ -28943,6 +30833,9 @@ async fn stream_chat_token_budget_reject_sends_sse_terminal_events() {
         svc.drain_background_tasks(Duration::from_secs(1)).await,
         "budget rejection task should finish promptly"
     );
+    assert!(svc.approval_channels.lock().await.is_empty());
+    assert!(svc.user_prompt_channels.lock().await.is_empty());
+    assert!(svc.progress_channels.lock().await.is_empty());
     assert!(
         events.iter().any(|event| {
             event.get("type").and_then(Value::as_str) == Some("run_error")
@@ -29036,6 +30929,12 @@ async fn create_run_accepts_promptly_while_global_admission_is_busy() {
         "create_run waited for global admission instead of returning promptly"
     );
 
+    {
+        let runs = svc.runs.read().await;
+        let queued = runs.get(&run.run_id).expect("accepted background run");
+        assert!(queued.live_tx.is_none());
+        assert!(queued.attached_event_tx.is_none());
+    }
     let cancelled = svc
         .cancel_run(run.run_id.clone(), "user-1".into())
         .await
@@ -29146,6 +31045,12 @@ async fn stream_chat_accepts_promptly_while_global_admission_is_busy_and_cancell
         "stream response waited for global admission instead of returning promptly"
     );
 
+    {
+        let runs = svc.runs.read().await;
+        let queued = runs.get(&stream.run_id).expect("accepted streaming run");
+        assert!(queued.live_tx.is_some());
+        assert!(queued.attached_event_tx.is_some());
+    }
     let run_id = stream.run_id.clone();
     let mut events = stream.event_rx.take().expect("stream receiver");
     let cancelled = svc
@@ -29308,21 +31213,28 @@ async fn drain_background_tasks_returns_immediately_when_idle() {
 /// P0-C: background_task_count increments on spawn and decrements on exit.
 #[tokio::test]
 async fn background_task_count_tracks_spawned_tasks() {
-    use std::sync::atomic::Ordering;
     let count = Arc::new(AtomicUsize::new(0));
-    let count_clone = Arc::clone(&count);
+    let guard = TaskCountGuard::new(Arc::clone(&count));
+    let unpolled = async move {
+        let _guard = guard;
+    };
+    assert_eq!(count.load(Ordering::Acquire), 1);
+    drop(unpolled);
+    assert_eq!(count.load(Ordering::Acquire), 0);
 
-    // Simulate what the spawn does: increment, spawn, decrement on drop
-    count.fetch_add(1, Ordering::Release);
+    let guard = TaskCountGuard::new(Arc::clone(&count));
+    let aborted = tokio::spawn(async move {
+        let _guard = guard;
+        std::future::pending::<()>().await;
+    });
+    aborted.abort();
+    assert!(aborted.await.unwrap_err().is_cancelled());
+    assert_eq!(count.load(Ordering::Acquire), 0);
+
+    let guard = TaskCountGuard::new(Arc::clone(&count));
     let handle = tokio::spawn(async move {
-        struct Guard(Arc<AtomicUsize>);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::Release);
-            }
-        }
-        let _g = Guard(count_clone);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _guard = guard;
+        tokio::task::yield_now().await;
     });
 
     assert_eq!(count.load(Ordering::Acquire), 1, "task in flight");
@@ -29579,6 +31491,67 @@ async fn run_semaphore_limit_two() {
         .expect("re-acquire after one drop");
     drop(p2);
     drop(p3);
+}
+
+/// A parked run does not monopolize execution capacity; waking is not a
+/// shortcut around the same semaphore used by independent runs.
+#[tokio::test]
+async fn parked_execution_releases_capacity_and_reenters_fair_admission() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let initial = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+    let mut capacity = RunExecutionCapacity::new(
+        Arc::clone(&semaphore),
+        None,
+        CancellationToken::new(),
+        initial,
+    );
+    capacity.release();
+
+    let independent = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+    let mut waiter = tokio::spawn(async move {
+        capacity.reacquire().await.unwrap();
+        capacity
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut waiter)
+            .await
+            .is_err(),
+        "woken run must not bypass another run's execution slot"
+    );
+    drop(independent);
+    let mut capacity = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("woken run should re-enter admission")
+        .unwrap();
+    assert_eq!(semaphore.available_permits(), 0);
+    capacity.release();
+    assert_eq!(semaphore.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn server_root_mailbox_survives_profile_change_between_turns() {
+    let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+        Arc::new(astra_messaging::InProcessTransport::new()),
+        Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
+    ));
+    let mut first = crate::turn::agentic_loop::host::make_test_loop_state();
+    install_server_root_mailbox(&mut first, &router, "session", "turn-plan", "planner").await;
+    let stable = first.messaging.mailbox.as_ref().unwrap().address.clone();
+    assert_eq!(stable.agent_id, "root-agent");
+    park_server_root_mailbox(&mut first).await;
+
+    let mut second = crate::turn::agentic_loop::host::make_test_loop_state();
+    install_server_root_mailbox(&mut second, &router, "session", "turn-review", "reviewer").await;
+    assert_eq!(second.messaging.mailbox.as_ref().unwrap().address, stable);
+    assert_eq!(
+        router.sender_address("turn-plan", "planner").await,
+        Some(stable.clone())
+    );
+    assert_eq!(
+        router.sender_address("turn-review", "reviewer").await,
+        Some(stable)
+    );
+    park_server_root_mailbox(&mut second).await;
 }
 
 /// Admission with timeout: `acquire_owned` + `timeout` rejects after

@@ -14,6 +14,23 @@ The multi-agent runtime defines how multiple agents cooperate under the same bac
 - Parallelism is bounded and observable.
 - Child failure should be isolated unless parent policy requires fail-fast.
 
+## Coordination receipts and child outcomes
+
+Agent-tool results distinguish accepted coordination from child execution
+outcomes through one shared, typed result-family contract. Starting concurrent
+work, admitting a wait, queuing a message, or listing children does not prove
+that a child completed. An accepted control receipt is neutral coordination:
+it neither creates a failed-child obligation nor supplies positive validation
+evidence. Child results retain their terminal status and output requirements.
+
+Malformed, unknown, rejected, or uncertain-delivery receipts must not gain
+accepted-control authority. Existing run/call ownership checks, child completion
+barriers, reply obligations, and Work settlement remain authoritative. Evaluation,
+recovery, and Server result projection consume the same classification; a later
+control receipt cannot erase an unrelated failed verification.
+An observation error does not establish child termination or release ownership.
+Presentation windows preserve the typed child envelope and pagination authority.
+
 Model-authored child sizing (`complexity` and `initial_turns`) selects only an
 initial, renewable execution slice. It is not a user-owned hard limit: a parent
 model cannot stop a child after an arbitrary number of rounds. Explicit
@@ -100,15 +117,33 @@ summary
 
 Delegated agents do not inherit unlimited authority. Capabilities are bounded
 by the delegation request, parent authorization, provider availability, and
-runtime policy. In a wildcard `read_only` delegation, `read_only` blocks
-workspace mutation; it does not by itself block network reads whose canonical
-tool effects declare no workspace writes, credentials, process spawning, or
-external mutation. Those tools remain subject to the parent's enabled-tool
-constraints and the child's actual provider/runtime admission. When the parent
+runtime policy. A wildcard `read_only` delegation inherits the parent's tool
+scope. `read_only` is workspace authority, not a second tool-name allowlist:
+the child's read-only execution binding rejects tools that declare a writable
+workspace requirement while discovery, coordination, and other
+parent-authorized capabilities remain subject to their own provider/runtime
+admission and enabled-tool constraints. Shell commands and external services
+are not made side-effect-free by this tool projection; they require their own
+execution and effect boundaries. When the parent
 has an explicit enabled-capability set, a child allowlist may include registered
 core tools or capabilities explicitly enabled by the parent; unknown names are
 rejected before dispatch. Dynamic capabilities must be present in that explicit
 parent set. A legacy unrestricted parent context retains its existing behavior.
+
+For a Server fanout with explicit child models, the runtime validates every
+slot before launching any child, admits the distinct non-inherited Offerings as
+one bounded user-scoped batch, and binds each admitted execution to its slot.
+An inherited parent Offering reuses the parent's admission without another
+catalog read. Any invalid or revoked slot fails preparation for the entire
+fanout; admission does not authorize a partial launch.
+CLI fanout uses the same Server-owned check through one `/model-access/admit`
+request when slots explicitly select a model or reasoning control. The response
+contains only display name and context-window metadata; it is not a reusable
+authorization token, and inference still revalidates the Offering. An
+inherited-only CLI batch keeps its existing single catalog lookup. A mixed
+batch with inherited slots requires the parent's exact Offering identity;
+without it, preparation fails before remote I/O instead of guessing from a
+display name.
 
 ## Result integration
 

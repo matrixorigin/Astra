@@ -56,6 +56,8 @@ pub use astra_skills::traits::{ResolvedSkill, SkillResolver, SkillToolInfo};
 /// Built at execution time from the agentic loop state.
 #[derive(Clone, Default)]
 pub struct SkillContext {
+    /// Trusted execution ceiling, never populated from skill arguments.
+    pub read_only_execution: bool,
     /// Current session identifier.
     pub session_id: Option<String>,
     /// Directory where session artifacts are stored.
@@ -699,8 +701,10 @@ pub fn skill_tool_schema_v2() -> Value {
                 "Execute a skill from the <available_skills> system listing. \
                  Call it only when the user's request matches a skill whose \
                  canonical name or alias appears literally in that listing; \
-                 never invent or infer a skill name. When it matches, call this \
-                 tool before any other tool or substantive response. \
+                 never invent or infer a skill name. For work this agent owns, \
+                 call a matching skill before substantive work on that objective. \
+                 If a child owns the objective, launch it first and let the child \
+                 load its own skills. \
                  `skill_name` is the listed canonical name or alias. `task` is optional \
                  extra context; omit to use the current conversation. On seeing \
                  `<skill-loaded name=\"...\"/>` in a tool result, follow that \
@@ -785,18 +789,11 @@ pub async fn execute_skill_inline(
     resolver: &dyn SkillResolver,
     _tool_name: &str,
     args: &Value,
+    skill_ctx: &SkillContext,
 ) -> SkillCallResult {
     let skill_name = args.get("skill_name").and_then(Value::as_str).unwrap_or("");
     let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
-    execute_skill(
-        resolver,
-        None,
-        skill_name,
-        task_hint,
-        None,
-        &SkillContext::default(),
-    )
-    .await
+    execute_skill(resolver, None, skill_name, task_hint, None, skill_ctx).await
 }
 
 pub async fn execute_skill_direct(
@@ -1951,6 +1948,7 @@ fn execute_skill_with_origin<'a>(
                 }
 
                 let is_mcp = skill.source == SkillSourceKind::Mcp;
+                let skip_effectful_hooks = is_mcp || skill_ctx.read_only_execution;
 
                 // MCP sandbox: block inline shell commands from untrusted sources.
                 if is_mcp && crate::skills::has_inline_shell(&skill.instructions) {
@@ -1966,9 +1964,20 @@ fn execute_skill_with_origin<'a>(
                 }
 
                 // Run pre-invocation hooks exactly once before any execution path.
-                run_hooks(&skill.hooks.pre_invoke, is_mcp);
+                run_hooks(&skill.hooks.pre_invoke, skip_effectful_hooks);
 
                 // Remote execution: dispatch to external endpoint.
+                if skill_ctx.read_only_execution && skill.remote_url.is_some() {
+                    return SkillCallResult {
+                        output: format!(
+                            "Remote skill '{}' is unavailable in a read-only child",
+                            skill_name
+                        ),
+                        success: false,
+                        activation: None,
+                        verification: None,
+                    };
+                }
                 if let Some(remote_url) = skill.remote_url.as_deref() {
                     match execute_remote_skill(remote_url, &skill, task_hint, skill_ctx).await {
                         Ok(remote_output) => {
@@ -1977,7 +1986,7 @@ fn execute_skill_with_origin<'a>(
                                 remote_output.text,
                                 remote_output.payload_json.as_ref(),
                             );
-                            run_hooks(&skill.hooks.post_invoke, is_mcp);
+                            run_hooks(&skill.hooks.post_invoke, skip_effectful_hooks);
                             return SkillCallResult {
                                 output,
                                 success: verification
@@ -1989,7 +1998,7 @@ fn execute_skill_with_origin<'a>(
                             };
                         }
                         Err(err) => {
-                            run_hooks(&skill.hooks.on_error, is_mcp);
+                            run_hooks(&skill.hooks.on_error, skip_effectful_hooks);
                             return SkillCallResult {
                                 output: format!("Remote skill '{}' failed: {err}", skill_name),
                                 success: false,
@@ -2045,7 +2054,7 @@ fn execute_skill_with_origin<'a>(
                         };
                         match exec.execute(&loaded, &ctx).await {
                             Ok(result) => {
-                                run_hooks(&skill.hooks.post_invoke, is_mcp);
+                                run_hooks(&skill.hooks.post_invoke, skip_effectful_hooks);
 
                                 // `success` is the typed child-run completion
                                 // contract.  Do not promote partial output from
@@ -2055,55 +2064,52 @@ fn execute_skill_with_origin<'a>(
                                 let execution_succeeded = result.success;
 
                                 // Post-execution verification (fork skills only)
-                                let (output, verification) = if execution_succeeded
-                                    && !skill.success_criteria.is_empty()
-                                {
-                                    let work_dir = skill
-                                        .skill_dir
-                                        .as_ref()
-                                        .map(std::path::PathBuf::from)
-                                        .unwrap_or_else(|| {
-                                            std::env::current_dir().unwrap_or_default()
-                                        });
-                                    let verifier =
-                                        astra_skills::verify::SkillVerifier::new(work_dir);
-                                    let mut manifest = SkillManifest::default();
-                                    // success_criteria is already Vec<serde_json::Value>
-                                    manifest.success_criteria = skill.success_criteria.clone();
-                                    let (all_passed, results) = verifier.verify(&manifest).await;
+                                let (output, verification) =
+                                    if execution_succeeded && !skill.success_criteria.is_empty() {
+                                        let work_dir = skill
+                                            .skill_dir
+                                            .as_ref()
+                                            .map(std::path::PathBuf::from)
+                                            .unwrap_or_else(|| {
+                                                std::env::current_dir().unwrap_or_default()
+                                            });
+                                        let (all_passed, results) =
+                                            astra_services::VerificationRunner::new(work_dir)
+                                                .run_criteria(&skill.success_criteria)
+                                                .await;
 
-                                    let mut output = result.output;
-                                    if !results.is_empty() {
-                                        output.push_str("\n\n---\n**Verification Results:**\n");
-                                        for r in &results {
-                                            let icon = if r.passed { "✅" } else { "❌" };
-                                            output.push_str(&format!(
-                                                "- {} {} ({}ms){}\n",
-                                                icon,
-                                                r.criterion_id,
-                                                r.duration_ms,
-                                                if let Some(ref err) = r.error {
-                                                    format!(" — {err}")
-                                                } else {
-                                                    String::new()
-                                                }
-                                            ));
-                                        }
-                                        if !all_passed {
-                                            output.push_str(
+                                        let mut output = result.output;
+                                        if !results.is_empty() {
+                                            output.push_str("\n\n---\n**Verification Results:**\n");
+                                            for r in &results {
+                                                let icon = if r.passed { "✅" } else { "❌" };
+                                                output.push_str(&format!(
+                                                    "- {} {} ({}ms){}\n",
+                                                    icon,
+                                                    r.criterion_id,
+                                                    r.duration_ms,
+                                                    if let Some(ref err) = r.error {
+                                                        format!(" — {err}")
+                                                    } else {
+                                                        String::new()
+                                                    }
+                                                ));
+                                            }
+                                            if !all_passed {
+                                                output.push_str(
                                             "\n⚠️ Some required verification criteria failed.\n",
                                         );
+                                            }
                                         }
-                                    }
-                                    (
-                                        output,
-                                        Some(SkillVerificationOutcome {
-                                            all_required_passed: all_passed,
-                                        }),
-                                    )
-                                } else {
-                                    (result.output, None)
-                                };
+                                        (
+                                            output,
+                                            Some(SkillVerificationOutcome {
+                                                all_required_passed: all_passed,
+                                            }),
+                                        )
+                                    } else {
+                                        (result.output, None)
+                                    };
 
                                 return SkillCallResult {
                                     output,
@@ -2123,7 +2129,7 @@ fn execute_skill_with_origin<'a>(
                                     skill_name, e
                                 );
                                 // pre_invoke already ran; notify lifecycle hooks, then fall back to inline.
-                                run_hooks(&skill.hooks.on_error, is_mcp);
+                                run_hooks(&skill.hooks.on_error, skip_effectful_hooks);
                             }
                         }
                     }
@@ -2158,7 +2164,7 @@ fn execute_skill_with_origin<'a>(
                 }
 
                 // Run post-invocation hooks (skipped for MCP)
-                run_hooks(&skill.hooks.post_invoke, is_mcp);
+                run_hooks(&skill.hooks.post_invoke, skip_effectful_hooks);
 
                 SkillCallResult {
                     output,
@@ -2180,14 +2186,13 @@ fn execute_skill_with_origin<'a>(
 /// Execute hook actions synchronously. Shell commands are run with best-effort
 /// (failures are logged but don't abort skill execution).
 ///
-/// When `skip_shell` is true (MCP skills), shell hooks are silently skipped
-/// to prevent untrusted skill definitions from executing arbitrary commands.
-fn run_hooks(actions: &[HookAction], skip_shell: bool) {
+/// Effectful hooks are unavailable for untrusted or read-only execution.
+fn run_hooks(actions: &[HookAction], skip_effectful: bool) {
     for action in actions {
         match action {
             HookAction::Shell { command } => {
-                if skip_shell {
-                    eprintln!("  ⚠ Skipping shell hook for MCP skill: {command}");
+                if skip_effectful {
+                    eprintln!("  ⚠ Skipping shell hook in restricted skill execution");
                     continue;
                 }
                 match std::process::Command::new("sh")
@@ -2206,8 +2211,8 @@ fn run_hooks(actions: &[HookAction], skip_shell: bool) {
                 }
             }
             HookAction::SetEnv { key, value } => {
-                if skip_shell {
-                    eprintln!("  ⚠ Skipping set_env hook for MCP skill: {key}={value}");
+                if skip_effectful {
+                    eprintln!("  ⚠ Skipping set_env hook in restricted skill execution");
                     continue;
                 }
                 astra_core::session_env_overlay::set(key, value);
@@ -2282,6 +2287,19 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn read_only_skill_hook_does_not_execute_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("hook-ran");
+        let hook = HookAction::Shell {
+            command: format!("touch '{}'", marker.display()),
+        };
+        run_hooks(&[hook.clone()], true);
+        assert!(!marker.exists());
+        run_hooks(&[hook], false);
+        assert!(marker.exists());
+    }
 
     /// Stub resolver for tests.
     struct StubResolver {
@@ -3956,6 +3974,7 @@ mod tests {
 
         struct ForkResolver {
             skill_dir: String,
+            criterion: Value,
         }
 
         impl SkillResolver for ForkResolver {
@@ -3969,17 +3988,7 @@ mod tests {
                     hooks: crate::skills::hooks::SkillHooks::default(),
                     skill_dir: Some(self.skill_dir.clone()),
                     source: SkillSourceKind::Local,
-                    success_criteria: vec![serde_json::json!({
-                        "id": "output-exists",
-                        "description": "Output file exists",
-                        "verifier": {
-                            "kind": "file_exists",
-                            "paths": ["output.txt"]
-                        },
-                        "required": true,
-                        "timeout_sec": 5,
-                        "global_only": false
-                    })],
+                    success_criteria: vec![self.criterion.clone()],
                     composition: None,
                     input_schema: None,
                     output_schema: None,
@@ -4027,25 +4036,47 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("output.txt"), "ok").unwrap();
-        let resolver = ForkResolver {
-            skill_dir: dir.path().to_string_lossy().into_owned(),
-        };
         let executor: Arc<dyn SkillExecutor> = Arc::new(StubExecutor);
-
-        let r = execute_skill(
-            &resolver,
-            Some(&executor),
-            "fork-verify",
-            "",
-            None,
-            &SkillContext::default(),
-        )
-        .await;
-
-        assert!(r.output.contains("Verification Results:"));
-        assert!(r.activation.is_some());
-        let verification = r.verification.expect("expected verification outcome");
-        assert!(verification.all_required_passed);
+        let check = |verifier: Value| {
+            serde_json::json!({
+                "id": "acceptance", "description": "Acceptance check",
+                "verifier": verifier, "required": true, "timeout_sec": 5
+            })
+        };
+        for verifier in [
+            serde_json::json!({"kind": "file_exists", "paths": ["output.txt"]}),
+            serde_json::json!({"kind": "command", "cmd": "touch marker"}),
+            serde_json::json!({"kind": "composite", "criteria": [check(
+                serde_json::json!({"kind": "command", "cmd": "touch marker"})
+            )]}),
+        ] {
+            let expected = verifier["kind"] == "file_exists";
+            let resolver = ForkResolver {
+                skill_dir: dir.path().to_string_lossy().into_owned(),
+                criterion: check(verifier),
+            };
+            for read_only_execution in [false, true] {
+                let r = execute_skill(
+                    &resolver,
+                    Some(&executor),
+                    "fork-verify",
+                    "",
+                    None,
+                    &SkillContext {
+                        read_only_execution,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                assert!(r.output.contains("Verification Results:"));
+                assert!(r.activation.is_some());
+                assert_eq!(r.verification.unwrap().all_required_passed, expected);
+                assert!(!dir.path().join("marker").exists());
+                if !expected {
+                    assert!(r.output.contains("authorized tool provider"));
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -4138,6 +4169,7 @@ mod tests {
     #[test]
     fn skill_context_as_substitution_vars() {
         let ctx = SkillContext {
+            read_only_execution: false,
             session_id: Some("sess-42".into()),
             session_dir: Some("/tmp/sessions/42".into()),
             work_dir: Some("/home/user/project".into()),

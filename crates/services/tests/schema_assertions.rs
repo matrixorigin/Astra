@@ -68,14 +68,27 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
             "missing live table: {expected}"
         );
     }
-    for retired in ["work_plan_proposal_sequences", "work_plan_proposals"] {
+    for retired in [
+        "work_plan_proposal_sequences",
+        "work_plan_proposals",
+        "harness_runs",
+        "harness_items",
+        "harness_skill_drafts",
+        "harness_skill_rules",
+        "harness_citations",
+        "eval_gate_results",
+        "eval_quality_assessments",
+        "eval_calibration_assessments",
+        "eval_training_datasets",
+        "eval_user_feedback",
+    ] {
         assert!(
             !contracts.iter().any(|table| table.name == retired),
-            "type-specific proposal table must not become a second schema owner: {retired}"
+            "retired table must not remain in schema authority: {retired}"
         );
         assert!(
             !existing.contains(retired),
-            "retired proposal table must not survive the clean schema cut: {retired}"
+            "retired table must not survive the clean schema cut: {retired}"
         );
     }
     assert!(
@@ -491,11 +504,6 @@ async fn schema_rationalization_runtime_contract() {
         "model request metric totals must remain bounded to explicit low-cardinality dimensions"
     );
     assert_eq!(
-        primary_key_columns(&pool, &schema, "eval_calibration_assessments").await,
-        ["user_id", "calibration_id"],
-        "eval_calibration_assessments identity must be owner-bound"
-    );
-    assert_eq!(
         primary_key_columns(&pool, &schema, "agent_sessions").await,
         ["user_id", "session_id"],
         "agent_sessions primary key must carry the owner boundary"
@@ -608,20 +616,6 @@ async fn schema_rationalization_runtime_contract() {
         "edge registry identity must be owner-bound so registry_id lookups never scan across tenants"
     );
 
-    for table in [
-        "harness_items",
-        "harness_skill_drafts",
-        "harness_skill_rules",
-    ] {
-        let columns = column_names(&pool, &schema, table).await;
-        assert!(
-            columns
-                .iter()
-                .any(|column| column == "decision_history_json"),
-            "{table} must retain inline decision history"
-        );
-    }
-
     let harness_snapshots = column_names(&pool, &schema, "harness_snapshots").await;
     for expected in [
         "user_id",
@@ -686,71 +680,10 @@ async fn schema_rationalization_runtime_contract() {
         );
     }
 
-    let harness_runs = column_names(&pool, &schema, "harness_runs").await;
-    for expected in ["harness_run_id", "user_id", "session_id", "updated_at"] {
-        assert!(
-            harness_runs.iter().any(|column| column == expected),
-            "harness_runs missing {expected}"
-        );
-    }
     assert_eq!(
         primary_key_columns(&pool, &schema, "run_display_projections").await,
         ["user_id", "run_id"],
         "run_display_projections primary key must carry the owner boundary"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "harness_runs",
-            "idx_harness_runs_owner_session_updated"
-        )
-        .await,
-        ["user_id", "session_id", "updated_at"],
-        "harness run session lifecycle paths must be owner/session scoped"
-    );
-    assert!(
-        index_columns(&pool, &schema, "harness_runs", "idx_harness_runs_session")
-            .await
-            .is_empty(),
-        "harness_runs must not keep ownerless session index idx_harness_runs_session"
-    );
-
-    let citation_columns = column_names(&pool, &schema, "harness_citations").await;
-    for expected in [
-        "source_snapshot_ref",
-        "source_content_hash",
-        "source_metadata_json",
-    ] {
-        assert!(
-            citation_columns.iter().any(|column| column == expected),
-            "harness_citations missing {expected}"
-        );
-    }
-
-    let eval_feedback = column_names(&pool, &schema, "eval_user_feedback").await;
-    for expected in ["feedback_id", "user_id", "session_id", "created_at"] {
-        assert!(
-            eval_feedback.iter().any(|column| column == expected),
-            "eval_user_feedback missing {expected}"
-        );
-    }
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "eval_user_feedback",
-            "idx_euf_owner_session_created"
-        )
-        .await,
-        ["user_id", "session_id", "created_at"],
-        "feedback session cleanup must be owner/session scoped"
-    );
-    assert!(
-        index_columns(&pool, &schema, "eval_user_feedback", "idx_euf_session")
-            .await
-            .is_empty(),
-        "eval_user_feedback must not keep ownerless session index idx_euf_session"
     );
 }
 
@@ -990,57 +923,6 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
             .unwrap_or_else(|| panic!("missing lifecycle contract for {table}"));
         assert_eq!(contract.owner, "work", "{table} must have one Work owner");
     }
-}
-
-#[tokio::test]
-#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn evaluation_schema_supports_calibration_reads() {
-    let pool = common::setup_pool().await;
-    let schema = current_schema(&pool).await;
-
-    let calibration = column_names(&pool, &schema, "eval_calibration_assessments").await;
-    for expected in [
-        "calibration_id",
-        "user_id",
-        "agent_id",
-        "session_id",
-        "confidence",
-        "quality_score",
-        "created_at",
-    ] {
-        assert!(
-            calibration.iter().any(|column| column == expected),
-            "eval_calibration_assessments missing {expected}"
-        );
-    }
-    assert_eq!(
-        column_character_maximum_length(&pool, &schema, "eval_calibration_assessments", "user_id")
-            .await,
-        Some(128),
-        "eval_calibration_assessments.user_id must use the standard owner width"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "eval_calibration_assessments",
-            "idx_eval_calibration_user_created"
-        )
-        .await,
-        ["user_id", "created_at"],
-        "calibration reads without agent_id must use user/created ordering"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "eval_calibration_assessments",
-            "idx_eval_calibration_user_agent_created"
-        )
-        .await,
-        ["user_id", "agent_id", "created_at"],
-        "calibration reads with agent_id must use user/agent/created ordering"
-    );
 }
 
 async fn current_schema(pool: &astra_core::SharedPool) -> String {

@@ -407,6 +407,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 pub struct ToolEventHookRegistry {
     hooks: Vec<ToolEventHook>,
     execution: Arc<Mutex<ToolHookExecution>>,
+    execution_disabled: bool,
 }
 
 #[derive(Debug, Default)]
@@ -478,7 +479,12 @@ impl ToolEventHookRegistry {
         Self {
             hooks,
             execution: Arc::default(),
+            execution_disabled: false,
         }
+    }
+
+    pub fn disable_execution(&mut self) {
+        self.execution_disabled = true;
     }
 
     pub fn capture_continuation(&self) -> Result<ToolHookContinuation, HookContinuationError> {
@@ -553,6 +559,9 @@ impl ToolEventHookRegistry {
         event: ToolEventKind,
         tool_name: &str,
     ) -> Vec<(usize, &ToolEventHook)> {
+        if self.execution_disabled {
+            return Vec::new();
+        }
         let mut execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
         let mut result: Vec<(usize, &ToolEventHook)> = self
             .hooks
@@ -595,11 +604,15 @@ impl ToolEventHookRegistry {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.hooks.is_empty()
+        self.execution_disabled || self.hooks.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.hooks.len()
+        if self.execution_disabled {
+            0
+        } else {
+            self.hooks.len()
+        }
     }
 
     fn note_hook_success(&self, index: usize) {
@@ -1590,6 +1603,7 @@ pub struct SessionHookOutput {
 pub struct SessionEventHookRegistry {
     hooks: Vec<SessionEventHook>,
     execution: Mutex<SessionHookExecution>,
+    execution_disabled: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1659,7 +1673,12 @@ impl SessionEventHookRegistry {
         Self {
             hooks,
             execution: Mutex::default(),
+            execution_disabled: false,
         }
+    }
+
+    pub fn disable_execution(&mut self) {
+        self.execution_disabled = true;
     }
 
     /// Call only after the environment output has actually been applied.
@@ -1704,6 +1723,9 @@ impl SessionEventHookRegistry {
 
     /// Return all hooks matching the given event, sorted by priority and filtered by `once`.
     pub fn matching(&self, event: SessionEvent) -> Vec<&SessionEventHook> {
+        if self.execution_disabled {
+            return Vec::new();
+        }
         let execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
         let mut result: Vec<(usize, &SessionEventHook)> = self
             .hooks
@@ -1731,15 +1753,19 @@ impl SessionEventHookRegistry {
 
     /// Check if any hooks exist for the given event (no allocation).
     pub fn has_event(&self, event: SessionEvent) -> bool {
-        self.hooks.iter().any(|h| h.event == event)
+        !self.execution_disabled && self.hooks.iter().any(|h| h.event == event)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.hooks.is_empty()
+        self.execution_disabled || self.hooks.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.hooks.len()
+        if self.execution_disabled {
+            0
+        } else {
+            self.hooks.len()
+        }
     }
 }
 
@@ -3605,6 +3631,45 @@ mod tests {
         )
         .await;
         assert_eq!(output.context.as_deref(), Some("Welcome back, user!"));
+    }
+
+    #[tokio::test]
+    async fn disabled_registries_never_execute_project_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("hook-ran");
+        let command = format!("touch '{}'", marker.display());
+        let mut tools = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "read_file".into(),
+            action: HookAction::Shell {
+                command: command.clone(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+        let mut sessions = SessionEventHookRegistry::new(vec![SessionEventHook {
+            event: SessionEvent::SessionStart,
+            action: HookAction::Shell { command },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+        tools.disable_execution();
+        sessions.disable_execution();
+        assert!(tools.is_empty());
+        assert!(sessions.is_empty());
+        assert_eq!(
+            evaluate_pre_tool_hooks(&tools, "read_file", &serde_json::json!({})).await,
+            PreToolDecision::Allow
+        );
+        let output = evaluate_session_hooks(&sessions, SessionEvent::SessionStart, "s", None).await;
+        assert!(output.context.is_none());
+        assert!(!marker.exists());
     }
 
     #[tokio::test]

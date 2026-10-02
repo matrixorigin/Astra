@@ -2,6 +2,7 @@ mod common;
 
 use std::sync::Arc;
 
+use astra_services::models::ModelUpdateRequestData;
 use astra_services::{
     DatabaseModelService, FernetTokenEncryptor, ModelAccessKind, ModelOfferingResolutionError,
     ModelService, resolve_active_llm_offering, revalidate_active_llm_offering,
@@ -31,6 +32,199 @@ async fn seed_model(pool: &sqlx::Pool<sqlx::MySql>, model_name: &str) -> String 
     .await
     .expect("seed model");
     model_id
+}
+
+#[tokio::test]
+#[ignore = "requires a dedicated live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn configured_catalog_price_matches_full_and_paginated_reads() {
+    let (shared_pool, settings) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get().clone();
+    let model_name = format!("catalog_price_{}", Uuid::new_v4().simple());
+    let model_id = seed_model(&pool, &model_name).await;
+    sqlx::query("UPDATE infra_llm_models SET pricing = ?, updated_at = ? WHERE model_id = ?")
+        .bind(r#"{"currency":"USD","unit":"per_token","prompt":0,"completion":0.000002,"cache_read":0.0000002}"#)
+        .bind("2026-09-23 12:00:00.000000")
+        .bind(&model_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let service = DatabaseModelService::new(
+        settings,
+        Arc::new(FernetTokenEncryptor::new("catalog-price-db-it-key").unwrap()),
+    )
+    .with_pool(shared_pool);
+    let full = service.list_models(String::new(), true).await.unwrap();
+    let full_item = full
+        .iter()
+        .find(|item| item.offering_id == model_id)
+        .unwrap();
+    let mut cursor = None;
+    let page_item = loop {
+        let page = service
+            .list_models_page(String::new(), true, 16, cursor)
+            .await
+            .unwrap();
+        if let Some(item) = page
+            .items
+            .into_iter()
+            .find(|item| item.offering_id == model_id)
+        {
+            break item;
+        }
+        cursor = page.next_cursor;
+        assert!(
+            cursor.is_some(),
+            "seeded Offering must be present in complete catalog"
+        );
+    };
+    assert_eq!(full_item.pricing, page_item.pricing);
+    let price = page_item.pricing.unwrap();
+    assert_eq!(price.prompt, 0.0);
+    assert_eq!(price.completion, 0.000002);
+    assert_eq!(price.cache_read, Some(0.0000002));
+    assert_eq!(price.cache_write, None);
+    assert_eq!(price.configuration_updated_at, "2026-09-23 12:00:00.000000");
+
+    sqlx::query("UPDATE infra_llm_models SET pricing = ? WHERE model_id = ?")
+        .bind(r#"{"prompt":0,"completion":0}"#)
+        .bind(&model_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    service
+        .update_model(
+            model_name,
+            ModelUpdateRequestData {
+                api_key: None,
+                base_url: None,
+                provider: None,
+                description: Some("unrelated description change".into()),
+                context_window: None,
+                max_completion_tokens: None,
+                input_modalities: None,
+                output_modalities: None,
+                supported_parameters: None,
+                pricing: None,
+                architecture: None,
+                tags: None,
+                is_active: None,
+                quirks: None,
+            },
+        )
+        .await
+        .unwrap();
+    let updated = service.list_models(String::new(), true).await.unwrap();
+    assert!(
+        updated
+            .iter()
+            .find(|item| item.offering_id == model_id)
+            .unwrap()
+            .pricing
+            .is_none()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a dedicated live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn batch_admission_is_ordered_owner_scoped_and_fresh() {
+    let (shared_pool, settings) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get().clone();
+    let encryptor = FernetTokenEncryptor::new("batch-admission-db-it-key").unwrap();
+    let owner = format!("batch_owner_{}", Uuid::new_v4().simple());
+    let other = format!("batch_other_{}", Uuid::new_v4().simple());
+    let infra_a = seed_model(&pool, &format!("batch_a_{}", Uuid::new_v4().simple())).await;
+    let infra_b = seed_model(&pool, &format!("batch_b_{}", Uuid::new_v4().simple())).await;
+    for (id, secret) in [(&infra_a, "infra-a-secret"), (&infra_b, "infra-b-secret")] {
+        sqlx::query("UPDATE infra_llm_models SET api_key_encrypted = ? WHERE model_id = ?")
+            .bind(encryptor.encrypt(secret).unwrap())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let personal = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO user_llm_models \
+         (model_id, user_id, model_alias, model_name, provider, api_key_encrypted, base_url, \
+          context_window, is_default, is_active) \
+         VALUES (?, ?, 'batch-personal', 'deepseek-chat', 'deepseek', ?, \
+          'https://api.deepseek.com', 128000, 0, 1)",
+    )
+    .bind(&personal)
+    .bind(&owner)
+    .bind(encryptor.encrypt("personal-secret").unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let service = DatabaseModelService::new(settings, Arc::new(encryptor)).with_pool(shared_pool);
+    let requested = vec![
+        infra_a.clone(),
+        personal.clone(),
+        infra_b.clone(),
+        personal.clone(),
+    ];
+    let admitted = service
+        .admit_model_offerings(owner.clone(), requested.clone())
+        .await
+        .expect("one batch admits each distinct authorized Offering");
+    assert_eq!(
+        admitted
+            .iter()
+            .map(|item| item.offering_id.as_str())
+            .collect::<Vec<_>>(),
+        requested.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    assert_eq!(admitted[0].api_key, "infra-a-secret");
+    assert_eq!(admitted[1].api_key, "personal-secret");
+    assert_eq!(admitted[2].api_key, "infra-b-secret");
+    assert_eq!(
+        admitted[1], admitted[3],
+        "duplicate Offering reuses one result"
+    );
+    assert!(!format!("{admitted:?}").contains("personal-secret"));
+
+    let other_error = service
+        .admit_model_offerings(other, vec![personal.clone()])
+        .await
+        .expect_err("a different owner cannot admit the personal Offering");
+    let scalar_error = service
+        .admit_model_offering("not-the-owner".into(), personal.clone())
+        .await
+        .expect_err("scalar owner isolation is the reference contract");
+    assert_eq!(other_error.0, scalar_error.0);
+    assert_eq!(other_error.1.error_code, scalar_error.1.error_code);
+
+    sqlx::query("UPDATE user_llm_models SET is_active = 0 WHERE user_id = ? AND model_id = ?")
+        .bind(&owner)
+        .bind(&personal)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error = service
+        .admit_model_offerings(owner.clone(), requested)
+        .await
+        .expect_err("inactive final personal Offering rejects all batch results");
+    assert_eq!(error.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        error.1.error_code.as_deref(),
+        Some("model_offering_unavailable")
+    );
+    sqlx::query("DELETE FROM user_llm_models WHERE user_id = ? AND model_id = ?")
+        .bind(&owner)
+        .bind(&personal)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for id in [infra_a, infra_b] {
+        sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -468,6 +662,47 @@ async fn compatible_byok_admission_rechecks_trust_and_owner() {
         .unwrap();
     assert_eq!(admitted.wire_model_name.as_deref(), Some("upstream-model"));
     assert_eq!(admitted.provider, "openai-compatible");
+    let second_model_id = Uuid::new_v4().to_string();
+    let second_host = format!("{}.example.com", Uuid::new_v4().simple());
+    let second_domain_id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO user_llm_models (model_id, user_id, model_alias, model_name, provider, api_key_encrypted, base_url, context_window, is_default, is_active) VALUES (?, ?, 'gateway-two', 'upstream-model', 'openai-compatible', ?, ?, 128000, 0, 1)")
+        .bind(&second_model_id)
+        .bind(&owner)
+        .bind(encryptor.encrypt("test-secret-two").unwrap())
+        .bind(format!("https://{second_host}/v1"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO runtime_llm_trusted_domains (domain_id, domain_host, domain_port, is_enabled) VALUES (?, ?, 443, 1)")
+        .bind(&second_domain_id)
+        .bind(&second_host)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let batch = service
+        .admit_model_offerings(
+            owner.clone(),
+            vec![model_id.clone(), second_model_id.clone()],
+        )
+        .await
+        .expect("distinct trusted endpoints pass one batch");
+    assert_eq!(batch.len(), 2);
+    sqlx::query("UPDATE runtime_llm_trusted_domains SET is_enabled = 0 WHERE domain_id = ?")
+        .bind(&second_domain_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .admit_model_offerings(
+                owner.clone(),
+                vec![model_id.clone(), second_model_id.clone()]
+            )
+            .await
+            .is_err(),
+        strict,
+        "revoking the second trusted endpoint rejects the entire batch only in strict mode"
+    );
     sqlx::query("UPDATE user_llm_models SET base_url = ? WHERE model_id = ?")
         .bind(format!("https://{host}:8443/v1"))
         .bind(&model_id)
@@ -536,8 +771,19 @@ async fn compatible_byok_admission_rechecks_trust_and_owner() {
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("DELETE FROM user_llm_models WHERE user_id = ? AND model_id = ?")
+        .bind(&owner)
+        .bind(&second_model_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM runtime_llm_trusted_domains WHERE domain_id = ?")
         .bind(&domain_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM runtime_llm_trusted_domains WHERE domain_id = ?")
+        .bind(&second_domain_id)
         .execute(&pool)
         .await
         .unwrap();

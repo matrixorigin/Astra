@@ -5,6 +5,34 @@ use thiserror::Error;
 pub const TURN_MESSAGE_PROVENANCE_FIELD: &str = "_astra_turn_provenance";
 pub const TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION: u8 = 1;
 
+/// Projection-only identity of one physical model response. This survives
+/// canonical persistence but must never be sent to a model or affect its cache.
+pub const MODEL_ITEM_ID_FIELD: &str = "model_item_id";
+
+pub fn model_item_id(message: &Value) -> Option<&str> {
+    (message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .then(|| message.get(MODEL_ITEM_ID_FIELD).and_then(Value::as_str))
+        .flatten()
+        .filter(|id| !id.is_empty())
+}
+
+/// Attach identity only at the producer's accepted assistant-message boundary.
+pub fn mark_model_message(message: &mut Value, model_item_id: Option<&str>) {
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return;
+    }
+    if let Some(object) = message.as_object_mut() {
+        match model_item_id.filter(|id| !id.is_empty()) {
+            Some(id) => {
+                object.insert(MODEL_ITEM_ID_FIELD.into(), Value::String(id.into()));
+            }
+            None => {
+                object.remove(MODEL_ITEM_ID_FIELD);
+            }
+        }
+    }
+}
+
 /// Producer-owned identity for a conversational message created by one
 /// active turn chain. This transport metadata survives context optimization
 /// so the runtime can locate the current-turn suffix, then is removed before

@@ -4,7 +4,6 @@
 //! stream consumers. The SSE, headless, and CLI paths must classify tools the
 //! same way or multi-tool turns drift into transport-specific behavior.
 
-pub mod hooks;
 pub mod preview;
 
 /// Small coalescing window for adjacent concurrency-safe `tool_request` SSE

@@ -1,0 +1,131 @@
+name: flash_fanout_model_default
+description: |
+  Real DeepSeek Flash parent and children exercise a shared explicit reasoning
+  setting in a two-slot atomic fanout. model_default must not invent a
+  provider-specific effort.
+prompt: |
+  Run exactly one foreground agent_fanout.start group with group_id
+  flash-model-selection-test and target_count 2.
+  Set defaults.reasoning to {"mode":"model_default"}. Give both slots
+  agent_type "explore". Ask slot 0 to reply exactly FLASH-SLOT-ALPHA and
+  slot 1 to reply exactly FLASH-SLOT-BETA. Do not retry or replace slots.
+  Wait for the group result, then report both exact replies and 2/2. Do not
+  call Reflect or any other diagnostic tool.
+debug_log: true
+capability: delegation
+timeout_seconds: 240
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent_fanout
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: start
+  - type: journal_tool_call_count
+    name: agent_fanout
+    min: 1
+    max: 1
+    ok: true
+    document: arguments
+    path: /defaults/reasoning/mode
+    equals: model_default
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /group_id
+    equals: flash-model-selection-test
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /group_id
+    equals: flash-model-selection-test
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /fanout/accepted
+    equals: 2
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 2
+    max: 2
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/fanout_slot/slot_index
+      equals: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/fanout_slot/slot_index
+      equals: 1
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 2
+    max: 2
+    json_match:
+      path: /metadata/fanout_slot/group_id
+      equals: flash-model-selection-test
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 2
+    max: 2
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: deepseek-v4-flash
+      unique_by: /metadata/run_id
+      result_ids_match:
+        tool_name: agent_fanout
+        event_parent_run_id_path: /metadata/parent_run_id
+        result_array_path: /agents
+        item_id_path: /run_id
+  # A foreground fanout may deliver its terminal child results either in a
+  # later get_results response or through the parent-owned completion mailbox.
+  # Both paths must prove the exact child result and its originating slot.
+  - type: any_of
+    criteria:
+      - type: all_of
+        criteria:
+          - type: journal_tool_json
+            name: agent_fanout
+            document: result
+            path: /fanout/terminal
+            equals: 2
+          - type: journal_tool_json
+            name: agent_fanout
+            document: result
+            path: /results/0/result/result
+            equals: FLASH-SLOT-ALPHA
+          - type: journal_tool_json
+            name: agent_fanout
+            document: result
+            path: /results/1/result/result
+            equals: FLASH-SLOT-BETA
+      - type: all_of
+        criteria:
+          - type: session_child_result_adopted
+            expected_result: FLASH-SLOT-ALPHA
+            spawn_match:
+              path: /metadata/fanout_slot/slot_index
+              equals: 0
+          - type: session_child_result_adopted
+            expected_result: FLASH-SLOT-BETA
+            spawn_match:
+              path: /metadata/fanout_slot/slot_index
+              equals: 1
+  - type: text_contains
+    needle: FLASH-SLOT-ALPHA
+  - type: text_contains
+    needle: FLASH-SLOT-BETA
+  # Keep the latency/cost case focused on fanout; Reflect would add a
+  # diagnostic model turn and persisted-session database reads.
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0

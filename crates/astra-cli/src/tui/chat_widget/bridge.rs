@@ -58,8 +58,20 @@ impl TurnContext {
 /// the bottom pane, the new loop handles scrollback.
 pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
     match ev {
-        TuiAppEvent::Token(text) => Some(AppEvent::wire(WireEvent::AnswerDelta(text))),
-        TuiAppEvent::ThinkingChunk(text) => Some(AppEvent::wire(WireEvent::ReasoningDelta(text))),
+        TuiAppEvent::Token {
+            model_item_id,
+            text,
+        } => Some(AppEvent::wire(WireEvent::AnswerDelta {
+            model_item_id,
+            text,
+        })),
+        TuiAppEvent::ThinkingChunk {
+            model_item_id,
+            text,
+        } => Some(AppEvent::wire(WireEvent::ReasoningDelta {
+            model_item_id,
+            text,
+        })),
         TuiAppEvent::ThinkingStopped => Some(AppEvent::wire(WireEvent::ReasoningDone)),
         TuiAppEvent::ToolStarted {
             name,
@@ -193,17 +205,26 @@ mod tests {
 
     #[test]
     fn token_to_answer_delta() {
-        let out = translate(TuiAppEvent::Token("hi".into()), TurnContext::default());
-        assert!(matches!(wire(&out), Some(WireEvent::AnswerDelta(s)) if s == "hi"));
+        let out = translate(
+            TuiAppEvent::Token {
+                model_item_id: None,
+                text: "hi".into(),
+            },
+            TurnContext::default(),
+        );
+        assert!(matches!(wire(&out), Some(WireEvent::AnswerDelta { text: s, .. }) if s == "hi"));
     }
 
     #[test]
     fn thinking_chunk_to_reasoning_delta() {
         let out = translate(
-            TuiAppEvent::ThinkingChunk("x".into()),
+            TuiAppEvent::ThinkingChunk {
+                model_item_id: None,
+                text: "x".into(),
+            },
             TurnContext::default(),
         );
-        assert!(matches!(wire(&out), Some(WireEvent::ReasoningDelta(s)) if s == "x"));
+        assert!(matches!(wire(&out), Some(WireEvent::ReasoningDelta { text: s, .. }) if s == "x"));
     }
 
     #[test]

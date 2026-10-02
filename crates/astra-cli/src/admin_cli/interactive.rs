@@ -33,7 +33,6 @@ const ADMIN_COMMANDS: &[(&str, &str)] = &[
         "prompt optimize",
         "Optimize agent prompt  (e.g. prompt optimize <agent_id>)",
     ),
-    ("feedback stats", "Show feedback statistics"),
     ("model list", "List available models"),
     (
         "model check",
@@ -271,14 +270,6 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
             let q = vec![("limit", "50".to_string()), ("offset", "0".to_string())];
             let body = api
                 .get_skills_query_text(&token, &q)
-                .await
-                .map_err(map_thin_err)?;
-            print_json_or_raw(&body);
-            Ok(())
-        } else if line.eq("feedback stats") {
-            let (_, _, _, token) = get_profile_and_token(profile)?;
-            let body = api
-                .get_bearer_path_query_text(&token, paths::ADMIN_FEEDBACK_STATS, &[])
                 .await
                 .map_err(map_thin_err)?;
             print_json_or_raw(&body);

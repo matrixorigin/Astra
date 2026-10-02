@@ -759,12 +759,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_detail_run_build_test_shows_command() {
-        let detail = tool_call_detail("run_build_test", &json!({"command": "cargo test"}));
-        assert_eq!(detail.as_deref(), Some("cargo test"));
-    }
-
-    #[test]
     fn tool_call_detail_powershell_shows_command() {
         let detail = tool_call_detail("powershell", &json!({"command": "Get-ChildItem"}));
         assert_eq!(detail.as_deref(), Some("Get-ChildItem"));

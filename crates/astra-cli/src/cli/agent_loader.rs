@@ -12,12 +12,10 @@
 //! description: Code review specialist
 //! tier: user
 //! tools: ["read_file", "grep", "glob"]
-//! model: claude-sonnet-4-20250514
+//! model_selection:
+//!   offering_id: <authorized-offering-id>
 //! max_turns: 10
 //! can_delegate: false
-//! triggers:
-//!   - type: keyword
-//!     pattern: review
 //! ---
 //! You are a thorough code reviewer. Analyze changes for bugs...
 //! ```
@@ -30,7 +28,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use astra_services::coordination::{AgentProfile, AgentTier, AgentTrigger};
+use astra_services::coordination::{AgentProfile, AgentTier};
 use serde::Deserialize;
 
 // ─── Frontmatter Schema ─────────────────────────────────────────────────────
@@ -56,19 +54,9 @@ struct AgentFrontmatter {
     can_delegate: Option<bool>,
     /// Maximum delegation depth override.
     max_delegation_depth: Option<u32>,
-    /// Auto-activation triggers.
-    #[serde(default)]
-    triggers: Vec<TriggerEntry>,
     /// MCP server names to connect (D-10).
     #[serde(default)]
     mcp_servers: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TriggerEntry {
-    #[serde(rename = "type")]
-    trigger_type: String,
-    pattern: String,
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────────
@@ -182,7 +170,6 @@ fn parse_agent_markdown(path: &Path) -> Result<AgentProfile, String> {
             max_turns: None,
             can_delegate: None,
             max_delegation_depth: None,
-            triggers: Vec::new(),
             mcp_servers: None,
         }
     } else {
@@ -209,15 +196,6 @@ fn parse_agent_markdown(path: &Path) -> Result<AgentProfile, String> {
         AgentTier::System => 1,
         AgentTier::User => 0,
     });
-
-    let triggers: Vec<AgentTrigger> = fm
-        .triggers
-        .into_iter()
-        .map(|t| AgentTrigger {
-            trigger_type: t.trigger_type,
-            pattern: t.pattern,
-        })
-        .collect();
 
     let mut metadata = HashMap::new();
     if let Some(desc) = &fm.description {
@@ -252,7 +230,6 @@ fn parse_agent_markdown(path: &Path) -> Result<AgentProfile, String> {
         can_delegate,
         delegate_to: Vec::new(),
         max_delegation_depth,
-        triggers,
         metadata,
         mcp_servers: fm.mcp_servers.unwrap_or_default(),
     })
@@ -302,11 +279,6 @@ model_selection:
   offering_id: offer-security-review
 max_turns: 15
 can_delegate: false
-triggers:
-  - type: keyword
-    pattern: security
-  - type: keyword
-    pattern: vulnerability
 ---
 You are a security auditor. Scan code for common vulnerabilities
 including SQL injection, XSS, and authentication bypasses.
@@ -325,7 +297,6 @@ including SQL injection, XSS, and authentication bypasses.
             Some("offer-security-review")
         );
         assert!(!p.can_delegate);
-        assert_eq!(p.triggers.len(), 2);
         assert!(
             p.system_prompt
                 .as_ref()

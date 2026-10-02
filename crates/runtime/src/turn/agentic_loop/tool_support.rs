@@ -119,8 +119,8 @@ pub(crate) fn delegate_tool_schema() -> Value {
                     },
                     "pattern": {
                         "type": "string",
-                        "enum": ["sequential", "fan_out", "pipeline", "adversarial", "fork", "auto"],
-                        "description": "Explicit coordination topology. Omit it to use typed runtime scenario/history signals; task prose is never keyword-classified."
+                        "enum": ["sequential", "fan_out", "fork", "auto"],
+                        "description": "Explicit coordination topology. Omit it to select from the agent count and has_dependencies hint; task prose and scenario labels do not change topology."
                     },
                     "tasks": {
                         "type": "array",
@@ -128,18 +128,9 @@ pub(crate) fn delegate_tool_schema() -> Value {
                         "minItems": 2,
                         "description": "Explicit sub-task list required by the fork pattern."
                     },
-                    "needs_review": {
-                        "type": "boolean",
-                        "description": "Typed hint for auto/default selection; true may choose adversarial review when exactly two agents are supplied."
-                    },
                     "has_dependencies": {
                         "type": "boolean",
                         "description": "Typed hint for auto/default selection; true keeps agents ordered."
-                    },
-                    "max_rounds": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Maximum rounds for adversarial pattern (default: 2)."
                     },
                     "timeout": {
                         "type": "integer",
@@ -275,36 +266,12 @@ mod tests {
         assert!(props["agents"].is_object());
         assert!(props["pattern"].is_object());
         assert!(props["tasks"].is_object());
-        assert!(props["needs_review"].is_object());
+        assert!(props.get("needs_review").is_none());
         assert!(props["has_dependencies"].is_object());
-        assert!(props["max_rounds"].is_object());
+        assert!(props.get("max_rounds").is_none());
         assert!(props.get("max_turns").is_none());
         assert!(props["timeout"].is_object());
         assert!(props["context"].is_object());
-    }
-
-    #[test]
-    fn delegate_schema_has_required_openai_structure() {
-        let schema = delegate_tool_schema();
-        assert_eq!(schema["type"], "function");
-        assert_eq!(schema["function"]["name"], "delegate");
-        assert!(schema["function"]["description"].as_str().unwrap().len() > 10);
-        let params = &schema["function"]["parameters"];
-        assert_eq!(params["type"], "object");
-        let required = params["required"].as_array().unwrap();
-        assert!(required.contains(&json!("task")));
-        assert!(required.contains(&json!("agents")));
-        let props = &params["properties"];
-        assert!(props.get("task").is_some());
-        assert!(props.get("agents").is_some());
-        assert!(props.get("pattern").is_some());
-        assert!(props.get("tasks").is_some());
-        assert!(props.get("needs_review").is_some());
-        assert!(props.get("has_dependencies").is_some());
-        assert!(props.get("max_rounds").is_some());
-        assert!(props.get("max_turns").is_none());
-        assert!(props.get("timeout").is_some());
-        assert!(props.get("context").is_some());
     }
 
     #[test]

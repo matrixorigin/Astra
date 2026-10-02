@@ -41,11 +41,20 @@ pub enum AgentLiveTermination {
     Cancelled,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentLiveEventKind {
-    OutputDelta(String),
-    ThinkingDelta(String),
-    Status(String),
+    OutputDelta {
+        model_item_id: Option<String>,
+        text: String,
+    },
+    ThinkingDelta {
+        model_item_id: Option<String>,
+        text: String,
+    },
+    Status {
+        text: String,
+    },
     /// Structured runtime/coordination evidence. Presentation belongs to the
     /// consuming UI; no control decision may be recovered from status text.
     Signal(AgentLiveSignal),
@@ -71,195 +80,6 @@ pub enum AgentLiveEventKind {
         duration_ms: u64,
         reason: Option<String>,
     },
-}
-
-// The public event format is internally tagged so consumers can route every
-// live event without inspecting unbounded output. Serde cannot derive that
-// representation for bare-string newtype variants, however. Keep the domain
-// ergonomics (`ThinkingDelta(String)`) and make the transport shape explicit
-// at this boundary instead of letting a valid runtime event panic a writer.
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum AgentLiveEventKindRef<'a> {
-    OutputDelta {
-        text: &'a str,
-    },
-    ThinkingDelta {
-        text: &'a str,
-    },
-    Status {
-        text: &'a str,
-    },
-    Signal {
-        #[serde(flatten)]
-        signal: &'a AgentLiveSignal,
-    },
-    ToolStarted {
-        name: &'a str,
-        description: &'a str,
-        tool_use_id: &'a str,
-    },
-    ToolCompleted {
-        name: &'a str,
-        description: &'a str,
-        status: &'a str,
-        duration_ms: u64,
-        output_summary: &'a Option<String>,
-        output: &'a Option<String>,
-        tool_use_id: &'a str,
-    },
-    AgentTerminated {
-        termination: AgentLiveTermination,
-        duration_ms: u64,
-        reason: &'a Option<String>,
-    },
-}
-
-impl<'a> From<&'a AgentLiveEventKind> for AgentLiveEventKindRef<'a> {
-    fn from(value: &'a AgentLiveEventKind) -> Self {
-        match value {
-            AgentLiveEventKind::OutputDelta(text) => Self::OutputDelta { text },
-            AgentLiveEventKind::ThinkingDelta(text) => Self::ThinkingDelta { text },
-            AgentLiveEventKind::Status(text) => Self::Status { text },
-            AgentLiveEventKind::Signal(signal) => Self::Signal { signal },
-            AgentLiveEventKind::ToolStarted {
-                name,
-                description,
-                tool_use_id,
-            } => Self::ToolStarted {
-                name,
-                description,
-                tool_use_id,
-            },
-            AgentLiveEventKind::ToolCompleted {
-                name,
-                description,
-                status,
-                duration_ms,
-                output_summary,
-                output,
-                tool_use_id,
-            } => Self::ToolCompleted {
-                name,
-                description,
-                status,
-                duration_ms: *duration_ms,
-                output_summary,
-                output,
-                tool_use_id,
-            },
-            AgentLiveEventKind::AgentTerminated {
-                termination,
-                duration_ms,
-                reason,
-            } => Self::AgentTerminated {
-                termination: *termination,
-                duration_ms: *duration_ms,
-                reason,
-            },
-        }
-    }
-}
-
-impl Serialize for AgentLiveEventKind {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        AgentLiveEventKindRef::from(self).serialize(serializer)
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum AgentLiveEventKindWire {
-    OutputDelta {
-        text: String,
-    },
-    ThinkingDelta {
-        text: String,
-    },
-    Status {
-        text: String,
-    },
-    Signal {
-        #[serde(flatten)]
-        signal: AgentLiveSignal,
-    },
-    ToolStarted {
-        name: String,
-        description: String,
-        tool_use_id: String,
-    },
-    ToolCompleted {
-        name: String,
-        description: String,
-        status: String,
-        duration_ms: u64,
-        output_summary: Option<String>,
-        output: Option<String>,
-        tool_use_id: String,
-    },
-    AgentTerminated {
-        termination: AgentLiveTermination,
-        duration_ms: u64,
-        reason: Option<String>,
-    },
-}
-
-impl From<AgentLiveEventKindWire> for AgentLiveEventKind {
-    fn from(value: AgentLiveEventKindWire) -> Self {
-        match value {
-            AgentLiveEventKindWire::OutputDelta { text } => Self::OutputDelta(text),
-            AgentLiveEventKindWire::ThinkingDelta { text } => Self::ThinkingDelta(text),
-            AgentLiveEventKindWire::Status { text } => Self::Status(text),
-            AgentLiveEventKindWire::Signal { signal } => Self::Signal(signal),
-            AgentLiveEventKindWire::ToolStarted {
-                name,
-                description,
-                tool_use_id,
-            } => Self::ToolStarted {
-                name,
-                description,
-                tool_use_id,
-            },
-            AgentLiveEventKindWire::ToolCompleted {
-                name,
-                description,
-                status,
-                duration_ms,
-                output_summary,
-                output,
-                tool_use_id,
-            } => Self::ToolCompleted {
-                name,
-                description,
-                status,
-                duration_ms,
-                output_summary,
-                output,
-                tool_use_id,
-            },
-            AgentLiveEventKindWire::AgentTerminated {
-                termination,
-                duration_ms,
-                reason,
-            } => Self::AgentTerminated {
-                termination,
-                duration_ms,
-                reason,
-            },
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for AgentLiveEventKind {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        AgentLiveEventKindWire::deserialize(deserializer).map(Into::into)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,9 +116,10 @@ pub enum AgentLiveSignal {
     OutputSettled,
     /// A canonical transcript writer committed a concrete assistant item.
     /// Consumers can use this immutable identity to prove that a canonical
-    /// page has caught up. It does not identify individual live deltas, so
-    /// equal text or item counts must never be used to delete model output.
+    /// page has caught up. The optional model identity does not assert which
+    /// parts a page represents, nor cover any earlier output or reasoning.
     TranscriptCommitted {
+        model_item_id: Option<String>,
         source_event_id: String,
         transcript_location: astra_turn_types::AgentTranscriptLocation,
     },
@@ -385,17 +206,25 @@ mod tests {
     fn text_live_events_use_a_tagged_object_and_round_trip() {
         for (kind, expected_type, expected_text) in [
             (
-                AgentLiveEventKind::OutputDelta("child output".into()),
+                AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("model-1".into()),
+                    text: "child output".into(),
+                },
                 "output_delta",
                 "child output",
             ),
             (
-                AgentLiveEventKind::ThinkingDelta("child reasoning".into()),
+                AgentLiveEventKind::ThinkingDelta {
+                    model_item_id: Some("model-1".into()),
+                    text: "child reasoning".into(),
+                },
                 "thinking_delta",
                 "child reasoning",
             ),
             (
-                AgentLiveEventKind::Status("waiting on tool".into()),
+                AgentLiveEventKind::Status {
+                    text: "waiting on tool".into(),
+                },
                 "status",
                 "waiting on tool",
             ),
@@ -406,9 +235,9 @@ mod tests {
             let decoded: AgentLiveEventKind =
                 serde_json::from_value(wire).expect("deserialize text live event");
             let text = match decoded {
-                AgentLiveEventKind::OutputDelta(text)
-                | AgentLiveEventKind::ThinkingDelta(text)
-                | AgentLiveEventKind::Status(text) => text,
+                AgentLiveEventKind::OutputDelta { text, .. }
+                | AgentLiveEventKind::ThinkingDelta { text, .. }
+                | AgentLiveEventKind::Status { text } => text,
                 unexpected => panic!("unexpected text live event: {unexpected:?}"),
             };
             assert_eq!(text, expected_text);
@@ -491,6 +320,7 @@ mod tests {
     #[test]
     fn transcript_commit_carries_exact_reconciliation_identity() {
         let signal = AgentLiveSignal::TranscriptCommitted {
+            model_item_id: Some("model-1".into()),
             source_event_id: "response:run-1:turn-7".into(),
             transcript_location: astra_turn_types::AgentTranscriptLocation::DurableServer,
         };
@@ -504,6 +334,7 @@ mod tests {
             AgentLiveSignal::TranscriptCommitted {
                 source_event_id,
                 transcript_location: astra_turn_types::AgentTranscriptLocation::DurableServer,
+                ..
             } if source_event_id == "response:run-1:turn-7"
         ));
     }

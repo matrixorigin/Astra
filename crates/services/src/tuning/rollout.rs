@@ -1,6 +1,6 @@
 //! Authenticated callers manage one versioned deployment per owner. Runtime
 //! decisions and reviewed outcomes stay in the canonical run-event ledger.
-use crate::evaluation::router::content_sha256;
+use crate::model_routing::offline::content_sha256;
 use crate::tuning::{RouterQualificationProtocol, RouterTuningRecord};
 use astra_core::SharedPool;
 use async_trait::async_trait;

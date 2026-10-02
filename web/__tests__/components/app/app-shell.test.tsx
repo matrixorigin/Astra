@@ -52,5 +52,5 @@ test("keeps Chat as a first-class navigation surface beside Work", () => {
   expect(screen.getByRole("link", { name: "Work" })).toHaveAttribute("href", "/works");
   expect(screen.getByRole("link", { name: "Chats" })).toHaveAttribute("href", "/chats");
   expect(screen.getByRole("link", { name: "Projects" })).toHaveAttribute("href", "/projects");
-  expect(screen.getByRole("link", { name: "Harnesses" })).toHaveAttribute("href", "/harnesses");
+  expect(screen.queryByRole("link", { name: "Harnesses" })).not.toBeInTheDocument();
 });

@@ -1,8 +1,7 @@
 use std::{fs, sync::Arc};
 
 use astra_runtime::{
-    AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer,
-    AdminFeedbackStatsFilter, AdminFeedbackStatsReader, AdminFeedbackStatsRecord, AdminInitRecord,
+    AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer, AdminInitRecord,
     AdminInitializer, AdminTokenCreateRequestData, AdminTokenFilter, AdminTokenReader,
     AdminTokenRecord, AdminTokenWriter, AdminUserRoleManager, AdminUserRoleRecord,
     AdminUserRoleRequestData, AppState, AuthenticatedUser, ErrorResponse, HealthChecker,
@@ -34,8 +33,6 @@ struct AdminContract {
     admin_token_create: CreateTokenContract,
     admin_prompt_optimize: QueueContract,
     admin_feedback_export: QueueContract,
-    admin_feedback_stats: ResponseContract,
-    admin_feedback_stats_filtered: ResponseContract,
     admin_role_grant: QueueContract,
     admin_role_grant_existing: QueueContract,
     admin_role_grant_user_not_found: QueueContract,
@@ -220,47 +217,6 @@ impl AdminAuditReader for StubAdminAuditReader {
 }
 
 #[derive(Clone)]
-struct StubAdminFeedbackStatsReader;
-
-#[async_trait]
-impl AdminFeedbackStatsReader for StubAdminFeedbackStatsReader {
-    async fn read_feedback_stats(
-        &self,
-        filter: AdminFeedbackStatsFilter,
-    ) -> Result<AdminFeedbackStatsRecord, (StatusCode, axum::Json<ErrorResponse>)> {
-        let all = AdminFeedbackStatsRecord {
-            total_feedback: 3,
-            positive_feedback: 1,
-            negative_feedback: 1,
-            avg_rating: Some(3.0),
-            feedback_by_type: serde_json::Map::from_iter([
-                ("wrong_skill".to_string(), serde_json::Value::from(2)),
-                ("low_satisfaction".to_string(), serde_json::Value::from(1)),
-            ]),
-        };
-
-        let filtered = AdminFeedbackStatsRecord {
-            total_feedback: 2,
-            positive_feedback: 1,
-            negative_feedback: 1,
-            avg_rating: Some(3.0),
-            feedback_by_type: serde_json::Map::from_iter([
-                ("wrong_skill".to_string(), serde_json::Value::from(1)),
-                ("low_satisfaction".to_string(), serde_json::Value::from(1)),
-            ]),
-        };
-
-        if filter.agent_id.as_deref() == Some("contract-agent")
-            && filter.since.as_deref() == Some("2026-01-04 00:00:00")
-        {
-            Ok(filtered)
-        } else {
-            Ok(all)
-        }
-    }
-}
-
-#[derive(Clone)]
 struct StubAdminUserRoleManager;
 
 #[async_trait]
@@ -345,7 +301,6 @@ fn build_app_with_admin() -> Router {
             .with_admin_token_writer(Arc::new(StubAdminTokenWriter))
             .with_admin_token_reader(Arc::new(StubAdminTokenReader))
             .with_admin_audit_reader(Arc::new(StubAdminAuditReader))
-            .with_admin_feedback_stats_reader(Arc::new(StubAdminFeedbackStatsReader))
             .with_admin_user_role_manager(Arc::new(StubAdminUserRoleManager)),
     )
 }
@@ -550,30 +505,6 @@ async fn admin_async_jobs_match_shared_contract() {
 }
 
 #[tokio::test]
-async fn admin_feedback_stats_variants_match_shared_contract() {
-    let contract = load_contract();
-    let app = build_app_with_admin();
-    let auth = &[("authorization", "Bearer admin-token")];
-
-    for (label, path, expected) in [
-        (
-            "default",
-            "/admin/feedback/stats?agent_id=contract-agent",
-            &contract.admin_feedback_stats,
-        ),
-        (
-            "filtered",
-            "/admin/feedback/stats?agent_id=contract-agent&since=2026-01-04%2000:00:00",
-            &contract.admin_feedback_stats_filtered,
-        ),
-    ] {
-        let (status, json) = read_json(app.clone(), path, auth).await;
-        assert_eq!(status.as_u16(), expected.status, "{label}");
-        assert_contract_json(&json, &expected.json, label);
-    }
-}
-
-#[tokio::test]
 async fn admin_role_grant_variants_match_shared_contract() {
     let contract = load_contract();
     let app = build_app_with_admin();
@@ -773,6 +704,7 @@ async fn model_router_http_dashboard_canary_outcome_and_rollback_on_matrixone() 
         offering_id: "strong".into(),
     });
     context.resolved_model_selection = Some(astra_services::runs::ResolvedModelSelection {
+        source_identity: None,
         offering_id: "strong".into(),
         model_name: "strong-model".into(),
     });
@@ -781,7 +713,7 @@ async fn model_router_http_dashboard_canary_outcome_and_rollback_on_matrixone() 
         .await
         .unwrap();
     let mut decision =
-        serde_json::from_str::<astra_services::evaluation::router::RouterDatasetInput>(
+        serde_json::from_str::<astra_services::model_routing::offline::RouterDatasetInput>(
             include_str!("../../../fixtures/contracts/model_router_offline.json"),
         )
         .unwrap()

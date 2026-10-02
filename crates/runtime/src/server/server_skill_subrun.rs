@@ -28,9 +28,8 @@ use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::turn::agentic_loop::host::{
     AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
-    StopHookState, TurnInteractionPolicy, project_skill_subrun_outcome, run_agentic_loop_with_host,
+    StopHookState, project_skill_subrun_outcome, run_agentic_loop_with_host,
 };
-use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunOutcome, SubRunResult};
 use astra_text_utils::semantic_dedup::SemanticDedup;
@@ -148,6 +147,7 @@ impl Drop for OuterSkillDispatchGuard {
 /// Creates a [`ServerAgenticLoopHost`] for each sub-run with isolated context
 /// but shared LLM credentials and skill resolver.
 pub struct ServerSkillSubRunExecutor {
+    model_catalog_reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
     model_service: Option<Arc<dyn astra_services::ModelService>>,
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
@@ -245,7 +245,13 @@ impl ServerSkillSubRunExecutor {
                     service
                         .admit_model_offering(self.user_id.clone(), id)
                         .await
-                        .map_err(|(_, body)| body.0.detail)
+                        .map_err(|(status, body)| {
+                            crate::server::run::lifecycle::safe_model_service_error_with_code(
+                                status,
+                                body.0.error_code.as_deref(),
+                            )
+                            .to_string()
+                        })
                 } else {
                     astra_services::revalidate_admitted_model_execution(
                         &self.matrixone,
@@ -255,13 +261,22 @@ impl ServerSkillSubRunExecutor {
                         self.shared_pool.as_ref().map(SharedPool::get),
                     )
                     .await
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| {
+                        crate::server::run::lifecycle::safe_model_offering_error_with_code(error)
+                    })
                 }
             },
         )
         .await
     }
 
+    pub fn with_model_catalog_reader(
+        mut self,
+        reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
+    ) -> Self {
+        self.model_catalog_reader = reader;
+        self
+    }
     pub fn with_model_service(
         mut self,
         service: Option<Arc<dyn astra_services::ModelService>>,
@@ -277,6 +292,7 @@ impl ServerSkillSubRunExecutor {
     ) -> Self {
         Self {
             model_service: None,
+            model_catalog_reader: None,
             matrixone,
             encryptor,
             shared_pool: None,
@@ -573,6 +589,7 @@ impl ServerSkillSubRunExecutor {
             None,
         )
         .with_reflect_service(Arc::clone(&self.reflect_service))
+        .with_model_catalog_reader(self.model_catalog_reader.clone())
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             self.shared_pool.is_some(),
             self.reflect_service.is_configured(),
@@ -990,6 +1007,10 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         )
         .with_model(effective_model.clone())
         .with_model_service(self.model_service.clone())
+        .with_model_catalog_reader(self.model_catalog_reader.clone())
+        .with_provider_scope_bound(admitted_model_execution.as_ref().is_some_and(|execution| {
+            execution.execution_placement == astra_services::models::ModelExecutionPlacement::Edge
+        }))
         .with_admitted_model_execution(admitted_model_execution.clone())
         .with_inference_owner_pod_id(Some(parent_owner_pod_id.to_string()))
         .with_edge_tools(self.edge_tools.clone())
@@ -1081,59 +1102,20 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         let mut state = AgenticLoopState {
             messages,
-            run_transcript_capture: None,
-            volatile_pending: Vec::new(),
-            recent_rounds: Vec::new(),
-            tool_results: Vec::new(),
             current_session_id: Some(self.session_id.clone()),
             current_run_id: Some(parent_run_id.to_string()),
             current_run_owner_generation: Some(parent_owner_generation),
-            applied_permission_mode: None,
-            inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
-            context_manifest_pool: None,
             context_manifest_user_id: Some(self.user_id.clone()),
             context_manifest_model_name: effective_model.clone(),
-            runtime_manifest: None,
             recursion_depth: child_recursion_depth,
-            final_text: String::new(),
-            final_text_streamed: false,
-            final_output_ready_notified: false,
-            total_prompt: 0,
-            total_completion: 0,
-            total_cache_read: 0,
-            total_cache_creation: 0,
-            total_tool_calls: 0,
-            total_observation_tool_calls: 0,
-            tool_ledger_receipt: Default::default(),
-            has_any_usage: false,
-            qualified_usage: None,
-            last_request_usage: None,
-            last_finish_reason: None,
             max_turns: initial_turns,
             remaining_turns: initial_turns,
-            charged_iterations: 0,
-            agentic_turn_budget,
             budget_is_explicit: true,
-            budget_policy: None,
-            loop_entry: Default::default(),
-            current_round_index: 0,
-            llm_rounds_completed: 0,
-            last_request_message_count: None,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
-            boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
-            step_recorder,
-            idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(
                 astra_text_utils::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
             ),
-            call_counts: HashMap::new(),
-            max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
-            max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
-            max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
-            stall: Default::default(),
-            telemetry: Default::default(),
             skills: SkillState {
                 // Inherit resolver for nested inline skills, but NO executor
                 // to prevent Fork→Fork recursion (same as CLI design).
@@ -1164,15 +1146,11 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 execution_lease_lost: self.execution_lease_lost.clone(),
                 resolved_origin: None,
             },
-            messaging: Default::default(),
             user_intents: {
                 let mut user_intents = crate::turn::agentic_loop::host::UserIntentState::default();
                 user_intents.commit_observed_cursor(inherited_user_intent_cursor);
                 user_intents
             },
-            error_recovery: Default::default(),
-            provider_adaptation: Default::default(),
-            run_control: None,
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
                     astra_turn_core::pipeline_config::PipelineConfig::default(),
@@ -1184,61 +1162,12 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             ),
             message: task_context.to_string(),
             user_intent: task_context.to_string(),
-            recent_tools: Vec::new(),
-            deferred_tool_activations: Vec::new(),
-            has_prior_assistant_turn: false,
-            turn_intent: None,
             task_profile: infer_task_execution_profile(task_context),
-            last_turn_policy: TurnInteractionPolicy::default(),
-            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
-                .expect("valid dummy URL"),
-            api_token: String::new(),
-            delegation_engine: None,
-            delegations_this_turn: 0,
-            delegation_chain: Vec::new(),
-            self_agent_id: "main".to_string(),
-            project_context: None,
-            checkpoint_gate: None,
-            last_llm_context_manifest_trace: None,
-            rate_limit_cooldown: Default::default(),
-            data_snapshot_provider: None,
-            last_composite_snapshot: None,
-            last_measured_prompt_tokens: None,
-            consecutive_context_window_errors: 0,
-            compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
-            sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens,
-            budget_wrapup_injected: false,
-            context_compression_triggered: false,
-            canonical_rewrite_state: Default::default(),
-            provider_canonical_wal_base: None,
-            provider_canonical_wal_head: None,
-            budget_wrapup_ignored_rounds: 0,
-            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
-            skill_produced_output: false,
-            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             permission_context: Some(permission_context),
-            permission_handler: None,
-            tactical_adapter: None,
-            step_signal_collector: None,
-            recent_tactical_actions: Vec::new(),
-            runtime_tool_executor: None,
-            interruption: None,
-            session_facts: Default::default(),
             memory_extraction_service: self.memory_extraction_service.clone(),
-            observation_journal: Default::default(),
-            session_memory_state: Default::default(),
             compact_strategy,
-            approval_overrides: None,
-            confidence_trend: Default::default(),
-            last_confidence_diagnosis: None,
-            session_turn: 0,
             canonical_turn_chain_id: Some(child_turn_chain_id),
-            root_user_query_event_id: None,
-            turn_event_buffer: None,
-            canonical_turn_started_at: Default::default(),
-            canonical_trace_time_bounds: Default::default(),
             harness: {
                 #[cfg(feature = "harness")]
                 {
@@ -1254,6 +1183,12 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                     crate::turn::harness_adapter::HarnessSlot::empty()
                 }
             },
+            ..AgenticLoopState::fresh(
+                step_recorder,
+                agentic_turn_budget,
+                &resolved_tool_policy,
+                astra_turn_types::InferencePurpose::SubAgent,
+            )
         };
 
         // ── Wire RuntimeToolExecutor for skill sub-run tool execution ────
@@ -1434,7 +1369,11 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert!(error.contains("Genesis Offering unavailable"), "{error}");
+        assert!(
+            error.contains("[model_offering_not_found]")
+                || error.contains("[model_offering_unavailable]"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1826,6 +1765,7 @@ mod tests {
                     },
                 ),
                 None,
+                None,
             )
             .await;
         assert!(
@@ -1867,6 +1807,7 @@ mod tests {
                         expected_execution_binding_generation: None,
                     },
                 ),
+                None,
                 None,
             )
             .await;

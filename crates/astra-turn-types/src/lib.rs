@@ -25,6 +25,7 @@ pub use completion_settlement::deserialize_required_option;
 mod context_identity;
 mod context_window;
 mod deferred_tool;
+mod delegation_model_admission;
 mod explain_analyze;
 mod memory_selection;
 pub use memory_selection::*;
@@ -40,6 +41,7 @@ pub mod model_routing;
 mod provider_canonical_transition;
 mod provider_contract;
 mod recovery_point;
+mod reply_obligations;
 mod result_quality;
 mod resume;
 mod runtime_scaffolding;
@@ -81,6 +83,15 @@ pub use context_identity::{
 };
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTokenUsage};
 pub use deferred_tool::DeferredToolActivation;
+pub use delegation_model_admission::{
+    DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY, DelegationCatalogResolutionFailure,
+    DelegationIntentRequirement, DelegationIntentRequirements, DelegationModelAdmission,
+    DelegationModelAdmissionOutcome, DelegationModelInstructionSource,
+    DelegationModelSlotConstraint, DelegationReasoningEffort, DelegationReasoningRequirement,
+    DelegationRequirementPropagation, DelegationRequirementStrength,
+    DelegationUserRequirementSource, DirectDelegationCommandIdentity, DirectDelegationModelPlan,
+    MAX_DIRECT_DELEGATION_SLOTS, MAX_MODEL_ADMISSION_SLOTS,
+};
 pub use explain_analyze::{
     EXPLAIN_ANALYZE_EVENT_TYPE, EXPLAIN_ANALYZE_MAX_SAFE_INTEGER, EXPLAIN_ANALYZE_SCHEMA_VERSION,
     ExplainAnalyzeAdmissionSettlementReasonV1, ExplainAnalyzeAdmissionSettlementStatusV1,
@@ -90,9 +101,9 @@ pub use explain_analyze::{
     ExplainAnalyzeContextAssemblyBasisV1, ExplainAnalyzeContextAssemblyV1,
     ExplainAnalyzeContextBudgetBasisV1, ExplainAnalyzeContextBudgetV1,
     ExplainAnalyzeContextMetricsV1, ExplainAnalyzeContextSourceKindV1,
-    ExplainAnalyzeContextSourceV1, ExplainAnalyzeCoverageGapV1, ExplainAnalyzeEventV1,
-    ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1, ExplainAnalyzeTokenUsageV1,
-    ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
+    ExplainAnalyzeContextSourceV1, ExplainAnalyzeCoverageGapV1, ExplainAnalyzeDecisionDetailV1,
+    ExplainAnalyzeEventV1, ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1,
+    ExplainAnalyzeTokenUsageV1, ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
 };
 pub use explain_analyze_projection::{
     ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeGraphV1, ExplainAnalyzeProjectedNodeV1,
@@ -101,8 +112,10 @@ pub use explain_analyze_projection::{
     ExplainAnalyzeScopeCoverageV1,
 };
 pub use inference::{
-    CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose, ModelSelection,
-    client_direct_execution_field,
+    AutoModelStrategy, CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose,
+    ModelSelection, ModelSelector, RequestedModelPolicy, RequestedModelPolicyError,
+    client_direct_execution_field, resolve_requested_model_selection,
+    resolve_requested_model_selector,
 };
 pub use memory_ranking::{
     MemoryRetrievalOutcome, PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE,
@@ -144,6 +157,7 @@ pub use recovery_point::{
     RecoveryPointRunFrontierV1, RecoveryPointRunStateV1, RecoveryPointValidationError,
     RecoveryPointWorkspaceReferenceV1,
 };
+pub use reply_obligations::{MAX_PENDING_REPLIES, PendingReply, ReplyObligationsSnapshotV1};
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};
 pub use resume::{
     CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION, CausalProjectionEnvelopeV1, CursorRelationV1,
@@ -188,7 +202,8 @@ pub use session_cursor::{
     ConversationCommitV1, ConversationDeltaV1, ConversationReplaceReason,
     DEFAULT_CONVERSATION_BRANCH_ID, SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION,
     SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1, canonical_conversation_identity,
-    canonical_conversation_root, canonical_conversation_serialized_len, json_serialized_len,
+    canonical_conversation_root, canonical_conversation_serialized_len, json_serialized_fits,
+    json_serialized_len,
 };
 pub use session_fork::{
     ForkBasisDimensionV1, ForkDimensionDispositionV1, ForkDimensionEvidenceV1,
@@ -227,9 +242,9 @@ pub use tool_result_projection::{
 };
 pub use tool_result_selection_observation::*;
 pub use turn_provenance::{
-    TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
+    MODEL_ITEM_ID_FIELD, TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
     TurnMessageProvenanceError, TurnMessageProvenanceV1, clear_turn_message_provenance,
-    mark_turn_message, turn_message_provenance,
+    mark_model_message, mark_turn_message, model_item_id, turn_message_provenance,
 };
 pub use user_intent::{
     AssessmentConfidence, FeedbackResponseReference, FeedbackResponseRelation, ObjectiveRelation,

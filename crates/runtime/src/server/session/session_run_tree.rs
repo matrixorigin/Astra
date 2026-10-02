@@ -158,10 +158,7 @@ fn project_run_node_with_status(
     inherited_control: bool,
 ) -> SessionRunNode {
     let partial_interruption = lifecycle_status == RunStatus::Failed
-        && astra_services::coordination::durable_agent_result_is_partial(
-            run.error_code.as_deref(),
-            run.error_message.as_deref(),
-        );
+        && astra_services::coordination::durable_agent_result_is_partial(run.error_code.as_deref());
     let status = match lifecycle_status {
         RunStatus::Running => SessionRunLifecycleStatus::Running,
         RunStatus::Waiting => SessionRunLifecycleStatus::Waiting,

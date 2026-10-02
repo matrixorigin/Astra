@@ -1412,11 +1412,23 @@ fn agent_live_event_from_sse(event: &Value) -> Result<AgentLiveEvent, String> {
     let run_id = required_sse_string(event, "run_id")?;
     let agent_id = required_sse_string(event, "agent_id")?;
     let kind = match required_sse_string(event, "event_kind")?.as_str() {
-        "output_delta" => AgentLiveEventKind::OutputDelta(required_sse_string(event, "content")?),
-        "thinking_delta" => {
-            AgentLiveEventKind::ThinkingDelta(required_sse_string(event, "content")?)
-        }
-        "status" => AgentLiveEventKind::Status(required_sse_string(event, "content")?),
+        "output_delta" => AgentLiveEventKind::OutputDelta {
+            model_item_id: event
+                .get("model_item_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            text: required_sse_string(event, "content")?,
+        },
+        "thinking_delta" => AgentLiveEventKind::ThinkingDelta {
+            model_item_id: event
+                .get("model_item_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            text: required_sse_string(event, "content")?,
+        },
+        "status" => AgentLiveEventKind::Status {
+            text: required_sse_string(event, "content")?,
+        },
         "signal" => AgentLiveEventKind::Signal(
             serde_json::from_value::<AgentLiveSignal>(
                 event
@@ -2652,7 +2664,7 @@ mod tests {
             .render_effects
             .iter()
             .filter_map(|e| match e {
-                SseRenderEffect::StreamText(s) => Some(s.as_str()),
+                SseRenderEffect::StreamText { text: s, .. } => Some(s.as_str()),
                 _ => None,
             })
             .collect();
@@ -2761,7 +2773,7 @@ mod tests {
     async fn recording_host_receives_typed_agent_communication() {
         let events = sse_event(
             "agent_communication",
-            ",\"schema_version\":\"astra.agent_communication.v1\",\"observed_by\":{\"run_id\":\"run-review\",\"agent_id\":\"reviewer\"},\"direction\":\"received\",\"message_id\":\"msg-1\",\"from\":{\"run_id\":\"run-code\",\"agent_id\":\"coder\"},\"to\":{\"kind\":\"direct\",\"address\":{\"run_id\":\"run-review\",\"agent_id\":\"reviewer\"}},\"payload_kind\":\"text\",\"summary\":\"review this\",\"timestamp_ms\":42,\"requires_ack\":false",
+            ",\"schema_version\":\"astra.agent_communication.v1\",\"observed_by\":{\"run_id\":\"run-review\",\"agent_id\":\"reviewer\"},\"direction\":\"received\",\"message_id\":\"msg-1\",\"from\":{\"run_id\":\"run-code\",\"agent_id\":\"coder\"},\"to\":{\"kind\":\"direct\",\"address\":{\"run_id\":\"run-review\",\"agent_id\":\"reviewer\"}},\"payload_kind\":\"text\",\"summary\":\"review this\",\"timestamp_ms\":42",
         );
         let mut stream = stream::iter(chunks_from_sse(&events));
         let mut host = RecordingSseStreamHost::new();
@@ -2845,7 +2857,7 @@ mod tests {
                 AgentLiveEvent {
                     run_id,
                     agent_id,
-                    kind: AgentLiveEventKind::ThinkingDelta(text),
+                    kind: AgentLiveEventKind::ThinkingDelta { text, .. },
                 },
                 AgentLiveEvent {
                     run_id: tool_run_id,

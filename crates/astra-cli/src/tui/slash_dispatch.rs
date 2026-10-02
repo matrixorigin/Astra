@@ -1718,7 +1718,9 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
                 ),
                 (
                     "cost",
-                    crate::cli::slash::slash_stats::format_optional_cost(state.total_session_cost),
+                    crate::cli::session::session_stats_scan::format_optional_cost(
+                        state.total_session_cost,
+                    ),
                 ),
             ];
             if !sid.is_empty() {
@@ -1839,7 +1841,7 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
         }
 
         "cost" => {
-            let pairs = crate::cli::slash::slash_stats::current_rate_cost_rows(state);
+            let pairs = crate::cli::session::session_stats_scan::current_rate_cost_rows(state);
             bottom_pane.push_view(Box::new(
                 InfoView::from_key_value("Current-rate Cost Scenario", pairs).with_reopen("/stats"),
             ));
@@ -1996,10 +1998,208 @@ fn split_sub(text: &str) -> (&str, &str) {
     }
 }
 
-fn handle_mcp_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
-    use crate::cli::slash::slash_mcp::ParsedMcpCommand as Cmd;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParsedMcpCommand<'a> {
+    Help,
+    Overview,
+    Servers,
+    Tools(Option<&'a str>),
+    Prompts,
+    Resources,
+    Read(Option<&'a str>),
+    History,
+    Inspect(Option<&'a str>),
+    Add(Option<&'a str>),
+    Remove(Option<&'a str>),
+    Subscribe(Option<&'a str>),
+    Unsubscribe(Option<&'a str>),
+    LogLevel(Option<&'a str>),
+    Prompt(Option<&'a str>),
+    Complete(Option<&'a str>),
+    Ping(Option<&'a str>),
+    Unknown(&'a str),
+}
 
-    let action = match crate::cli::slash::slash_mcp::parse_mcp_command(args) {
+fn split_mcp_subcommand(text: &str) -> (&str, &str) {
+    let trimmed = text.trim();
+    match trimmed.find(char::is_whitespace) {
+        Some(pos) => (&trimmed[..pos], trimmed[pos..].trim()),
+        None => (trimmed, ""),
+    }
+}
+
+pub(crate) fn parse_mcp_command(arg: &str) -> ParsedMcpCommand<'_> {
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        return ParsedMcpCommand::Help;
+    }
+
+    let (sub, rest) = split_mcp_subcommand(trimmed);
+    match sub {
+        "help" => ParsedMcpCommand::Help,
+        "status" => ParsedMcpCommand::Overview,
+        "list" => {
+            if rest.is_empty() {
+                ParsedMcpCommand::Overview
+            } else {
+                let (category, tail) = split_mcp_subcommand(rest);
+                match category {
+                    "status" => ParsedMcpCommand::Overview,
+                    "servers" => {
+                        if tail.is_empty() {
+                            ParsedMcpCommand::Servers
+                        } else {
+                            ParsedMcpCommand::Unknown(trimmed)
+                        }
+                    }
+                    "tools" => ParsedMcpCommand::Tools((!tail.is_empty()).then_some(tail)),
+                    "prompts" => {
+                        if tail.is_empty() {
+                            ParsedMcpCommand::Prompts
+                        } else {
+                            ParsedMcpCommand::Unknown(trimmed)
+                        }
+                    }
+                    "resources" => {
+                        if tail.is_empty() {
+                            ParsedMcpCommand::Resources
+                        } else {
+                            ParsedMcpCommand::Unknown(trimmed)
+                        }
+                    }
+                    _ => ParsedMcpCommand::Unknown(trimmed),
+                }
+            }
+        }
+        "servers" => ParsedMcpCommand::Servers,
+        "tools" => ParsedMcpCommand::Tools((!rest.is_empty()).then_some(rest)),
+        "prompts" => ParsedMcpCommand::Prompts,
+        "resources" => ParsedMcpCommand::Resources,
+        "resource" | "read" => ParsedMcpCommand::Read((!rest.is_empty()).then_some(rest)),
+        "history" => ParsedMcpCommand::History,
+        "inspect" => ParsedMcpCommand::Inspect((!rest.is_empty()).then_some(rest)),
+        "add" => ParsedMcpCommand::Add((!rest.is_empty()).then_some(rest)),
+        "remove" => ParsedMcpCommand::Remove((!rest.is_empty()).then_some(rest)),
+        "subscribe" => ParsedMcpCommand::Subscribe((!rest.is_empty()).then_some(rest)),
+        "unsubscribe" => ParsedMcpCommand::Unsubscribe((!rest.is_empty()).then_some(rest)),
+        "log-level" => ParsedMcpCommand::LogLevel((!rest.is_empty()).then_some(rest)),
+        "prompt" => ParsedMcpCommand::Prompt((!rest.is_empty()).then_some(rest)),
+        "complete" => ParsedMcpCommand::Complete((!rest.is_empty()).then_some(rest)),
+        "ping" => ParsedMcpCommand::Ping((!rest.is_empty()).then_some(rest)),
+        _ => ParsedMcpCommand::Unknown(trimmed),
+    }
+}
+
+/// Build dynamic subcommand completions for `/mcp` from the live MCP manager.
+///
+/// Returns `(subcommand_suffix, description)` pairs that are injected into the
+/// slash menu's `extra_subcommands` so the user gets real server/tool names
+/// when they type `/mcp ` and press Tab. For example:
+///
+///   `("inspect github:list_prs",  "github · list_prs")`
+///   `("tools github",             "Tools on github")`
+///   `("ping github",              "Ping github")`
+///
+/// This feeds the interactive workbench, so it only lists operations that
+/// the TUI can actually carry out. Configuration mutations unsupported by the workbench are
+/// intentionally absent instead of leading users into an unavailable action.
+pub(crate) fn build_mcp_extra_subcommands(
+    manager: &crate::mcp_client::McpClientManager,
+) -> Vec<(String, String)> {
+    let servers: Vec<&str> = manager.connected_servers();
+    let mut items = workbench_server_completions(servers);
+
+    // Per tool: inspect <server>:<tool>
+    for (server, tool) in manager.all_tools() {
+        items.push((
+            format!("inspect {server}:{}", tool.name),
+            format!("{server} · {}", tool.name),
+        ));
+    }
+
+    items
+}
+
+fn workbench_server_completions<'a>(
+    servers: impl IntoIterator<Item = &'a str>,
+) -> Vec<(String, String)> {
+    let mut items = Vec::new();
+    for server in servers {
+        items.push((format!("tools {server}"), format!("Tools on {server}")));
+        items.push((format!("ping {server}"), format!("Ping {server}")));
+    }
+    items
+}
+
+pub(crate) fn resolve_protocol_tool_query<'a>(
+    manager: &'a crate::mcp_client::McpClientManager,
+    query: &str,
+) -> Result<(&'a str, &'a rmcp::model::Tool), String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("Usage: /mcp inspect <server>:<tool>  ·  try `/mcp tools` first.".into());
+    }
+
+    if let Some((server, tool_name)) = query.split_once(':') {
+        if let Some((resolved_server, tool)) = manager
+            .all_tools()
+            .into_iter()
+            .find(|(resolved_server, tool)| *resolved_server == server && tool.name == tool_name)
+        {
+            return Ok((resolved_server, tool));
+        }
+        if manager.get(server).is_none() {
+            return Err(format!(
+                "Server '{server}' not found. Try `/mcp list` or `/mcp servers`."
+            ));
+        }
+        return Err(format!(
+            "Tool '{tool_name}' not found on server '{server}'. Try `/mcp tools {server}`."
+        ));
+    }
+
+    let exact: Vec<(&str, &rmcp::model::Tool)> = manager
+        .all_tools()
+        .into_iter()
+        .filter(|(_, tool)| tool.name == query)
+        .collect();
+    match exact.len() {
+        1 => return Ok(exact[0]),
+        n if n > 1 => {
+            let locations = exact
+                .iter()
+                .map(|(server, _)| (*server).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "Tool '{query}' exists on multiple servers ({locations}). Use `/mcp inspect <server>:<tool>`."
+            ));
+        }
+        _ => {}
+    }
+
+    let sanitized: Vec<(&str, &rmcp::model::Tool)> = manager
+        .all_tools()
+        .into_iter()
+        .filter(|(server, tool)| {
+            crate::mcp_client::sanitize_tool_name(&format!("mcp__{server}__{}", tool.name)) == query
+        })
+        .collect();
+    match sanitized.len() {
+        1 => Ok(sanitized[0]),
+        n if n > 1 => Err(format!(
+            "Tool id '{query}' is ambiguous across {n} servers. Use `/mcp inspect <server>:<tool>`."
+        )),
+        _ => Err(format!(
+            "Tool '{query}' not found. Try `/mcp tools` or `/mcp tools <server>`."
+        )),
+    }
+}
+
+fn handle_mcp_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use ParsedMcpCommand as Cmd;
+
+    let action = match parse_mcp_command(args) {
         Cmd::Help => McpReadAction::Help,
         Cmd::Overview => McpReadAction::Overview,
         Cmd::Servers => McpReadAction::Servers,
@@ -2500,7 +2700,7 @@ fn mcp_builtin_tool_text(meta: &astra_turn_core::tool::registry::meta::ToolMeta)
 
 async fn mcp_inspect_text(manager: &McpManagerHandle, query: &str) -> String {
     let manager = manager.read().await;
-    match crate::cli::slash::slash_mcp::resolve_protocol_tool_query(&manager, query) {
+    match resolve_protocol_tool_query(&manager, query) {
         Ok((server, tool)) => mcp_protocol_tool_text(server, tool),
         Err(protocol_error) => {
             for meta in astra_turn_core::tool::registry::meta::TOOL_CATALOG {
@@ -2510,6 +2710,59 @@ async fn mcp_inspect_text(manager: &McpManagerHandle, query: &str) -> String {
             }
             protocol_error
         }
+    }
+}
+
+#[cfg(test)]
+mod mcp_command_tests {
+    use super::{ParsedMcpCommand, parse_mcp_command, workbench_server_completions};
+
+    #[test]
+    fn parse_mcp_command_defaults_to_help() {
+        assert_eq!(parse_mcp_command(""), ParsedMcpCommand::Help);
+        assert_eq!(parse_mcp_command("help"), ParsedMcpCommand::Help);
+    }
+
+    #[test]
+    fn parse_mcp_command_supports_list_aliases() {
+        assert_eq!(parse_mcp_command("list"), ParsedMcpCommand::Overview);
+        assert_eq!(parse_mcp_command("status"), ParsedMcpCommand::Overview);
+        assert_eq!(
+            parse_mcp_command("list tools github"),
+            ParsedMcpCommand::Tools(Some("github"))
+        );
+        assert_eq!(parse_mcp_command("list prompts"), ParsedMcpCommand::Prompts);
+        assert_eq!(
+            parse_mcp_command("list resources"),
+            ParsedMcpCommand::Resources
+        );
+    }
+
+    #[test]
+    fn parse_mcp_command_supports_read_alias() {
+        assert_eq!(
+            parse_mcp_command("read github:file:///README.md"),
+            ParsedMcpCommand::Read(Some("github:file:///README.md"))
+        );
+        assert_eq!(
+            parse_mcp_command("resource github:file:///README.md"),
+            ParsedMcpCommand::Read(Some("github:file:///README.md"))
+        );
+    }
+
+    #[test]
+    fn workbench_completions_only_offer_supported_server_actions() {
+        let entries = workbench_server_completions(["github"]);
+        let names = entries
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["tools github", "ping github"]);
+        assert!(
+            !names
+                .iter()
+                .any(|name| matches!(*name, "remove github" | "log-level github"))
+        );
     }
 }
 
@@ -2800,7 +3053,7 @@ pub(crate) fn push_model_picker(
 }
 
 fn model_catalog_error_message(
-    error: &crate::cli::slash::slash_router::ModelCatalogError,
+    error: &crate::cli::session::session_runtime::ModelCatalogError,
 ) -> String {
     if error.is_authentication_failure() {
         "Not authorized — try /login first".into()
@@ -2820,10 +3073,10 @@ fn model_catalog_error_message(
 pub(crate) async fn load_model_catalog(
     api: astra_thin_client::ThinClient,
     profile: Option<String>,
-) -> Result<Vec<crate::cli::slash::slash_router::ModelCatalogEntry>, String> {
+) -> Result<Vec<astra_services::ModelListItemResponse>, String> {
     let token =
         crate::cli::session::session_runtime::fresh_access_token(&api, profile.as_deref()).await;
-    match crate::cli::slash::slash_router::fetch_model_catalog(&api, token.as_deref()).await {
+    match crate::cli::session::session_runtime::fetch_model_catalog(&api, token.as_deref()).await {
         Ok(models) => Ok(models),
         Err(error) => {
             if !error.is_authentication_failure() {
@@ -2835,7 +3088,7 @@ pub(crate) async fn load_model_catalog(
             {
                 let refreshed =
                     crate::cli::session::session_runtime::current_access_token(profile.as_deref());
-                match crate::cli::slash::slash_router::fetch_model_catalog(
+                match crate::cli::session::session_runtime::fetch_model_catalog(
                     &api,
                     refreshed.as_deref(),
                 )
@@ -2859,7 +3112,7 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
         Ok(models) => {
             let names = models
                 .iter()
-                .filter_map(crate::cli::slash::slash_router::entry_model_name)
+                .filter_map(crate::cli::session::session_runtime::model_list_entry_name)
                 .map(ToOwned::to_owned)
                 .collect();
             if push_model_picker(ctx.state, ctx.bottom_pane, ctx.chat_widget, names) {
@@ -2880,15 +3133,13 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     }
     let Some(name) = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name)) else {
         ctx.state.model = None;
-        crate::cli::slash::slash_config::set_active_model_for_display(None);
-        crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
+        crate::cli::session::session_runtime::set_active_offering_id_for_request(None);
         ctx.bottom_pane.footer.model = None;
         ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
         return;
     };
     ctx.state.model = Some(name.to_string());
-    crate::cli::slash::slash_config::set_active_model_for_display(Some(name.to_string()));
-    crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
+    crate::cli::session::session_runtime::set_active_offering_id_for_request(None);
     ctx.bottom_pane.footer.model = Some(name.to_string());
     ctx.show_response(format!("Set model to {name}"));
 }
@@ -2897,8 +3148,7 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
 /// scrollback so the user sees the footer switch.
 async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
     ctx.state.model = None;
-    crate::cli::slash::slash_config::set_active_model_for_display(None);
-    crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
+    crate::cli::session::session_runtime::set_active_offering_id_for_request(None);
     ctx.bottom_pane.footer.model = None;
     ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
     SlashResult::Handled
@@ -2980,7 +3230,9 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
         ("session total tokens", fmt_tokens(cumulative_tokens)),
         (
             "session cost",
-            crate::cli::slash::slash_stats::format_optional_cost(ctx.state.total_session_cost),
+            crate::cli::session::session_stats_scan::format_optional_cost(
+                ctx.state.total_session_cost,
+            ),
         ),
     ];
     ctx.open_view(
@@ -3169,7 +3421,7 @@ pub(crate) fn session_hub_view(
     // Live state
     pairs.push((
         "cost",
-        crate::cli::slash::slash_stats::format_optional_cost(snapshot.total_cost),
+        crate::cli::session::session_stats_scan::format_optional_cost(snapshot.total_cost),
     ));
     pairs.push(("prompt tokens", fmt_tokens(snapshot.prompt_tokens)));
     pairs.push(("completion tokens", fmt_tokens(snapshot.completion_tokens)));
@@ -3507,7 +3759,7 @@ fn handle_inspect_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashRe
     }
 
     use crate::tui::bottom_pane::info_view::InfoView;
-    let inspection = crate::cli::slash::slash_inspect::inspect_workbench(ctx.state);
+    let inspection = crate::tui::inspection::inspect_workbench(ctx.state);
     ctx.open_view(
         "Opened runtime inspector",
         Box::new(

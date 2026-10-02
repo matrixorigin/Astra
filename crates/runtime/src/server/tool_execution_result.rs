@@ -2,8 +2,9 @@ use serde_json::{Map, Value};
 
 use astra_core::work_unit::{WORK_UNIT_OBSERVATION_FIELD, WorkUnitObservation};
 use astra_turn_core::orchestration::agent_result_wire::{
+    AGENT_RESULT_CLASS_AGENT_INCOMPLETE, AgentToolResultStatusKind, DecodedAgentToolResult,
     agent_fanout_result_looks_like, agent_fanout_structured_result_class,
-    agent_tool_result_looks_like, agent_tool_structured_result_class,
+    agent_tool_structured_result_class, decode_agent_tool_result,
 };
 
 use super::tool_transport_metadata::{
@@ -139,20 +140,26 @@ fn execution_boundary_wait_error_kind(reason: &str) -> Option<&'static str> {
 
 pub(crate) fn agent_tool_result_from_output(output: String) -> astra_tools::ToolResult {
     let parsed = serde_json::from_str::<Value>(&output).ok();
-    let result_class = parsed.as_ref().and_then(|value| {
-        if agent_fanout_result_looks_like(value) {
-            agent_fanout_structured_result_class(value)
-        } else if agent_tool_result_looks_like(value) {
-            agent_tool_structured_result_class(value)
-        } else {
-            None
+    let result_class = match parsed.as_ref() {
+        None => Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE),
+        Some(value) => {
+            if value.get("result_family").is_none() && agent_fanout_result_looks_like(value) {
+                agent_fanout_structured_result_class(value)
+            } else {
+                agent_tool_structured_result_class(value)
+            }
         }
-    });
+    };
     let interrupted_agent = parsed.as_ref().and_then(|value| {
-        let status = value.get("status").and_then(Value::as_str)?;
-        if !matches!(status, "waiting" | "interrupted") {
+        let Some(DecodedAgentToolResult::ChildResult(status)) = decode_agent_tool_result(value)
+        else {
             return None;
-        }
+        };
+        let status = match status {
+            AgentToolResultStatusKind::Waiting => "waiting",
+            AgentToolResultStatusKind::Interrupted => "interrupted",
+            _ => return None,
+        };
         let reason = match status {
             "waiting" => value
                 .get("reason")
@@ -284,6 +291,36 @@ pub(crate) fn workspace_path_mismatch_tool_result(message: String) -> astra_tool
             Value::String(TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH.to_string()),
         ),
         ("blocked".to_string(), Value::Bool(true)),
+        (
+            "disposition".to_string(),
+            Value::String("rejected".to_string()),
+        ),
+        ("execution_started".to_string(), Value::Bool(false)),
+        (
+            "execution_fact".to_string(),
+            Value::String("not_executed".to_string()),
+        ),
+    ]));
+    result
+}
+
+/// Return a typed result for an admission/preflight rejection. The executor
+/// did not own a process, so lifecycle evaluation must not treat this as a
+/// failed execution that needs reconciliation.
+pub(crate) fn pre_dispatch_rejection_tool_result(
+    message: impl Into<String>,
+) -> astra_tools::ToolResult {
+    let mut result = astra_tools::ToolResult::error(message.into());
+    result.metadata = Some(Map::from_iter([
+        (
+            "disposition".to_string(),
+            Value::String("rejected".to_string()),
+        ),
+        ("execution_started".to_string(), Value::Bool(false)),
+        (
+            "execution_fact".to_string(),
+            Value::String("not_executed".to_string()),
+        ),
     ]));
     result
 }
@@ -359,6 +396,7 @@ mod tests {
     fn blocked_agent_result_preserves_work_observation_metadata() {
         let result = agent_tool_result_from_output(
             serde_json::json!({
+                "result_family": "child_result",
                 "status": "waiting",
                 "agent_id": "future-agent-1",
                 "reason": "executor_offline",
@@ -383,6 +421,57 @@ mod tests {
         assert_eq!(observation.id, "future-agent-1");
         assert_eq!(observation.status, WorkUnitStatus::WaitingForInput);
         assert_eq!(observation.mode, WorkUnitObservationMode::Wait);
+    }
+
+    #[test]
+    fn control_receipt_metadata_is_neutral_and_malformed_receipts_fail_closed() {
+        let opaque = agent_tool_result_from_output("opaque executor failure".into());
+        assert_eq!(
+            result_metadata_str(&opaque, "result_class"),
+            Some("agent_incomplete")
+        );
+        for receipt in [
+            serde_json::json!({
+                "result_family":"control_receipt", "action":"wait", "success":true,
+                "status":"wait_admitted", "result_class":"success",
+                "wait_request":{"parent_run_id":"parent", "tool_call_id":"call", "timeout_ms":1}
+            }),
+            serde_json::json!({
+                "result_family":"control_receipt", "action":"send_message", "success":true,
+                "status":"queued", "result_class":"success", "run_id":"r",
+                "message_id":"m", "target":"parent", "message_type":"text", "recipients":null
+            }),
+        ] {
+            let result = agent_tool_result_from_output(receipt.to_string());
+            assert!(!result.is_error);
+            assert_eq!(result_metadata_str(&result, "result_class"), None);
+            for (field, invalid) in [
+                ("result_family", serde_json::json!("unknown")),
+                ("success", serde_json::json!(false)),
+                ("status", serde_json::json!("failed")),
+                ("status", serde_json::json!("delivery_unknown")),
+                ("status", serde_json::json!("ok")),
+                ("status", serde_json::json!("completed")),
+                ("result", serde_json::json!("")),
+            ] {
+                let mut invalid_receipt = receipt.clone();
+                invalid_receipt[field] = invalid;
+                invalid_receipt["group_id"] = serde_json::json!("group");
+                invalid_receipt["results"] = serde_json::json!([]);
+                let result = agent_tool_result_from_output(invalid_receipt.to_string());
+                assert_eq!(
+                    result_metadata_str(&result, "result_class"),
+                    Some("agent_incomplete")
+                );
+            }
+            let mut missing_status = receipt;
+            missing_status.as_object_mut().unwrap().remove("status");
+            let result = agent_tool_result_from_output(missing_status.to_string());
+            assert_eq!(
+                result_metadata_str(&result, "result_class"),
+                Some("agent_incomplete")
+            );
+        }
     }
 
     #[test]

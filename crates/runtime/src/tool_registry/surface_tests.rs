@@ -103,10 +103,9 @@ fn assert_resident_external_state_contract(resident_bash: &Value, canonical_bash
         .as_str()
         .expect("resident Bash description");
     for cue in [
-        "Before external mutations",
-        "smallest absolute external roots",
+        "External mutations only",
+        "minimal absolute roots",
         "owned foreground delta",
-        "Omit for workspace-only or read-only work",
     ] {
         assert!(
             description.contains(cue),
@@ -162,6 +161,16 @@ fn default_always_load_surface_has_a_fixed_schema_budget() {
         .expect("base tool surface must serialize")
         .len();
     const SAFETY_MARGIN_BYTES: usize = 256;
+    eprintln!("resident schemas: {bytes} bytes + {SAFETY_MARGIN_BYTES} bytes safety margin");
+    if bytes.saturating_add(SAFETY_MARGIN_BYTES) > DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET {
+        for schema in surface.always_load_schemas() {
+            eprintln!(
+                "{}: {} bytes",
+                tool_schema_name(&schema).unwrap_or("unknown"),
+                serde_json::to_vec(&schema).unwrap().len()
+            );
+        }
+    }
     assert!(
         bytes.saturating_add(SAFETY_MARGIN_BYTES) <= DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET,
         "default always-load schemas use {bytes} bytes, leaving less than the {SAFETY_MARGIN_BYTES}-byte fixed-prefix safety margin (budget={} bytes); defer a non-primitive workflow or simplify its schema",
@@ -171,6 +180,109 @@ fn default_always_load_surface_has_a_fixed_schema_budget() {
         bytes > base_bytes,
         "hot Work lifecycle schemas must be included in the default resident surface"
     );
+}
+
+#[test]
+fn models_discovery_is_easy_from_resident_and_selected_model_catalog() {
+    let schemas = catalog_schemas();
+    let surface = ToolSurface::build(schemas.clone(), &ToolSurfaceConfig::default(), &[]);
+    let introspect = surface
+        .always_load_schemas()
+        .into_iter()
+        .find(|schema| tool_schema_name(schema) == Some("introspect"))
+        .unwrap();
+    assert!(
+        introspect["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("select:model_catalog")
+    );
+    let description = introspect["function"]["description"].as_str().unwrap();
+    assert!(!description.contains("facet=models"));
+    let params = &introspect["function"]["parameters"]["properties"];
+    assert!(
+        !params["facet"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("models"))
+    );
+    assert!(params.get("catalog").is_none());
+    for arguments in [
+        json!({"facet":"overview"}),
+        json!({"explain":{"target":"previous"}}),
+        json!({"artifact":"artifact://session/tool-result/example","offset":0,"max_bytes":1024}),
+    ] {
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "introspect",
+            &arguments,
+            &introspect,
+        )
+        .expect("ordinary observation and Explain must stay resident");
+    }
+    let advanced = json!({"depth":"diagnostic","horizon":"recent","source_policy":"live_only"});
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "introspect",
+            &advanced,
+            &introspect
+        )
+        .is_err()
+    );
+    let full_introspect = schemas
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("introspect"))
+        .unwrap();
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "introspect",
+        &advanced,
+        full_introspect,
+    )
+    .expect("advanced observation remains supported by its canonical contract");
+    let model_catalog = schemas
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("model_catalog"))
+        .unwrap();
+    assert_eq!(
+        model_catalog["function"]["parameters"]["properties"]["limit"]["maximum"],
+        32
+    );
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "model_catalog",
+        &json!({"limit":16}),
+        model_catalog,
+    )
+    .unwrap();
+    let selected: Value = serde_json::from_str(&astra_tools::tool_search::tool_search(
+        &schemas,
+        &json!({"query":"select:model_catalog"}),
+    ))
+    .unwrap();
+    let contract = &selected["matches"][0];
+    assert!(
+        contract["description"]
+            .as_str()
+            .unwrap()
+            .contains("Authorized Chat model availability/comparison")
+    );
+    assert!(contract["parameters"]["properties"]["limit"].is_object());
+    assert_eq!(contract["parameters"]["properties"]["limit"]["maximum"], 32);
+    let full = schemas
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("introspect"))
+        .unwrap();
+    // Every retained field preserves its canonical executable structure.
+    let canonical = without_descriptions(full["function"]["parameters"]["properties"].clone());
+    for (name, property) in params.as_object().unwrap() {
+        assert_eq!(property, &canonical[name]);
+    }
+    for args in [
+        // Advanced observations remain callable through the selected contract.
+        json!({"facet":"overview","depth":"summary","horizon":"recent"}),
+        json!({"topic":"runtime","horizon":"now","source_policy":"live_only","include_context":true}),
+    ] {
+        astra_tools::schemas::validate_tool_arguments_against_schema("introspect", &args, full)
+            .expect("advanced observations must remain supported");
+    }
 }
 
 #[test]
@@ -192,6 +304,7 @@ fn default_surface_keeps_small_primitives_and_defers_complex_workflows() {
         "bash",
         "read_file",
         "write_file",
+        "agent",
     ] {
         assert!(
             always_load.contains(name),
@@ -200,7 +313,6 @@ fn default_surface_keeps_small_primitives_and_defers_complex_workflows() {
     }
     for name in [
         "agent_fanout",
-        "agent",
         "glob",
         "worktree",
         "inspect_work_plan",
@@ -296,8 +408,8 @@ fn resident_work_lifecycle_schemas_preserve_the_canonical_contract() {
         start["function"]["parameters"]["properties"]["tasks"]["description"], *task_description,
         "resident projection must retain the canonical distinction between outcomes and procedural steps"
     );
-    assert!(description.contains("one canonical Work graph"));
-    assert!(description.contains("never call start_work again"));
+    assert!(description.contains("One Work graph"));
+    assert!(description.contains("no repeat start"));
     assert!(description.contains("revision-pinned proposal"));
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "start_work",
@@ -409,6 +521,35 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     );
     assert!(!memory_properties.contains_key("memory_id"));
 
+    let agent = find(&resident, "agent");
+    let agent_params = &agent["function"]["parameters"];
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "agent", &json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"}), agent,
+    ).expect("ordinary delegation must not require model catalog fields");
+    assert_eq!(
+        agent_params["properties"]["action"]["enum"],
+        serde_json::json!(["spawn", "list", "get_result", "wait", "send_message"])
+    );
+    assert_eq!(agent_params["required"], serde_json::json!(["action"]));
+    assert_eq!(agent_params["additionalProperties"], false);
+    assert!(
+        agent_params["properties"]
+            .get("requested_model_policy")
+            .is_none()
+    );
+    assert!(agent_params["properties"].get("agent_id").is_some());
+    assert!(
+        agent_params
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.starts_with("x-astra-")
+                || matches!(
+                    key.as_str(),
+                    "x-astra-per-action-required" | "x-astra-per-action-allowed"
+                ))
+    );
+
     let ask_user = find(&resident, "ask_user");
     assert_eq!(
         ask_user["function"]["parameters"]["properties"]["questions"]["items"]["additionalProperties"],
@@ -441,6 +582,71 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
             .get("memory_id")
             .is_some()
     );
+    let full_agent = find(&full, "agent");
+    assert!(
+        full_agent["function"]["parameters"]["properties"]
+            .get("requested_model_policy")
+            .is_some()
+    );
+    let ordinary_spawn = json!({"action":"spawn","description":"Review","prompt":"Review the change","agent_type":"code-review"});
+    astra_tools::schemas::validate_tool_arguments_against_schema("agent", &ordinary_spawn, agent)
+        .expect("the user-facing spawn instruction must match the resident contract");
+    let resident_reasoning_spawn = json!({
+        "action":"spawn",
+        "description":"Reason carefully",
+        "prompt":"Return the requested result",
+        "reasoning":{"mode":"adaptive","effort":"high"}
+    });
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "agent",
+        &resident_reasoning_spawn,
+        agent,
+    )
+    .expect("reasoning is a first-class resident spawn control");
+    for arguments in [
+        json!({"action":"list"}),
+        json!({"action":"get_result","agent_id":"child"}),
+        json!({"action":"send_message","to":"parent","message":"question","message_type":"question"}),
+    ] {
+        astra_tools::schemas::validate_tool_arguments_against_schema("agent", &arguments, agent)
+            .expect("basic collaboration must be directly callable");
+    }
+    for arguments in [
+        json!({"action":"get_result"}),
+        json!({"action":"send_message","to":"parent"}),
+        json!({"action":"list","prompt":"not a spawn"}),
+        json!({"action":"run_chain"}),
+    ] {
+        assert!(
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "agent", &arguments, agent
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "agent",
+            &json!({"action":"spawn","description":"Review"}),
+            agent,
+        )
+        .is_err()
+    );
+    let advanced_spawn = json!({"action":"spawn","description":"Review","prompt":"Review the change","requested_model_policy":{"mode":"fixed","selector":{"kind":"offering_id","offering_id":"offer-a"}}});
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "agent",
+            &advanced_spawn,
+            agent,
+        )
+        .is_err()
+    );
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "agent",
+        &advanced_spawn,
+        full_agent,
+    )
+    .expect("selected canonical contract retains advanced spawn fields");
     let full_ask_user = find(&full, "ask_user");
     assert!(
         full_ask_user["function"]["parameters"]["properties"]["questions"]["items"]["properties"]
@@ -524,6 +730,28 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
             .unwrap_or_else(|| panic!("missing schema {name}"))
     }
 
+    let agent = find(&resident, "agent");
+    assert_eq!(
+        agent["function"]["parameters"]["x-astra-per-action-allowed"]["wait"],
+        json!(["action", "timeout_ms"])
+    );
+    for arguments in [
+        json!({"action": "wait"}),
+        json!({"action": "wait", "timeout_ms": 1}),
+    ] {
+        astra_tools::schemas::validate_tool_arguments_against_schema("agent", &arguments, agent)
+            .expect("resident wait accepts its canonical observation shape");
+    }
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "agent",
+            &json!({"action": "wait", "agent_id": "other-child"}),
+            agent,
+        )
+        .is_err(),
+        "resident wait must not accept fields belonging to other actions"
+    );
+
     let advanced_memory = json!({
         "action": "remember",
         "content": "durable preference",
@@ -564,8 +792,7 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
     let description = find(&resident, "memory")["function"]["description"]
         .as_str()
         .unwrap();
-    assert!(description.contains("forget/update"));
-    assert!(description.contains("tool_search select:memory; invoke_tool"));
+    assert!(description.contains("remember/recall"));
 
     let resident_reflect = json!({
         "question": "What durable evidence explains the last failed turn?"
@@ -761,7 +988,19 @@ fn server_builtin_inventory_is_public_schema_backed() {
     let schema_names = schema_name_set();
     let registry = astra_runtime_env::ToolRegistry::builtins();
 
-    for name in crate::provider::server_builtin::server_builtin_tool_names() {
+    let server_builtin_names: std::collections::BTreeSet<String> =
+        crate::capabilities::server_builtin_tool_schemas(
+            &astra_turn_core::capability::CapabilitySet::all(),
+        )
+        .into_iter()
+        .map(|schema| {
+            astra_turn_core::tool::schema::tool_schema_name(&schema)
+                .expect("server schema must declare its name")
+                .to_string()
+        })
+        .collect();
+    assert!(!server_builtin_names.is_empty());
+    for name in &server_builtin_names {
         let spec = registry
             .get(name)
             .unwrap_or_else(|| panic!("server builtin inventory has no ToolSpec: {name}"));
@@ -1122,7 +1361,7 @@ fn observation_recovery_and_reflection_are_eager() {
         introspect["function"]["description"]
             .as_str()
             .unwrap()
-            .contains("explain={target:previous}")
+            .contains("explain.target=previous|run")
     );
     let description = introspect["function"]["description"].as_str().unwrap();
     assert!(description.contains("question=label"));
@@ -1140,8 +1379,8 @@ fn observation_recovery_and_reflection_are_eager() {
         .find(|schema| schema["function"]["name"] == "reflect")
         .expect("reflect observation schema must be eager");
     let description = reflect["function"]["description"].as_str().unwrap();
-    assert!(description.contains("tool_search select:reflect"));
-    assert!(description.contains("invoke_tool"));
+    assert!(description.contains("Session history"));
+    assert!(description.contains("Exact run: Explain"));
     let reflect_properties = reflect["function"]["parameters"]["properties"]
         .as_object()
         .expect("resident reflect properties");

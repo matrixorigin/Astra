@@ -10,7 +10,7 @@
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, OnceLock, mpsc};
@@ -254,6 +254,7 @@ fn writer_epoch_state(workspace_root: &Path) -> Option<Arc<WriterEpochState>> {
         QUARANTINED_WRITER_STATES.get_or_init(|| std::sync::Mutex::new(Default::default()));
     let map = recover_mutex(quarantine_map);
     if let Some(state) = lookup_keys.iter().find_map(|key| map.get(key).cloned()) {
+        hydrate_persistent_ownership_quarantine(&state, &lookup_keys);
         return Some(state);
     }
     let epochs = WRITER_EPOCHS.get_or_init(|| std::sync::Mutex::new(Default::default()));
@@ -263,14 +264,90 @@ fn writer_epoch_state(workspace_root: &Path) -> Option<Arc<WriterEpochState>> {
         .iter()
         .find_map(|key| map.get(key).and_then(std::sync::Weak::upgrade))
     {
+        hydrate_persistent_ownership_quarantine(&state, &lookup_keys);
         return Some(state);
     }
     let state = Arc::new(WriterEpochState::default());
     let weak = Arc::downgrade(&state);
-    for key in lookup_keys {
-        map.insert(key, weak.clone());
+    for key in &lookup_keys {
+        map.insert(key.clone(), weak.clone());
     }
+    // A previous process may have left an unresolved descendant behind. The
+    // persistent marker is the cross-process part of the same sticky fence;
+    // hydrate it before any fingerprint or lease caller can observe a clean
+    // in-process state.
+    hydrate_persistent_ownership_quarantine(&state, &lookup_keys);
     Some(state)
+}
+
+fn effective_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+fn ownership_unsettled_marker_path(key: &Path) -> Option<PathBuf> {
+    let root = stable_coordination_root()?;
+    let digest = coordination_key_digest(key);
+    Some(root.join(format!(
+        ".astra-workspace-{digest}-observation-uid-{}.unsettled",
+        effective_uid()
+    )))
+}
+
+fn ownership_unsettled_marker_exists(key: &Path) -> bool {
+    ownership_unsettled_marker_path(key).is_some_and(|path| path.is_file())
+}
+
+fn hydrate_persistent_ownership_quarantine(state: &Arc<WriterEpochState>, keys: &[PathBuf]) {
+    if keys
+        .iter()
+        .any(|key| ownership_unsettled_marker_exists(key))
+    {
+        state
+            .quarantined
+            .store(true, std::sync::atomic::Ordering::Release);
+        state
+            .ownership_unsettled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Install a restart- and process-stable ownership fence. The marker contains
+/// no workspace path or user data; its digest is only a coordination key. It
+/// is deliberately never removed automatically because no process can prove
+/// that the delayed provider-side writer has stopped after a lost ACK.
+fn persist_ownership_unsettled_markers(keys: &[PathBuf]) -> bool {
+    let mut all_persisted = true;
+    for key in keys {
+        let Some(path) = ownership_unsettled_marker_path(key) else {
+            all_persisted = false;
+            continue;
+        };
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&path) {
+            Ok(mut file) => {
+                if file
+                    .write_all(b"astra workspace ownership unsettled\n")
+                    .and_then(|_| file.sync_all())
+                    .is_err()
+                {
+                    all_persisted = false;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => all_persisted = false,
+        }
+    }
+    all_persisted
 }
 
 /// Resolve a stable binding key even when an invocation has removed or
@@ -407,6 +484,13 @@ fn quarantine_observation_state(
             }
         }
     }
+    if ownership_unsettled && !persist_ownership_unsettled_markers(&aliases) {
+        tracing::error!(
+            component = "workspace_observation",
+            operation = "persistent_quarantine",
+            "could not install the cross-process ownership fence; keeping the local fence and rejecting further workspace work"
+        );
+    }
     let quarantine_map =
         QUARANTINED_WRITER_STATES.get_or_init(|| std::sync::Mutex::new(Default::default()));
     let mut quarantined = recover_mutex(quarantine_map);
@@ -444,6 +528,27 @@ pub fn workspace_ownership_is_unsettled(workspace_root: &Path) -> Option<bool> {
             .ownership_unsettled
             .load(std::sync::atomic::Ordering::Acquire),
     )
+}
+
+/// Why a workspace lease could not be admitted.  This is intentionally a
+/// small classification: callers must distinguish a safe retry after
+/// contention from a binding that needs repair or ownership that must never
+/// be replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceLeaseFailure {
+    OwnershipUnsettled,
+    BindingUnavailable,
+    Contended,
+}
+
+pub fn classify_workspace_lease_failure(workspace_root: &Path) -> WorkspaceLeaseFailure {
+    if workspace_ownership_is_unsettled(workspace_root) == Some(true) {
+        WorkspaceLeaseFailure::OwnershipUnsettled
+    } else if !workspace_root.exists() {
+        WorkspaceLeaseFailure::BindingUnavailable
+    } else {
+        WorkspaceLeaseFailure::Contended
+    }
 }
 
 /// Mark an executor-owned writer that may recursively invoke other tools.
@@ -5948,6 +6053,35 @@ mod tests {
     }
 
     #[test]
+    fn persistent_ownership_marker_hydrates_a_fresh_process_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let key = workspace_binding_key(temp.path()).expect("workspace key");
+        let marker = ownership_unsettled_marker_path(&key).expect("marker path");
+        let _ = fs::remove_file(&marker);
+        assert!(persist_ownership_unsettled_markers(std::slice::from_ref(
+            &key
+        )));
+
+        // A fresh process has no in-memory WriterEpochState. Reading the
+        // binding must still hydrate the same sticky fence before a lease or
+        // fingerprint can be admitted.
+        let state = writer_epoch_state(temp.path()).expect("writer state");
+        assert!(state.quarantined.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            state
+                .ownership_unsettled
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(WorkspaceFingerprint::capture(temp.path()).is_none());
+        assert!(
+            acquire_workspace_observation_lease_sync(temp.path(), Duration::from_millis(20))
+                .is_none()
+        );
+
+        fs::remove_file(marker).expect("remove test marker");
+    }
+
+    #[test]
     fn external_preimage_reports_sticky_quarantine_without_exposing_paths() {
         let log = tempfile::NamedTempFile::new().unwrap();
         let writer = log.reopen().unwrap();
@@ -5982,6 +6116,10 @@ mod tests {
             workspace_ownership_is_unsettled(external.path()),
             Some(false)
         );
+        // The formatter owns the cloned file handle. Drop the subscriber
+        // before reading the evidence so the assertion observes all buffered
+        // records deterministically instead of depending on scheduler timing.
+        drop(_subscriber);
         let output = fs::read_to_string(log.path()).unwrap();
         assert!(output.contains("attribution_uncertain"));
         assert!(output.contains("external_state_observation_quarantined"));

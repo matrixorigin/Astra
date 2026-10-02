@@ -7,6 +7,7 @@ publish = false
 description = "Shared MCP client library for Astra CLI and runtime"
 
 [dependencies]
+astra-turn-core.workspace = true
 astra-turn-types.workspace = true
 rmcp = { version = "1.3", default-features = false, features = [
     "client",

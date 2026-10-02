@@ -5,7 +5,7 @@ use super::offline::{
     CandidateChoice, PolicyMetrics, RouterCandidate, RouterTrainingConfig, comparisons,
     feature_key, recorded_auto_choice, representatives, train_router,
 };
-use astra_services::evaluation::router::*;
+use astra_services::model_routing::offline::*;
 use astra_services::tuning::{
     RouterQualificationProtocol, RouterQualificationStatus, RouterTuningRecord,
     router_evaluation_plan_sha256,

@@ -54,32 +54,6 @@
       "download_url": null
     }
   },
-  "admin_feedback_stats": {
-    "status": 200,
-    "json": {
-      "total_feedback": 3,
-      "positive_feedback": 1,
-      "negative_feedback": 1,
-      "avg_rating": 3.0,
-      "feedback_by_type": {
-        "wrong_skill": 2,
-        "low_satisfaction": 1
-      }
-    }
-  },
-  "admin_feedback_stats_filtered": {
-    "status": 200,
-    "json": {
-      "total_feedback": 2,
-      "positive_feedback": 1,
-      "negative_feedback": 1,
-      "avg_rating": 3.0,
-      "feedback_by_type": {
-        "wrong_skill": 1,
-        "low_satisfaction": 1
-      }
-    }
-  },
   "admin_role_grant": {
     "request": {
       "username": "contract-grant-user",

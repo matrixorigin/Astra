@@ -7,8 +7,8 @@ publish = false
 
 [features]
 # Enables the database-backed CslStore (`DbCslStore`) and its sqlx dependency.
-# Consumers that only need the in-process / file-backed stores (CLI, unit tests)
-# should NOT enable this feature so they don't pay the sqlx compile cost.
+# Leave disabled when only in-process / file-backed CslStores are needed.
+# Other dependencies still bring SQLx into the build transitively.
 db-store = ["dep:sqlx"]
 
 [dependencies]

@@ -17,7 +17,7 @@
 //!
 //! # Key properties
 //!
-//! - **Versioned**: compound encoding `major*1000+minor`. `VersionPolicy` with negotiation chain.
+//! - **Versioned**: checkpoints must match the current protocol exactly.
 //! - **Slot-based cursor**: `ExecutionSlot` per tool (state machine), not sequential index.
 //! - **Tiered checkpoints**: `LightCheckpoint` (frequent) + `HeavyCheckpoint` (full recovery).
 //! - **Checkpoint strategy**: `CheckpointTrigger` maps events to Light/Heavy tier.
@@ -46,78 +46,21 @@ pub const PROTOCOL_VERSION_MAJOR: u32 = 2;
 pub const PROTOCOL_VERSION_MINOR: u32 = 0;
 pub const PROTOCOL_VERSION: u32 = PROTOCOL_VERSION_MAJOR * 1000 + PROTOCOL_VERSION_MINOR;
 
-/// How to handle version mismatches on checkpoint restore.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum VersionPolicy {
-    /// Reject any mismatch (safe default for production)
-    #[default]
-    Strict,
-    /// Accept if major version matches (same major = version / 1000).
-    /// E.g., v1.0 (1000) and v1.1 (1001) are compatible.
-    Compatible,
-}
-
-/// Result of version negotiation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VersionVerdict {
-    /// Exact match — proceed normally
-    ExactMatch,
-    /// Compatible (same major, different minor) — proceed with caution
-    CompatibleDecode { found: u32 },
-}
-
-pub fn check_protocol_version_with_policy(
-    version: u32,
-    policy: VersionPolicy,
-) -> Result<VersionVerdict, ProtocolError> {
-    // Version 0 is always invalid regardless of policy
-    if version == 0 {
-        return Err(ProtocolError::VersionMismatch {
-            expected: PROTOCOL_VERSION,
-            found: 0,
-            policy,
-        });
-    }
-
-    // Exact match — always OK
+/// Reject checkpoints not written with the current protocol.
+pub fn check_protocol_version(version: u32) -> Result<(), ProtocolError> {
     if version == PROTOCOL_VERSION {
-        return Ok(VersionVerdict::ExactMatch);
-    }
-
-    match policy {
-        VersionPolicy::Strict => Err(ProtocolError::VersionMismatch {
+        Ok(())
+    } else {
+        Err(ProtocolError::VersionMismatch {
             expected: PROTOCOL_VERSION,
             found: version,
-            policy,
-        }),
-        VersionPolicy::Compatible => {
-            let expected_major = PROTOCOL_VERSION / 1000;
-            let found_major = version / 1000;
-            if expected_major == found_major {
-                Ok(VersionVerdict::CompatibleDecode { found: version })
-            } else {
-                Err(ProtocolError::VersionMismatch {
-                    expected: PROTOCOL_VERSION,
-                    found: version,
-                    policy,
-                })
-            }
-        }
+        })
     }
-}
-
-/// Convenience: strict check (returns Ok(()) for exact match)
-pub fn check_protocol_version(version: u32) -> Result<(), ProtocolError> {
-    check_protocol_version_with_policy(version, VersionPolicy::Strict).map(|_| ())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProtocolError {
-    VersionMismatch {
-        expected: u32,
-        found: u32,
-        policy: VersionPolicy,
-    },
+    VersionMismatch { expected: u32, found: u32 },
     InvalidCursor(String),
     CheckpointCorrupt(String),
 }
@@ -125,21 +68,10 @@ pub enum ProtocolError {
 impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::VersionMismatch {
-                expected,
-                found,
-                policy,
-            } => {
-                let action = match policy {
-                    VersionPolicy::Strict => "Discard checkpoint and restart",
-                    VersionPolicy::Compatible => "Incompatible major version, discarding",
-                };
-                write!(
-                    f,
-                    "Protocol version mismatch: expected v{expected}, found v{found} \
-                     (policy: {policy:?}). {action}."
-                )
-            }
+            Self::VersionMismatch { expected, found } => write!(
+                f,
+                "Protocol version mismatch: expected v{expected}, found v{found}. Discard checkpoint and restart."
+            ),
             Self::InvalidCursor(msg) => write!(f, "Invalid execution cursor: {msg}"),
             Self::CheckpointCorrupt(msg) => write!(f, "Corrupt checkpoint: {msg}"),
         }
@@ -718,13 +650,28 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "version", deny_unknown_fields)]
 pub enum RunExecutionControl {
-    #[serde(rename = "2")]
-    V2 {
+    #[serde(rename = "3")]
+    V3 {
         completion_settlement: astra_turn_types::CompletionSettlementState,
         hook_obligations: astra_turn_types::StopHookObligations,
+        reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1,
         budget_wrapup_injected: bool,
         budget_wrapup_ignored_rounds: u32,
     },
+}
+
+impl RunExecutionControl {
+    pub fn validate_budget(&self, budget: &RunExecutionBudget) -> Result<(), &'static str> {
+        let Self::V3 {
+            reply_obligations, ..
+        } = self;
+        let RunExecutionBudget::V1 {
+            run_id,
+            producer_owner_generation,
+            ..
+        } = budget;
+        reply_obligations.validate_owner(run_id, *producer_owner_generation)
+    }
 }
 
 /// Heavy checkpoint: conversation and execution facts at one frontier.
@@ -913,7 +860,6 @@ pub struct BreakpointIndex {
 
 pub use astra_core::composite_snapshot::{
     CompositeSnapshot, CompositeSnapshotIndex, DataSnapshotRef, MemorySnapshotRef, SnapshotRef,
-    SnapshotSpec,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1062,6 +1008,19 @@ impl StepCheckpoint {
             return Err(ProtocolError::CheckpointCorrupt(
                 "Heavy checkpoint contains an unknown workspace observation quarantine".into(),
             ));
+        }
+
+        if let Self::Heavy(h) = self
+            && let Some(control) = &h.run_execution_control
+        {
+            let Some(budget) = &h.run_execution_budget else {
+                return Err(ProtocolError::CheckpointCorrupt(
+                    "execution control has no paired run budget".into(),
+                ));
+            };
+            control
+                .validate_budget(budget)
+                .map_err(|error| ProtocolError::CheckpointCorrupt(error.into()))?;
         }
 
         Ok(())
@@ -1736,9 +1695,14 @@ mod tests {
 
     #[test]
     fn run_execution_control_requires_complete_known_contract() {
-        let snapshot = RunExecutionControl::V2 {
+        let snapshot = RunExecutionControl::V3 {
             completion_settlement: astra_turn_types::CompletionSettlementState::default(),
             hook_obligations: astra_turn_types::StopHookObligations::default(),
+            reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
+                run_id: "control-run".into(),
+                producer_owner_generation: 3,
+                pending: Vec::new(),
+            },
             budget_wrapup_injected: true,
             budget_wrapup_ignored_rounds: 1,
         };
@@ -1760,58 +1724,81 @@ mod tests {
         assert!(serde_json::from_value::<RunExecutionControl>(unknown).is_err());
     }
 
+    #[test]
+    fn checkpoint_control_requires_exact_paired_question_owner() {
+        let mut checkpoint = StepCheckpoint::heavy(
+            "step".into(),
+            "task".into(),
+            "worker".into(),
+            ExecutionCursor::default(),
+        );
+        let StepCheckpoint::Heavy(heavy) = &mut checkpoint else {
+            unreachable!()
+        };
+        heavy.run_execution_control = Some(RunExecutionControl::V3 {
+            completion_settlement: Default::default(),
+            hook_obligations: Default::default(),
+            reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
+                run_id: "questioner".into(),
+                producer_owner_generation: 3,
+                pending: vec![astra_turn_types::PendingReply {
+                    request_id: "q1".into(),
+                    expected_responder: astra_turn_types::AgentCommunicationParty {
+                        run_id: "parent-mailbox".into(),
+                        agent_id: "orchestrator".into(),
+                    },
+                }],
+            },
+            budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
+        });
+        assert!(
+            checkpoint.validate().is_err(),
+            "unpaired control cannot restore"
+        );
+        for (run_id, generation, valid) in [
+            ("other-run", 3, false),
+            ("questioner", 4, false),
+            ("questioner", 3, true),
+        ] {
+            let StepCheckpoint::Heavy(heavy) = &mut checkpoint else {
+                unreachable!()
+            };
+            heavy.run_execution_budget = Some(RunExecutionBudget::V1 {
+                run_id: run_id.into(),
+                producer_owner_generation: generation,
+                charged_iterations: 1,
+                granted_iteration_boundary: 10,
+                remaining_iterations: 9,
+                effective_hard_turn_limit: None,
+            });
+            let decoded: StepCheckpoint =
+                serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+            assert_eq!(decoded.validate().is_ok(), valid);
+        }
+    }
+
     // ── Protocol Version ──
 
     #[test]
     fn protocol_version_checks() {
-        // Exact match succeeds for both policies
-        for policy in [VersionPolicy::Strict, VersionPolicy::Compatible] {
-            let result = check_protocol_version_with_policy(PROTOCOL_VERSION, policy);
-            assert!(result.is_ok());
-            assert_eq!(result.unwrap(), VersionVerdict::ExactMatch);
-        }
-
-        // Default check uses strict and succeeds for current version
         assert!(check_protocol_version(PROTOCOL_VERSION).is_ok());
-
-        // Mismatched version with strict → error with Discard message
-        let err = check_protocol_version(PROTOCOL_VERSION + 1).unwrap_err();
-        assert!(matches!(err, ProtocolError::VersionMismatch { .. }));
-        assert!(err.to_string().contains("Discard"));
-
-        // Strict rejects mismatch, zero version rejected by both
-        let cases: Vec<(u32, VersionPolicy, bool, &str)> = vec![
-            (999, VersionPolicy::Strict, false, "strict rejects mismatch"),
-            (0, VersionPolicy::Strict, false, "strict rejects zero"),
-            (
-                0,
-                VersionPolicy::Compatible,
-                false,
-                "compatible rejects zero",
-            ),
-            (
-                1000,
-                VersionPolicy::Compatible,
-                false,
-                "compatible rejects diff major",
-            ),
-            (
-                2050,
-                VersionPolicy::Compatible,
-                true,
-                "compatible accepts same major",
-            ),
-        ];
-        for (ver, policy, expect_ok, desc) in cases {
-            let result = check_protocol_version_with_policy(ver, policy);
-            assert_eq!(result.is_ok(), expect_ok, "{desc} (ver={ver})");
-            if !expect_ok {
-                if let Err(ProtocolError::VersionMismatch { policy: p, .. }) = result {
-                    assert_eq!(p, policy);
-                } else {
-                    panic!("expected VersionMismatch for {desc}");
-                }
-            }
+        for version in [
+            0,
+            500,
+            999,
+            1000,
+            PROTOCOL_VERSION - 1,
+            PROTOCOL_VERSION + 1,
+            2050,
+        ] {
+            assert_eq!(
+                check_protocol_version(version),
+                Err(ProtocolError::VersionMismatch {
+                    expected: PROTOCOL_VERSION,
+                    found: version,
+                })
+            );
         }
     }
 
@@ -2986,26 +2973,15 @@ mod tests {
         assert_eq!(key1, key2);
     }
 
-    // ── Version Display per Policy ──
+    // ── Version mismatch guidance ──
 
     #[test]
     fn version_display_strict_says_discard() {
         let err = ProtocolError::VersionMismatch {
             expected: 1000,
             found: 999,
-            policy: VersionPolicy::Strict,
         };
         assert!(err.to_string().contains("Discard checkpoint and restart"));
-    }
-
-    #[test]
-    fn version_display_compatible_says_incompatible() {
-        let err = ProtocolError::VersionMismatch {
-            expected: 1000,
-            found: 2000,
-            policy: VersionPolicy::Compatible,
-        };
-        assert!(err.to_string().contains("Incompatible major version"));
     }
 
     // ── Recovery Boundary: validate() hardened ──
@@ -3336,13 +3312,6 @@ mod tests {
         assert_eq!(PROTOCOL_VERSION_MINOR, 0);
         assert_eq!(PROTOCOL_VERSION / 1000, PROTOCOL_VERSION_MAJOR);
         assert_eq!(PROTOCOL_VERSION % 1000, PROTOCOL_VERSION_MINOR);
-    }
-
-    #[test]
-    fn version_compatible_rejects_old_versions() {
-        // Old version in major 0 range, current is major 1
-        let result = check_protocol_version_with_policy(500, VersionPolicy::Compatible);
-        assert!(result.is_err()); // major 0 != major 1
     }
 
     // ── Wait Trigger Validation ──

@@ -5,7 +5,7 @@ use super::{
     qualification::qualify_router,
 };
 use astra_services::{
-    evaluation::router::*,
+    model_routing::offline::*,
     tuning::{RouterQualificationProtocol, RouterQualificationStatus, rollout::*},
 };
 use astra_turn_types::model_routing::{AutoModelRoutingPolicy, ModelRoutingFeatures};

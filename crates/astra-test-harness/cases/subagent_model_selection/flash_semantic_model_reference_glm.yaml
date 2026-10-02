@@ -1,0 +1,55 @@
+name: flash_semantic_model_reference_glm
+description: |
+  A natural-language model reference with reordered terms must be resolved
+  against the authorized candidate catalog, not by a hard-coded alias.
+prompt: |
+  请让 5.2glm 模型的子代理只回答 ASTRA-SEMANTIC-MODEL-OK，然后把它的回答告诉我。
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: glm-5.2
+  - type: session_event_count
+    event_type: LlmRoundCompleted
+    min: 1
+    json_match:
+      path: /payload/model
+      equals: glm-5.2
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+        related_match:
+          path: /metadata/model_configuration/prepared_selection/model_name
+          equals: glm-5.2
+  - type: session_child_result_adopted
+    expected_result: ASTRA-SEMANTIC-MODEL-OK
+    spawn_match:
+      path: /metadata/model_configuration/prepared_selection/model_name
+      equals: glm-5.2
+    allow_get_result: true
+  - type: text_contains
+    needle: ASTRA-SEMANTIC-MODEL-OK
+  - type: journal_tool_call_count
+    name: reflect
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: grep
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: read_file
+    min: 0
+    max: 0

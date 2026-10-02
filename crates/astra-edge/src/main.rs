@@ -1029,8 +1029,6 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         &workspace,
         config.edge_id.clone(),
         session_id,
-        "astra-edge/0.1",
-        Duration::from_secs(30),
     ));
     let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedEdgeInvocation>(1_024);
     let execution_budget = EdgeExecutionBudget::new();

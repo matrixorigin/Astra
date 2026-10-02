@@ -27,7 +27,7 @@ pub async fn run_team_http_negative_paths() {
     let bad_empty_members: Value = json!({
         "name": format!("bad_empty_{}", ctx.suffix),
         "description": "should fail validation",
-        "coordination": { "type": "pipeline" },
+        "coordination": { "type": "sequential", "stop_on_success": false },
         "members": []
     });
     let (st_bad, bad_j) = post_json(&ctx.app, "/teams", Some(auth), bad_empty_members).await;
@@ -36,7 +36,7 @@ pub async fn run_team_http_negative_paths() {
     let dup_roles: Value = json!({
         "name": format!("bad_dup_roles_{}", ctx.suffix),
         "description": "duplicate roles",
-        "coordination": { "type": "pipeline" },
+        "coordination": { "type": "sequential", "stop_on_success": false },
         "members": [
             {
                 "role": "twin",
@@ -60,7 +60,7 @@ pub async fn run_team_http_negative_paths() {
     let budget_all_zero: Value = json!({
         "name": format!("bad_budget_all_zero_{}", ctx.suffix),
         "description": "invalid budget",
-        "coordination": { "type": "pipeline" },
+        "coordination": { "type": "sequential", "stop_on_success": false },
         "members": [
             {
                 "role": "only",
@@ -89,7 +89,7 @@ pub async fn run_team_http_negative_paths() {
     let budget_negative: Value = json!({
         "name": format!("bad_budget_neg_{}", ctx.suffix),
         "description": "negative usd",
-        "coordination": { "type": "pipeline" },
+        "coordination": { "type": "sequential", "stop_on_success": false },
         "members": [
             {
                 "role": "x1",
@@ -115,9 +115,9 @@ pub async fn run_team_http_negative_paths() {
     let (st_bn, bn_j) = post_json(&ctx.app, "/teams", Some(auth), budget_negative).await;
     assert_eq!(st_bn, StatusCode::BAD_REQUEST, "negative budget: {bn_j}");
 
-    let adversarial_three_members: Value = json!({
+    let retired_coordination: Value = json!({
         "name": format!("bad_adv_count_{}", ctx.suffix),
-        "description": "adversarial needs exactly 2 members",
+        "description": "unsupported coordination strategy",
         "coordination": { "type": "adversarial", "max_rounds": 3, "threshold": 0.8 },
         "members": [
             {
@@ -143,12 +143,11 @@ pub async fn run_team_http_negative_paths() {
             }
         ]
     });
-    let (st_adv, adv_j) =
-        post_json(&ctx.app, "/teams", Some(auth), adversarial_three_members).await;
+    let (st_adv, adv_j) = post_json(&ctx.app, "/teams", Some(auth), retired_coordination).await;
     assert_eq!(
         st_adv,
-        StatusCode::BAD_REQUEST,
-        "adversarial member count: {adv_j}"
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "retired strategy schema rejection: {adv_j}"
     );
 
     b.ctx.close().await;

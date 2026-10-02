@@ -625,6 +625,34 @@ pub fn evaluate_tool_call_records_with_thresholds(
 
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
+    input: &str,
+    recent_tools: &[String],
+    tool_call_records: &[ToolCallRecord],
+    stall_count: usize,
+    verdict_warning: bool,
+    budget_pressure: f64,
+    thresholds: EvaluationThresholds,
+    telemetry: TurnEvaluationTelemetry,
+) -> TurnEvaluation {
+    evaluate_tool_call_records_with_resolved_children(
+        input,
+        recent_tools,
+        tool_call_records,
+        stall_count,
+        verdict_warning,
+        budget_pressure,
+        thresholds,
+        telemetry,
+        &[],
+    )
+}
+
+/// Final-turn evaluation can consume producer-owned child completions that
+/// supersede earlier nonterminal agent receipts. The execution records remain
+/// unchanged for audit; only this quality projection treats proven receipts
+/// as settled. Callers must validate the child identity and delivery first.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_tool_call_records_with_resolved_children(
     _input: &str,
     _recent_tools: &[String],
     tool_call_records: &[ToolCallRecord],
@@ -633,6 +661,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     budget_pressure: f64,
     thresholds: EvaluationThresholds,
     telemetry: TurnEvaluationTelemetry,
+    resolved_children: &[astra_turn_types::task_resolution::ToolExecutionEvidenceRef],
 ) -> TurnEvaluation {
     // Execution health is computed only from calls that reached an executor.
     // Rejected, reused, suppressed, and deferred requests remain available as
@@ -798,7 +827,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     revoke_all_tools_healthy_when_quality_signals_disagree(&mut eval, &tool_calls);
     align_high_cost_low_yield_verdict(&mut eval, &tool_calls, telemetry);
     apply_blocked_tool_failures(&mut eval, tool_call_records);
-    apply_unresolved_tool_outcome_failures(&mut eval, tool_call_records);
+    apply_unresolved_tool_outcome_failures(&mut eval, tool_call_records, resolved_children);
     calibrate_confidence_after_quality_penalties(&mut eval);
 
     eval
@@ -1075,11 +1104,30 @@ fn operation_identity_key(record: &ToolCallRecord) -> Option<String> {
 
 fn unresolved_tool_outcome_failure_counts(
     records: &[ToolCallRecord],
+    resolved_children: &[astra_turn_types::task_resolution::ToolExecutionEvidenceRef],
 ) -> std::collections::BTreeMap<String, usize> {
     unresolved_tool_outcome_fact_counts(
         &records
             .iter()
-            .map(ToolEvaluationFact::from_record)
+            .map(|record| {
+                let mut fact = ToolEvaluationFact::from_record(record);
+                if record.name == "agent"
+                    && record.ok
+                    && fact.effective_result_class.as_deref() == Some(RESULT_CLASS_AGENT_INCOMPLETE)
+                    && record
+                        .execution_completion
+                        .as_ref()
+                        .is_some_and(|reference| {
+                            resolved_children
+                                .iter()
+                                .any(|resolved| resolved == reference)
+                        })
+                {
+                    fact.effective_result_class = Some("success".into());
+                    fact.non_failure_outcome = true;
+                }
+                fact
+            })
             .collect::<Vec<_>>(),
     )
 }
@@ -1353,7 +1401,7 @@ pub fn rejected_operation_key(record: &ToolCallRecord) -> Option<String> {
 /// result for the same operation removes the earlier failure, so runtime
 /// feedback does not keep advising about a problem the agent already fixed.
 pub fn count_unresolved_tool_outcome_failures(records: &[ToolCallRecord]) -> usize {
-    unresolved_tool_outcome_failure_counts(records)
+    unresolved_tool_outcome_failure_counts(records, &[])
         .values()
         .copied()
         .sum()
@@ -1374,6 +1422,17 @@ pub fn tool_outcome_is_positive_success(record: &ToolCallRecord) -> bool {
 }
 
 fn effective_tool_result_class(record: &ToolCallRecord) -> Option<String> {
+    if matches!(record.name.as_str(), "agent" | "agent_fanout") {
+        if let Some(class) = record
+            .result_class
+            .as_deref()
+            .map(str::trim)
+            .filter(|class| !class.is_empty() && *class != "success")
+        {
+            return Some(class.to_string());
+        }
+        return structured_tool_result_class(record).map(str::to_string);
+    }
     if let Some(class) = record
         .result_class
         .as_deref()
@@ -1387,7 +1446,13 @@ fn effective_tool_result_class(record: &ToolCallRecord) -> Option<String> {
 }
 
 fn structured_tool_result_class(record: &ToolCallRecord) -> Option<&'static str> {
-    let value = parse_structured_tool_result(record)?;
+    let Some(value) = parse_structured_tool_result(record) else {
+        return matches!(record.name.as_str(), "agent" | "agent_fanout")
+            .then_some(RESULT_CLASS_AGENT_INCOMPLETE);
+    };
+    if value.get("result_family").is_some() {
+        return agent_tool_structured_result_class(&value);
+    }
     if record.name == "agent_fanout" || agent_fanout_result_looks_like(&value) {
         return agent_fanout_structured_result_class(&value);
     }
@@ -1473,8 +1538,12 @@ fn record_is_rejected_attempt(record: &ToolCallRecord) -> bool {
             || record.was_blocked_by_policy())
 }
 
-fn apply_unresolved_tool_outcome_failures(eval: &mut TurnEvaluation, records: &[ToolCallRecord]) {
-    let counts = unresolved_tool_outcome_failure_counts(records);
+fn apply_unresolved_tool_outcome_failures(
+    eval: &mut TurnEvaluation,
+    records: &[ToolCallRecord],
+    resolved_children: &[astra_turn_types::task_resolution::ToolExecutionEvidenceRef],
+) {
+    let counts = unresolved_tool_outcome_failure_counts(records, resolved_children);
     let total: usize = counts.values().sum();
     if total == 0 {
         return;
@@ -1998,9 +2067,7 @@ fn observation_evidence_identities(
         return (None, None);
     };
     let result_key = if record.name == "introspect"
-        && args_value
-            .as_ref()
-            .is_some_and(|args| args.get("artifact").is_none() && args.get("explain").is_none())
+        && args_value.as_ref().is_some_and(is_live_snapshot_request)
     {
         let result = delivered_model_result(record).filter(|value| !value.is_empty());
         let Some(result) = result else {
@@ -2028,6 +2095,10 @@ fn observation_evidence_identities(
     )
 }
 
+fn is_live_snapshot_request(args: &serde_json::Value) -> bool {
+    args.get("artifact").is_none() && args.get("explain").is_none()
+}
+
 fn observation_coverage(record: &ToolCallRecord) -> Option<Vec<String>> {
     if record.name != "introspect"
         || !record.ok
@@ -2044,7 +2115,7 @@ fn observation_coverage(record: &ToolCallRecord) -> Option<Vec<String>> {
         return None;
     }
     let args = serde_json::from_str::<serde_json::Value>(args).ok()?;
-    if args.get("artifact").is_some() || args.get("explain").is_some() {
+    if !is_live_snapshot_request(&args) {
         return None;
     }
     let result = delivered_model_result(record).filter(|value| !value.is_empty())?;
@@ -2093,7 +2164,7 @@ fn observation_scope(record: &ToolCallRecord) -> Option<ObservationScope> {
         return None;
     }
     let args = serde_json::from_str::<serde_json::Value>(args).ok()?;
-    if args.get("artifact").is_some() || args.get("explain").is_some() {
+    if !is_live_snapshot_request(&args) {
         return None;
     }
     Some(ObservationScope::from_request(
@@ -2117,7 +2188,7 @@ fn observation_request_key(
     let Some(args) = args else {
         return operation_identity_key(record);
     };
-    if args.get("artifact").is_some() || args.get("explain").is_some() {
+    if !is_live_snapshot_request(args) {
         return operation_identity_key(record);
     }
     let request = crate::introspect::IntrospectRequest::from_args(args);
@@ -4232,6 +4303,122 @@ mod tests {
     }
 
     #[test]
+    fn admitted_coordination_is_not_a_failed_child_execution_or_validation() {
+        let mut record = journal_ok_call("agent");
+        record.tool_call_id = Some("wait-call".into());
+        record.args_full =
+            Some(serde_json::json!({"action":"wait","timeout_ms":120000}).to_string());
+        record.result_full = Some(
+            serde_json::json!({
+                "result_family":"control_receipt", "action":"wait", "success":true,
+                "status":"wait_admitted",
+                "wait_request":{"parent_run_id":"parent","tool_call_id":record.tool_call_id,
+                    "timeout_ms":120000}
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(std::slice::from_ref(&record)),
+            0
+        );
+        assert!(
+            !tool_outcome_is_positive_success(&record),
+            "coordination admission is not evidence that child work or validation succeeded"
+        );
+        let mut annotated = record.clone();
+        annotated.result_class = Some("success".into());
+        annotated.exit_semantics = Some("success".into());
+        assert!(
+            !tool_outcome_is_positive_success(&annotated),
+            "generic success metadata cannot promote a coordination receipt to validation"
+        );
+        let receipt: Value = serde_json::from_str(record.result_full.as_deref().unwrap()).unwrap();
+        let mut opaque = record.clone();
+        opaque.result_full = Some("opaque executor failure".into());
+        opaque.result_class = Some("execution_error".into());
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(std::slice::from_ref(&opaque)),
+            1
+        );
+        opaque.result_class = None;
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(std::slice::from_ref(&opaque)),
+            1
+        );
+        opaque.ok = false;
+        opaque.disposition = Some(astra_services::session_journal::ToolCallDisposition::Rejected);
+        opaque.result_class = Some("execution_error".into());
+        assert_eq!(
+            effective_tool_result_class(&opaque).as_deref(),
+            Some("execution_error"),
+            "a rejected non-JSON executor error must retain its failure classification"
+        );
+        assert_eq!(terminal_rejected_attempt_count(&[opaque]), 1);
+        let mut disguised = record.clone();
+        let mut envelope = receipt.clone();
+        envelope["result_family"] = serde_json::json!("unknown");
+        envelope["group_id"] = serde_json::json!("group");
+        envelope["results"] = serde_json::json!([]);
+        disguised.result_full = Some(envelope.to_string());
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(std::slice::from_ref(&disguised)),
+            1
+        );
+        for invalid_field in ["result_family", "success", "wait_request"] {
+            let mut malformed = receipt.clone();
+            malformed.as_object_mut().unwrap().remove(invalid_field);
+            let mut rejected = record.clone();
+            rejected.result_full = Some(malformed.to_string());
+            assert_eq!(
+                count_unresolved_tool_outcome_failures(std::slice::from_ref(&rejected)),
+                1,
+                "missing {invalid_field} cannot acquire coordination authority"
+            );
+            assert!(!tool_outcome_is_positive_success(&rejected));
+        }
+        for (field, value) in [
+            ("result_family", serde_json::json!("unknown")),
+            ("success", serde_json::json!(false)),
+            ("incomplete", serde_json::json!(true)),
+        ] {
+            let mut malformed = receipt.clone();
+            malformed[field] = value;
+            let mut rejected = record.clone();
+            rejected.result_full = Some(malformed.to_string());
+            assert_eq!(
+                count_unresolved_tool_outcome_failures(std::slice::from_ref(&rejected)),
+                1
+            );
+        }
+        let mut verifier = journal_ok_call("bash");
+        verifier.ok = false;
+        verifier.args_full = Some(serde_json::json!({"command":"cargo test"}).to_string());
+        verifier.result_class = Some("test_failure".into());
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(&[verifier, record.clone()]),
+            1,
+            "a successful coordination receipt must not erase a failed verifier"
+        );
+        for output in [
+            serde_json::json!({"status":"completed","agent_id":"child","result":""}),
+            serde_json::json!({"status":"interrupted","agent_id":"child"}),
+            serde_json::json!({"status":"unknown_status","agent_id":"child"}),
+        ] {
+            let mut incomplete = record.clone();
+            incomplete.args_full =
+                Some(serde_json::json!({"action":"get_result","agent_id":"child"}).to_string());
+            let mut output = output;
+            output["result_family"] = serde_json::json!("child_result");
+            incomplete.result_full = Some(output.to_string());
+            assert_eq!(
+                count_unresolved_tool_outcome_failures(std::slice::from_ref(&incomplete)),
+                1
+            );
+            assert!(!tool_outcome_is_positive_success(&incomplete));
+        }
+    }
+
+    #[test]
     fn positive_success_is_stricter_than_completed_domain_outcome() {
         let mut record = journal_ok_call("bash");
         record.args_full =
@@ -4704,6 +4891,26 @@ mod tests {
             ]),
             0,
             "a missing result must not be treated as unchanged evidence"
+        );
+    }
+
+    #[test]
+    fn model_catalog_pages_do_not_collapse_into_one_live_snapshot_request() {
+        let mut first = journal_ok_call("model_catalog");
+        first.args_full = Some(serde_json::json!({}).to_string());
+        first.result_full = Some("first complete JSON page".into());
+        let mut second = first.clone();
+        second.args_full =
+            Some(serde_json::json!({"cursor":"next","catalog_revision":"revision"}).to_string());
+        second.result_full = Some("second complete JSON page".into());
+        assert!(observation_scope(&first).is_none());
+        assert!(observation_scope(&second).is_none());
+        let a: serde_json::Value = serde_json::from_str(first.args_full.as_ref().unwrap()).unwrap();
+        let b: serde_json::Value =
+            serde_json::from_str(second.args_full.as_ref().unwrap()).unwrap();
+        assert_ne!(
+            observation_request_key(&first, Some(&a)),
+            observation_request_key(&second, Some(&b))
         );
     }
 
@@ -5355,6 +5562,7 @@ mod tests {
             serde_json::json!({
                 "status": "interrupted",
                 "agent_id": "reviewer@abc",
+                "result_family": "child_result",
                 "finish_reason": "empty_completion",
                 "incomplete": true,
                 "result": "partial review"
@@ -5382,6 +5590,7 @@ mod tests {
         active.result_full = Some(
             serde_json::json!({
                 "status": "still_running",
+                "result_family": "child_result",
                 "agent_id": "reviewer@abc"
             })
             .to_string(),
@@ -5408,6 +5617,7 @@ mod tests {
             serde_json::json!({
                 "status": "interrupted",
                 "agent_id": "reviewer@abc",
+                "result_family": "child_result",
                 "incomplete": true
             })
             .to_string(),
@@ -5418,6 +5628,7 @@ mod tests {
             serde_json::json!({
                 "status": "completed",
                 "agent_id": "reviewer@abc",
+                "result_family": "child_result",
                 "result": "done"
             })
             .to_string(),
@@ -5458,6 +5669,7 @@ mod tests {
                     "agent_id": "reviewer@abc",
                     "result": {
                         "status": "interrupted",
+                        "result_family": "child_result",
                         "agent_id": "reviewer@abc",
                         "incomplete": true
                     }
@@ -5490,6 +5702,7 @@ mod tests {
                     "agent_id": "reviewer@abc",
                     "result": {
                         "status": "still_running",
+                        "result_family": "child_result",
                         "agent_id": "reviewer@abc"
                     }
                 }]
@@ -5526,6 +5739,7 @@ mod tests {
                     "agent_id": "reviewer@abc",
                     "result": {
                         "status": "still_running",
+                        "result_family": "child_result",
                         "agent_id": "reviewer@abc"
                     },
                     "recovery": {

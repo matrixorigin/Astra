@@ -10,9 +10,9 @@ use ratatui::{
 };
 
 use super::view::{BottomPaneView, CancellationEvent, ViewCompletion};
-use crate::{
-    cli::slash::slash_inspect::{InspectorFactStatus, WorkbenchInspection},
-    tui::theme,
+use crate::tui::{
+    inspection::{InspectorFactStatus, WorkbenchInspection},
+    theme,
 };
 
 const MAX_VISIBLE: usize = 14;
@@ -467,18 +467,16 @@ impl BottomPaneView for InfoView {
 #[cfg(test)]
 mod tests {
     use super::InfoView;
-    use crate::{
-        cli::slash::slash_inspect::{
-            InspectorFact, InspectorFactStatus, InspectorSection, WorkbenchInspection,
-        },
-        tui::bottom_pane::view::BottomPaneView,
-        tui::theme,
+    use crate::tui::{
+        bottom_pane::view::BottomPaneView,
+        inspection::{InspectorFact, InspectorFactStatus, InspectorSection, WorkbenchInspection},
+        theme,
     };
 
     #[test]
     fn cost_scenario_qualification_survives_narrow_render() {
         let state = crate::cli::session::session_state::SessionState::default();
-        let rows = crate::cli::slash::slash_stats::current_rate_cost_rows(&state);
+        let rows = crate::cli::session::session_stats_scan::current_rate_cost_rows(&state);
         let view = InfoView::from_key_value("Current-rate Cost Scenario", rows);
         for width in [40, 60] {
             let area = ratatui::layout::Rect::new(0, 0, width, 20);
@@ -562,6 +560,7 @@ mod tests {
             "horizon": "session",
             "source_policy": "auto",
             "include_context": false,
+            "model_requests": astra_services::reflect::ModelRequestCapture::default(),
             "data_coverage": {
                 "overall": "fresh",
                 "source": "session_journal",

@@ -812,9 +812,7 @@ pub(crate) struct AgentIdArgs {
 }
 
 #[derive(Args, Debug)]
-#[command(
-    after_help = "Examples:\n  astra messaging\n  astra messaging dlq\n  astra messaging status"
-)]
+#[command(after_help = "Example:\n  astra messaging")]
 pub(crate) struct MessagingArgs {
     #[command(subcommand)]
     pub command: Option<MessagingSubcommand>,
@@ -824,10 +822,6 @@ pub(crate) struct MessagingArgs {
 pub(crate) enum MessagingSubcommand {
     /// Show metrics snapshot
     Metrics,
-    /// Show dead letter queue summary
-    Dlq,
-    /// Show mailbox status
-    Status,
 }
 
 #[derive(Args, Debug)]

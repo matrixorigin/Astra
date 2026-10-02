@@ -299,7 +299,9 @@ mod tests {
         fn new(provider: &str, api_key: &str) -> Self {
             Self {
                 admitted: AdmittedModelExecution {
+                    price_snapshot: None,
                     offering_id: "judge-offering".into(),
+                    source_identity: None,
                     access_kind: ModelAccessKind::SelfHosted,
                     execution_placement: ModelExecutionPlacement::Server,
                     model_name: "judge-model".into(),

@@ -1,62 +1,23 @@
 //! Cross-system contract tests for args-aware tool classification.
 //!
-//! These tests verify that the classification → partition → approval →
+//! These tests verify that the classification → approval →
 //! speculation pipeline stays consistent when bash commands carry
 //! read-only vs mutating arguments. This is the cloud-edge advantage
 //! over the reference agent: `bash "git status"` runs in parallel without
 //! approval while `bash "rm -rf"` is serialized and gated.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
-
 use astra_turn_core::cloud_approval_policy::{
     CloudGatedToolKind, cloud_gated_tool_kind_with_args, edge_tool_requires_cloud_approval,
     edge_tool_requires_cloud_approval_with_args,
 };
-use astra_turn_core::parallel_tool_exec::{
-    ToolExecutorFn, execute_parallel_round, is_read_only_tool, is_read_only_tool_with_args,
-    partition_tool_calls,
-};
+use astra_turn_core::parallel_tool_exec::{is_read_only_tool, is_read_only_tool_with_args};
 use astra_turn_core::streaming_tool_exec::should_speculate;
 use astra_turn_core::tool_categories::{ToolCategory, classify, classify_name};
-use serde_json::{Value, json};
-
-// ── Helpers ─────────────────────────────────────────────────────────────
-
-fn tc(name: &str, id: &str) -> Value {
-    json!({
-        "id": id,
-        "type": "function",
-        "function": { "name": name, "arguments": "{}" }
-    })
-}
-
-fn tc_bash(id: &str, command: &str) -> Value {
-    json!({
-        "id": id,
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "arguments": json!({"command": command}).to_string()
-        }
-    })
-}
-
-fn tc_bash_obj_args(id: &str, command: &str) -> Value {
-    json!({
-        "id": id,
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "arguments": {"command": command}
-        }
-    })
-}
+use serde_json::json;
 
 // ── Scenario 1: Full pipeline consistency for read-only bash ────────────
 
-/// The entire pipeline must agree: classify, partition, approval, and
+/// The entire pipeline must agree: classify, approval, and
 /// speculation all treat `bash "git status"` as read-only.
 #[test]
 fn pipeline_consistency_bash_git_status() {
@@ -118,188 +79,6 @@ fn pipeline_consistency_bash_no_args() {
     assert!(!is_read_only_tool("bash"));
     assert!(edge_tool_requires_cloud_approval("bash"));
     assert!(!should_speculate("bash", None, None));
-}
-
-// ── Scenario 2: Mixed bash batch — real-world agentic turn ──────────────
-
-/// Simulate an agentic investigation turn: the LLM emits 6 tool calls
-/// in one batch. Build commands stay sequential because project-controlled
-/// build scripts, plugins, and proc macros may execute even for `check`.
-#[test]
-fn mixed_agentic_batch_partition() {
-    let calls = vec![
-        tc_bash("1", "git status"),
-        tc("read_file", "2"),
-        tc_bash("3", "cargo check 2>&1 | head -50"),
-        tc_bash("4", "git diff HEAD"),
-        tc_bash("5", "cargo build --release"),
-        tc("str_replace", "6"),
-    ];
-
-    let (ro, mut_) = partition_tool_calls(&calls);
-
-    assert_eq!(ro.len(), 3, "git status + read_file + git diff");
-    assert_eq!(mut_.len(), 3, "cargo check + cargo build + str_replace");
-
-    // Verify indices
-    assert_eq!(ro[0].0, 0); // bash git status
-    assert_eq!(ro[1].0, 1); // read_file
-    assert_eq!(ro[2].0, 3); // bash git diff
-    assert_eq!(mut_[0].0, 2); // bash cargo check
-    assert_eq!(mut_[1].0, 4); // bash cargo build
-    assert_eq!(mut_[2].0, 5); // str_replace
-}
-
-/// Same batch but with object-style arguments (not JSON strings).
-#[test]
-fn mixed_batch_with_object_args() {
-    let calls = vec![
-        tc_bash_obj_args("1", "ls -la"),
-        tc_bash_obj_args("2", "git push origin main"),
-        tc("grep", "3"),
-    ];
-
-    let (ro, mut_) = partition_tool_calls(&calls);
-    assert_eq!(ro.len(), 2, "ls + grep");
-    assert_eq!(mut_.len(), 1, "git push");
-}
-
-// ── Scenario 3: Wall-clock parallelism for bash read-only ───────────────
-
-/// 4 bash read-only commands (each 200ms) must complete in < 500ms when
-/// dispatched through execute_parallel_round — proving args-aware
-/// classification enables real parallel execution.
-#[tokio::test]
-async fn bash_read_only_commands_run_in_parallel() {
-    let counter = Arc::new(AtomicUsize::new(0));
-    let max_concurrent = Arc::new(AtomicUsize::new(0));
-    let c = counter.clone();
-    let m = max_concurrent.clone();
-
-    let executor: ToolExecutorFn = Arc::new(move |tc_value: Value| {
-        let c = c.clone();
-        let m = m.clone();
-        Box::pin(async move {
-            let cur = c.fetch_add(1, Ordering::SeqCst) + 1;
-            m.fetch_max(cur, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            c.fetch_sub(1, Ordering::SeqCst);
-            let call_id = tc_value["id"].as_str().unwrap_or("").to_string();
-            let name = tc_value["function"]["name"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            (call_id, name, "ok".into(), true)
-        })
-    });
-
-    let calls = vec![
-        tc_bash("1", "git status"),
-        tc_bash("2", "ls -la"),
-        tc_bash("3", "git diff HEAD 2>&1"),
-        tc_bash("4", "grep -r TODO ."),
-    ];
-
-    let started = Instant::now();
-    let outcome = execute_parallel_round(&calls, executor).await;
-    let elapsed = started.elapsed();
-
-    assert_eq!(outcome.parallel_count, 4);
-    assert_eq!(outcome.sequential_count, 0);
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "4 parallel bash commands should finish in < 500ms, took {elapsed:?}"
-    );
-    assert!(
-        max_concurrent.load(Ordering::SeqCst) > 1,
-        "expected parallel execution, max concurrent = {}",
-        max_concurrent.load(Ordering::SeqCst)
-    );
-}
-
-/// Mix of read-only bash + mutating bash: read-only run in parallel
-/// (phase 1), mutating run after (phase 2).
-#[tokio::test]
-async fn mixed_bash_parallel_then_sequential() {
-    let ran = Arc::new(AtomicUsize::new(0));
-    let ran_c = ran.clone();
-
-    let executor: ToolExecutorFn = Arc::new(move |tc_value: Value| {
-        let ran = ran_c.clone();
-        Box::pin(async move {
-            ran.fetch_add(1, Ordering::SeqCst);
-            let call_id = tc_value["id"].as_str().unwrap_or("").to_string();
-            let name = tc_value["function"]["name"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            (call_id, name, "ok".into(), true)
-        })
-    });
-
-    let calls = vec![
-        tc_bash("1", "git status"),  // read-only → parallel
-        tc_bash("2", "ls"),          // read-only → parallel
-        tc_bash("3", "cargo build"), // mutating → sequential
-        tc_bash("4", "git push"),    // mutating → sequential
-    ];
-
-    let outcome = execute_parallel_round(&calls, executor).await;
-    assert_eq!(outcome.parallel_count, 2);
-    assert_eq!(outcome.sequential_count, 2);
-    assert_eq!(outcome.results.len(), 4);
-    // All ran
-    assert_eq!(ran.load(Ordering::SeqCst), 4);
-}
-
-// ── Scenario 4: Sibling abort with args-aware classification ────────────
-
-/// A mutating bash error aborts subsequent mutations, but read-only bash
-/// commands (which ran in Phase 1) are already complete.
-#[tokio::test]
-async fn sibling_abort_respects_args_aware_partition() {
-    let ran = Arc::new(AtomicUsize::new(0));
-    let ran_c = ran.clone();
-
-    let executor: ToolExecutorFn = Arc::new(move |tc_value: Value| {
-        let ran = ran_c.clone();
-        Box::pin(async move {
-            ran.fetch_add(1, Ordering::SeqCst);
-            let call_id = tc_value["id"].as_str().unwrap_or("").to_string();
-            let name = tc_value["function"]["name"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            // Parse the bash command to check if it's the failing one
-            let args_str = tc_value["function"]["arguments"].as_str().unwrap_or("{}");
-            let args: Value = serde_json::from_str(args_str).unwrap_or_default();
-            let cmd = args["command"].as_str().unwrap_or("");
-            let success = cmd != "cargo build"; // cargo build fails
-            (call_id, name, format!("cmd={cmd}"), success)
-        })
-    });
-
-    let calls = vec![
-        tc_bash("1", "git status"),  // read-only → Phase 1 (succeeds)
-        tc_bash("2", "ls"),          // read-only → Phase 1 (succeeds)
-        tc_bash("3", "cargo build"), // mutating → Phase 2 (FAILS)
-        tc_bash("4", "git push"),    // mutating → Phase 2 (ABORTED)
-    ];
-
-    let outcome = execute_parallel_round(&calls, executor).await;
-
-    // Phase 1 read-only tools succeeded
-    assert!(outcome.results[0].success, "git status should succeed");
-    assert!(outcome.results[1].success, "ls should succeed");
-
-    // Phase 2: cargo build failed, git push aborted
-    assert!(!outcome.results[2].success, "cargo build should fail");
-    assert!(!outcome.results[3].success, "git push should be aborted");
-    assert!(outcome.results[3].content.contains("Aborted"));
-    assert!(outcome.sibling_aborted);
-
-    // Only 3 tools actually executed (2 read-only + 1 mutating before abort)
-    assert_eq!(ran.load(Ordering::SeqCst), 3);
 }
 
 // ── Scenario 5: Cloud approval bypass savings ───────────────────────────

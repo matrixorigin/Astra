@@ -20,7 +20,7 @@ turn arbitrary production exports into an authorization file.
 ## Prepare the evidence
 
 The exact typed schema lives in
-[`services::evaluation::router`](../../crates/services/src/evaluation/router/types.rs).
+[`services::model_routing::offline`](../../crates/services/src/model_routing/offline/types.rs).
 [`model_router_offline.json`](../../fixtures/contracts/model_router_offline.json)
 is a synthetic one-example shape fixture, not evidence of model performance.
 It is intentionally too small to qualify a threshold under default settings.

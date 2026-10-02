@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// labels, costs, replay completion and feedback. Source/group order is immaterial.
 /// Computing this digest does not authorize the sources or attest preregistration.
 pub fn router_evaluation_plan_sha256(
-    input: &crate::evaluation::router::RouterDatasetInput,
+    input: &crate::model_routing::offline::RouterDatasetInput,
 ) -> Result<String, String> {
     #[derive(Serialize)]
     struct PlannedSource<'a> {
@@ -53,7 +53,7 @@ pub fn router_evaluation_plan_sha256(
     {
         return Err("Duplicate source in router evaluation plan".into());
     }
-    crate::evaluation::router::content_sha256(&(
+    crate::model_routing::offline::content_sha256(&(
         "router-evaluation-plan-v1",
         &input.manifest,
         sources,
@@ -114,7 +114,7 @@ pub struct RouterTuningRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evaluation::router::{Acceptability, RouterDatasetInput};
+    use crate::model_routing::offline::{Acceptability, RouterDatasetInput};
 
     fn input() -> RouterDatasetInput {
         serde_json::from_str(include_str!(

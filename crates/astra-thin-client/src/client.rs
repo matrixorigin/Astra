@@ -857,7 +857,7 @@ impl ThinClient {
                     ));
                 }
             }
-            reason = match value.get("workspace_blocker").and_then(Value::as_str) {
+            reason = match value.get("execution_blocker").and_then(Value::as_str) {
                 Some("execution_slot" | "active_run") => "an execution is still stopping",
                 Some("settlement_pending") => {
                     "execution stopped but its durable settlement is incomplete"
@@ -869,10 +869,9 @@ impl ThinClient {
                     "the execution provider is switching or needs attention"
                 }
                 Some("unresolved_tool") => {
-                    "a tool's external outcome is still unknown; the checkout remains protected"
+                    "a tool's external outcome is still unknown; the Session remains protected"
                 }
                 Some("owner_unavailable") => "the previous execution state could not be verified",
-                Some("claim_changed") => "checkout ownership changed during cancellation",
                 _ => "execution shutdown is not yet confirmed",
             }
             .to_owned();
@@ -3572,7 +3571,7 @@ mod tests {
             .and(path("/sessions/session-1/cancel"))
             .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
                 "session_id": "session-1", "status": "cancellation_requested", "execution_settled": false,
-                "workspace_blocker": "unresolved_tool",
+                "execution_blocker": "unresolved_tool",
             })))
             .mount(&srv)
             .await;

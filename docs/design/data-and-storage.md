@@ -38,10 +38,12 @@ published only after schema validation succeeds.
 
 ## Transcript persistence
 
-Fresh schema contract `2026-09-22-v89` stores transcript items and their
+Fresh schema contract `2026-09-29-v91` stores transcript items and their
 committed projection head. Physical page metadata and the unused source event
 position column are removed. The run lookup index is `(user_id, run_id)`.
-There is no migration, replacement table, page cache, or rebuild job.
+The retired session-level physical-workspace claim table is not part of this
+contract. There is no migration, replacement table, page cache, or rebuild job;
+an older database must be recreated from the current schema.
 
 One append implementation requires canonical session admission in the same
 transaction. Canonical/core event writers reuse their admission; standalone

@@ -1,48 +1,18 @@
-use crate::cli::slash::slash_stats;
-
-#[test]
-fn displayed_cost_rows_keep_missing_evidence_and_overflow_unknown() {
-    let pricing = astra_services::models::PricingData {
-        prompt: 0.01,
-        completion: 0.02,
-        cache_read: None,
-        cache_write: None,
-    };
-    let complete =
-        slash_stats::scenario_cost_for_lanes([Some(10), Some(2), Some(0), Some(0)], &pricing);
-    let missing =
-        slash_stats::scenario_cost_for_lanes([Some(10), None, Some(0), Some(0)], &pricing);
-    let unpriced =
-        slash_stats::scenario_cost_for_lanes([Some(10), Some(2), Some(1), Some(0)], &pricing);
-    assert!(complete.is_some());
-    for unavailable in [missing, unpriced] {
-        assert_eq!(unavailable, None);
-        for rows in [
-            [complete, unavailable, complete],
-            [unavailable, complete, complete],
-        ] {
-            assert_eq!(
-                rows.into_iter()
-                    .fold(Some(0.0), slash_stats::add_scenario_cost),
-                None
-            );
-        }
-    }
-    assert_eq!(
-        slash_stats::add_scenario_cost(Some(f64::MAX), Some(f64::MAX)),
-        None
-    );
-    let zero = slash_stats::scenario_cost_for_lanes([Some(0); 4], &pricing);
-    assert_eq!(slash_stats::format_optional_cost(zero), "$0.0000");
-}
+use crate::cli::session::{session_runtime, session_stats_scan};
 
 #[test]
 fn unavailable_cost_is_not_formatted_as_free() {
     for cost in [None, Some(f64::NAN), Some(f64::INFINITY), Some(-1.0)] {
-        assert_eq!(slash_stats::format_optional_cost(cost), "unavailable");
+        assert_eq!(
+            session_stats_scan::format_optional_cost(cost),
+            "unavailable"
+        );
     }
-    assert_eq!(slash_stats::format_optional_cost(Some(0.0)), "$0.0000");
-    assert_eq!(slash_stats::format_optional_cost(Some(1.5)), "$1.50");
+    assert_eq!(
+        session_stats_scan::format_optional_cost(Some(0.0)),
+        "$0.0000"
+    );
+    assert_eq!(session_stats_scan::format_optional_cost(Some(1.5)), "$1.50");
 }
 
 #[test]
@@ -59,7 +29,7 @@ fn current_rate_scenario_preserves_unknown_prices_and_observed_counts() {
         cache_read: None,
         cache_write: None,
     };
-    let rows = slash_stats::current_rate_cost_rows(&state);
+    let rows = session_stats_scan::current_rate_cost_rows(&state);
     assert!(rows.contains(&("billing", "not a session bill".into())));
     assert!(rows.contains(&("coverage", "unknown".into())));
     assert!(rows.contains(&("attribution", "unknown".into())));
@@ -71,18 +41,18 @@ fn current_rate_scenario_preserves_unknown_prices_and_observed_counts() {
         || value.contains("%")));
     state.cached_pricing.cache_read = Some(0.001);
     state.cached_pricing.cache_write = Some(0.01);
-    let rows = slash_stats::current_rate_cost_rows(&state);
+    let rows = session_stats_scan::current_rate_cost_rows(&state);
     assert!(rows.contains(&("scenario sum", "$2.60".into())));
     state.cached_pricing.cache_read = Some(0.0);
     state.cached_pricing.cache_write = Some(0.0);
-    let rows = slash_stats::current_rate_cost_rows(&state);
+    let rows = session_stats_scan::current_rate_cost_rows(&state);
     assert!(rows.contains(&("cache read", "900 ($0.0000)".into())));
     assert!(rows.contains(&("scenario sum", "$1.40".into())));
     state.total_cache_read_tokens = 0;
     state.total_cache_creation_tokens = 0;
     state.cached_pricing.cache_read = None;
     state.cached_pricing.cache_write = None;
-    let rows = slash_stats::current_rate_cost_rows(&state);
+    let rows = session_stats_scan::current_rate_cost_rows(&state);
     assert!(rows.contains(&("scenario sum", "$1.40".into())));
 }
 
@@ -153,104 +123,8 @@ fn format_cost() {
         (100.0, "$100.00"),
         (0.0, "$0.0000"),
     ] {
-        assert_eq!(slash_stats::format_cost(input), expected);
+        assert_eq!(session_stats_scan::format_cost(input), expected);
     }
-}
-
-// ── extract_pricing_for_model ───────────────────────────────────────
-
-#[test]
-fn extract_pricing_for_model_basic_scenarios() {
-    // nested object
-    let models = vec![
-        serde_json::json!({"name":"gpt-4","pricing":{"prompt":0.000_03,"completion":0.000_06}}),
-    ];
-    let p = slash_stats::extract_pricing_for_model(&models, "gpt-4").unwrap();
-    assert!((p.prompt - 0.000_03).abs() < 1e-10);
-    assert!((p.completion - 0.000_06).abs() < 1e-10);
-
-    // flat fields
-    let models = vec![
-        serde_json::json!({"name":"claude-3","pricing_prompt":0.000_008,"pricing_completion":0.000_024}),
-    ];
-    let p = slash_stats::extract_pricing_for_model(&models, "claude-3").unwrap();
-    assert!((p.prompt - 0.000_008).abs() < 1e-10);
-    assert!((p.completion - 0.000_024).abs() < 1e-10);
-
-    // model not found
-    assert!(slash_stats::extract_pricing_for_model(&models, "nonexistent").is_none());
-
-    // empty models
-    let empty: Vec<serde_json::Value> = vec![];
-    assert!(slash_stats::extract_pricing_for_model(&empty, "any").is_none());
-
-    // zero values → None
-    let models =
-        vec![serde_json::json!({"name":"test","pricing_prompt":0.0,"pricing_completion":0.0})];
-    assert!(slash_stats::extract_pricing_for_model(&models, "test").is_none());
-}
-
-#[test]
-fn extract_pricing_preserves_missing_cache_rates() {
-    let models = vec![serde_json::json!({
-        "name": "qwen-plus",
-        "pricing_prompt": 0.000_000_8,
-        "pricing_completion": 0.000_002,
-    })];
-    let p = slash_stats::extract_pricing_for_model(&models, "qwen-plus").unwrap();
-    assert_eq!(p.cache_write, None);
-    assert_eq!(p.cache_read, None);
-}
-
-#[test]
-fn extract_pricing_preserves_explicit_cache_rates() {
-    let models = vec![serde_json::json!({
-        "name": "claude-sonnet",
-        "pricing_prompt": 0.000_003,
-        "pricing_completion": 0.000_015,
-        "pricing_cache_read": 0.000_000_3,
-        "pricing_cache_write": 0.000_003_75,
-    })];
-    let p = slash_stats::extract_pricing_for_model(&models, "claude-sonnet").unwrap();
-    assert!((p.cache_read.unwrap() - 0.000_000_3).abs() < 1e-10);
-    assert!((p.cache_write.unwrap() - 0.000_003_75).abs() < 1e-10);
-}
-
-#[test]
-fn extract_pricing_rejects_invalid_nested_and_cache_rates() {
-    let nested = vec![serde_json::json!({
-        "name": "broken-nested",
-        "pricing": {"prompt": -0.000_003, "completion": 0.000_015}
-    })];
-    assert!(
-        slash_stats::extract_pricing_for_model(&nested, "broken-nested").is_none(),
-        "invalid server pricing must not enter the CLI cost accumulator"
-    );
-
-    let flat = vec![serde_json::json!({
-        "name": "broken-cache",
-        "pricing_prompt": 0.000_003,
-        "pricing_completion": 0.000_015,
-        "pricing_cache_read": -0.000_001
-    })];
-    assert!(
-        slash_stats::extract_pricing_for_model(&flat, "broken-cache").is_none(),
-        "invalid cache pricing must not be converted into a zero-cost estimate"
-    );
-}
-
-#[test]
-fn missing_cache_rates_remain_unpriced_without_family_guesses() {
-    let models = vec![serde_json::json!({
-        "name": "us.anthropic.claude-sonnet-4-6",
-        "pricing_prompt": 0.000_003,
-        "pricing_completion": 0.000_015,
-    })];
-    let p =
-        slash_stats::extract_pricing_for_model(&models, "us.anthropic.claude-sonnet-4-6").unwrap();
-    assert_eq!(p.cache_read, None);
-    assert_eq!(p.cache_write, None);
-    assert_eq!(p.estimated_cost_usd(0, 0, 1000, 1000), None);
 }
 
 // ── fallback_pricing ────────────────────────────────────────────────
@@ -267,7 +141,7 @@ fn fallback_pricing_by_model() {
         ("some-unknown-model", 0.000_003, None), // defaults to sonnet
     ];
     for (model, expected_prompt, expected_cache_read) in cases {
-        let p = slash_stats::fallback_pricing(model);
+        let p = session_runtime::fallback_pricing(model);
         assert!(
             (p.prompt - expected_prompt).abs() < 1e-12,
             "{model}: prompt"
@@ -283,7 +157,7 @@ fn fallback_pricing_by_model() {
 
 #[test]
 fn fallback_cost_calculation_with_cache() {
-    let p = slash_stats::fallback_pricing("claude-sonnet-4-20250514");
+    let p = session_runtime::fallback_pricing("claude-sonnet-4-20250514");
     let cost = p.estimated_cost_usd(1000, 500, 2000, 100).unwrap();
     let expected = 0.003 + 0.0075 + 0.0006 + 0.000375;
     assert!((cost - expected).abs() < 1e-8);
@@ -292,7 +166,7 @@ fn fallback_cost_calculation_with_cache() {
 #[test]
 fn fallback_no_cache_write_premium_for_non_anthropic() {
     for model in ["qwen-plus", "MiniMax-M2.5", "glm-5.1"] {
-        let p = slash_stats::fallback_pricing(model);
+        let p = session_runtime::fallback_pricing(model);
         assert_eq!(
             p.cache_write, None,
             "{model}: must not inherit Anthropic cache_write"

@@ -16,7 +16,7 @@ pub async fn run_team_cross_user_isolation() {
     let payload = json!({
         "name": team_name,
         "description": "owner A only",
-        "coordination": { "type": "pipeline" },
+        "coordination": { "type": "sequential", "stop_on_success": false },
         "members": [
             {
                 "role": "a1",

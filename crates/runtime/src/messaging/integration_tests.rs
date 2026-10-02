@@ -323,380 +323,12 @@ mod tests {
         }
     }
 
-    // ─── Ack / Nack flow ────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn requires_ack_message_receives_ack_reply() {
-        let (_router, mut parent, mut children, _dt) = setup_delegation(1, "del-ack-reply").await;
-
-        // Child sends message with requires_ack.
-        let msg = AgentMessage::new(
-            children[0].address.clone(),
-            MessageTarget::Parent,
-            MessagePayload::Text {
-                content: "need confirmation".to_string(),
-                summary: None,
-            },
-        )
-        .with_ack_required();
-        assert!(msg.requires_ack);
-
-        children[0].send(msg.clone()).await.unwrap();
-
-        // Parent receives the message.
-        let received = parent.drain();
-        assert_eq!(received.len(), 1);
-        assert!(received[0].requires_ack);
-
-        // Parent sends ack back.
-        let ack = received[0].make_ack(parent.address.clone());
-        parent.send(ack).await.unwrap();
-
-        // Child receives the ack.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let replies = children[0].drain();
-        assert_eq!(replies.len(), 1);
-        match &replies[0].payload {
-            MessagePayload::Ack { message_id } => {
-                assert_eq!(message_id, &msg.id);
-            }
-            other => panic!("expected Ack, got: {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn nack_message_carries_reason() {
-        let (_router, mut parent, mut children, _dt) = setup_delegation(1, "del-nack").await;
-
-        let msg = AgentMessage::new(
-            children[0].address.clone(),
-            MessageTarget::Parent,
-            MessagePayload::Text {
-                content: "bad request".to_string(),
-                summary: None,
-            },
-        )
-        .with_ack_required();
-
-        children[0].send(msg.clone()).await.unwrap();
-        let received = parent.drain();
-        assert_eq!(received.len(), 1);
-
-        // Parent nacks.
-        let nack =
-            received[0].make_nack(parent.address.clone(), Some("invalid format".to_string()));
-        parent.send(nack).await.unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let replies = children[0].drain();
-        assert_eq!(replies.len(), 1);
-        match &replies[0].payload {
-            MessagePayload::Nack { message_id, reason } => {
-                assert_eq!(message_id, &msg.id);
-                assert_eq!(reason.as_deref(), Some("invalid format"));
-            }
-            other => panic!("expected Nack, got: {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn ack_tracker_end_to_end_with_mailbox() {
-        use astra_messaging::ack_tracker::{AckConfig, PendingAckTracker};
-
-        let (_router, mut parent, mut children, _dt) = setup_delegation(1, "del-ack-e2e").await;
-
-        // Create a tracker for the child.
-        let tracker = PendingAckTracker::with_config(AckConfig {
-            ack_timeout: std::time::Duration::from_millis(200),
-            max_retries: 2,
-            sweep_interval: std::time::Duration::from_millis(50),
-        });
-
-        // Child sends a requires_ack message and tracks it.
-        let msg = AgentMessage::new(
-            children[0].address.clone(),
-            MessageTarget::Parent,
-            MessagePayload::Text {
-                content: "important".to_string(),
-                summary: None,
-            },
-        )
-        .with_ack_required();
-
-        children[0].send(msg.clone()).await.unwrap();
-        tracker.track(std::sync::Arc::new(msg.clone())).await;
-        assert_eq!(tracker.pending_count().await, 1);
-
-        // Parent acks.
-        let received = parent.drain();
-        let ack = received[0].make_ack(parent.address.clone());
-        parent.send(ack).await.unwrap();
-
-        // Child receives ack and routes to tracker.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let replies = children[0].drain();
-        for reply in &replies {
-            if let MessagePayload::Ack { message_id } = &reply.payload {
-                tracker.acknowledge(message_id).await;
-            }
-        }
-
-        assert_eq!(tracker.pending_count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn ack_sweep_task_retries_and_dead_letters_while_idle() {
-        use astra_messaging::ack_tracker::{AckConfig, PendingAckTracker, start_sweep_task};
-        use astra_messaging::dead_letter::DeadLetterQueue;
-
-        let (_router, parent, children, _dt) = setup_delegation(1, "del-ack-sweep").await;
-
-        let tracker = Arc::new(PendingAckTracker::with_config(AckConfig {
-            ack_timeout: std::time::Duration::from_millis(40),
-            max_retries: 2,
-            sweep_interval: std::time::Duration::from_millis(10),
-        }));
-        let dlq = Arc::new(DeadLetterQueue::new());
-        let _sweeper = start_sweep_task(
-            tracker.clone(),
-            children[0].router(),
-            Some(dlq.clone()),
-            None,
-        );
-
-        let msg = AgentMessage::new(
-            children[0].address.clone(),
-            MessageTarget::Parent,
-            MessagePayload::Text {
-                content: "retry me while idle".to_string(),
-                summary: None,
-            },
-        )
-        .with_ack_required();
-
-        let msg = Arc::new(msg);
-        children[0].send((*msg).clone()).await.unwrap();
-        tracker.track(msg.clone()).await;
-
-        let first = tokio::time::timeout(std::time::Duration::from_secs(1), parent.recv())
-            .await
-            .expect("initial delivery should arrive")
-            .expect("parent mailbox should stay open");
-        match &first.payload {
-            MessagePayload::Text { content, .. } => assert_eq!(content, "retry me while idle"),
-            other => panic!("expected text payload, got {other:?}"),
-        }
-
-        let retry = tokio::time::timeout(std::time::Duration::from_secs(1), parent.recv())
-            .await
-            .expect("retry delivery should arrive without turn-loop sweep")
-            .expect("parent mailbox should stay open");
-        match &retry.payload {
-            MessagePayload::Text { content, .. } => assert_eq!(content, "retry me while idle"),
-            other => panic!("expected retry text payload, got {other:?}"),
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-
-        assert_eq!(tracker.pending_count().await, 0);
-        assert_eq!(dlq.count().await, 1);
-        let dead_letters = dlq.list().await;
-        assert_eq!(dead_letters[0].message.id, msg.id);
-        match &dead_letters[0].reason {
-            astra_messaging::dead_letter::DeadLetterReason::AckTimeout { attempts } => {
-                assert_eq!(*attempts, 2);
-            }
-            other => panic!("expected AckTimeout, got: {other:?}"),
-        }
-    }
-
-    // ─── Dead Letter Queue integration tests ─────────────────────────────────
-
-    #[tokio::test]
-    async fn ack_timeout_stores_in_dlq() {
-        use astra_messaging::ack_tracker::{AckConfig, AckOutcome, PendingAckTracker};
-        use astra_messaging::dead_letter::DeadLetterQueue;
-        use std::time::Duration;
-
-        let (_router, _parent, children, _dt) = setup_delegation(2, "del-dlq-timeout").await;
-
-        let dlq = Arc::new(DeadLetterQueue::new());
-        let tracker = PendingAckTracker::with_config(AckConfig {
-            ack_timeout: Duration::from_millis(10),
-            max_retries: 1, // fail after first attempt
-            sweep_interval: Duration::from_millis(5),
-        });
-
-        // Send message requiring ack
-        let msg = AgentMessage::new(
-            children[0].address.clone(),
-            MessageTarget::Direct {
-                address: children[1].address.clone(),
-            },
-            MessagePayload::Text {
-                content: "urgent task".into(),
-                summary: None,
-            },
-        )
-        .with_ack_required();
-
-        let msg = Arc::new(msg);
-        tracker.track(msg.clone()).await;
-        children[0].send((*msg).clone()).await.unwrap();
-
-        // Don't ack — wait for timeout
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let outcomes = tracker.sweep().await;
-
-        // Store failed in DLQ
-        for outcome in &outcomes {
-            if let AckOutcome::Failed {
-                message, attempts, ..
-            } = outcome
-            {
-                dlq.store(
-                    Arc::clone(message),
-                    astra_messaging::dead_letter::DeadLetterReason::AckTimeout {
-                        attempts: *attempts,
-                    },
-                    *attempts,
-                )
-                .await;
-            }
-        }
-
-        assert_eq!(dlq.count().await, 1);
-        let entries = dlq.list().await;
-        assert_eq!(entries[0].message.id, msg.id);
-    }
-
-    #[tokio::test]
-    async fn nack_stores_in_dlq() {
-        use astra_messaging::ack_tracker::{AckOutcome, PendingAckTracker};
-        use astra_messaging::dead_letter::DeadLetterQueue;
-
-        let (_router, _parent, children, _dt) = setup_delegation(2, "del-dlq-nack").await;
-
-        let dlq = Arc::new(DeadLetterQueue::new());
-        let tracker = PendingAckTracker::new();
-
-        let msg = AgentMessage::new(
-            children[0].address.clone(),
-            MessageTarget::Direct {
-                address: children[1].address.clone(),
-            },
-            MessagePayload::Text {
-                content: "bad request".into(),
-                summary: None,
-            },
-        )
-        .with_ack_required();
-
-        let msg = Arc::new(msg);
-        let msg_id = msg.id.clone();
-        tracker.track(msg.clone()).await;
-        children[0].send((*msg).clone()).await.unwrap();
-
-        // Receiver nacks
-        tracker.reject(&msg_id, Some("invalid format".into())).await;
-
-        let failures = tracker.failed_outcomes().await;
-        for outcome in &failures {
-            if let AckOutcome::Rejected {
-                message, reason, ..
-            } = outcome
-            {
-                dlq.store(
-                    Arc::clone(message),
-                    astra_messaging::dead_letter::DeadLetterReason::Rejected {
-                        reason: reason.clone(),
-                    },
-                    1,
-                )
-                .await;
-            }
-        }
-
-        assert_eq!(dlq.count().await, 1);
-        let entries = dlq.list().await;
-        match &entries[0].reason {
-            astra_messaging::dead_letter::DeadLetterReason::Rejected { reason } => {
-                assert_eq!(reason.as_deref(), Some("invalid format"));
-            }
-            _ => panic!("expected Rejected reason"),
-        }
-    }
-
-    #[tokio::test]
-    async fn dlq_take_for_retry_removes_entries() {
-        use astra_messaging::ack_tracker::{AckConfig, AckOutcome, PendingAckTracker};
-        use astra_messaging::dead_letter::DeadLetterQueue;
-        use std::time::Duration;
-
-        let (_router, _parent, children, _dt) = setup_delegation(2, "del-dlq-retry").await;
-
-        let dlq = Arc::new(DeadLetterQueue::new());
-        let tracker = PendingAckTracker::with_config(AckConfig {
-            ack_timeout: Duration::from_millis(5),
-            max_retries: 1,
-            sweep_interval: Duration::from_millis(5),
-        });
-
-        // Send 3 messages, all will timeout
-        for i in 0..3 {
-            let msg = AgentMessage::new(
-                children[0].address.clone(),
-                MessageTarget::Direct {
-                    address: children[1].address.clone(),
-                },
-                MessagePayload::Text {
-                    content: format!("msg-{i}"),
-                    summary: None,
-                },
-            )
-            .with_ack_required();
-            tracker.track(Arc::new(msg)).await;
-        }
-
-        tokio::time::sleep(Duration::from_millis(15)).await;
-        let outcomes = tracker.sweep().await;
-        for outcome in &outcomes {
-            if let AckOutcome::Failed {
-                message, attempts, ..
-            } = outcome
-            {
-                dlq.store(
-                    Arc::clone(message),
-                    astra_messaging::dead_letter::DeadLetterReason::AckTimeout {
-                        attempts: *attempts,
-                    },
-                    *attempts,
-                )
-                .await;
-            }
-        }
-
-        assert_eq!(dlq.count().await, 3);
-
-        // Take first 2 for retry by their IDs
-        let all = dlq.list().await;
-        let id0 = all[0].message.id.clone();
-        let id1 = all[1].message.id.clone();
-
-        let r0 = dlq.take_for_retry(&id0).await;
-        assert!(r0.is_some());
-        let r1 = dlq.take_for_retry(&id1).await;
-        assert!(r1.is_some());
-        assert_eq!(dlq.count().await, 1);
-    }
-
     // ─── Metrics integration tests ───────────────────────────────────────────
 
     #[tokio::test]
-    async fn metrics_track_send_receive_ack_flow() {
+    async fn metrics_track_send_receive_flow() {
         use astra_messaging::metrics::MessagingMetrics;
         use std::sync::atomic::Ordering;
-        use std::time::Duration;
 
         let (_router, _parent, mut children, _dt) = setup_delegation(2, "del-metrics").await;
 
@@ -720,21 +352,11 @@ mod tests {
         let received = children[1].try_recv().unwrap();
         metrics.messages_received.fetch_add(1, Ordering::Relaxed);
 
-        // Simulate ack latency
-        let start = std::time::Instant::now();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        let ack_msg = received.make_ack(children[1].address.clone());
-        children[1].send(ack_msg).await.unwrap();
-        metrics.acks_sent.fetch_add(1, Ordering::Relaxed);
-        metrics.ack_latency.record(start.elapsed());
-
         let snap = metrics.snapshot();
         assert_eq!(snap.messages_sent, 1);
         assert_eq!(snap.messages_received, 1);
-        assert_eq!(snap.acks_sent, 1);
-        assert!(snap.ack_latency.count > 0);
-        // Latency should be non-zero (we slept 5ms, but don't assert exact bound)
-        assert!(snap.ack_latency.min_us > 0);
+        assert!(matches!(received.payload, MessagePayload::Text { .. }));
+        assert!(children[0].try_recv().is_none());
     }
 
     #[tokio::test]
@@ -745,7 +367,6 @@ mod tests {
         struct Counter {
             sent: AtomicU32,
             received: AtomicU32,
-            dead_lettered: AtomicU32,
         }
         impl MessagingEventHandler for Counter {
             fn on_event(&self, event: &MessagingEvent) {
@@ -755,9 +376,6 @@ mod tests {
                     }
                     MessagingEvent::Received { .. } => {
                         self.received.fetch_add(1, Ordering::Relaxed);
-                    }
-                    MessagingEvent::DeadLettered { .. } => {
-                        self.dead_lettered.fetch_add(1, Ordering::Relaxed);
                     }
                     _ => {}
                 }
@@ -770,7 +388,6 @@ mod tests {
         let counter = Arc::new(Counter {
             sent: AtomicU32::new(0),
             received: AtomicU32::new(0),
-            dead_lettered: AtomicU32::new(0),
         });
         dispatcher.add_handler(counter.clone()).await;
 
@@ -793,16 +410,8 @@ mod tests {
             })
             .await;
 
-        dispatcher
-            .dispatch(&MessagingEvent::DeadLettered {
-                message_id: "m1".into(),
-                reason: "ack timeout".into(),
-            })
-            .await;
-
         assert_eq!(counter.sent.load(Ordering::Relaxed), 1);
         assert_eq!(counter.received.load(Ordering::Relaxed), 1);
-        assert_eq!(counter.dead_lettered.load(Ordering::Relaxed), 1);
     }
 
     // ── Concurrent stress tests ─────────────────────────────────────────────
@@ -1002,120 +611,5 @@ mod tests {
                 "Receiver {i}: expected {TOTAL_PER_RECEIVER}, got {received}"
             );
         }
-    }
-
-    /// Stress test: concurrent send + ack + retry + DLQ interactions.
-    /// Verifies: system stability under mixed operations.
-    #[tokio::test]
-    async fn stress_mixed_operations() {
-        use astra_messaging::ack_tracker::PendingAckTracker;
-        use astra_messaging::dead_letter::DeadLetterQueue;
-
-        const NUM_AGENTS: usize = 5;
-        const OPS_PER_AGENT: usize = 50;
-
-        let transport = Arc::new(InProcessTransport::new());
-        let dt = tracker();
-        let router = Arc::new(AgentMailboxRouter::new(transport.clone(), dt.clone()));
-        let ack_tracker = Arc::new(PendingAckTracker::new());
-        let dlq = Arc::new(DeadLetterQueue::new());
-
-        // Register agents in a ring topology
-        let mut agents = Vec::new();
-        for i in 0..NUM_AGENTS {
-            let agent_addr = addr(&format!("run-{i}"), &format!("agent-{i}"));
-            let mb = router.register(agent_addr.clone(), None).await.unwrap();
-            agents.push((agent_addr, mb));
-
-            // Each agent can send to the next
-            let next = (i + 1) % NUM_AGENTS;
-            dt.record_sub_run(SubRunRecord {
-                run_id: format!("run-{next}"),
-                parent_run_id: format!("run-{i}"),
-                delegation_id: "ring".into(),
-                agent_id: format!("agent-{next}"),
-                depth: 1,
-                state: SubRunState::Created,
-                retry_of: None,
-            })
-            .await;
-        }
-
-        // Spawn mixed operations
-        let mut handles = Vec::new();
-        for i in 0..NUM_AGENTS {
-            let sender_addr = agents[i].0.clone();
-            let recv_addr = agents[(i + 1) % NUM_AGENTS].0.clone();
-            let router_clone = router.clone();
-            let ack_clone = ack_tracker.clone();
-            let dlq_clone = dlq.clone();
-
-            handles.push(tokio::spawn(async move {
-                for j in 0..OPS_PER_AGENT {
-                    let msg_id = format!("msg-{i}-{j}");
-
-                    // Create and send a message via router
-                    let mut msg = AgentMessage::new(
-                        sender_addr.clone(),
-                        MessageTarget::Direct {
-                            address: recv_addr.clone(),
-                        },
-                        MessagePayload::Text {
-                            content: format!("Mixed op {i}-{j}"),
-                            summary: None,
-                        },
-                    );
-                    // Override the auto-generated ID for tracking
-                    msg.id = msg_id.clone();
-                    msg.requires_ack = true;
-
-                    let msg = Arc::new(msg);
-                    router_clone.send((*msg).clone()).await.unwrap();
-                    ack_clone.track(msg.clone()).await;
-
-                    // Randomly: ack, nack, or let timeout (simulate DLQ)
-                    match j % 3 {
-                        0 => {
-                            // Ack
-                            ack_clone.acknowledge(&msg_id).await;
-                        }
-                        1 => {
-                            // Nack (reject)
-                            ack_clone
-                                .reject(&msg_id, Some("test rejection".to_string()))
-                                .await;
-                        }
-                        _ => {
-                            // Simulate dead-letter after "timeout"
-                            dlq_clone
-                                .store(
-                                    msg,
-                                    astra_messaging::dead_letter::DeadLetterReason::AckTimeout {
-                                        attempts: 3,
-                                    },
-                                    3,
-                                )
-                                .await;
-                        }
-                    }
-                }
-            }));
-        }
-
-        // Wait for all operations
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        // Verify system didn't panic and DLQ has expected entries
-        let dlq_summary = dlq.reason_summary().await;
-        // We expect ~1/3 of total messages to be dead-lettered (every j%3==2)
-        // Due to integer rounding, allow some slack
-        let expected_dlq = (NUM_AGENTS * OPS_PER_AGENT) / 3;
-        assert!(
-            dlq_summary.total >= expected_dlq - 5 && dlq_summary.total <= expected_dlq + 5,
-            "Expected ~{expected_dlq} dead letters, got {}",
-            dlq_summary.total
-        );
     }
 }

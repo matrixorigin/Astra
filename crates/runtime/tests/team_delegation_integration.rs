@@ -122,7 +122,9 @@ async fn full_pipeline_team_execution() {
     let store = Arc::new(InMemoryTeamStore::new());
     let team = test_team(
         "pipe",
-        TeamCoordination::Pipeline,
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
         vec![
             ("coder", Some("Write code")),
             ("reviewer", Some("Review code")),
@@ -161,28 +163,6 @@ async fn full_pipeline_team_execution() {
     // Verify execution history recorded
     let history = store.list_executions(&team.team_id, 10).await.unwrap();
     assert!(!history.is_empty());
-}
-
-#[tokio::test]
-async fn full_adversarial_team_execution() {
-    let store = Arc::new(InMemoryTeamStore::new());
-    let team = test_team(
-        "adv",
-        TeamCoordination::Adversarial {
-            max_rounds: 2,
-            threshold: 0.8,
-        },
-        vec![("writer", Some("Write")), ("critic", Some("Critique"))],
-    );
-    store.save_team(&team).await.unwrap();
-
-    let (orch, _, _) = setup_orchestrator(store).await;
-    let report = orch.execute_team("adv", "write docs", None).await;
-
-    assert_eq!(report.status, TeamExecutionStatus::Completed);
-    let dr = report.delegation_result.unwrap();
-    // 2 rounds × 2 agents = 4
-    assert_eq!(dr.agent_results.len(), 4);
 }
 
 #[tokio::test]
@@ -248,7 +228,13 @@ async fn orchestrator_team_not_found() {
 #[tokio::test]
 async fn orchestrator_empty_team_fails_validation() {
     let store = Arc::new(InMemoryTeamStore::new());
-    let team = test_team("empty", TeamCoordination::Pipeline, vec![]);
+    let team = test_team(
+        "empty",
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
+        vec![],
+    );
     store.save_team(&team).await.unwrap();
 
     let (orch, run_engine, _) = setup_orchestrator(store).await;
@@ -281,7 +267,9 @@ async fn orchestrator_delegation_failure_propagates() {
     let store = Arc::new(InMemoryTeamStore::new());
     let team = test_team(
         "fail",
-        TeamCoordination::Pipeline,
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
         vec![("worker", Some("Do work"))],
     );
     store.save_team(&team).await.unwrap();
@@ -377,7 +365,9 @@ async fn team_persistence_full_lifecycle() {
 
     let team = test_team(
         "lifecycle",
-        TeamCoordination::Pipeline,
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
         vec![("a", Some("Agent A")), ("b", Some("Agent B"))],
     );
 
@@ -429,7 +419,9 @@ async fn orchestrator_records_execution_with_stable_team_id() {
 
     let team = test_team(
         "consistency",
-        TeamCoordination::Pipeline,
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
         vec![
             ("coder", Some("Code agent")),
             ("tester", Some("Test agent")),
@@ -501,13 +493,19 @@ async fn orchestrator_writes_start_then_complete_not_duplicate() {
 #[tokio::test(start_paused = true)]
 async fn budget_timeout_aborts_slow_execution() {
     use astra_services::team_persistence::TeamBudget;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let store = Arc::new(InMemoryTeamStore::new());
 
     let mut team = test_team(
         "slow-team",
-        TeamCoordination::Pipeline,
-        vec![("worker", Some("Slow worker"))],
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
+        vec![
+            ("worker", Some("Slow worker")),
+            ("later", Some("Later stage")),
+        ],
     );
     team.budget = Some(TeamBudget {
         max_cost_usd: 100.0,
@@ -517,10 +515,11 @@ async fn budget_timeout_aborts_slow_execution() {
     store.save_team(&team).await.unwrap();
 
     // Executor that sleeps longer than the budget timeout
-    struct SlowExecutor;
+    struct SlowExecutor(Arc<AtomicUsize>);
     #[async_trait]
     impl SubRunExecutor for SlowExecutor {
         async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             Ok(AgentResult {
                 agent_id: config.agent_profile.agent_id.clone(),
@@ -535,10 +534,19 @@ async fn budget_timeout_aborts_slow_execution() {
         }
     }
 
+    let calls = Arc::new(AtomicUsize::new(0));
     let (orch, _, _) =
-        setup_orchestrator_with_executor(store.clone(), Arc::new(SlowExecutor)).await;
+        setup_orchestrator_with_executor(store.clone(), Arc::new(SlowExecutor(calls.clone())))
+            .await;
+    let started = tokio::time::Instant::now();
     let report = orch.execute_team("slow-team", "do work", None).await;
 
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "later stages must not launch after cancellation"
+    );
     assert_eq!(report.status, TeamExecutionStatus::Failed);
     assert!(
         report
@@ -559,7 +567,9 @@ async fn budget_timeout_zero_means_no_limit() {
 
     let mut team = test_team(
         "no-limit",
-        TeamCoordination::Pipeline,
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
         vec![("worker", Some("Fast worker"))],
     );
     team.budget = Some(TeamBudget {
@@ -656,7 +666,9 @@ async fn pipeline_continues_after_first_stage_fails() {
     let store = Arc::new(InMemoryTeamStore::new());
     let team = test_team(
         "fail-early",
-        TeamCoordination::Pipeline,
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
         vec![
             ("coder", Some("Write code")),
             ("reviewer", Some("Review code")),
@@ -805,12 +817,16 @@ async fn concurrent_team_executions_isolated() {
     // Two different teams
     let team1 = test_team(
         "team-a",
-        TeamCoordination::Pipeline,
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
         vec![("coder-a", Some("Team A coder"))],
     );
     let team2 = test_team(
         "team-b",
-        TeamCoordination::Pipeline,
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
         vec![("coder-b", Some("Team B coder"))],
     );
     store.save_team(&team1).await.unwrap();
@@ -879,7 +895,9 @@ async fn concurrent_same_team_executions_have_distinct_runs_and_history_records(
     let store = Arc::new(InMemoryTeamStore::new());
     let team = test_team(
         "same-team",
-        TeamCoordination::Pipeline,
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
         vec![("worker", Some("Handle one request"))],
     );
     let team_id = team.team_id.clone();
@@ -1009,154 +1027,6 @@ async fn sequential_stop_on_success_stops_early() {
         execution_count.load(Ordering::SeqCst),
         2,
         "should stop after first success"
-    );
-}
-
-// ─── Adversarial Review Unhappy Paths ───────────────────────────────────────
-
-/// Tests that adversarial review runs all rounds when all agents succeed.
-#[tokio::test]
-async fn adversarial_runs_all_rounds_on_success() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let store = Arc::new(InMemoryTeamStore::new());
-    let team = test_team(
-        "adversarial-quick",
-        TeamCoordination::Adversarial {
-            max_rounds: 5,
-            threshold: 0.8,
-        },
-        vec![
-            ("producer", Some("Create content")),
-            ("reviewer", Some("Review content")),
-        ],
-    );
-    store.save_team(&team).await.unwrap();
-
-    let rounds_executed = Arc::new(AtomicUsize::new(0));
-    let rounds_ref = rounds_executed.clone();
-
-    struct QuickConvergeExecutor {
-        rounds: Arc<AtomicUsize>,
-    }
-    #[async_trait]
-    impl SubRunExecutor for QuickConvergeExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
-            self.rounds.fetch_add(1, Ordering::SeqCst);
-            // Always succeed - producer passes, reviewer approves
-            Ok(AgentResult {
-                agent_id: config.agent_profile.agent_id.clone(),
-                run_id: config.run_id,
-                status: "completed".to_string(),
-                output: Some(if config.agent_profile.agent_id.contains("reviewer") {
-                    "APPROVED: content is good".to_string()
-                } else {
-                    "generated content".to_string()
-                }),
-                error: None,
-                prompt_tokens: 50,
-                completion_tokens: 100,
-                tool_calls: 0,
-            })
-        }
-    }
-
-    let (orch, _, _) = setup_orchestrator_with_executor(
-        store,
-        Arc::new(QuickConvergeExecutor { rounds: rounds_ref }),
-    )
-    .await;
-    let report = orch
-        .execute_team("adversarial-quick", "create document", None)
-        .await;
-
-    assert_eq!(report.status, TeamExecutionStatus::Completed);
-    // Adversarial runs all max_rounds, each round has 2 agents (producer + reviewer)
-    assert_eq!(
-        rounds_executed.load(Ordering::SeqCst),
-        10,
-        "should run all 5 rounds × 2 agents"
-    );
-}
-
-/// Tests that adversarial review fails when reviewer keeps rejecting.
-#[tokio::test]
-async fn adversarial_fails_after_max_rounds() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let store = Arc::new(InMemoryTeamStore::new());
-    let team = test_team(
-        "adversarial-stuck",
-        TeamCoordination::Adversarial {
-            max_rounds: 2,
-            threshold: 0.8,
-        },
-        vec![
-            ("producer", Some("Create content")),
-            ("reviewer", Some("Review content")),
-        ],
-    );
-    store.save_team(&team).await.unwrap();
-
-    let rounds_executed = Arc::new(AtomicUsize::new(0));
-    let rounds_ref = rounds_executed.clone();
-
-    struct AlwaysRejectExecutor {
-        rounds: Arc<AtomicUsize>,
-    }
-    #[async_trait]
-    impl SubRunExecutor for AlwaysRejectExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
-            self.rounds.fetch_add(1, Ordering::SeqCst);
-            if config.agent_profile.agent_id.contains("reviewer") {
-                // Reviewer always rejects
-                Ok(AgentResult {
-                    agent_id: config.agent_profile.agent_id.clone(),
-                    run_id: config.run_id,
-                    status: "completed".to_string(),
-                    output: Some("REJECTED: needs more work".to_string()),
-                    error: None,
-                    prompt_tokens: 50,
-                    completion_tokens: 100,
-                    tool_calls: 0,
-                })
-            } else {
-                Ok(AgentResult {
-                    agent_id: config.agent_profile.agent_id.clone(),
-                    run_id: config.run_id,
-                    status: "completed".to_string(),
-                    output: Some("generated content".to_string()),
-                    error: None,
-                    prompt_tokens: 50,
-                    completion_tokens: 100,
-                    tool_calls: 0,
-                })
-            }
-        }
-    }
-
-    let (orch, _, _) = setup_orchestrator_with_executor(
-        store,
-        Arc::new(AlwaysRejectExecutor { rounds: rounds_ref }),
-    )
-    .await;
-    let report = orch
-        .execute_team("adversarial-stuck", "create document", None)
-        .await;
-
-    // Adversarial that never converges still completes (with rejection noted)
-    assert!(
-        matches!(
-            report.status,
-            TeamExecutionStatus::Completed | TeamExecutionStatus::Partial
-        ),
-        "should complete even without approval"
-    );
-    // Should have executed all rounds: 2 rounds * 2 agents = 4 calls
-    assert_eq!(
-        rounds_executed.load(Ordering::SeqCst),
-        4,
-        "should execute all max_rounds"
     );
 }
 

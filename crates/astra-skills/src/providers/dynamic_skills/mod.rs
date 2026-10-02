@@ -8,7 +8,6 @@ mod debug;
 mod reflect;
 mod remember;
 mod review;
-mod skillify;
 mod stuck;
 mod verify;
 
@@ -22,7 +21,6 @@ pub fn all_dynamic_skills() -> Vec<String> {
         debug::skill_content(),
         reflect::skill_content(),
         review::skill_content(),
-        skillify::skill_content(),
         stuck::skill_content(),
         verify::skill_content(),
         remember::skill_content(),
@@ -35,12 +33,10 @@ mod tests {
 
     #[test]
     fn dynamic_skills_are_valid_unique_manifests() {
-        let expected = [
-            "debug", "reflect", "remember", "review", "skillify", "stuck", "verify",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
+        let expected = ["debug", "reflect", "remember", "review", "stuck", "verify"]
+            .into_iter()
+            .map(String::from)
+            .collect();
         let mut actual = std::collections::BTreeSet::new();
 
         for content in all_dynamic_skills() {
@@ -57,6 +53,32 @@ mod tests {
         }
 
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn bundled_discovery_and_loading_exclude_retired_skillify() {
+        use crate::SkillProvider;
+
+        let provider = crate::providers::bundled::BundledSkillProvider::new();
+        for content in all_dynamic_skills() {
+            provider.register_from_skill_md(&content).unwrap();
+        }
+
+        let manifests = provider.discover().await.unwrap();
+        assert_eq!(manifests.len(), 6);
+        assert!(!manifests.iter().any(|manifest| manifest.name == "skillify"));
+        assert!(matches!(
+            provider.load("skillify").await,
+            Err(crate::SkillError::NotFound(_))
+        ));
+        assert!(
+            !provider
+                .load("review")
+                .await
+                .unwrap()
+                .instructions
+                .is_empty()
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ pub const SEMANTIC_JUDGMENT_TRACE_ATTR: &str = "semantic_judgment.v1";
 pub const SEMANTIC_JUDGMENT_MAX_BYTES: usize = 8_192;
 pub const SEMANTIC_JUDGMENT_ID_MAX_BYTES: usize = 512;
 pub const SEMANTIC_JUDGMENT_PRESENTATION_MAX_BYTES: usize = 160;
-pub const REQUEST_JUDGMENT_MAX_FIELDS: usize = 19;
+pub const REQUEST_JUDGMENT_MAX_FIELDS: usize = 20;
 /// Payload-free validation error; never retains serde/provider error text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SemanticJudgmentValidationError {
@@ -106,6 +106,8 @@ pub enum RequestJudgmentFieldV1 {
     ParallelSubruns,
     #[serde(rename = "capability.web")]
     CapabilityWeb,
+    #[serde(rename = "delegation.model_requirement")]
+    DelegationModelRequirement,
 }
 impl RequestJudgmentFieldV1 {
     pub fn from_question_id(id: &str) -> Option<Self> {
@@ -129,6 +131,7 @@ impl RequestJudgmentFieldV1 {
             "domain.database" => Some(Self::DomainDatabase),
             "parallel_subruns" => Some(Self::ParallelSubruns),
             "capability.web" => Some(Self::CapabilityWeb),
+            "delegation.model_requirement" => Some(Self::DelegationModelRequirement),
             _ => None,
         }
     }
@@ -603,6 +606,7 @@ fn field_label(field: RequestJudgmentFieldV1) -> &'static str {
         RequestJudgmentFieldV1::DomainDatabase => "domain.database",
         RequestJudgmentFieldV1::ParallelSubruns => "parallel_subruns",
         RequestJudgmentFieldV1::CapabilityWeb => "capability.web",
+        RequestJudgmentFieldV1::DelegationModelRequirement => "delegation.model_requirement",
     }
 }
 

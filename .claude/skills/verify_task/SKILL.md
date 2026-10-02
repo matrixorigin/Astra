@@ -47,7 +47,12 @@ git diff --name-only
 | Verification journal event | `crates/services/src/session_journal.rs` |
 
 Current verifier kinds are `command`, `command_output`, `file_exists`, `grep_check`,
-`build_pass`, `test_pass`, `read_file_contains`, `llm_judge`, and `composite`.
+`build_pass`, `test_pass`, `read_file_contains`, and `composite`.
+
+These are acceptance declarations, not shell authorization. Automatic fork-skill
+verification supports file observers only; command-backed criteria, including
+nested ones, fail explicitly. Run commands through the ordinary authorized tool
+provider and retain its evidence; never execute them locally to bypass admission.
 
 3. If there is no contract, create acceptance criteria from changed behavior:
 

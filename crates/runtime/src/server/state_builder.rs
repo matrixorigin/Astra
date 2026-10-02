@@ -72,7 +72,6 @@ pub async fn build_server_state(
             settings.memoria.master_key.clone(),
         )
         .with_self_hosted_memoria_fallback(settings.memoria.allows_self_hosted_master_fallback());
-    let state = install_skillify_harness_service(state, &settings, &shared_pool, &shared_encryptor);
 
     let wiring =
         runtime::build_runtime_wiring(&settings, &shared_pool, &shared_encryptor, &state).await?;
@@ -117,26 +116,6 @@ fn pool_settings_with_limit(
         .db_pool_min_connections
         .min(settings.db_pool_max_connections);
     settings
-}
-
-fn install_skillify_harness_service(
-    state: AppState,
-    settings: &AppSettings,
-    shared_pool: &SharedPool,
-    shared_encryptor: &Arc<FernetTokenEncryptor>,
-) -> AppState {
-    let skillify_agent_executor = Arc::new(
-        super::skillify_agent_executor::RuntimeSkillifyAgentExecutor::new(
-            settings.matrixone.clone(),
-            Arc::clone(shared_encryptor),
-            state.admin.config_service.clone(),
-            shared_pool.clone(),
-        ),
-    );
-    state.with_harness_service(Arc::new(
-        DatabaseHarnessService::new(shared_pool.clone())
-            .with_skillify_agent_executor(skillify_agent_executor),
-    ))
 }
 
 #[cfg(test)]

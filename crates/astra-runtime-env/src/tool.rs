@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -334,6 +335,30 @@ impl ToolSpec {
             && self.required.network != RequiredNetwork::None
             && self.required.workspace != RequiredWorkspace::ReadWrite
     }
+
+    /// Whether this contract is safe to expose under an immutable execution
+    /// ceiling.  This is deliberately derived from the capability contract,
+    /// rather than from a second list of tool names.  Unknown providers and
+    /// effectful services fail closed because they cannot prove this property.
+    pub fn is_read_only_execution_capability(&self) -> bool {
+        matches!(
+            self.required.executor,
+            RequiredExecutor::ControlPlane
+                | RequiredExecutor::RuntimeExecutor
+                | RequiredExecutor::ServiceOrRuntimeExecutor
+        ) && !self.effect.writes_workspace
+            && !self.effect.spawns_process
+            && !self.effect.uses_credentials
+            && !self.effect.mutates_external_state
+            && !self.required.filesystem_write
+            && !self.required.process_spawn
+            && !self.required.shell
+            && !self.required.git
+            && !self.required.lsp
+            && !self.required.background_session
+            && !self.required.credentials
+            && self.required.workspace != RequiredWorkspace::ReadWrite
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -410,14 +435,25 @@ impl ToolRegistry {
     }
 }
 
+/// Fast contract lookup for the hot permission path. The registry is built
+/// once per process; callers do not allocate a fresh HashMap per tool call.
+pub fn builtin_tool_is_read_only_execution_capability(name: &str) -> bool {
+    static BUILTINS: OnceLock<ToolRegistry> = OnceLock::new();
+    BUILTINS
+        .get_or_init(ToolRegistry::builtins)
+        .get(name)
+        .is_some_and(ToolSpec::is_read_only_execution_capability)
+}
+
 fn builtin_tool_specs() -> Vec<ToolSpec> {
     vec![
         // Blocking clarification is part of the default safety loop: when the
         // model needs a user decision, ask_user must already be callable.
         control_plane("ask_user", ToolLoadPolicy::AlwaysLoad),
-        // Delegation is a workflow decision, not a first-turn primitive. Its
-        // multi-action schema belongs behind discovery alongside fanout.
-        control_plane("agent", ToolLoadPolicy::Deferred),
+        // Ordinary spawn is a first-class interaction. The resident surface
+        // projects only its small spawn contract; other actions still require
+        // explicit selection of the full canonical agent contract.
+        control_plane("agent", ToolLoadPolicy::AlwaysLoad),
         control_plane("agent_fanout", ToolLoadPolicy::Deferred),
         control_plane("enter_plan_mode", ToolLoadPolicy::Deferred),
         control_plane("exit_plan_mode", ToolLoadPolicy::Deferred),
@@ -427,6 +463,7 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         // discovery round-trip; their resident projections remain compact,
         // while the canonical catalog retains the full diagnostic contract.
         control_plane("introspect", ToolLoadPolicy::AlwaysLoad),
+        control_plane("model_catalog", ToolLoadPolicy::Deferred),
         control_plane("reflect", ToolLoadPolicy::AlwaysLoad),
         control_plane("submit_task_resolution", ToolLoadPolicy::Deferred),
         // Non-blocking status updates are still part of the user communication
@@ -436,7 +473,11 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         control_plane("compress_context", ToolLoadPolicy::Deferred),
         control_plane("rollback_session_state", ToolLoadPolicy::Deferred),
         control_plane("session", ToolLoadPolicy::Deferred),
-        control_plane("skill", ToolLoadPolicy::AlwaysLoad),
+        // Skill activation is a conditional workflow. Keep its compact
+        // listing in the prompt, and load the executable contract only when
+        // a matching skill is selected; it is not part of every turn's cache
+        // prefix.
+        control_plane("skill", ToolLoadPolicy::Deferred),
         work_coordinator_control_plane("start_work", ToolLoadPolicy::AlwaysLoad),
         // This is intentionally distinct from the generic `agent` surface:
         // it selects and starts one canonical Work item from durable state.
@@ -1627,6 +1668,45 @@ mod tests {
     }
 
     #[test]
+    fn read_only_execution_capability_uses_the_declared_effect_contract() {
+        let registry = registry();
+        for name in [
+            "read_file",
+            "grep",
+            "web_fetch",
+            "introspect",
+            "start_work",
+            "run_next_work_item",
+            "settle_work_item",
+        ] {
+            assert!(
+                registry
+                    .get(name)
+                    .expect("registered read-only capability")
+                    .is_read_only_execution_capability(),
+                "{name} should be available under a read-only execution ceiling"
+            );
+            assert!(builtin_tool_is_read_only_execution_capability(name));
+        }
+        for name in ["bash", "lsp", "write_file", "memory", "mo_query"] {
+            assert!(
+                !registry
+                    .get(name)
+                    .expect("registered capability")
+                    .is_read_only_execution_capability(),
+                "{name} must not be treated as a read-only execution capability"
+            );
+            assert!(!builtin_tool_is_read_only_execution_capability(name));
+        }
+
+        let mut future_reader = registry.get("read_file").unwrap().clone();
+        future_reader.name = "future_reader".to_string();
+        assert!(future_reader.is_read_only_execution_capability());
+        future_reader.required.process_spawn = true;
+        assert!(!future_reader.is_read_only_execution_capability());
+    }
+
+    #[test]
     fn work_execution_role_controls_attempt_and_coordinator_surfaces() {
         let registry = registry();
         for name in ["start_work", "run_next_work_item", "settle_work_item"] {
@@ -2000,7 +2080,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_topology_is_discoverable_without_a_fixed_schema_tax() {
+    fn ordinary_spawn_is_resident_while_fanout_remains_deferred() {
         let registry = registry();
         for name in ["agent", "agent_fanout"] {
             let spec = registry
@@ -2015,8 +2095,8 @@ mod tests {
         }
         assert_eq!(
             registry.get("agent").expect("agent registered").load_policy,
-            ToolLoadPolicy::Deferred,
-            "delegation is a workflow decision, not a first-request primitive"
+            ToolLoadPolicy::AlwaysLoad,
+            "ordinary spawn has a compact resident projection; admission still controls dispatch"
         );
         assert_eq!(
             registry

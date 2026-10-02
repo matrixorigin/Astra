@@ -57,6 +57,7 @@ pub(crate) fn spawn_file_writer(
 
 async fn write_stream_events(rx: &mut StreamEventRx, mut emit: impl FnMut(String, bool) -> bool) {
     let mut thinking = String::new();
+    let mut thinking_model_item_id = None;
     let mut flush = tokio::time::interval_at(
         tokio::time::Instant::now() + THINKING_CHUNK_FLUSH_INTERVAL,
         THINKING_CHUNK_FLUSH_INTERVAL,
@@ -68,15 +69,21 @@ async fn write_stream_events(rx: &mut StreamEventRx, mut emit: impl FnMut(String
             event = rx.recv() => {
                 let Some(event) = event else {
                     if !thinking.is_empty() {
-                        let _ = emit(event_to_json(&StreamEvent::ThinkingChunk(std::mem::take(&mut thinking))), false);
+                        let _ = emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }), false);
                     }
                     break;
                 };
                 match event {
-                    StreamEvent::ThinkingChunk(chunk) => {
-                        thinking.push_str(&chunk);
+                    StreamEvent::ThinkingChunk { model_item_id, text } => {
+                        if !thinking.is_empty() && thinking_model_item_id != model_item_id {
+                            if !emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }), false) {
+                                break;
+                            }
+                        }
+                        thinking_model_item_id = model_item_id;
+                        thinking.push_str(&text);
                         if thinking.len() >= THINKING_CHUNK_FLUSH_BYTES {
-                            if !emit(event_to_json(&StreamEvent::ThinkingChunk(std::mem::take(&mut thinking))), false) {
+                            if !emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }), false) {
                                 break;
                             }
                         }
@@ -86,14 +93,14 @@ async fn write_stream_events(rx: &mut StreamEventRx, mut emit: impl FnMut(String
                         // boundary while collapsing only adjacent preview
                         // fragments.
                         if !thinking.is_empty() {
-                            if !emit(event_to_json(&StreamEvent::ThinkingChunk(std::mem::take(&mut thinking))), false) {
+                            if !emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }), false) {
                                 break;
                             }
                         }
                         // Make lifecycle/structural evidence promptly visible
                         // to timeout observers without turning token streaming
                         // into one filesystem flush per model delta.
-                        let flush_after = !matches!(event, StreamEvent::Token(_));
+                        let flush_after = !matches!(event, StreamEvent::Token { .. });
                         if !emit(event_to_json(&event), flush_after) {
                             break;
                         }
@@ -101,7 +108,7 @@ async fn write_stream_events(rx: &mut StreamEventRx, mut emit: impl FnMut(String
                 }
             }
             _ = flush.tick(), if !thinking.is_empty() => {
-                if !emit(event_to_json(&StreamEvent::ThinkingChunk(std::mem::take(&mut thinking))), false) {
+                if !emit(event_to_json(&StreamEvent::ThinkingChunk { model_item_id: thinking_model_item_id.clone(), text: std::mem::take(&mut thinking) }), false) {
                     break;
                 }
             }
@@ -150,14 +157,20 @@ fn event_to_json(event: &StreamEvent) -> String {
             "type": "runtime_feedback",
             "runtime_feedback": frame,
         }),
-        StreamEvent::Token(text) => {
-            serde_json::json!({"type": "token", "text": text})
+        StreamEvent::Token {
+            model_item_id,
+            text,
+        } => {
+            serde_json::json!({"type": "token", "model_item_id": model_item_id, "text": text})
         }
         StreamEvent::Thinking(active) => {
             serde_json::json!({"type": "thinking", "active": active})
         }
-        StreamEvent::ThinkingChunk(text) => {
-            serde_json::json!({"type": "thinking_chunk", "text": text})
+        StreamEvent::ThinkingChunk {
+            model_item_id,
+            text,
+        } => {
+            serde_json::json!({"type": "thinking_chunk", "model_item_id": model_item_id, "text": text})
         }
         StreamEvent::ToolStarted {
             name,
@@ -391,37 +404,62 @@ mod tests {
 
     #[tokio::test]
     async fn adjacent_thinking_chunks_are_coalesced_before_structural_events() {
-        let (tx, mut rx) = crate::cli::chat_stream::stream_event_channel();
-        tx.send(StreamEvent::ThinkingChunk("a".into()))
+        for ids in [[None, None], [Some("A"), Some("A")], [Some("A"), Some("B")]] {
+            let (tx, mut rx) = crate::cli::chat_stream::stream_event_channel();
+            tx.send(StreamEvent::ThinkingChunk {
+                model_item_id: ids[0].map(str::to_owned),
+                text: "a".into(),
+            })
             .await
             .unwrap();
-        tx.send(StreamEvent::ThinkingChunk("b".into()))
+            tx.send(StreamEvent::ThinkingChunk {
+                model_item_id: ids[1].map(str::to_owned),
+                text: "b".into(),
+            })
             .await
             .unwrap();
-        tx.send(StreamEvent::Thinking(false)).await.unwrap();
-        drop(tx);
+            tx.send(StreamEvent::Thinking(false)).await.unwrap();
+            drop(tx);
 
-        let mut lines = Vec::new();
-        write_stream_events(&mut rx, |line, _| {
-            lines.push(line);
-            true
-        })
-        .await;
+            let mut lines = Vec::new();
+            write_stream_events(&mut rx, |line, _| {
+                lines.push(line);
+                true
+            })
+            .await;
 
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        let chunk: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-        let boundary: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
-        assert_eq!(chunk["type"], "thinking_chunk");
-        assert_eq!(chunk["text"], "ab");
-        assert_eq!(boundary["type"], "thinking");
-        assert_eq!(boundary["active"], false);
+            let same_item = ids[0] == ids[1];
+            assert_eq!(lines.len(), if same_item { 2 } else { 3 }, "{lines:?}");
+            let chunk: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+            let boundary: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+            assert_eq!(chunk["type"], "thinking_chunk");
+            assert_eq!(chunk["text"], if same_item { "ab" } else { "a" });
+            assert_eq!(chunk["model_item_id"], serde_json::json!(ids[0]));
+            if !same_item {
+                let next: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+                assert_eq!(next["text"], "b");
+                assert_eq!(next["model_item_id"], serde_json::json!(ids[1]));
+            }
+            assert_eq!(boundary["type"], "thinking");
+            assert_eq!(boundary["active"], false);
+        }
     }
 
     #[tokio::test]
     async fn closed_optional_event_sink_stops_only_its_writer() {
         let (tx, mut rx) = crate::cli::chat_stream::stream_event_channel();
-        tx.send(StreamEvent::Token("first".into())).await.unwrap();
-        tx.send(StreamEvent::Token("second".into())).await.unwrap();
+        tx.send(StreamEvent::Token {
+            model_item_id: None,
+            text: "first".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(StreamEvent::Token {
+            model_item_id: None,
+            text: "second".into(),
+        })
+        .await
+        .unwrap();
         drop(tx);
 
         let mut writes = 0;
@@ -460,7 +498,10 @@ mod tests {
 
     #[test]
     fn token_event_serializes() {
-        let json = event_to_json(&StreamEvent::Token("hello".into()));
+        let json = event_to_json(&StreamEvent::Token {
+            model_item_id: None,
+            text: "hello".into(),
+        });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "token");
         assert_eq!(v["text"], "hello");
@@ -576,6 +617,7 @@ mod tests {
             start_elapsed_ms: Some(12),
             duration_ms: Some(70),
             outcome: Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded),
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),
@@ -720,9 +762,15 @@ mod tests {
     #[test]
     fn all_event_types_produce_valid_json() {
         let events = vec![
-            StreamEvent::Token("x".into()),
+            StreamEvent::Token {
+                model_item_id: None,
+                text: "x".into(),
+            },
             StreamEvent::Thinking(false),
-            StreamEvent::ThinkingChunk("hmm".into()),
+            StreamEvent::ThinkingChunk {
+                model_item_id: None,
+                text: "hmm".into(),
+            },
             StreamEvent::ToolStarted {
                 name: "t".into(),
                 description: "d".into(),
@@ -876,14 +924,20 @@ mod tests {
 
     #[test]
     fn token_with_chinese_and_emoji() {
-        let json = event_to_json(&StreamEvent::Token("你好世界 🌍".into()));
+        let json = event_to_json(&StreamEvent::Token {
+            model_item_id: None,
+            text: "你好世界 🌍".into(),
+        });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["text"], "你好世界 🌍");
     }
 
     #[test]
     fn token_empty_string() {
-        let json = event_to_json(&StreamEvent::Token("".into()));
+        let json = event_to_json(&StreamEvent::Token {
+            model_item_id: None,
+            text: "".into(),
+        });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["text"], "");
     }
@@ -1000,9 +1054,10 @@ mod tests {
             astra_turn_core::agent_live_event::AgentLiveEvent {
                 run_id: "child-run".into(),
                 agent_id: "reviewer@child-run".into(),
-                kind: astra_turn_core::agent_live_event::AgentLiveEventKind::ThinkingDelta(
-                    "checking the client boundary".into(),
-                ),
+                kind: astra_turn_core::agent_live_event::AgentLiveEventKind::ThinkingDelta {
+                    model_item_id: Some("test-model-item".into()),
+                    text: "checking the client boundary".into(),
+                },
             },
         ));
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSONL event");

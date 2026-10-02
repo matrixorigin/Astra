@@ -1008,10 +1008,6 @@ impl PreparedWriteFile {
     }
 
     pub fn apply(&self) -> ToolResult {
-        self.apply_with_formatting(true)
-    }
-
-    fn apply_with_formatting(&self, format_staging: bool) -> ToolResult {
         if self.already_desired {
             if let Err(error) =
                 verify_expected_original_hash(&self.path, self.original_content_hash.as_deref())
@@ -1041,7 +1037,6 @@ impl PreparedWriteFile {
             self.content.as_bytes(),
             false,
             self.original_content_hash.as_deref(),
-            format_staging,
         ) {
             Ok(warning) => {
                 let mut message = format!(
@@ -1124,13 +1119,6 @@ pub fn write_file(workspace_root: &Path, args: &Value) -> ToolResult {
     }
 }
 
-pub(crate) fn write_file_without_formatter(workspace_root: &Path, args: &Value) -> ToolResult {
-    match prepare_write_file(workspace_root, args) {
-        Ok(prepared) => prepared.apply_with_formatting(false),
-        Err(error) => error,
-    }
-}
-
 #[derive(Debug)]
 pub struct PreparedStrReplace {
     path: PathBuf,
@@ -1157,10 +1145,6 @@ impl PreparedStrReplace {
     }
 
     pub fn apply(self) -> ToolResult {
-        self.apply_with_formatting(true)
-    }
-
-    fn apply_with_formatting(self, format_staging: bool) -> ToolResult {
         if self.dry_run {
             return ToolResult::text(self.success_message);
         }
@@ -1169,7 +1153,6 @@ impl PreparedStrReplace {
             self.new_content.as_bytes(),
             self.allow_structural_change,
             self.original_content_hash.as_deref(),
-            format_staging,
         ) {
             Ok(warning) => {
                 let mut message = self.success_message;
@@ -1407,27 +1390,15 @@ pub fn prepare_str_replace(
 }
 
 pub fn str_replace(workspace_root: &Path, args: &Value) -> ToolResult {
-    str_replace_with_formatting(workspace_root, args, true)
-}
-
-pub(crate) fn str_replace_without_formatter(workspace_root: &Path, args: &Value) -> ToolResult {
-    str_replace_with_formatting(workspace_root, args, false)
-}
-
-fn str_replace_with_formatting(
-    workspace_root: &Path,
-    args: &Value,
-    format_staging: bool,
-) -> ToolResult {
     let args = match normalize_str_replace_args(args) {
         Ok(args) => args,
         Err(error) => return ToolResult::error(error),
     };
     if args.get("edits").and_then(Value::as_array).is_some() {
-        return multi_path_edit(workspace_root, &args, format_staging);
+        return multi_path_edit(workspace_root, &args);
     }
     match prepare_str_replace(workspace_root, &args) {
-        Ok(prepared) => prepared.apply_with_formatting(format_staging),
+        Ok(prepared) => prepared.apply(),
         Err(error) => error,
     }
 }
@@ -1458,10 +1429,6 @@ impl PreparedMultiEdit {
     }
 
     pub fn apply(&self) -> ToolResult {
-        self.apply_with_formatting(true)
-    }
-
-    fn apply_with_formatting(&self, format_staging: bool) -> ToolResult {
         if self.dry_run {
             return ToolResult::text(format!(
                 "Dry run: {} edit(s) would be applied to {}",
@@ -1474,7 +1441,6 @@ impl PreparedMultiEdit {
             self.new_content.as_bytes(),
             self.allow_structural_change,
             self.original_content_hash.as_deref(),
-            format_staging,
         ) {
             Ok(warning) => {
                 let mut message = format!(
@@ -1806,13 +1772,6 @@ pub fn multi_edit(workspace_root: &Path, args: &Value) -> ToolResult {
     }
 }
 
-pub(crate) fn multi_edit_without_formatter(workspace_root: &Path, args: &Value) -> ToolResult {
-    match prepare_multi_edit(workspace_root, args) {
-        Ok(prepared) => prepared.apply_with_formatting(false),
-        Err(error) => error,
-    }
-}
-
 #[derive(Debug)]
 pub struct PreparedMultiPathEdit {
     prepared: Vec<PreparedMultiEdit>,
@@ -1824,10 +1783,6 @@ impl PreparedMultiPathEdit {
     }
 
     pub fn apply(&self) -> ToolResult {
-        self.apply_with_formatting(true)
-    }
-
-    fn apply_with_formatting(&self, format_staging: bool) -> ToolResult {
         if self.prepared.iter().all(|prepared| prepared.dry_run) {
             let messages: Vec<String> = self
                 .prepared
@@ -1896,11 +1851,7 @@ impl PreparedMultiPathEdit {
             }
 
             // Format the staging file (best-effort, same as single-file path).
-            let formatter_outcome = if format_staging {
-                format_file_in_place_best_effort(&staging_path)
-            } else {
-                FormatterOutcome::NotFound
-            };
+            let formatter_outcome = format_file_in_place_best_effort(&staging_path);
             let warning = match formatter_outcome {
                 FormatterOutcome::Success | FormatterOutcome::NotFound => None,
                 FormatterOutcome::Warning(w) => Some(w),
@@ -2007,9 +1958,9 @@ impl PreparedMultiPathEdit {
     }
 }
 
-fn multi_path_edit(workspace_root: &Path, args: &Value, format_staging: bool) -> ToolResult {
+fn multi_path_edit(workspace_root: &Path, args: &Value) -> ToolResult {
     match prepare_multi_path_edit(workspace_root, args) {
-        Ok(prepared) => prepared.apply_with_formatting(format_staging),
+        Ok(prepared) => prepared.apply(),
         Err(error) => error,
     }
 }
@@ -2387,7 +2338,6 @@ fn write_file_atomic_with_format(
     content: &[u8],
     allow_formatter_syntax_error: bool,
     expected_original_hash: Option<&str>,
-    format_staging: bool,
 ) -> Result<Option<String>, String> {
     // Verify the file hasn't been modified since we read it.
     verify_expected_original_hash(path, expected_original_hash)?;
@@ -2405,11 +2355,7 @@ fn write_file_atomic_with_format(
         return Err(format!("Error: Cannot stage write: {e}"));
     }
 
-    let formatter_outcome = if format_staging {
-        format_file_in_place_best_effort(&tmp)
-    } else {
-        FormatterOutcome::NotFound
-    };
+    let formatter_outcome = format_file_in_place_best_effort(&tmp);
     let warning = match formatter_outcome {
         FormatterOutcome::Success | FormatterOutcome::NotFound => None,
         FormatterOutcome::Warning(warning) => Some(warning),
@@ -2646,7 +2592,7 @@ fn str_replace_not_found_hint_for_edit(
     )
 }
 
-fn str_replace_not_found_hint_with_what(what: String, content: &str, old_str: &str) -> String {
+pub fn str_replace_not_found_hint_with_what(what: String, content: &str, old_str: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let old_lines: Vec<&str> = old_str.lines().collect();
     let mut msg = str_replace_fail(
@@ -2717,228 +2663,44 @@ fn str_replace_not_found_hint_with_what(what: String, content: &str, old_str: &s
     msg
 }
 
-const LCS_LINE_LIMIT: usize = 4000;
-
 fn unified_diff(old_content: &str, new_content: &str, path_str: &str) -> String {
-    let filename = Path::new(path_str)
+    format!(
+        "[DRY RUN] Preview of changes (not applied):\n{}",
+        unified_diff_raw(old_content, new_content, Path::new(path_str))
+    )
+}
+
+/// Diff body shared by previews and receipts; never reads or authorizes paths.
+/// Myers has a computation deadline rather than a quadratic LCS allocation.
+pub fn unified_diff_raw(old_content: &str, new_content: &str, path: &Path) -> String {
+    let filename = path
         .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
-    let old_lines: Vec<&str> = old_content.lines().collect();
-    let new_lines: Vec<&str> = new_content.lines().collect();
-
-    if old_lines.len().max(new_lines.len()) > LCS_LINE_LIMIT {
-        return unified_diff_simple(old_content, new_content, &filename);
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "file".into());
+    if old_content == new_content {
+        return format!("--- a/{filename}\n+++ b/{filename}\n(no changes)\n");
     }
-
-    let ops = lcs_diff(&old_lines, &new_lines);
-    if ops.is_empty() || ops.iter().all(|op| matches!(op, DiffOp::Equal(..))) {
-        return format!(
-            "[DRY RUN] Preview of changes (not applied):\n--- a/{filename}\n+++ b/{filename}\n(no changes)\n"
-        );
+    let diff = similar::TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(20))
+        .diff_lines(old_content, new_content);
+    let mut bytes = vec![0; 64 * 1024];
+    let mut output = std::io::Cursor::new(bytes.as_mut_slice());
+    let truncated = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{filename}"), &format!("b/{filename}"))
+        .to_writer(&mut output)
+        .is_err();
+    let written = output.position() as usize;
+    bytes.truncate(written);
+    if let Err(error) = std::str::from_utf8(&bytes) {
+        bytes.truncate(error.valid_up_to());
     }
-
-    let hunks = group_into_hunks(&ops, 3);
-    let mut diff = format!("--- a/{filename}\n+++ b/{filename}\n");
-    for hunk in &hunks {
-        let mut old_start = usize::MAX;
-        let mut old_count = 0;
-        let mut new_start = usize::MAX;
-        let mut new_count = 0;
-        for op in hunk {
-            match op {
-                DiffOp::Equal(o, n, _) => {
-                    old_start = old_start.min(*o);
-                    new_start = new_start.min(*n);
-                    old_count += 1;
-                    new_count += 1;
-                }
-                DiffOp::Delete(o, _) => {
-                    old_start = old_start.min(*o);
-                    old_count += 1;
-                }
-                DiffOp::Insert(n, _) => {
-                    new_start = new_start.min(*n);
-                    new_count += 1;
-                }
-            }
-        }
-        if old_start == usize::MAX {
-            old_start = 0;
-        }
-        if new_start == usize::MAX {
-            new_start = 0;
-        }
-        diff.push_str(&format!(
-            "@@ -{},{} +{},{} @@\n",
-            old_start + 1,
-            old_count,
-            new_start + 1,
-            new_count,
-        ));
-        for op in hunk {
-            match op {
-                DiffOp::Equal(_, _, line) => diff.push_str(&format!(" {line}\n")),
-                DiffOp::Delete(_, line) => diff.push_str(&format!("-{line}\n")),
-                DiffOp::Insert(_, line) => diff.push_str(&format!("+{line}\n")),
-            }
-        }
+    let mut rendered = String::from_utf8(bytes).expect("diff inputs and headers are UTF-8");
+    if truncated {
+        rendered.push_str("\n... (diff preview truncated; not an applicable patch)\n");
     }
-    format!("[DRY RUN] Preview of changes (not applied):\n{diff}")
-}
-
-#[derive(Debug, Clone, Copy)]
-enum DiffOp<'a> {
-    Equal(usize, usize, &'a str),
-    Delete(usize, &'a str),
-    Insert(usize, &'a str),
-}
-
-fn lcs_diff<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<DiffOp<'a>> {
-    let m = old.len();
-    let n = new.len();
-    // LCS table
-    let mut table = vec![vec![0u32; n + 1]; m + 1];
-    for i in (0..m).rev() {
-        for j in (0..n).rev() {
-            table[i][j] = if old[i] == new[j] {
-                table[i + 1][j + 1] + 1
-            } else {
-                table[i + 1][j].max(table[i][j + 1])
-            };
-        }
-    }
-    let mut raw = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < m || j < n {
-        if i < m && j < n && old[i] == new[j] {
-            raw.push(DiffOp::Equal(i, j, old[i]));
-            i += 1;
-            j += 1;
-        } else if i < m && (j >= n || table[i + 1][j] >= table[i][j + 1]) {
-            raw.push(DiffOp::Delete(i, old[i]));
-            i += 1;
-        } else {
-            raw.push(DiffOp::Insert(j, new[j]));
-            j += 1;
-        }
-    }
-    // Reorder runs of non-equal ops: deletes before inserts (standard diff convention)
-    let mut ops = Vec::with_capacity(raw.len());
-    let mut idx = 0;
-    while idx < raw.len() {
-        if matches!(raw[idx], DiffOp::Equal(..)) {
-            ops.push(raw[idx]);
-            idx += 1;
-        } else {
-            let run_start = idx;
-            while idx < raw.len() && !matches!(raw[idx], DiffOp::Equal(..)) {
-                idx += 1;
-            }
-            for op in &raw[run_start..idx] {
-                if matches!(op, DiffOp::Delete(..)) {
-                    ops.push(*op);
-                }
-            }
-            for op in &raw[run_start..idx] {
-                if matches!(op, DiffOp::Insert(..)) {
-                    ops.push(*op);
-                }
-            }
-        }
-    }
-    ops
-}
-
-fn group_into_hunks<'a>(ops: &[DiffOp<'a>], context: usize) -> Vec<Vec<DiffOp<'a>>> {
-    let mut hunks: Vec<Vec<DiffOp<'a>>> = Vec::new();
-    let mut change_indices: Vec<usize> = Vec::new();
-    for (idx, op) in ops.iter().enumerate() {
-        if !matches!(op, DiffOp::Equal(..)) {
-            change_indices.push(idx);
-        }
-    }
-    if change_indices.is_empty() {
-        return hunks;
-    }
-    let mut hunk_start = change_indices[0].saturating_sub(context);
-    let mut hunk_end = (change_indices[0] + context + 1).min(ops.len());
-    for &ci in &change_indices[1..] {
-        let cs = ci.saturating_sub(context);
-        let ce = (ci + context + 1).min(ops.len());
-        if cs <= hunk_end {
-            hunk_end = ce;
-        } else {
-            hunks.push(ops[hunk_start..hunk_end].to_vec());
-            hunk_start = cs;
-            hunk_end = ce;
-        }
-    }
-    hunks.push(ops[hunk_start..hunk_end].to_vec());
-    hunks
-}
-
-fn unified_diff_simple(old_content: &str, new_content: &str, filename: &str) -> String {
-    let old_lines: Vec<&str> = old_content.lines().collect();
-    let new_lines: Vec<&str> = new_content.lines().collect();
-    let max_len = old_lines.len().max(new_lines.len());
-    let mut first_diff = max_len;
-    let mut last_diff = 0;
-    for idx in 0..max_len {
-        let o = old_lines.get(idx).copied().unwrap_or("");
-        let n = new_lines.get(idx).copied().unwrap_or("");
-        if o != n {
-            first_diff = first_diff.min(idx);
-            last_diff = idx;
-        }
-    }
-    let mut diff = format!("--- a/{filename}\n+++ b/{filename}\n");
-    if first_diff > last_diff {
-        return format!("[DRY RUN] Preview of changes (not applied):\n{diff}(no changes)\n");
-    }
-    let context = 3;
-    let start = first_diff.saturating_sub(context);
-    let end = (last_diff + context + 1).min(max_len);
-    diff.push_str(&format!(
-        "@@ -{},{} +{},{} @@\n",
-        start + 1,
-        end.min(old_lines.len()).saturating_sub(start),
-        start + 1,
-        end.min(new_lines.len()).saturating_sub(start),
-    ));
-    let mut idx = start;
-    while idx < end {
-        let o = old_lines.get(idx).copied();
-        let n = new_lines.get(idx).copied();
-        match (o, n) {
-            (Some(a), Some(b)) if a == b => {
-                diff.push_str(&format!(" {a}\n"));
-                idx += 1;
-            }
-            _ => {
-                let run_start = idx;
-                while idx < end {
-                    let a = old_lines.get(idx).copied();
-                    let b = new_lines.get(idx).copied();
-                    if matches!((a, b), (Some(x), Some(y)) if x == y) {
-                        break;
-                    }
-                    idx += 1;
-                }
-                for i in run_start..idx {
-                    if let Some(line) = old_lines.get(i) {
-                        diff.push_str(&format!("-{line}\n"));
-                    }
-                }
-                for i in run_start..idx {
-                    if let Some(line) = new_lines.get(i) {
-                        diff.push_str(&format!("+{line}\n"));
-                    }
-                }
-            }
-        }
-    }
-    format!("[DRY RUN] Preview of changes (not applied):\n{diff}")
+    rendered
 }
 
 #[cfg(test)]
@@ -3941,7 +3703,7 @@ mod tests {
         let prepared = prepare_multi_path_edit(tmp.path(), &args).expect("prepared");
         std::fs::write(&b, "external change").unwrap();
 
-        let result = prepared.apply_with_formatting(true);
+        let result = prepared.apply();
 
         assert!(result.is_error, "stale target must fail: {}", result.output);
         assert!(
@@ -4562,6 +4324,21 @@ mod tests {
 
     // ─── unified_diff edge cases ────────────────────────────────────────
     #[test]
+    fn raw_diff_preserves_newlines_and_bounds_unicode_previews() {
+        for (old, new) in [("", "one\n"), ("one\n", ""), ("one", "one\n")] {
+            let rendered = unified_diff_raw(old, new, Path::new("nested/change.txt"));
+            assert!(rendered.starts_with("--- a/change.txt\n+++ b/change.txt\n"));
+            assert!(!rendered.contains("(no changes)"));
+            assert!(!rendered.contains("[DRY RUN]"));
+            assert!(!rendered.contains("nested/"));
+        }
+        let rendered = unified_diff_raw("", &"记忆".repeat(20_000), Path::new("large.txt"));
+        assert!(rendered.len() <= 64 * 1024 + 80);
+        assert!(rendered.ends_with("... (diff preview truncated; not an applicable patch)\n"));
+        assert!(!rendered.contains('\u{fffd}'));
+    }
+
+    #[test]
     fn unified_diff_groups_removed_then_added_lines() {
         let old = "ctx\nold1\nold2\nctx\n";
         let new = "ctx\nnew1\nnew2\nctx\n";
@@ -4685,19 +4462,15 @@ mod tests {
         }
     }
 
-    // ─── Issue #2: LCS line-count guard for large files ──────────────────
     #[test]
-    fn unified_diff_large_file_uses_simple_fallback() {
-        // File exceeds LCS_LINE_LIMIT → falls back to index-aligned diff.
-        let line_count = LCS_LINE_LIMIT + 100;
+    fn unified_diff_large_file_preserves_the_changed_line() {
+        let line_count = 4100;
         let old_lines: Vec<String> = (0..line_count).map(|i| format!("line {i}")).collect();
         let mut new_lines = old_lines.clone();
         new_lines[line_count / 2] = "CHANGED".to_string();
         let old = old_lines.join("\n");
         let new = new_lines.join("\n");
-        let start = std::time::Instant::now();
         let diff = unified_diff(&old, &new, "big.txt");
-        let elapsed = start.elapsed();
         assert!(
             diff.contains("[DRY RUN]"),
             "got:\n{}",
@@ -4708,16 +4481,10 @@ mod tests {
             "got:\n{}",
             &diff[..500.min(diff.len())]
         );
-        assert!(
-            elapsed.as_millis() < 200,
-            "fallback should be fast, took {}ms",
-            elapsed.as_millis()
-        );
     }
 
     #[test]
-    fn unified_diff_within_lcs_limit_uses_lcs() {
-        // File within limit still gets proper LCS-based diff
+    fn unified_diff_insertion_preserves_unchanged_neighbors() {
         let old = "a\nb\nc\nd\n";
         let new = "a\nb\nINSERTED\nc\nd\n";
         let diff = unified_diff(old, new, "small.txt");
@@ -4772,15 +4539,6 @@ mod tests {
             !msg.contains("footer"),
             "hint must not echo file lines, got: {msg}"
         );
-    }
-
-    #[test]
-    fn diff_op_is_copy() {
-        let op = DiffOp::Equal(0, 0, "line");
-        let copy = op;
-        // If DiffOp is not Copy, using `op` after the move would fail to compile.
-        assert!(matches!(op, DiffOp::Equal(0, 0, "line")));
-        assert!(matches!(copy, DiffOp::Equal(0, 0, "line")));
     }
 
     // ─── Issue #2: replace_all + mixed curly-quote forms → specific error ──
@@ -5296,8 +5054,7 @@ mod tests {
         std::fs::write(&target, "original\n").unwrap();
 
         let _warning =
-            write_file_atomic_with_format(&target, b"pub fn new_body() {}\n", false, None, true)
-                .unwrap();
+            write_file_atomic_with_format(&target, b"pub fn new_body() {}\n", false, None).unwrap();
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "pub fn new_body() {}\n",
@@ -5322,7 +5079,7 @@ mod tests {
         // End-to-end: write, check content lands.
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("hello.txt");
-        let result = write_file_atomic_with_format(&target, b"hello world\n", false, None, true);
+        let result = write_file_atomic_with_format(&target, b"hello world\n", false, None);
         assert!(result.is_ok(), "atomic write must succeed: {result:?}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello world\n");
     }
@@ -5347,7 +5104,7 @@ mod tests {
             ro.set_mode(0o500); // r-x only, no write for owner
             std::fs::set_permissions(tmp.path(), ro).unwrap();
 
-            let result = write_file_atomic_with_format(&target, b"NEW\n", false, None, true);
+            let result = write_file_atomic_with_format(&target, b"NEW\n", false, None);
 
             // Restore perms before asserting so tempdir drop works.
             std::fs::set_permissions(tmp.path(), orig_perm).unwrap();

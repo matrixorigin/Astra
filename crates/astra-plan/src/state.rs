@@ -91,9 +91,6 @@ pub struct PlanModeState {
     /// Whether the mirrored plan has loaded or local edits.
     #[serde(default)]
     pub modified: bool,
-    /// Execution timeline used by active plan/executor flows.
-    #[serde(default)]
-    pub timeline: ExecutionTimeline,
     /// Monotonic version counter for optimistic concurrency control.
     /// Incremented on every save; checked on update to detect lost writes.
     #[serde(default = "default_version")]
@@ -114,7 +111,6 @@ impl PlanModeState {
             plan: TaskPlan::default(),
             plan_md: None,
             modified: false,
-            timeline: ExecutionTimeline::default(),
             version: 1,
             created_by: None,
             session_hint: None,
@@ -157,81 +153,5 @@ impl PlanModeState {
         } else {
             format!("{}-{:04x}", slug.to_lowercase(), (hash & 0xFFFF) as u16)
         }
-    }
-}
-
-/// Configuration for plan execution behavior.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PlanExecutionConfig {
-    /// If true, prompt user for confirmation before executing each subtask.
-    pub step_by_step: bool,
-}
-
-/// Types of events that can occur during plan execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum TimelineEventKind {
-    /// Plan was rewound — subtask at `from_idx` and every subtask after it
-    /// reset to pending. `reset_count` is the number that actually flipped.
-    SubtaskRewound {
-        anchor: String,
-        from_idx: usize,
-        reset_count: usize,
-        reason: Option<String>,
-    },
-    /// A single subtask was reset for re-execution (distinct from a rewind).
-    SubtaskRedone {
-        subtask_id: String,
-        title: String,
-        attempt: u32,
-    },
-}
-
-/// A single event in the execution timeline.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimelineEvent {
-    /// ISO 8601 timestamp
-    pub timestamp: String,
-    /// The event details
-    pub event: TimelineEventKind,
-}
-
-impl TimelineEvent {
-    /// Create a new timeline event with current timestamp.
-    pub fn new(event: TimelineEventKind) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        Self {
-            timestamp: now.to_string(),
-            event,
-        }
-    }
-}
-
-/// Execution timeline tracking all events during plan execution.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ExecutionTimeline {
-    /// All recorded events, in chronological order.
-    pub events: Vec<TimelineEvent>,
-}
-
-impl ExecutionTimeline {
-    /// Record a new event.
-    pub fn record(&mut self, kind: TimelineEventKind) {
-        self.events.push(TimelineEvent::new(kind));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plan_execution_config_defaults() {
-        let config = PlanExecutionConfig::default();
-        assert!(!config.step_by_step);
     }
 }

@@ -16,7 +16,7 @@ pub use agent_result_status::{
 };
 pub use agent_tool::{
     AgentToolContext, AgentTranscriptLocation, WorkspaceMutationAuthority,
-    handle_agent_fanout_tool, handle_agent_get_result_action,
+    handle_agent_fanout_tool, handle_agent_get_result_action, handle_agent_list_action,
     handle_agent_send_message_with_router, handle_agent_spawn_action, handle_agent_tool,
     normalize_agent_spawn_args, recover_agent_fanout_tool_result,
     render_agent_runtime_binding_error,
@@ -68,9 +68,9 @@ pub use spawner::{
     AgentHistoryRecord, AgentStatus, CANCELLATION_ORIGIN_UNVERIFIED, CancellationTransferOutcome,
     DescendantCancellationReason, DurableAgentReconciler, DynamicAgentSpawner,
     FANOUT_GROUP_CANCELLED_EVENT_TYPE, FanoutGroupCancellation, FanoutParentAdmission,
-    InheritedChildPrefix, PermissionSummary, ROOT_RUN_ID, SpawnAgentExecutor, SpawnContext,
-    SpawnError, SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunResult,
-    SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics, SpawnedAgentState,
-    WaitForAgentOutcome, project_subrun_status_to_spawn,
-    spawn_completion_status_from_finish_reason,
+    InheritedChildPrefix, PermissionSummary, PreparedSpawn, PreparedSpawnModelIdentity,
+    ROOT_RUN_ID, SpawnAgentExecutor, SpawnContext, SpawnError, SpawnRunCancellationDurability,
+    SpawnRunConfig, SpawnRunResult, SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics,
+    SpawnedAgentState, WaitForAgentOutcome, project_subrun_status_to_spawn,
+    selector_for_admitted_spawn_input, spawn_completion_status_from_finish_reason,
 };

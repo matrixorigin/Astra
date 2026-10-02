@@ -189,7 +189,6 @@ dependencies = [
  "serial_test",
  "sha2",
  "shell-words",
- "similar",
  "sqlx",
  "supports-color",
  "temp-env",
@@ -349,6 +348,7 @@ dependencies = [
 name = "astra-mcp"
 version = "0.2.10"
 dependencies = [
+ "astra-turn-core",
  "astra-turn-types",
  "chrono",
  "futures-util",
@@ -618,7 +618,6 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tracing",
- "unicode-segmentation",
  "uuid",
  "webpki-roots 1.0.7",
 ]
@@ -628,7 +627,6 @@ name = "astra-skills"
 version = "0.2.10"
 dependencies = [
  "astra-core",
- "astra-pipeline",
  "astra-runtime-env",
  "astra-services",
  "async-trait",
@@ -686,6 +684,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "serial_test",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -757,6 +756,7 @@ dependencies = [
  "serde_yaml_ng",
  "serial_test",
  "sha2",
+ "similar",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

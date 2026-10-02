@@ -882,6 +882,121 @@ pub struct ObservationEvidence {
     pub confidence: ObservationConfidence,
 }
 
+/// Shared presentation priority. Severity is authoritative; prose and kind names
+/// are not classifiers. Confidence only breaks ties within a severity band.
+pub fn observation_priority_key(observation: &ObservationRecord) -> i64 {
+    let severity = match observation.severity.as_str() {
+        "critical" => 3000,
+        "error" => 2000,
+        "warning" => 1000,
+        _ => 0,
+    };
+    severity
+        + ((observation.confidence.evidence.unwrap_or(0.5)
+            + observation.confidence.classification.unwrap_or(0.0)
+            + observation.confidence.causal.unwrap_or(0.0))
+            * 100.0) as i64
+}
+
+/// Select observations together with their supporting evidence, then hints with
+/// all their observation dependencies. Preferred support wins within a severity
+/// band, never over a higher-severity diagnostic. No source-specific kind rules.
+pub fn budget_observation_support(
+    depth: ObservationDepth,
+    observations: &mut Vec<ObservationRecord>,
+    evidence: &mut Vec<ObservationEvidence>,
+    action_hints: &mut Vec<ObservationActionHint>,
+    preferred_evidence: &BTreeSet<String>,
+) -> ObservationBudgetResult {
+    let (max_observations, max_evidence, max_hints) = depth.report_limits();
+    let before = (observations.len(), evidence.len(), action_hints.len());
+    observations.sort_by_key(|observation| {
+        std::cmp::Reverse(
+            observation_priority_key(observation)
+                + if observation
+                    .evidence_refs
+                    .iter()
+                    .any(|id| preferred_evidence.contains(id))
+                {
+                    400
+                } else {
+                    0
+                },
+        )
+    });
+    let available: BTreeSet<_> = evidence.iter().map(|item| &item.ref_id).collect();
+    let mut selected = BTreeSet::new();
+    let mut kept = 0;
+    observations.retain(|observation| {
+        if kept == max_observations {
+            return false;
+        }
+        if !observation.evidence_refs.is_empty() {
+            let support = observation
+                .evidence_refs
+                .iter()
+                .find(|id| selected.contains(*id))
+                .or_else(|| {
+                    (selected.len() < max_evidence)
+                        .then(|| {
+                            observation
+                                .evidence_refs
+                                .iter()
+                                .find(|id| available.contains(id))
+                        })
+                        .flatten()
+                });
+            let Some(support) = support else {
+                return false;
+            };
+            selected.insert(support.clone());
+        }
+        kept += 1;
+        true
+    });
+    for observation in observations.iter() {
+        for id in &observation.evidence_refs {
+            if selected.len() < max_evidence && available.contains(id) {
+                selected.insert(id.clone());
+            }
+        }
+    }
+    // Independent evidence remains useful even when no observation cites it.
+    // Referenced support owns the budget first; previews use only spare slots.
+    for item in evidence.iter() {
+        if selected.len() < max_evidence {
+            selected.insert(item.ref_id.clone());
+        }
+    }
+    evidence.retain(|item| selected.contains(&item.ref_id));
+    for observation in observations.iter_mut() {
+        observation.evidence_refs.retain(|id| selected.contains(id));
+    }
+    let retained: BTreeSet<_> = observations.iter().map(|item| &item.ref_id).collect();
+    action_hints.retain(|hint| {
+        !hint.observation_refs.is_empty()
+            && hint.observation_refs.iter().all(|id| retained.contains(id))
+    });
+    action_hints.sort_by_key(|hint| {
+        observations
+            .iter()
+            .position(|observation| hint.observation_refs.contains(&observation.ref_id))
+            .unwrap_or(usize::MAX)
+    });
+    action_hints.truncate(max_hints);
+    let omitted = ObservationBudgetOmitted {
+        observations: before.0.saturating_sub(observations.len()) as i64,
+        evidence_previews: before.1.saturating_sub(evidence.len()) as i64,
+        action_hints: before.2.saturating_sub(action_hints.len()) as i64,
+        ..Default::default()
+    };
+    ObservationBudgetResult {
+        truncated: !omitted.is_empty(),
+        omitted,
+        next_cursor: None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ObservationActionHint {
     pub target_type: String,
@@ -1030,6 +1145,14 @@ fn clamp_confidence(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_catalog_is_not_an_observation_facet() {
+        for value in ["models", "Models", "model_catalog", "runtime/models"] {
+            assert!(value.parse::<ObservationFacet>().is_err());
+            assert!(serde_json::from_value::<ObservationFacet>(serde_json::json!(value)).is_err());
+        }
+    }
 
     #[test]
     fn observation_facet_parses_advertised_edge_local_facets() {

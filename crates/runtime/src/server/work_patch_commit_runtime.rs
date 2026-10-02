@@ -13,9 +13,12 @@ use astra_services::{
     },
 };
 use astra_tools::patch_materialization::{
-    GitReviewedCommitReconciliation, GitWorktreeCommitMetadata, GitWorktreeCommitNotCreatedCode,
-    GitWorktreeCommitOutcome, commit_reviewed_git_patch, reconcile_reviewed_git_patch_commit,
+    GitReviewedCommitReconciliation, GitReviewedCommitReconciliationReason,
+    GitWorktreeCommitMetadata, GitWorktreeCommitNotCreatedCode, GitWorktreeCommitOutcome,
+    commit_reviewed_git_patch_with_workspace_lease,
+    reconcile_reviewed_git_patch_commit_with_workspace_lease,
 };
+use astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options;
 use futures_util::{StreamExt, stream};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -72,8 +75,9 @@ pub(crate) fn spawn_work_patch_commit_recovery(
             stream::iter(pending)
                 .for_each_concurrent(RECOVERY_CONCURRENCY, |item| {
                     let pool = pool.clone();
+                    let cancel = cancel.clone();
                     async move {
-                        if let Err(error) = drive_commit(pool, item.clone()).await
+                        if let Err(error) = drive_commit(pool, item.clone(), &cancel).await
                             && !matches!(error, WorkPatchCommitError::ExecutorConflict)
                         {
                             tracing::warn!(
@@ -98,14 +102,18 @@ pub(crate) fn spawn_work_patch_commit_recovery(
 async fn drive_commit(
     pool: SharedPool,
     item: WorkPatchCommitRecoveryItem,
+    cancel: &CancellationToken,
 ) -> Result<(), WorkPatchCommitError> {
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     let service = DatabaseWorkPatchCommitService::new(pool.clone());
     match item.operation.phase {
         WorkPatchCommitPhase::AwaitingDispatch => {
-            drive_awaiting_dispatch(&service, &pool, &item).await
+            drive_awaiting_dispatch(&service, &pool, &item, cancel).await
         }
         WorkPatchCommitPhase::Committing | WorkPatchCommitPhase::Reconciling => {
-            drive_reconciliation(&service, &pool, &item).await
+            drive_reconciliation(&service, &pool, &item, cancel).await
         }
         WorkPatchCommitPhase::Complete => Ok(()),
     }
@@ -115,12 +123,19 @@ async fn drive_awaiting_dispatch(
     service: &DatabaseWorkPatchCommitService,
     pool: &SharedPool,
     item: &WorkPatchCommitRecoveryItem,
+    cancel: &CancellationToken,
 ) -> Result<(), WorkPatchCommitError> {
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     let executor_token = format!("server-commit-{}", Uuid::now_v7());
     let invocation = provider_invocation_ref(item);
     let workspace = match resolve_workspace(pool, item).await {
         Ok(workspace) => workspace,
         Err(WorkspaceResolutionError::Definitive(code)) => {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
             service
                 .claim_committing(
                     &item.owner_id,
@@ -139,16 +154,21 @@ async fn drive_awaiting_dispatch(
                 %error,
                 "Work patch commit workspace resolution will be retried before dispatch"
             );
-            service
-                .defer_recovery(
-                    &item.owner_id,
-                    &item.operation.work_id,
-                    &item.operation.operation_id,
-                )
-                .await?;
+            if !cancel.is_cancelled() {
+                service
+                    .defer_recovery(
+                        &item.owner_id,
+                        &item.operation.work_id,
+                        &item.operation.operation_id,
+                    )
+                    .await?;
+            }
             return Ok(());
         }
     };
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     let patch = match service
         .load_patch_payload(
             &item.owner_id,
@@ -164,16 +184,21 @@ async fn drive_awaiting_dispatch(
                 %error,
                 "Work patch commit payload read will be retried before dispatch"
             );
-            service
-                .defer_recovery(
-                    &item.owner_id,
-                    &item.operation.work_id,
-                    &item.operation.operation_id,
-                )
-                .await?;
+            if !cancel.is_cancelled() {
+                service
+                    .defer_recovery(
+                        &item.owner_id,
+                        &item.operation.work_id,
+                        &item.operation.operation_id,
+                    )
+                    .await?;
+            }
             return Ok(());
         }
         Err(error) => {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
             service
                 .claim_committing(
                     &item.owner_id,
@@ -200,6 +225,27 @@ async fn drive_awaiting_dispatch(
             return Ok(());
         }
     };
+    let Some(workspace_lease) = acquire_workspace_mutation_lease_with_options(
+        &workspace,
+        Some(cancel),
+        Duration::from_secs(120),
+    )
+    .await
+    else {
+        if !cancel.is_cancelled() {
+            service
+                .defer_recovery(
+                    &item.owner_id,
+                    &item.operation.work_id,
+                    &item.operation.operation_id,
+                )
+                .await?;
+        }
+        return Ok(());
+    };
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     service
         .claim_committing(
             &item.owner_id,
@@ -214,12 +260,13 @@ async fn drive_awaiting_dispatch(
         author_name: item.operation.author_name.clone(),
         author_email: item.operation.author_email.clone(),
     };
-    match commit_reviewed_git_patch(
+    match commit_reviewed_git_patch_with_workspace_lease(
         &workspace,
         &item.operation.base_subject_revision,
         &item.operation.result_subject_revision,
         &patch,
         &metadata,
+        &workspace_lease,
     )
     .await
     {
@@ -252,15 +299,17 @@ async fn drive_awaiting_dispatch(
             code,
             observed_revision,
         } => {
-            record_failure(
-                service,
-                item,
-                executor_token,
-                invocation,
-                map_not_created(code),
-                observed_revision,
-            )
-            .await?;
+            if code != GitWorktreeCommitNotCreatedCode::WorkspaceUnavailable {
+                record_failure(
+                    service,
+                    item,
+                    executor_token,
+                    invocation,
+                    map_not_created(code),
+                    observed_revision,
+                )
+                .await?;
+            }
         }
     }
     Ok(())
@@ -270,22 +319,17 @@ async fn drive_reconciliation(
     service: &DatabaseWorkPatchCommitService,
     pool: &SharedPool,
     item: &WorkPatchCommitRecoveryItem,
+    cancel: &CancellationToken,
 ) -> Result<(), WorkPatchCommitError> {
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     let invocation = item
         .operation
         .commit_invocation_ref
         .clone()
         .ok_or_else(|| WorkPatchCommitError::NeedsRepair("missing commit invocation".into()))?;
     let executor_token = format!("server-commit-reconciler-{}", Uuid::now_v7());
-    service
-        .claim_reconciliation(
-            &item.owner_id,
-            &item.operation.work_id,
-            &item.operation.operation_id,
-            &executor_token,
-            &invocation,
-        )
-        .await?;
     let workspace = match resolve_workspace(pool, item).await {
         Ok(workspace) => workspace,
         Err(_) => return Ok(()),
@@ -301,11 +345,33 @@ async fn drive_reconciliation(
         Ok(patch) => patch,
         Err(_) => return Ok(()),
     };
-    match reconcile_reviewed_git_patch_commit(
+    let Some(workspace_lease) = acquire_workspace_mutation_lease_with_options(
+        &workspace,
+        Some(cancel),
+        Duration::from_secs(120),
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
+    service
+        .claim_reconciliation(
+            &item.owner_id,
+            &item.operation.work_id,
+            &item.operation.operation_id,
+            &executor_token,
+            &invocation,
+        )
+        .await?;
+    match reconcile_reviewed_git_patch_commit_with_workspace_lease(
         &workspace,
         &item.operation.base_subject_revision,
         &item.operation.result_subject_revision,
         &patch,
+        &workspace_lease,
     )
     .await
     {
@@ -338,17 +404,48 @@ async fn drive_reconciliation(
             )
             .await?;
         }
-        GitReviewedCommitReconciliation::Diverged { observed_revision } => {
-            record_failure(
-                service,
-                item,
-                executor_token,
-                invocation,
-                WorkPatchCommitFailureCode::ResultChanged,
-                observed_revision,
-            )
-            .await?;
-        }
+        GitReviewedCommitReconciliation::Diverged {
+            observed_revision,
+            reason,
+        } => match reason {
+            GitReviewedCommitReconciliationReason::TargetChanged => {
+                if observed_revision.is_some() {
+                    record_failure(
+                        service,
+                        item,
+                        executor_token,
+                        invocation,
+                        WorkPatchCommitFailureCode::ResultChanged,
+                        observed_revision,
+                    )
+                    .await?;
+                }
+            }
+            GitReviewedCommitReconciliationReason::InvalidPatch => {
+                record_failure(
+                    service,
+                    item,
+                    executor_token,
+                    invocation,
+                    WorkPatchCommitFailureCode::PatchRejected,
+                    observed_revision,
+                )
+                .await?;
+            }
+            GitReviewedCommitReconciliationReason::InvalidWorkspace => {
+                record_failure(
+                    service,
+                    item,
+                    executor_token,
+                    invocation,
+                    WorkPatchCommitFailureCode::InvalidWorkspace,
+                    observed_revision,
+                )
+                .await?;
+            }
+            GitReviewedCommitReconciliationReason::WorkspaceUnavailable
+            | GitReviewedCommitReconciliationReason::ProviderUnavailable => {}
+        },
     }
     Ok(())
 }
@@ -453,6 +550,9 @@ fn map_not_created(code: GitWorktreeCommitNotCreatedCode) -> WorkPatchCommitFail
             WorkPatchCommitFailureCode::CommitRejected
         }
         GitWorktreeCommitNotCreatedCode::RefConflict => WorkPatchCommitFailureCode::RefConflict,
+        GitWorktreeCommitNotCreatedCode::InvalidWorkspace => {
+            WorkPatchCommitFailureCode::InvalidWorkspace
+        }
         GitWorktreeCommitNotCreatedCode::WorkspaceUnavailable => {
             WorkPatchCommitFailureCode::WorkspaceUnavailable
         }

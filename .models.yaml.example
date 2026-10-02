@@ -36,10 +36,16 @@
 #   context_window        — Max input tokens (integer). Affects history truncation.
 #   max_completion_tokens — Max output tokens (integer). Sent to provider. A
 #                           typed judgment model needs enough room for every
-#                           batched answer identity; 512 is a safe starting
-#                           point for the built-in Jev judgment contract.
-#   pricing_prompt        — Cost per token (input), in USD. Used by /stats.
-#   pricing_completion    — Cost per token (output), in USD. Used by /stats.
+#                           batched answer identity. The delegated-model
+#                           selector is capped at 4096 output tokens; if a
+#                           configured judgment route cannot fit a batch, the
+#                           bounded selector can run once on the primary model.
+#   pricing_currency      — Required with prices; currently only USD is supported.
+#   pricing_unit          — Required with prices; use per_token.
+#   pricing_prompt        — Explicit USD cost per input token.
+#   pricing_completion    — Explicit USD cost per output token.
+#                           Set all four fields together. Do not enter CNY rates
+#                           without a documented conversion to USD.
 #   fallback_chain        — Ordered list of model names for rate-limit recovery.
 #                           Example: [qwen-turbo, qwen-flash]
 #   supported_parameters  — Feature flags (list of strings):
@@ -115,8 +121,6 @@
   api_key: sk-your-dashscope-key
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
   description: "Alibaba Qwen-Plus via DashScope"
-  pricing_prompt: 0.0000008     # ¥0.8/1M (≤128K)
-  pricing_completion: 0.000002  # ¥2/1M
   tags: [code, chat, reasoning]
   fallback_chain: [qwen-turbo, qwen-flash]
   context_window: 1000000
@@ -128,8 +132,6 @@
   api_key: sk-your-dashscope-key
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
   description: "Alibaba Qwen-Max via DashScope"
-  pricing_prompt: 0.0000024     # ¥2.4/1M
-  pricing_completion: 0.0000096 # ¥9.6/1M
   tags: [code, chat, reasoning]
   context_window: 131072
   max_completion_tokens: 8192
@@ -140,8 +142,6 @@
   api_key: sk-your-dashscope-key
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
   description: "Alibaba Qwen-Turbo via DashScope (fastest/cheapest)"
-  pricing_prompt: 0.0000003     # ¥0.3/1M
-  pricing_completion: 0.0000006 # ¥0.6/1M
   tags: [code, chat]
   context_window: 1000000
   max_completion_tokens: 16384
@@ -152,8 +152,6 @@
   api_key: sk-your-dashscope-key
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
   description: "Alibaba Qwen-Flash — ultra-cheap, good for intent/tool selection"
-  pricing_prompt: 0.00000015    # ¥0.15/1M (≤128K)
-  pricing_completion: 0.0000015 # ¥1.5/1M
   tags: [chat, selector]
   context_window: 1000000
   max_completion_tokens: 32768
@@ -164,8 +162,6 @@
   api_key: sk-your-dashscope-key
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
   description: "Qwen3-Coder-Next — agentic coding specialist (MoE 80B/3B)"
-  pricing_prompt: 0.000001
-  pricing_completion: 0.000004
   tags: [code, chat, reasoning]
   context_window: 131072
   max_completion_tokens: 65536
@@ -176,8 +172,6 @@
   api_key: sk-your-dashscope-key
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
   description: "Alibaba Qwen3.5-Flash — cheapest Qwen3 series, intent/tool selection"
-  pricing_prompt: 0.0000002     # ¥0.2/1M (≤128K)
-  pricing_completion: 0.000002  # ¥2/1M
   tags: [chat, selector]
   context_window: 1000000
   max_completion_tokens: 65536
@@ -188,8 +182,6 @@
   api_key: sk-your-dashscope-key
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
   description: "Alibaba Qwen2.5-3B — ultra-cheap selector model"
-  pricing_prompt: 0.0000003     # ¥0.3/1M
-  pricing_completion: 0.0000006 # ¥0.6/1M
   tags: [selector]
   context_window: 32768
   max_completion_tokens: 8192
@@ -201,8 +193,6 @@
   api_key: sk-your-moonshot-key
   base_url: https://api.moonshot.cn/v1
   description: "Kimi Coding API"
-  pricing_prompt: 0.005         # ¥5/1M
-  pricing_completion: 0.005
   tags: [code, chat, reasoning]
   context_window: 65536
   max_completion_tokens: 8192
@@ -216,8 +206,10 @@
 #   astra admin config get judgment_model
 # To disable all optional judgment calls in newly started sessions:
 #   astra admin config unset judgment_model
-# The runtime does not silently reuse the main agent model as a judgment
-# fallback; bind an ordinary model explicitly when that is desired.
+# The runtime does not silently reuse the main agent model for general memory
+# or request judgments. The bounded delegated-model selector is different: if
+# no judgment Offering is configured, it uses the primary model once with the
+# same typed selector contract, so model selection still works without Jev.
 # Omitting judgment_default leaves the existing binding unchanged.
 # Credentials are stored encrypted through the existing model registry.
 # An empty api_key is unusable; no JEV_KEY environment variable is required.
@@ -228,6 +220,8 @@
 #   api_key: ""
 #   context_window: 64000
 #   max_completion_tokens: 512
+#   pricing_currency: USD
+#   pricing_unit: per_token
 #   pricing_prompt: 0.000000042
 #   pricing_completion: 0
 #   tags: []

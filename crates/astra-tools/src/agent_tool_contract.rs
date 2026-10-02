@@ -1,8 +1,61 @@
 use serde_json::Value;
 
 pub const AGENT_RUNTIME_TOOL_NAMES: &[&str] = &["agent", "agent_fanout"];
-pub const AGENT_ACTIONS: &[&str] = &["spawn", "get_result", "run_chain", "send_message"];
-pub const AGENT_ACTIONS_DISPLAY: &str = "spawn, get_result, run_chain, send_message";
+pub const AGENT_ACTIONS: &[&str] = &[
+    "spawn",
+    "list",
+    "get_result",
+    "wait",
+    "run_chain",
+    "send_message",
+];
+pub const AGENT_ACTIONS_DISPLAY: &str = "spawn, list, get_result, wait, run_chain, send_message";
+
+pub const AGENT_WAIT_DEFAULT_MS: u64 = 30_000;
+pub const AGENT_WAIT_MAX_MS: u64 = 300_000;
+
+/// The producer distinguishes acceptance of a control action from evidence
+/// about a child's work. A control receipt never proves task completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentToolResultFamily {
+    ControlReceipt,
+    ChildResult,
+}
+
+/// Successful control outcomes, each bound to exactly one action. Producers
+/// and readers share this contract; these are not child completion statuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AgentControlOutcome {
+    #[serde(rename = "launched")]
+    SpawnLaunched,
+    #[serde(rename = "wait_admitted")]
+    WaitAdmitted,
+    #[serde(rename = "queued")]
+    MessageQueued,
+    #[serde(rename = "ok")]
+    ListObserved,
+}
+
+impl AgentControlOutcome {
+    pub fn action(self) -> AgentAction {
+        match self {
+            Self::SpawnLaunched => AgentAction::Spawn,
+            Self::WaitAdmitted => AgentAction::Wait,
+            Self::MessageQueued => AgentAction::SendMessage,
+            Self::ListObserved => AgentAction::List,
+        }
+    }
+}
+
+/// Accepted current-invocation yield, not evidence that any child completed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentWaitReceipt {
+    pub parent_run_id: String,
+    pub tool_call_id: String,
+    pub timeout_ms: u64,
+}
 
 pub const AGENT_FANOUT_ACTIONS: &[&str] = &["start", "get_results", "stop_slot", "stop_group"];
 pub const AGENT_FANOUT_ACTIONS_DISPLAY: &str = "start, get_results, stop_slot, stop_group";
@@ -13,7 +66,7 @@ pub const AGENT_FANOUT_ACTIONS_DISPLAY: &str = "start, get_results, stop_slot, s
 /// caller cannot request an unbounded group through another surface. The
 /// serialized tool schema remains structurally stable so this safety fix does
 /// not churn the prompt-cache prefix.
-pub const AGENT_FANOUT_MAX_TARGET_COUNT: u64 = 50;
+pub const AGENT_FANOUT_MAX_TARGET_COUNT: u64 = astra_turn_types::MAX_MODEL_ADMISSION_SLOTS as u64;
 pub const AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS: u64 = 256;
 pub const AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS: u64 = 4096;
 
@@ -32,7 +85,9 @@ pub fn has_malformed_tool_args(args: &Value) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentAction {
     Spawn,
+    List,
     GetResult,
+    Wait,
     RunChain,
     SendMessage,
 }
@@ -41,7 +96,9 @@ impl AgentAction {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Spawn => "spawn",
+            Self::List => "list",
             Self::GetResult => "get_result",
+            Self::Wait => "wait",
             Self::RunChain => "run_chain",
             Self::SendMessage => "send_message",
         }
@@ -94,7 +151,9 @@ pub fn agent_action_from_args(args: &Value) -> Result<AgentAction, String> {
     match args.get("action") {
         Some(Value::String(action)) if !action.trim().is_empty() => match action.as_str() {
             "spawn" => Ok(AgentAction::Spawn),
+            "list" => Ok(AgentAction::List),
             "get_result" => Ok(AgentAction::GetResult),
+            "wait" => Ok(AgentAction::Wait),
             "run_chain" => Ok(AgentAction::RunChain),
             "send_message" => Ok(AgentAction::SendMessage),
             other => Err(agent_unknown_action_message(other)),

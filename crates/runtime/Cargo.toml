@@ -15,8 +15,6 @@ live-provider-tests = []
 otel = ["astra-logging/otel"]
 # Observation + verification harness (zero cost when disabled).
 harness = ["dep:astra-harness"]
-# Crash recovery with skill checkpointing (Phase 3).
-crash-recovery = ["astra-skills/crash-recovery"]
 
 [[test]]
 name = "system_matrix_http_e2e"
@@ -47,7 +45,7 @@ astra-sandbox.workspace = true
 astra-server-types = { workspace = true, features = ["server"] }
 astra-sync-protocol.workspace = true
 astra-mcp.workspace = true
-astra-skills = { workspace = true, features = ["crash-recovery"] }
+astra-skills.workspace = true
 astra-turn-core = { workspace = true, features = ["db-store"] }
 astra-turn-types.workspace = true
 astra-services.workspace = true

@@ -337,7 +337,7 @@ impl DetachShellListener {
 pub type DetachShellSlot = std::sync::Arc<tokio::sync::Mutex<Option<DetachShellHandle>>>;
 
 /// Make a fresh slot pre-loaded with a handle. Returns `(slot,
-/// listener)`: install the slot on `ToolContext.detach_shell_handle_slot`,
+/// listener)`: install the slot on the CLI host,
 /// keep the listener so Ctrl+B can fire the signal and await the
 /// payload.
 pub fn new_slot_with_handle() -> (DetachShellSlot, DetachShellListener) {
@@ -347,7 +347,7 @@ pub fn new_slot_with_handle() -> (DetachShellSlot, DetachShellListener) {
 }
 
 /// Construct a fresh detach pair. The runner gets the
-/// [`DetachShellHandle`] (placed in `ToolContext`); the TUI keeps
+/// [`DetachShellHandle`]; the TUI keeps
 /// the [`DetachShellListener`] until either Ctrl+B fires or the
 /// turn ends.
 pub fn new_detach_pair() -> (DetachShellHandle, DetachShellListener) {
