@@ -548,10 +548,9 @@ pub fn validate_tool_arguments_against_schema(
     args: &Value,
     schema: &Value,
 ) -> Result<(), ToolArgumentValidationError> {
-    let Some(parameters) = schema
+    let Some(parameter_schema @ Value::Object(parameters)) = schema
         .get("function")
         .and_then(|function| function.get("parameters"))
-        .and_then(Value::as_object)
     else {
         return Ok(());
     };
@@ -630,13 +629,7 @@ pub fn validate_tool_arguments_against_schema(
         }
     }
 
-    validate_schema_value(
-        args,
-        &Value::Object(parameters.clone()),
-        "",
-        false,
-        &mut issues,
-    );
+    validate_schema_value(args, parameter_schema, "", false, &mut issues);
 
     if issues.is_empty() {
         Ok(())

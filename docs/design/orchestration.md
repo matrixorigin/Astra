@@ -73,12 +73,17 @@ The native entrypoints use the same configuration:
 astra team create delivery
 astra team add-member delivery lead --can-delegate -- Describe the lead's responsibilities
 astra team add-member delivery developer -- Describe the member's responsibilities
-astra team info delivery
-astra team run delivery --lead-agent-id <agent_id-from-info> <task>
+astra team run delivery <task>
 ```
 
-In the TUI, use `/team run delivery --lead-agent-id <agent_id-from-info> <task>`;
+In the TUI, use `/team run delivery <task>`;
 configuration remains in the CLI. Subsequent ordinary input retains that selection.
+Native entrypoints select the sole delegation-capable member from the already
+loaded configuration. With zero or multiple such members, use `team info` and
+`--lead-agent-id <agent_id>` to choose explicitly; role names and member order
+never choose a lead or grant permission. Server admission authorizes and freezes
+the explicit resolved identity. This UI default does not change the protocol's
+`lead_agent_id: null` meaning: an ordinary root with an admitted member directory.
 Native `team run --json` reuses the ordinary turn's terminal JSON; its hidden
 `--stream-events <path>` flag writes the same structured event stream as `chat`.
 For an isolated one-shot task, `team run --no-resume` uses ordinary Chat routing

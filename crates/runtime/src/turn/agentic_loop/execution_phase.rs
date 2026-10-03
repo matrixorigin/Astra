@@ -3299,26 +3299,18 @@ pub(crate) fn observed_direct_child_for_nonterminal_receipt<'a>(
     {
         return None;
     }
-    let Some(args) = record
+    let args = record
         .authoritative_args_full()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-    else {
-        return None;
-    };
-    let Some(result) = record
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())?;
+    let result = record
         .runtime_model_result_full
         .as_deref()
         .or(record.result_full.as_deref())
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-    else {
-        return None;
-    };
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())?;
     let action = args["action"].as_str();
     let agent_id = match action {
         Some("spawn") | Some("get_result") => {
-            let Some(agent_id) = result["agent_id"].as_str() else {
-                return None;
-            };
+            let agent_id = result["agent_id"].as_str()?;
             if action == Some("get_result") && args["agent_id"] != agent_id {
                 return None;
             }
@@ -3335,9 +3327,7 @@ pub(crate) fn observed_direct_child_for_nonterminal_receipt<'a>(
             // answers a question.  Do not accept a display name or a generic
             // target here: the terminal result must be correlated to the
             // same producer-owned child.
-            let Some(agent_id) = args["to"].as_str().map(str::trim) else {
-                return None;
-            };
+            let agent_id = args["to"].as_str().map(str::trim)?;
             if agent_id.is_empty() || result["status"].as_str() != Some("queued") {
                 return None;
             }

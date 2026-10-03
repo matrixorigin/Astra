@@ -24403,7 +24403,9 @@ impl ServerSubRunExecutor {
             let mut durable_terminal_committed = false;
             let mut atomic_terminal_attempted = false;
             let mut committed_frontier = None;
-            let execution = AssertUnwindSafe(async {
+            // Keep the large child body out of the enclosing lifecycle poll
+            // frame. This remains one supervised task and one unwind boundary.
+            let execution = AssertUnwindSafe(Box::pin(async {
             let durable_run = match self.durable_run_engine() {
                 Some(engine) => Some(
                     engine
@@ -25700,7 +25702,7 @@ impl ServerSubRunExecutor {
                 tool_calls: loop_state.total_tool_calls,
             }),
         }
-        })
+        }))
         .catch_unwind()
         .await;
             let execution_result = match execution {

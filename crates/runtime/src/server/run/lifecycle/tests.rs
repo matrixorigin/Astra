@@ -18643,6 +18643,9 @@ async fn completed_direct_child_supersedes_launch_receipt_in_final_evaluation() 
             "children": [{"agent_id":"child@run","status":"completed"}]
         }),
     );
+    assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+    state.volatile_pending.last_mut().unwrap().payload["children"][0]["result"] =
+        serde_json::json!("check complete");
     let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
     host.direct_child_owner = Some(
         crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
@@ -18712,7 +18715,7 @@ async fn completed_direct_child_is_resolved_even_with_unrelated_interruption() {
             "schema": "direct_child_completion.v1",
             "parent_run_id": "run-1",
             "observed_by_provider": true,
-            "children": [{"agent_id":"child@run","status":"completed"}]
+            "children": [{"agent_id":"child@run","status":"completed","result":"check complete"}]
         }),
     );
     let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
@@ -18753,7 +18756,7 @@ async fn mismatched_child_owner_cannot_retire_terminal_notification() {
             "schema": "direct_child_completion.v1",
             "parent_run_id": "run-1",
             "observed_by_provider": true,
-            "children": [{"agent_id":"child@run","status":"completed"}]
+            "children": [{"agent_id":"child@run","status":"completed","result":"check complete"}]
         }),
     );
     let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
@@ -28133,9 +28136,16 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
                 .expect("database invocation ledger"),
         )
         .with_model_service(Some(model_service.clone()));
-        let result = tokio::time::timeout(Duration::from_secs(15), delegated.execute(config))
+        // Production supervision polls children as independent tasks, not
+        // beneath the parent's setup/query future. JoinSet also aborts the
+        // owned child if this test times out or unwinds.
+        let mut children = tokio::task::JoinSet::new();
+        children.spawn(async move { delegated.execute(config).await });
+        let (result, _) = tokio::time::timeout(Duration::from_secs(15), children.join_next())
             .await
             .expect("bounded delegated Explain execution")
+            .expect("delegated Explain child task")
+            .expect("delegated Explain child did not panic")
             .expect("delegated Explain run");
         assert_eq!(result.status, STATUS_COMPLETED, "{result:?}");
         let outputs: Vec<(String,)> = sqlx::query_as(

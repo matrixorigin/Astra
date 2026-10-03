@@ -22,12 +22,6 @@ pub(crate) async fn resolve_team_run_chat_request(
     lead_agent_id: Option<&str>,
     task: &str,
 ) -> Result<TeamChatRequest, String> {
-    let lead_agent_id = lead_agent_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            "Team run requires an explicit canonical lead: --lead-agent-id <agent_id>".to_string()
-        })?;
     if task.trim().is_empty() {
         return Err("Team run task cannot be empty".into());
     }
@@ -42,21 +36,38 @@ pub(crate) async fn resolve_team_run_chat_request(
             team.name
         ));
     }
-    let lead_is_member = team.members.iter().any(|member| {
-        astra_services::team_persistence::resolve_member_to_profile(member, &team).agent_id
-            == lead_agent_id
-    });
-    if !lead_is_member {
-        return Err(format!(
-            "lead '{}' is not a canonical resolved agent_id in Team '{}'; use an Agent ID shown by `team info`",
-            lead_agent_id, team.name
-        ));
-    }
+    let mut profiles = team
+        .members
+        .iter()
+        .map(|member| astra_services::team_persistence::resolve_member_to_profile(member, &team));
+    let lead = match lead_agent_id {
+        Some(id) => profiles
+            .find(|profile| profile.agent_id == id.trim())
+            .ok_or_else(|| {
+                format!(
+                    "lead '{}' is not a member of Team '{}'; use an Agent ID shown by `team info`",
+                    id, team.name
+                )
+            })?,
+        None => {
+            let mut coordinators = profiles.filter(|profile| profile.can_delegate);
+            let lead = coordinators.next().ok_or_else(|| {
+                format!("Team '{}' has no delegation-capable coordinator; select a member with --lead-agent-id", team.name)
+            })?;
+            if coordinators.next().is_some() {
+                return Err(format!(
+                    "Team '{}' has multiple delegation-capable coordinators; select one with --lead-agent-id",
+                    team.name
+                ));
+            }
+            lead
+        }
+    };
     Ok(TeamChatRequest {
         message: task.trim().to_string(),
         selection: astra_services::runs::AgentProfileSelection {
             team_id: team.team_id,
-            lead_agent_id: Some(lead_agent_id.to_string()),
+            lead_agent_id: Some(lead.agent_id),
         },
     })
 }
@@ -430,7 +441,7 @@ pub(crate) async fn handle_team_command(
                     );
                     eprintln!("  {} {}", "Description:".dim(), t.description);
                     eprintln!("  {} {}", "Created:".dim(), t.created_at);
-                    eprintln!("  {} {:?}", "Coordination:".dim(), &t.coordination);
+                    eprintln!("  {} {:?}", "Coordination:".dim(), t.coordination);
                     eprintln!("\n  {}", "Members:".bold());
                     for m in &t.members {
                         let agent_id =
@@ -1028,19 +1039,59 @@ mod tests {
 
     // ── New feature tests ───────────────────────────────────────
 
-    #[test]
-    fn explicit_coordination_wins_over_default_regardless_of_role_text() {
-        use astra_services::team_persistence::TeamCoordination;
-        let mut team = make_team(&["producer", "reviewer"]);
-        team.coordination = TeamCoordination::Sequential {
-            stop_on_success: false,
-        };
-        assert!(matches!(
-            team.coordination,
-            TeamCoordination::Sequential {
-                stop_on_success: false
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn native_team_lead_selection_uses_permissions_and_one_configuration_read() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some("test-token".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let server = wiremock::MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        for (permissions, requested, expected) in [
+            ([false, true], None, Some("member-1")),
+            ([false, false], None, None),
+            ([true, true], None, None),
+            ([false, true], Some("member-0"), Some("member-0")),
+            ([true, true], Some("member-1"), Some("member-1")),
+            ([false, true], Some("missing"), None),
+            ([false, true], Some(""), None),
+        ] {
+            let mut team = make_team(&["coordinator-looking", "ordinary-looking"]);
+            for (index, member) in team.members.iter_mut().enumerate() {
+                member.agent_id = Some(format!("member-{index}"));
+                member.can_delegate = permissions[index];
+                member.max_delegation_depth = u32::from(permissions[index]);
             }
-        ));
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/teams/test"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&team))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result =
+                super::resolve_team_run_chat_request(&api, None, "test", requested, " task ").await;
+            match expected {
+                Some(id) => {
+                    let request = result.unwrap();
+                    assert_eq!(request.selection.team_id, team.team_id);
+                    assert_eq!(request.selection.lead_agent_id.as_deref(), Some(id));
+                    assert_eq!(request.message, "task");
+                }
+                None => assert!(
+                    result.is_err(),
+                    "ambiguous or invalid selection must not launch"
+                ),
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            server.reset().await;
+        }
     }
 
     #[test]

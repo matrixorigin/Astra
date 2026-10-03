@@ -273,13 +273,13 @@ impl AgentProfile {
                 self.agent_id
             ));
         }
-        if let (Some(initial), Some(maximum)) = (self.initial_turns, self.max_turns) {
-            if initial > maximum {
-                return Err(format!(
-                    "agent profile '{}' initial_turns cannot exceed max_turns",
-                    self.agent_id
-                ));
-            }
+        if let (Some(initial), Some(maximum)) = (self.initial_turns, self.max_turns)
+            && initial > maximum
+        {
+            return Err(format!(
+                "agent profile '{}' initial_turns cannot exceed max_turns",
+                self.agent_id
+            ));
         }
         Ok(())
     }

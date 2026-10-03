@@ -7,7 +7,7 @@
 //! API and tool infrastructure as the parent conversation.
 
 use async_trait::async_trait;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ use astra_runtime::{
     server::delegation::engine::{SubRunConfig, SubRunExecutor},
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
     turn::agentic_loop::host::{
-        AgenticLoopState, CancellationState, MessagingState, SkillState, StopHookState,
+        AgenticLoopState, CancellationState, MessagingState, StopHookState,
         runtime_manifest_for_model,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
@@ -27,7 +27,8 @@ use astra_turn_core::tool::schema::tool_names_from_schemas;
 
 use super::skill_subrun::{SubRunHost, SubRunJournalIdentity, persist_failed_subrun};
 use super::spawn_subrun::{
-    agent_live_stream_event_sink, emit_agent_terminated, emit_agent_transcript_committed,
+    agent_live_stream_event_sink, build_child_skill_state, build_restricted_tools,
+    emit_agent_terminated, emit_agent_transcript_committed,
 };
 use crate::cli::cli_config::cli_utils::cli_user_id;
 use crate::edge_tools;
@@ -216,37 +217,6 @@ impl CliDelegateSubRunExecutor {
             .and_then(|provider| provider())
             .unwrap_or_else(|| self.token.clone())
     }
-
-    fn build_skill_state(
-        &self,
-        request_constraints: astra_runtime::turn::agentic_loop::host::RequestConstraints,
-        effective_root: &Path,
-    ) -> SkillState {
-        SkillState {
-            request_constraints,
-            resolver: self.skill_resolver.clone(),
-            quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
-            improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-            tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(effective_root),
-            session_event_hooks: astra_skills::hooks::load_session_event_hooks(effective_root),
-            ..Default::default()
-        }
-    }
-}
-
-/// Restrict the admitted tool surface using an explicit profile allowlist.
-fn build_restricted_tools(
-    allow_tools: Option<&[String]>,
-    valid_tool_names: &HashSet<String>,
-) -> HashSet<String> {
-    let Some(allow_tools) = allow_tools else {
-        return HashSet::new();
-    };
-    valid_tool_names
-        .iter()
-        .filter(|name| !allow_tools.contains(name))
-        .cloned()
-        .collect()
 }
 
 #[async_trait]
@@ -752,7 +722,11 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 );
                 s
             },
-            skills: self.build_skill_state(config.request_constraints, &effective_root),
+            skills: build_child_skill_state(
+                config.request_constraints,
+                self.skill_resolver.clone(),
+                &effective_root,
+            ),
             hooks: StopHookState {
                 workspace_root_hint: Some(effective_root.to_string_lossy().into_owned()),
                 ..Default::default()
@@ -1026,8 +1000,8 @@ pub(crate) fn register_default_agents(
 #[cfg(test)]
 mod tests {
     use super::{
-        CliDelegateSubRunExecutor, build_restricted_tools, initial_delegate_transcript_identity,
-        register_default_agents, resolve_worktree_path,
+        CliDelegateSubRunExecutor, build_child_skill_state, build_restricted_tools,
+        initial_delegate_transcript_identity, register_default_agents, resolve_worktree_path,
     };
     use crate::cli::permission_manager::PermissionMode;
     use std::collections::{HashMap, HashSet};
@@ -1107,7 +1081,8 @@ mod tests {
         constraints.allowed_tools = Some(HashSet::from(["read_file".to_string()]));
         let expected = constraints.clone();
 
-        let state = executor.build_skill_state(constraints, Path::new("."));
+        let state =
+            build_child_skill_state(constraints, executor.skill_resolver.clone(), Path::new("."));
 
         assert_eq!(
             state.request_constraints.delegated_model_requirements,
@@ -1124,7 +1099,11 @@ mod tests {
 
         let mut explicitly_disabled = expected;
         explicitly_disabled.enabled_tools = Some(HashSet::new());
-        let disabled_state = executor.build_skill_state(explicitly_disabled, Path::new("."));
+        let disabled_state = build_child_skill_state(
+            explicitly_disabled,
+            executor.skill_resolver.clone(),
+            Path::new("."),
+        );
         assert_eq!(
             disabled_state.request_constraints.enabled_tools,
             Some(HashSet::new())

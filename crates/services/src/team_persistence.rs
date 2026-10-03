@@ -381,13 +381,13 @@ pub fn validate_team(team: &TeamDefinition) -> Result<(), Vec<TeamValidationErro
                 m.role
             )));
         }
-        if let (Some(initial), Some(maximum)) = (m.initial_turns, m.max_turns) {
-            if initial > maximum {
-                errors.push(TeamValidationError::InvalidMember(format!(
-                    "role '{}' initial_turns cannot exceed max_turns",
-                    m.role
-                )));
-            }
+        if let (Some(initial), Some(maximum)) = (m.initial_turns, m.max_turns)
+            && initial > maximum
+        {
+            errors.push(TeamValidationError::InvalidMember(format!(
+                "role '{}' initial_turns cannot exceed max_turns",
+                m.role
+            )));
         }
     }
     let dup_ids: Vec<String> = id_counts

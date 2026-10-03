@@ -586,7 +586,7 @@ pub(crate) struct TeamContextArgs {
 pub(crate) struct TeamRunArgs {
     /// Team name
     pub team: String,
-    /// Exact canonical agent_id of the member that leads the ordinary root turn.
+    /// Lead agent ID; defaults to the sole delegation-capable member.
     #[arg(long = "lead-agent-id", value_name = "AGENT_ID")]
     pub lead_agent_id: Option<String>,
     /// Output the completed root turn as JSON (implies quiet output).

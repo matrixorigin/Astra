@@ -5,7 +5,7 @@
 use astra_server_types::{ModelAdmissionRequestV1, ModelAdmissionSlotV1};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use astra_pipeline::step_recorder::StepRecorder;
@@ -39,6 +39,39 @@ use crate::edge_tools;
 
 /// Re-export from runtime so all CLI components share one type.
 pub type TokenProvider = astra_runtime::capabilities::TokenProvider;
+
+/// Build the shared skill state used by local child conversations.
+pub(crate) fn build_child_skill_state(
+    request_constraints: astra_runtime::turn::agentic_loop::host::RequestConstraints,
+    resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
+    effective_root: &Path,
+) -> SkillState {
+    SkillState {
+        request_constraints,
+        resolver,
+        quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
+        improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
+        tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(effective_root),
+        session_event_hooks: astra_skills::hooks::load_session_event_hooks(effective_root),
+        ..Default::default()
+    }
+}
+
+/// Restrict the admitted tool surface using an explicit allowlist.
+pub(crate) fn build_restricted_tools(
+    allow_tools: Option<&[String]>,
+    valid_tool_names: &HashSet<String>,
+) -> HashSet<String> {
+    let Some(allow_tools) = allow_tools else {
+        return HashSet::new();
+    };
+    let allowed: HashSet<&str> = allow_tools.iter().map(String::as_str).collect();
+    valid_tool_names
+        .iter()
+        .filter(|name| !allowed.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
 
 fn cancelled_loop_origin(interruption_kind: Option<InterruptionKind>) -> CancellationOrigin {
     if interruption_kind == Some(InterruptionKind::UserCancelled) {
@@ -1592,17 +1625,12 @@ impl CliSpawnAgentExecutor {
         }
 
         // Build restricted tools based on agent type's allowed_tools
-        let restricted_tools: HashSet<String> = if config.allowed_tools.iter().any(|t| t == "*") {
+        let restricted_tools = if config.allowed_tools.iter().any(|t| t == "*") {
             // All tools allowed
             HashSet::new()
         } else {
-            // Only allow specified tools
-            let allowed: HashSet<&str> = config.allowed_tools.iter().map(|s| s.as_str()).collect();
-            valid_tool_names
-                .iter()
-                .filter(|name| !allowed.contains(name.as_str()))
-                .cloned()
-                .collect()
+            // Only allow specified tools.
+            build_restricted_tools(Some(config.allowed_tools.as_slice()), &valid_tool_names)
         };
 
         // Add edit/create to restricted if read_only
@@ -1683,18 +1711,14 @@ impl CliSpawnAgentExecutor {
             budget_is_explicit: config.hard_turn_limit.is_some(),
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
-            skills: SkillState {
-                request_constraints: astra_runtime::turn::agentic_loop::host::RequestConstraints {
+            skills: build_child_skill_state(
+                astra_runtime::turn::agentic_loop::host::RequestConstraints {
                     delegated_model_requirements: child_model_requirements,
                     ..Default::default()
                 },
-                resolver: self.skill_resolver.clone(),
-                quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-                tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&effective_root),
-                session_event_hooks: astra_skills::hooks::load_session_event_hooks(&effective_root),
-                ..Default::default()
-            },
+                self.skill_resolver.clone(),
+                &effective_root,
+            ),
             hooks: StopHookState {
                 workspace_root_hint: Some(effective_root.to_string_lossy().into_owned()),
                 ..Default::default()
