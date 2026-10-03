@@ -1019,13 +1019,7 @@ pub struct SessionAdmissionFacts {
     pub active_plan_id: Option<String>,
 }
 
-/// Configuration selection only; the Server resolves owner-scoped authority.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentProfileSelection {
-    pub team_id: String,
-    pub lead_agent_id: Option<String>,
-}
+pub use astra_turn_types::AgentProfileSelection;
 
 /// Immutable admitted configuration. Runtime registries and credentials are
 /// deliberately not part of the protected run-start facts.

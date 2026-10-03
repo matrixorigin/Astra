@@ -6124,6 +6124,7 @@ impl AgenticRunLifecycleService {
         rewrite_proof: Option<&CanonicalRewriteProof>,
         allow_empty_delta: bool,
         run_id: &str,
+        agent_profile_selection: Option<astra_turn_types::AgentProfileSelection>,
     ) -> Result<Option<astra_turn_types::SessionCursorV1>, astra_core::ClassifiedError> {
         let Some(admission) = admission else {
             return Ok(None);
@@ -6143,6 +6144,7 @@ impl AgenticRunLifecycleService {
             let base = admission.reservation.expected_cursor.as_ref();
             let replaces_history = mode == astra_turn_types::CanonicalDeltaModeV1::Replace;
             let delta = astra_turn_types::CanonicalTurnDeltaV1 {
+                agent_profile_selection,
                 schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
                 completed_turn: admission.reservation.reserved_turn,
                 journal_event_seq: base
@@ -14816,6 +14818,12 @@ impl AgenticRunLifecycleService {
         let bg_shared_pool = self.shared_pool.clone();
         let bg_trace_ingestion = self.trace_ingestion.clone();
         let bg_explain = request.explain;
+        let bg_profile_selection = request.admitted_agent_profiles.as_ref().map(|snapshot| {
+            astra_turn_types::AgentProfileSelection {
+                team_id: snapshot.source_team_id.clone(),
+                lead_agent_id: snapshot.lead_agent_id.clone(),
+            }
+        });
         let missing_lifecycle_spawner = descendant_spawner;
         let bg_metrics_registry = self.metrics_registry.clone();
         let bg_cancel_flag = cancel_flag.clone();
@@ -15915,6 +15923,7 @@ impl AgenticRunLifecycleService {
                             || bg_cancel_flag.load(Ordering::Acquire)
                             || bg_llm_cancel_token.is_cancelled(),
                         &bg_run_id,
+                        bg_profile_selection,
                     )
                     .await
                     {

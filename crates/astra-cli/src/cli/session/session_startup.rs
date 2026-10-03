@@ -775,7 +775,11 @@ pub(crate) async fn complete_session_startup(
     if state.session_id.is_none()
         && let Some(sid) = resume_session_id
     {
+        let launch_selection = state.cli_context.agent_profile_selection.clone();
         slash_session::restore_session_into_state(sid, profile, api, state).await?;
+        if launch_selection.is_some() {
+            state.cli_context.agent_profile_selection = launch_selection;
+        }
     }
 
     print_session_banner(profile, state, banner_native_auth);

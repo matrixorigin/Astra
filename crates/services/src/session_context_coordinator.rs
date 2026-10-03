@@ -468,6 +468,8 @@ pub struct MaterializedConversationV1 {
 /// database row lock; this snapshot only removes duplicate preflight reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionAdmissionSnapshotV1 {
+    /// Selection committed at exactly `head.cursor`; never authorizes a run.
+    pub agent_profile_selection: Option<astra_turn_types::AgentProfileSelection>,
     pub head: Option<SessionContextHeadV1>,
     pub active_writer: Option<ConversationWriterLeaseV1>,
     pub authority_epochs: AuthorityEpochsV1,
@@ -1880,7 +1882,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         key.validate()
             .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
         let row = sqlx::query(
-            "SELECT head_json, active_writer_json, authorization_epoch,
+            "SELECT head_json, last_commit_json, active_writer_json, authorization_epoch,
                     device_trust_epoch, permission_epoch,
                     CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) AS database_now_unix_ms
              FROM session_context_heads
@@ -1896,6 +1898,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         .map_err(|source| database_error("load_admission_snapshot", source))?;
         let Some(row) = row else {
             return Ok(SessionAdmissionSnapshotV1 {
+                agent_profile_selection: None,
                 head: None,
                 active_writer: None,
                 authority_epochs: AuthorityEpochsV1::default(),
@@ -1933,7 +1936,22 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 "admission writer owner-scoped key mismatch".into(),
             ));
         }
+        let receipt = row
+            .try_get::<Option<String>, _>("last_commit_json")
+            .map_err(|source| database_error("decode_admission_commit", source))?
+            .as_deref()
+            .map(|json| database_json::<CommitReceiptV1>("last_commit", json))
+            .transpose()?;
+        let agent_profile_selection = receipt
+            .filter(|receipt| {
+                receipt.reservation.key == *key
+                    && head
+                        .as_ref()
+                        .is_some_and(|head| head.cursor == receipt.cursor)
+            })
+            .and_then(|receipt| receipt.agent_profile_selection);
         Ok(SessionAdmissionSnapshotV1 {
+            agent_profile_selection,
             head,
             active_writer,
             authority_epochs: AuthorityEpochsV1 {
@@ -3734,6 +3752,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             writer_epoch: reservation.writer_epoch,
         });
         state.last_commit = Some(CommitReceiptV1 {
+            agent_profile_selection: delta.agent_profile_selection.clone(),
             idempotency_key: idempotency_key.to_owned(),
             reservation_id: reservation.reservation_id.clone(),
             reservation: reservation.clone(),
@@ -4514,6 +4533,7 @@ struct ReservationReceiptV1 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommitReceiptV1 {
+    agent_profile_selection: Option<astra_turn_types::AgentProfileSelection>,
     idempotency_key: String,
     reservation_id: String,
     reservation: TurnReservationV1,
@@ -6508,6 +6528,14 @@ fn turn_delta_hash(delta: &CanonicalTurnDeltaV1) -> String {
         &mut digest,
         delta.config_version_id.as_deref().unwrap_or_default(),
     );
+    digest.update([u8::from(delta.agent_profile_selection.is_some())]);
+    if let Some(selection) = &delta.agent_profile_selection {
+        hash_field(&mut digest, &selection.team_id);
+        digest.update([u8::from(selection.lead_agent_id.is_some())]);
+        if let Some(lead) = &selection.lead_agent_id {
+            hash_field(&mut digest, lead);
+        }
+    }
     digest.update((delta.logical_segments.len() as u64).to_be_bytes());
     for messages in &delta.logical_segments {
         hash_field(&mut digest, &canonical_conversation_root(messages));

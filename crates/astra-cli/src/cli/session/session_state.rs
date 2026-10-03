@@ -822,6 +822,7 @@ impl SessionState {
     /// session boundary; this synchronous reset does not tear down the
     /// asynchronously registered root mailbox.
     pub fn reset_for_new_session(&mut self) {
+        self.cli_context.agent_profile_selection = None;
         self.advance_session_attachment();
         // A registry generation belongs to exactly one session. Old producers
         // may still be retiring after the bounded rebind deadline; replacing
@@ -1081,10 +1082,15 @@ mod default_tests {
             pending_bg_notifications: vec!["bg".into()],
             ..Default::default()
         };
+        state.cli_context.agent_profile_selection = Some(astra_turn_types::AgentProfileSelection {
+            team_id: "previous-team".into(),
+            lead_agent_id: Some("previous-lead".into()),
+        });
         state.perm_manager.record_approval("bash", None, true);
 
         state.reset_for_new_session();
 
+        assert!(state.cli_context.agent_profile_selection.is_none());
         assert!(state.pending_recovery.is_none());
         assert!(state.run_id.is_none());
         assert_eq!(state.turn, 0);

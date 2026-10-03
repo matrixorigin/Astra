@@ -5264,6 +5264,12 @@ async fn apply_restored_session(
     ) {
         (_, None) => false,
         (None, Some(_)) => true,
+        (_, Some(remote))
+            if restored.restored_from_cloud
+                && remote.resume.source == astra_turn_types::ResumeSourceV1::CanonicalJournal =>
+        {
+            true
+        }
         (Some(local), Some(remote)) => {
             let candidates = [
                 session_continuation::portable_resume_descriptor(local.clone()),
@@ -5574,6 +5580,11 @@ async fn apply_restored_session(
         );
         eprintln!("  {} Restored step checkpoint from cloud", "☁".magenta());
     }
+
+    state.cli_context.agent_profile_selection = typed_continuation
+        .as_ref()
+        .filter(|_| use_typed_continuation)
+        .and_then(|continuation| continuation.agent_profile_selection.clone());
 
     if use_typed_continuation {
         state.history = session_continuation::history_pairs_from_messages(restored_resume_messages);
@@ -6568,6 +6579,10 @@ mod resume_tests {
             compaction_generation: 0,
             config_version_id: None,
         };
+        let selection = astra_turn_types::AgentProfileSelection {
+            team_id: "delivery".into(),
+            lead_agent_id: Some("lead".into()),
+        };
         let bundle = astra_turn_types::ResumeBundleV1 {
             schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
             cursor: cursor.clone(),
@@ -6576,7 +6591,16 @@ mod resume_tests {
             materialized_conversation_root_hash: None,
             degraded_reasons: vec![astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback],
             repair_actions: Vec::new(),
-            projections: Default::default(),
+            projections: astra_turn_types::ResumeProjectionSetV1 {
+                provider: Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                    cursor.clone(),
+                    astra_turn_types::ResumeProviderProjectionV1 {
+                        agent_profile_selection: Some(selection.clone()),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
         };
         let restored = RestoredSession {
             session_id: session_id.clone(),
@@ -6586,14 +6610,37 @@ mod resume_tests {
             last_status: "active".into(),
             ..Default::default()
         };
+        let mut server_restored = restored.clone();
+        server_restored.resume_bundle.as_mut().unwrap().source =
+            astra_turn_types::ResumeSourceV1::CanonicalJournal;
+        server_restored
+            .resume_bundle
+            .as_mut()
+            .unwrap()
+            .cursor
+            .journal_event_seq = 100;
+        // Align the provider envelope with the authoritative Server cursor.
+        let server_bundle = server_restored.resume_bundle.as_mut().unwrap();
+        server_bundle
+            .projections
+            .provider
+            .as_mut()
+            .unwrap()
+            .source_cursor = Some(server_bundle.cursor.clone());
         let mut state = SessionState::default();
 
         apply_restored_session(None, &api, &mut state, restored)
             .await
             .expect("apply typed cloud resume");
 
+        assert_eq!(
+            state.cli_context.agent_profile_selection,
+            Some(selection.clone())
+        );
+
         let active = state
             .active_conversation
+            .as_ref()
             .expect("typed cloud resume must install active conversation");
         assert_eq!(active.cursor(), &cursor);
         assert_eq!(active.messages(), messages);
@@ -6602,6 +6649,16 @@ mod resume_tests {
                 .history
                 .iter()
                 .any(|(_, assistant)| assistant == "done")
+        );
+        write_local_resumable_session(&session_id, 20);
+        apply_restored_session(None, &api, &mut state, server_restored)
+            .await
+            .expect("Server journal authority must not compare replica clocks");
+        assert_eq!(state.turn, 3);
+        assert_eq!(state.cli_context.agent_profile_selection, Some(selection));
+        assert_eq!(
+            state.active_conversation.as_ref().unwrap().messages(),
+            messages
         );
     }
 
@@ -7070,17 +7127,25 @@ mod resume_tests {
             objective,
             serde_json::json!({"role": "assistant", "content": "cloud fallback"}),
         ];
+        let mut bundle = typed_resume_bundle(&session_id, 2, conversation_messages.clone());
+        bundle.projections.provider =
+            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                bundle.cursor.clone(),
+                astra_turn_types::ResumeProviderProjectionV1 {
+                    agent_profile_selection: Some(astra_turn_types::AgentProfileSelection {
+                        team_id: "stale-cloud-team".into(),
+                        lead_agent_id: None,
+                    }),
+                    ..Default::default()
+                },
+            ));
         let restored = RestoredSession {
             session_id: session_id.clone(),
             turn_count: 2,
             model: Some("gpt-5".into()),
             last_status: "active".into(),
             restored_from_cloud: true,
-            resume_bundle: Some(typed_resume_bundle(
-                &session_id,
-                2,
-                conversation_messages.clone(),
-            )),
+            resume_bundle: Some(bundle),
             interruption: Some(serde_json::json!({
                 "kind": "context_overflow",
                 "resumable": true,
@@ -7108,6 +7173,7 @@ mod resume_tests {
         assert!(!guidance.contains("objective: repair session lifecycle"));
         assert!(!guidance.contains("3 attempt(s)"));
         assert_eq!(state.runtime_compaction_state, None);
+        assert!(state.cli_context.agent_profile_selection.is_none());
     }
 
     #[serial_test::serial]
