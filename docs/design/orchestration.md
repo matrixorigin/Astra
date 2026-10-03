@@ -295,6 +295,10 @@ established by an in-process mailbox test alone.
 path accepts the envelope. The sender continues without waiting for the receiver
 or an application receipt. Parent, child, and peer messages use the same mailbox
 consumer at safe execution boundaries, including while waiting for child results.
+Definite routing or delivery rejection reports `success=false` and
+`executed=false`; the canonical tool outcome records rejection without an
+unfinished execution obligation. An ambiguous delivery reports `executed=null`
+and retains unknown execution, even when the transport accepted the envelope.
 Semantic messages can wake the waiting parent before a child completes; transient
 progress does not require another model round.
 Model-authored coordination messages are limited to 3,000 characters; larger

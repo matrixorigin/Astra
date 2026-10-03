@@ -333,10 +333,11 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_send_reaches_host_only_after_runtime_acceptance() {
-        for (recipient, related) in [
-            ("receiver-run", true),
-            ("missing-run", true),
-            ("receiver-run", false),
+        for (recipient, related, terminal) in [
+            ("receiver-run", true, false),
+            ("missing-run", true, false),
+            ("receiver-run", false, false),
+            ("receiver-run", true, true),
         ] {
             let workspace = tempfile::tempdir().unwrap();
             let context = crate::server::runtime_tool_executor::tests::test_agent_tool_context(
@@ -364,6 +365,9 @@ mod tests {
                         depth: 1,
                     })
                     .await;
+            }
+            if terminal {
+                router.retire_terminal(receiver.lifetime()).await.unwrap();
             }
             let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
                 workspace.path().to_path_buf(),
@@ -397,7 +401,7 @@ mod tests {
             run_agentic_loop_with_host(&mut host, &mut state)
                 .await
                 .unwrap();
-            if recipient == "receiver-run" && related {
+            if recipient == "receiver-run" && related && !terminal {
                 let delivered = receiver.try_recv().unwrap_or_else(|| {
                     panic!(
                         "accepted envelope missing; actual execution records: {:?}",
@@ -422,6 +426,21 @@ mod tests {
                     .find(|record| record.name == "agent")
                     .expect("rejection must still be recorded");
                 assert!(!record.ok);
+                assert_eq!(
+                    record.disposition,
+                    Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+                );
+                assert!(
+                    state
+                        .stall
+                        .runtime_policy_evaluation
+                        .unresolved_tool_outcomes()
+                        .is_empty()
+                );
+                assert!(
+                    state.interruption.is_none(),
+                    "definite rejection is not unfinished execution"
+                );
             }
         }
     }
@@ -635,6 +654,17 @@ mod tests {
                 }
             );
             assert_eq!(receipt["run_id"], run_id);
+            if ambiguous {
+                assert!(receipt.get("executed").is_some_and(Value::is_null));
+                let mapped = crate::server::tool_execution_result::agent_tool_result_from_output(
+                    "agent",
+                    receipt.to_string(),
+                );
+                let metadata = mapped.metadata.expect("execution facts");
+                assert_eq!(metadata.get("execution_fact"), Some(&json!("unknown")));
+                assert!(!metadata.contains_key("execution_started"));
+                assert!(!metadata.contains_key("disposition"));
+            }
             let question = parent
                 .try_recv()
                 .expect("transport accepted the original question");
@@ -1218,6 +1248,7 @@ mod tests {
         let result: Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(result["success"], false);
         assert_eq!(result["status"], "rejected");
+        assert_eq!(result["executed"], false);
         assert!(!replies.has_pending("run-parent"));
     }
 

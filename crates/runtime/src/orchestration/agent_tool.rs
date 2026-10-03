@@ -650,6 +650,7 @@ fn rejected_agent_message(reason: impl Into<String>) -> String {
         "result_family": AgentToolResultFamily::ControlReceipt,
         "action": AgentAction::SendMessage.as_str(),
         "success": false,
+        "executed": false,
         "status": "rejected",
         "reason": reason.into(),
     })
@@ -661,6 +662,7 @@ fn rejected_delivery_message(reason: impl Into<String>) -> String {
         "result_family": AgentToolResultFamily::ControlReceipt,
         "action": AgentAction::SendMessage.as_str(),
         "success": false,
+        "executed": false,
         "status": "rejected",
         "reason": reason.into(),
         "instruction": "The target is not accepting this message. If it is a terminal child, its result remains available through agent(action='get_result'); do not spawn a replacement merely to retry this delivery. Otherwise verify the target identity before retrying.",
@@ -874,6 +876,7 @@ pub(crate) async fn handle_agent_send_message_with_router_observed(
                 "run_id": run_id,
                 "success": false,
                 "status": "delivery_unknown",
+                "executed": null,
                 "message_id": message_id,
                 "target": target_display,
                 "message_type": message_type,
