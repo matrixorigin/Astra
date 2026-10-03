@@ -315,6 +315,19 @@ pub(crate) fn report_turn_failure(
         }),
     );
     err_event = err_event.with_run_id(failure.partial.run_id.as_deref());
+    // This producer owns the root turn; missing admission identity remains
+    // unknown rather than being inferred from a user message or turn number.
+    err_event.producer_scope = failure
+        .partial
+        .run_id
+        .as_ref()
+        .filter(|run_id| !run_id.trim().is_empty())
+        .map(|run_id| session_journal::JournalProducerScope {
+            run_id: run_id.clone(),
+            parent_run_id: None,
+            agent_id: Some("root".into()),
+            local_turn: None,
+        });
 
     // The live continuation and restart hydration must be byte-for-byte the
     // same projection of the same durable TurnError fact. Partial assistant
@@ -683,6 +696,13 @@ mod tests {
             persisted.metadata.as_ref().unwrap()["run_id"],
             "run-failure-1"
         );
+        let scope = persisted
+            .producer_scope
+            .as_ref()
+            .expect("exact root producer");
+        assert_eq!(scope.run_id, "run-failure-1");
+        assert_eq!(scope.agent_id.as_deref(), Some("root"));
+        assert!(scope.parent_run_id.is_none());
     }
 
     #[test]

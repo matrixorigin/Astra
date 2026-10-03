@@ -130,7 +130,13 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
     let mcp_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
         crate::mcp_client::McpClientManager::new(),
     ));
-    let context = BasicCliChatContext {
+    let mut cli_context = crate::cli::cli_config::cli_context::CliContext::default();
+    cli_context.select_model(Some("test-model"));
+    cli_context.agent_profile_selection = Some(astra_services::runs::AgentProfileSelection {
+        team_id: "selected-roster".into(),
+        lead_agent_id: Some("selected-lead".into()),
+    });
+    let mut context = BasicCliChatContext {
         mcp_manager: Some(mcp_manager.clone()),
         api: &api,
         auth_profile: None,
@@ -143,7 +149,7 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
         render_md: false,
         verbose_mode: false,
         render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
-        cli_context: None,
+        cli_context: Some(&cli_context),
         unified_skill_registry: &unified_skill_registry,
         agent_spawner: None,
         root_agent_id: None,
@@ -201,6 +207,18 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
     );
 
     let request = captured_request.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        request["requested_model_policy"],
+        serde_json::json!({
+            "mode": "fixed", "selector": { "kind": "offering_id",
+                "offering_id": request["model_selection"]["offering_id"] }
+        })
+    );
+    assert_eq!(
+        request["agent_profile_selection"],
+        serde_json::to_value(cli_context.agent_profile_selection.as_ref().unwrap()).unwrap()
+    );
+    assert!(request["context"].get("agent_profile_selection").is_none());
     let injections = request["context"]["edge_profile"]
         [astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS]
         .as_array()
@@ -218,6 +236,25 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
     assert_eq!(
         active_work["payload"]["work_unit_observations"][0]["status"],
         "running"
+    );
+
+    // Ordinary follow-up input retains the selected roster without issuing a
+    // second Team lookup or requiring the user to repeat the selection.
+    context.message = "Continue with the same team";
+    let follow_up = ChatTurnParams::basic_cli(
+        &context,
+        "fake-token",
+        Some("sess-active-fanout"),
+        &mut permission_manager,
+        &mut skill_quality_tracker,
+    );
+    stream_chat_sse(follow_up).await.unwrap();
+    let follow_up = captured_request.lock().unwrap().clone().unwrap();
+    assert_eq!(request["session_id"], "sess-active-fanout");
+    assert_eq!(follow_up["session_id"], request["session_id"]);
+    assert_eq!(
+        follow_up["agent_profile_selection"],
+        request["agent_profile_selection"]
     );
 }
 

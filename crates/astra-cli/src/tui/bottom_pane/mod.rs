@@ -1151,8 +1151,20 @@ impl BottomPane {
         width: u16,
         terminal_height: u16,
     ) -> bool {
-        self.has_root_transcript_tab()
-            && self.ensure_durable_root_transcript(session_id, width, terminal_height)
+        let Some(index) = self.view_stack.iter().rposition(|view| {
+            view.conversation_tab_id().as_ref() == Some(&ConversationTabId::Root)
+        }) else {
+            return false;
+        };
+        if self.view_stack[index].durable_root_transcript_session() == Some(session_id.as_str()) {
+            return false;
+        }
+        self.view_stack[index] = Box::new(root_transcript_view::RootTranscriptView::loading(
+            session_id,
+            width,
+            terminal_height,
+        ));
+        true
     }
 
     pub(crate) fn activate_agent_transcript(&mut self, agent_id: &str, run_id: &str) -> bool {

@@ -1924,9 +1924,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `run_chain`: REQUIRES `action`, `name`, `description`, `steps`.\n\
          - `send_message`: REQUIRES `action`, `to`, `message`; `message_type=answer` also requires the exact `request_id` shown on the incoming question. A child asking its parent uses `to=parent` and `message_type=question`, not `ask_user` (which addresses the human user). The parent answers with `message_type=answer` and that exact request ID. Returns `queued` when the routing/transport path accepts the message. Receiver observation does not prove model inclusion, compliance, or task completion.\n\n\
          For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is for `list` and `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Status filters and result calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `list` or `get_result`.\n\n\
-         Model choice uses `requested_model_policy`, not a `model` field. If the `agent` tool is already visible, call it directly; do not call `tool_search` or `model_catalog` first just to spawn one child. For any model name coming from the user—including natural-language variations in spelling, spacing, or component order—omit `requested_model_policy`; one candidate-aware admission resolves it against the authorized catalog. Use a fixed selector only when an exact authorized Offering ID is already supplied by the caller. Never guess an Offering ID, inspect configuration, or turn a human name into a fixed selector.\n\n\
+         Model choice uses `requested_model_policy`, not a `model` field. If the `agent` tool is already visible, call it directly; do not call `tool_search` or `model_catalog` first just to spawn one child. For any model name coming from the user—including natural-language variations in spelling, spacing, or component order—omit `requested_model_policy`; one candidate-aware admission resolves it against the authorized catalog. Use a fixed selector only when an exact authorized Offering ID is already supplied by the caller. Never guess an Offering ID, inspect configuration, or turn a human name into a fixed selector. When an admitted profile directory is present, `agent_type` must be its exact non-empty directory/profile ID; do not omit it or substitute a builtin persona. Omit `agent_type` only when no admitted directory is present; the trusted runtime then supplies the bounded default.\n\n\
          ## Spawn example\n\
-         `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\",\"agent_type\":\"general-purpose\"}`\n\n\
+         `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\"}`\n\n\
          ## Execution mode\n\
          `spawn` returns a `launched` receipt with a runtime-generated `agent_id` promptly after execution ownership is established, while the child runs and the parent continues independent work. When no relevant independent work remains, propose a final answer: the runtime waits and presents the child outcome before accepting it. Do not use shell sleep or busy-poll status to wait. No background flag or Ctrl+B is needed. The receipt proves launch, not completion; collect the child outcome before relying on it. Normal model admission, tool permissions, execution deadlines, lineage, and cancellation ownership still apply. Launching does not extend the deadline or grant permissions.\n\n\
          ## Parallel sub-agent fan-out\n\
@@ -1952,7 +1952,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "send_message": ["local", "server"]
                     },
                     "x-astra-surface-descriptions": {
-                        "server": "Server-owned single-agent lifecycle. If visible, call it directly; do not call tool_search or model_catalog first just to spawn. Actions: spawn, list, get_result, send_message. An omitted agent_type uses bounded read-only explore; choose task/general-purpose only for mutation or the full surface. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. For a user model name, omit requested_model_policy for one catalog admission; fixed selectors require an exact authorized Offering ID. Never inspect workspace files, model configuration, or credentials or normalize a human name into a selector. Use visible start_work for durable Work."
+                        "server": "Server-owned single-agent lifecycle. If visible, call it directly; do not call tool_search or model_catalog first just to spawn. Actions: spawn, list, get_result, send_message. When an admitted profile directory is present, use its exact non-empty directory/profile ID for agent_type; do not omit it or substitute a builtin persona. Without a directory, omit agent_type for the bounded read-only default; choose a builtin persona only then when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. For a user model name, omit requested_model_policy for one catalog admission; fixed selectors require an exact authorized Offering ID. Never inspect workspace files, model configuration, or credentials or normalize a human name into a selector. Use visible start_work for durable Work."
                     },
                     "x-astra-surface-discovery-summaries": {
                         "server": "requested_model_policy: user model=omit+catalog; fixed=Offering ID; no config reads; hard reqs bind; spawn=launched; propose final; runtime waits; no shell sleep; agent question."
@@ -1986,7 +1986,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "description": {"type": "string", "description": "Short operation description when required by the selected action."},
                         "prompt": {"type": "string", "description": "Full self-contained child task brief for spawn. Include the constraints, conditional mappings, and expected output needed to finish; only a choice the child must ask about may be left unresolved. Non-empty and required with description."},
-                        "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: bounded read-only explore. Choose task or general-purpose only when the child must mutate or use the full capability surface."},
+                        "agent_type": {"type": "string", "minLength": 1, "description": "Exact non-empty admitted profile/directory ID when this run has a profile directory; do not omit it or substitute a builtin persona. Without an admitted directory, omit for the bounded read-only default or choose a builtin persona only when mutation or the full surface is required."},
                         "requested_model_policy": requested_model_policy_schema(),
                         "reasoning": fanout_reasoning_schema(),
                         "name": {"type": "string", "description": "Action label when accepted by the selected action."},
@@ -2053,7 +2053,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `get_results`: requires `action` and returned `group_id`. It takes a short non-blocking snapshot; the parent-owned completion boundary independently stages terminal child outcomes, so do not busy-poll. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
          - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
          - `stop_group`: requires `action` and `group_id`; it requests cancellation for every non-terminal child in one group operation.\n\n\
-         Use this for independent parallel work only when the user request or loaded workflow explicitly requires parallelism. Put one concise child brief in each slot. Children inherit the current execution binding unless an exact authorized Offering or reasoning control is set; those overrides require atomic admission before any slot starts. For any model name coming from the user, omit requested_model_policy and let one candidate-aware admission resolve it against the authorized catalog; use a fixed selector only when an exact authorized Offering ID is already supplied. Never inspect workspace configuration or credentials or normalize a human name into a selector. Only tools exposed in a child's own tool surface are usable; do not start workspace-dependent slots while the workspace provider is unavailable. Omit `agent_type` for the bounded read-only default; request `task` or `general-purpose` for mutation or full-surface work. Never paste file contents or prior tool output into a slot prompt. Use `allowed_tools`, not `tools`; do not send `brief`, `agents`, `background`, or generated `agent_id` fields. Start launches admitted slots concurrently and returns a receipt; use get_results for a bounded snapshot, never busy-poll.",
+         Use this for independent parallel work only when the user request or loaded workflow explicitly requires parallelism. Put one concise child brief in each slot. An omitted model policy uses the admitted profile's model default, then the parent Offering; explicit inherit selects the parent Offering. Exact authorized Offering and reasoning overrides require atomic admission before any slot starts. For any model name coming from the user, omit requested_model_policy and let one candidate-aware admission resolve it against the authorized catalog; use a fixed selector only when an exact authorized Offering ID is already supplied. Never inspect workspace configuration or credentials or normalize a human name into a selector. Only tools exposed in a child's own tool surface are usable; do not start workspace-dependent slots while the workspace provider is unavailable. When an admitted profile directory is present, set `agent_type` on each slot or in `defaults` to the exact non-empty profile/directory ID from that directory; do not omit it or substitute explore, code-review, task, or general-purpose. Without a directory, omit `agent_type` for the bounded read-only default, or choose a builtin persona only when mutation or the full surface is required. Never paste file contents or prior tool output into a slot prompt. Use `allowed_tools`, not `tools`; do not send `brief`, `agents`, `background`, or generated `agent_id` fields. Start launches admitted slots concurrently and returns a receipt; use get_results for a bounded snapshot, never busy-poll.",
                 "parameters": {
                     "type": "object",
                     "x-astra-per-action-discovery-summaries": {
@@ -2078,7 +2078,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                     "id": {"type": "string", "description": "Optional stable caller-facing label for this slot. Returned in start/results/fanout projections. Not the runtime agent_id."},
                                     "description": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS, "description": "Short UI summary for this slot."},
                                     "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Concise child task brief. The child inherits current provider bindings and can use only its exposed tools; never paste file contents, diffs, or prior tool output here."},
-                                    "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Child persona. Omit for bounded read-only explore; choose task/general-purpose explicitly for mutation or full-surface work."},
+                                    "agent_type": {"type": "string", "minLength": 1, "description": "Exact non-empty admitted profile/directory ID when this run has a profile directory; do not omit it or substitute a builtin persona. Without an admitted directory, omit for the bounded read-only default or choose a builtin persona only when mutation or the full surface is required."},
                                     "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
                                     "max_output_tokens": {"type": "integer", "minimum": 1},
                                     "complexity": {"type": "string", "enum": ["light","normal","deep"]},
@@ -2095,7 +2095,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "description": "Shared runtime configuration inherited by every slot. Slot-level overrides take precedence.",
                             "additionalProperties": false,
                             "properties": {
-                                "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Shared child persona. Omit for bounded read-only explore; choose task/general-purpose explicitly for mutation or full-surface work."},
+                                "agent_type": {"type": "string", "minLength": 1, "description": "Exact non-empty admitted profile/directory ID when this run has a profile directory; do not omit it or substitute a builtin persona. Without an admitted directory, omit for the bounded read-only default or choose a builtin persona only when mutation or the full surface is required."},
                                 "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
                                 "max_output_tokens": {"type": "integer", "minimum": 1},
                                 "complexity": {"type": "string", "enum": ["light","normal","deep"]},
@@ -2667,6 +2667,9 @@ mod tests {
         assert!(props.get("background").is_none());
         assert!(props.get("max_turns").is_none());
         assert!(props.get("initial_turns").is_some());
+        assert_eq!(props["agent_type"]["type"], "string");
+        assert_eq!(props["agent_type"]["minLength"], 1);
+        assert!(props["agent_type"].get("enum").is_none());
     }
 
     #[test]
@@ -2692,6 +2695,8 @@ mod tests {
         assert!(policy_description.contains("authorized catalog"));
         assert!(policy_description.contains("omit this field"));
         assert!(policy_description.contains("cannot override a hard user requirement"));
+        assert!(description.contains("exact non-empty directory/profile ID"));
+        assert!(description.contains("do not omit it or substitute a builtin persona"));
     }
 
     #[test]
@@ -2963,6 +2968,14 @@ mod tests {
         );
         assert!(params["properties"].get("run_in_background").is_none());
         let slot_props = &params["properties"]["slots"]["items"]["properties"];
+        for agent_type in [
+            &slot_props["agent_type"],
+            &params["properties"]["defaults"]["properties"]["agent_type"],
+        ] {
+            assert_eq!(agent_type["type"], "string");
+            assert_eq!(agent_type["minLength"], 1);
+            assert!(agent_type.get("enum").is_none());
+        }
         assert!(
             slot_props.get("id").is_some(),
             "fanout slots must expose the canonical caller-facing identity field"
@@ -3028,6 +3041,64 @@ mod tests {
             slot_props.get("name").is_none(),
             "fanout slots should not expose spawn mailbox names as slot identity"
         );
+        assert!(description.contains("exact non-empty profile/directory ID"));
+        assert!(description.contains(
+            "do not omit it or substitute explore, code-review, task, or general-purpose"
+        ));
+    }
+
+    #[test]
+    fn admitted_team_profile_ids_validate_through_native_and_deferred_schemas() {
+        let team =
+            astra_services::team_persistence::builtin_teams("schema-owner", "2026-10-03T00:00:00Z")
+                .into_iter()
+                .next()
+                .expect("builtin team fixture");
+        let profile_id =
+            astra_services::team_persistence::resolve_member_to_profile(&team.members[0], &team)
+                .agent_id;
+
+        let agent_args = json!({
+            "action": "spawn",
+            "description": "Review the runtime",
+            "prompt": "Return evidence from the runtime review.",
+            "agent_type": profile_id.clone(),
+        });
+        let fanout_args = json!({
+            "action": "start",
+            "target_count": 1,
+            "slots": [{
+                "description": "Review the runtime",
+                "prompt": "Return evidence from the runtime review.",
+                "agent_type": profile_id.clone(),
+            }],
+            "defaults": {"agent_type": profile_id.clone()},
+        });
+
+        validate_tool_arguments("agent", &agent_args)
+            .expect("native agent schema accepts the admitted profile ID");
+        validate_tool_arguments("agent_fanout", &fanout_args)
+            .expect("native fanout schema accepts the admitted profile ID");
+
+        for surface in ["local", "server"] {
+            let mut schemas = all_tool_schemas();
+            project_action_schemas_for_surface(&mut schemas, surface);
+
+            for (name, args) in [("agent", &agent_args), ("agent_fanout", &fanout_args)] {
+                let schema = find_schema(&schemas, name).expect("delegation schema");
+                validate_tool_arguments_against_schema(name, args, schema).unwrap_or_else(|err| {
+                    panic!("{surface} deferred schema rejected admitted profile ID: {err}")
+                });
+            }
+        }
+
+        let mut blank_agent = agent_args.clone();
+        blank_agent["agent_type"] = json!(" ");
+        assert!(validate_tool_arguments("agent", &blank_agent).is_err());
+
+        let mut blank_fanout = fanout_args.clone();
+        blank_fanout["slots"][0]["agent_type"] = json!("");
+        assert!(validate_tool_arguments("agent_fanout", &blank_fanout).is_err());
     }
 
     #[test]

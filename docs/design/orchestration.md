@@ -1,7 +1,7 @@
 # Orchestration
 
 > Status: target design contract.
-> Last updated: 2026-09-29.
+> Last updated: 2026-10-03.
 
 Orchestration owns multi-agent coordination, delegation, fanout/fanin, model choice per agent, and result integration. It does not own provider routing or lifecycle state machines.
 
@@ -25,6 +25,17 @@ requires an explicitly wired executor; a stub is a test fixture, not a default
 execution mode.
 
 Child results and failures remain in the canonical lifecycle and journal.
+CLI delegate, dynamic-agent and skill children use the runtime's common fresh
+loop state, then install their exact identity, authority, context, transport and
+execution budget. Entry-specific configuration does not define another loop
+lifecycle. Fork context inheritance and recursion restrictions are independent
+of result aggregation: Fork applies its declared aggregation through the same
+result combiner as FanOut.
+Child execution deadlines belong to the request, not a reusable executor.
+FanOut and Fork admit one absolute deadline before model preparation and pass
+it unchanged through queuing into CLI/Server loops, tools and nested children.
+Sequential retains its explicit per-stage timeout policy; a zero timeout adds
+no deadline. Invalid deadline ranges fail before child admission.
 The scheduler does not parse task output into a second findings store or copy
 it into ancestor state rows. Sequential execution stops at a paused or waiting
 stage instead of launching a successor without a settled predecessor. Active
@@ -33,6 +44,126 @@ the existing short publication grace and bounded, owner-fenced reconciliation
 preserve actual terminal outcomes or explicitly unfinished recovery state.
 
 ## Delegation model
+
+### Team configuration ownership
+
+Team definitions have one owner-scoped persistence contract. CLI commands use
+the existing HTTP adapter; their registry is a display projection, not a second
+configuration store or template authority. An empty roster is a valid draft,
+but execution rejects it before admitting children. Configuration edits retain
+the complete definition, including member capabilities, budget and concurrency.
+The accepted save response supplies the persisted identity without a follow-up
+read. Failed reads or writes must not publish success or a locally committed
+configuration, and standalone commands must return a failing exit status.
+Snapshot restore uses the complete saved configuration and preserves the current
+Team identity. It requires the exact returned snapshot ID, publishes only the
+accepted save response, and never checks out Git or changes running tasks.
+
+### Team user journey (target, not yet a proven runtime guarantee)
+
+Native CLI and TUI Team tasks must enter the ordinary root-turn owner with a
+selected lead and an authorized member set. Configuration commands and fixed
+fanout alone do not establish the interactive lead journey below; acceptance
+requires the same session, guidance, callbacks and child observations across
+successive turns.
+
+The native entrypoints use the same configuration:
+
+```text
+astra team create delivery
+astra team add-member delivery lead --can-delegate -- Describe the lead's responsibilities
+astra team add-member delivery developer -- Describe the member's responsibilities
+astra team info delivery
+astra team run delivery --lead-agent-id <agent_id-from-info> <task>
+```
+
+In the TUI, use `/team run delivery --lead-agent-id <agent_id-from-info> <task>`;
+configuration remains in the CLI. Subsequent ordinary input retains that selection.
+Native `team run --json` reuses the ordinary turn's terminal JSON; its hidden
+`--stream-events <path>` flag writes the same structured event stream as `chat`.
+For an isolated one-shot task, `team run --no-resume` uses ordinary Chat routing
+to create a new conversation instead of attaching recent history. In the TUI,
+start a fresh conversation with `/clear` before `/team run`; `--no-resume` is
+only applicable to one-shot CLI execution.
+Role names do not grant delegation permission. `--model <available-model-name>`
+on `add-member` is optional; an explicit root model selection takes precedence
+over the lead's configured default. These entrypoints alone do not prove the
+full acceptance criteria below.
+
+Built-in templates declare one delegation-capable coordinator:
+`dev/planner`, `research/synthesizer`, and `review/reviewer`. Each can start
+direct members at depth one; other members retain non-delegating authority.
+Selecting a different lead does not silently promote its permissions.
+
+A Team is a reusable collaboration configuration, not a second execution
+engine. The user addresses one accountable lead with an objective; they need
+not manually invoke every member or understand transport contracts. The lead
+clarifies missing requirements, maintains the plan, assigns work, integrates
+observed results and checks acceptance. Product manager and developer are
+ordinary configured responsibilities, not hard-coded runtime roles.
+
+Profile admission belongs to ordinary root and child execution. Built-in agent
+definitions and owner-authorized Team members normalize to the same effective
+profile, preserving prompt, model intent, skill and MCP selection, tool limits,
+read-only restrictions, initial turn limits and delegation scope. Skills are
+not tool permission aliases. A profile can narrow current execution authority;
+it cannot grant capabilities that the parent or selected provider lacks.
+
+Explicit profile MCP selection is not yet wired to the shared provider binding
+and dispatch owner. Run admission rejects nonempty `mcp_servers` rather than
+silently ignoring it. An empty selection inherits the currently authorized
+parent MCP scope; it does not establish new connections or credentials.
+
+The admitted member set is immutable and scoped to the run, never installed
+into a session-global registry. Ordinary spawn, fanout and coordination consume
+the same preflight facts; all fanout slots must pass before any child starts.
+Protected `run_started` facts retain the effective configuration and its
+owner/source identity. Recovery preserves those facts rather than resolving a
+subsequently edited Team, while revalidating current capability and model
+authorization. Public request metadata cannot establish child-run authority.
+
+Children execute through the existing same-session run tree. Client-side
+ordinary root admissions are not a replacement for internal child admission:
+sharing a parent's session writer causes contention, while opening unrelated
+sessions loses authoritative lineage. Native CLI/TUI must retain the ordinary
+root's authenticated Edge delivery, callback, cancellation and observation
+channels when retiring local orchestration. The existing JSON-only Team batch
+endpoint does not currently carry those channels.
+
+Multi-step collaboration uses the existing Work dependency and attempt owner.
+Member execution, messages, user guidance, cancellation, pause and recovery use
+the same child-agent backbone as ordinary delegation. Sequential/FanOut/Fork
+are coordination policies, not independent lifecycle authorities. A member's
+claimed completion is insufficient to settle an attempt or finish the Team.
+Blocked dependencies, questions and failed acceptance may require another
+step; neither a one-shot aggregate nor a transport acknowledgement proves the
+objective has been achieved.
+
+Explicit model choices remain authoritative. Optional model selection may
+choose among authorized candidates within the existing budget and capability
+constraints; it cannot relax a hard requirement. Model choice is not required
+for communication, step tracking or lifecycle correctness.
+
+When a child request omits a model policy, its admitted profile's model default
+is resolved before falling back to the parent binding. An explicit `inherit`
+request selects the parent binding; explicit fixed choices and admitted user
+requirements remain authoritative. This normalization precedes shared model
+admission for both single spawn and fanout, so launch receipts and execution
+use the same prepared Offering rather than changing models after launch.
+
+The user can inspect progress, blockers and artifacts, change requirements,
+pause or cancel, and drill down into member execution without flooding the
+lead transcript. Execution identity must connect Team, lead, child, Work
+attempt and physical provider calls in existing Trace/Explain/Audit facts.
+Team summaries are aggregates, not additional billable provider usage;
+unknown usage, cache or price coverage must remain explicit. Acceptance must
+exercise a real multi-step exchange and recovery, not only fixed fanout.
+
+Team execution responses label their summaries `usage_scope=child_results_only`.
+Without a returned child-result aggregate, token and tool counts are `null`,
+not zero. Returned counts do not establish full coverage of physical provider
+attempts, auxiliary judgments, cache billing or historical prices; those facts
+remain owned by inference observations and Audit.
 
 The agent executing an objective owns its relevant skill selection, evidence
 gathering, and result. When the user assigns an objective to a child, the parent

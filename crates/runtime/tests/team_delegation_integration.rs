@@ -16,6 +16,8 @@ use astra_services::team_persistence::{
     TeamPersistenceService, WorktreeMode,
 };
 
+use astra_runtime::messaging::{AgentMailboxRouter, InProcessTransport};
+use astra_runtime::orchestration::{DynamicAgentSpawner, SpawnRunFrontier};
 use astra_runtime::server::delegation::engine::{
     DelegationEngine, DelegationTracker, StubSubRunExecutor, SubRunConfig, SubRunExecutor,
 };
@@ -48,6 +50,7 @@ fn test_team(
                 mcp_servers: vec![],
                 can_delegate: false,
                 max_delegation_depth: 0,
+                ..Default::default()
             })
             .collect(),
         context: HashMap::new(),
@@ -57,6 +60,27 @@ fn test_team(
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
     }
+}
+
+fn execution_bound_delegation(
+    registry: Arc<RwLock<AgentProfileRegistry>>,
+    run_engine: Arc<RunEngine>,
+    tracker: Arc<DelegationTracker>,
+    executor: Arc<dyn SubRunExecutor>,
+) -> Arc<DelegationEngine> {
+    let router = Arc::new(AgentMailboxRouter::new(
+        Arc::new(InProcessTransport::new()),
+        tracker.clone(),
+    ));
+    let spawner = Arc::new(DynamicAgentSpawner::new(router));
+
+    // The owner carries the real child router.  It is intentionally not
+    // installed as the engine mailbox configuration; no-mailbox scenarios
+    // must remain no-mailbox.
+    Arc::new(
+        DelegationEngine::with_executor(registry, run_engine, tracker, executor)
+            .for_execution(spawner),
+    )
 }
 
 async fn setup_orchestrator(
@@ -91,12 +115,12 @@ async fn setup_orchestrator_with_executor(
     let run_engine = Arc::new(RunEngine::new(run_store));
     let tracker = Arc::new(DelegationTracker::new());
 
-    let delegation = Arc::new(DelegationEngine::with_executor(
+    let delegation = execution_bound_delegation(
         registry.clone(),
         run_engine.clone(),
         tracker.clone(),
         executor,
-    ));
+    );
 
     let orch = TeamExecutionOrchestrator::new(
         team_store,
@@ -116,6 +140,68 @@ async fn setup_orchestrator_with_executor(
 }
 
 // ─── Full Pipeline Tests ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn team_member_controls_reach_the_shared_executor() {
+    struct Capture(std::sync::Mutex<Vec<SubRunConfig>>);
+    #[async_trait]
+    impl SubRunExecutor for Capture {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
+            let result = AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id.clone(),
+                status: "completed".into(),
+                output: Some("done".into()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            };
+            self.0.lock().unwrap().push(config);
+            Ok((result, None))
+        }
+    }
+    let store = Arc::new(InMemoryTeamStore::new());
+    let mut team = test_team(
+        "bounded",
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
+        vec![("member", None)],
+    );
+    let member = &mut team.members[0];
+    member.allow_tools = Some(vec![]);
+    member.read_only = true;
+    member.initial_turns = Some(2);
+    member.max_turns = Some(3);
+    member.skills = vec!["focused-skill".into()];
+    store.save_team(&team).await.unwrap();
+    let executor = Arc::new(Capture(std::sync::Mutex::new(vec![])));
+    let (orchestrator, _, _) = setup_orchestrator_with_executor(store, executor.clone()).await;
+    let report = orchestrator
+        .execute_team("bounded", "perform the task", None)
+        .await;
+    assert_eq!(report.status, TeamExecutionStatus::Completed);
+    let captured = executor.0.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let child = &captured[0];
+    assert!(child.agent_profile.read_only);
+    assert_eq!(child.agent_profile.allow_tools, Some(vec![]));
+    assert_eq!(child.initial_turns, Some(2));
+    assert_eq!(child.max_turns, Some(3));
+    assert!(
+        child
+            .request_constraints
+            .allowed_tools
+            .as_ref()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(child.agent_profile.skill_filter, vec!["focused-skill"]);
+}
 
 #[tokio::test]
 async fn full_pipeline_team_execution() {
@@ -257,7 +343,10 @@ struct ErrorExecutor;
 
 #[async_trait]
 impl SubRunExecutor for ErrorExecutor {
-    async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+    async fn execute(
+        &self,
+        config: SubRunConfig,
+    ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
         Err(format!("agent {} crashed", config.agent_profile.agent_id))
     }
 }
@@ -518,19 +607,25 @@ async fn budget_timeout_aborts_slow_execution() {
     struct SlowExecutor(Arc<AtomicUsize>);
     #[async_trait]
     impl SubRunExecutor for SlowExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
             self.0.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            Ok(AgentResult {
-                agent_id: config.agent_profile.agent_id.clone(),
-                run_id: config.run_id,
-                status: "completed".to_string(),
-                output: Some("done".to_string()),
-                error: None,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
-            })
+            Ok((
+                AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some("done".to_string()),
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
+                None,
+            ))
         }
     }
 
@@ -615,7 +710,10 @@ async fn fan_out_respects_max_parallel() {
     }
     #[async_trait]
     impl SubRunExecutor for ConcurrencyTracker {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
             let prev = self.current.fetch_add(1, Ordering::SeqCst);
             let concurrent = prev + 1;
             // Update peak
@@ -626,16 +724,19 @@ async fn fan_out_respects_max_parallel() {
             // test to ~150ms real time for no extra coverage.
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             self.current.fetch_sub(1, Ordering::SeqCst);
-            Ok(AgentResult {
-                agent_id: config.agent_profile.agent_id.clone(),
-                run_id: config.run_id,
-                status: "completed".to_string(),
-                output: Some("done".to_string()),
-                error: None,
-                prompt_tokens: 10,
-                completion_tokens: 20,
-                tool_calls: 0,
-            })
+            Ok((
+                AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some("done".to_string()),
+                    error: None,
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    tool_calls: 0,
+                },
+                None,
+            ))
         }
     }
 
@@ -685,31 +786,40 @@ async fn pipeline_continues_after_first_stage_fails() {
     }
     #[async_trait]
     impl SubRunExecutor for FailFirstExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
             let n = self.count.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
                 // First stage fails
-                Ok(AgentResult {
-                    agent_id: config.agent_profile.agent_id.clone(),
-                    run_id: config.run_id,
-                    status: "failed".to_string(),
-                    output: None,
-                    error: Some("compilation error".to_string()),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                })
+                Ok((
+                    AgentResult {
+                        agent_id: config.agent_profile.agent_id.clone(),
+                        run_id: config.run_id,
+                        status: "failed".to_string(),
+                        output: None,
+                        error: Some("compilation error".to_string()),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    },
+                    None,
+                ))
             } else {
-                Ok(AgentResult {
-                    agent_id: config.agent_profile.agent_id.clone(),
-                    run_id: config.run_id,
-                    status: "completed".to_string(),
-                    output: Some("done".to_string()),
-                    error: None,
-                    prompt_tokens: 10,
-                    completion_tokens: 20,
-                    tool_calls: 0,
-                })
+                Ok((
+                    AgentResult {
+                        agent_id: config.agent_profile.agent_id.clone(),
+                        run_id: config.run_id,
+                        status: "completed".to_string(),
+                        output: Some("done".to_string()),
+                        error: None,
+                        prompt_tokens: 10,
+                        completion_tokens: 20,
+                        tool_calls: 0,
+                    },
+                    None,
+                ))
             }
         }
     }
@@ -756,30 +866,39 @@ async fn fan_out_returns_partial_success_with_failures() {
     struct PartialFailExecutor;
     #[async_trait]
     impl SubRunExecutor for PartialFailExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
             // Middle agent fails
             if config.agent_profile.agent_id.contains("researcher2") {
-                Ok(AgentResult {
-                    agent_id: config.agent_profile.agent_id.clone(),
-                    run_id: config.run_id,
-                    status: "failed".to_string(),
-                    output: None,
-                    error: Some("network timeout".to_string()),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                })
+                Ok((
+                    AgentResult {
+                        agent_id: config.agent_profile.agent_id.clone(),
+                        run_id: config.run_id,
+                        status: "failed".to_string(),
+                        output: None,
+                        error: Some("network timeout".to_string()),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    },
+                    None,
+                ))
             } else {
-                Ok(AgentResult {
-                    agent_id: config.agent_profile.agent_id.clone(),
-                    run_id: config.run_id,
-                    status: "completed".to_string(),
-                    output: Some(format!("results from {}", config.agent_profile.agent_id)),
-                    error: None,
-                    prompt_tokens: 100,
-                    completion_tokens: 200,
-                    tool_calls: 1,
-                })
+                Ok((
+                    AgentResult {
+                        agent_id: config.agent_profile.agent_id.clone(),
+                        run_id: config.run_id,
+                        status: "completed".to_string(),
+                        output: Some(format!("results from {}", config.agent_profile.agent_id)),
+                        error: None,
+                        prompt_tokens: 100,
+                        completion_tokens: 200,
+                        tool_calls: 1,
+                    },
+                    None,
+                ))
             }
         }
     }
@@ -841,7 +960,10 @@ async fn concurrent_team_executions_isolated() {
     }
     #[async_trait]
     impl SubRunExecutor for LoggingExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
             let agent_id = config.agent_profile.agent_id.clone();
             self.log.lock().await.push(format!("start:{agent_id}"));
             // Yield once so the runtime can interleave the two concurrent
@@ -852,16 +974,19 @@ async fn concurrent_team_executions_isolated() {
             // any specific duration.
             tokio::task::yield_now().await;
             self.log.lock().await.push(format!("end:{agent_id}"));
-            Ok(AgentResult {
-                agent_id,
-                run_id: config.run_id,
-                status: "completed".to_string(),
-                output: Some("done".to_string()),
-                error: None,
-                prompt_tokens: 10,
-                completion_tokens: 20,
-                tool_calls: 0,
-            })
+            Ok((
+                AgentResult {
+                    agent_id,
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some("done".to_string()),
+                    error: None,
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    tool_calls: 0,
+                },
+                None,
+            ))
         }
     }
 
@@ -906,17 +1031,23 @@ async fn concurrent_same_team_executions_have_distinct_runs_and_history_records(
     struct EchoExecutor;
     #[async_trait]
     impl SubRunExecutor for EchoExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
-            Ok(AgentResult {
-                agent_id: config.agent_profile.agent_id.clone(),
-                run_id: config.run_id,
-                status: "completed".to_string(),
-                output: Some(format!("done by {}", config.agent_profile.agent_id)),
-                error: None,
-                prompt_tokens: 10,
-                completion_tokens: 20,
-                tool_calls: 1,
-            })
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
+            Ok((
+                AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some(format!("done by {}", config.agent_profile.agent_id)),
+                    error: None,
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    tool_calls: 1,
+                },
+                None,
+            ))
         }
     }
 
@@ -982,32 +1113,41 @@ async fn sequential_stop_on_success_stops_early() {
     }
     #[async_trait]
     impl SubRunExecutor for SuccessSecondExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
             let n = self.count.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
                 // First fails
-                Ok(AgentResult {
-                    agent_id: config.agent_profile.agent_id.clone(),
-                    run_id: config.run_id,
-                    status: "failed".to_string(),
-                    output: None,
-                    error: Some("not available".to_string()),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                })
+                Ok((
+                    AgentResult {
+                        agent_id: config.agent_profile.agent_id.clone(),
+                        run_id: config.run_id,
+                        status: "failed".to_string(),
+                        output: None,
+                        error: Some("not available".to_string()),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    },
+                    None,
+                ))
             } else {
                 // Second succeeds
-                Ok(AgentResult {
-                    agent_id: config.agent_profile.agent_id.clone(),
-                    run_id: config.run_id,
-                    status: "completed".to_string(),
-                    output: Some("success!".to_string()),
-                    error: None,
-                    prompt_tokens: 10,
-                    completion_tokens: 20,
-                    tool_calls: 0,
-                })
+                Ok((
+                    AgentResult {
+                        agent_id: config.agent_profile.agent_id.clone(),
+                        run_id: config.run_id,
+                        status: "completed".to_string(),
+                        output: Some("success!".to_string()),
+                        error: None,
+                        prompt_tokens: 10,
+                        completion_tokens: 20,
+                        tool_calls: 0,
+                    },
+                    None,
+                ))
             }
         }
     }
@@ -1055,20 +1195,26 @@ async fn team_execution_respects_cancellation() {
     }
     #[async_trait]
     impl SubRunExecutor for BlockingExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
             self.started.store(true, Ordering::SeqCst);
             // Block for a long time
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            Ok(AgentResult {
-                agent_id: config.agent_profile.agent_id.clone(),
-                run_id: config.run_id,
-                status: "completed".to_string(),
-                output: Some("done".to_string()),
-                error: None,
-                prompt_tokens: 10,
-                completion_tokens: 20,
-                tool_calls: 0,
-            })
+            Ok((
+                AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some("done".to_string()),
+                    error: None,
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    tool_calls: 0,
+                },
+                None,
+            ))
         }
     }
 
@@ -1131,31 +1277,40 @@ async fn error_messages_preserved_in_results() {
     struct MixedResultExecutor;
     #[async_trait]
     impl SubRunExecutor for MixedResultExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
             if config.agent_profile.agent_id.contains("faulty") {
-                Ok(AgentResult {
-                    agent_id: config.agent_profile.agent_id.clone(),
-                    run_id: config.run_id,
-                    status: "failed".to_string(),
-                    output: None,
-                    error: Some(
-                        "DatabaseConnectionError: connection timed out after 30s".to_string(),
-                    ),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                })
+                Ok((
+                    AgentResult {
+                        agent_id: config.agent_profile.agent_id.clone(),
+                        run_id: config.run_id,
+                        status: "failed".to_string(),
+                        output: None,
+                        error: Some(
+                            "DatabaseConnectionError: connection timed out after 30s".to_string(),
+                        ),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    },
+                    None,
+                ))
             } else {
-                Ok(AgentResult {
-                    agent_id: config.agent_profile.agent_id.clone(),
-                    run_id: config.run_id,
-                    status: "completed".to_string(),
-                    output: Some("success".to_string()),
-                    error: None,
-                    prompt_tokens: 100,
-                    completion_tokens: 200,
-                    tool_calls: 0,
-                })
+                Ok((
+                    AgentResult {
+                        agent_id: config.agent_profile.agent_id.clone(),
+                        run_id: config.run_id,
+                        status: "completed".to_string(),
+                        output: Some("success".to_string()),
+                        error: None,
+                        prompt_tokens: 100,
+                        completion_tokens: 200,
+                        tool_calls: 0,
+                    },
+                    None,
+                ))
             }
         }
     }
@@ -1202,22 +1357,28 @@ async fn team_report_includes_error_summary() {
     struct BothFailExecutor;
     #[async_trait]
     impl SubRunExecutor for BothFailExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
             let error = if config.agent_profile.agent_id.contains('a') {
                 "A crashed"
             } else {
                 "B crashed"
             };
-            Ok(AgentResult {
-                agent_id: config.agent_profile.agent_id.clone(),
-                run_id: config.run_id,
-                status: "failed".to_string(),
-                output: None,
-                error: Some(error.to_string()),
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
-            })
+            Ok((
+                AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "failed".to_string(),
+                    output: None,
+                    error: Some(error.to_string()),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
+                None,
+            ))
         }
     }
 

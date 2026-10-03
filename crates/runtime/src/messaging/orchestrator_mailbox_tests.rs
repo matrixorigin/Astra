@@ -48,7 +48,10 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for ProgressReportingExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<crate::orchestration::SpawnRunFrontier>), String> {
             let agent_id = config.agent_profile.agent_id.clone();
             let run_id = config.run_id.clone();
 
@@ -69,16 +72,19 @@ mod tests {
                 .await
                 .push((agent_id.clone(), send_result));
 
-            Ok(AgentResult {
-                agent_id,
-                run_id,
-                status: "completed".into(),
-                output: Some("done".into()),
-                error: None,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
-            })
+            Ok((
+                AgentResult {
+                    agent_id,
+                    run_id,
+                    status: "completed".into(),
+                    output: Some("done".into()),
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
+                None,
+            ))
         }
     }
 
@@ -186,7 +192,10 @@ mod tests {
             tracker.clone(),
             executor,
         )
-        .with_mailbox_router(router.clone());
+        .with_mailbox_router(router.clone())
+        .for_execution(Arc::new(crate::orchestration::DynamicAgentSpawner::new(
+            router.clone(),
+        )));
 
         TestHarness {
             engine,
@@ -209,7 +218,10 @@ mod tests {
             run_engine.clone(),
             tracker.clone(),
             executor,
-        );
+        )
+        .for_execution(Arc::new(crate::orchestration::DynamicAgentSpawner::new(
+            router.clone(),
+        )));
         // Intentionally NOT calling .with_mailbox_router()
 
         TestHarness {
@@ -400,7 +412,10 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for DelayedProgressExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<crate::orchestration::SpawnRunFrontier>), String> {
             let agent_id = config.agent_profile.agent_id.clone();
             let run_id = config.run_id.clone();
 
@@ -421,16 +436,19 @@ mod tests {
                 .await
                 .push((agent_id.clone(), send_result));
 
-            Ok(AgentResult {
-                agent_id,
-                run_id,
-                status: "completed".into(),
-                output: Some("done".into()),
-                error: None,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
-            })
+            Ok((
+                AgentResult {
+                    agent_id,
+                    run_id,
+                    status: "completed".into(),
+                    output: Some("done".into()),
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
+                None,
+            ))
         }
     }
 
@@ -676,22 +694,28 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for UncooperativeExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<crate::orchestration::SpawnRunFrontier>), String> {
             let agent_id = config.agent_profile.agent_id.clone();
             let run_id = config.run_id.clone();
             // Ignore cancel_token — block on a channel that never sends.
             let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
             let _ = rx.await;
-            Ok(AgentResult {
-                agent_id,
-                run_id,
-                status: "completed".into(),
-                output: None,
-                error: None,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
-            })
+            Ok((
+                AgentResult {
+                    agent_id,
+                    run_id,
+                    status: "completed".into(),
+                    output: None,
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
+                None,
+            ))
         }
     }
 

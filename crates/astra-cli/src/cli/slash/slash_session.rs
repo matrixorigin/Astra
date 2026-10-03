@@ -5520,8 +5520,14 @@ async fn apply_restored_session(
     if let Some(mode) = restored_permission_mode {
         state.perm_manager.set_mode(mode);
     }
-    state.model =
-        normalize_model_override(restored.model.as_deref()).map(|model| model.to_string().into());
+    // Restored effective selection is a baseline, not a new explicit request.
+    if !matches!(
+        state.cli_context.requested_model_policy,
+        Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
+    ) {
+        state.model =
+            normalize_model_override(restored.model.as_deref()).map(|model| model.to_string().into());
+    }
     apply_prepared_workspace_restore(state, &prepared_workspace);
 
     if let Some(step_restored) = step_restored {

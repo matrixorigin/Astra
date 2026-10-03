@@ -204,6 +204,7 @@ fn bench_prompt_delta_plan(c: &mut Criterion) {
                 astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
                     user_id: "phase0-baseline-user",
                     session_id: "phase0-baseline-session",
+                    run_id: None,
                     turn: 50,
                     round: 3,
                     attempt: 0,

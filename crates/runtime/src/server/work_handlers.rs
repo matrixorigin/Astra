@@ -3952,6 +3952,8 @@ pub(super) async fn post_work_branch_turn_handler(
         .flatten();
     let expected_run_id = turn.start_idempotency.run_id().to_string();
     let request = ChatRequestData {
+        agent_profile_selection: None,
+        admitted_agent_profiles: None,
         model_catalog_reader: Some(astra_services::models::AuthorizedModelCatalogReader::new(
             state.model_service.clone(),
             state.auth_service.clone(),

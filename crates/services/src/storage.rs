@@ -4480,7 +4480,7 @@ async fn ensure_core_schema_while_leased(
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             created_at_unix_ms BIGINT NULL,
             PRIMARY KEY (user_id, request_id),
-            UNIQUE KEY uq_prompt_request_attempt (user_id, session_id, turn, round, source, attempt),
+            UNIQUE KEY uq_prompt_request_attempt (user_id, session_id, run_id, turn, round, source, attempt),
             INDEX idx_prompt_requests_owner_session_created (user_id, session_id, created_at, turn, round, attempt),
             INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt),
             INDEX idx_prompt_requests_owner_previous (user_id, session_id, previous_request_id),
@@ -6754,6 +6754,18 @@ async fn verify_core_schema_shape(
         &["user_id", "request_id"],
     )?;
     for (index, expected_columns) in [
+        (
+            "uq_prompt_request_attempt",
+            &[
+                "user_id",
+                "session_id",
+                "run_id",
+                "turn",
+                "round",
+                "source",
+                "attempt",
+            ][..],
+        ),
         (
             "idx_prompt_requests_owner_session_created",
             &[

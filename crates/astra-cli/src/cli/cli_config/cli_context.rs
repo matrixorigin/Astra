@@ -1,7 +1,11 @@
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CliContext {
+    /// Caller intent, distinct from the resolved/default model used for UI and budgets.
+    pub(crate) requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
+    /// Configuration selection only; authority is materialized by Server admission.
+    pub(crate) agent_profile_selection: Option<astra_services::runs::AgentProfileSelection>,
     pub(crate) no_journal_content: bool,
     pub(crate) allowed_tools: Vec<String>,
     pub(crate) disallowed_tools: Vec<String>,
@@ -35,6 +39,8 @@ impl CliContext {
         }
 
         Ok(Self {
+            requested_model_policy: None,
+            agent_profile_selection: None,
             no_journal_content,
             allowed_tools: resolve_tool_list(allowed_tools, "ASTRA_CLI_ALLOWED_TOOLS"),
             disallowed_tools: resolve_tool_list(disallowed_tools, "ASTRA_CLI_DISALLOWED_TOOLS"),
@@ -49,6 +55,23 @@ impl CliContext {
     pub(crate) fn with_permission_mode(mut self, permission_mode: Option<String>) -> Self {
         self.permission_mode = permission_mode;
         self
+    }
+
+    /// Called only by an explicit model flag or picker/clear action, never by a resolver.
+    pub(crate) fn select_model(&mut self, model: Option<&str>) {
+        self.requested_model_policy = Some(
+            astra_core::model_override::normalize_model_override(model)
+                .map(|model| astra_turn_types::RequestedModelPolicy::Fixed {
+                    selector: astra_turn_types::ModelSelector::ConfiguredName {
+                        model_name:
+                            astra_turn_core::thinking_config::resolve_model_thinking_request(model)
+                                .0
+                                .to_string(),
+                        source: None,
+                    },
+                })
+                .unwrap_or(astra_turn_types::RequestedModelPolicy::Inherit),
+        );
     }
 }
 
@@ -118,6 +141,28 @@ fn canonicalize_dirs(values: &[String]) -> Vec<PathBuf> {
 mod tests {
     use super::{CliContext, canonicalize_dirs};
     use std::path::PathBuf;
+
+    #[test]
+    fn explicit_model_intent_is_separate_from_defaults_and_can_be_cleared() {
+        use astra_turn_types::{ModelSelector, RequestedModelPolicy};
+        let mut context = CliContext::default();
+        assert_eq!(context.requested_model_policy, None);
+        context.select_model(Some("model-a(thinking:high)"));
+        assert_eq!(
+            context.requested_model_policy,
+            Some(RequestedModelPolicy::Fixed {
+                selector: ModelSelector::ConfiguredName {
+                    model_name: "model-a".into(),
+                    source: None
+                },
+            })
+        );
+        context.select_model(None);
+        assert_eq!(
+            context.requested_model_policy,
+            Some(RequestedModelPolicy::Inherit)
+        );
+    }
 
     #[test]
     fn from_launch_options_normalizes_tool_lists() {

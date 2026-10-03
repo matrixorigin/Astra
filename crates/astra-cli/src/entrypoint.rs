@@ -379,7 +379,7 @@ async fn run_async() -> i32 {
     }
 
     let _ = (startup_trace, bare);
-    let cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
+    let mut cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
         no_journal_content,
         &allowed_tools,
         &disallowed_tools,
@@ -463,6 +463,8 @@ async fn run_async() -> i32 {
     } else {
         None
     };
+    // Preserve explicit intent before merging with the configured default.
+    cli_context.select_model(cli_model.as_deref());
     let resolved_model = normalize_model_override_owned(cli_model.or(config_default_model));
 
     // Make the resolved model available to slash commands that print

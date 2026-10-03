@@ -3546,6 +3546,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     let first_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
         user_id: &owner_user_id,
         session_id: &session_id,
+        run_id: Some("first-root-run"),
         turn: 1,
         round: 0,
         attempt: 0,
@@ -3560,7 +3561,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
         &astra_services::PromptRequestPersistInput {
             session_id: session_id.clone(),
             user_id: owner_user_id.clone(),
-            run_id: None,
+            run_id: Some("first-root-run".into()),
             turn: 1,
             round: 0,
             attempt: 0,
@@ -3600,6 +3601,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     let second_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
         user_id: &owner_user_id,
         session_id: &session_id,
+        run_id: Some("second-root-run"),
         turn: 2,
         round: 0,
         attempt: 0,
@@ -3614,7 +3616,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
         &astra_services::PromptRequestPersistInput {
             session_id: session_id.clone(),
             user_id: owner_user_id.clone(),
-            run_id: None,
+            run_id: Some("second-root-run".into()),
             turn: 2,
             round: 0,
             attempt: 0,
@@ -3667,6 +3669,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     let third_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
         user_id: &owner_user_id,
         session_id: &session_id,
+        run_id: None,
         turn: 3,
         round: 0,
         attempt: 0,
@@ -3704,6 +3707,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
         let plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
             user_id: &owner_user_id,
             session_id: &session_id,
+            run_id: None,
             turn,
             round: 0,
             attempt: 0,
@@ -3743,6 +3747,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     let tail_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
         user_id: &owner_user_id,
         session_id: &session_id,
+        run_id: None,
         turn: 101,
         round: 0,
         attempt: 0,

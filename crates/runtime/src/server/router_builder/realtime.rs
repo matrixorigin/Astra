@@ -246,7 +246,8 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/teams/snapshots/{id}",
-            delete(crate::server::team::handlers::delete_snapshot_handler),
+            get(crate::server::team::handlers::get_snapshot_handler)
+                .delete(crate::server::team::handlers::delete_snapshot_handler),
         )
         .route(
             "/chat/session/{session_id}/reflect",

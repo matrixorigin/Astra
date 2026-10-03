@@ -79,6 +79,8 @@ pub struct AgentCommunicationEvent {
     pub observed_by: AgentCommunicationParty,
     pub direction: AgentCommunicationDirection,
     pub message_id: String,
+    /// Envelope routing address; a root mailbox may be session-stable even
+    /// when observed_by identifies the current execution run.
     pub from: AgentCommunicationParty,
     pub to: AgentCommunicationTarget,
     pub payload_kind: AgentCommunicationPayloadKind,

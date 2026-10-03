@@ -88,7 +88,9 @@ pub trait DelegationTracking: Send + Sync {
     async fn cleanup_delegation(&self, delegation_id: &str) -> Result<(), String>;
 }
 
-/// Persists durable run state (events, status, checkpoints, usage).
+/// Persists durable Team parent state (events, status, and checkpoints).
+/// Provider/token usage remains owned by each real child run; Team summaries
+/// retain the child aggregate without projecting it onto the parent run.
 #[async_trait]
 pub trait RunPersistence: Send + Sync {
     /// Create a durable run record with delegation metadata.
@@ -111,17 +113,6 @@ pub trait RunPersistence: Send + Sync {
     async fn persist_status_if_current(
         &self,
         request: RunStatusCasRequest<'_>,
-    ) -> Result<bool, String>;
-
-    /// Persist token/tool usage counters.
-    async fn persist_usage(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        tool_calls: u32,
     ) -> Result<bool, String>;
 
     /// Save a checkpoint for crash recovery.

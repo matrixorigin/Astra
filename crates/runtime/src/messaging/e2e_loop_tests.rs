@@ -1549,6 +1549,8 @@ mod tests {
     #[tokio::test]
     async fn parent_loop_handles_permission_request_before_llm_injection() {
         let (_router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
+        let parent_address = parent_mb.address.clone();
+        let child_address = child_mb.address.clone();
 
         let request = PermissionRequest::new("bash", json!({"command": "x".repeat(5_000)}))
             .to_message(&child_mb.address, &parent_mb.address)
@@ -1557,6 +1559,7 @@ mod tests {
 
         let mut host = MockHost::new(vec![text_result("Handled request.")]);
         let mut state = make_state();
+        state.current_run_id = Some("parent-execution".into());
         state.messaging.mailbox = Some(parent_mb);
         state.permission_context = Some(PermissionSyncContext::shared_root(PermissionMode::Auto));
 
@@ -1566,6 +1569,26 @@ mod tests {
         let response = child_mb
             .try_recv()
             .expect("child should receive permission response");
+        assert_eq!(response.from, parent_address);
+        assert!(matches!(
+            &response.to,
+            MessageTarget::Direct { address } if address == &child_address
+        ));
+        assert_eq!(response.correlation_id.as_deref(), Some("perm-1"));
+        assert_eq!(host.communication_events.len(), 2);
+        assert_eq!(
+            host.communication_events[0].direction,
+            astra_messaging::AgentCommunicationDirection::Received
+        );
+        assert_eq!(
+            host.communication_events[1].direction,
+            astra_messaging::AgentCommunicationDirection::Sent
+        );
+        assert!(
+            host.communication_events
+                .iter()
+                .all(|event| event.observed_by.run_id == "parent-execution")
+        );
         match &response.payload {
             MessagePayload::Response { accepted, data, .. } => {
                 assert!(*accepted);
@@ -1596,10 +1619,11 @@ mod tests {
             .to_message(&child_mb.address, &parent_mb.address)
             .with_correlation("perm-disconnected");
         child_mb.send(request).await.unwrap();
-        child_mb.unregister().await.unwrap();
+        child_mb.retire().await.unwrap();
 
         let mut host = MockHost::new(vec![text_result("must not run")]);
         let mut state = make_state();
+        state.current_run_id = Some("parent-execution".into());
         state.messaging.mailbox = Some(parent_mb);
         state.permission_context = Some(PermissionSyncContext::shared_root(PermissionMode::Auto));
 
@@ -1607,6 +1631,15 @@ mod tests {
             .await
             .expect("obsolete child request must not abort unrelated parent work");
         assert!(host.current_turn > 0);
+        assert_eq!(host.communication_events.len(), 1);
+        assert_eq!(
+            host.communication_events[0].direction,
+            astra_messaging::AgentCommunicationDirection::Received
+        );
+        assert_eq!(
+            host.communication_events[0].observed_by.run_id,
+            "parent-execution"
+        );
         assert!(
             state
                 .messaging

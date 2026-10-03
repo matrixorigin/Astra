@@ -1,22 +1,14 @@
-//! Mock LLM server for end-to-end testing of team orchestration without real LLM calls.
+//! Scripted HTTP/SSE fixtures for client protocol and UI tests without real LLM calls.
 //!
-//! Starts an in-process axum HTTP server that responds to `POST /chat/stream` with
-//! pre-scripted SSE streams. Every other part of the system (worktrees, progress
-//! channels, delegation engine, tool execution, journal) runs for real.
-//!
-//! # Usage
-//! ```text
-//! /team run dev "build login page" --mock complete
-//! /team run dev "build login page" --mock tool_then_complete
-//! /team run dev "build login page" --mock multi_turn
-//! /team run dev "build login page" --mock fail
-//! /team run dev "build login page" --mock slow
-//! ```
+//! The mock records exact issued tool requests and validates Edge callbacks.
+//! Tool fixtures retain one callback-gated Server stream with terminal evidence.
+//! Agent admission and child settlement belong to the runtime integrations;
+//! inference-only scenarios intentionally remain missing-terminal negative controls.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use axum::Router;
 use axum::extract::State;
@@ -47,16 +39,6 @@ pub enum MockScenario {
     /// Agent remains pending long enough for cancellation journeys to prove
     /// that Ctrl+C, rather than a naturally completed response, settles the turn.
     CancellationPending,
-    /// Root activates and launches one asynchronous child, then acknowledges
-    /// its launch receipt.
-    AgentThenComplete,
-    /// Root launches one asynchronous three-slot fanout. Individual slots
-    /// settle at different times; the runtime wakes the parent once after
-    /// every slot settles.
-    FanoutThenComplete,
-    /// Same asynchronous fanout, but the second child fails. The parent
-    /// receives one terminal hint with two completed slots and one failure.
-    FanoutPartialThenComplete,
     /// Adversarial: a single tool_call_start event's JSON is split across
     /// multiple SSE `data:` chunks (with blank lines in between) so a naive
     /// per-chunk JSON decoder will fail on each half. A correct client must
@@ -86,11 +68,6 @@ impl MockScenario {
             "fail" | "error" => Some(Self::Fail),
             "slow" => Some(Self::Slow),
             "cancellation_pending" => Some(Self::CancellationPending),
-            "agent_then_complete" | "agent" => Some(Self::AgentThenComplete),
-            "fanout_then_complete" | "fanout" => Some(Self::FanoutThenComplete),
-            "fanout_partial_then_complete" | "fanout_partial" => {
-                Some(Self::FanoutPartialThenComplete)
-            }
             "sse_chunk_split" | "sse_split" | "chunk_split" => Some(Self::SseChunkSplit),
             "malformed_json" | "malformed" | "bad_json" => Some(Self::MalformedJson),
             "rate_limited" | "rate_limit" | "429" => Some(Self::RateLimited),
@@ -108,13 +85,6 @@ impl MockScenario {
             Self::Fail => "agent returns error",
             Self::Slow => "3s delay before response (tests progress display)",
             Self::CancellationPending => "pending response for cancellation journeys",
-            Self::AgentThenComplete => "one asynchronous child agent, then launch acknowledgement",
-            Self::FanoutThenComplete => {
-                "three asynchronous fanout slots, one terminal parent reconciliation"
-            }
-            Self::FanoutPartialThenComplete => {
-                "three asynchronous fanout slots, one child failure, one terminal parent reconciliation"
-            }
             Self::SseChunkSplit => "tool_call JSON split across SSE frames (adversarial)",
             Self::MalformedJson => "one SSE event carries malformed JSON (adversarial)",
             Self::RateLimited => "HTTP 429 with Retry-After (adversarial)",
@@ -139,18 +109,6 @@ impl MockScenario {
             (
                 "cancellation_pending",
                 "pending response for cancellation journeys",
-            ),
-            (
-                "agent_then_complete",
-                "one asynchronous child agent, then launch acknowledgement",
-            ),
-            (
-                "fanout_then_complete",
-                "three asynchronous fanout slots, one terminal parent reconciliation",
-            ),
-            (
-                "fanout_partial_then_complete",
-                "three asynchronous fanout slots, one child failure, one terminal parent reconciliation",
             ),
             (
                 "sse_chunk_split",
@@ -400,253 +358,6 @@ async fn body_cancellation_pending(agent_id: &str, turn: u32) -> String {
     body_complete(agent_id, turn)
 }
 
-pub const AGENT_JOURNEY_CHILD_TASK: &str =
-    "Inspect the assigned work and return one evidence-backed finding.";
-
-fn is_agent_journey_child_request(body: &Value) -> bool {
-    body.get("message").and_then(Value::as_str) == Some(AGENT_JOURNEY_CHILD_TASK)
-        && body.pointer("/context/agent_type").and_then(Value::as_str) == Some("general-purpose")
-}
-
-async fn body_agent_round(body: &Value, round: u32) -> String {
-    if is_agent_journey_child_request(body) {
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let message = "child_evidence_visible: delegated review completed successfully.";
-        let mut stream = session_info("mock-run-agent-child");
-        stream.push_str(&text_delta(message));
-        stream.push_str(&text_done(message));
-        stream.push_str(&server_terminal_event("mock-run-agent-child", message, 100));
-        return stream;
-    }
-
-    match round {
-        0 => {
-            let mut stream = session_info("mock-run-agent-root");
-            let args = serde_json::json!({"query": "select:agent"});
-            stream.push_str(&tool_call_start(
-                "call-activate-agent",
-                "tool_search",
-                args.clone(),
-            ));
-            stream.push_str(&tool_request_for_run(
-                "call-activate-agent",
-                "tool_search",
-                args,
-                "mock-run-agent-root",
-                "mock-turn-chain-agent-root",
-            ));
-            stream.push_str(&done_event(40));
-            stream
-        }
-        1 => {
-            let mut stream = session_info("mock-run-agent-root");
-            let args = serde_json::json!({
-                "action": "spawn",
-                "description": "Mock child review",
-                "prompt": AGENT_JOURNEY_CHILD_TASK,
-                "agent_type": "general-purpose"
-            });
-            stream.push_str(&tool_call_start("call-spawn-child", "agent", args.clone()));
-            stream.push_str(&tool_request_for_run(
-                "call-spawn-child",
-                "agent",
-                args,
-                "mock-run-agent-root",
-                "mock-turn-chain-agent-root",
-            ));
-            stream.push_str(&done_event(80));
-            stream
-        }
-        _ => {
-            let message = "Parent acknowledged the child launch.";
-            let mut stream = session_info("mock-run-agent-root");
-            stream.push_str(&text_delta(message));
-            stream.push_str(&text_done(message));
-            stream.push_str(&server_terminal_event("mock-run-agent-root", message, 140));
-            stream
-        }
-    }
-}
-
-pub const FANOUT_JOURNEY_CHILD_TASKS: [&str; 3] = [
-    "Inspect storage behavior and return one evidence-backed finding.",
-    "Inspect runtime behavior and return one evidence-backed finding.",
-    "Inspect user experience and return one evidence-backed finding.",
-];
-pub const FANOUT_JOURNEY_STATUS_QUESTION: &str = "what_background_work_is_running";
-
-fn server_edge_profile(body: &Value) -> Option<&Value> {
-    body.pointer("/context/edge_profile")
-}
-
-fn server_message(body: &Value) -> Option<&str> {
-    body.get("message").and_then(Value::as_str)
-}
-
-fn server_fanout_journey_child_index(body: &Value) -> Option<usize> {
-    body.get("context")?;
-    let prompt = server_message(body)?;
-    FANOUT_JOURNEY_CHILD_TASKS
-        .iter()
-        .position(|candidate| *candidate == prompt)
-}
-
-async fn body_fanout_round(
-    body: &Value,
-    failed_child: Option<usize>,
-    completed_children: &AtomicU8,
-    held_response_release: Option<&tokio::sync::Notify>,
-    round: u32,
-) -> String {
-    let child_index = server_fanout_journey_child_index(body);
-    if let Some(index) = child_index {
-        match index {
-            0 => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
-            1 => tokio::time::sleep(std::time::Duration::from_millis(700)).await,
-            _ => match held_response_release {
-                Some(release) => release.notified().await,
-                None => tokio::time::sleep(std::time::Duration::from_secs(6)).await,
-            },
-        }
-        if failed_child == Some(index) {
-            let mut stream = session_info(&format!("mock-run-fanout-child-{index}"));
-            stream.push_str(&error_event(&format!(
-                "fanout_child_{}_failed_with_distinct_cause",
-                index + 1
-            )));
-            completed_children.fetch_or(1 << index, Ordering::Release);
-            return stream;
-        }
-        let message = format!("fanout_child_{}_evidence_visible", index + 1);
-        let mut stream = session_info(&format!("mock-run-fanout-child-{index}"));
-        stream.push_str(&text_delta(&message));
-        stream.push_str(&text_done(&message));
-        stream.push_str(&server_terminal_event(
-            &format!("mock-run-fanout-child-{index}"),
-            &message,
-            100,
-        ));
-        completed_children.fetch_or(1 << index, Ordering::Release);
-        return stream;
-    }
-
-    // Runtime reconciliation is a typed, already-authorized continuation of
-    // the existing fanout. Handle it before ordinary tool discovery so this
-    // journey fails if a terminal notification accidentally re-enters the
-    // delegation bootstrap and creates the work again.
-    let latest_user = server_message(body).unwrap_or_default();
-    if latest_user == astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE
-    {
-        let message = if failed_child.is_some() {
-            "Parent reconciled 2 completed and 1 failed slot exactly once."
-        } else {
-            "Parent reconciled one terminal fanout group exactly once."
-        };
-        let mut stream = session_info("mock-run-fanout-root");
-        stream.push_str(&text_delta(message));
-        stream.push_str(&text_done(message));
-        stream.push_str(&server_terminal_event("mock-run-fanout-root", message, 140));
-        return stream;
-    }
-    if latest_user == FANOUT_JOURNEY_STATUS_QUESTION {
-        let active_work = server_edge_profile(body)
-            .and_then(|profile| profile.get("runtime_volatile_injections"))
-            .and_then(Value::as_array)
-            .and_then(|injections| {
-                injections
-                    .iter()
-                    .find(|injection| injection["kind"] == "active_work_snapshot")
-            });
-        let has_running_group = active_work.is_some_and(|injection| {
-            injection["delivery_class"] == "required_context"
-                && injection["payload"]["authority"] == "runtime_producer"
-                && injection["payload"]["schema"] == "active_work_snapshot.v1"
-                && injection["payload"]["work_unit_observations"]
-                    .as_array()
-                    .is_some_and(|observations| {
-                        observations.iter().any(|observation| {
-                            observation["id"] == "mock-review-group"
-                                && observation["kind"] == "agent_fanout"
-                                && observation["status"] == "running"
-                        })
-                    })
-        });
-        let message = if has_running_group {
-            "Astra knows Three mock reviews are running as one background work group."
-        } else {
-            "ERROR: authoritative background work snapshot is missing."
-        };
-        let mut stream = session_info("mock-run-fanout-root");
-        stream.push_str(&text_delta(message));
-        stream.push_str(&text_done(message));
-        stream.push_str(&server_terminal_event("mock-run-fanout-root", message, 140));
-        return stream;
-    }
-
-    if round == 0 {
-        let mut stream = session_info("mock-run-fanout-root");
-        let args = serde_json::json!({"query": "select:agent_fanout"});
-        stream.push_str(&tool_call_start(
-            "call-activate-fanout",
-            "tool_search",
-            args.clone(),
-        ));
-        stream.push_str(&tool_request_for_run(
-            "call-activate-fanout",
-            "tool_search",
-            args,
-            "mock-run-fanout-root",
-            "mock-turn-chain-fanout-root",
-        ));
-        stream.push_str(&done_event(40));
-        return stream;
-    }
-    if round == 1 {
-        let mut stream = session_info("mock-run-fanout-root");
-        let args = serde_json::json!({
-            "action": "start",
-            "group_id": "mock-review-group",
-            "title": "Three mock reviews",
-            "target_count": 3,
-            // This is the production-shaped review fanout: qualitative
-            // complexity supplies a renewable persona slice, not a numeric
-            // child hard limit. The PTY journey below therefore guards the
-            // same code-review/deep configuration used by real audits.
-            "defaults": {"agent_type": "code-review", "complexity": "deep"},
-            "slots": FANOUT_JOURNEY_CHILD_TASKS.iter().enumerate().map(|(index, prompt)| {
-                serde_json::json!({
-                    "id": format!("review-{}", index + 1),
-                    "description": format!("Mock review {}", index + 1),
-                    "prompt": prompt,
-                })
-            }).collect::<Vec<_>>(),
-        });
-        stream.push_str(&tool_call_start(
-            "call-start-fanout",
-            "agent_fanout",
-            args.clone(),
-        ));
-        stream.push_str(&tool_request_for_run(
-            "call-start-fanout",
-            "agent_fanout",
-            args,
-            "mock-run-fanout-root",
-            "mock-turn-chain-fanout-root",
-        ));
-        stream.push_str(&done_event(80));
-        return stream;
-    }
-
-    // A launch receipt acknowledges accepted slots. Terminal reconciliation
-    // comes from the runtime only after every child has actually settled.
-    let message = "Three mock reviews are running.";
-    let mut stream = session_info("mock-run-fanout-root");
-    stream.push_str(&text_delta(message));
-    stream.push_str(&text_done(message));
-    stream.push_str(&server_terminal_event("mock-run-fanout-root", message, 140));
-    stream
-}
-
 // ─── Adversarial bodies (P1 hardening) ──────────────────────────────────────
 
 /// Split one `tool_call_start` event across multiple SSE frames.
@@ -745,6 +456,8 @@ fn body_text_only(agent_id: &str, turn: u32) -> String {
     s
 }
 
+// ─── Server state ─────────────────────────────────────────────────────────────
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IssuedToolRequestIdentity {
     session_id: String,
@@ -830,7 +543,6 @@ struct ServerState {
     received_requests: Arc<Mutex<Vec<Value>>>,
     issued_tool_requests: Arc<Mutex<Vec<IssuedToolRequestIdentity>>>,
     tool_results: Arc<Mutex<Vec<Value>>>,
-    completed_fanout_children: Arc<AtomicU8>,
     callback_ready: Arc<tokio::sync::Notify>,
     emitted_text: Arc<Mutex<Vec<(String, String)>>>,
     held_response_release: Option<Arc<tokio::sync::Notify>>,
@@ -920,17 +632,7 @@ fn orchestration_response(state: ServerState, request: Value) -> Response<axum::
                         round + 1,
                     )
                 }
-                MockScenario::AgentThenComplete => body_agent_round(&request, round).await,
-                _ => {
-                    body_fanout_round(
-                        &request,
-                        (state.scenario == MockScenario::FanoutPartialThenComplete).then_some(1),
-                        &state.completed_fanout_children,
-                        state.held_response_release.as_deref(),
-                        round,
-                    )
-                    .await
-                }
+                _ => unreachable!("only tool scenarios use an orchestration stream"),
             };
             let run_id = body
                 .lines()
@@ -1006,20 +708,8 @@ fn orchestration_response(state: ServerState, request: Value) -> Response<axum::
                             ))
                             .expect("receipt serializes");
                         event["tool_calls_count"] = count.into();
-                        event["observation_tool_calls_count"] =
-                            u32::from(state.scenario != MockScenario::ToolThenComplete).into();
-                        event["tools_used"] = if state.scenario == MockScenario::ToolThenComplete {
-                            serde_json::json!(["write_file"])
-                        } else {
-                            serde_json::json!([
-                                "tool_search",
-                                if state.scenario == MockScenario::AgentThenComplete {
-                                    "agent"
-                                } else {
-                                    "agent_fanout"
-                                }
-                            ])
-                        };
+                        event["observation_tool_calls_count"] = 0.into();
+                        event["tools_used"] = serde_json::json!(["write_file"]);
                         event["llm_rounds"] = (round + 1).into();
                         event["token_usage_coverage"]["attempts"] = (round + 1).into();
                         event["token_usage_coverage"]["provider_reported"] = (round + 1).into();
@@ -1109,11 +799,7 @@ async fn handle_chat_turn(
 
     if matches!(
         state.scenario,
-        MockScenario::ToolThenComplete
-            | MockScenario::ToolThenMissingTerminal
-            | MockScenario::AgentThenComplete
-            | MockScenario::FanoutThenComplete
-            | MockScenario::FanoutPartialThenComplete
+        MockScenario::ToolThenComplete | MockScenario::ToolThenMissingTerminal
     ) {
         return orchestration_response(state, request_body);
     }
@@ -1129,11 +815,6 @@ async fn handle_chat_turn(
             body_slow(&agent_id, turn, state.held_response_release.as_deref()).await
         }
         MockScenario::CancellationPending => body_cancellation_pending(&agent_id, turn).await,
-        MockScenario::AgentThenComplete
-        | MockScenario::FanoutThenComplete
-        | MockScenario::FanoutPartialThenComplete => {
-            unreachable!("delegation scenarios use one orchestration stream")
-        }
         MockScenario::SseChunkSplit => body_sse_chunk_split(&agent_id, turn),
         MockScenario::MalformedJson => body_malformed_json(&agent_id, turn),
         MockScenario::TextOnly => body_text_only(&agent_id, turn),
@@ -1379,7 +1060,11 @@ async fn handle_transcript(
     if let Some(request) = requests.first() {
         push(
             "user",
-            server_message(request).unwrap_or_default().to_owned(),
+            request
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             serde_json::json!([]),
             Value::Null,
         );
@@ -1439,7 +1124,6 @@ pub struct MockLlmServer {
     pub base_url: String,
     received_requests: Arc<Mutex<Vec<Value>>>,
     tool_results: Arc<Mutex<Vec<Value>>>,
-    completed_fanout_children: Arc<AtomicU8>,
     held_response_release: Option<Arc<tokio::sync::Notify>>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
@@ -1448,19 +1132,6 @@ impl MockLlmServer {
     /// Start the mock server on a random free port. Returns immediately.
     pub async fn start(scenario: MockScenario) -> Result<Self, String> {
         Self::start_inner(scenario, false).await
-    }
-
-    /// Start a fanout fixture whose final child remains live until explicitly
-    /// released. This gives lifecycle journeys an authoritative concurrency
-    /// boundary instead of racing a wall-clock delay.
-    pub async fn start_with_held_fanout_child(scenario: MockScenario) -> Result<Self, String> {
-        if !matches!(
-            scenario,
-            MockScenario::FanoutThenComplete | MockScenario::FanoutPartialThenComplete
-        ) {
-            return Err("held fanout child requires a fanout scenario".to_string());
-        }
-        Self::start_inner(scenario, true).await
     }
 
     /// Start the slow-response fixture at an explicit provider boundary.
@@ -1480,7 +1151,6 @@ impl MockLlmServer {
         let received_requests = Arc::new(Mutex::new(Vec::new()));
         let issued_tool_requests = Arc::new(Mutex::new(Vec::new()));
         let tool_results = Arc::new(Mutex::new(Vec::new()));
-        let completed_fanout_children = Arc::new(AtomicU8::new(0));
         let held_response_release = hold_response.then(|| Arc::new(tokio::sync::Notify::new()));
         let state = ServerState {
             scenario,
@@ -1488,7 +1158,6 @@ impl MockLlmServer {
             received_requests: received_requests.clone(),
             issued_tool_requests,
             tool_results: tool_results.clone(),
-            completed_fanout_children: completed_fanout_children.clone(),
             callback_ready: Arc::new(tokio::sync::Notify::new()),
             emitted_text: Arc::new(Mutex::new(Vec::new())),
             held_response_release: held_response_release.clone(),
@@ -1529,7 +1198,6 @@ impl MockLlmServer {
             base_url,
             received_requests,
             tool_results,
-            completed_fanout_children,
             held_response_release,
             _shutdown: tx,
         })
@@ -1541,12 +1209,6 @@ impl MockLlmServer {
             .lock()
             .map(|requests| requests.clone())
             .unwrap_or_default()
-    }
-
-    pub fn completed_fanout_children(&self) -> u32 {
-        self.completed_fanout_children
-            .load(Ordering::Acquire)
-            .count_ones()
     }
 
     /// Return the bounded callback bodies accepted by the mock server.
@@ -1609,142 +1271,123 @@ mod tests {
 
     #[tokio::test]
     async fn orchestration_stream_waits_for_exact_callbacks_and_closes_real_counts() {
-        for scenario in [
-            MockScenario::ToolThenComplete,
-            MockScenario::AgentThenComplete,
-            MockScenario::FanoutThenComplete,
-        ] {
-            let server = super::MockLlmServer::start(scenario).await.unwrap();
-            let client = reqwest::Client::new();
-            let mut response = client
-                .post(format!("{}/chat/stream", server.base_url))
-                .json(&serde_json::json!({"agent_id": "astra-cli", "message": "launch the review"}))
+        let server = super::MockLlmServer::start(MockScenario::ToolThenComplete)
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+        let mut response = client
+            .post(format!("{}/chat/stream", server.base_url))
+            .json(&serde_json::json!({"agent_id": "astra-cli", "message": "launch the review"}))
+            .send()
+            .await
+            .unwrap();
+        let mut full = String::new();
+        let mut stage = String::new();
+        while super::issued_tool_requests_from_sse(&stage).is_empty() {
+            let chunk = response
+                .chunk()
+                .await
+                .unwrap()
+                .expect("tool request before EOF");
+            stage.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        let identity = super::issued_tool_requests_from_sse(&stage).remove(0);
+        assert!(!stage.contains("turn_complete"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), response.chunk())
+                .await
+                .is_err()
+        );
+        let make_result = |request_id: String| {
+            astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: identity.session_id.clone(),
+                    run_id: identity.run_id.clone(),
+                    turn_chain_id: identity.turn_chain_id.clone(),
+                    request_id,
+                    edge_agent_id: "edge-fixture".to_owned(),
+                    status: "completed".to_owned(),
+                    output: "accepted launch receipt".to_owned(),
+                    duration_ms: 1,
+                    tool_result_fields: None,
+                },
+            )
+        };
+        let rejected = client
+            .post(format!("{}/tools/result", server.base_url))
+            .header(astra_thin_client::ASTRA_EDGE_ID_HEADER, "edge-fixture")
+            .json(&make_result("unissued".to_owned()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), response.chunk())
+                .await
+                .is_err()
+        );
+        for _ in 0..2 {
+            let accepted = client
+                .post(format!("{}/tools/result", server.base_url))
+                .header(astra_thin_client::ASTRA_EDGE_ID_HEADER, "edge-fixture")
+                .json(&make_result(identity.request_id.clone()))
                 .send()
                 .await
                 .unwrap();
-            let expected = if scenario == MockScenario::ToolThenComplete {
-                1
-            } else {
-                2
-            };
-            let mut full = String::new();
-            for _ in 0..expected {
-                let mut stage = String::new();
-                while super::issued_tool_requests_from_sse(&stage).is_empty() {
-                    let chunk = response
-                        .chunk()
-                        .await
-                        .unwrap()
-                        .expect("tool request before EOF");
-                    stage.push_str(std::str::from_utf8(&chunk).unwrap());
-                }
-                let identity = super::issued_tool_requests_from_sse(&stage).remove(0);
-                assert!(!stage.contains("turn_complete"));
-                assert!(
-                    tokio::time::timeout(std::time::Duration::from_millis(30), response.chunk())
-                        .await
-                        .is_err()
-                );
-                let make_result = |request_id: String| {
-                    astra_thin_client::ToolResultRequest::new_with_hash(
-                        astra_thin_client::ToolResultRequestParts {
-                            session_id: identity.session_id.clone(),
-                            run_id: identity.run_id.clone(),
-                            turn_chain_id: identity.turn_chain_id.clone(),
-                            request_id,
-                            edge_agent_id: "edge-fixture".to_owned(),
-                            status: "completed".to_owned(),
-                            output: "accepted launch receipt".to_owned(),
-                            duration_ms: 1,
-                            tool_result_fields: None,
-                        },
-                    )
-                };
-                let rejected = client
-                    .post(format!("{}/tools/result", server.base_url))
-                    .header(astra_thin_client::ASTRA_EDGE_ID_HEADER, "edge-fixture")
-                    .json(&make_result("unissued".to_owned()))
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
-                assert!(
-                    tokio::time::timeout(std::time::Duration::from_millis(30), response.chunk())
-                        .await
-                        .is_err()
-                );
-                for _ in 0..2 {
-                    let accepted = client
-                        .post(format!("{}/tools/result", server.base_url))
-                        .header(astra_thin_client::ASTRA_EDGE_ID_HEADER, "edge-fixture")
-                        .json(&make_result(identity.request_id.clone()))
-                        .send()
-                        .await
-                        .unwrap();
-                    assert!(accepted.status().is_success());
-                }
-                full.push_str(&stage);
-            }
-            while let Some(chunk) = response.chunk().await.unwrap() {
-                full.push_str(std::str::from_utf8(&chunk).unwrap());
-            }
-            let events: Vec<Value> = parse_sse_events(&full)
-                .iter()
-                .map(|event| serde_json::from_str(event).unwrap())
-                .collect();
-            let mut accum = astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default();
-            for event in &events {
-                astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
-                    &super::sse_line(event),
-                    &mut accum,
-                    &mut Vec::new(),
-                );
-            }
-            assert!(accum.usage_is_run_total);
-            assert_eq!(
-                accum.qualified_usage.unwrap().input_tokens(),
-                Some(if expected == 1 { 350 } else { 260 })
-            );
-            assert_eq!(
-                accum.current_request_input_tokens,
-                Some(if expected == 1 { 200 } else { 140 })
-            );
-            assert_eq!(accum.current_request_usage.unwrap().output_tokens, 50);
-            let terminals: Vec<_> = events
-                .iter()
-                .filter(|event| event["type"] == "turn_complete")
-                .collect();
-            assert_eq!(terminals.len(), 1);
-            let terminal = terminals[0];
-            assert_eq!(terminal["tool_calls_count"], expected);
-            assert_eq!(terminal["llm_rounds"], expected + 1);
-            let receipt: astra_turn_core::tool_ledger_receipt::ToolLedgerReceipt =
-                serde_json::from_value(terminal["tool_ledger_receipt"].clone()).unwrap();
-            assert!(receipt.is_complete());
-            assert_eq!(receipt.attempted, expected);
-            assert_eq!(server.received_requests().len(), 1);
-            if scenario == MockScenario::ToolThenComplete {
-                let page: astra_thin_client::SessionTranscriptPage = client
-                    .get(format!(
-                        "{}/sessions/mock-session/transcript?scope=root_conversation&limit=200",
-                        server.base_url
-                    ))
-                    .send()
-                    .await
-                    .unwrap()
-                    .json()
-                    .await
-                    .unwrap();
-                assert_eq!(page.items.len(), 4);
-                let call = &page.items[1].tool_calls[0];
-                let result = page.items[2].tool_result.as_ref().unwrap();
-                assert_eq!(call.tool_use_id, result.tool_use_id);
-                assert_eq!(call.name, "write_file");
-                assert_eq!(result.status.as_deref(), Some("completed"));
-                assert_eq!(page.items[2].content, "accepted launch receipt");
-                assert!(page.items[3].content.contains("wrote the requested file"));
-            }
+            assert!(accepted.status().is_success());
         }
+        full.push_str(&stage);
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            full.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        let events: Vec<Value> = parse_sse_events(&full)
+            .iter()
+            .map(|event| serde_json::from_str(event).unwrap())
+            .collect();
+        let mut accum = astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default();
+        for event in &events {
+            astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                &super::sse_line(event),
+                &mut accum,
+                &mut Vec::new(),
+            );
+        }
+        assert!(accum.usage_is_run_total);
+        assert_eq!(accum.qualified_usage.unwrap().input_tokens(), Some(350));
+        assert_eq!(accum.current_request_input_tokens, Some(200));
+        assert_eq!(accum.current_request_usage.unwrap().output_tokens, 50);
+        let terminals: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == "turn_complete")
+            .collect();
+        assert_eq!(terminals.len(), 1);
+        let terminal = terminals[0];
+        assert_eq!(terminal["tool_calls_count"], 1);
+        assert_eq!(terminal["llm_rounds"], 2);
+        let receipt: astra_turn_core::tool_ledger_receipt::ToolLedgerReceipt =
+            serde_json::from_value(terminal["tool_ledger_receipt"].clone()).unwrap();
+        assert!(receipt.is_complete());
+        assert_eq!(receipt.attempted, 1);
+        assert_eq!(server.received_requests().len(), 1);
+        let page: astra_thin_client::SessionTranscriptPage = client
+            .get(format!(
+                "{}/sessions/mock-session/transcript?scope=root_conversation&limit=200",
+                server.base_url
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 4);
+        let call = &page.items[1].tool_calls[0];
+        let result = page.items[2].tool_result.as_ref().unwrap();
+        assert_eq!(call.tool_use_id, result.tool_use_id);
+        assert_eq!(call.name, "write_file");
+        assert_eq!(result.status.as_deref(), Some("completed"));
+        assert_eq!(page.items[2].content, "accepted launch receipt");
+        assert!(page.items[3].content.contains("wrote the requested file"));
     }
 
     #[tokio::test]
@@ -1936,6 +1579,19 @@ mod tests {
             );
         }
         assert!(MockScenario::parse("nonexistent").is_none());
+        for retired in [
+            "agent_then_complete",
+            "agent",
+            "fanout_then_complete",
+            "fanout",
+            "fanout_partial_then_complete",
+            "fanout_partial",
+        ] {
+            assert!(
+                MockScenario::parse(retired).is_none(),
+                "retired lifecycle scenario '{retired}' must not remain selectable"
+            );
+        }
         // Aliases
         assert_eq!(
             MockScenario::parse("tool"),

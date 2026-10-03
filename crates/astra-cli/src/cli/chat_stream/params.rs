@@ -547,6 +547,8 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) perm_manager: &'a mut PermissionManager,
     pub(crate) verbose_mode: bool,
     pub(crate) render_policy: crate::cli::stream::stream_render::RenderPolicy,
+    /// Includes caller model intent and optional profile selection; resolved
+    /// `model`/`offering_id` alone must never establish an explicit override.
     pub(crate) cli_context: Option<&'a CliContext>,
 
     pub(crate) recent_tools: &'a [String],

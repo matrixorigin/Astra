@@ -119,19 +119,19 @@ pub struct TeamDefinition {
 
 /// Budget constraints applied to a team execution.
 ///
-/// `max_duration_secs` is enforced as a hard timeout (execution is cancelled).
-/// `max_tokens` and `max_cost_usd` are **post-execution checks** — the execution
-/// runs to completion and the budget violation is reported afterward, because
-/// token counts are only known after LLM responses arrive.
+/// `max_duration_secs` requests cooperative cancellation after the execution
+/// phase budget; preparation and cleanup are not currently included.
+/// `max_tokens` is checked against returned child usage after execution.
+/// `max_cost_usd` is configuration only: cost enforcement is not yet wired.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TeamBudget {
-    /// Maximum cost in USD for the entire team execution.
+    /// Requested cost limit in USD; currently not enforced.
     #[serde(default)]
     pub max_cost_usd: f64,
     /// Maximum total tokens (prompt + completion) across all agents.
     #[serde(default)]
     pub max_tokens: u64,
-    /// Maximum wall-clock time in seconds for the entire execution.
+    /// Execution-phase cancellation budget in seconds (excludes preparation).
     #[serde(default)]
     pub max_duration_secs: u64,
 }
@@ -167,7 +167,7 @@ pub enum TeamCoordination {
 /// Lightweight member declaration within a team.
 ///
 /// Resolved to a full [`AgentProfile`] at execution time via [`resolve_member_to_profile`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TeamMemberDef {
     pub role: String,
@@ -176,6 +176,19 @@ pub struct TeamMemberDef {
     pub agent_id: Option<String>,
     pub system_prompt: Option<String>,
     pub skills: Vec<String>,
+    /// Optional execution-tool allowlist. `None` inherits the admitted tool
+    /// surface; `Some(empty)` is an explicit deny-all.
+    #[serde(default)]
+    pub allow_tools: Option<Vec<String>>,
+    /// Whether this member is restricted to read-only execution.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Optional initial adaptive turn slice.
+    #[serde(default)]
+    pub initial_turns: Option<u32>,
+    /// Optional hard maximum turn budget.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
     pub model_selection: Option<astra_turn_types::ModelSelection>,
     pub mcp_servers: Vec<String>,
     /// Whether this member can delegate to sub-agents.  
@@ -244,6 +257,12 @@ pub fn resolve_member_to_profile(member: &TeamMemberDef, team: &TeamDefinition) 
         profile.mcp_servers = member.mcp_servers.clone();
     }
 
+    // Preserve the execution controls independently from the skill selector.
+    profile.allow_tools = member.allow_tools.clone();
+    profile.read_only = member.read_only;
+    profile.initial_turns = member.initial_turns;
+    profile.max_turns = member.max_turns;
+
     // Override delegation settings from member def
     if member.can_delegate {
         profile.can_delegate = true;
@@ -285,6 +304,8 @@ pub enum TeamValidationError {
     DuplicateAgentIds(Vec<String>),
     /// Budget contains invalid values.
     InvalidBudget(String),
+    /// A member contains an invalid canonical profile control.
+    InvalidMember(String),
 }
 
 impl std::fmt::Display for TeamValidationError {
@@ -300,23 +321,20 @@ impl std::fmt::Display for TeamValidationError {
             Self::InvalidBudget(msg) => {
                 write!(f, "invalid budget: {msg}")
             }
+            Self::InvalidMember(msg) => {
+                write!(f, "invalid team member: {msg}")
+            }
         }
     }
 }
 
-/// Validate a team definition before execution.
+/// Validate a team configuration, including an unfinished member roster.
 ///
 /// Checks:
-/// - Non-empty member list
 /// - No duplicate roles
 /// - No duplicate agent IDs (after resolution)
 pub fn validate_team(team: &TeamDefinition) -> Result<(), Vec<TeamValidationError>> {
     let mut errors = Vec::new();
-
-    if team.members.is_empty() {
-        errors.push(TeamValidationError::EmptyMembers);
-        return Err(errors);
-    }
 
     // Check duplicate roles
     let mut role_counts: HashMap<&str, usize> = HashMap::new();
@@ -340,6 +358,37 @@ pub fn validate_team(team: &TeamDefinition) -> Result<(), Vec<TeamValidationErro
             .clone()
             .unwrap_or_else(|| format!("team-{}-{}", team.name, m.role));
         *id_counts.entry(id).or_default() += 1;
+
+        if m.agent_id
+            .as_deref()
+            .is_some_and(|agent_id| agent_id.trim().is_empty())
+        {
+            errors.push(TeamValidationError::InvalidMember(format!(
+                "role '{}' agent_id must not be empty",
+                m.role
+            )));
+        }
+
+        if m.initial_turns == Some(0) {
+            errors.push(TeamValidationError::InvalidMember(format!(
+                "role '{}' initial_turns must be positive",
+                m.role
+            )));
+        }
+        if m.max_turns == Some(0) {
+            errors.push(TeamValidationError::InvalidMember(format!(
+                "role '{}' max_turns must be positive",
+                m.role
+            )));
+        }
+        if let (Some(initial), Some(maximum)) = (m.initial_turns, m.max_turns) {
+            if initial > maximum {
+                errors.push(TeamValidationError::InvalidMember(format!(
+                    "role '{}' initial_turns cannot exceed max_turns",
+                    m.role
+                )));
+            }
+        }
     }
     let dup_ids: Vec<String> = id_counts
         .into_iter()
@@ -390,6 +439,9 @@ pub fn resolve_team(
     parent_run_id: &str,
     session_id: &str,
 ) -> Result<(DelegationRequest, Vec<AgentProfile>), String> {
+    if team.members.is_empty() {
+        return Err(TeamValidationError::EmptyMembers.to_string());
+    }
     // Validate first
     validate_team(team).map_err(|errs| {
         errs.iter()
@@ -652,7 +704,7 @@ pub trait TeamPersistenceService: Send + Sync {
     /// principal.
     async fn ensure_builtins(&self, user_id: &str) -> Result<(), String>;
 
-    async fn save_team(&self, team: &TeamDefinition) -> Result<(), String>;
+    async fn save_team(&self, team: &TeamDefinition) -> Result<TeamDefinition, String>;
     async fn load_team(&self, user_id: &str, name: &str) -> Result<Option<TeamDefinition>, String>;
     async fn load_team_by_id(
         &self,
@@ -708,10 +760,11 @@ pub trait TeamPersistenceService: Send + Sync {
 
     // ── Snapshots ───────────────────────────────────────────────
 
-    /// Save a team snapshot. Default: no-op.
-    async fn save_snapshot(&self, _snapshot: &TeamSnapshotRecord) -> Result<(), String> {
-        Ok(())
-    }
+    /// Save a team snapshot and return its accepted identity and contents.
+    async fn save_snapshot(
+        &self,
+        snapshot: &TeamSnapshotRecord,
+    ) -> Result<TeamSnapshotRecord, String>;
 
     /// List snapshots for a team, most recent first. Default: empty.
     async fn list_snapshots(
@@ -736,14 +789,12 @@ pub trait TeamPersistenceService: Send + Sync {
         team_snapshot_page_from_records(snapshots, limit, cursor)
     }
 
-    /// Find a snapshot by exact ID or unique prefix. Default: None.
+    /// Find an owner-scoped snapshot by its complete, exact ID.
     async fn find_snapshot(
         &self,
-        _snapshot_id: &str,
-        _user_id: &str,
-    ) -> Result<Option<TeamSnapshotRecord>, String> {
-        Ok(None)
-    }
+        snapshot_id: &str,
+        user_id: &str,
+    ) -> Result<Option<TeamSnapshotRecord>, String>;
 
     /// Delete a snapshot by ID. Returns true if found and deleted.
     async fn delete_snapshot(&self, _snapshot_id: &str, _user_id: &str) -> Result<bool, String> {
@@ -803,11 +854,11 @@ impl TeamPersistenceService for InMemoryTeamStore {
         Ok(())
     }
 
-    async fn save_team(&self, team: &TeamDefinition) -> Result<(), String> {
+    async fn save_team(&self, team: &TeamDefinition) -> Result<TeamDefinition, String> {
         let key = format!("{}:{}", team.user_id, team.name);
         let mut map = self.teams.write().map_err(|e| e.to_string())?;
         map.insert(key, team.clone());
-        Ok(())
+        Ok(team.clone())
     }
 
     async fn load_team(&self, user_id: &str, name: &str) -> Result<Option<TeamDefinition>, String> {
@@ -940,10 +991,13 @@ impl TeamPersistenceService for InMemoryTeamStore {
 
     // ── Snapshots ───────────────────────────────────────────────
 
-    async fn save_snapshot(&self, snapshot: &TeamSnapshotRecord) -> Result<(), String> {
+    async fn save_snapshot(
+        &self,
+        snapshot: &TeamSnapshotRecord,
+    ) -> Result<TeamSnapshotRecord, String> {
         let mut snaps = self.snapshots.write().map_err(|e| e.to_string())?;
         snaps.push(snapshot.clone());
-        Ok(())
+        Ok(snapshot.clone())
     }
 
     async fn list_snapshots(
@@ -985,22 +1039,10 @@ impl TeamPersistenceService for InMemoryTeamStore {
         user_id: &str,
     ) -> Result<Option<TeamSnapshotRecord>, String> {
         let snaps = self.snapshots.read().map_err(|e| e.to_string())?;
-        // Exact match first
-        if let Some(s) = snaps
+        Ok(snaps
             .iter()
             .find(|s| s.snapshot_id == snapshot_id && s.user_id == user_id)
-        {
-            return Ok(Some(s.clone()));
-        }
-        // Prefix match — return only if unique
-        let matches: Vec<_> = snaps
-            .iter()
-            .filter(|s| s.user_id == user_id && s.snapshot_id.starts_with(snapshot_id))
-            .collect();
-        match matches.len() {
-            1 => Ok(Some(matches[0].clone())),
-            _ => Ok(None),
-        }
+            .cloned())
     }
 
     async fn delete_snapshot(&self, snapshot_id: &str, user_id: &str) -> Result<bool, String> {
@@ -1172,7 +1214,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         MatrixOneTeamStore::ensure_builtins(self, user_id).await
     }
 
-    async fn save_team(&self, team: &TeamDefinition) -> Result<(), String> {
+    async fn save_team(&self, team: &TeamDefinition) -> Result<TeamDefinition, String> {
         let coordination_json =
             serde_json::to_string(&team.coordination).map_err(|e| e.to_string())?;
         let members_json = serde_json::to_string(&team.members).map_err(|e| e.to_string())?;
@@ -1249,7 +1291,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
             Err(error) => return Err(format!("team INSERT failed: {error}")),
         }
 
-        Ok(())
+        Ok(team.clone())
     }
 
     async fn load_team(&self, user_id: &str, name: &str) -> Result<Option<TeamDefinition>, String> {
@@ -1486,7 +1528,10 @@ impl TeamPersistenceService for MatrixOneTeamStore {
 
     // ── Snapshots ───────────────────────────────────────────────
 
-    async fn save_snapshot(&self, snapshot: &TeamSnapshotRecord) -> Result<(), String> {
+    async fn save_snapshot(
+        &self,
+        snapshot: &TeamSnapshotRecord,
+    ) -> Result<TeamSnapshotRecord, String> {
         sqlx::query(
             "INSERT INTO team_snapshots \
              (snapshot_id, team_name, user_id, label, git_commit, session_id, \
@@ -1503,7 +1548,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("snapshot INSERT failed: {e}"))?;
-        Ok(())
+        Ok(snapshot.clone())
     }
 
     async fn list_snapshots(
@@ -1802,6 +1847,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     mcp_servers: vec![],
                     can_delegate: false,
                     max_delegation_depth: 0,
+                    ..Default::default()
                 },
                 TeamMemberDef {
                     role: "reviewer".to_string(),
@@ -1814,8 +1860,9 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     skills: vec!["review-changes".to_string()],
                     model_selection: None,
                     mcp_servers: vec![],
-                    can_delegate: false,
-                    max_delegation_depth: 0,
+                    can_delegate: true,
+                    max_delegation_depth: 1,
+                    ..Default::default()
                 },
             ],
             context: HashMap::new(),
@@ -1846,6 +1893,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     mcp_servers: vec![],
                     can_delegate: false,
                     max_delegation_depth: 0,
+                    ..Default::default()
                 },
                 TeamMemberDef {
                     role: "synthesizer".to_string(),
@@ -1856,8 +1904,9 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     skills: vec![],
                     model_selection: None,
                     mcp_servers: vec![],
-                    can_delegate: false,
-                    max_delegation_depth: 0,
+                    can_delegate: true,
+                    max_delegation_depth: 1,
+                    ..Default::default()
                 },
             ],
             context: HashMap::new(),
@@ -1886,8 +1935,9 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     skills: vec![],
                     model_selection: None,
                     mcp_servers: vec![],
-                    can_delegate: false,
-                    max_delegation_depth: 0,
+                    can_delegate: true,
+                    max_delegation_depth: 1,
+                    ..Default::default()
                 },
                 TeamMemberDef {
                     role: "implementer".to_string(),
@@ -1900,6 +1950,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     mcp_servers: vec![],
                     can_delegate: false,
                     max_delegation_depth: 0,
+                    ..Default::default()
                 },
                 TeamMemberDef {
                     role: "tester".to_string(),
@@ -1912,6 +1963,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     mcp_servers: vec![],
                     can_delegate: false,
                     max_delegation_depth: 0,
+                    ..Default::default()
                 },
             ],
             context: HashMap::new(),
@@ -1952,10 +2004,15 @@ mod tests {
                     agent_id: Some("coder-agent".to_string()),
                     system_prompt: None,
                     skills: vec!["edit".to_string()],
+                    allow_tools: Some(vec!["read_file".to_string()]),
+                    read_only: true,
+                    initial_turns: Some(2),
+                    max_turns: Some(5),
                     model_selection: None,
                     mcp_servers: vec![],
                     can_delegate: false,
                     max_delegation_depth: 0,
+                    ..Default::default()
                 },
                 TeamMemberDef {
                     role: "reviewer".to_string(),
@@ -1966,6 +2023,7 @@ mod tests {
                     mcp_servers: vec!["github".to_string()],
                     can_delegate: false,
                     max_delegation_depth: 0,
+                    ..Default::default()
                 },
             ],
             context: HashMap::from([("project".to_string(), "test-project".to_string())]),
@@ -2051,6 +2109,10 @@ mod tests {
         let profile = resolve_member_to_profile(&team.members[0], &team);
         assert_eq!(profile.agent_id, "coder-agent");
         assert_eq!(profile.skill_filter, vec!["edit"]);
+        assert_eq!(profile.allow_tools, Some(vec!["read_file".to_string()]));
+        assert!(profile.read_only);
+        assert_eq!(profile.initial_turns, Some(2));
+        assert_eq!(profile.max_turns, Some(5));
         assert!(profile.model_selection.is_none());
         assert_eq!(profile.tier, AgentTier::User);
         assert!(!profile.can_delegate);
@@ -2086,6 +2148,17 @@ mod tests {
         let team = test_team();
         let profile = resolve_member_to_profile(&team.members[1], &team);
         assert_eq!(profile.system_prompt.as_deref(), Some("Review carefully"));
+    }
+
+    #[test]
+    fn validate_team_rejects_non_positive_member_turn_controls() {
+        let mut team = test_team();
+        team.members[0].initial_turns = Some(0);
+        let errors = validate_team(&team).unwrap_err();
+        assert!(errors.iter().any(|error| {
+            matches!(error, TeamValidationError::InvalidMember(message)
+                if message.contains("initial_turns must be positive"))
+        }));
     }
 
     #[tokio::test]
@@ -2278,6 +2351,7 @@ mod tests {
                 mcp_servers: vec!["github".to_string()],
                 can_delegate: false,
                 max_delegation_depth: 0,
+                ..Default::default()
             },
             TeamMemberDef {
                 role: "reviewer".to_string(),
@@ -2288,6 +2362,7 @@ mod tests {
                 mcp_servers: vec![],
                 can_delegate: false,
                 max_delegation_depth: 0,
+                ..Default::default()
             },
         ];
 
@@ -2524,11 +2599,14 @@ mod tests {
     // ─── T-2: Validation Tests ─────────────────────────────────────────────
 
     #[test]
-    fn validate_team_empty_members() {
+    fn draft_team_is_valid_but_cannot_execute() {
         let mut team = test_team();
         team.members.clear();
-        let err = validate_team(&team).unwrap_err();
-        assert!(err.contains(&TeamValidationError::EmptyMembers));
+        assert!(validate_team(&team).is_ok());
+        assert_eq!(
+            resolve_team(&team, "task", "parent", "session").unwrap_err(),
+            TeamValidationError::EmptyMembers.to_string()
+        );
     }
 
     #[test]

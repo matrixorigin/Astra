@@ -1319,6 +1319,8 @@ fn build_ws_chat_request(
     is_plan_subtask: Option<bool>,
 ) -> astra_services::runs::ChatRequestData {
     astra_services::runs::ChatRequestData {
+        agent_profile_selection: None,
+        admitted_agent_profiles: None,
         model_catalog_reader: None,
         message: content.to_string(),
         user_intent,

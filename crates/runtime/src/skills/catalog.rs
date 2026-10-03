@@ -35,7 +35,7 @@ const SERVER_CATALOG_DB_PAGE_SIZE: u32 = 500;
 const SERVER_CATALOG_DB_MAX_ROWS: u32 = 5_000;
 
 /// Build the full catalog visible to one authenticated user on this API server.
-pub fn build_server_visible_skill_registry(
+pub async fn build_server_visible_skill_registry(
     skill_service: Option<Arc<dyn SkillService>>,
     user_id: &str,
 ) -> Option<Arc<UnifiedSkillRegistry>> {
@@ -50,82 +50,15 @@ pub fn build_server_visible_skill_registry(
     }
 
     let registry = Arc::new(registry);
-    discover_registry_now(&registry);
+    if let Err(source) = registry.discover_all().await {
+        tracing::warn!(error = %source, "skill catalog discovery failed");
+    }
 
     if registry.is_empty() {
         None
     } else {
         Some(registry)
     }
-}
-
-#[derive(Clone, Copy)]
-enum RegistryDiscoveryScope {
-    LocalBootstrap,
-    All,
-}
-
-fn discover_registry_with_scope_now(
-    registry: &Arc<UnifiedSkillRegistry>,
-    scope: RegistryDiscoveryScope,
-) {
-    fn log_discovery_result(result: Result<(), astra_skills::traits::SkillError>) {
-        if let Err(source) = result {
-            tracing::warn!(error = %source, "skill catalog discovery failed");
-        }
-    }
-
-    async fn discover(
-        registry: Arc<UnifiedSkillRegistry>,
-        scope: RegistryDiscoveryScope,
-    ) -> Result<(), astra_skills::traits::SkillError> {
-        match scope {
-            RegistryDiscoveryScope::LocalBootstrap => {
-                registry.discover_local_bootstrap().await?;
-            }
-            RegistryDiscoveryScope::All => {
-                registry.discover_all().await?;
-            }
-        }
-        Ok(())
-    }
-
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let registry = Arc::clone(registry);
-        match handle.runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::MultiThread => {
-                log_discovery_result(tokio::task::block_in_place(|| {
-                    handle.block_on(discover(registry, scope))
-                }));
-            }
-            _ => {
-                let joined = std::thread::scope(|thread_scope| {
-                    thread_scope
-                        .spawn(|| handle.block_on(discover(registry, scope)))
-                        .join()
-                });
-                match joined {
-                    Ok(result) => log_discovery_result(result),
-                    Err(_) => tracing::warn!("skill catalog discovery thread panicked"),
-                }
-            }
-        }
-    }
-}
-
-/// Discover providers on a synchronously built registry.
-///
-/// The server run-state builder is synchronous today. Keep the blocking bridge
-/// centralized here so handler/runtime paths use the same discovery semantics
-/// and future async refactors have one place to replace.
-pub fn discover_registry_now(registry: &Arc<UnifiedSkillRegistry>) {
-    discover_registry_with_scope_now(registry, RegistryDiscoveryScope::All);
-}
-
-/// Build the immediately usable local capability baseline without touching a
-/// network or subprocess-backed provider.
-pub fn discover_local_registry_now(registry: &Arc<UnifiedSkillRegistry>) {
-    discover_registry_with_scope_now(registry, RegistryDiscoveryScope::LocalBootstrap);
 }
 
 /// Render a visible server catalog into the legacy `/skills` list response.

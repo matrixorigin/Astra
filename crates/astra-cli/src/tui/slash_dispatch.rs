@@ -360,6 +360,10 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
     }
 
     match resolved {
+        "/team" => {
+            ctx.show_info("Use /team run <team> --lead-agent-id <agent_id> <task>. Configure teams with astra team.".to_string());
+            SlashResult::Handled
+        }
         // ── Exit ────────────────────────────────────────────────────
         "/exit" => SlashResult::Exit,
         "/stop" => {
@@ -3128,11 +3132,13 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
         return;
     }
     let Some(name) = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name)) else {
+        ctx.state.cli_context.select_model(None);
         ctx.state.model = None;
         ctx.bottom_pane.footer.model = None;
         ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
         return;
     };
+    ctx.state.cli_context.select_model(Some(name));
     ctx.state.model = Some((name.to_string()).into());
     ctx.bottom_pane.footer.model = Some(name.to_string());
     ctx.show_response(format!("Set model to {name}"));
@@ -3141,6 +3147,7 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
 /// `/model clear` — unset the session model. Reports the change to
 /// scrollback so the user sees the footer switch.
 async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
+    ctx.state.cli_context.select_model(None);
     ctx.state.model = None;
     ctx.bottom_pane.footer.model = None;
     ctx.show_response("Model selection cleared — choose a model before the next turn.".into());

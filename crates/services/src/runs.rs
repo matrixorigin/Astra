@@ -1019,6 +1019,73 @@ pub struct SessionAdmissionFacts {
     pub active_plan_id: Option<String>,
 }
 
+/// Configuration selection only; the Server resolves owner-scoped authority.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProfileSelection {
+    pub team_id: String,
+    pub lead_agent_id: Option<String>,
+}
+
+/// Immutable admitted configuration. Runtime registries and credentials are
+/// deliberately not part of the protected run-start facts.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProfileSnapshot {
+    pub owner_user_id: String,
+    pub source_team_id: String,
+    pub lead_agent_id: Option<String>,
+    pub profiles: Vec<crate::coordination::AgentProfile>,
+}
+
+impl std::fmt::Debug for AgentProfileSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentProfileSnapshot")
+            .field("profile_count", &self.profiles.len())
+            .field("has_selected_lead", &self.lead_agent_id.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgentProfileSnapshot {
+    /// Rebuild the existing registry from protected facts, never from a
+    /// client-authored registry or last-writer-wins map.
+    pub fn registry(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<crate::coordination::AgentProfileRegistry, String> {
+        if self.owner_user_id != owner_user_id || self.source_team_id.trim().is_empty() {
+            return Err("agent profile snapshot owner or source is invalid".into());
+        }
+        if self.profiles.is_empty() || self.profiles.len() > 64 {
+            return Err("agent profile snapshot requires between 1 and 64 profiles".into());
+        }
+        if serde_json::to_vec(self)
+            .map_err(|error| error.to_string())?
+            .len()
+            > 262_144
+        {
+            return Err("agent profile snapshot exceeds its byte budget".into());
+        }
+        let mut registry = crate::coordination::AgentProfileRegistry::new();
+        for profile in &self.profiles {
+            if !profile.mcp_servers.is_empty() {
+                return Err("profile MCP selection is not supported by the shared execution binding; inherit the authorized parent MCP scope".into());
+            }
+            registry.register(profile.clone())?;
+        }
+        if self
+            .lead_agent_id
+            .as_ref()
+            .is_some_and(|lead| registry.get(lead).is_none())
+        {
+            return Err("selected lead is not an admitted member".into());
+        }
+        Ok(registry)
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
     /// Trusted, non-serialized observation binding. No catalog is read until
@@ -1038,6 +1105,9 @@ pub struct ChatRequestData {
     pub run_start_idempotency: Option<RunStartIdempotency>,
     pub full_llm_capture: bool,
     pub agent_id: Option<String>,
+    pub agent_profile_selection: Option<AgentProfileSelection>,
+    /// Server-materialized facts; never accepted from client transports.
+    pub admitted_agent_profiles: Option<std::sync::Arc<AgentProfileSnapshot>>,
     pub model: Option<String>,
     /// Optional exact-name assertion for a client-prepared child Offering.
     /// This is not execution authority; the Server freshly admits the
@@ -27512,6 +27582,47 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admitted_profile_snapshot_rebuild_preserves_controls_and_rejects_invalid_authority() {
+        use crate::coordination::{AgentProfile, AgentTier};
+        let mut member = AgentProfile::new("member", "Member", AgentTier::System);
+        member.allow_tools = Some(Vec::new());
+        member.read_only = true;
+        member.system_prompt = Some("private member instructions".into());
+        member.max_turns = Some(3);
+        let snapshot = super::AgentProfileSnapshot {
+            owner_user_id: "owner".into(),
+            source_team_id: "team".into(),
+            lead_agent_id: Some("member".into()),
+            profiles: vec![member.clone()],
+        };
+        let restored: super::AgentProfileSnapshot =
+            serde_json::from_value(serde_json::to_value(&snapshot).unwrap()).unwrap();
+        assert!(!format!("{restored:?}").contains("private member instructions"));
+        assert_eq!(
+            restored.registry("owner").unwrap().get("member"),
+            Some(&member)
+        );
+        assert!(restored.registry("other-owner").is_err());
+        let mut invalid = restored.clone();
+        invalid.profiles.push(member);
+        assert!(invalid.registry("owner").is_err());
+        invalid = restored.clone();
+        invalid.lead_agent_id = Some("absent".into());
+        assert!(invalid.registry("owner").is_err());
+        invalid = restored.clone();
+        invalid.profiles[0].mcp_servers = vec!["unresolved-binding".into()];
+        assert!(
+            invalid
+                .registry("owner")
+                .err()
+                .unwrap()
+                .contains("MCP selection")
+        );
+        invalid = restored;
+        invalid.profiles[0].max_turns = Some(0);
+        assert!(invalid.registry("owner").is_err());
+    }
     use super::*;
     use serde_json::json;
     use std::sync::Arc;
@@ -39856,6 +39967,8 @@ mod tests {
         forward_headers.insert("__astra_connection_tokens".to_string(), "x-hop".to_string());
 
         let request = ChatRequestData {
+            agent_profile_selection: None,
+            admitted_agent_profiles: None,
             model_catalog_reader: None,
             message: "hi".to_string(),
             user_intent: None,
@@ -40064,6 +40177,8 @@ mod tests {
     #[test]
     fn chat_request_data_debug_redacts_runtime_auth_value() {
         let request = ChatRequestData {
+            agent_profile_selection: None,
+            admitted_agent_profiles: None,
             model_catalog_reader: None,
             message: "hi".to_string(),
             user_intent: None,
@@ -40188,6 +40303,8 @@ mod tests {
             .create_run(
                 "u1".to_string(),
                 ChatRequestData {
+                    agent_profile_selection: None,
+                    admitted_agent_profiles: None,
                     model_catalog_reader: None,
                     message: "hi".to_string(),
                     user_intent: None,

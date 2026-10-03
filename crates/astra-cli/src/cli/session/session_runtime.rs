@@ -12,18 +12,18 @@ use astra_services::{
 use astra_text_utils::str_preview::prefix_chars;
 use crossterm::style::Stylize;
 use std::collections::HashSet;
-pub(crate) fn create_pipeline_modules(
+pub(crate) async fn create_pipeline_modules(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> PipelineModules {
-    create_pipeline_modules_inner(api, profile, true, true, None)
+    create_pipeline_modules_inner(api, profile, true, true, None).await
 }
 
-pub(crate) fn create_pipeline_modules_quiet(
+pub(crate) async fn create_pipeline_modules_quiet(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> PipelineModules {
-    create_pipeline_modules_inner(api, profile, false, true, None)
+    create_pipeline_modules_inner(api, profile, false, true, None).await
 }
 
 /// Build the local interactive baseline and defer every external provider.
@@ -34,12 +34,12 @@ pub(crate) fn create_pipeline_modules_quiet(
 /// session's resolved workspace root (git root preferred) so skills stay
 /// visible even when the process cwd differs from the tool execution workdir.
 /// `None` falls back to the process current directory.
-pub(crate) fn create_tui_pipeline_modules(
+pub(crate) async fn create_tui_pipeline_modules(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     project_root: Option<&std::path::Path>,
 ) -> PipelineModules {
-    create_pipeline_modules_inner(api, profile, false, false, project_root)
+    create_pipeline_modules_inner(api, profile, false, false, project_root).await
 }
 
 /// Resolve the astra server base URL. Returns `None` when no server
@@ -162,7 +162,7 @@ pub(crate) async fn discover_external_pipeline_capabilities(
     }
 }
 
-fn create_pipeline_modules_inner(
+async fn create_pipeline_modules_inner(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     announce_skills: bool,
@@ -190,13 +190,14 @@ fn create_pipeline_modules_inner(
     );
     let unified_skill_registry = if connect_external {
         astra_runtime::capabilities::build_cli_local_skill_registry(remote_catalog, project_root)
+            .await
     } else {
         astra_runtime::capabilities::build_cli_local_skill_registry_bootstrap(
             remote_catalog,
             project_root,
         )
+        .await
     };
-    let handle = tokio::runtime::Handle::current();
 
     // Initialize MCP client manager and connect any MCP servers declared in
     // skill manifests. This registers `skill://` resources from connected
@@ -215,83 +216,59 @@ fn create_pipeline_modules_inner(
         if let Some(root_path) = workspace_root.as_deref() {
             let uri = format!("file://{}", root_path.display());
             let root = rmcp::model::Root::new(uri).with_name("workspace");
-            tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    let roots = mcp_manager.read().await.roots().clone();
-                    roots.write().await.push(root);
-                })
-            });
+            let roots = mcp_manager.read().await.roots().clone();
+            roots.write().await.push(root);
         }
     }
 
     if connect_external {
         let mcp_configs = manifest_loader::collect_mcp_server_configs();
         if !mcp_configs.is_empty() {
-            let mgr = mcp_manager.clone();
-            let reg = unified_skill_registry.clone();
-            let _ = std::thread::scope(|s| {
-                s.spawn(|| {
-                    handle.block_on(async {
-                        let results = connect_mcp_configs(mcp_configs, &mgr, &reg).await;
+            let results =
+                connect_mcp_configs(mcp_configs, &mcp_manager, &unified_skill_registry).await;
 
-                        if announce_skills {
-                            // Count MCP tools per server (0 is fine — e.g. memoria).
-                            let manager = mgr.read().await;
-                            let mut tool_counts: std::collections::HashMap<String, usize> =
-                                std::collections::HashMap::new();
-                            for (server, _) in manager.all_tools() {
-                                *tool_counts.entry(server.to_string()).or_insert(0) += 1;
-                            }
+            if announce_skills {
+                // Count MCP tools per server (0 is fine — e.g. memoria).
+                let manager = mcp_manager.read().await;
+                let mut tool_counts: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                for (server, _) in manager.all_tools() {
+                    *tool_counts.entry(server.to_string()).or_insert(0) += 1;
+                }
 
-                            let ok: Vec<&str> = results
-                                .iter()
-                                .filter_map(|(n, r)| r.is_ok().then_some(n.as_str()))
-                                .collect();
-                            let failures: Vec<(&str, &str)> = results
-                                .iter()
-                                .filter_map(|(n, r)| {
-                                    r.as_ref().err().map(|e| (n.as_str(), e.as_str()))
-                                })
-                                .collect();
+                let ok: Vec<&str> = results
+                    .iter()
+                    .filter_map(|(n, r)| r.is_ok().then_some(n.as_str()))
+                    .collect();
+                let failures: Vec<(&str, &str)> = results
+                    .iter()
+                    .filter_map(|(n, r)| r.as_ref().err().map(|e| (n.as_str(), e.as_str())))
+                    .collect();
 
-                            // ✓ N MCP server(s) connected: name1 (12)  ·  name2  ·  name3 (5)
-                            if !ok.is_empty() {
-                                let list = ok
-                                    .iter()
-                                    .map(|name| {
-                                        match tool_counts.get(*name).copied().unwrap_or(0) {
-                                            0 => name.to_string(),
-                                            n => format!("{name} ({n})"),
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("  ·  ");
-                                eprintln!(
-                                    "  {} {} MCP server{} connected: {}",
-                                    theme::icon_ok(),
-                                    ok.len(),
-                                    if ok.len() == 1 { "" } else { "s" },
-                                    list,
-                                );
-                            }
+                // ✓ N MCP server(s) connected: name1 (12)  ·  name2  ·  name3 (5)
+                if !ok.is_empty() {
+                    let list = ok
+                        .iter()
+                        .map(|name| match tool_counts.get(*name).copied().unwrap_or(0) {
+                            0 => name.to_string(),
+                            n => format!("{name} ({n})"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("  ·  ");
+                    eprintln!(
+                        "  {} {} MCP server{} connected: {}",
+                        theme::icon_ok(),
+                        ok.len(),
+                        if ok.len() == 1 { "" } else { "s" },
+                        list,
+                    );
+                }
 
-                            // ✗ bad-server: <reason>  (one line per failure)
-                            for (name, err) in &failures {
-                                eprintln!("  {} MCP '{}': {}", theme::icon_err(), name, err,);
-                            }
-                        }
-                    })
-                })
-                .join()
-                .unwrap_or_else(|e| {
-                    if announce_skills {
-                        eprintln!(
-                            "  {} MCP connection thread panicked: {e:?}",
-                            theme::icon_err()
-                        )
-                    }
-                })
-            });
+                // ✗ bad-server: <reason>  (one line per failure)
+                for (name, err) in &failures {
+                    eprintln!("  {} MCP '{}': {}", theme::icon_err(), name, err,);
+                }
+            }
         }
     }
 
@@ -303,14 +280,6 @@ fn create_pipeline_modules_inner(
             astra_skills::loader::skill_search_paths_from_root,
         ),
     );
-
-    let creds = load_credentials();
-    let name = profile_name(profile, &creds);
-    let _token = creds
-        .profiles
-        .get(&name)
-        .and_then(|p| p.access_token.as_ref())
-        .cloned();
 
     PipelineModules {
         unified_skill_registry,
@@ -2481,7 +2450,7 @@ mod tests {
         ACCESS_TOKEN_REFRESH_SKEW_SECS, BannerTextStyle, ModelCatalogError, RestoredSessionState,
         ServerDefaultModel, SilentRefreshError, access_token_needs_refresh,
         admit_server_model_slots, applied_user_intents_from_turn_metadata, banner_session_display,
-        banner_welcome_text, current_access_token, current_git_root,
+        banner_welcome_text, create_pipeline_modules, current_access_token, current_git_root,
         default_model_selection_from_access, ensure_state_default_model,
         fetch_server_model_catalog, fresh_access_token, git_root_from, initialize_session_state,
         load_server_model_access, model_default_invalid_reason_message,
@@ -2668,6 +2637,30 @@ mod tests {
             "total": total,
             "catalog_revision": "sha256:test-catalog"
         })
+    }
+
+    #[serial_test::serial]
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_pipeline_modules_current_thread_awaits_remote_catalog() {
+        let _credentials = isolate_credentials();
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "pipeline-test-token");
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/skills"))
+            .and(query_param("limit", "500"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "skills": [],
+                "limit": 500,
+                "total": 0,
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+        let _modules = create_pipeline_modules(&api, None).await;
+        assert_eq!(mock.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2998,6 +2991,10 @@ mod tests {
         assert_eq!(resolved, Some("beta-model".to_string()));
         assert_eq!(state.model.as_deref(), Some("beta-model"));
         assert_eq!(state.context_budget.model_limit, 128_000);
+        assert_eq!(
+            state.cli_context.requested_model_policy, None,
+            "resolving a default must not create explicit user intent"
+        );
     }
 
     #[tokio::test]
@@ -3066,6 +3063,10 @@ mod tests {
         assert_eq!(
             state.context_budget.model_limit, 1_000_000,
             "state diagnostics must reflect the server model context_window, not the client default"
+        );
+        assert_eq!(
+            state.cli_context.requested_model_policy, None,
+            "an already populated model is not proof of an explicit user choice"
         );
     }
 

@@ -40,6 +40,7 @@ use astra_turn_core::orchestration_fanout_group::{
     AgentFanoutGroupProjection, AgentFanoutSlot, AgentFanoutSlotStatus,
 };
 
+use super::spawner::ParentProfileAuthority;
 use super::{
     AgentStatus, CancellationOrigin, DynamicAgentSpawner, InheritedPermissions, SpawnAgentInput,
     SpawnAgentOutput, SpawnContext, SpawnError, WaitForAgentOutcome,
@@ -377,6 +378,9 @@ fn is_timeout_fanout_finish_reason(reason: &str) -> bool {
 /// Context for executing `agent` tool lifecycle actions.
 #[derive(Clone)]
 pub struct AgentToolContext {
+    /// Exact admitted configuration identity, separate from runtime agent ID.
+    pub parent_profile_authority: ParentProfileAuthority,
+    pub admitted_agent_profiles: Option<Arc<astra_services::runs::AgentProfileSnapshot>>,
     /// Invocation-local frozen user model requirement, installed only by the
     /// trusted tool metadata path. Shared lifecycle contexts keep this empty.
     pub delegation_model_admission: Option<astra_turn_types::DelegationModelAdmission>,
@@ -1116,7 +1120,7 @@ const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
 ];
 const FANOUT_STOP_SLOT_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id", "slot_index"];
 const FANOUT_STOP_GROUP_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id"];
-const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put concise work instructions in each slots[i].prompt. If no agent_type is supplied at slot or defaults level, fanout uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly when a child must mutate or use the full surface. Children inherit the parent setting unless an explicit authorized Offering ID or reasoning control is set; for any model name coming from the user, omit requested_model_policy and let one candidate-aware admission resolve it. Auto strategies are preserved as requests but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable. Reasoning is a separate control. Every slot is resolved and admitted atomically before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout starts all admitted children concurrently and returns launch receipts immediately; the parent continues independent work and uses `agent_fanout(action='get_results', group_id=...)` when it needs results. Do not pass run_in_background.";
+const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}]}. Put concise work instructions in each slots[i].prompt. If this run has an admitted profile directory, set agent_type on each slot or in defaults to the exact non-empty profile/directory ID from that directory; do not omit it or substitute explore, code-review, task, or general-purpose. If no admitted profile directory is present, omit agent_type for the bounded read-only default, or choose a builtin persona only when mutation or the full surface is required. With an admitted profile directory, an omitted model policy uses that exact profile's model default; if it has no default, it inherits the parent Offering. Explicit Inherit requests the parent Offering, while an explicit authorized Offering ID or reasoning control remains authoritative; for any model name coming from the user, omit requested_model_policy and let one candidate-aware admission resolve it. Auto strategies are preserved as requests but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable. Reasoning is a separate control. Every slot is resolved and admitted atomically before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout starts all admitted children concurrently and returns launch receipts immediately; the parent continues independent work and uses `agent_fanout(action='get_results', group_id=...)` when it needs results. Do not pass run_in_background.";
 const FANOUT_GET_RESULTS_SHAPE: &str = "Use one JSON object: {\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}. For large results, use {\"action\":\"get_results\",\"group_id\":\"returned-group-id\",\"slot_index\":0,\"offset\":0,\"max_bytes\":8192}.";
 const FANOUT_STOP_SLOT_SHAPE: &str = "Use one JSON object: {\"action\":\"stop_slot\",\"group_id\":\"returned-group-id\",\"slot_index\":0}.";
 const FANOUT_STOP_GROUP_SHAPE: &str =
@@ -1263,11 +1267,13 @@ fn normalize_spawn_model_selection(
     input: &mut SpawnAgentInput,
     inherited: Option<&astra_turn_types::ModelSelection>,
 ) -> Result<(), String> {
+    let omitted_before_authorized_preparation =
+        input.requested_model_policy.is_none() && input.resolved_model_selection.is_none();
     let unresolved_auto = matches!(
         input.requested_model_policy,
         Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
     ) && input.resolved_model_selection.is_none();
-    let selector = if unresolved_auto {
+    let selector = if unresolved_auto || omitted_before_authorized_preparation {
         None
     } else {
         super::selector_for_admitted_spawn_input(input, inherited)
@@ -1566,35 +1572,13 @@ async fn handle_agent_fanout_start_action_with_deadline(
             ));
         }
     }
-    if let Some(admission) = ctx.delegation_model_admission.as_ref() {
-        for (_, _, spawn_input) in &mut planned_slots {
-            if let Err(error) = super::spawner::apply_delegation_model_admission(
-                spawn_input,
-                admission,
-                &ctx.run_id,
-                tool_call_id.as_deref(),
-            ) {
-                return render_agent_tool_admission_error(&format!(
-                    "fanout preflight failed: {error}"
-                ));
-            }
-        }
-    }
-    if planned_slots.iter().any(|(_, _, input)| {
-        matches!(
-            input.requested_model_policy,
-            Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
-        ) && input.resolved_model_selection.is_none()
-    }) {
-        return render_agent_tool_admission_error(
-            &astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable.to_string(),
-        );
-    }
     let mut resolved_inputs: Vec<_> = planned_slots
         .iter()
         .map(|(_, _, input)| input.clone())
         .collect();
     let spawn_context = SpawnContext {
+        parent_profile_authority: ctx.parent_profile_authority.clone(),
+        admitted_agent_profiles: ctx.admitted_agent_profiles.clone(),
         delegation_model_admission: ctx.delegation_model_admission.clone(),
         parent_model_reasoning: ctx.parent_model_reasoning.clone(),
         parent_run_id: ctx.run_id.clone(),
@@ -1616,11 +1600,24 @@ async fn handle_agent_fanout_start_action_with_deadline(
         workspace_mutation: ctx.workspace_mutation.get(),
         delegation_chain: ctx.delegation_chain.clone(),
     };
-    if let Err(error) = ctx
-        .spawner
-        .validate_spawn_inputs(&resolved_inputs, &spawn_context)
+    if let Err(error) =
+        ctx.spawner
+            .validate_spawn_inputs(&mut resolved_inputs, &spawn_context, inherited_selection)
     {
         return render_agent_tool_admission_error(&format!("fanout preflight failed: {error}"));
+    }
+    for (index, (_, _, planned_input)) in planned_slots.iter_mut().enumerate() {
+        *planned_input = resolved_inputs[index].clone();
+    }
+    if resolved_inputs.iter().any(|input| {
+        matches!(
+            input.requested_model_policy,
+            Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
+        ) && input.resolved_model_selection.is_none()
+    }) {
+        return render_agent_tool_admission_error(
+            &astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable.to_string(),
+        );
     }
     let _capacity_reservation = match ctx
         .spawner
@@ -1647,11 +1644,9 @@ async fn handle_agent_fanout_start_action_with_deadline(
                 .unwrap_or_else(std::time::Instant::now),
         )
     });
-    let preparation = ctx.spawner.prepare_spawn_batch(
-        &resolved_inputs,
-        &spawn_context,
-        ctx.current_model_selection.as_ref(),
-    );
+    let preparation =
+        ctx.spawner
+            .prepare_spawn_batch(&resolved_inputs, &spawn_context, inherited_selection);
     let preparations = match tokio::select! {
         _ = start_cancellation.cancelled() => {
             return render_agent_tool_admission_error("fanout start cancelled during model admission");
@@ -2916,25 +2911,6 @@ async fn handle_agent_spawn_input_with_controls(
         return render_agent_tool_admission_error(&error);
     }
 
-    if let Some(admission) = ctx.delegation_model_admission.as_ref() {
-        if let Err(error) = super::spawner::apply_delegation_model_admission(
-            &mut input,
-            admission,
-            &ctx.run_id,
-            spawn_tool_call_id.as_deref(),
-        ) {
-            return render_agent_tool_admission_error(&error.to_string());
-        }
-    }
-    if matches!(
-        input.requested_model_policy,
-        Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
-    ) && input.resolved_model_selection.is_none()
-    {
-        return render_agent_tool_admission_error(
-            &astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable.to_string(),
-        );
-    }
     let unavailable = unavailable_requested_tools(
         input.allowed_tools.as_deref().unwrap_or_default(),
         ctx.enabled_tools.as_ref(),
@@ -2970,18 +2946,14 @@ async fn handle_agent_spawn_input_with_controls(
 
     // The resolved Offering is runtime-owned; keep the user's optional policy
     // unchanged for durable provenance and nested delegation.
-    let model_selection = input.resolved_model_selection.clone();
-    let resolved_model_name = model_selection
-        .as_ref()
-        .zip(ctx.current_model_selection.as_ref())
-        .filter(|(selected, current)| selected.offering_id == current.offering_id)
-        .and_then(|_| ctx.current_model.clone());
-    let spawn_ctx = SpawnContext {
+    let mut spawn_ctx = SpawnContext {
+        parent_profile_authority: ctx.parent_profile_authority.clone(),
+        admitted_agent_profiles: ctx.admitted_agent_profiles.clone(),
         delegation_model_admission: ctx.delegation_model_admission.clone(),
         parent_model_reasoning: ctx.parent_model_reasoning.clone(),
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
-        resolved_model_name,
+        resolved_model_name: None,
         recursion_depth: ctx.recursion_depth,
         parent_is_fork_child: ctx.is_fork_child,
         working_dir: ctx.working_dir.clone(),
@@ -3004,21 +2976,40 @@ async fn handle_agent_spawn_input_with_controls(
     // Yield once as well so child startup is polled from a fresh scheduler
     // boundary rather than inheriting the parent tool pipeline's stack.
     if preparation.is_none() {
-        if let Err(error) = ctx
-            .spawner
-            .validate_spawn_inputs(std::slice::from_ref(&input), &spawn_ctx)
-        {
+        if let Err(error) = ctx.spawner.validate_spawn_inputs(
+            std::slice::from_mut(&mut input),
+            &spawn_ctx,
+            inherited_selection,
+        ) {
             if matches!(error, SpawnError::ExecutorUnavailable) {
                 return render_agent_runtime_binding_error("agent", "spawn");
             }
             return render_agent_tool_admission_error(&format!("spawn preflight failed: {error}"));
         }
+        if matches!(
+            input.requested_model_policy,
+            Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
+        ) && input.resolved_model_selection.is_none()
+        {
+            return render_agent_tool_admission_error(
+                &astra_turn_types::RequestedModelPolicyError::AutomaticRoutingUnavailable
+                    .to_string(),
+            );
+        }
+    }
+    spawn_ctx.resolved_model_name = input
+        .resolved_model_selection
+        .as_ref()
+        .zip(ctx.current_model_selection.as_ref())
+        .filter(|(selected, current)| selected == current)
+        .and_then(|_| ctx.current_model.clone());
+    if preparation.is_none() {
         preparation = match ctx
             .spawner
             .prepare_spawn_batch(
                 std::slice::from_ref(&input),
                 &spawn_ctx,
-                ctx.current_model_selection.as_ref(),
+                inherited_selection,
             )
             .await
         {
@@ -4508,6 +4499,8 @@ mod tests {
         current_model: Option<&str>,
     ) -> AgentToolContext {
         AgentToolContext {
+            parent_profile_authority: ParentProfileAuthority::Unbound,
+            admitted_agent_profiles: None,
             fanout_admission: spawner.fanout_parent("run-parent"),
             reply_obligations: Arc::new(Default::default()),
             delegation_model_admission: None,
@@ -4649,6 +4642,171 @@ mod tests {
                 .take_captured_model_selection()
                 .map(|selection| selection.offering_id),
             Some("offer-parent-test".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_profile_model_is_used_by_spawn_and_fanout_handlers() {
+        use astra_services::coordination::{AgentProfile, AgentTier};
+        use astra_turn_core::trace_event::TraceContext;
+        use astra_turn_types::{
+            DelegationModelAdmission, DelegationModelAdmissionOutcome,
+            DelegationModelInstructionSource, DelegationModelSlotConstraint,
+            DelegationRequirementStrength,
+        };
+
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let mut ctx = test_spawn_context(spawner, Some("Flash"));
+        ctx.current_model_selection = Some(astra_turn_types::ModelSelection {
+            offering_id: "offering-flash".into(),
+        });
+        let mut lead = AgentProfile::new("lead", "Lead", AgentTier::Orchestrator);
+        lead.can_delegate = true;
+        lead.max_delegation_depth = 3;
+        lead.delegate_to = vec!["profile-glm".into()];
+        let mut profile = AgentProfile::new("profile-glm", "GLM", AgentTier::User);
+        profile.model_selection = Some(astra_turn_types::ModelSelection {
+            offering_id: "offering-glm".into(),
+        });
+        ctx.parent_profile_authority = ParentProfileAuthority::AdmittedMember {
+            profile_id: "lead".into(),
+            ancestor_profile_ids: Vec::new(),
+        };
+        ctx.admitted_agent_profiles = Some(Arc::new(astra_services::runs::AgentProfileSnapshot {
+            owner_user_id: "user-1".into(),
+            source_team_id: "team-1".into(),
+            lead_agent_id: Some("lead".into()),
+            profiles: vec![lead, profile],
+        }));
+        ctx.trace_context = Some(TraceContext {
+            session_id: "session-1".into(),
+            user_id: "user-1".into(),
+            turn_id: "turn-1".into(),
+            turn_seq: 1,
+            causal_chain_id: "chain-1".into(),
+            root_event_id: "event-1".into(),
+        });
+
+        let spawn = handle_agent_spawn_action(
+            &json!({
+                "description": "Profile-default child",
+                "prompt": "Use the admitted profile model",
+                "agent_type": "profile-glm"
+            }),
+            Some(&ctx),
+        )
+        .await;
+        assert_eq!(
+            collect_spawn_receipt(&spawn, &ctx).await["status"],
+            "completed"
+        );
+        assert_eq!(
+            executor
+                .take_captured_model_selection()
+                .map(|selection| selection.offering_id),
+            Some("offering-glm".into())
+        );
+
+        let fanout = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "target_count": 1,
+                "slots": [{
+                    "id": "profile-default",
+                    "agent_type": "profile-glm",
+                    "description": "Profile-default fanout",
+                    "prompt": "Use the admitted profile model"
+                }]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        assert_eq!(
+            collect_fanout_start(&fanout, &ctx).await["status"],
+            "completed"
+        );
+        assert_eq!(
+            executor
+                .take_captured_model_selection()
+                .map(|selection| selection.offering_id),
+            Some("offering-glm".into())
+        );
+
+        // A parent that chose fanout cannot later switch to bare spawn.
+        // Model overrides belong to a fresh parent execution.
+        ctx.run_id = "run-parent-model-overrides".into();
+        ctx.fanout_admission = ctx.spawner.fanout_parent(&ctx.run_id);
+        let inherit = handle_agent_spawn_action(
+            &json!({
+                "description": "Explicit parent model",
+                "prompt": "Use the parent Offering",
+                "agent_type": "profile-glm",
+                "requested_model_policy": {"mode": "inherit"}
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let inherited_result = collect_spawn_receipt(&inherit, &ctx).await;
+        assert_eq!(
+            inherited_result["status"], "completed",
+            "{inherited_result}"
+        );
+        assert_eq!(
+            executor
+                .take_captured_model_selection()
+                .map(|selection| selection.offering_id),
+            Some("offering-flash".into())
+        );
+
+        ctx.delegation_model_admission = Some(DelegationModelAdmission {
+            source: DelegationModelInstructionSource {
+                user_id: "user-1".into(),
+                session_id: "session-1".into(),
+                run_id: ctx.run_id.clone(),
+                turn_chain_id: "chain-1".into(),
+                owner_generation: 1,
+                control_epoch: 1,
+                applied_intent_id: None,
+                session_turn: 1,
+                user_intent_digest: "sha256:test".into(),
+            },
+            invocation_id: "hard-model-call".into(),
+            arguments_digest: "sha256:args".into(),
+            child_requirements: vec![Default::default()],
+            outcome: DelegationModelAdmissionOutcome::Constrained {
+                slots: vec![DelegationModelSlotConstraint {
+                    slot_index: 0,
+                    model_selection: Some(astra_turn_types::ModelSelection {
+                        offering_id: "offering-hard".into(),
+                    }),
+                    requested_model_policy: None,
+                    model_strength: Some(DelegationRequirementStrength::Hard),
+                    reasoning: None,
+                    reasoning_strength: None,
+                    task_scope_quote: None,
+                }],
+            },
+        });
+        let hard = handle_agent_spawn_action(
+            &json!({
+                "_tool_call_id": "hard-model-call",
+                "description": "Hard model child",
+                "prompt": "Use the admitted hard Offering",
+                "agent_type": "profile-glm"
+            }),
+            Some(&ctx),
+        )
+        .await;
+        assert_eq!(
+            collect_spawn_receipt(&hard, &ctx).await["status"],
+            "completed"
+        );
+        assert_eq!(
+            executor
+                .take_captured_model_selection()
+                .map(|selection| selection.offering_id),
+            Some("offering-hard".into())
         );
     }
 
@@ -8399,9 +8557,12 @@ mod tests {
             1,
             astra_core::STATUS_FAILED,
         );
-        recovered.agent_id = Some("retained-child".into());
+        crate::orchestration::spawner::tests::bind_durable_child_identity(
+            &mut recovered,
+            "retained-child".into(),
+        );
         recovered.parent_run_id = Some(ctx.run_id.clone());
-        spawner.restore_durable_agent_runs(&[recovered]).await;
+        assert_eq!(spawner.restore_durable_agent_runs(&[recovered]).await, 1);
         spawner
             .record_agent_result_collected(
                 &ctx.run_id,

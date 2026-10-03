@@ -206,7 +206,6 @@ pub(crate) async fn initialize_multi_agent_runtime(
     )
     .with_mailbox_router(mailbox_router.clone())
     .with_prefix_store(prefix_store.clone());
-    state.delegation_engine = Some(std::sync::Arc::new(engine));
 
     let mut spawn_executor =
         spawn_subrun::CliSpawnAgentExecutor::new(api.clone(), token, project_root, None)
@@ -236,7 +235,7 @@ pub(crate) async fn initialize_multi_agent_runtime(
     // prefix store attached unconditionally: cheap to own.
     spawn_executor = spawn_executor.with_fork_cache_sink(shared_fork_cache_sink);
 
-    state.agent_spawner = Some(std::sync::Arc::new(attach_session_to_spawner(
+    let spawner = std::sync::Arc::new(attach_session_to_spawner(
         astra_runtime::orchestration::DynamicAgentSpawner::with_broadcaster(
             mailbox_router,
             progress_broadcaster,
@@ -246,7 +245,9 @@ pub(crate) async fn initialize_multi_agent_runtime(
         .with_prefix_store(prefix_store)
         .with_max_concurrent_agents(resolved_spawn_concurrency_cap()),
         state.session_id.as_deref(),
-    )));
+    ));
+    state.delegation_engine = Some(std::sync::Arc::new(engine.for_execution(spawner.clone())));
+    state.agent_spawner = Some(spawner);
 }
 
 #[cfg(test)]

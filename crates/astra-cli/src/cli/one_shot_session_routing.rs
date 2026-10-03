@@ -856,6 +856,24 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn disabled_resume_skips_existing_session_and_remote_lookup() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let routing = resolve_one_shot_session_routing(
+            &api,
+            None,
+            Some(uuid::Uuid::new_v4().to_string()),
+            false,
+        )
+        .await
+        .expect("new conversation needs no resume lookup");
+        assert!(routing.server_session_id.is_none());
+        assert!(routing.history_source_session_id.is_none());
+        assert!(routing.continuation().unwrap().is_none());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn resolve_one_shot_session_routing_keeps_local_continuation_when_cloud_has_no_session() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();

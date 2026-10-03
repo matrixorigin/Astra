@@ -6228,6 +6228,24 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
         },
     );
+    // A failed remote stream can still contain completed local callbacks.
+    // Retain audit facts before Fatal skips the tool phase, without granting
+    // local continuation or adding to the Server's aggregate usage/counts.
+    if continuation_authority == ContinuationAuthority::RemoteServer {
+        let mut observed_ids = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter_map(|record| record.tool_call_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for result in &turn_result.edge_tool_round {
+            if observed_ids.insert(result.request_id.clone()) {
+                state.stall.tool_call_records.push(
+                    astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(result),
+                );
+            }
+        }
+    }
     // Apply weak/partial quarantine on the same boundary as newly ingested
     // records, and checkpoint the first transition immediately.
     if let Some(records) = state.stall.tool_call_records.get(tool_record_floor..) {
@@ -10864,6 +10882,7 @@ mod tests {
             let sender = AgentAddress::new("sender-run", "peer-agent");
             let mut state = make_state();
             state.recursion_depth = depth;
+            state.current_run_id = Some(format!("{run_id}-first-execution"));
             state.messaging.mailbox = Some(router.register(address.clone(), None).await.unwrap());
             let _sender_mailbox = router.register(sender.clone(), None).await.unwrap();
             let mut host = MockHost::new(vec![]);
@@ -10893,8 +10912,10 @@ mod tests {
 
             router
                 .send(AgentMessage::new(
-                    sender,
-                    MessageTarget::Direct { address },
+                    sender.clone(),
+                    MessageTarget::Direct {
+                        address: address.clone(),
+                    },
                     MessagePayload::Text {
                         content: "Review the cancellation path before editing.".into(),
                         summary: None,
@@ -10908,6 +10929,43 @@ mod tests {
                     .unwrap()
                     .model_context_changed,
                 "semantic input must supersede the stale tool action"
+            );
+            assert_eq!(host.communication_events.len(), 1);
+            assert_eq!(
+                host.communication_events[0].observed_by.run_id,
+                format!("{run_id}-first-execution")
+            );
+            state.current_run_id = Some(format!("{run_id}-second-execution"));
+            let message = AgentMessage::new(
+                sender.clone(),
+                MessageTarget::Direct {
+                    address: address.clone(),
+                },
+                MessagePayload::Text {
+                    content: "Queued follow-up".into(),
+                    summary: None,
+                },
+            );
+            let message_id = message.id.clone();
+            router.send(message).await.unwrap();
+            runtime_input_boundary(&mut host, &mut state, RuntimeInputBoundary::Action)
+                .await
+                .unwrap();
+            let event = host.communication_events.last().unwrap();
+            assert_eq!(
+                event.observed_by.run_id,
+                format!("{run_id}-second-execution")
+            );
+            assert_eq!(event.message_id, message_id);
+            assert_eq!(event.from.run_id, sender.run_id);
+            assert_eq!(
+                event.to,
+                astra_turn_types::AgentCommunicationTarget::Direct {
+                    address: astra_turn_types::AgentCommunicationParty {
+                        run_id: address.run_id.clone(),
+                        agent_id: address.agent_id.clone()
+                    },
+                }
             );
             assert!(
                 serde_json::to_string(&state.volatile_pending)

@@ -149,6 +149,7 @@ pub(super) async fn build_runtime_wiring(
     let run_lifecycle = run_lifecycle.with_harness_registry(state.harness_registry.clone());
 
     let team_store = initialize_team_store(shared_pool);
+    let run_lifecycle = run_lifecycle.with_team_store(team_store.clone());
     Ok(RuntimeWiring {
         matrix_rt,
         run_lifecycle,
@@ -219,6 +220,7 @@ pub(super) fn default_agent_profile_registry() -> astra_services::AgentProfileRe
     let mut profile_registry = astra_services::AgentProfileRegistry::new();
 
     let mut orch = AgentProfile::new("orchestrator", "Orchestrator", AgentTier::Orchestrator);
+    orch.delegate_to = vec!["coder".into(), "reviewer".into(), "writer".into()];
     orch.system_prompt = Some(
         "You are the orchestrator agent. Coordinate sub-agents to complete complex tasks."
             .to_string(),
@@ -226,23 +228,25 @@ pub(super) fn default_agent_profile_registry() -> astra_services::AgentProfileRe
     let _ = profile_registry.register(orch);
 
     let mut coder = AgentProfile::new("coder", "Coder", AgentTier::System);
+    coder.delegate_to = vec!["writer".into()];
     coder.system_prompt =
         Some("You are a coding agent. Write, edit, and debug code to complete tasks.".to_string());
-    coder.skill_filter = vec![
+    coder.allow_tools = Some(vec![
         "bash".into(),
         "read_file".into(),
         "write_file".into(),
         "str_replace".into(),
         "git".into(),
-    ];
+    ]);
     let _ = profile_registry.register(coder);
 
     let mut reviewer = AgentProfile::new("reviewer", "Reviewer", AgentTier::System);
+    reviewer.delegate_to = vec!["writer".into()];
     reviewer.system_prompt = Some(
         "You are a code review agent. Review code for bugs, security, and best practices."
             .to_string(),
     );
-    reviewer.skill_filter = vec!["read_file".into(), "bash".into()];
+    reviewer.allow_tools = Some(vec!["read_file".into(), "bash".into()]);
     let _ = profile_registry.register(reviewer);
 
     let mut writer = AgentProfile::new("writer", "Writer", AgentTier::User);

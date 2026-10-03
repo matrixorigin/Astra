@@ -11,9 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use astra_pipeline::{step_protocol::InMemoryIdempotencyCache, step_recorder::StepRecorder};
+use astra_pipeline::step_recorder::StepRecorder;
 use astra_runtime::{
-    semantic_dedup::SemanticDedup,
     server::delegation::engine::{SubRunConfig, SubRunExecutor},
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
     turn::agentic_loop::host::{
@@ -235,33 +234,19 @@ impl CliDelegateSubRunExecutor {
     }
 }
 
-/// Build the set of restricted tools from an agent profile's `skill_filter`.
-///
-/// `skill_filter` may contain tool names (from `agent_loader`, e.g. `["read_file",
-/// "grep"]`) or skill names (from team member definitions, e.g.
-/// `["review-changes"]`).  Only entries that match at least one known tool name
-/// are treated as an allowlist; when none match, the entries are skill names and
-/// all tools remain available.
+/// Restrict the admitted tool surface using an explicit profile allowlist.
 fn build_restricted_tools(
-    skill_filter: &[String],
+    allow_tools: Option<&[String]>,
     valid_tool_names: &HashSet<String>,
 ) -> HashSet<String> {
-    if skill_filter.is_empty() {
+    let Some(allow_tools) = allow_tools else {
         return HashSet::new();
-    }
-    let allowed: HashSet<&str> = skill_filter.iter().map(|s| s.as_str()).collect();
-    if valid_tool_names
+    };
+    valid_tool_names
         .iter()
-        .any(|n| allowed.contains(n.as_str()))
-    {
-        valid_tool_names
-            .iter()
-            .filter(|name| !allowed.contains(name.as_str()))
-            .cloned()
-            .collect()
-    } else {
-        HashSet::new()
-    }
+        .filter(|name| !allow_tools.contains(name))
+        .cloned()
+        .collect()
 }
 
 #[async_trait]
@@ -449,7 +434,16 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             .collect()
     }
 
-    async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+    async fn execute(
+        &self,
+        config: SubRunConfig,
+    ) -> Result<
+        (
+            AgentResult,
+            Option<astra_runtime::orchestration::SpawnRunFrontier>,
+        ),
+        String,
+    > {
         let cancel_token = config.cancel_token.clone().or_else(|| {
             self.cancel_token
                 .as_ref()
@@ -462,8 +456,12 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                     &config.context,
                 ),
             )?;
+        config.agent_profile.validate_capability_bounds()?;
         let explicit_hard_limit = config
             .max_turns
+            .into_iter()
+            .chain(config.agent_profile.max_turns)
+            .min()
             .map(|turns| {
                 std::num::NonZeroUsize::new(turns as usize)
                     .ok_or_else(|| "max_turns must be positive".to_string())
@@ -544,9 +542,11 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
 
         // Issue #326 P5b: delegate sub-run is headless — strip project
         // allow rules but honour deny + user file.
+        let mut inherited_permissions = self.inherited_permissions.clone();
+        inherited_permissions.read_only_execution |= profile.read_only;
         let perm_manager = super::permission_manager::PermissionManager::with_inherited(
             &self.project_root,
-            self.inherited_permissions.clone(),
+            inherited_permissions,
         );
         let permission_context = perm_manager.runtime_permission_handle();
 
@@ -608,7 +608,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             initial_output_limit: config.max_output_tokens,
             effort: None,
             agent_type: None,
-            execution_deadline: None,
+            execution_deadline: config.execution_deadline,
             cancel_token: cancel_token.clone(),
             skill_resolver: self.skill_resolver.clone(),
             progress_tx: self.progress_tx.clone(),
@@ -701,7 +701,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             ));
         }
 
-        let restricted_tools = build_restricted_tools(&profile.skill_filter, &valid_tool_names);
+        let restricted_tools =
+            build_restricted_tools(profile.allow_tools.as_deref(), &valid_tool_names);
 
         let task_profile = infer_task_execution_profile(&config.task);
         let agentic_turn_budget =
@@ -710,6 +711,9 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 runtime_ceiling,
                 config
                     .initial_turns
+                    .into_iter()
+                    .chain(profile.initial_turns)
+                    .min()
                     .map_or(DELEGATE_INITIAL_TURNS, |turns| turns as usize),
                 explicit_hard_limit,
             );
@@ -723,24 +727,9 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         );
 
         let mut state = AgenticLoopState {
-            evaluation_thresholds:
-                astra_runtime::turn::runtime_policy::evaluation_thresholds_from_policy(
-                    &tool_policy_config,
-                ),
-            observation_journal: Default::default(),
-            tool_ledger_receipt: Default::default(),
             messages,
-            run_transcript_capture: None,
-            volatile_pending: Vec::new(),
-            recent_rounds: Vec::new(),
-            tool_results: Vec::new(),
-            session_memory_state: Default::default(),
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),
-            current_run_owner_generation: None,
-            provider_canonical_wal_head: None,
-            inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
-            context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
             context_manifest_model_name: effective_model.clone(),
             runtime_manifest: runtime_manifest_for_model(
@@ -749,42 +738,9 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 effective_model.as_deref(),
             ),
             recursion_depth: config.recursion_depth,
-            final_text: String::new(),
-            current_model_item_id: None,
-            final_text_model_item_id: None,
-            final_text_streamed: false,
-            final_output_ready_notified: false,
-            total_prompt: 0,
-            total_completion: 0,
-            total_cache_read: 0,
-            total_cache_creation: 0,
-            total_tool_calls: 0,
-            last_finish_reason: None,
-            total_observation_tool_calls: 0,
-            has_any_usage: false,
-            qualified_usage: None,
-            last_request_usage: None,
-            max_turns: agentic_turn_budget.initial_turns,
-            remaining_turns: agentic_turn_budget.initial_turns,
-            charged_iterations: 0,
-            agentic_turn_budget,
             budget_is_explicit: explicit_hard_limit.is_some(),
-            loop_entry: Default::default(),
-            current_round_index: 0,
-            llm_rounds_completed: 0,
-            last_request_message_count: None,
             turn_guard: TurnGuard::with_profile(task_profile),
-            budget_policy: None,
             restricted_tools,
-            step_recorder,
-            idempotency_cache: InMemoryIdempotencyCache::new(),
-            semantic_dedup: SemanticDedup::new(
-                astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
-            ),
-            call_counts: HashMap::new(),
-            max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
-            max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
-            max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
             stall: {
                 let mut s = astra_runtime::turn::agentic_loop::host::StallTrackingState::default();
                 s.circuit_breaker = astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
@@ -796,7 +752,6 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 );
                 s
             },
-            telemetry: Default::default(),
             skills: self.build_skill_state(config.request_constraints, &effective_root),
             hooks: StopHookState {
                 workspace_root_hint: Some(effective_root.to_string_lossy().into_owned()),
@@ -814,7 +769,6 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 }),
                 ..Default::default()
             },
-            user_intents: Default::default(),
             cancellation: CancellationState {
                 flag: None,
                 pause_flag: config.pause_flag.clone(),
@@ -822,9 +776,6 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 execution_lease_lost: None,
                 resolved_origin: None,
             },
-            error_recovery: Default::default(),
-            provider_adaptation: Default::default(),
-            run_control: None,
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
                     astra_turn_core::pipeline_config::PipelineConfig::default(),
@@ -835,55 +786,26 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             ),
             message: config.task.clone(),
             user_intent: config.task.clone(),
-            recent_tools: Vec::new(),
-            deferred_tool_activations: Vec::new(),
-            has_prior_assistant_turn: false,
-            turn_intent: None,
             task_profile,
-            last_turn_policy:
-                astra_runtime::turn::agentic_loop::host::TurnInteractionPolicy::default(),
-            api: self.api.clone(),
             api_token: token,
-            delegation_engine: None,
-            delegations_this_turn: 0,
             delegation_chain: config.delegation_chain.clone(),
             self_agent_id: profile.agent_id.clone(),
-            project_context: None,
-            last_llm_context_manifest_trace: None,
-            rate_limit_cooldown: Default::default(),
-            last_composite_snapshot: None,
-            last_measured_prompt_tokens: None,
-            consecutive_context_window_errors: 0,
-            compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
-            sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
-            budget_wrapup_injected: false,
-            context_compression_triggered: false,
-            canonical_rewrite_state: Default::default(),
-            provider_canonical_wal_base: None,
-            budget_wrapup_ignored_rounds: 0,
-            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
-            skill_produced_output: false,
             thinking: config.thinking.clone(),
             permission_context: Some(permission_context),
-            applied_permission_mode: None,
-            permission_handler: None,
-            runtime_tool_executor: None,
-            interruption: None,
-            session_facts: Default::default(),
-            memory_extraction_service: None,
             compact_strategy,
-            approval_overrides: None,
-            confidence_trend: Default::default(),
-            last_confidence_diagnosis: None,
-            session_turn: 0,
             canonical_turn_chain_id: Some(config.run_id.clone()),
             root_user_query_event_id: Some(format!("{}:initial-user-query", config.run_id)),
-            turn_event_buffer: None,
-            canonical_turn_started_at: Default::default(),
-            canonical_trace_time_bounds: Default::default(),
-            harness: astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
+            ..AgenticLoopState::fresh(
+                step_recorder,
+                agentic_turn_budget,
+                &resolved_tool_policy,
+                astra_turn_types::InferencePurpose::SubAgent,
+                astra_runtime::turn::runtime_policy::evaluation_thresholds_from_policy(
+                    &tool_policy_config,
+                ),
+                self.api.clone(),
+            )
         };
 
         // Persist the child task before its first model boundary, then flush
@@ -1052,7 +974,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 );
             }
         }
-        result
+        result.map(|result| (result, None))
     }
 }
 
@@ -1269,6 +1191,7 @@ mod tests {
         let mut registry = astra_services::coordination::AgentProfileRegistry::new();
         register_default_agents(&mut registry);
         let config = SubRunConfig {
+            profile_authority: astra_runtime::orchestration::ParentProfileAuthority::Unbound,
             run_id: "invalid-cap-child".into(),
             parent_run_id: "parent".into(),
             agent_profile: registry.get("coder").unwrap().clone(),
@@ -1276,6 +1199,8 @@ mod tests {
             session_id: "session".into(),
             user_id: "user".into(),
             execution_owner_generation: None,
+            cancellation_binding_id: None,
+            child_supervisor: None,
             execution_owner_generation_sink: None,
             previous_output: None,
             context: HashMap::new(),
@@ -1295,6 +1220,7 @@ mod tests {
             progress_emitter: None,
             live_event_sink: None,
             cancel_token: None,
+            execution_deadline: None,
             inherited_prefix: None,
             execution_metadata: None,
             delegation_chain: Vec::new(),
@@ -1539,66 +1465,17 @@ mod tests {
     }
 
     #[test]
-    fn empty_skill_filter_restricts_nothing() {
-        let r = build_restricted_tools(&[], &toolset(&["bash", "read_file", "grep"]));
-        assert!(r.is_empty());
-    }
-
-    #[test]
-    fn tool_names_in_filter_restrict_other_tools() {
-        // agent_loader path: skill_filter = ["read_file", "grep"]
-        let r = build_restricted_tools(
-            &tools(&["read_file", "grep"]),
-            &toolset(&["bash", "read_file", "grep", "write_file"]),
-        );
-        assert!(r.contains("bash"));
-        assert!(r.contains("write_file"));
-        assert!(!r.contains("read_file"));
-        assert!(!r.contains("grep"));
-        assert_eq!(r.len(), 2);
-    }
-
-    #[test]
-    fn skill_names_in_filter_restrict_nothing() {
-        // team path: skill_filter = ["review-changes"] — no tool matches
-        let r = build_restricted_tools(
-            &tools(&["review-changes"]),
-            &toolset(&["bash", "read_file", "grep", "write_file"]),
-        );
-        assert!(r.is_empty(), "skill names must not restrict tools: {r:?}");
-    }
-
-    #[test]
-    fn multiple_skill_names_restrict_nothing() {
-        // team with multiple skills, none matching tool names
-        let r = build_restricted_tools(
-            &tools(&["review-changes", "analyze-session", "verify-task"]),
-            &toolset(&["bash", "read_file", "grep"]),
-        );
-        assert!(r.is_empty());
-    }
-
-    #[test]
-    fn mixed_tool_and_skill_names_uses_tool_allowlist() {
-        // If at least one entry matches a tool, treat as tool allowlist
-        let r = build_restricted_tools(
-            &tools(&["bash", "review-changes"]),
-            &toolset(&["bash", "read_file", "grep"]),
-        );
-        // "bash" matches → allowlist mode → restrict read_file and grep
-        assert!(r.contains("read_file"));
-        assert!(r.contains("grep"));
-        assert!(!r.contains("bash"));
-    }
-
-    #[test]
-    fn single_tool_restricts_all_others() {
-        let r = build_restricted_tools(
-            &tools(&["bash"]),
-            &toolset(&["bash", "read_file", "write_file", "grep", "glob"]),
-        );
-        assert_eq!(r.len(), 4);
-        assert!(!r.contains("bash"));
+    fn explicit_tool_allowlist_preserves_inherit_and_deny_semantics() {
+        let surface = toolset(&["bash", "read_file", "grep"]);
+        for (allowed, denied) in [
+            (None, toolset(&[])),
+            (Some(tools(&[])), surface.clone()),
+            (Some(tools(&["unknown"])), surface.clone()),
+            (Some(tools(&["bash"])), toolset(&["read_file", "grep"])),
+            (Some(tools(&["read_file", "grep"])), toolset(&["bash"])),
+        ] {
+            assert_eq!(build_restricted_tools(allowed.as_deref(), &surface), denied);
+        }
     }
 
     #[test]
@@ -1632,9 +1509,9 @@ mod tests {
         let all_schemas = crate::edge_tools::all_tool_schemas();
         let valid_tool_names = astra_turn_core::tool::schema::tool_names_from_schemas(&all_schemas);
 
-        let restricted = build_restricted_tools(&coder.skill_filter, &valid_tool_names);
+        let restricted = build_restricted_tools(coder.allow_tools.as_deref(), &valid_tool_names);
 
-        // Empty skill_filter = no restrictions = all tools available (including write tools)
+        // No tool allowlist inherits the admitted surface, including write tools.
         assert!(
             restricted.is_empty(),
             "coder agent should have no tool restrictions, but got: {:?}",

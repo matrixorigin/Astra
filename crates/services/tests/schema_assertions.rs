@@ -325,6 +325,31 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     ensure_core_schema(&settings, &bootstrap_catalog)
         .await
         .expect("restored fixture is valid");
+    sqlx::query("ALTER TABLE prompt_request_records DROP INDEX uq_prompt_request_attempt")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    sqlx::query("CREATE UNIQUE INDEX uq_prompt_request_attempt ON prompt_request_records (user_id, session_id, turn, round, source, attempt)")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    let error = ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect_err("completed bootstrap must reject incorrect diagnostic attribution key")
+        .to_string();
+    assert!(error.contains("uq_prompt_request_attempt"), "{error}");
+    assert!(error.contains("run_id"), "{error}");
+    sqlx::query("ALTER TABLE prompt_request_records DROP INDEX uq_prompt_request_attempt")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    sqlx::query("CREATE UNIQUE INDEX uq_prompt_request_attempt ON prompt_request_records (user_id, session_id, run_id, turn, round, source, attempt)")
+        .execute(pool.get())
+        .await
+        .unwrap();
+    ensure_core_schema(&settings, &bootstrap_catalog)
+        .await
+        .expect("restored diagnostic attribution key is valid");
     sqlx::query("ALTER TABLE user_llm_models DROP COLUMN thinking_probe_json")
         .execute(pool.get())
         .await
@@ -1444,12 +1469,13 @@ async fn phase1_run_durability_schema_contract() {
         [
             "user_id",
             "session_id",
+            "run_id",
             "turn",
             "round",
             "source",
             "attempt"
         ],
-        "prompt request idempotency must be bound to owner/session attempt identity"
+        "prompt request idempotency must be bound to owner/session/run attempt identity"
     );
     assert_eq!(
         index_columns(

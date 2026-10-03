@@ -3968,12 +3968,14 @@ pub fn runtime_manifest_for_model(
 impl AgenticLoopState {
     /// Common empty loop state. Callers install identity, authority, context and
     /// restored frontiers explicitly; this never admits, restores or performs I/O.
-    pub(crate) fn fresh(
+    /// Reuse the caller's transport rather than constructing an unused client.
+    pub fn fresh(
         step_recorder: StepRecorder,
         agentic_turn_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
         policy: &astra_config::runtime_config::EffectiveToolPolicy,
         inference_purpose: astra_turn_types::InferencePurpose,
         evaluation_thresholds: astra_turn_core::evaluation::EvaluationThresholds,
+        api: astra_thin_client::ThinClient,
     ) -> Self {
         Self {
             evaluation_thresholds,
@@ -4048,7 +4050,7 @@ impl AgenticLoopState {
             turn_intent: None,
             task_profile: TaskExecutionProfile::default(),
             last_turn_policy: TurnInteractionPolicy::default(),
-            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            api,
             api_token: String::new(),
             delegation_engine: None,
             delegations_this_turn: 0,
@@ -5737,6 +5739,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
             &policy,
             astra_turn_types::InferencePurpose::PrimaryAgent,
             Default::default(),
+            astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
         )
     }
 }
@@ -6561,6 +6564,7 @@ pub(crate) mod tests {
         execution_time_budget_remaining: Option<Duration>,
         pub(crate) direct_child_owner: Option<Arc<crate::orchestration::FanoutParentAdmission>>,
         pub(crate) child_wait_started: Option<Arc<tokio::sync::Notify>>,
+        pub(crate) communication_events: Vec<astra_messaging::AgentCommunicationEvent>,
         pub(crate) capacity_readmission_gate:
             Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         pub(crate) execution_capacity_releases: usize,
@@ -6625,6 +6629,7 @@ pub(crate) mod tests {
                 execution_time_budget_remaining: None,
                 direct_child_owner: None,
                 child_wait_started: None,
+                communication_events: Vec::new(),
                 capacity_readmission_gate: None,
                 execution_capacity_releases: 0,
                 child_boundary_outcomes: Vec::new(),
@@ -6755,6 +6760,9 @@ pub(crate) mod tests {
             Ok(())
         }
 
+        fn on_agent_communication(&mut self, event: astra_messaging::AgentCommunicationEvent) {
+            self.communication_events.push(event);
+        }
         fn release_execution_capacity_for_wait(&mut self) {
             self.execution_capacity_releases += 1;
         }
@@ -8226,6 +8234,33 @@ pub(crate) mod tests {
         );
         assert!(!state.final_text.contains("empty_completion"));
         assert!(!state.final_text.contains("[turn_interrupted]"));
+    }
+
+    #[tokio::test]
+    async fn failed_remote_stream_retains_completed_callbacks_without_continuation() {
+        let mut failed = text_result("partial", 15, 5, Some(30));
+        failed.accum.run_id = Some("remote-run".into());
+        failed.accum.error_message = Some("missing terminal execution evidence".into());
+        failed.accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+        failed.error_kind = failed.accum.error_kind;
+        failed.edge_tool_round = vec![make_edge_tool("write_file", "observed write")];
+        let call_id = failed.edge_tool_round[0].request_id.clone();
+        let mut host = MockHost::new(vec![failed, text_result("must not run", 15, 5, Some(30))])
+            .with_remote_server_continuation();
+        let mut state = make_state();
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert_eq!(
+            outcome.unwrap_err().kind,
+            astra_core::ErrorKind::ContractViolation
+        );
+        assert_eq!(host.turn_count(), 1);
+        assert_eq!(state.stall.tool_call_records.len(), 1);
+        let record = &state.stall.tool_call_records[0];
+        assert_eq!(record.tool_call_id.as_deref(), Some(call_id.as_str()));
+        assert_eq!(record.result_full.as_deref(), Some("observed write"));
+        assert!(record.ok);
+        assert_eq!(state.tool_ledger_receipt.attempted, 0);
+        assert_eq!(state.tool_ledger_receipt.terminal, 0);
     }
 
     #[tokio::test]

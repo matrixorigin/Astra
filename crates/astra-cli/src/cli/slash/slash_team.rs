@@ -1,94 +1,77 @@
 use crate::cli::surface::run_status_surface::run_status_icon;
 use crate::cli::{
-    agent_loader,
-    cli_config::cli_utils::{map_thin_err, truncate_str},
-    delegate_subrun, mock_llm,
-    session::session_state::SessionState,
-    skill_subrun, theme,
+    cli_config::cli_utils::truncate_str, session::session_state::SessionState, theme,
 };
-use astra_runtime::server::team::orchestrator::ExecutionPhase;
-use astra_services::team_persistence::WorktreeMode;
-use astra_turn_core::chat_turn_heuristics::is_session_not_found_error;
+use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode};
 use crossterm::style::Stylize;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Instant;
 
-/// The local CLI has no server-owned RunStateStore, but a Team command can
-/// still be reconstructed while the process is alive (for example by a
-/// progress/retry boundary). Keep one owner for the process so the command
-/// identity remains an atomic run-admission key across those boundaries.
-/// Run records retain their authenticated user/session owner, and the store's
-/// bounded eviction keeps this process-local registry from growing without
-/// limit. Server execution uses its existing persistent RunStateStore instead.
-fn cli_team_run_store() -> Arc<astra_services::runs::InMemoryRunStateStore> {
-    static STORE: std::sync::OnceLock<Arc<astra_services::runs::InMemoryRunStateStore>> =
-        std::sync::OnceLock::new();
-    STORE
-        .get_or_init(|| Arc::new(astra_services::runs::InMemoryRunStateStore::default()))
-        .clone()
+/// Typed input for the existing ordinary Chat command. This is only a
+/// configuration carrier; admission, execution, cancellation, and recovery
+/// remain owned by the normal root-turn path.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TeamChatRequest {
+    pub message: String,
+    pub selection: astra_services::runs::AgentProfileSelection,
 }
 
-// ── Team History & Snapshot Tracking ────────────────────────────────────
-
-/// Record of a past team execution.
-#[derive(Clone, Debug)]
-pub(crate) struct TeamHistoryEntry {
-    pub team_name: String,
-    pub task: String,
-    pub delegation_id: String,
-    pub parent_run_id: String,
-    pub status: String,
-    pub agent_count: usize,
-    pub total_prompt_tokens: u64,
-    pub total_completion_tokens: u64,
-    pub error: Option<String>,
-    pub started_at: String,
-}
-
-/// A saved snapshot associated with a team.
-#[derive(Clone, Debug)]
-pub(crate) struct TeamSnapshotEntry {
-    pub snapshot_id: String,
-    pub team_name: String,
-    pub label: String,
-    pub git_commit: Option<String>,
-    pub session_id: Option<String>,
-    pub created_at: String,
+pub(crate) async fn resolve_team_run_chat_request(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    team_name_or_id: &str,
+    lead_agent_id: Option<&str>,
+    task: &str,
+) -> Result<TeamChatRequest, String> {
+    let lead_agent_id = lead_agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "Team run requires an explicit canonical lead: --lead-agent-id <agent_id>".to_string()
+        })?;
+    if task.trim().is_empty() {
+        return Err("Team run task cannot be empty".into());
+    }
+    let store = crate::cli::http_team_store::HttpTeamStore::new(api.api_origin(), profile);
+    let team = TeamPersistenceService::load_team(&store, "", team_name_or_id)
+        .await
+        .map_err(|error| format!("failed to load team '{team_name_or_id}': {error}"))?
+        .ok_or_else(|| format!("Team '{team_name_or_id}' not found"))?;
+    if team.members.is_empty() {
+        return Err(format!(
+            "Team '{}' has no members. Add a member before starting a lead turn.",
+            team.name
+        ));
+    }
+    let lead_is_member = team.members.iter().any(|member| {
+        astra_services::team_persistence::resolve_member_to_profile(member, &team).agent_id
+            == lead_agent_id
+    });
+    if !lead_is_member {
+        return Err(format!(
+            "lead '{}' is not a canonical resolved agent_id in Team '{}'; use an Agent ID shown by `team info`",
+            lead_agent_id, team.name
+        ));
+    }
+    Ok(TeamChatRequest {
+        message: task.trim().to_string(),
+        selection: astra_services::runs::AgentProfileSelection {
+            team_id: team.team_id,
+            lead_agent_id: Some(lead_agent_id.to_string()),
+        },
+    })
 }
 
 // ── Team Registry ───────────────────────────────────────────────────────
 
-/// A named team of agent roles that can coordinate on tasks.
-#[derive(Clone, Debug)]
-pub(crate) struct Team {
-    /// Stable identifier persisted across runs (UUID assigned at creation).
-    pub team_id: String,
-    pub name: String,
-    pub description: String,
-    pub members: Vec<TeamMember>,
-    pub shared_context: HashMap<String, String>,
-    pub worktree_mode: WorktreeMode,
-    /// Explicit coordination mode (`None` uses the stable fan-out default).
-    pub coordination: Option<astra_services::team_persistence::TeamCoordination>,
-    pub created_at: String,
-}
-
-/// A member role within a team.
-#[derive(Clone, Debug)]
-pub(crate) struct TeamMember {
-    pub role: String,
-    pub description: String,
-    pub skills: Vec<String>,
-    pub model_selection: Option<astra_turn_types::ModelSelection>,
-}
+/// The CLI registry stores the persistence owner's canonical definition
+/// directly. There is no second lossy Team/TeamMember schema in the CLI.
+pub(crate) type Team = astra_services::team_persistence::TeamDefinition;
+pub(crate) type TeamMember = astra_services::team_persistence::TeamMemberDef;
 
 /// Registry of all defined teams (stored in SessionState).
 #[derive(Clone, Debug)]
 pub(crate) struct TeamRegistry {
     teams: HashMap<String, Team>,
-    pub history: Vec<TeamHistoryEntry>,
-    snapshots: Vec<TeamSnapshotEntry>,
     /// Whether we've loaded teams from the persistence store yet.
     pub store_loaded: bool,
 }
@@ -101,162 +84,23 @@ impl Default for TeamRegistry {
 
 impl TeamRegistry {
     pub fn new() -> Self {
-        let mut reg = Self {
+        Self {
             teams: HashMap::new(),
-            history: Vec::new(),
-            snapshots: Vec::new(),
             store_loaded: false,
-        };
-        // Register built-in team templates
-        reg.register_builtins();
-        reg
+        }
     }
 
-    fn register_builtins(&mut self) {
-        use astra_services::team_persistence::TeamCoordination;
-
-        // Independent reviews use the same parallel execution as other tasks.
-        self.teams.insert(
-            "review".to_string(),
-            Team {
-                team_id: uuid::Uuid::new_v4().to_string(),
-                name: "review".to_string(),
-                description: "Independent code reviews with aggregated findings".into(),
-                members: vec![
-                    TeamMember {
-                        role: "correctness_reviewer".to_string(),
-                        description: "Performs code review. Use admitted tools to inspect recent commits and diffs \
-                            (git log/show through Bash when available), and read_file/grep to understand \
-                            context. Produce a detailed review covering correctness, security, \
-                            and edge cases."
-                            .into(),
-                        skills: vec![],
-                        model_selection: None,
-                    },
-                    TeamMember {
-                        role: "reviewer".to_string(),
-                        description: "Independently review security and edge cases. \
-                            Use admitted tools to inspect commit diffs and read files. \
-                            Provide actionable, evidence-backed findings."
-                            .into(),
-                        skills: vec![],
-                        model_selection: None,
-                    },
-                ],
-                shared_context: HashMap::new(),
-                worktree_mode: WorktreeMode::Shared,
-                coordination: Some(TeamCoordination::FanOut {
-                    aggregation: astra_services::team_persistence::TeamAggregation::AllResults,
-                }),
-                created_at: chrono::Utc::now().to_rfc3339(),
-            },
-        );
-
-        // Research team: explorer + synthesizer
-        self.teams.insert(
-            "research".to_string(),
-            Team {
-                team_id: uuid::Uuid::new_v4().to_string(),
-                name: "research".to_string(),
-                description: "Deep research: explorer gathers info, synthesizer produces report"
-                    .into(),
-                members: vec![
-                    TeamMember {
-                        role: "explorer".to_string(),
-                        description: "Searches codebase, reads docs, gathers information".into(),
-                        skills: vec!["analyze-session".into()],
-                        model_selection: None,
-                    },
-                    TeamMember {
-                        role: "synthesizer".to_string(),
-                        description: "Synthesizes findings into coherent analysis".into(),
-                        skills: vec![],
-                        model_selection: None,
-                    },
-                ],
-                shared_context: HashMap::new(),
-                worktree_mode: WorktreeMode::Shared,
-                coordination: Some(TeamCoordination::Sequential {
-                    stop_on_success: false,
-                }),
-                created_at: chrono::Utc::now().to_rfc3339(),
-            },
-        );
-
-        // Full dev team: planner + implementer + tester
-        self.teams.insert(
-            "dev".to_string(),
-            Team {
-                team_id: uuid::Uuid::new_v4().to_string(),
-                name: "dev".to_string(),
-                description:
-                    "Full development cycle: planner decomposes, implementer codes, tester verifies"
-                        .into(),
-                members: vec![
-                    TeamMember {
-                        role: "planner".to_string(),
-                        description: "Decomposes task into subtasks with acceptance criteria"
-                            .into(),
-                        skills: vec![],
-                        model_selection: None,
-                    },
-                    TeamMember {
-                        role: "implementer".to_string(),
-                        description: "Implements code changes following the plan".into(),
-                        skills: vec![],
-                        model_selection: None,
-                    },
-                    TeamMember {
-                        role: "tester".to_string(),
-                        description: "Writes and runs tests, verifies acceptance criteria".into(),
-                        skills: vec!["verify-task".into()],
-                        model_selection: None,
-                    },
-                ],
-                shared_context: HashMap::new(),
-                worktree_mode: WorktreeMode::Isolated,
-                coordination: Some(TeamCoordination::Sequential {
-                    stop_on_success: false,
-                }),
-                created_at: chrono::Utc::now().to_rfc3339(),
-            },
-        );
-    }
-
-    /// Merge teams from persistence store into the registry (idempotent).
+    /// Merge the owner-scoped persistence projection into the registry.
+    ///
+    /// Persistence is authoritative: a remote definition with the same name
+    /// replaces any stale in-process projection, including a definition that
+    /// was present before hydration.
     pub fn merge_from_store(
         &mut self,
         teams: Vec<astra_services::team_persistence::TeamDefinition>,
     ) {
         for def in teams {
-            if self.teams.contains_key(&def.name) {
-                continue; // don't overwrite in-memory edits
-            }
-            self.teams.insert(
-                def.name.clone(),
-                Team {
-                    team_id: def.team_id,
-                    name: def.name,
-                    description: def.description,
-                    members: def
-                        .members
-                        .iter()
-                        .map(|m| TeamMember {
-                            role: m.role.clone(),
-                            description: m
-                                .system_prompt
-                                .clone()
-                                .unwrap_or_else(|| format!("{} agent", m.role)),
-                            skills: m.skills.clone(),
-                            model_selection: m.model_selection.clone(),
-                        })
-                        .collect(),
-                    shared_context: def.context,
-                    worktree_mode: def.worktree_mode,
-                    coordination: Some(def.coordination),
-                    created_at: def.created_at,
-                },
-            );
+            self.teams.insert(def.name.clone(), def);
         }
     }
 
@@ -270,90 +114,13 @@ impl TeamRegistry {
         teams
     }
 
-    pub fn create(
-        &mut self,
-        name: String,
-        description: String,
-        coordination: Option<astra_services::team_persistence::TeamCoordination>,
-    ) -> Result<(), String> {
-        if self.teams.contains_key(&name) {
-            return Err(format!("Team '{name}' already exists"));
-        }
-        self.teams.insert(
-            name.clone(),
-            Team {
-                team_id: uuid::Uuid::new_v4().to_string(),
-                name,
-                description,
-                members: Vec::new(),
-                shared_context: HashMap::new(),
-                worktree_mode: WorktreeMode::Shared,
-                coordination,
-                created_at: chrono::Utc::now().to_rfc3339(),
-            },
-        );
-        Ok(())
-    }
-
-    pub fn add_member(&mut self, team: &str, member: TeamMember) -> Result<(), String> {
-        let t = self
-            .teams
-            .get_mut(team)
-            .ok_or_else(|| format!("Team '{team}' not found"))?;
-        if t.members.iter().any(|m| m.role == member.role) {
-            return Err(format!(
-                "Role '{}' already exists in team '{team}'",
-                member.role
-            ));
-        }
-        t.members.push(member);
-        Ok(())
-    }
-
     pub fn remove(&mut self, name: &str) -> Result<(), String> {
         if self.teams.remove(name).is_none() {
             return Err(format!("Team '{name}' not found"));
         }
         Ok(())
     }
-
-    pub fn set_context(&mut self, team: &str, key: String, value: String) -> Result<(), String> {
-        let t = self
-            .teams
-            .get_mut(team)
-            .ok_or_else(|| format!("Team '{team}' not found"))?;
-        t.shared_context.insert(key, value);
-        Ok(())
-    }
-
-    pub fn record_execution(&mut self, entry: TeamHistoryEntry) {
-        self.history.push(entry);
-    }
-
-    pub fn get_history(&self, team_name: &str) -> Vec<&TeamHistoryEntry> {
-        self.history
-            .iter()
-            .filter(|e| e.team_name == team_name)
-            .collect()
-    }
-
-    pub fn add_snapshot(&mut self, entry: TeamSnapshotEntry) {
-        self.snapshots.push(entry);
-    }
-
-    pub fn get_snapshots(&self, team_name: &str) -> Vec<&TeamSnapshotEntry> {
-        self.snapshots
-            .iter()
-            .filter(|s| s.team_name == team_name)
-            .collect()
-    }
-
-    pub fn find_snapshot(&self, snapshot_id: &str) -> Option<&TeamSnapshotEntry> {
-        self.snapshots.iter().find(|s| s.snapshot_id == snapshot_id)
-    }
 }
-
-// ── CLI Team → TeamDefinition Conversion ────────────────────────────────
 
 /// Get current git HEAD commit SHA (best-effort).
 fn git_head_sha() -> Option<String> {
@@ -365,157 +132,33 @@ fn git_head_sha() -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
-/// Convert a CLI [`Team`] to a runtime [`TeamDefinition`] for the orchestrator.
-///
-/// Uses the explicitly selected coordination mode, or a stable fan-out default.
-fn cli_team_to_definition(
-    team: &Team,
-    user_id: &str,
-) -> astra_services::team_persistence::TeamDefinition {
-    use astra_services::team_persistence::{
-        TeamAggregation, TeamCoordination, TeamDefinition, TeamMemberDef,
-    };
-
-    let coordination = team
-        .coordination
+fn team_member_description(member: &TeamMember) -> String {
+    member
+        .system_prompt
         .clone()
-        .unwrap_or(TeamCoordination::FanOut {
-            aggregation: TeamAggregation::AllResults,
-        });
-    let now = chrono::Utc::now().to_rfc3339();
-    TeamDefinition {
-        team_id: team.team_id.clone(),
-        user_id: user_id.to_string(),
-        name: team.name.clone(),
-        description: team.description.clone(),
-        coordination,
-        members: team
-            .members
-            .iter()
-            .map(|m| TeamMemberDef {
-                role: m.role.clone(),
-                agent_id: None,
-                system_prompt: Some(m.description.clone()),
-                skills: m.skills.clone(),
-                model_selection: m.model_selection.clone(),
-                mcp_servers: vec![],
-                can_delegate: false,
-                max_delegation_depth: 0,
-            })
-            .collect(),
-        context: team.shared_context.clone(),
-        worktree_mode: team.worktree_mode.clone(),
-        budget: None,
-        max_parallel: 0,
-        created_at: now.clone(),
-        updated_at: now,
-    }
+        .unwrap_or_else(|| format!("{} agent", member.role))
 }
 
 // ── Slash Command Handler ───────────────────────────────────────────────
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TeamRunSession {
-    session_id: String,
-    user_id: String,
-    turn: u32,
-}
-
-fn team_run_session_from_response(
-    response: &serde_json::Value,
-    expected_session_id: Option<&str>,
-    turn: u32,
-) -> Result<TeamRunSession, String> {
-    let session_id = response
-        .get("session_id")
-        .or_else(|| response.get("id"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "session response is missing session_id".to_string())?;
-    if expected_session_id.is_some_and(|expected| expected != session_id) {
-        return Err("session response identity did not match the requested session".into());
-    }
-    let user_id = response
-        .get("user_id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "session response is missing its authenticated owner".to_string())?;
-    Ok(TeamRunSession {
-        session_id: session_id.to_string(),
-        user_id: user_id.to_string(),
-        turn,
-    })
-}
-
-async fn ensure_team_run_session(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    state: &mut SessionState,
-) -> Result<TeamRunSession, String> {
-    let token = crate::cli::session::session_runtime::fresh_access_token(api, profile)
-        .await
-        .ok_or_else(|| "Not logged in".to_string())?;
-    if let Some(session_id) = state.session_id.clone() {
-        match api.get_session(Some(&token), &session_id).await {
-            Ok(response) => {
-                let binding =
-                    team_run_session_from_response(&response, Some(&session_id), state.turn)?;
-                state.ingestion_user_id = Some(binding.user_id.clone());
-                return Ok(binding);
-            }
-            Err(err) => {
-                let err = map_thin_err(err);
-                if !is_session_not_found_error(&err) {
-                    return Err(format!(
-                        "could not validate the active session owner: {err}"
-                    ));
-                }
-                crate::cli::cli_config::cli_utils::clear_profile_last_session_if_matches_or_warn(
-                    profile,
-                    &session_id,
-                    "slash_team:ensure_team_run_session",
-                );
-                state.clear_session_id();
-                state.unregister_root_mailbox().await;
-                state.run_id = None;
-                state.journal = None;
-            }
-        }
-    }
-
-    let body = api
-        .post_sessions_json(&token, &serde_json::json!({}))
-        .await
-        .map_err(map_thin_err)?;
-    let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-    let binding = team_run_session_from_response(&value, None, state.turn)?;
-
-    crate::cli::session::session_startup::initialize_journal_pub(state, &binding.session_id);
-    crate::cli::cli_config::cli_utils::persist_profile_last_session_or_warn(
-        profile,
-        &binding.session_id,
-        "slash_team:ensure_team_run_session",
-    );
-    state.set_session_id(binding.session_id.clone());
-    state.ingestion_user_id = Some(binding.user_id.clone());
-    Ok(binding)
-}
 
 pub(crate) async fn handle_team_command(
     arg: &str,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     state: &mut SessionState,
-) {
+) -> Result<(), String> {
     // Hydrate registry from persistence store on first command
     if !state.team_registry.store_loaded {
         let user_id = state
             .ingestion_user_id
             .clone()
             .unwrap_or_else(|| "local".into());
-        if let Ok(teams) = state.team_store.list_teams(&user_id).await {
-            state.team_registry.merge_from_store(teams);
-        }
+        let teams = state
+            .team_store
+            .list_teams(&user_id)
+            .await
+            .map_err(|error| format!("failed to hydrate teams: {error}"))?;
+        state.team_registry.merge_from_store(teams);
         state.team_registry.store_loaded = true;
     }
 
@@ -549,7 +192,7 @@ pub(crate) async fn handle_team_command(
             eprintln!(
                 "  {:<16} {}",
                 "built-ins:".dim(),
-                "review, research, dev".magenta()
+                "owner-scoped team service".magenta()
             );
             eprintln!();
             eprintln!("  {}", team_subcommands_hint().dim());
@@ -557,7 +200,8 @@ pub(crate) async fn handle_team_command(
             eprintln!("    {}", "/team info review".magenta());
             eprintln!(
                 "    {}",
-                "/team run review review the latest diff".magenta()
+                "/team run review --lead-agent-id team-review-reviewer review the latest diff"
+                    .magenta()
             );
             eprintln!("    {}", "/team snapshot dev before-refactor".magenta());
             eprintln!();
@@ -570,7 +214,7 @@ pub(crate) async fn handle_team_command(
                     "  {}",
                     "No teams defined. Use /team create <name> <description>".dim()
                 );
-                return;
+                return Ok(());
             }
             eprintln!(
                 "\n{}",
@@ -579,29 +223,32 @@ pub(crate) async fn handle_team_command(
                     .magenta()
             );
             for t in &teams {
-                let member_names: Vec<_> = t.members.iter().map(|m| m.role.as_str()).collect();
                 eprintln!(
                     "\n  {} {}",
                     t.name.as_str().magenta().bold(),
                     format!("({})", t.description).dim()
                 );
-                if member_names.is_empty() {
+                if t.members.is_empty() {
                     eprintln!("    {}", "No members. Use /team add-member".dim());
                 } else {
                     for m in &t.members {
+                        let agent_id =
+                            astra_services::team_persistence::resolve_member_to_profile(m, t)
+                                .agent_id;
                         eprintln!(
-                            "    {} {} {}",
+                            "    {} {} [{}] {}",
                             "•".dim(),
                             m.role.as_str().green(),
-                            format!("— {}", m.description).dim()
+                            agent_id.dim(),
+                            format!("— {}", team_member_description(m)).dim()
                         );
                     }
                 }
-                if !t.shared_context.is_empty() {
+                if !t.context.is_empty() {
                     eprintln!(
                         "    {} shared keys: {}",
                         "📎".to_string().dim(),
-                        t.shared_context
+                        t.context
                             .keys()
                             .cloned()
                             .collect::<Vec<_>>()
@@ -619,12 +266,9 @@ pub(crate) async fn handle_team_command(
             let name = parts.next().unwrap_or("").trim();
             let rest = parts.next().unwrap_or("").trim();
             if name.is_empty() {
-                eprintln!(
-                    "{}",
-                    "  Usage: /team create <name> [--mode fanout|sequential] [description]"
-                        .yellow()
+                return Err(
+                    "Usage: /team create <name> [--mode fanout|sequential] [description]".into(),
                 );
-                return;
             }
             let (coordination, desc) = if rest.starts_with("--mode ") {
                 let after_flag = &rest[7..];
@@ -644,12 +288,9 @@ pub(crate) async fn handle_team_command(
                         },
                     ),
                     other => {
-                        eprintln!(
-                            "  {} Unknown mode '{}'. Options: fanout, sequential",
-                            theme::icon_err(),
-                            other
-                        );
-                        return;
+                        return Err(format!(
+                            "Unknown mode '{other}'. Options: fanout, sequential"
+                        ));
                     }
                 };
                 (coord, d)
@@ -661,85 +302,124 @@ pub(crate) async fn handle_team_command(
             } else {
                 desc.to_string()
             };
-            match state
-                .team_registry
-                .create(name.to_string(), description, coordination)
-            {
-                Ok(()) => {
-                    // Persist so team survives restart
-                    let user_id = state
-                        .ingestion_user_id
-                        .clone()
-                        .unwrap_or_else(|| "local".into());
-                    if let Some(t) = state.team_registry.get(name) {
-                        let def = cli_team_to_definition(t, &user_id);
-                        if let Err(e) = state.team_store.save_team(&def).await {
-                            eprintln!("  {} persist warning: {e}", theme::icon_warn());
-                        }
-                    }
-                    eprintln!(
-                        "  {} Team '{}' created. Add members with /team add-member {} <role> <description>",
-                        theme::icon_ok(),
-                        name.magenta(),
-                        name
-                    );
-                }
-                Err(e) => eprintln!("  {} {e}", theme::icon_err()),
+            let user_id = state
+                .ingestion_user_id
+                .clone()
+                .unwrap_or_else(|| "local".into());
+            if state.team_registry.get(name).is_some() {
+                return Err(format!("Team '{name}' already exists"));
             }
+            let now = chrono::Utc::now().to_rfc3339();
+            let definition = Team {
+                team_id: uuid::Uuid::new_v4().to_string(),
+                user_id,
+                name: name.to_string(),
+                description,
+                coordination: coordination.unwrap_or(
+                    astra_services::team_persistence::TeamCoordination::FanOut {
+                        aggregation: astra_services::team_persistence::TeamAggregation::AllResults,
+                    },
+                ),
+                members: Vec::new(),
+                context: HashMap::new(),
+                worktree_mode: WorktreeMode::Shared,
+                budget: None,
+                max_parallel: 0,
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            let persisted = state
+                .team_store
+                .save_team(&definition)
+                .await
+                .map_err(|error| format!("failed to persist team '{name}': {error}"))?;
+            state.team_registry.merge_from_store(vec![persisted]);
+            eprintln!(
+                "  {} Team '{}' created. Add members with /team add-member {} <role> <description>",
+                theme::icon_ok(),
+                name.magenta(),
+                name
+            );
         }
 
         "add-member" => {
-            // /team add-member <team> <role> <description>
-            let mut parts = sub_arg.splitn(3, ' ');
-            let team = parts.next().unwrap_or("").trim();
-            let role = parts.next().unwrap_or("").trim();
-            let desc = parts.next().unwrap_or("").trim();
-            if team.is_empty() || role.is_empty() {
-                eprintln!(
-                    "{}",
-                    "  Usage: /team add-member <team> <role> [description]".yellow()
-                );
-                return;
-            }
+            let crate::cli::cli_config::cli_args::Command::Team(args) =
+                crate::cli::command_router::parse_team_bridge_command(arg)?
+            else {
+                return Err("expected a Team command".into());
+            };
+            let Some(crate::cli::cli_config::cli_args::TeamSubcommand::AddMember(member_args)) =
+                args.command
+            else {
+                return Err("expected add-member arguments".into());
+            };
+            let team = member_args.team.as_str();
+            let role = member_args.role.as_str();
+            let desc = member_args.description.join(" ");
+            let model_selection = if let Some(model) = member_args.model.as_deref() {
+                let token = crate::cli::session::session_runtime::fresh_access_token(api, profile)
+                    .await
+                    .ok_or_else(|| "Not logged in".to_string())?;
+                let selected =
+                    crate::cli::session::session_runtime::resolve_server_model_selection(
+                        api,
+                        &token,
+                        model,
+                        astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+                    )
+                    .await?;
+                Some(astra_turn_types::ModelSelection {
+                    offering_id: selected.offering_id,
+                })
+            } else {
+                None
+            };
             let member = TeamMember {
                 role: role.to_string(),
-                description: if desc.is_empty() {
+                agent_id: None,
+                system_prompt: Some(if desc.is_empty() {
                     format!("{role} agent")
                 } else {
-                    desc.to_string()
-                },
+                    desc
+                }),
                 skills: Vec::new(),
-                model_selection: None,
+                model_selection,
+                mcp_servers: Vec::new(),
+                can_delegate: member_args.can_delegate,
+                max_delegation_depth: member_args.max_delegation_depth.unwrap_or(0),
+                ..Default::default()
             };
-            match state.team_registry.add_member(team, member) {
-                Ok(()) => {
-                    // Sync to persistence store
-                    let user_id = state
-                        .ingestion_user_id
-                        .clone()
-                        .unwrap_or_else(|| "local".into());
-                    if let Some(t) = state.team_registry.get(team) {
-                        let def = cli_team_to_definition(t, &user_id);
-                        if let Err(e) = state.team_store.save_team(&def).await {
-                            eprintln!("  {} persist warning: {e}", theme::icon_warn());
-                        }
-                    }
-                    eprintln!(
-                        "  {} Added role '{}' to team '{}'",
-                        theme::icon_ok(),
-                        role.green(),
-                        team.magenta()
-                    );
-                }
-                Err(e) => eprintln!("  {} {e}", theme::icon_err()),
+            let mut definition = state
+                .team_registry
+                .get(team)
+                .cloned()
+                .ok_or_else(|| format!("Team '{team}' not found"))?;
+            if definition
+                .members
+                .iter()
+                .any(|existing| existing.role == role)
+            {
+                return Err(format!("Role '{}' already exists in team '{team}'", role));
             }
+            definition.members.push(member);
+            let persisted = state
+                .team_store
+                .save_team(&definition)
+                .await
+                .map_err(|error| format!("failed to persist team '{team}': {error}"))?;
+            state.team_registry.merge_from_store(vec![persisted]);
+            eprintln!(
+                "  {} Added role '{}' to team '{}'",
+                theme::icon_ok(),
+                role.green(),
+                team.magenta()
+            );
         }
 
         "info" => {
             let name = sub_arg.trim();
             if name.is_empty() {
-                eprintln!("{}", "  Usage: /team info <name>".yellow());
-                return;
+                return Err("Usage: /team info <name>".into());
             }
             match state.team_registry.get(name) {
                 Some(t) => {
@@ -750,16 +430,18 @@ pub(crate) async fn handle_team_command(
                     );
                     eprintln!("  {} {}", "Description:".dim(), t.description);
                     eprintln!("  {} {}", "Created:".dim(), t.created_at);
-                    if let Some(ref coord) = t.coordination {
-                        eprintln!("  {} {:?}", "Coordination:".dim(), coord);
-                    }
+                    eprintln!("  {} {:?}", "Coordination:".dim(), &t.coordination);
                     eprintln!("\n  {}", "Members:".bold());
                     for m in &t.members {
+                        let agent_id =
+                            astra_services::team_persistence::resolve_member_to_profile(m, t)
+                                .agent_id;
                         eprintln!(
-                            "    {} {} — {}",
+                            "    {} {} [{}] — {}",
                             "•".dim(),
                             m.role.as_str().green(),
-                            m.description
+                            agent_id.dim(),
+                            team_member_description(m)
                         );
                         if !m.skills.is_empty() {
                             eprintln!("      {} {}", "Skills:".dim(), m.skills.join(", "));
@@ -768,9 +450,9 @@ pub(crate) async fn handle_team_command(
                             eprintln!("      {} {}", "Offering:".dim(), model.offering_id);
                         }
                     }
-                    if !t.shared_context.is_empty() {
+                    if !t.context.is_empty() {
                         eprintln!("\n  {}", "Shared Context:".bold());
-                        for (k, v) in &t.shared_context {
+                        for (k, v) in &t.context {
                             let preview = truncate_str(v, 60);
                             eprintln!("    {} = {}", k.as_str().magenta(), preview);
                         }
@@ -778,7 +460,7 @@ pub(crate) async fn handle_team_command(
                     eprintln!();
                 }
                 None => {
-                    eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
+                    return Err(format!("Team '{name}' not found"));
                 }
             }
         }
@@ -786,21 +468,25 @@ pub(crate) async fn handle_team_command(
         "delete" => {
             let name = sub_arg.trim();
             if name.is_empty() {
-                eprintln!("{}", "  Usage: /team delete <name>".yellow());
-                return;
+                return Err("Usage: /team delete <name>".into());
             }
-            match state.team_registry.remove(name) {
-                Ok(()) => {
-                    // Also delete from persistence store (best-effort)
-                    let user_id = state
-                        .ingestion_user_id
-                        .clone()
-                        .unwrap_or_else(|| "local".into());
-                    let _ = state.team_store.delete_team(&user_id, name).await;
-                    eprintln!("  {} Team '{}' deleted", theme::icon_ok(), name);
-                }
-                Err(e) => eprintln!("  {} {e}", theme::icon_err()),
+            if state.team_registry.get(name).is_none() {
+                return Err(format!("Team '{name}' not found"));
             }
+            let user_id = state
+                .ingestion_user_id
+                .clone()
+                .unwrap_or_else(|| "local".into());
+            let deleted = state
+                .team_store
+                .delete_team(&user_id, name)
+                .await
+                .map_err(|error| format!("failed to delete team '{name}': {error}"))?;
+            if !deleted {
+                return Err(format!("Team '{name}' was not found in persistence store"));
+            }
+            state.team_registry.remove(name)?;
+            eprintln!("  {} Team '{}' deleted", theme::icon_ok(), name);
         }
 
         "context" => {
@@ -810,792 +496,59 @@ pub(crate) async fn handle_team_command(
             let key = parts.next().unwrap_or("").trim();
             let value = parts.next().unwrap_or("").trim();
             if team.is_empty() || key.is_empty() {
-                eprintln!("{}", "  Usage: /team context <team> <key> <value>".yellow());
-                eprintln!(
-                    "{}",
-                    "  Sets shared context accessible to all team members.".dim()
-                );
-                return;
+                return Err("Usage: /team context <team> <key> <value>".into());
             }
-            match state
+            let mut candidate = state
                 .team_registry
-                .set_context(team, key.to_string(), value.to_string())
-            {
-                Ok(()) => {
-                    eprintln!(
-                        "  {} Set context '{}'='{}' on team '{}'",
-                        theme::icon_ok(),
-                        key,
-                        truncate_str(value, 40),
-                        team.magenta()
-                    );
-                }
-                Err(e) => eprintln!("  {} {e}", theme::icon_err()),
-            }
-        }
-
-        "run" => {
-            // /team run <team> <task description> [--mock <scenario>]
-            let mut parts = sub_arg.splitn(2, ' ');
-            let team_name = parts.next().unwrap_or("").trim();
-            let rest = parts.next().unwrap_or("").trim();
-
-            // Parse optional --mock flag (must be a standalone word, not inside task text)
-            let (task, mock_scenario) = {
-                let words: Vec<&str> = rest.split_whitespace().collect();
-                if let Some(pos) = words.iter().position(|&w| w == "--mock") {
-                    let task_part = words[..pos].join(" ");
-                    let scenario_name = words.get(pos + 1).copied().unwrap_or("complete");
-                    let scenario =
-                        mock_llm::MockScenario::parse(scenario_name).unwrap_or_else(|| {
-                            eprintln!(
-                                "  {} Unknown mock scenario '{}'. Available: {}",
-                                theme::icon_warn(),
-                                scenario_name,
-                                mock_llm::MockScenario::all()
-                                    .iter()
-                                    .map(|(n, _)| *n)
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            );
-                            mock_llm::MockScenario::Complete
-                        });
-                    (task_part, Some(scenario))
-                } else {
-                    (rest.to_string(), None)
-                }
-            };
-            let task = task.trim();
-
-            if team_name.is_empty() || task.is_empty() {
-                eprintln!(
-                    "{}",
-                    "  Usage: /team run <team> <task description> [--mock <scenario>]".yellow()
-                );
-                eprintln!(
-                    "{}",
-                    "  Executes a team task through the delegation engine.".dim()
-                );
-                eprintln!("  Mock scenarios (bypass LLM, test orchestration only):");
-                for (name, desc) in mock_llm::MockScenario::all() {
-                    eprintln!("    --mock {:<20} {}", name, desc);
-                }
-                return;
-            }
-
-            let cli_team = match state.team_registry.get(team_name) {
-                Some(t) => t.clone(),
-                None => {
-                    eprintln!("  {} Team '{}' not found", theme::icon_err(), team_name);
-                    return;
-                }
-            };
-
-            if cli_team.members.is_empty() {
-                eprintln!(
-                    "  {} Team '{}' has no members. Use /team add-member to add agents first.",
-                    theme::icon_err(),
-                    team_name
-                );
-                return;
-            }
-
-            let session = match ensure_team_run_session(api, profile, state).await {
-                Ok(session) => session,
-                Err(e) => {
-                    eprintln!("  {} Failed to prepare session: {e}", theme::icon_err());
-                    return;
-                }
-            };
-            let user_id = session.user_id.clone();
-            let session_id = session.session_id.clone();
-
-            let token = match crate::cli::session::session_runtime::fresh_access_token(api, profile)
+                .get(team)
+                .cloned()
+                .ok_or_else(|| format!("Team '{team}' not found"))?;
+            candidate.context.insert(key.to_string(), value.to_string());
+            let persisted = state
+                .team_store
+                .save_team(&candidate)
                 .await
-            {
-                Some(t) => t,
-                None => {
-                    eprintln!("  {} Not logged in", theme::icon_err());
-                    return;
-                }
-            };
-
-            // Convert CLI team → TeamDefinition for the orchestrator
-            let team_def = cli_team_to_definition(&cli_team, &user_id);
-
-            // The direct Team command is a distinct authenticated user intent.
-            // Resolve its exact profile/slot snapshot before persisting or
-            // starting a run so any ambiguity fails closed with zero children.
-            let direct_command = if mock_scenario.is_none() {
-                let command_identity = astra_turn_types::DirectDelegationCommandIdentity {
-                    command_intent_id: uuid::Uuid::new_v4().to_string(),
-                    session_turn: session.turn,
-                };
-                let (planned_request, planned_profiles) =
-                    match astra_services::team_persistence::resolve_team(
-                        &team_def,
-                        task,
-                        "direct-team-plan",
-                        &session_id,
-                    ) {
-                        Ok(resolved) => resolved,
-                        Err(error) => {
-                            eprintln!("  {} Team validation failed: {error}", theme::icon_err());
-                            return;
-                        }
-                    };
-                match crate::cli::session_judge::assess_direct_team_model_plan(
-                    api,
-                    &token,
-                    state.journal.as_ref(),
-                    &user_id,
-                    &session_id,
-                    &command_identity,
-                    task,
-                    &planned_request,
-                    &planned_profiles,
-                )
-                .await
-                {
-                    Ok(plan) => Some((plan, command_identity)),
-                    Err(error) => {
-                        eprintln!("  {} {error}", theme::icon_err());
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-
-            // Use the shared team store; ensure this team is loaded into it
-            let team_store = state.team_store.clone();
-            if let Err(e) = team_store.save_team(&team_def).await {
-                eprintln!("  {} Failed to prepare team store: {e}", theme::icon_err());
-                return;
-            }
-
-            // Build a fresh delegation engine with a cancel token so Ctrl+C
-            // propagates into sub-agent SSE streams.
-            let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
-            let project_root = match std::env::current_dir() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!(
-                        "  {} Cannot determine working directory: {e}",
-                        theme::icon_err()
-                    );
-                    return;
-                }
-            };
-            let (progress_tx, mut progress_rx) =
-                tokio::sync::mpsc::unbounded_channel::<skill_subrun::SubRunProgressEvent>();
-
-            // Start mock LLM server if --mock was requested
-            let _mock_server;
-            let effective_api = if let Some(scenario) = mock_scenario {
-                match mock_llm::MockLlmServer::start(scenario).await {
-                    Ok(srv) => {
-                        let mock_api = match astra_thin_client::ThinClient::new(&srv.base_url, None)
-                        {
-                            Ok(a) => a,
-                            Err(e) => {
-                                eprintln!(
-                                    "  {} Failed to create mock API client: {e}",
-                                    theme::icon_err()
-                                );
-                                return;
-                            }
-                        };
-                        _mock_server = Some(srv);
-                        mock_api
-                    }
-                    Err(e) => {
-                        eprintln!("  {} Failed to start mock server: {e}", theme::icon_err());
-                        return;
-                    }
-                }
-            } else {
-                _mock_server = None;
-                api.clone()
-            };
-
-            let executor = delegate_subrun::CliDelegateSubRunExecutor::new(
-                effective_api,
-                token,
-                state.model.as_deref().map(str::to_string),
-                project_root.clone(),
-                state.perm_manager.inherited_permissions_for_child(true),
-                Some(cancel_token.clone()),
-            )
-            .with_progress_tx(progress_tx);
-            let mut profile_registry = astra_services::coordination::AgentProfileRegistry::new();
-            delegate_subrun::register_default_agents(&mut profile_registry);
-            let _ = agent_loader::load_and_merge(&project_root, &mut profile_registry);
-            let profile_registry = Arc::new(tokio::sync::RwLock::new(profile_registry));
-            let run_store = cli_team_run_store();
-            let run_engine = Arc::new(astra_runtime::server::run::engine::RunEngine::new(
-                run_store,
-            ));
-            let tracker =
-                Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
-            let transport = Arc::new(astra_messaging::InProcessTransport::new());
-            let mailbox_router = Arc::new(astra_messaging::AgentMailboxRouter::new(
-                transport,
-                tracker.clone(),
-            ));
-            let delegation_engine = Arc::new(
-                astra_runtime::server::delegation::engine::DelegationEngine::with_executor(
-                    profile_registry.clone(),
-                    run_engine.clone(),
-                    tracker.clone(),
-                    Arc::new(executor),
-                )
-                .with_mailbox_router(mailbox_router),
-            );
-
-            // Wire live progress callback for phase updates
-            let progress: astra_runtime::server::team::orchestrator::ProgressCallback =
-                Arc::new(move |phase: ExecutionPhase| match phase {
-                    ExecutionPhase::Preparing {
-                        team_name,
-                        member_count,
-                    } => {
-                        eprintln!(
-                            "  {} Preparing team '{}' ({} members)...",
-                            "🔄".dim(),
-                            team_name.magenta(),
-                            member_count
-                        );
-                    }
-                    ExecutionPhase::WorktreesCreated { ref agent_ids } => {
-                        eprintln!(
-                            "  {} Worktrees created for {} agent{}",
-                            "📂".dim(),
-                            agent_ids.len(),
-                            if agent_ids.len() == 1 { "" } else { "s" }
-                        );
-                        for id in agent_ids {
-                            eprintln!("    {} {}", "→".dim(), id.as_str().dim());
-                        }
-                    }
-                    ExecutionPhase::Executing { ref delegation_id } => {
-                        eprintln!(
-                            "  {} Executing delegation {}...",
-                            "🚀".dim(),
-                            delegation_id.get(..8).unwrap_or(delegation_id).dim()
-                        );
-                    }
-                    ExecutionPhase::Merging { agent_count } => {
-                        eprintln!(
-                            "  {} Merging results from {} agent{}...",
-                            "🔀".dim(),
-                            agent_count,
-                            if agent_count == 1 { "" } else { "s" }
-                        );
-                    }
-                    ExecutionPhase::Reporting { ref status } => {
-                        eprintln!(
-                            "  {} Generating report ({})...",
-                            "📊".dim(),
-                            status.to_string().dim()
-                        );
-                    }
-                    ExecutionPhase::AgentProgress {
-                        ref agent_states,
-                        completed_count,
-                        total_count,
-                        ..
-                    } => {
-                        let summary: Vec<String> = agent_states
-                            .iter()
-                            .map(|(id, st)| format!("{}={}", id, st))
-                            .collect();
-                        eprintln!(
-                            "  {} Progress: {}/{} agents done [{}]",
-                            "📡".dim(),
-                            completed_count,
-                            total_count,
-                            summary.join(", ").dim()
-                        );
-                    }
-                });
-
-            let config = astra_runtime::server::team::orchestrator::OrchestratorConfig {
-                user_id: user_id.clone(),
-                session_id,
-                // Must match the profile registered by register_default_agents()
-                source_agent_id: "main".to_string(),
-                progress: Some(progress),
-            };
-
-            let orchestrator =
-                astra_runtime::server::team::orchestrator::TeamExecutionOrchestrator::new(
-                    team_store,
-                    delegation_engine.clone(),
-                    tracker.clone(),
-                    run_engine,
-                    profile_registry,
-                    config,
-                )
-                .with_cancellation_token(cancel_token.clone());
-
-            // Print header
+                .map_err(|error| format!("failed to persist team '{team}': {error}"))?;
+            state.team_registry.merge_from_store(vec![persisted]);
             eprintln!(
-                "\n{}",
-                format!("─── Team Run: {} ───", team_name).bold().magenta()
+                "  {} Set context '{}'='{}' on team '{}'",
+                theme::icon_ok(),
+                key,
+                truncate_str(value, 40),
+                team.magenta()
             );
-            for m in &cli_team.members {
-                eprintln!(
-                    "    {} {} {}",
-                    "→".dim(),
-                    m.role.as_str().green(),
-                    format!("— {}", m.description).dim()
-                );
-            }
-            eprintln!("  {} {}\n", "📋 Task:".bold(), task);
-
-            let started_at = chrono::Utc::now().to_rfc3339();
-            let timer = Instant::now();
-
-            // Progress renderer: 3s heartbeat with per-agent tracking and stall detection.
-            let render_cancel = cancel_token.clone();
-            let member_count = cli_team.members.len();
-            let progress_renderer = tokio::spawn(async move {
-                use astra_runtime::turn::agentic::headless_round::HeadlessStderrStyle;
-                use std::collections::HashMap as ProgressMap;
-
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
-                interval.tick().await; // skip first immediate tick
-                let mut last_event_at = Instant::now();
-                let mut agent_events: ProgressMap<String, u32> = ProgressMap::new();
-                let mut ticker_dirty = false;
-
-                loop {
-                    tokio::select! {
-                        biased;
-                        Some(evt) = progress_rx.recv() => {
-                            last_event_at = Instant::now();
-                            if !evt.agent_id.is_empty() {
-                                *agent_events.entry(evt.agent_id.clone()).or_insert(0) += 1;
-                            }
-                            if ticker_dirty {
-                                eprint!("\r{}\r", " ".repeat(72));
-                                ticker_dirty = false;
-                            }
-                            let tag = format_duration(timer.elapsed());
-                            let prefix = if evt.agent_id.is_empty() {
-                                format!("  [{}] ", tag.dim())
-                            } else {
-                                format!("  [{}] {} ", tag.dim(), evt.agent_id.magenta())
-                            };
-                            match evt.style {
-                                HeadlessStderrStyle::Green =>
-                                    eprintln!("{}{}", prefix, evt.line.green()),
-                                HeadlessStderrStyle::Red =>
-                                    eprintln!("{}{}", prefix, evt.line.red()),
-                                HeadlessStderrStyle::Yellow =>
-                                    eprintln!("{}{}", prefix, evt.line.yellow()),
-                                _ =>
-                                    eprintln!("{}{}", prefix, evt.line.dim()),
-                            }
-                        }
-                        _ = interval.tick() => {
-                            let elapsed = timer.elapsed();
-                            let silence = last_event_at.elapsed();
-                            let active = agent_events.len();
-                            let status = if silence.as_secs() >= 30 {
-                                format!(
-                                    "running… {} | {}/{} agents | no output for {}",
-                                    format_duration(elapsed), active, member_count,
-                                    format_duration(silence),
-                                )
-                            } else {
-                                format!(
-                                    "running… {} | {}/{} agents active",
-                                    format_duration(elapsed), active, member_count,
-                                )
-                            };
-                            eprint!("\r{}\r  {} {}", " ".repeat(72), "⏳".dim(), status.dim());
-                            ticker_dirty = true;
-                        }
-                        _ = render_cancel.cancelled() => {
-                            if ticker_dirty {
-                                eprint!("\r{}\r", " ".repeat(72));
-                            }
-                            break;
-                        }
-                    }
-                }
-            });
-
-            let repo_root = std::env::current_dir().ok();
-
-            // ─── Journal: record team execution start ────────────────────────
-            let agent_roles: Vec<String> =
-                cli_team.members.iter().map(|m| m.role.clone()).collect();
-            let coordination_label = cli_team
-                .coordination
-                .as_ref()
-                .map(|c| format!("{c:?}"))
-                .unwrap_or_else(|| "auto".to_string());
-            if let Some(ref j) = state.journal {
-                crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
-                    j,
-                    state.session_id.as_deref(),
-                    &astra_services::session_journal::JournalEvent::delegation_started(
-                        state.session_id.as_deref(),
-                        team_name, // delegation_id not yet known — use team name
-                        "orchestrator",
-                        &coordination_label,
-                        &agent_roles,
-                    ),
-                    "slash_team:delegation_started",
-                );
-            }
-
-            let execution = async {
-                match direct_command {
-                    Some((plan, identity)) => {
-                        orchestrator
-                            .execute_team_with_model_plan(
-                                team_name, task, repo_root, plan, identity,
-                            )
-                            .await
-                    }
-                    None => orchestrator.execute_team(team_name, task, repo_root).await,
-                }
-            };
-            tokio::pin!(execution);
-            let mut interrupted = false;
-            let report = tokio::select! {
-                report = &mut execution => report,
-                _ = tokio::signal::ctrl_c() => {
-                    interrupted = true;
-                    cancel_token.cancel();
-                    eprint!("\r{}\r", " ".repeat(72));
-                    eprintln!("  {} Interrupting team run and waiting for durable cleanup...", "⚠️ ".yellow());
-                    // The orchestrator owns cancellation settlement. Await it
-                    // instead of dropping the future with live child records.
-                    (&mut execution).await
-                }
-            };
-            if interrupted {
-                eprintln!("  {} Team run interrupted and settled.", theme::icon_err());
-            }
-            cancel_token.cancel();
-            progress_renderer.abort();
-            let elapsed = timer.elapsed();
-
-            // Display report header with status
-            eprintln!();
-            match report.status {
-                astra_runtime::server::team::orchestrator::TeamExecutionStatus::Completed => {
-                    eprintln!(
-                        "  ✅ Team '{}' execution completed {}",
-                        team_name.green().bold(),
-                        format!("({})", format_duration(elapsed)).dim()
-                    );
-                }
-                astra_runtime::server::team::orchestrator::TeamExecutionStatus::Unfinished => {
-                    eprintln!(
-                        "  ⏳ Team '{}' returned unfinished {}",
-                        team_name.yellow().bold(),
-                        format!("({})", format_duration(elapsed)).dim()
-                    );
-                    if let Some(ref err) = report.error {
-                        eprintln!("    {} {}", theme::icon_warn(), err.as_str().yellow());
-                    }
-                }
-                astra_runtime::server::team::orchestrator::TeamExecutionStatus::Partial => {
-                    eprintln!(
-                        "  ⚠️  Team '{}' completed partially {}",
-                        team_name.yellow().bold(),
-                        format!("({})", format_duration(elapsed)).dim()
-                    );
-                    if let Some(ref err) = report.error {
-                        eprintln!("    {} {}", theme::icon_warn(), err.as_str().yellow());
-                    }
-                }
-                astra_runtime::server::team::orchestrator::TeamExecutionStatus::CompletedWithConflicts => {
-                    eprintln!(
-                        "  {}  Team '{}' completed with merge conflicts {}",
-                        theme::icon_warn(), team_name.yellow().bold(),
-                        format!("({})", format_duration(elapsed)).dim()
-                    );
-                    if let Some(ref err) = report.error {
-                        eprintln!("    {} {}", theme::icon_warn(), err.as_str().yellow());
-                    }
-                }
-                astra_runtime::server::team::orchestrator::TeamExecutionStatus::CompletedOverBudget => {
-                    eprintln!(
-                        "  {}  Team '{}' completed over budget {}",
-                        theme::icon_warn(), team_name.yellow().bold(),
-                        format!("({})", format_duration(elapsed)).dim()
-                    );
-                    if let Some(ref err) = report.error {
-                        eprintln!("    {} {}", theme::icon_warn(), err.as_str().yellow());
-                    }
-                }
-                astra_runtime::server::team::orchestrator::TeamExecutionStatus::Failed => {
-                    eprintln!(
-                        "  {} Team '{}' execution failed {}",
-                        theme::icon_err(), team_name.red().bold(),
-                        format!("({})", format_duration(elapsed)).dim()
-                    );
-                    if let Some(ref err) = report.error {
-                        eprintln!("    {} {}", theme::icon_err(), err);
-                    }
-                }
-            }
-
-            if !report.preserved_worktree_branches.is_empty() {
-                eprintln!(
-                    "\n  {} Isolated work was preserved for recovery:",
-                    theme::icon_warn()
-                );
-                for branch in &report.preserved_worktree_branches {
-                    eprintln!("    {} {}", "→".dim(), branch.as_str().yellow());
-                }
-            }
-
-            // Agent results
-            if let Some(ref dr) = report.delegation_result {
-                let total_tokens = dr.total_prompt_tokens + dr.total_completion_tokens;
-                eprintln!(
-                    "\n  📊 {} agent{} | {} tokens ({}↑ {}↓) | delegation {}",
-                    dr.agent_results.len(),
-                    if dr.agent_results.len() == 1 { "" } else { "s" },
-                    format_tokens(total_tokens),
-                    format_tokens(dr.total_prompt_tokens),
-                    format_tokens(dr.total_completion_tokens),
-                    dr.delegation_id.get(..8).unwrap_or(&dr.delegation_id).dim(),
-                );
-                for ar in &dr.agent_results {
-                    let is_success = ar.is_success();
-                    let is_unfinished = ar.is_unfinished();
-                    let (status_icon, status_color) = if is_success {
-                        ("✅", "green")
-                    } else if is_unfinished {
-                        ("⏳", "yellow")
-                    } else {
-                        ("❌", "red")
-                    };
-                    let first_line = ar
-                        .output
-                        .as_deref()
-                        .filter(|value| !value.trim().is_empty())
-                        .or_else(|| ar.error.as_deref().filter(|value| !value.trim().is_empty()))
-                        .unwrap_or(ar.status.as_str())
-                        .lines()
-                        .next()
-                        .unwrap_or("");
-                    let agent_tokens = ar.prompt_tokens + ar.completion_tokens;
-                    let status_label = if is_success {
-                        format!("({}tok)", format_tokens(agent_tokens))
-                    } else {
-                        format!("({} · {}tok)", ar.status, format_tokens(agent_tokens))
-                    };
-                    match status_color {
-                        "green" => eprintln!(
-                            "    {} {} {} — {}",
-                            status_icon.green(),
-                            ar.agent_id.as_str().magenta(),
-                            status_label.dim(),
-                            truncate_str(first_line, 72),
-                        ),
-                        "yellow" => eprintln!(
-                            "    {} {} {} — {}",
-                            status_icon.yellow(),
-                            ar.agent_id.as_str().magenta(),
-                            status_label.dim(),
-                            truncate_str(first_line, 72),
-                        ),
-                        _ => eprintln!(
-                            "    {} {} {} — {}",
-                            status_icon.red(),
-                            ar.agent_id.as_str().magenta(),
-                            status_label.dim(),
-                            truncate_str(first_line, 72),
-                        ),
-                    }
-                }
-            }
-
-            // Merge results
-            if let Some(ref merge) = report.merge_result {
-                if merge.conflicts.is_empty() {
-                    if !merge.merged.is_empty() {
-                        eprintln!(
-                            "\n  🔀 Merge: {} branch{} merged cleanly",
-                            merge.merged.len(),
-                            if merge.merged.len() == 1 { "" } else { "es" }
-                        );
-                    }
-                } else {
-                    eprintln!(
-                        "\n  🔀 Merge: {} conflict{}",
-                        merge.conflicts.len(),
-                        if merge.conflicts.len() == 1 { "" } else { "s" }
-                    );
-                    for c in &merge.conflicts {
-                        eprintln!(
-                            "    {} {} — {}",
-                            "!".red().bold(),
-                            c.agent_id.as_str().yellow(),
-                            c.files.join(", ")
-                        );
-                    }
-                }
-            }
-
-            eprintln!();
-
-            // Record this execution in history (in-memory + persistence service)
-            let (prompt_tok, compl_tok, agent_count) = report
-                .delegation_result
-                .as_ref()
-                .map(|dr| {
-                    (
-                        dr.total_prompt_tokens,
-                        dr.total_completion_tokens,
-                        dr.agent_results.len(),
-                    )
-                })
-                .unwrap_or((0, 0, 0));
-            state.team_registry.record_execution(TeamHistoryEntry {
-                team_name: team_name.to_string(),
-                task: task.to_string(),
-                delegation_id: report.delegation_id.clone(),
-                parent_run_id: report.parent_run_id.clone(),
-                status: report.status.to_string(),
-                agent_count,
-                total_prompt_tokens: prompt_tok,
-                total_completion_tokens: compl_tok,
-                error: report.error.clone(),
-                started_at,
-            });
-
-            // ─── Journal: record team execution completion ───────────────
-            if let Some(ref j) = state.journal {
-                let (succeeded, failed) = report
-                    .delegation_result
-                    .as_ref()
-                    .map(|dr| {
-                        let s = dr.agent_results.iter().filter(|r| r.is_success()).count();
-                        (s, dr.agent_results.len() - s)
-                    })
-                    .unwrap_or((0, 0));
-                let mut event = astra_services::session_journal::JournalEvent::delegation_completed(
-                    state.session_id.as_deref(),
-                    &report.delegation_id,
-                    &coordination_label,
-                    agent_count,
-                    succeeded,
-                    failed,
-                    &report.status.to_string(),
-                    report
-                        .delegation_result
-                        .as_ref()
-                        .and_then(|result| result.aggregated_output.as_deref()),
-                );
-                if !report.preserved_worktree_branches.is_empty()
-                    && let Some(metadata) = event.metadata.as_mut()
-                {
-                    metadata["preserved_worktree_branches"] =
-                        serde_json::json!(&report.preserved_worktree_branches);
-                    metadata["integration"] = serde_json::json!("skipped_after_cancellation");
-                }
-                crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
-                    j,
-                    state.session_id.as_deref(),
-                    &event,
-                    "slash_team:delegation_completed",
-                );
-            }
         }
 
         "history" => {
-            // /team history <team>
-            // Currently reads from in-memory TeamRegistry. When API-backed persistence is active,
-            // state.team_store.list_executions() becomes the primary source.
             let name = sub_arg.trim();
             if name.is_empty() {
-                eprintln!("{}", "  Usage: /team history <team>".yellow());
-                eprintln!("{}", "  Shows execution history for a team.".dim());
-                return;
+                return Err("Usage: /team history <team>".into());
             }
-            let team = match state.team_registry.get(name) {
-                Some(t) => t.clone(),
-                None => {
-                    eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
-                    return;
-                }
-            };
-
-            // Query persistence store using stable team_id (not display name)
-            let store_entries = state
+            let team = state
+                .team_registry
+                .get(name)
+                .ok_or_else(|| format!("Team '{name}' not found"))?;
+            let entries = state
                 .team_store
                 .list_executions(&team.team_id, 50)
                 .await
-                .unwrap_or_default();
-            let registry_entries = state.team_registry.get_history(name);
-
-            if registry_entries.is_empty() && store_entries.is_empty() {
+                .map_err(|error| format!("failed to load team history: {error}"))?;
+            eprintln!("\n─── Team batch execution history: {name} ───");
+            if entries.is_empty() {
                 eprintln!(
-                    "\n  📜 No execution history for team '{}'.",
-                    name.magenta().bold()
+                    "  No batch execution records. Interactive lead turns use the ordinary session trace."
                 );
-                eprintln!("  {}", "  Use /team run to execute a task.".dim());
-                return;
             }
-
-            // Display from in-memory registry (primary for this session)
-            let entries = &registry_entries;
-            let store_extra = if store_entries.len() > entries.len() {
-                store_entries.len() - entries.len()
-            } else {
-                0
-            };
-
-            eprintln!(
-                "\n{}",
-                format!(
-                    "─── History: {} ({} run{}{}) ───",
-                    name,
-                    entries.len(),
-                    if entries.len() == 1 { "" } else { "s" },
-                    if store_extra > 0 {
-                        format!(", +{} in store", store_extra)
-                    } else {
-                        String::new()
-                    }
-                )
-                .bold()
-            );
-            for (i, e) in entries.iter().enumerate().rev() {
-                let status_icon = run_status_icon(&e.status);
+            for entry in entries {
                 eprintln!(
-                    "\n  {} #{} {} {}",
-                    status_icon,
-                    i + 1,
-                    e.status.as_str().bold(),
-                    e.started_at.as_str().dim()
+                    "  {} {} · {} · {}",
+                    run_status_icon(&entry.status),
+                    entry.execution_id,
+                    entry.status,
+                    entry.started_at
                 );
-                eprintln!("    {} {}", "Task:".dim(), truncate_str(&e.task, 70));
-                eprintln!(
-                    "    {} agents: {} | tokens: {} ({}↑ {}↓) | delegation: {}",
-                    "📊".dim(),
-                    e.agent_count,
-                    format_tokens(e.total_prompt_tokens + e.total_completion_tokens),
-                    format_tokens(e.total_prompt_tokens),
-                    format_tokens(e.total_completion_tokens),
-                    e.delegation_id.get(..8).unwrap_or(&e.delegation_id),
-                );
-                if let Some(ref err) = e.error {
-                    eprintln!("    {} {}", theme::icon_err(), truncate_str(err, 60));
-                }
+                eprintln!("    {}", truncate_str(&entry.task, 70));
             }
-            eprintln!();
         }
 
         "snapshot" => {
@@ -1604,14 +557,13 @@ pub(crate) async fn handle_team_command(
             let name = parts.next().unwrap_or("").trim();
             let label = parts.next().unwrap_or("").trim();
             if name.is_empty() {
-                eprintln!("{}", "  Usage: /team snapshot <team> [label]".yellow());
-                eprintln!("{}", "  Saves team state + git commit as a snapshot.".dim());
-                return;
+                return Err("Usage: /team snapshot <team> [label]".into());
             }
-            if state.team_registry.get(name).is_none() {
-                eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
-                return;
-            }
+            let team_definition = state
+                .team_registry
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("Team '{name}' not found"))?;
 
             let snapshot_id = format!("team-{}-{}", name, chrono::Utc::now().timestamp());
             let git_sha = git_head_sha();
@@ -1624,479 +576,222 @@ pub(crate) async fn handle_team_command(
                 label.to_string()
             };
 
-            // Build CompositeSnapshot
-            let mut builder = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(
-                session_id.clone().unwrap_or_default(),
-                0,
-            )
-            .label(&snap_label);
-
-            if let Some(ref sha) = git_sha {
-                builder = builder.git_commit(sha);
-            }
-            if let Some(ref sid) = session_id {
-                builder = builder.session_state(sid);
-            }
-
-            let composite = builder.build();
-
-            state.team_registry.add_snapshot(TeamSnapshotEntry {
-                snapshot_id: snapshot_id.clone(),
-                team_name: name.to_string(),
-                label: snap_label.clone(),
-                git_commit: git_sha.clone(),
-                session_id: session_id.clone(),
-                created_at: now.clone(),
-            });
-
-            // Persist snapshot to store (with full team definition JSON)
-            let team_def_json = state.team_registry.get(name).map(|t| {
-                serde_json::json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "members": t.members.iter().map(|m| serde_json::json!({
-                        "role": m.role,
-                        "description": m.description,
-                        "skills": m.skills,
-                        "model_selection": m.model_selection,
-                    })).collect::<Vec<_>>(),
-                    "shared_context": t.shared_context,
-                })
-                .to_string()
-            });
+            // Persist the complete canonical definition, not a display-only
+            // projection that would discard member capabilities or budgets.
+            let team_def_json = Some(
+                serde_json::to_string(&team_definition)
+                    .map_err(|error| format!("failed to encode team snapshot: {error}"))?,
+            );
             let snap_record = astra_services::team_persistence::TeamSnapshotRecord {
                 snapshot_id: snapshot_id.clone(),
                 team_name: name.to_string(),
-                user_id: String::new(),
+                user_id: team_definition.user_id.clone(),
                 label: snap_label.clone(),
                 git_commit: git_sha.clone(),
-                session_id,
+                session_id: session_id.clone(),
                 team_definition_json: team_def_json,
-                created_at: now,
+                created_at: now.clone(),
             };
-            let _ = state.team_store.save_snapshot(&snap_record).await;
-
+            let accepted = state
+                .team_store
+                .save_snapshot(&snap_record)
+                .await
+                .map_err(|error| format!("failed to persist snapshot: {error}"))?;
             eprintln!(
                 "\n  {} Snapshot '{}' created for team '{}'",
                 theme::icon_ok(),
-                snapshot_id.as_str().dim(),
+                accepted.snapshot_id.as_str().dim(),
                 name.magenta()
             );
-            let dims = composite.dimensions();
-            eprintln!("    {} Captured: {}", "📸".dim(), dims.join(", "),);
-            if let Some(ref sha) = git_sha {
+            if let Some(ref sha) = accepted.git_commit {
                 eprintln!("    {} Git: {}", "🔖".dim(), sha.get(..12).unwrap_or(sha),);
             }
             eprintln!(
                 "    {} Use '/team restore {} {}' to restore.",
                 "💡".dim(),
                 name,
-                snapshot_id,
+                accepted.snapshot_id,
             );
             eprintln!();
         }
 
         "restore" => {
-            // /team restore <team> <snapshot-id>
             let mut parts = sub_arg.splitn(2, ' ');
             let name = parts.next().unwrap_or("").trim();
             let snapshot_id = parts.next().unwrap_or("").trim();
             if name.is_empty() || snapshot_id.is_empty() {
-                eprintln!("{}", "  Usage: /team restore <team> <snapshot-id>".yellow());
-                eprintln!("{}", "  Restores git state from a team snapshot.".dim());
-                return;
+                return Err("Usage: /team restore <team> <snapshot-id>".into());
             }
-            if state.team_registry.get(name).is_none() {
-                eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
-                return;
-            }
-
-            let snap = match state.team_registry.find_snapshot(snapshot_id) {
-                Some(s) => s.clone(),
-                None => {
-                    // Try prefix match in registry
-                    let matches: Vec<_> = state
-                        .team_registry
-                        .get_snapshots(name)
-                        .into_iter()
-                        .filter(|s| s.snapshot_id.starts_with(snapshot_id))
-                        .collect();
-                    match matches.len() {
-                        0 => {
-                            // Fallback: try persistence store
-                            if let Ok(Some(stored)) =
-                                state.team_store.find_snapshot(snapshot_id, "").await
-                            {
-                                TeamSnapshotEntry {
-                                    snapshot_id: stored.snapshot_id,
-                                    team_name: stored.team_name,
-                                    label: stored.label,
-                                    git_commit: stored.git_commit,
-                                    session_id: stored.session_id,
-                                    created_at: stored.created_at,
-                                }
-                            } else {
-                                eprintln!(
-                                    "  {} Snapshot '{}' not found",
-                                    theme::icon_err(),
-                                    snapshot_id
-                                );
-                                let available = state.team_registry.get_snapshots(name);
-                                if !available.is_empty() {
-                                    eprintln!("  {} Available snapshots:", "💡".dim());
-                                    for s in available {
-                                        eprintln!(
-                                            "    {} {} — {}",
-                                            "•".dim(),
-                                            s.snapshot_id.as_str().dim(),
-                                            s.label
-                                        );
-                                    }
-                                }
-                                return;
-                            }
-                        }
-                        1 => matches[0].clone(),
-                        _ => {
-                            eprintln!(
-                                "  {} Ambiguous snapshot prefix '{}'. Matches:",
-                                theme::icon_err(),
-                                snapshot_id
-                            );
-                            for s in matches {
-                                eprintln!("    {} {}", "•".dim(), s.snapshot_id);
-                            }
-                            return;
-                        }
-                    }
-                }
-            };
-
+            let current = state
+                .team_registry
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("Team '{name}' not found"))?;
+            let snap = state
+                .team_store
+                .find_snapshot(snapshot_id, &current.user_id)
+                .await
+                .map_err(|error| format!("failed to load snapshot '{snapshot_id}': {error}"))?
+                .ok_or_else(|| format!("Snapshot '{snapshot_id}' not found"))?;
             if snap.team_name != name {
-                eprintln!(
-                    "  {} Snapshot '{}' belongs to team '{}', not '{}'",
-                    theme::icon_err(),
-                    snap.snapshot_id,
-                    snap.team_name,
-                    name
-                );
-                return;
+                return Err(format!(
+                    "Snapshot '{}' belongs to team '{}', not '{}'",
+                    snap.snapshot_id, snap.team_name, name
+                ));
             }
-
-            // Safety: check for uncommitted changes before restore
-            let git_dirty = std::process::Command::new("git")
-                .args(["status", "--porcelain"])
-                .output()
-                .ok()
-                .map(|o| !o.stdout.is_empty())
-                .unwrap_or(false);
-            if git_dirty {
-                eprintln!(
-                    "  {} Working tree has uncommitted changes. Commit or stash first.",
-                    theme::icon_err()
-                );
-                eprintln!(
-                    "  {}",
-                    "  Run `git stash` to save changes, then retry.".dim()
-                );
-                return;
+            let definition_json = snap
+                .team_definition_json
+                .as_deref()
+                .ok_or_else(|| "Snapshot has no Team configuration".to_string())?;
+            let mut definition: Team = serde_json::from_str(definition_json)
+                .map_err(|error| format!("invalid snapshot configuration: {error}"))?;
+            if definition.name != current.name || definition.user_id != current.user_id {
+                return Err("Snapshot configuration belongs to another Team or owner".into());
             }
-
+            astra_services::team_persistence::validate_team(&definition)
+                .map_err(|errors| format!("invalid snapshot configuration: {errors:?}"))?;
+            // Restore configuration, never historical identity or Git state.
+            definition.team_id = current.team_id;
+            definition.created_at = current.created_at;
+            definition.updated_at = chrono::Utc::now().to_rfc3339();
+            let accepted = state
+                .team_store
+                .save_team(&definition)
+                .await
+                .map_err(|error| format!("failed to restore Team configuration: {error}"))?;
+            state.team_registry.merge_from_store(vec![accepted]);
             eprintln!(
-                "\n  ⏪ Restoring team '{}' from snapshot '{}'...",
-                name.magenta(),
-                snap.snapshot_id.dim()
-            );
-            eprintln!("    {} {}", "Label:".dim(), snap.label);
-
-            // Restore git state if snapshot has a commit
-            if let Some(ref sha) = snap.git_commit {
-                eprintln!(
-                    "    {} Checking out git commit {}...",
-                    "🔖".dim(),
-                    sha.get(..12).unwrap_or(sha)
-                );
-                let output = std::process::Command::new("git")
-                    .args(["checkout", sha])
-                    .output();
-                match output {
-                    Ok(o) if o.status.success() => {
-                        eprintln!(
-                            "    {} Git restored to {}",
-                            theme::icon_ok(),
-                            sha.get(..12).unwrap_or(sha)
-                        );
-                    }
-                    Ok(o) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        eprintln!(
-                            "    {} Git checkout failed: {}",
-                            theme::icon_err(),
-                            truncate_str(stderr.trim(), 60)
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("    {} Git checkout error: {}", theme::icon_err(), e);
-                    }
-                }
-            } else {
-                eprintln!(
-                    "    {} No git commit in snapshot (git state unchanged)",
-                    "ℹ️ ".dim()
-                );
-            }
-
-            eprintln!("  {} Restore complete.\n", theme::icon_ok());
-        }
-
-        "status" => {
-            let name = sub_arg.trim();
-            let entries: Vec<TeamHistoryEntry> = if name.is_empty() {
-                let mut all: Vec<_> = state.team_registry.history.to_vec();
-                all.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-                all.into_iter().take(5).collect()
-            } else {
-                state
-                    .team_registry
-                    .get_history(name)
-                    .into_iter()
-                    .rev()
-                    .take(3)
-                    .cloned()
-                    .collect()
-            };
-            if entries.is_empty() {
-                eprintln!("  {} No recent team executions.", "ℹ️ ".dim());
-                return;
-            }
-            eprintln!("\n{}", "─── Recent Team Runs ───".bold().magenta());
-            for e in &entries {
-                let icon = run_status_icon(&e.status);
-                eprintln!(
-                    "  {} {} {} — {} ({} agents, {}tok)",
-                    icon,
-                    e.team_name.as_str().magenta(),
-                    e.status.as_str().dim(),
-                    truncate_str(&e.task, 50),
-                    e.agent_count,
-                    format_tokens(e.total_prompt_tokens + e.total_completion_tokens),
-                );
-                eprintln!(
-                    "    {} delegation: {}",
-                    "→".dim(),
-                    e.delegation_id.get(..12).unwrap_or(&e.delegation_id).dim()
-                );
-            }
-            eprintln!();
-        }
-
-        "agents" => {
-            // /team agents — list all available agent types (builtin + custom)
-            let spawner = match state.agent_spawner.as_ref() {
-                Some(s) => s,
-                None => {
-                    eprintln!("  {} Agent spawner not initialized", theme::icon_err());
-                    return;
-                }
-            };
-            let registry = spawner.agent_registry();
-            let all = registry.list_all();
-            let builtin_count = 4; // explore, task, code-review, general-purpose
-
-            eprintln!(
-                "\n{}",
-                "─── Agent Types ─────────────────────────────────────────"
-                    .bold()
-                    .magenta()
-            );
-            for def in all.iter() {
-                let tag = if registry.is_custom(&def.agent_type) {
-                    " (custom)".yellow().to_string()
-                } else {
-                    " (builtin)".dim().to_string()
-                };
-                eprintln!("\n  {}{}", def.agent_type.as_str().magenta().bold(), tag,);
-                eprintln!("    {}", def.description.as_str().dim());
-                eprintln!(
-                    "    {} {} | {}",
-                    "Max turns:".dim(),
-                    def.max_turns,
-                    if def.read_only {
-                        "read-only".yellow().to_string()
-                    } else {
-                        "read-write".green().to_string()
-                    }
-                );
-            }
-            let custom_count = all.len().saturating_sub(builtin_count);
-            eprintln!(
-                "\n  {} builtin, {} custom\n",
-                builtin_count.min(all.len()),
-                custom_count
+                "  {} Team configuration restored; Git and running tasks unchanged.\n",
+                theme::icon_ok()
             );
         }
 
-        _ => {
-            eprintln!(
-                "{}",
-                format!(
-                    "  Unknown /team subcommand: '{sub}'. {}",
-                    team_subcommands_hint()
-                )
-                .yellow()
-            );
-        }
+        _ => return Err(format!("Unknown /team subcommand: '{sub}'")),
     }
+    Ok(())
 }
 
 fn team_subcommands_hint() -> &'static str {
-    "Subcommands: /team list · info · create · add-member · context · run · status · history · snapshot · restore · delete · agents · help"
-}
-
-// ─── Formatting helpers ────────────────────────────────────────────────────
-
-/// Format a Duration as a human-readable string (e.g. "2.3s", "1m 12s").
-fn format_duration(d: std::time::Duration) -> String {
-    let secs = d.as_secs();
-    let millis = d.subsec_millis();
-    if secs >= 60 {
-        let mins = secs / 60;
-        let rem = secs % 60;
-        format!("{mins}m {rem}s")
-    } else if secs >= 10 {
-        format!("{secs}s")
-    } else {
-        format!("{secs}.{:01}s", millis / 100)
-    }
-}
-
-/// Format token counts with K/M suffixes for readability.
-fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 10_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
+    "Subcommands: /team list · info · create · add-member · context · run · history · snapshot · restore · delete · help"
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Team, TeamHistoryEntry, TeamMember, TeamRegistry, TeamSnapshotEntry,
-        cli_team_to_definition, ensure_team_run_session, format_duration, format_tokens,
-        git_head_sha, team_subcommands_hint,
-    };
-    use crate::cli::cli_config::cli_utils::{
-        CredentialsFile, Profile, load_credentials, save_credentials,
-    };
+    use super::{Team, TeamMember, TeamRegistry, git_head_sha, team_subcommands_hint};
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use crate::cli::session::session_state::SessionState;
-    use astra_runtime::server::team::orchestrator::ExecutionPhase;
-    use astra_services::session_journal;
     use astra_services::team_persistence::WorktreeMode;
-    use axum::{Router, routing::get, routing::post};
     use std::collections::HashMap;
 
-    async fn spawn_mock(app: Router) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let base = format!("http://{addr}");
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        tokio::task::yield_now().await;
-        base
-    }
-
     #[test]
-    fn registry_has_builtin_teams_with_explicit_coordination() {
-        use astra_services::team_persistence::TeamCoordination;
-
+    fn registry_starts_empty_until_remote_hydration() {
         let reg = TeamRegistry::new();
-        assert!(matches!(
-            reg.get("review")
-                .and_then(|team| team.coordination.as_ref()),
-            Some(TeamCoordination::FanOut {
-                aggregation: astra_services::team_persistence::TeamAggregation::AllResults
-            })
-        ));
-        assert!(matches!(
-            reg.get("research")
-                .and_then(|team| team.coordination.as_ref()),
-            Some(TeamCoordination::Sequential {
-                stop_on_success: false
-            })
-        ));
-        assert!(matches!(
-            reg.get("dev").and_then(|team| team.coordination.as_ref()),
-            Some(TeamCoordination::Sequential {
-                stop_on_success: false
-            })
-        ));
-        assert_eq!(reg.list().len(), 3);
+        assert!(reg.list().is_empty());
+        assert!(!reg.store_loaded);
     }
 
     #[test]
-    fn create_and_delete_team() {
+    fn remote_projection_can_be_published_and_deleted() {
         let mut reg = TeamRegistry::new();
-        reg.create("my-team".into(), "test team".into(), None)
-            .unwrap();
-        assert!(reg.get("my-team").is_some());
-        assert_eq!(reg.list().len(), 4);
+        reg.merge_from_store(vec![make_team(&["coder"])]);
+        assert!(reg.get("test").is_some());
+        assert_eq!(reg.list().len(), 1);
 
-        reg.remove("my-team").unwrap();
-        assert!(reg.get("my-team").is_none());
+        reg.remove("test").unwrap();
+        assert!(reg.get("test").is_none());
     }
 
     #[test]
-    fn create_duplicate_fails() {
+    fn canonical_projection_preserves_member_and_team_fields() {
+        let mut team = make_team(&["coder"]);
+        team.budget = Some(astra_services::team_persistence::TeamBudget {
+            max_cost_usd: 2.5,
+            max_tokens: 900,
+            max_duration_secs: 30,
+        });
+        team.max_parallel = 2;
+        team.members[0].agent_id = Some("stable-coder".into());
+        team.members[0].mcp_servers = vec!["docs".into()];
+        team.members[0].can_delegate = true;
+        team.members[0].max_delegation_depth = 2;
+
         let mut reg = TeamRegistry::new();
-        assert!(reg.create("review".into(), "dup".into(), None).is_err());
+        reg.merge_from_store(vec![team.clone()]);
+        let stored = reg.get("test").unwrap();
+        assert_eq!(stored.team_id, team.team_id);
+        assert_eq!(stored.budget, team.budget);
+        assert_eq!(stored.max_parallel, team.max_parallel);
+        assert_eq!(stored.members[0].agent_id, team.members[0].agent_id);
+        assert_eq!(stored.members[0].mcp_servers, team.members[0].mcp_servers);
+        assert_eq!(stored.members[0].can_delegate, team.members[0].can_delegate);
     }
 
-    #[test]
-    fn add_member_to_team() {
-        let mut reg = TeamRegistry::new();
-        reg.create("test".into(), "test".into(), None).unwrap();
-        reg.add_member(
-            "test",
-            TeamMember {
-                role: "coder".into(),
-                description: "writes code".into(),
-                skills: vec![],
-                model_selection: None,
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn failed_team_http_commands_leave_the_published_projection_unchanged() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some("test-token".into()),
+                ..Default::default()
             },
-        )
-        .unwrap();
-        let team = reg.get("test").unwrap();
-        assert_eq!(team.members.len(), 1);
-        assert_eq!(team.members[0].role, "coder");
-    }
-
-    #[test]
-    fn add_duplicate_role_fails() {
-        let mut reg = TeamRegistry::new();
-        reg.create("test".into(), "test".into(), None).unwrap();
-        let member = TeamMember {
-            role: "coder".into(),
-            description: "v1".into(),
-            skills: vec![],
-            model_selection: None,
-        };
-        reg.add_member("test", member.clone()).unwrap();
-        assert!(reg.add_member("test", member).is_err());
-    }
-
-    #[test]
-    fn shared_context_set_and_read() {
-        let mut reg = TeamRegistry::new();
-        reg.set_context("review", "project".into(), "astra".into())
-            .unwrap();
-        let team = reg.get("review").unwrap();
-        assert_eq!(team.shared_context.get("project").unwrap(), "astra");
+        );
+        save_credentials(&creds).unwrap();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/teams"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/teams"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let original = make_team(&["first"]);
+        let expected = serde_json::to_value(&original).unwrap();
+        let mut state = SessionState::default();
+        state.team_store = std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(
+            server.uri(),
+            None,
+        ));
+        state.team_registry.merge_from_store(vec![original]);
+        state.team_registry.store_loaded = true;
+        for command in [
+            "create fresh",
+            "add-member test second",
+            "context test key value",
+        ] {
+            assert!(
+                super::handle_team_command(command, &api, None, &mut state)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                serde_json::to_value(state.team_registry.get("test").unwrap()).unwrap(),
+                expected
+            );
+            assert!(state.team_registry.get("fresh").is_none());
+        }
+        state.team_registry.store_loaded = false;
+        assert!(
+            super::handle_team_command("list", &api, None, &mut state)
+                .await
+                .is_err()
+        );
+        assert!(!state.team_registry.store_loaded);
+        assert_eq!(
+            serde_json::to_value(state.team_registry.get("test").unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
     }
 
     #[test]
@@ -2105,158 +800,213 @@ mod tests {
         assert!(reg.remove("ghost").is_err());
     }
 
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn snapshot_and_cold_restore_preserve_owner_and_configuration() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some("test-token".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let server = wiremock::MockServer::start().await;
+        let mut saved = make_team(&["first"]);
+        saved.context.insert("contract".into(), "before".into());
+        saved.max_parallel = 2;
+        saved.budget = Some(astra_services::team_persistence::TeamBudget {
+            max_cost_usd: 1.0,
+            max_tokens: 100,
+            max_duration_secs: 30,
+        });
+        saved.members[0].mcp_servers = vec!["fixture-mcp".into()];
+        saved.members[0].can_delegate = true;
+        saved.members[0].max_delegation_depth = 2;
+        let snapshot = serde_json::json!({
+            "snapshot_id": "snap-server-identity", "team_name": "test",
+            "label": "accepted-label", "git_commit": "not-a-checkout-target",
+            "session_id": null, "team_definition_json": serde_json::to_string(&saved).unwrap(),
+            "created_at": "2026-10-03T00:00:00Z",
+        });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/teams"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"teams": [&saved]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/teams/test/snapshots"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&snapshot))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let store = std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(
+            server.uri(),
+            None,
+        ));
+        let mut initial = SessionState::default();
+        initial.team_store = store.clone();
+        super::handle_team_command("snapshot test local-label", &api, None, &mut initial)
+            .await
+            .unwrap();
+        assert_eq!(initial.team_registry.get("test").unwrap().user_id, "u");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        server.reset().await;
+
+        let mut current = make_team(&["second"]);
+        current.context.insert("contract".into(), "after".into());
+        let mut expected = saved.clone();
+        expected.team_id = current.team_id.clone();
+        expected.created_at = current.created_at.clone();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/teams"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"teams": [&current]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/teams/snapshots/snap-server-identity",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&snapshot))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/teams"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "context": saved.context, "budget": saved.budget,
+                "max_parallel": saved.max_parallel, "members": saved.members,
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&expected))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = SessionState::default();
+        state.team_store = store;
+        super::handle_team_command("restore test snap-server-identity", &api, None, &mut state)
+            .await
+            .unwrap();
+        let expected_json = serde_json::to_value(&expected).unwrap();
+        assert_eq!(
+            serde_json::to_value(state.team_registry.get("test").unwrap()).unwrap(),
+            expected_json
+        );
+        assert_ne!(expected.team_id, saved.team_id);
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        server.reset().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/teams/snapshots/snap-server-identity",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&snapshot))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .expect(2)
+            .mount(&server)
+            .await;
+        for command in ["restore test snap-server-identity", "snapshot test failed"] {
+            assert!(
+                super::handle_team_command(command, &api, None, &mut state)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                serde_json::to_value(state.team_registry.get("test").unwrap()).unwrap(),
+                expected_json
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        server.reset().await;
+
+        let mut wrong_owner = saved.clone();
+        wrong_owner.user_id = "another-owner".into();
+        for (team_name, definition_json) in [
+            ("test", None),
+            ("test", Some("{".into())),
+            ("test", Some(serde_json::to_string(&wrong_owner).unwrap())),
+            ("another-team", Some(serde_json::to_string(&saved).unwrap())),
+        ] {
+            let mut invalid = snapshot.clone();
+            invalid["team_name"] = serde_json::json!(team_name);
+            invalid["team_definition_json"] = serde_json::json!(definition_json);
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(
+                    "/teams/snapshots/snap-server-identity",
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&invalid))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert!(
+                super::handle_team_command(
+                    "restore test snap-server-identity",
+                    &api,
+                    None,
+                    &mut state
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                serde_json::to_value(state.team_registry.get("test").unwrap()).unwrap(),
+                expected_json
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            server.reset().await;
+        }
+    }
+
     // ── Coordination tests ──────────────────────────────────────────
 
     fn make_team(roles: &[&str]) -> Team {
+        let now = "2024-01-01T00:00:00Z".to_string();
         Team {
             team_id: uuid::Uuid::new_v4().to_string(),
+            user_id: "u".into(),
             name: "test".into(),
             description: "test team".into(),
             members: roles
                 .iter()
                 .map(|r| TeamMember {
                     role: r.to_string(),
-                    description: format!("{r} agent"),
+                    agent_id: None,
+                    system_prompt: Some(format!("{r} agent")),
                     skills: vec![],
                     model_selection: None,
+                    mcp_servers: vec![],
+                    can_delegate: false,
+                    max_delegation_depth: 0,
+                    ..Default::default()
                 })
                 .collect(),
-            shared_context: HashMap::new(),
+            context: HashMap::new(),
             worktree_mode: WorktreeMode::Shared,
-            coordination: None,
-            created_at: "2024-01-01T00:00:00Z".into(),
+            coordination: astra_services::team_persistence::TeamCoordination::FanOut {
+                aggregation: astra_services::team_persistence::TeamAggregation::AllResults,
+            },
+            budget: None,
+            max_parallel: 0,
+            created_at: now.clone(),
+            updated_at: now,
         }
     }
 
-    #[test]
-    fn absent_coordination_is_fanout_independent_of_role_text() {
-        use astra_services::team_persistence::TeamCoordination;
-
-        let keyword_rich = cli_team_to_definition(
-            &make_team(&["producer", "reviewer", "planner", "implementer"]),
-            "u",
-        );
-        let arbitrary = cli_team_to_definition(
-            &make_team(&["orbital-cartographer", "signal-gardener"]),
-            "u",
-        );
-        assert_eq!(keyword_rich.coordination, arbitrary.coordination);
-        assert!(matches!(
-            keyword_rich.coordination,
-            TeamCoordination::FanOut { .. }
-        ));
-    }
-
-    #[test]
-    fn cli_team_to_definition_converts_members() {
-        let team = make_team(&["coder", "tester"]);
-        let def = cli_team_to_definition(&team, "user-123");
-        assert_eq!(def.name, "test");
-        assert_eq!(def.user_id, "user-123");
-        assert_eq!(def.members.len(), 2);
-        assert_eq!(def.members[0].role, "coder");
-        assert_eq!(def.members[1].role, "tester");
-        assert!(def.members[0].agent_id.is_none());
-        assert_eq!(def.members[0].system_prompt.as_deref(), Some("coder agent"));
-    }
-
-    #[test]
-    fn cli_team_to_definition_preserves_context() {
-        let mut team = make_team(&["a"]);
-        team.shared_context.insert("lang".into(), "rust".into());
-        let def = cli_team_to_definition(&team, "u");
-        assert_eq!(def.context.get("lang").unwrap(), "rust");
-    }
-
-    #[test]
-    fn cli_team_to_definition_preserves_worktree_mode() {
-        let mut reg = TeamRegistry::new();
-        let dev = reg.get("dev").unwrap().clone();
-        let def = cli_team_to_definition(&dev, "u");
-        assert_eq!(def.worktree_mode, WorktreeMode::Isolated);
-
-        reg.create("custom".into(), "custom".into(), None).unwrap();
-        let custom = reg.get("custom").unwrap().clone();
-        let custom_def = cli_team_to_definition(&custom, "u");
-        assert_eq!(custom_def.worktree_mode, WorktreeMode::Shared);
-    }
-
     // ── History / Snapshot tests ─────────────────────────────────
-
-    #[test]
-    fn record_and_get_history() {
-        let mut reg = TeamRegistry::new();
-        assert!(reg.get_history("dev").is_empty());
-
-        reg.record_execution(TeamHistoryEntry {
-            team_name: "dev".into(),
-            task: "fix auth".into(),
-            delegation_id: "deleg-1".into(),
-            parent_run_id: "run-1".into(),
-            status: "completed".into(),
-            agent_count: 3,
-            total_prompt_tokens: 1000,
-            total_completion_tokens: 500,
-            error: None,
-            started_at: "2025-01-01T00:00:00Z".into(),
-        });
-        reg.record_execution(TeamHistoryEntry {
-            team_name: "dev".into(),
-            task: "add tests".into(),
-            delegation_id: "deleg-2".into(),
-            parent_run_id: "run-2".into(),
-            status: "failed".into(),
-            agent_count: 2,
-            total_prompt_tokens: 600,
-            total_completion_tokens: 200,
-            error: Some("timeout".into()),
-            started_at: "2025-01-02T00:00:00Z".into(),
-        });
-
-        let history = reg.get_history("dev");
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].task, "fix auth");
-        assert_eq!(history[1].status, "failed");
-        assert_eq!(history[1].error.as_deref(), Some("timeout"));
-
-        // Different team has no history
-        assert!(reg.get_history("review").is_empty());
-    }
-
-    #[test]
-    fn add_and_find_snapshot() {
-        let mut reg = TeamRegistry::new();
-        reg.add_snapshot(TeamSnapshotEntry {
-            snapshot_id: "snap-abc123".into(),
-            team_name: "dev".into(),
-            label: "before refactor".into(),
-            git_commit: Some("deadbeef".into()),
-            session_id: Some("sess-1".into()),
-            created_at: "2025-01-01T00:00:00Z".into(),
-        });
-        reg.add_snapshot(TeamSnapshotEntry {
-            snapshot_id: "snap-def456".into(),
-            team_name: "review".into(),
-            label: "baseline".into(),
-            git_commit: None,
-            session_id: None,
-            created_at: "2025-01-02T00:00:00Z".into(),
-        });
-
-        // Exact match
-        let found = reg.find_snapshot("snap-abc123");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().label, "before refactor");
-
-        // Non-existent
-        let found = reg.find_snapshot("snap-xyz");
-        assert!(found.is_none());
-
-        // Team-scoped list
-        assert_eq!(reg.get_snapshots("dev").len(), 1);
-        assert_eq!(reg.get_snapshots("review").len(), 1);
-        assert_eq!(reg.get_snapshots("research").len(), 0);
-    }
 
     #[test]
     fn git_head_sha_returns_some_in_git_repo() {
@@ -2276,374 +1026,17 @@ mod tests {
         assert!(hint.contains("help"));
     }
 
-    #[serial_test::serial]
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn ensure_team_run_session_creates_remote_session_when_missing() {
-        let _creds_guard = crate::tests::isolate_credentials();
-
-        let mut creds = CredentialsFile::default();
-        creds.profiles.insert(
-            "default".to_string(),
-            Profile {
-                access_token: Some("team-token".to_string()),
-                ..Default::default()
-            },
-        );
-        save_credentials(&creds).unwrap();
-
-        let app = Router::new().route(
-            "/sessions",
-            post(|| async {
-                axum::Json(serde_json::json!({ "session_id": "team-sess-1", "user_id": "owner-1" }))
-            }),
-        );
-        let base = spawn_mock(app).await;
-        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-        let mut state = SessionState::default();
-
-        state.turn = 7;
-        let session = ensure_team_run_session(&api, None, &mut state)
-            .await
-            .unwrap();
-
-        assert_eq!(session.session_id, "team-sess-1");
-        assert_eq!(session.user_id, "owner-1");
-        assert_eq!(session.turn, 7);
-        assert_eq!(state.session_id.as_deref(), Some("team-sess-1"));
-        assert_eq!(state.ingestion_user_id.as_deref(), Some("owner-1"));
-        assert!(state.journal.is_some());
-
-        let creds = load_credentials();
-        assert_eq!(
-            creds.profiles["default"].last_session_id.as_deref(),
-            Some("team-sess-1")
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn ensure_team_run_session_replaces_stale_remote_session() {
-        let _creds_guard = crate::tests::isolate_credentials();
-
-        let mut creds = CredentialsFile::default();
-        creds.profiles.insert(
-            "default".to_string(),
-            Profile {
-                access_token: Some("team-token".to_string()),
-                last_session_id: Some("stale-sess".to_string()),
-                ..Default::default()
-            },
-        );
-        save_credentials(&creds).unwrap();
-
-        let app = Router::new()
-            .route(
-                "/sessions/{id}",
-                get(|| async {
-                    (
-                        axum::http::StatusCode::NOT_FOUND,
-                        axum::Json(serde_json::json!({ "detail": "Session not found" })),
-                    )
-                }),
-            )
-            .route(
-                "/sessions",
-                post(|| async {
-                    axum::Json(
-                        serde_json::json!({ "session_id": "team-sess-2", "user_id": "owner-2" }),
-                    )
-                }),
-            );
-        let base = spawn_mock(app).await;
-        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-        let mut state = SessionState {
-            session_id: Some("stale-sess".to_string()),
-            journal: session_journal::JournalWriter::new("stale-sess").ok(),
-            ..Default::default()
-        };
-
-        let session = ensure_team_run_session(&api, None, &mut state)
-            .await
-            .unwrap();
-
-        assert_eq!(session.session_id, "team-sess-2");
-        assert_eq!(session.user_id, "owner-2");
-        assert_eq!(state.session_id.as_deref(), Some("team-sess-2"));
-        assert!(state.journal.is_some());
-
-        let creds = load_credentials();
-        assert_eq!(
-            creds.profiles["default"].last_session_id.as_deref(),
-            Some("team-sess-2")
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn ensure_team_run_session_uses_server_owned_identity_for_existing_session() {
-        let _creds_guard = crate::tests::isolate_credentials();
-
-        let mut creds = CredentialsFile::default();
-        creds.profiles.insert(
-            "default".to_string(),
-            Profile {
-                access_token: Some("team-token".to_string()),
-                ..Default::default()
-            },
-        );
-        save_credentials(&creds).unwrap();
-
-        let app = Router::new().route(
-            "/sessions/{id}",
-            get(|| async {
-                axum::Json(serde_json::json!({
-                    "session_id": "existing-session",
-                    "user_id": "authenticated-owner"
-                }))
-            }),
-        );
-        let base = spawn_mock(app).await;
-        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-        let mut state = SessionState {
-            session_id: Some("existing-session".to_string()),
-            turn: 9,
-            ingestion_user_id: Some("stale-local-owner".to_string()),
-            ..Default::default()
-        };
-
-        let session = ensure_team_run_session(&api, None, &mut state)
-            .await
-            .unwrap();
-
-        assert_eq!(session.session_id, "existing-session");
-        assert_eq!(session.user_id, "authenticated-owner");
-        assert_eq!(session.turn, 9);
-        assert_eq!(
-            state.ingestion_user_id.as_deref(),
-            Some("authenticated-owner")
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn ensure_team_run_session_fails_closed_on_non_not_found_validation_error() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let _creds_guard = crate::tests::isolate_credentials();
-
-        let mut creds = CredentialsFile::default();
-        creds.profiles.insert(
-            "default".to_string(),
-            Profile {
-                access_token: Some("team-token".to_string()),
-                ..Default::default()
-            },
-        );
-        save_credentials(&creds).unwrap();
-
-        let post_count = std::sync::Arc::new(AtomicUsize::new(0));
-        let count_for_post = post_count.clone();
-        let app = Router::new()
-            .route(
-                "/sessions/{id}",
-                get(|| async {
-                    (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        axum::Json(serde_json::json!({ "detail": "session store unavailable" })),
-                    )
-                }),
-            )
-            .route(
-                "/sessions",
-                post(move || {
-                    let count = count_for_post.clone();
-                    async move {
-                        count.fetch_add(1, Ordering::SeqCst);
-                        axum::Json(serde_json::json!({
-                            "session_id": "must-not-be-created",
-                            "user_id": "authenticated-owner"
-                        }))
-                    }
-                }),
-            );
-        let base = spawn_mock(app).await;
-        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-        let mut state = SessionState {
-            session_id: Some("existing-session".to_string()),
-            ..Default::default()
-        };
-
-        let error = ensure_team_run_session(&api, None, &mut state)
-            .await
-            .unwrap_err();
-
-        assert!(error.contains("could not validate the active session owner"));
-        assert_eq!(post_count.load(Ordering::SeqCst), 0);
-        assert_eq!(state.session_id.as_deref(), Some("existing-session"));
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn ensure_team_run_session_clears_matching_pointer_across_profiles() {
-        let _creds_guard = crate::tests::isolate_credentials();
-
-        let mut creds = CredentialsFile::default();
-        creds.profiles.insert(
-            "default".to_string(),
-            Profile {
-                access_token: Some("team-token".to_string()),
-                ..Default::default()
-            },
-        );
-        creds.profiles.insert(
-            "other".to_string(),
-            Profile {
-                last_session_id: Some("stale-sess".to_string()),
-                ..Default::default()
-            },
-        );
-        save_credentials(&creds).unwrap();
-
-        let app = Router::new()
-            .route(
-                "/sessions/{id}",
-                get(|| async {
-                    (
-                        axum::http::StatusCode::NOT_FOUND,
-                        axum::Json(serde_json::json!({ "detail": "Session not found" })),
-                    )
-                }),
-            )
-            .route(
-                "/sessions",
-                post(|| async {
-                    axum::Json(
-                        serde_json::json!({ "session_id": "team-sess-3", "user_id": "owner-3" }),
-                    )
-                }),
-            );
-        let base = spawn_mock(app).await;
-        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-        let mut state = SessionState {
-            session_id: Some("stale-sess".to_string()),
-            journal: session_journal::JournalWriter::new("stale-sess").ok(),
-            ..Default::default()
-        };
-
-        let session = ensure_team_run_session(&api, None, &mut state)
-            .await
-            .unwrap();
-
-        assert_eq!(session.session_id, "team-sess-3");
-        assert_eq!(session.user_id, "owner-3");
-        let creds = load_credentials();
-        assert_eq!(
-            creds.profiles["other"].last_session_id.as_deref(),
-            None,
-            "team run should clear matching stale pointer even when another profile holds it"
-        );
-        assert_eq!(
-            creds.profiles["default"].last_session_id.as_deref(),
-            Some("team-sess-3")
-        );
-    }
-
-    // ── Formatting helper tests ─────────────────────────────────
-
-    #[test]
-    fn format_duration_sub_second() {
-        let d = std::time::Duration::from_millis(500);
-        assert_eq!(format_duration(d), "0.5s");
-    }
-
-    #[test]
-    fn format_duration_seconds() {
-        let d = std::time::Duration::from_secs(3) + std::time::Duration::from_millis(200);
-        assert_eq!(format_duration(d), "3.2s");
-    }
-
-    #[test]
-    fn format_duration_ten_plus_seconds() {
-        let d = std::time::Duration::from_secs(42);
-        assert_eq!(format_duration(d), "42s");
-    }
-
-    #[test]
-    fn format_duration_minutes() {
-        let d = std::time::Duration::from_secs(125);
-        assert_eq!(format_duration(d), "2m 5s");
-    }
-
-    #[test]
-    fn format_tokens_small() {
-        assert_eq!(format_tokens(500), "500");
-        assert_eq!(format_tokens(9999), "9999");
-    }
-
-    #[test]
-    fn format_tokens_thousands() {
-        assert_eq!(format_tokens(10000), "10.0K");
-        assert_eq!(format_tokens(42500), "42.5K");
-    }
-
-    #[test]
-    fn format_tokens_millions() {
-        assert_eq!(format_tokens(1_500_000), "1.5M");
-        assert_eq!(format_tokens(2_000_000), "2.0M");
-    }
-
-    // ── Progress callback type check ────────────────────────────
-
-    #[test]
-    fn execution_phase_display() {
-        // Verify the ExecutionPhase variants we use in the progress callback
-        let p = ExecutionPhase::Preparing {
-            team_name: "dev".into(),
-            member_count: 3,
-        };
-        assert!(matches!(p, ExecutionPhase::Preparing { .. }));
-
-        let p = ExecutionPhase::Executing {
-            delegation_id: "abc123".into(),
-        };
-        assert!(matches!(p, ExecutionPhase::Executing { .. }));
-    }
-
     // ── New feature tests ───────────────────────────────────────
-
-    #[test]
-    fn create_with_explicit_coordination() {
-        use astra_services::team_persistence::TeamCoordination;
-        let mut reg = TeamRegistry::new();
-        let coord = Some(TeamCoordination::Sequential {
-            stop_on_success: false,
-        });
-        reg.create("pipe-team".into(), "pipeline team".into(), coord)
-            .unwrap();
-        let team = reg.get("pipe-team").unwrap();
-        assert!(matches!(
-            team.coordination,
-            Some(TeamCoordination::Sequential {
-                stop_on_success: false
-            })
-        ));
-    }
 
     #[test]
     fn explicit_coordination_wins_over_default_regardless_of_role_text() {
         use astra_services::team_persistence::TeamCoordination;
         let mut team = make_team(&["producer", "reviewer"]);
-        team.coordination = Some(TeamCoordination::Sequential {
+        team.coordination = TeamCoordination::Sequential {
             stop_on_success: false,
-        });
-        let def = cli_team_to_definition(&team, "u");
+        };
         assert!(matches!(
-            def.coordination,
+            team.coordination,
             TeamCoordination::Sequential {
                 stop_on_success: false
             }
@@ -2651,17 +1044,16 @@ mod tests {
     }
 
     #[test]
-    fn merge_from_store_skips_existing() {
+    fn merge_from_store_replaces_stale_same_name() {
         use astra_services::team_persistence::{
             TeamCoordination, TeamDefinition, TeamMemberDef, WorktreeMode,
         };
         let mut reg = TeamRegistry::new();
-        assert!(reg.get("review").is_some()); // builtin
 
         let foreign = TeamDefinition {
             team_id: "foreign-id".into(),
             user_id: "u".into(),
-            name: "review".into(), // same name as builtin
+            name: "review".into(),
             description: "foreign review".into(),
             coordination: TeamCoordination::Sequential {
                 stop_on_success: false,
@@ -2674,6 +1066,10 @@ mod tests {
             created_at: "2025-01-01T00:00:00Z".into(),
             updated_at: "2025-01-01T00:00:00Z".into(),
         };
+        let mut stale = foreign.clone();
+        stale.team_id = "stale-id".into();
+        stale.description = "stale local projection".into();
+        reg.merge_from_store(vec![stale]);
         let custom = TeamDefinition {
             team_id: "custom-id".into(),
             user_id: "u".into(),
@@ -2691,6 +1087,7 @@ mod tests {
                 mcp_servers: vec![],
                 can_delegate: false,
                 max_delegation_depth: 0,
+                ..Default::default()
             }],
             context: HashMap::new(),
             worktree_mode: WorktreeMode::Shared,
@@ -2702,15 +1099,18 @@ mod tests {
 
         reg.merge_from_store(vec![foreign, custom]);
 
-        // "review" should NOT be overwritten
+        // Remote persistence is authoritative over the stale projection.
         let review = reg.get("review").unwrap();
-        assert_ne!(review.team_id, "foreign-id");
+        assert_eq!(review.team_id, "foreign-id");
 
         // "from-store" should be loaded
         let loaded = reg.get("from-store").unwrap();
         assert_eq!(loaded.team_id, "custom-id");
         assert_eq!(loaded.members.len(), 1);
-        assert_eq!(loaded.members[0].description, "does work");
+        assert_eq!(
+            loaded.members[0].system_prompt.as_deref(),
+            Some("does work")
+        );
     }
 
     #[test]

@@ -679,7 +679,8 @@ pub(crate) async fn complete_session_startup(
         api,
         profile,
         resolved_session_project_root().as_deref(),
-    );
+    )
+    .await;
     tracer.phase("pipeline_modules");
 
     // Load cross-session tool-health state from local files.

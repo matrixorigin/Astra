@@ -288,6 +288,8 @@ pub(crate) struct SessionState {
     pub run_id: Option<String>,
     /// Display name for this session (set via --name flag).
     pub session_name: Option<String>,
+    /// Session-owned caller intent (including model policy/profile selection),
+    /// independent of `model`, which may be populated by default resolution.
     pub cli_context: CliContext,
     pub model: Option<SessionModelChoice>,
     pub turn: u32,

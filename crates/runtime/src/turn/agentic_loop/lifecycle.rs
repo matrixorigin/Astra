@@ -73,6 +73,12 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
         };
         let has_more = lease.has_more();
         let address = &lease.mailbox().address;
+        // A root mailbox may outlive one execution. Observe through the
+        // current run without changing transport identity or reply matching.
+        let mut observer = address.clone();
+        if let Some(run_id) = state.current_run_id.as_ref() {
+            observer.run_id.clone_from(run_id);
+        }
         let mut parts = Vec::new();
         let self_echo = msg.from == *address
             && matches!(
@@ -87,7 +93,7 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
             );
             if !is_transient_progress {
                 host.on_agent_communication(astra_messaging::agent_communication_event(
-                    address,
+                    &observer,
                     astra_messaging::AgentCommunicationDirection::Received,
                     &msg,
                 ));
@@ -125,7 +131,7 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                     // parent task can continue without replaying it forever.
                 } else {
                     host.on_agent_communication(astra_messaging::agent_communication_event(
-                        address,
+                        &observer,
                         astra_messaging::AgentCommunicationDirection::Sent,
                         &response_msg,
                     ));

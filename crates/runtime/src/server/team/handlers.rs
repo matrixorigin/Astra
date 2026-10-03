@@ -7,12 +7,11 @@
 //!   DELETE /teams/{name}                — delete a team
 //!   GET    /teams/{name}/executions     — list execution history
 //!   POST   /teams/{name}/execute        — run team task via [`TeamExecutionOrchestrator`]
+//!   GET    /teams/snapshots/{id}        — get an owner-scoped snapshot
 
 use std::sync::Arc;
 
-use astra_server_types::team_orchestrator_traits::{
-    DelegationExecutor, DelegationTracking, RunPersistence,
-};
+use astra_server_types::team_orchestrator_traits::{DelegationExecutor, DelegationTracking};
 use astra_server_types::team_orchestrator_types::{OrchestratorConfig, sum_usage};
 
 use super::super::*;
@@ -194,7 +193,7 @@ pub(crate) async fn upsert_team_handler(
         error_response(StatusCode::BAD_REQUEST, msg)
     })?;
 
-    store
+    let def = store
         .save_team(&def)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -358,9 +357,14 @@ pub(crate) async fn execute_team_handler(
             .clone();
     let engine = require_delegation_engine(&state)?;
 
-    let delegation_engine: Arc<dyn DelegationExecutor> = engine.clone();
+    let delegation_engine: Arc<dyn DelegationExecutor> = Arc::new(
+        engine
+            .for_session(&user.user_id, &body.session_id)
+            .await
+            .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))?,
+    );
     let delegation_tracker: Arc<dyn DelegationTracking> = engine.tracker().clone();
-    let run_engine: Arc<dyn RunPersistence> = engine.run_engine().clone();
+    let run_engine = engine.run_engine().clone();
     let profile_registry = engine.registry().clone();
 
     let orch = TeamExecutionOrchestrator::new(
@@ -430,20 +434,18 @@ pub(crate) struct TeamExecuteResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub agent_count: usize,
-    pub total_prompt_tokens: u64,
-    pub total_completion_tokens: u64,
-    pub total_tool_calls: u32,
+    /// Returned child-result aggregate, not a complete physical-call invoice.
+    pub usage_scope: &'static str,
+    pub total_prompt_tokens: Option<u64>,
+    pub total_completion_tokens: Option<u64>,
+    pub total_tool_calls: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub preserved_worktree_branches: Vec<String>,
 }
 
 impl From<TeamExecutionReport> for TeamExecuteResponse {
     fn from(r: TeamExecutionReport) -> Self {
-        let (tp, tc, tt) = r
-            .delegation_result
-            .as_ref()
-            .map(sum_usage)
-            .unwrap_or((0, 0, 0));
+        let usage = r.delegation_result.as_ref().map(sum_usage);
         Self {
             team_name: r.team_name,
             status: r.status.to_string(),
@@ -456,9 +458,10 @@ impl From<TeamExecutionReport> for TeamExecuteResponse {
                 .as_ref()
                 .map(|d| d.agent_results.len())
                 .unwrap_or(0),
-            total_prompt_tokens: tp,
-            total_completion_tokens: tc,
-            total_tool_calls: tt,
+            usage_scope: "child_results_only",
+            total_prompt_tokens: usage.map(|(prompt, _, _)| prompt),
+            total_completion_tokens: usage.map(|(_, completion, _)| completion),
+            total_tool_calls: usage.map(|(_, _, tools)| tools),
             preserved_worktree_branches: r.preserved_worktree_branches,
         }
     }
@@ -589,11 +592,29 @@ pub(crate) async fn create_snapshot_handler(
         team_definition_json: team_json,
         created_at: now,
     };
-    store
+    let record = store
         .save_snapshot(&record)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(SnapshotEntry::from(record)))
+}
+
+/// GET /teams/snapshots/{id}
+pub(crate) async fn get_snapshot_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<SnapshotEntry>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let store = require_owner_team_store(&state, &user.user_id).await?;
+    let snapshot = store
+        .find_snapshot(&id, &user.user_id)
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| {
+            error_response(StatusCode::NOT_FOUND, format!("snapshot '{id}' not found"))
+        })?;
+    Ok(Json(SnapshotEntry::from(snapshot)))
 }
 
 /// DELETE /teams/snapshots/{id}
@@ -707,6 +728,18 @@ mod tests {
             response.error_code.as_deref(),
             Some("team_execution_failed")
         );
+        let body = serde_json::to_value(response).unwrap();
+        assert_eq!(body["usage_scope"], "child_results_only");
+        for field in [
+            "total_prompt_tokens",
+            "total_completion_tokens",
+            "total_tool_calls",
+        ] {
+            assert!(
+                body[field].is_null(),
+                "missing child results are not zero usage"
+            );
+        }
     }
 
     #[test]
