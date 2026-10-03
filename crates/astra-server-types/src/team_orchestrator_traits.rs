@@ -8,11 +8,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use astra_core::SubRunState;
 use astra_services::coordination::{AgentProfileRegistry, DelegationRequest, DelegationResult};
-use astra_services::runs::RunStatusCasRequest;
 
 // ─── Types that must live here for trait signatures ─────────────────────
 
@@ -86,50 +84,4 @@ pub trait DelegationTracking: Send + Sync {
 
     /// Cleanup all state for a completed delegation.
     async fn cleanup_delegation(&self, delegation_id: &str) -> Result<(), String>;
-}
-
-/// Persists durable Team parent state (events, status, and checkpoints).
-/// Provider/token usage remains owned by each real child run; Team summaries
-/// retain the child aggregate without projecting it onto the parent run.
-#[async_trait]
-pub trait RunPersistence: Send + Sync {
-    /// Create a durable run record with delegation metadata.
-    #[allow(clippy::too_many_arguments)]
-    async fn start_run_ext(
-        &self,
-        run_id: &str,
-        user_id: &str,
-        session_id: &str,
-        parent_run_id: Option<&str>,
-        delegation_id: Option<&str>,
-        agent_id: Option<&str>,
-        retry_of: Option<&str>,
-    ) -> Result<(), String>;
-
-    /// Persist a status only while the durable run still has one of the
-    /// expected statuses. Orchestrators must use this for outcomes so a stale
-    /// worker cannot overwrite a concurrent pause, cancellation, or terminal
-    /// decision.
-    async fn persist_status_if_current(
-        &self,
-        request: RunStatusCasRequest<'_>,
-    ) -> Result<bool, String>;
-
-    /// Save a checkpoint for crash recovery.
-    async fn persist_checkpoint(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        checkpoint_json: &str,
-    ) -> Result<bool, String>;
-
-    /// Append an event to the durable event log.
-    async fn append_event(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        event: Value,
-    ) -> Result<(), String>;
 }

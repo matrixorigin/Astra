@@ -5449,65 +5449,6 @@ impl UserIntentProvider for RunEngine {
     }
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
-
-// ─── Trait Implementation ─────────────────────────────────────────────────────────
-
-#[async_trait::async_trait]
-impl astra_server_types::team_orchestrator_traits::RunPersistence for RunEngine {
-    async fn start_run_ext(
-        &self,
-        run_id: &str,
-        user_id: &str,
-        session_id: &str,
-        parent_run_id: Option<&str>,
-        delegation_id: Option<&str>,
-        agent_id: Option<&str>,
-        retry_of: Option<&str>,
-    ) -> Result<(), String> {
-        RunEngine::start_run_ext(
-            self,
-            run_id,
-            user_id,
-            session_id,
-            parent_run_id,
-            delegation_id,
-            agent_id,
-            retry_of,
-        )
-        .await
-        .map(|_| ())
-    }
-
-    async fn persist_status_if_current(
-        &self,
-        request: RunStatusCasRequest<'_>,
-    ) -> Result<bool, String> {
-        RunEngine::persist_status_if_current(self, request).await
-    }
-
-    async fn persist_checkpoint(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        checkpoint_json: &str,
-    ) -> Result<bool, String> {
-        RunEngine::persist_checkpoint(self, user_id, expected_session_id, run_id, checkpoint_json)
-            .await
-    }
-
-    async fn append_event(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        event: serde_json::Value,
-    ) -> Result<(), String> {
-        RunEngine::append_event(self, user_id, expected_session_id, run_id, event).await
-    }
-}
-
 /// Continuously owns orphan classification after the startup pass. A
 /// transient cancellation-intent lookup failure deliberately leaves the run
 /// active; this leased sweeper is the corresponding retry owner, so
