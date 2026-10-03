@@ -690,11 +690,11 @@ fn start_work_schema() -> Value {
         "type": "function",
         "function": {
             "name": "start_work",
-            "description": "Establish the conversation's one canonical Work with an initial ordered task list. This is the genesis transition: call it only when no Work is bound; once bound, never call start_work again. When the user explicitly requests durable Work with 2+ independently useful deliverables/evidence tracks, call this before exploration. Count user acceptance units: A and B are separate only when each owes its own payload or evidence and remains useful alone; inputs serving one combined conclusion are one outcome. Same-turn multi-agent topology alone uses independent agent.spawn calls, or agent_fanout when group control is needed, not Work; simple questions and one-shot responses do not use Work. activation=start assigns the first task; use activation=defer when this turn only establishes/prepares a plan or explicitly says not to execute; defer creates no attempt. Supply the smallest independently executable outcomes; task identities are server-owned; declare only explicit execution prerequisites via after_initial_tasks. Preserve chronology: outcomes said to be added, replaced, cancelled, discovered, or decided later are omitted from initial tasks until the typed graph-update boundary. One bounded operation producing all requested evidence is one task; exclude synthesis, formatting, reporting, and restatement. Preserve N explicitly named execution tracks as exactly N tasks unless scope changes. A successful result normally includes initial_task; execute it directly instead of calling run_next_work_item. For a bound Work, inspect_work_plan then propose_work_plan is the only graph-change path.",
+            "description": "Establish the conversation's one canonical Work with an initial ordered task list. This is the genesis transition: call it only when no Work is bound; once bound, never call start_work again. When the user explicitly requests durable Work with 2+ independently useful deliverables/evidence tracks, call this before exploration. Count user acceptance units: A and B are separate only when each owes its own payload or evidence and remains useful alone; inputs serving one combined conclusion are one outcome. Same-turn multi-agent topology alone uses independent agent.spawn calls, or agent_fanout when group control is needed, not Work; simple questions and one-shot responses do not use Work. activation=start assigns the first task; use activation=defer when this turn only establishes/prepares a plan or explicitly says not to execute; defer creates no attempt. Declare every known outcome initially, including dependent outcomes; task identities are server-owned; declare only explicit execution prerequisites via after_initial_tasks. Omit only outcomes to be decided, discovered, added, replaced, or cancelled later until the typed graph-update boundary. One bounded operation producing all requested evidence is one task; exclude synthesis, formatting, reporting, and restatement. Preserve N explicitly named execution tracks as exactly N tasks unless scope changes. A successful result normally includes initial_task; execute it directly instead of calling run_next_work_item. For a bound Work, inspect_work_plan then propose_work_plan is the only graph-change path.",
             "parameters": {
                 "type": "object",
                 "additionalProperties": false,
-                "x-astra-discovery-summary": "Declare only initial outcomes. Omit outcomes named for later addition/replacement until graph update. Preserve exactly N named initial tracks. start assigns the first task; use its returned assignment.",
+                "x-astra-discovery-summary": "Declare known outcomes, including dependencies. Omit later decisions/additions/replacements until graph update. Preserve exactly N named initial tracks. start assigns the first task; use its returned assignment.",
                 "properties": {
                     "goal": {
                         "type": "string",
@@ -711,7 +711,7 @@ fn start_work_schema() -> Value {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 8,
-                        "description": "Initial acceptance units, not steps; honor counts. Keep each outcome's observation/verification/report together; omit later additions/replacements.",
+                        "description": "Known acceptance units, including dependent outcomes; honor counts. Keep observation/verification/report together; omit later decisions/additions/replacements.",
                         "items": {
                             "type": "object",
                             "additionalProperties": false,
@@ -3232,6 +3232,10 @@ mod tests {
         assert!(description.contains("propose_work_plan"));
         assert!(description.contains("task identities are server-owned"));
         assert!(description.contains("explicit execution prerequisites via after_initial_tasks"));
+        assert!(
+            description
+                .contains("Declare every known outcome initially, including dependent outcomes")
+        );
         assert_eq!(
             required_fields(schema),
             vec![
@@ -3247,12 +3251,11 @@ mod tests {
             selection["description_truncated"], false,
             "load-bearing Work chronology must survive deferred discovery"
         );
-        assert!(
-            selection["description"]
-                .as_str()
-                .is_some_and(|summary| summary.contains("Omit outcomes named for later")
-                    && summary.contains("exactly N named initial tracks"))
-        );
+        assert!(selection["description"].as_str().is_some_and(|summary| {
+            summary.contains("Declare known outcomes, including dependencies")
+                && summary.contains("Omit later decisions/additions/replacements")
+                && summary.contains("exactly N named initial tracks")
+        }));
         let task_properties = parameters["properties"]["tasks"]["items"]["properties"]
             .as_object()
             .expect("task fields must be structurally declared");
