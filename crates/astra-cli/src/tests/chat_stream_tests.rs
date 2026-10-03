@@ -29,6 +29,36 @@ pub(super) fn sse_text_response(text: &str, session_id: &str) -> String {
     sse_text_response_with_execution_summary(text, session_id, 0, 0, &[], 1)
 }
 
+fn with_root_communication(body: String, session_id: &str) -> String {
+    let run_id = format!("run-{session_id}");
+    let mut stream = format!(
+        "data: {}\n\n",
+        serde_json::json!({
+            "type": "session_info", "session_id": session_id, "run_id": run_id,
+        })
+    );
+    for (observed_run, direction, kind) in [
+        (run_id.as_str(), "received", "text"),
+        (run_id.as_str(), "received", "text"), // transport replay
+        ("child-run", "received", "text"),
+        (run_id.as_str(), "sent", "text"),
+        (run_id.as_str(), "received", "progress"),
+    ] {
+        stream.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "type": "agent_communication", "schema_version": "astra.agent_communication.v1",
+                "observed_by": {"run_id": observed_run, "agent_id": "root"},
+                "direction": direction, "message_id": "coordination-1",
+                "from": {"run_id": "child-run", "agent_id": "worker"},
+                "to": {"kind": "parent"}, "payload_kind": kind,
+                "summary": "The requested checkpoint is ready", "timestamp_ms": 42,
+            })
+        ));
+    }
+    stream + &body
+}
+
 fn sse_text_response_with_execution_summary(
     text: &str,
     session_id: &str,
@@ -272,7 +302,10 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         post(|| async {
             (
                 TEST_SSE_HEADERS,
-                sse_text_response("Hello!", "sess-step-adopt"),
+                with_root_communication(
+                    sse_text_response("Hello!", "sess-step-adopt"),
+                    "sess-step-adopt",
+                ),
             )
         }),
     );
@@ -371,6 +404,15 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
     .unwrap();
 
     assert_eq!(result.session_id.as_deref(), Some("sess-step-adopt"));
+    // A later physical exchange/recovery may repeat an already observed C1.
+    // Conversion must deduplicate evidence, not ordinary equal-text messages.
+    let replay = result
+        .run_transcript_messages
+        .iter()
+        .find(|message| message.get("evidence").is_some())
+        .unwrap()
+        .clone();
+    result.run_transcript_messages.push(replay);
     assert!(
         astra_services::session_journal::SessionExecutionLease::try_acquire("sess-step-adopt")
             .is_err(),
@@ -392,6 +434,32 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         )
         .expect("late-bound canonical continuation");
     assert_eq!(restored.last().unwrap()["content"], "Hello!");
+    assert!(restored.iter().all(|message| message["role"] != "event"));
+    let evidence = session_journal::read_journal("sess-step-adopt")
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| event.transcript_item)
+        .filter(|item| item.message.get("evidence").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].run_id, "run-sess-step-adopt");
+    assert_eq!(evidence[0].agent_id, "root");
+    let observed = &evidence[0].message["evidence"]["event"];
+    assert_eq!(
+        observed["observed_by"],
+        serde_json::json!({"run_id":"run-sess-step-adopt","agent_id":"root"})
+    );
+    assert_eq!(
+        observed["from"],
+        serde_json::json!({"run_id":"child-run","agent_id":"worker"})
+    );
+    assert_eq!(observed["to"], serde_json::json!({"kind":"parent"}));
+    assert_eq!(observed["direction"], "received");
+    assert_eq!(observed["payload_kind"], "text");
+    assert_eq!(
+        evidence[0].message["evidence"]["event"]["message_id"],
+        "coordination-1"
+    );
 
     let cli_user_id = crate::cli::cli_config::cli_utils::cli_user_id();
     let store =
@@ -1130,7 +1198,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
                             .to_string();
                     (
                         TEST_SSE_HEADERS,
-                        body,
+                        with_root_communication(body, "sess-tc"),
                     )
                 }
             }),
@@ -1228,6 +1296,14 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
     assert_eq!(result.partial.prompt_tokens, 10);
     assert_eq!(result.partial.completion_tokens, 5);
     assert_eq!(result.partial.tool_calls_count, 0);
+    let evidence = result
+        .partial
+        .run_transcript_messages
+        .iter()
+        .filter_map(|message| message.get("evidence"))
+        .collect::<Vec<_>>();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0]["event"]["observed_by"]["run_id"], "run-sess-tc");
     assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 

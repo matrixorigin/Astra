@@ -1331,6 +1331,17 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
 
         let mut turn_result = turn_result?;
 
+        // Capture observed coordination before ingest can reject an incomplete
+        // remote terminal. The existing success/failure journal commit owns
+        // durability; evidence never enters provider-facing prompt history.
+        state.record_prompt_history_messages(
+            turn_result
+                .core
+                .transcript_evidence
+                .iter()
+                .map(|evidence| serde_json::json!({"role": "event", "evidence": evidence})),
+        );
+
         // Step events are collected before the HTTP admission response so the
         // live projection can render preparation phases.  Persist them only
         // after both identities come from the server; the locally generated

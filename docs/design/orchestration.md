@@ -155,6 +155,10 @@ The user can inspect progress, blockers and artifacts, change requirements,
 pause or cancel, and drill down into member execution without flooding the
 lead transcript. Execution identity must connect Team, lead, child, Work
 attempt and physical provider calls in existing Trace/Explain/Audit facts.
+CLI root history retains exact-run durable received messages in the existing
+transcript journal, including interrupted turns and one-shot submissions.
+Replayed evidence is deduplicated by typed identity, not message text; it does
+not enter provider-facing conversation history or authorize completion.
 Team summaries are aggregates, not additional billable provider usage;
 unknown usage, cache or price coverage must remain explicit. Acceptance must
 exercise a real multi-step exchange and recovery, not only fixed fanout.

@@ -196,6 +196,9 @@ pub struct ChatTurnSseAccum {
     /// local turn commit; otherwise restart silently reconstructs a different
     /// conversation from the server's canonical transcript.
     pub applied_user_intents: Vec<StreamAppliedUserIntent>,
+    /// Exact-root coordination observations for transcript persistence only.
+    /// These are not provider messages or execution authority.
+    pub transcript_evidence: Vec<astra_turn_types::AgentTranscriptEvidence>,
     #[doc(hidden)]
     pub root_identity: StreamRootIdentity,
     /// Terminal lifecycle fact for the durable run that owns this physical
@@ -898,6 +901,29 @@ fn apply_one_event(
             if accum.thinking_active {
                 accum.thinking_active = false;
                 effects.push(SseRenderEffect::StopThinkingSpinner);
+            }
+        }
+        "agent_communication" => {
+            let Ok(event) =
+                serde_json::from_value::<astra_turn_types::AgentCommunicationEvent>(event.clone())
+            else {
+                return;
+            };
+            if Some(event.observed_by.run_id.as_str()) != accum.root_identity.run_id()
+                || event.message_id.trim().is_empty()
+                || event.direction != astra_turn_types::AgentCommunicationDirection::Received
+                || !event.payload_kind.is_durable()
+            {
+                return;
+            }
+            let evidence = astra_turn_types::AgentTranscriptEvidence::AgentCommunication { event };
+            let key = evidence.stable_key();
+            if !accum
+                .transcript_evidence
+                .iter()
+                .any(|item| item.stable_key() == key)
+            {
+                accum.transcript_evidence.push(evidence);
             }
         }
         "user_intent_applied" => {
