@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "astra-cli"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-config",
  "astra-core",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "astra-config"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-core",
  "astra-turn-types",
@@ -241,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "astra-core"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "async-trait",
  "axum",
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "astra-credentials"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "axum",
  "base64",
@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "astra-edge"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-core",
  "astra-credentials",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "astra-harness"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-turn-core",
  "serde",
@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "astra-logging"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "astra-mcp"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-turn-core",
  "astra-turn-types",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "astra-memoria"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-turn-types",
  "async-trait",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "astra-messaging"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-text-utils",
  "astra-turn-types",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "astra-pipeline"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-core",
  "astra-services",
@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "astra-plan"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-core",
  "astra-services",
@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "astra-prompts"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-core",
  "chrono",
@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "astra-runtime"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-config",
  "astra-core",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "astra-runtime-env"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-core",
  "async-trait",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "astra-sandbox"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-core",
  "astra-skills",
@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "astra-server-types"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-core",
  "astra-services",
@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "astra-services"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-config",
  "astra-core",
@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "astra-skills"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-core",
  "astra-runtime-env",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "astra-sync-protocol"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-core",
  "hmac",
@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "astra-test-harness"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "astra-core",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "astra-text-utils"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "dirs",
  "serde",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "astra-thin-client"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-core",
  "astra-runtime-env",
@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "astra-tools"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-core",
  "astra-memoria",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "astra-turn-core"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-core",
  "astra-messaging",
@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "astra-turn-types"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "astra-prompts",
  "regex",

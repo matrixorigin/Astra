@@ -2555,6 +2555,8 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
     let fixture_model = format!("mock-{}", ctx.suffix);
     let root_model = fixture_model.clone();
     let child_model = fixture_model.clone();
+    let releases =
+        ReleaseProviderGatesOnDrop(vec![std::sync::Arc::new(tokio::sync::Notify::new())]);
     ctx.install_native_provider(auth,vec![
         ProviderScript::new("actual parent fanout execution",move |request| request.path=="/v1/chat/completions" && request.body["model"]==root_model && request.body["stream"]==true && delegation_assessment(&request.body).is_none() && request.body["messages"].as_array().is_some_and(|messages|messages.iter().any(|message|message["role"]=="user" && message["content"]=="Run three reviews and preserve every failure cause.")),vec![
                     native_search_response("online-failed-fanout-search", "agent_fanout"),
@@ -2574,29 +2576,73 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
                             "defaults": {"agent_type": "general-purpose"}
                         }),
                     ),
-                    native_invoke_response(
-                        "online-failed-fanout-wait", "agent", json!({"action": "wait", "timeout_ms": 10000}),
+                    gated_native_delta(
+                        json!({"tool_calls":[{"index":0,"id":"online-failed-fanout-wait","type":"function","function":{"name":"invoke_tool","arguments":json!({"name":"agent","arguments":{"action":"wait","timeout_ms":10000}}).to_string()}}]}),
+                        "tool_calls",
+                        releases.0[0].clone(),
                     ), native_text_response(final_reply)]),
         native_child_script(child_model.clone(),"Run three reviews and preserve every failure cause.","Inspect storage.",ProviderResponse::Json {status:StatusCode::BAD_REQUEST,body:json!({"error":{"message":"private failed child marker"}})}),
 native_child_script(child_model.clone(),"Run three reviews and preserve every failure cause.","Inspect runtime.",ProviderResponse::Json {status:StatusCode::BAD_REQUEST,body:json!({"error":{"message":"private failed child marker"}})}),
 native_child_script(child_model.clone(),"Run three reviews and preserve every failure cause.","Inspect journey.",ProviderResponse::Json {status:StatusCode::BAD_REQUEST,body:json!({"error":{"message":"private failed child marker"}})}),
         ProviderScript::new("actual canonical delegation assessment",move |request|request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && delegation_assessment(&request.body).is_some(),vec![native_text_response("{\"disposition\":\"not_applicable\"}")])
     ]).await;
-    let (status, raw_sse) = stream_chat_full(
-        app,
-        auth,
-        json!({
-            "message": "Run three reviews and preserve every failure cause.",
-        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
-            "session_id": &session_id,
-            "model_selection": seeded_model_selection(ctx),
-            "context": {
-
-            }
-        }),
+    let payload = json!({
+        "message": "Run three reviews and preserve every failure cause.",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
+        "session_id": &session_id,
+        "model_selection": seeded_model_selection(ctx),
+        "context": {
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let test_secret = std::env::var("ASTRA_TEST_E2E_SECRET").expect("bridge test secret");
+    let response = tokio::time::timeout_at(
+        deadline,
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/chat/stream")
+                .header("authorization", auth.as_str())
+                .header("content-type", "application/json")
+                .header("x-astra-e2e-test-secret", &test_secret)
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "chat/stream: {raw_sse}");
+    let response = response
+        .expect("bounded failed-fanout stream admission")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    // Keep the third parent response in flight until the complete failed
+    // group is visible. The Action fence then adopts all newly arrived child
+    // results together, rather than consuming one scripted response per race.
+    loop {
+        let chunk = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .expect("bounded wait for failed child terminals")
+            .expect("live stream before failed child terminals")
+            .unwrap();
+        bytes.extend_from_slice(&chunk);
+        if parse_sse_events(&String::from_utf8_lossy(&bytes))
+            .iter()
+            .filter(|event| event["type"] == "agent_failed")
+            .count()
+            == 3
+        {
+            break;
+        }
+    }
+    releases.0[0].notify_one();
+    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .expect("bounded failed-fanout stream completion")
+    {
+        bytes.extend_from_slice(&chunk.unwrap());
+    }
+    let raw_sse = String::from_utf8(bytes).unwrap();
     assert_native_delegation_judgment(
         ctx,
         "Run three reviews and preserve every failure cause.",
