@@ -2261,7 +2261,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         runtime_control_calls_by_id,
         mut pre_resolved_results,
         mut edge_tool_round,
-        communication_events,
     } = try_prepare_intercepted_tool_round(
         state,
         &turn_result,
@@ -2273,9 +2272,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     )
     .await?;
     pre_resolved_results.extend(delegation_pre_resolved_results);
-    for event in communication_events {
-        host.on_agent_communication(event);
-    }
     recover_missing_control_tool_results(
         host,
         state.current_run_id.as_deref(),
@@ -2502,6 +2498,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             plan_mode_active,
         }, action_fence.as_ref().map(|fence| fence as &dyn super::super::agentic::headless_round::HeadlessActionFence))
         .await;
+        for accepted in headless_outcome.accepted_sends {
+            term_adapter.0.on_agent_communication(accepted.into_event());
+        }
         let action_admission_error = headless_outcome.action_admission_error;
         let superseded_before_action = headless_outcome.superseded_before_action;
         (

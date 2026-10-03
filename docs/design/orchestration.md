@@ -298,6 +298,10 @@ completion. Missing receiver evidence is unknown. Correlated requests and
 responses remain semantic exchanges, including permission decisions; child
 completion remains owned by the child lifecycle, not a model-authored result
 message. Trace and Explain project these facts without inventing an applied state.
+Accepted sends carry typed evidence through the internal execution result, not
+public tool output or metadata. Child settlement retains durable communication
+in the existing generation-fenced event append, including when paused; progress
+remains transient. Replay cannot resend an envelope or create new send authority.
 
 Transport owns consumption acknowledgement, claims, and redelivery. There is no
 application ACK/NACK envelope, sender retry tracker, or in-memory dead-letter

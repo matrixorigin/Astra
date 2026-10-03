@@ -331,6 +331,101 @@ mod tests {
 
     // ── Tests ───────────────────────────────────────────────────────────────
 
+    #[tokio::test]
+    async fn explicit_send_reaches_host_only_after_runtime_acceptance() {
+        for (recipient, related) in [
+            ("receiver-run", true),
+            ("missing-run", true),
+            ("receiver-run", false),
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            let context = crate::server::runtime_tool_executor::tests::test_agent_tool_context(
+                workspace.path(),
+            );
+            let router = context.spawner.mailbox_router();
+            let sender = router
+                .register(AgentAddress::new("session-mailbox", "root"), None)
+                .await
+                .unwrap();
+            router
+                .record_parent_delivery_alias("test-run", &sender.address, &context.agent_id)
+                .await;
+            let mut receiver = router
+                .register(AgentAddress::new("receiver-run", "worker"), None)
+                .await
+                .unwrap();
+            if related {
+                router
+                    .record_sub_run(astra_messaging::delegation::SubRunInfo {
+                        run_id: "receiver-run".into(),
+                        parent_run_id: "test-run".into(),
+                        delegation_id: "send-fixture".into(),
+                        agent_id: "worker".into(),
+                        depth: 1,
+                    })
+                    .await;
+            }
+            let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+                workspace.path().to_path_buf(),
+                "test-user".into(),
+                "test-session".into(),
+                None,
+                None,
+            );
+            executor.set_execution_bindings(
+                crate::server::tool_execution_binding::WorkspaceBinding::server_sandbox(
+                    workspace.path(),
+                ),
+                crate::server::tool_execution_binding::ExecutorBinding::server_local(),
+            );
+            executor.enable_durable_invocations();
+            executor.set_agent_tool_context(context);
+            let args = json!({"action":"send_message", "to":recipient, "message":"Keep the original message.", "request_id":"question-1"});
+            let mut send_turn = text_result("");
+            send_turn.accum.has_tool_calls = true;
+            send_turn.accum.tool_calls = vec![
+                json!({"id":"send-call", "type":"function", "function":{"name":"agent", "arguments":args.to_string()}}),
+            ];
+            let mut host =
+                MockHost::new(vec![send_turn, text_result("Done.")]).with_valid_tools(&["agent"]);
+            let mut state = make_state();
+            state.current_run_id = Some("test-run".into());
+            state.current_session_id = Some("test-session".into());
+            state.permission_context =
+                Some(PermissionSyncContext::shared_root(PermissionMode::Auto));
+            state.runtime_tool_executor = Some(Arc::new(executor));
+            run_agentic_loop_with_host(&mut host, &mut state)
+                .await
+                .unwrap();
+            if recipient == "receiver-run" && related {
+                let delivered = receiver.try_recv().unwrap_or_else(|| {
+                    panic!(
+                        "accepted envelope missing; actual execution records: {:?}",
+                        state.stall.tool_call_records
+                    )
+                });
+                assert_eq!(
+                    host.communication_events,
+                    vec![astra_messaging::agent_communication_event(
+                        &AgentAddress::new("test-run", "test-agent"),
+                        astra_messaging::AgentCommunicationDirection::Sent,
+                        &delivered,
+                    )]
+                );
+            } else {
+                assert!(receiver.try_recv().is_none());
+                assert!(host.communication_events.is_empty());
+                let record = state
+                    .stall
+                    .tool_call_records
+                    .iter()
+                    .find(|record| record.name == "agent")
+                    .expect("rejection must still be recorded");
+                assert!(!record.ok);
+            }
+        }
+    }
+
     // send_message is now an action in the consolidated `agent` tool.
     // No separate schema injection is needed — the agent schema is always present.
     #[tokio::test]
@@ -525,11 +620,12 @@ mod tests {
             state.step_recorder.begin_turn(1);
             state.messaging.mailbox = Some(child);
             let run_id = state.current_run_id.clone().unwrap();
-            let receipt = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
+            let receipt = crate::orchestration::agent_tool::handle_agent_send_message_with_router_observed(
                 &json!({"action":"send_message", "to":"parent", "message_type":"question", "message":"Which format?"}),
                 &router, &run_id, "worker", &state.messaging.reply_obligations,
             ).await;
-            let receipt: Value = serde_json::from_str(&receipt).unwrap();
+            assert_eq!(receipt.accepted_send.is_some(), !ambiguous);
+            let receipt: Value = serde_json::from_str(&receipt.output).unwrap();
             assert_eq!(
                 receipt["status"],
                 if ambiguous {
@@ -1104,20 +1200,22 @@ mod tests {
             assert!(accepted <= 4_096, "inbox must have a finite bound");
         }
         let replies = ReplyObligations::default();
-        let result = crate::orchestration::agent_tool::handle_agent_send_message_with_router(
-            &json!({
-                "action": "send_message",
-                "to": "run-child-0",
-                "message_type": "question",
-                "message": "Can you answer?",
-            }),
-            &router,
-            "run-parent",
-            "orchestrator",
-            &replies,
-        )
-        .await;
-        let result: Value = serde_json::from_str(&result).unwrap();
+        let result =
+            crate::orchestration::agent_tool::handle_agent_send_message_with_router_observed(
+                &json!({
+                    "action": "send_message",
+                    "to": "run-child-0",
+                    "message_type": "question",
+                    "message": "Can you answer?",
+                }),
+                &router,
+                "run-parent",
+                "orchestrator",
+                &replies,
+            )
+            .await;
+        assert!(result.accepted_send.is_none());
+        let result: Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(result["success"], false);
         assert_eq!(result["status"], "rejected");
         assert!(!replies.has_pending("run-parent"));

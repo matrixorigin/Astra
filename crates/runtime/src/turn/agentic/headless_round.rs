@@ -41,13 +41,14 @@ pub trait HeadlessActionFence: Send + Sync {
     async fn allow_action(&self, action_id: &str) -> Result<bool, String>;
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct HeadlessRoundOutcome {
     pub superseded_before_action: bool,
     pub action_admission_error: Option<String>,
     /// Exact server call IDs whose terminal event is owned by the shared
     /// headless loop. Runtime-route and edge-owned calls are excluded.
     pub shared_loop_terminal_call_ids: HashSet<String>,
+    pub(crate) accepted_sends: Vec<crate::orchestration::agent_tool::AcceptedAgentSend>,
 }
 
 /// Ordered views of one provider batch at the history/execution boundary.
@@ -551,9 +552,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             }
         }
     }
-    let superseded_before_action = pipeline.action_fence_superseded();
-    let action_admission_error = pipeline.action_fence_error().map(ToString::to_string);
-    let shared_loop_terminal_call_ids = pipeline.into_shared_loop_terminal_call_ids();
+    let outcome = pipeline.into_round_outcome();
     for message in messages.iter_mut().skip(history_start) {
         if message.get("role").and_then(Value::as_str) != Some("tool") {
             continue;
@@ -568,11 +567,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             );
         }
     }
-    HeadlessRoundOutcome {
-        superseded_before_action,
-        action_admission_error,
-        shared_loop_terminal_call_ids,
-    }
+    outcome
 }
 
 use astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx;

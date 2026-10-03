@@ -21662,37 +21662,45 @@ fn durable_subrun_host_terminal_events(
     events
         .into_iter()
         .filter_map(|mut event| {
-            (durable_event_type(&event) == Some("tool_call_end")).then(|| {
-                if let Some(object) = event.as_object_mut() {
-                    object.remove(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD);
-                    object.remove(DURABLE_EVENT_COMMITTED_FIELD);
+            let (prefix, identity) = match durable_event_type(&event) {
+                Some("tool_call_end") => (
+                    "subrun-tool-terminal",
+                    event
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("idless")
+                        .to_string(),
+                ),
+                Some("agent_communication") => {
+                    let communication = serde_json::from_value::<
+                        astra_turn_types::AgentCommunicationEvent,
+                    >(event.clone())
+                    .ok()?;
+                    if !communication.payload_kind.is_durable() {
+                        return None;
+                    }
+                    (
+                        "subrun-communication",
+                        astra_turn_types::AgentTranscriptEvidence::AgentCommunication {
+                            event: communication,
+                        }
+                        .stable_key(),
+                    )
                 }
-                event
-            })
-        })
-        .map(|mut event| {
-            if let Some(execution_owner_generation) = execution_owner_generation {
-                let call_id = event
-                    .as_object_mut()
-                    .map(|object| {
-                        object.remove("idempotency_key");
-                        object
-                            .get("call_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("idless")
-                            .to_string()
-                    })
-                    .unwrap_or_else(|| "idless".to_string());
-                if let Some(object) = event.as_object_mut() {
+                _ => return None,
+            };
+            if let Some(object) = event.as_object_mut() {
+                object.remove(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD);
+                object.remove(DURABLE_EVENT_COMMITTED_FIELD);
+                if let Some(generation) = execution_owner_generation {
+                    object.remove("idempotency_key");
                     object.insert(
                         "idempotency_key".to_string(),
-                        Value::String(format!(
-                            "subrun-tool-terminal:{execution_owner_generation}:{call_id}"
-                        )),
+                        Value::String(format!("{prefix}:{generation}:{identity}")),
                     );
                 }
             }
-            event
+            Some(event)
         })
         .collect()
 }

@@ -3288,25 +3288,22 @@ fn terminally_relevant_unresolved_tool_outcomes(
 /// result; once the child completion has been staged and adopted, retaining the
 /// queued acknowledgement as an unresolved `agent_incomplete` outcome makes a
 /// healthy parent turn impossible to finalize.
-pub(crate) fn nonterminal_child_receipt_superseded(
-    state: &AgenticLoopState,
+pub(crate) fn observed_direct_child_for_nonterminal_receipt<'a>(
+    state: &'a AgenticLoopState,
     record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    if record.name == "agent_fanout" && fanout_start_receipt_superseded(state, record) {
-        return true;
-    }
+) -> Option<&'a serde_json::Value> {
     if record.name != "agent"
         || !record.ok
         || record.disposition
             != Some(astra_services::session_journal::ToolCallDisposition::Executed)
     {
-        return false;
+        return None;
     }
     let Some(args) = record
         .authoritative_args_full()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
     else {
-        return false;
+        return None;
     };
     let Some(result) = record
         .runtime_model_result_full
@@ -3314,22 +3311,22 @@ pub(crate) fn nonterminal_child_receipt_superseded(
         .or(record.result_full.as_deref())
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
     else {
-        return false;
+        return None;
     };
     let action = args["action"].as_str();
     let agent_id = match action {
         Some("spawn") | Some("get_result") => {
             let Some(agent_id) = result["agent_id"].as_str() else {
-                return false;
+                return None;
             };
             if action == Some("get_result") && args["agent_id"] != agent_id {
-                return false;
+                return None;
             }
             if !matches!(
                 (action, result["status"].as_str()),
                 (Some("spawn"), Some("launched")) | (Some("get_result"), Some("still_running"))
             ) {
-                return false;
+                return None;
             }
             agent_id
         }
@@ -3339,27 +3336,58 @@ pub(crate) fn nonterminal_child_receipt_superseded(
             // target here: the terminal result must be correlated to the
             // same producer-owned child.
             let Some(agent_id) = args["to"].as_str().map(str::trim) else {
-                return false;
+                return None;
             };
             if agent_id.is_empty() || result["status"].as_str() != Some("queued") {
-                return false;
+                return None;
             }
             agent_id
         }
-        _ => return false,
+        _ => return None,
     };
-    state.volatile_pending.iter().any(|entry| {
-        entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
-            && entry.payload["parent_run_id"].as_str() == state.current_run_id.as_deref()
-            && entry.payload["observed_by_provider"] == true
-            && entry.payload["children"]
-                .as_array()
-                .is_some_and(|children| {
-                    children.iter().any(|child| {
-                        child["agent_id"] == agent_id && child["status"] == "completed"
-                    })
+    state
+        .volatile_pending
+        .iter()
+        .filter(|entry| {
+            entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                && entry.payload["parent_run_id"].as_str() == state.current_run_id.as_deref()
+                && entry.payload["observed_by_provider"] == true
+        })
+        .find_map(|entry| {
+            let delivery_count = entry.payload["delivery_count"].as_u64().unwrap_or_default();
+            entry.payload["children"].as_array().and_then(|children| {
+                children.iter().find(|child| {
+                    if child["agent_id"] != agent_id || child["status"] != "completed" {
+                        return false;
+                    }
+                    if child["result"]
+                        .as_str()
+                        .is_some_and(|result| !result.trim().is_empty())
+                    {
+                        return true;
+                    }
+                    // `AgenticLoopState::commit_volatile_attempt_lease` is
+                    // the sole producer of this compacted shape: after two
+                    // observed leases it removes the presentation result but
+                    // retains the positive byte count and delivery count.
+                    delivery_count >= 2
+                        && child.get("result").is_none()
+                        && child["result_bytes"]
+                            .as_u64()
+                            .is_some_and(|bytes| bytes > 0)
                 })
-    })
+            })
+        })
+}
+
+pub(crate) fn nonterminal_child_receipt_superseded(
+    state: &AgenticLoopState,
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    if record.name == "agent_fanout" && fanout_start_receipt_superseded(state, record) {
+        return true;
+    }
+    observed_direct_child_for_nonterminal_receipt(state, record).is_some()
 }
 
 /// A fanout start is deliberately non-terminal: it only acknowledges that the
@@ -11109,7 +11137,12 @@ mod tests {
             serde_json::json!({
                 "schema": DIRECT_CHILD_RESULT_SCHEMA,
                 "parent_run_id": "parent-run",
-                "children": [{"agent_id":"child@run","status":"completed"}]
+                "children": [{
+                    "agent_id":"child@run",
+                    "status":"completed",
+                    "result":"child completed",
+                    "result_bytes": 15
+                }]
             }),
         );
         assert!(!nonterminal_child_receipt_superseded(&state, &record));

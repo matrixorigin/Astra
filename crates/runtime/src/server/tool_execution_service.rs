@@ -17,7 +17,9 @@ use super::tool_execution_binding::{
 use super::tool_external_transport::{
     ExternalTransport, execute_gateway_relay, execute_sandbox_resident_agent,
 };
-use super::tool_local_transport::{ServerLocalToolTransport, execute_local_transport};
+use super::tool_local_transport::{
+    ServerLocalToolTransport, ToolTransportResult, execute_local_transport,
+};
 use super::tool_route_boundary::{ToolRouteBoundary, route_binding_event_fields};
 use super::tool_route_selection::ToolExecutionRouteKind;
 use super::tool_route_selection::routing_decision_for_binding;
@@ -658,14 +660,15 @@ impl ToolExecutionService {
             .await
     }
 
-    pub(crate) async fn execute_boundary_with_cancel<L>(
+    pub(crate) async fn execute_boundary_with_cancel<L, R>(
         &self,
         boundary: &ToolRouteBoundary,
         local_transport: &L,
         cancel_token: Option<Arc<CancellationToken>>,
-    ) -> astra_tools::ToolResult
+    ) -> R
     where
-        L: ServerLocalToolTransport + ?Sized,
+        L: ServerLocalToolTransport<R> + ?Sized,
+        R: ToolTransportResult,
     {
         self.execute_with_route_and_cancel(
             boundary.request().clone(),
@@ -676,15 +679,16 @@ impl ToolExecutionService {
         .await
     }
 
-    async fn execute_with_route_and_cancel<L>(
+    async fn execute_with_route_and_cancel<L, R>(
         &self,
         request: ToolExecutionRequest,
         route: ToolExecutionRouteKind,
         local_transport: &L,
         cancel_token: Option<Arc<CancellationToken>>,
-    ) -> astra_tools::ToolResult
+    ) -> R
     where
-        L: ServerLocalToolTransport + ?Sized,
+        L: ServerLocalToolTransport<R> + ?Sized,
+        R: ToolTransportResult,
     {
         let transport_request = request.with_transport_arguments();
         if transport_request.runtime_process_authorization_required
@@ -702,7 +706,8 @@ impl ToolExecutionService {
                 &binding,
                 "process-authorization",
                 reason,
-            );
+            )
+            .into();
         }
         if transport_request.runtime_edge_dispatch_authorization_required
             && (!matches!(route, ToolExecutionRouteKind::EdgeBound)
@@ -724,7 +729,8 @@ impl ToolExecutionService {
                 &binding,
                 "edge-authorization",
                 reason,
-            );
+            )
+            .into();
         }
         if matches!(route, ToolExecutionRouteKind::Unsupported)
             && !matches!(
@@ -733,16 +739,17 @@ impl ToolExecutionService {
             )
         {
             let binding = transport_request.runtime_environment_binding(&self.tool_registry);
-            return unsupported_workspace_executor_result(&transport_request, &binding);
+            return unsupported_workspace_executor_result(&transport_request, &binding).into();
         }
         let binding = match self.authorize_tool_request(&transport_request) {
             Ok(binding) => binding,
             Err(ref err) => {
-                return capability_denied_result(&transport_request, &err.0, err.1.clone());
+                return capability_denied_result(&transport_request, &err.0, err.1.clone()).into();
             }
         };
         if selected_offer_route_mismatch(&transport_request, route) {
-            return selected_offer_route_mismatch_result(&transport_request, &binding, route);
+            return selected_offer_route_mismatch_result(&transport_request, &binding, route)
+                .into();
         }
         if matches!(route, ToolExecutionRouteKind::RequestScopedMcp)
             && transport_request.selected_offer.is_none()
@@ -753,7 +760,8 @@ impl ToolExecutionService {
                 astra_runtime_env::ToolUnavailableReason::PolicyDenied(
                     "selected tool offer is required for request-scoped MCP execution".to_string(),
                 ),
-            );
+            )
+            .into();
         }
 
         // ── Runtime offer policy check (admin API / config) ──
@@ -834,7 +842,8 @@ impl ToolExecutionService {
                 metadata: Some(meta),
                 is_error: true,
                 exit_semantics: None,
-            };
+            }
+            .into();
         }
         if let Some((offer_id, provider_id)) =
             disallowed_offer_id_for_request(&transport_request, &admission, &provider_allowed_tools)
@@ -882,7 +891,8 @@ impl ToolExecutionService {
                 metadata: Some(meta),
                 is_error: true,
                 exit_semantics: None,
-            };
+            }
+            .into();
         }
         // A selected offer is the authoritative, precomputed provider binding
         // from prompt-surface assembly. Dynamic providers such as
@@ -893,7 +903,7 @@ impl ToolExecutionService {
         if transport_request.selected_offer.is_none()
             && let Some(reason) = admission_denied_unavailable_reason(&admission)
         {
-            return capability_denied_result(&transport_request, &binding, reason);
+            return capability_denied_result(&transport_request, &binding, reason).into();
         }
 
         match route {
@@ -908,7 +918,7 @@ impl ToolExecutionService {
                 .await
             }
             ToolExecutionRouteKind::ServerRuntime | ToolExecutionRouteKind::RequestScopedMcp => {
-                let mut result = execute_local_route(
+                let mut result: R = execute_local_route(
                     &transport_request,
                     &binding,
                     route,
@@ -916,41 +926,38 @@ impl ToolExecutionService {
                     cancel_token.map(|t| (*t).clone()),
                 )
                 .await;
-                append_route_binding_metadata(&mut result, route, &transport_request);
+                append_route_binding_metadata(result.result_mut(), route, &transport_request);
                 result
             }
-            ToolExecutionRouteKind::EdgeBound => {
-                execute_edge_bound(
-                    transport_request,
-                    &binding,
-                    self.edge_connection_pool.clone(),
-                    self.edge_dispatch_service.clone(),
-                    self.edge_registry_service.clone(),
-                    &self.tool_registry,
-                    cancel_token,
-                )
-                .await
-            }
-            ToolExecutionRouteKind::GatewayRelay => {
-                execute_gateway_relay(
-                    transport_request,
-                    &binding,
-                    self.gateway_relay_transport.clone(),
-                    cancel_token,
-                )
-                .await
-            }
-            ToolExecutionRouteKind::SandboxResidentAgent => {
-                execute_sandbox_resident_agent(
-                    transport_request,
-                    &binding,
-                    self.sandbox_resident_agent_transport.clone(),
-                    cancel_token,
-                )
-                .await
-            }
+            ToolExecutionRouteKind::EdgeBound => execute_edge_bound(
+                transport_request,
+                &binding,
+                self.edge_connection_pool.clone(),
+                self.edge_dispatch_service.clone(),
+                self.edge_registry_service.clone(),
+                &self.tool_registry,
+                cancel_token,
+            )
+            .await
+            .into(),
+            ToolExecutionRouteKind::GatewayRelay => execute_gateway_relay(
+                transport_request,
+                &binding,
+                self.gateway_relay_transport.clone(),
+                cancel_token,
+            )
+            .await
+            .into(),
+            ToolExecutionRouteKind::SandboxResidentAgent => execute_sandbox_resident_agent(
+                transport_request,
+                &binding,
+                self.sandbox_resident_agent_transport.clone(),
+                cancel_token,
+            )
+            .await
+            .into(),
             ToolExecutionRouteKind::Unsupported => {
-                unsupported_workspace_executor_result(&transport_request, &binding)
+                unsupported_workspace_executor_result(&transport_request, &binding).into()
             }
         }
     }
@@ -1048,15 +1055,16 @@ fn local_result_binding(
 }
 
 /// Execute a tool via the local transport, resolving binding metadata first.
-async fn execute_local_route<L>(
+async fn execute_local_route<L, R>(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
     route: ToolExecutionRouteKind,
     local_transport: &L,
     cancel_token: Option<CancellationToken>,
-) -> astra_tools::ToolResult
+) -> R
 where
-    L: ServerLocalToolTransport + ?Sized,
+    L: ServerLocalToolTransport<R> + ?Sized,
+    R: ToolTransportResult,
 {
     let (result_workspace, result_executor, result_transport) =
         local_result_binding(route, request);

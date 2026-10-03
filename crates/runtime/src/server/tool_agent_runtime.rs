@@ -9,16 +9,23 @@ use crate::orchestration::AgentToolContext;
 use crate::server::tool_execution_result::{
     agent_tool_result_from_output, pre_dispatch_rejection_tool_result,
 };
+use crate::server::tool_local_transport::RuntimeToolExecutionResult;
 
 pub(crate) async fn execute_agent_tool(
     _default_executor: &DefaultToolExecutor,
     agent_tool_context: Option<&AgentToolContext>,
     args: &Value,
+    run_id: Option<&str>,
     tool_call_id: Option<&str>,
     delegation_model_admission: Option<&astra_turn_types::DelegationModelAdmission>,
-) -> astra_tools::ToolResult {
+) -> RuntimeToolExecutionResult {
     let scoped_context = agent_tool_context.map(|context| {
         let mut context = context.clone();
+        if let Some(run_id) = run_id
+            && matches!(agent_action_from_args(args), Ok(AgentAction::SendMessage))
+        {
+            context.run_id = run_id.to_string();
+        }
         context.delegation_model_admission = delegation_model_admission.cloned();
         context
     });
@@ -28,11 +35,14 @@ pub(crate) async fn execute_agent_tool(
         return agent_tool_result_from_output(
             "agent",
             crate::orchestration::handle_agent_tool(&correlated_args, agent_tool_context).await,
-        );
+        )
+        .into();
     }
     let action = match agent_action_from_args(args) {
         Ok(action) => action,
-        Err(error) => return agent_tool_result_from_output("agent", render_agent_error(error)),
+        Err(error) => {
+            return agent_tool_result_from_output("agent", render_agent_error(error)).into();
+        }
     };
     if agent_tool_context.is_none()
         && !astra_turn_core::tool::registry::meta::tool_allows_validation_without_runtime_binding(
@@ -43,18 +53,26 @@ pub(crate) async fn execute_agent_tool(
         return agent_tool_result_from_output(
             "agent",
             crate::orchestration::render_agent_runtime_binding_error("agent", action.as_str()),
-        );
+        )
+        .into();
     }
     match action {
-        AgentAction::RunChain => server_agent_run_chain_unavailable_result(),
+        AgentAction::RunChain => server_agent_run_chain_unavailable_result().into(),
         AgentAction::Spawn
         | AgentAction::List
         | AgentAction::GetResult
         | AgentAction::Wait
-        | AgentAction::SendMessage => agent_tool_result_from_output(
-            "agent",
-            crate::orchestration::handle_agent_tool(&correlated_args, agent_tool_context).await,
-        ),
+        | AgentAction::SendMessage => {
+            let outcome = crate::orchestration::agent_tool::handle_agent_tool_observed(
+                &correlated_args,
+                agent_tool_context,
+            )
+            .await;
+            RuntimeToolExecutionResult {
+                result: agent_tool_result_from_output("agent", outcome.output),
+                accepted_send: outcome.accepted_send,
+            }
+        }
     }
 }
 

@@ -37,7 +37,6 @@ pub(crate) struct PreparedToolRound {
     pub(crate) runtime_control_calls_by_id: HashMap<String, RuntimeControlInvocationKind>,
     pub(crate) pre_resolved_results: Vec<HeadlessPreResolvedToolResult>,
     pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
-    pub(crate) communication_events: Vec<astra_messaging::AgentCommunicationEvent>,
 }
 
 /// Persist pre-execution admission rejections as exact terminal outcomes.
@@ -828,7 +827,6 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
     let (allowlist_blocked_tool_results, allowed_tool_calls) =
         intercept_disallowed_tool_calls(state, effective_tool_calls);
     let blocked_tool_results = allowlist_blocked_tool_results;
-    let communication_events = Vec::new();
     let SkillInterceptionResult {
         results: skill_results,
         surgically_removed_ids,
@@ -1036,7 +1034,6 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
         runtime_control_calls_by_id,
         pre_resolved_results,
         edge_tool_round,
-        communication_events,
     })
 }
 

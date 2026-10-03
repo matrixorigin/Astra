@@ -14976,14 +14976,36 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
         .await
         .expect("pause child before settlement");
     let terminals = durable_subrun_host_terminal_events(
-        vec![json!({
-            "type": "tool_call_end",
-            "call_id": "edge-child-call",
-            "status": "completed",
-            "transport": "edge_ledger",
-            "_astra_durable_event_committed": true,
-        })],
+        vec![
+            json!({
+                "type": "tool_call_end",
+                "call_id": "edge-child-call",
+                "status": "completed",
+                "transport": "edge_ledger",
+                "_astra_durable_event_committed": true,
+            }),
+            json!({
+                "type": "agent_communication",
+                "schema_version": "astra.agent_communication.v1",
+                "direction": "received", "message_id": "answer-1",
+                "observed_by": {"run_id": "paused-child", "agent_id": "child"},
+                "from": {"run_id": "session-1", "agent_id": "root"},
+                "to": {"kind": "direct", "address": {"run_id": "paused-child", "agent_id": "child"}},
+                "payload_kind": "response", "related_message_id": "question-1",
+                "correlation_id": "question-1", "response_accepted": true,
+                "timestamp_ms": 1,
+            }),
+        ],
         Some(authority.owner_generation),
+    );
+    let mut progress = terminals[1].clone();
+    progress["payload_kind"] = json!("progress");
+    assert!(
+        durable_subrun_host_terminal_events(
+            vec![progress, json!({"type": "agent_communication"})],
+            Some(authority.owner_generation),
+        )
+        .is_empty()
     );
 
     for _ in 0..2 {
@@ -15020,6 +15042,33 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
         .expect("load paused child")
         .expect("paused child");
     assert_eq!(durable.status, STATUS_PAUSED);
+    let communication: Vec<_> = durable
+        .events
+        .iter()
+        .filter(|event| durable_event_type(event) == Some("agent_communication"))
+        .collect();
+    assert_eq!(
+        communication.len(),
+        1,
+        "settlement retry must not duplicate message evidence"
+    );
+    assert_eq!(communication[0]["message_id"], "answer-1");
+    assert_eq!(communication[0]["related_message_id"], "question-1");
+    assert_eq!(communication[0]["observed_by"]["run_id"], "paused-child");
+    assert_eq!(communication[0]["from"]["run_id"], "session-1");
+    assert!(
+        ServerSubRunExecutor::persist_durable_subrun_tool_terminals(
+            &run_engine,
+            "user-1",
+            "session-1",
+            "paused-child",
+            authority.owner_generation + 1,
+            &terminals,
+        )
+        .await
+        .is_err(),
+        "a different generation must not publish these observations"
+    );
     let stored: Vec<_> = durable
         .events
         .iter()

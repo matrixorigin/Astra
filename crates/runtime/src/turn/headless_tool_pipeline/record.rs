@@ -607,8 +607,10 @@ fn truncate_tool_error(result_str: &str) -> String {
 }
 
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
-    pub(super) async fn record_execution(&mut self, executed: ExecutedExecution) {
-        self.observe_execution_terminal_owner(&executed.execution);
+    pub(super) async fn record_execution(&mut self, mut executed: ExecutedExecution) {
+        // Preserve the accepted transport fact before presentation/governance
+        // can rewrite or fail this tool's displayed result.
+        self.observe_execution_terminal_owner(&mut executed.execution);
         let terminal_owner = executed.execution.terminal_projection_owner();
         let ExecutedExecution {
             mut execution,
@@ -1313,6 +1315,7 @@ mod tests {
             )])),
             authoritative_is_error: Some(false),
             pending_runtime_completion: None,
+            accepted_send: None,
             edge_duration_ms: 1,
             is_edge_tool: true,
             edge_result_missing: false,

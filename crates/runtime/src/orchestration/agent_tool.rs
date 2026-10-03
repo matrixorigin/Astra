@@ -475,27 +475,59 @@ fn render_unavailable_delegation_capabilities(unavailable: &[String]) -> String 
 /// the caller before/after this function. This shared handler intentionally
 /// owns spawn/get_result/send_message validation and rendering.
 pub async fn handle_agent_tool(args: &Value, ctx: Option<&AgentToolContext>) -> String {
+    handle_agent_tool_observed(args, ctx).await.output
+}
+
+/// Execution-only custody of an accepted explicit send. Deliberately neither
+/// serializable nor cloneable: presentation and replay cannot mint this fact.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AcceptedAgentSend(astra_messaging::AgentCommunicationEvent);
+
+impl AcceptedAgentSend {
+    pub(crate) fn into_event(self) -> astra_messaging::AgentCommunicationEvent {
+        self.0
+    }
+}
+
+pub(crate) struct AgentToolOutcome {
+    pub(crate) output: String,
+    pub(crate) accepted_send: Option<AcceptedAgentSend>,
+}
+
+impl From<String> for AgentToolOutcome {
+    fn from(output: String) -> Self {
+        Self {
+            output,
+            accepted_send: None,
+        }
+    }
+}
+
+pub(crate) async fn handle_agent_tool_observed(
+    args: &Value,
+    ctx: Option<&AgentToolContext>,
+) -> AgentToolOutcome {
     if has_malformed_tool_args(args) {
         return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_malformed_arguments_error(
             "agent",
             args.get("_parse_error"),
-        );
+        ).into();
     }
     let action = match agent_action_from_args(args) {
         Ok(action) => action,
-        Err(error) => return render_agent_tool_contract_error(&error),
+        Err(error) => return render_agent_tool_contract_error(&error).into(),
     };
     match action {
         AgentAction::Spawn => handle_agent_spawn_action(args, ctx).await,
         AgentAction::List => handle_agent_list_action(args, ctx).await,
         AgentAction::GetResult => handle_agent_get_result_action(args, ctx).await,
         AgentAction::Wait => handle_agent_wait_action(args, ctx),
-        AgentAction::SendMessage => handle_agent_send_message_action(args, ctx).await,
+        AgentAction::SendMessage => return handle_agent_send_message_action(args, ctx).await,
         AgentAction::RunChain => render_agent_tool_error(
             None,
             "agent.run_chain is owned by the executor chain engine and cannot be handled by the shared agent lifecycle handler.",
         ),
-    }
+    }.into()
 }
 
 /// Admit a yield only. The backbone owns subscriptions, input application,
@@ -693,12 +725,15 @@ fn agent_message_payload(message_type: &str, content: &str) -> Result<MessagePay
     }
 }
 
-async fn handle_agent_send_message_action(args: &Value, ctx: Option<&AgentToolContext>) -> String {
+async fn handle_agent_send_message_action(
+    args: &Value,
+    ctx: Option<&AgentToolContext>,
+) -> AgentToolOutcome {
     let Some(ctx) = ctx else {
-        return render_agent_runtime_binding_error("agent", "send_message");
+        return render_agent_runtime_binding_error("agent", "send_message").into();
     };
     let router = ctx.spawner.mailbox_router();
-    handle_agent_send_message_with_router(
+    handle_agent_send_message_with_router_observed(
         args,
         router.as_ref(),
         &ctx.run_id,
@@ -719,9 +754,27 @@ pub async fn handle_agent_send_message_with_router(
     agent_id: &str,
     reply_obligations: &crate::messaging::reply_obligations::ReplyObligations,
 ) -> String {
+    handle_agent_send_message_with_router_observed(
+        args,
+        router,
+        run_id,
+        agent_id,
+        reply_obligations,
+    )
+    .await
+    .output
+}
+
+pub(crate) async fn handle_agent_send_message_with_router_observed(
+    args: &Value,
+    router: &astra_messaging::router::AgentMailboxRouter,
+    run_id: &str,
+    agent_id: &str,
+    reply_obligations: &crate::messaging::reply_obligations::ReplyObligations,
+) -> AgentToolOutcome {
     let content = match agent_message_content(args) {
         Ok(content) => content,
-        Err(error) => return rejected_agent_message(error),
+        Err(error) => return rejected_agent_message(error).into(),
     };
     let message_type = args
         .get("message_type")
@@ -734,7 +787,7 @@ pub async fn handle_agent_send_message_with_router(
         .filter(|request_id| !request_id.is_empty());
     let payload = if message_type == "answer" {
         let Some(request_id) = request_id else {
-            return rejected_agent_message("answer requires the request_id of the question");
+            return rejected_agent_message("answer requires the request_id of the question").into();
         };
         MessagePayload::Response {
             request_id: request_id.to_string(),
@@ -744,17 +797,17 @@ pub async fn handle_agent_send_message_with_router(
     } else {
         match agent_message_payload(message_type, &content) {
             Ok(payload) => payload,
-            Err(error) => return rejected_agent_message(error),
+            Err(error) => return rejected_agent_message(error).into(),
         }
     };
     let recipient = match args.get("to").and_then(Value::as_str) {
         Some(recipient) => recipient,
-        None => return rejected_agent_message("send_message requires string field `to`"),
+        None => return rejected_agent_message("send_message requires string field `to`").into(),
     };
     let (target, target_display, recipients) =
         match router.resolve_message_target(run_id, recipient).await {
             Ok(target) => target,
-            Err(error) => return rejected_delivery_message(error.to_string()),
+            Err(error) => return rejected_delivery_message(error.to_string()).into(),
         };
 
     // Replies must target a mailbox that actually survives long enough
@@ -762,7 +815,7 @@ pub async fn handle_agent_send_message_with_router(
     // while its mailbox is session-scoped; child/server agents normally use
     // the same identity for both.
     let Some(from) = router.sender_address(run_id, agent_id).await else {
-        return rejected_agent_message("sender mailbox is not bound to this run");
+        return rejected_agent_message("sender mailbox is not bound to this run").into();
     };
     let mut message = AgentMessage::new(from, target, payload);
     if let Some(request_id) = request_id {
@@ -775,11 +828,12 @@ pub async fn handle_agent_send_message_with_router(
             MessageTarget::Broadcast { .. } | MessageTarget::Parent => {
                 return rejected_agent_message(
                     "a question needs one direct responder; broadcast is unsupported",
-                );
+                )
+                .into();
             }
         };
         if let Err(error) = reply_obligations.reserve(run_id, &message_id, responder.clone()) {
-            return rejected_agent_message(error);
+            return rejected_agent_message(error).into();
         }
         Some(astra_turn_types::PendingReply {
             request_id: message_id.clone(),
@@ -791,6 +845,13 @@ pub async fn handle_agent_send_message_with_router(
     } else {
         None
     };
+    // Bound the evidence from the original envelope before transport takes
+    // ownership, but grant accepted-send custody only after explicit success.
+    let event = astra_messaging::agent_communication_event(
+        &AgentAddress::new(run_id, agent_id),
+        astra_messaging::AgentCommunicationDirection::Sent,
+        &message,
+    );
     if let Err(error) = router.send(message).await {
         let definitely_rejected = matches!(
             error,
@@ -804,7 +865,7 @@ pub async fn handle_agent_send_message_with_router(
         if message_type == "question" && definitely_rejected {
             reply_obligations.reject(run_id, &message_id);
         }
-        return if definitely_rejected {
+        return (if definitely_rejected {
             rejected_delivery_message(error.to_string())
         } else {
             json!({
@@ -821,7 +882,7 @@ pub async fn handle_agent_send_message_with_router(
                 "instruction": "Do not resend this message with a new identity; delivery may already have occurred.",
             })
             .to_string()
-        };
+        }).into();
     }
 
     let mut result = json!({
@@ -841,7 +902,10 @@ pub async fn handle_agent_send_message_with_router(
             "The answer is queued, not applied or completed. {CHILD_OUTCOME_GUIDANCE}"
         ));
     }
-    result.to_string()
+    AgentToolOutcome {
+        output: result.to_string(),
+        accepted_send: Some(AcceptedAgentSend(event)),
+    }
 }
 
 /// Handle the atomic `agent_fanout` tool.

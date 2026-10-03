@@ -321,6 +321,7 @@ pub(crate) struct GovernableRuntimeToolResult {
     pub(crate) result: astra_tools::ToolResult,
     pub(crate) pending: Option<PendingRuntimeToolCompletion>,
     pub(crate) dispatch_control: RuntimeToolDispatchControl,
+    pub(crate) accepted_send: Option<crate::orchestration::agent_tool::AcceptedAgentSend>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -405,6 +406,7 @@ impl GovernableRuntimeToolResult {
             confirmed_invocation: finished.record,
             pending: None,
             dispatch_control,
+            accepted_send: None,
         }
     }
 
@@ -415,6 +417,7 @@ impl GovernableRuntimeToolResult {
             result,
             pending: None,
             dispatch_control: RuntimeToolDispatchControl::Continue,
+            accepted_send: None,
         }
     }
 
@@ -428,6 +431,7 @@ impl GovernableRuntimeToolResult {
             result,
             pending: None,
             dispatch_control,
+            accepted_send: None,
         }
     }
 
@@ -447,6 +451,7 @@ impl GovernableRuntimeToolResult {
             result,
             pending: None,
             dispatch_control: RuntimeToolDispatchControl::Continue,
+            accepted_send: None,
         }
     }
 }
@@ -4159,6 +4164,7 @@ impl RuntimeToolExecutor {
         );
         GovernableRuntimeToolResult {
             confirmed_invocation: None,
+            accepted_send: executed.accepted_send,
             result: executed.result,
             pending: Some(PendingRuntimeToolCompletion {
                 boundary: executed.boundary,
@@ -4639,7 +4645,7 @@ impl RuntimeToolExecutor {
         &self,
         request: &ToolExecutionRequest,
         cancel_token: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
+    ) -> crate::server::tool_local_transport::RuntimeToolExecutionResult {
         let name = request.tool_name.as_str();
         let args = &request.args;
         let convergence_authority = non_empty_identity(&request.run_id)
@@ -4657,12 +4663,13 @@ impl RuntimeToolExecutor {
         if nested_run_script_callback && name == "run_script" {
             return astra_tools::ToolResult::error(
                 "run_script cannot recursively start another opaque script writer".into(),
-            );
+            )
+            .into();
         }
         if let LocalToolPreflight::ShortCircuit(result) =
             self.run_local_tool_preflight(name, args).await
         {
-            return result;
+            return result.into();
         }
 
         let lifecycle = LocalToolExecutionLifecycle {
@@ -4707,7 +4714,8 @@ impl RuntimeToolExecutor {
                                 .into(),
                         ),
                     )
-                    .await;
+                    .await
+                    .into();
             }
             Err(ServerWorkspaceAuthorityError::Cancelled) => {
                 if let Some(authority) = convergence_authority.as_deref() {
@@ -4719,7 +4727,8 @@ impl RuntimeToolExecutor {
                         &call_id,
                         astra_tools::cancelled_tool_result(name, false),
                     )
-                    .await;
+                    .await
+                    .into();
             }
             Err(ServerWorkspaceAuthorityError::Unavailable) => {
                 return lifecycle
@@ -4731,7 +4740,8 @@ impl RuntimeToolExecutor {
                             &self.workspace_root,
                         ),
                     )
-                    .await;
+                    .await
+                    .into();
             }
         };
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
@@ -4744,10 +4754,31 @@ impl RuntimeToolExecutor {
                     &call_id,
                     astra_tools::cancelled_tool_result(name, false),
                 )
-                .await;
+                .await
+                .into();
         }
 
+        // The agent handler carries private execution facts through the same
+        // local policy, cancellation and workspace authority boundary.
+        let mut accepted_send = None;
         let mut result = match name {
+            "agent" => {
+                let context = self.agent_tool_context_snapshot();
+                let outcome = astra_tools::tool_engine::execute_tool_with_panic_boundary(
+                    name,
+                    crate::server::tool_agent_runtime::execute_agent_tool(
+                        &self.default_executor,
+                        context.as_ref(),
+                        args,
+                        non_empty_identity(&request.run_id),
+                        non_empty_identity(&request.tool_call_id),
+                        request.policy.delegation_model_admission.as_ref(),
+                    ),
+                )
+                .await;
+                accepted_send = outcome.accepted_send;
+                outcome.result
+            }
             _ if self.tool_engine.contains(name) => {
                 if let Some(result) = self
                     .tool_engine
@@ -4913,7 +4944,10 @@ impl RuntimeToolExecutor {
         // guards. Release before asynchronous lifecycle persistence so an
         // unrelated caller is not held behind database or UI latency.
         drop(workspace_authority);
-        lifecycle.finish(name, &call_id, result).await
+        crate::server::tool_local_transport::RuntimeToolExecutionResult {
+            result: lifecycle.finish(name, &call_id, result).await,
+            accepted_send,
+        }
     }
 
     async fn run_local_tool_preflight(&self, name: &str, args: &Value) -> LocalToolPreflight {
@@ -5252,17 +5286,19 @@ mod runtime_environment_denial_tests {
 // or on an edge/CLI client.
 
 #[async_trait]
-impl ServerLocalToolTransport for RuntimeToolExecutor {
+impl ServerLocalToolTransport<crate::server::tool_local_transport::RuntimeToolExecutionResult>
+    for RuntimeToolExecutor
+{
     async fn execute_server_local_tool(
         &self,
         request: &ToolExecutionRequest,
         cancel_token: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
+    ) -> crate::server::tool_local_transport::RuntimeToolExecutionResult {
         if astra_runtime_env::is_mcp_namespaced_tool_name(&request.tool_name) {
             if let Some(result) =
                 self.executor_readiness_preflight_result(&request.tool_name, &request.args)
             {
-                return result;
+                return result.into();
             }
             let workspace_bound = !matches!(
                 self.execution_binding.workspace().kind,
@@ -5285,7 +5321,8 @@ impl ServerLocalToolTransport for RuntimeToolExecutor {
                         return astra_tools::ToolResult::error(format!(
                             "Error: MCP tool '{}' cannot be prepared: {error}",
                             request.tool_name
-                        ));
+                        ))
+                        .into();
                     }
                 }
             } else {
@@ -5306,7 +5343,8 @@ impl ServerLocalToolTransport for RuntimeToolExecutor {
             if workspace_bound && mcp_effect == ResolvedToolEffect::Unknown {
                 return astra_tools::mcp_workspace_effect_undeclared_tool_result(
                     &request.tool_name,
-                );
+                )
+                .into();
             }
             let workspace_authority = match acquire_server_workspace_authority(
                 &self.workspace_root,
@@ -5323,13 +5361,14 @@ impl ServerLocalToolTransport for RuntimeToolExecutor {
             {
                 Ok(authority) => authority,
                 Err(ServerWorkspaceAuthorityError::Cancelled) => {
-                    return astra_tools::cancelled_tool_result(&request.tool_name, false);
+                    return astra_tools::cancelled_tool_result(&request.tool_name, false).into();
                 }
                 Err(ServerWorkspaceAuthorityError::Unavailable) => {
                     return astra_tools::workspace_lease_unavailable_tool_result_for_workspace(
                         &request.tool_name,
                         &self.workspace_root,
-                    );
+                    )
+                    .into();
                 }
                 Err(ServerWorkspaceAuthorityError::RecursiveRunScript) => unreachable!(),
             };
@@ -5351,7 +5390,7 @@ impl ServerLocalToolTransport for RuntimeToolExecutor {
                 result,
             );
             drop(workspace_authority);
-            return result;
+            return result.into();
         }
         spawn_resource_tool_call_recording(&self.user_id, self.resource_governor.as_ref());
         self.execute_local_with_metadata(request, cancel_token)
@@ -11576,14 +11615,13 @@ esac
     }
 
     #[tokio::test]
-    async fn agent_tools_execute_from_tool_engine_registry() {
+    async fn agent_tools_execute_through_canonical_runtime_dispatch() {
         let (exec, _dir) = test_executor();
-        for name in ["agent", "agent_fanout"] {
-            assert!(
-                exec.tool_engine.contains(name),
-                "{name} should be registered in ToolEngine for server-local execution"
-            );
-        }
+        assert!(
+            !exec.tool_engine.contains("agent"),
+            "agent must use typed runtime dispatch, not a second ToolEngine handler"
+        );
+        assert!(exec.tool_engine.contains("agent_fanout"));
 
         let delegate = exec
             .execute_with_metadata(
@@ -11607,7 +11645,7 @@ esac
                 .metadata
                 .as_ref()
                 .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
-            "ToolEngine agent errors should still receive execution metadata"
+            "Typed agent dispatch errors should still receive execution metadata"
         );
 
         let fanout = exec
@@ -13021,13 +13059,11 @@ esac
             .expect("busy MCP registry should be rejected by executor readiness preflight");
         let request = exec.tool_execution_request("mcp__demo__search", &args);
 
-        let actual =
-            <RuntimeToolExecutor as crate::server::tool_local_transport::ServerLocalToolTransport>::execute_server_local_tool(
-                &exec,
-                &request,
-                None,
-            )
-            .await;
+        let actual = <RuntimeToolExecutor as ServerLocalToolTransport<
+            crate::server::tool_local_transport::RuntimeToolExecutionResult,
+        >>::execute_server_local_tool(&exec, &request, None)
+        .await
+        .result;
 
         assert_eq!(actual.is_error, expected.is_error);
         assert_eq!(
@@ -13061,13 +13097,11 @@ esac
         let mut request = exec.tool_execution_request("mcp__calculator", &json!({"expr": "1+1"}));
         request.tool_call_id = " \t".to_string();
 
-        let result =
-            <RuntimeToolExecutor as crate::server::tool_local_transport::ServerLocalToolTransport>::execute_server_local_tool(
-                &exec,
-                &request,
-                None,
-            )
-            .await;
+        let result = <RuntimeToolExecutor as ServerLocalToolTransport<
+            crate::server::tool_local_transport::RuntimeToolExecutionResult,
+        >>::execute_server_local_tool(&exec, &request, None)
+        .await
+        .result;
 
         assert!(result.is_error);
         assert!(
@@ -13170,13 +13204,11 @@ esac
         let mut request = exec.tool_execution_request("mcp__mail__send", &json!({}));
         request.tool_call_id = "call-provider-interaction".to_string();
 
-        let result =
-            <RuntimeToolExecutor as crate::server::tool_local_transport::ServerLocalToolTransport>::execute_server_local_tool(
-                &exec,
-                &request,
-                None,
-            )
-            .await;
+        let result = <RuntimeToolExecutor as ServerLocalToolTransport<
+            crate::server::tool_local_transport::RuntimeToolExecutionResult,
+        >>::execute_server_local_tool(&exec, &request, None)
+        .await
+        .result;
 
         server.abort();
         (

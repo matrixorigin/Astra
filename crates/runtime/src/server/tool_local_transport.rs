@@ -14,15 +14,47 @@ const LOCAL_OWNER_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::fr
 const LOCAL_OWNER_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[async_trait]
-pub trait ServerLocalToolTransport: Send + Sync {
+pub trait ServerLocalToolTransport<R = astra_tools::ToolResult>: Send + Sync {
     async fn execute_server_local_tool(
         &self,
         request: &ToolExecutionRequest,
         cancel_token: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult;
+    ) -> R;
 }
 
-pub(crate) async fn execute_local_transport<L>(
+/// Private live execution return. Public results, cache hits and remote
+/// callbacks can only enter through `From`, which carries no send authority.
+pub(crate) struct RuntimeToolExecutionResult {
+    pub(crate) result: astra_tools::ToolResult,
+    pub(crate) accepted_send: Option<crate::orchestration::agent_tool::AcceptedAgentSend>,
+}
+
+impl From<astra_tools::ToolResult> for RuntimeToolExecutionResult {
+    fn from(result: astra_tools::ToolResult) -> Self {
+        Self {
+            result,
+            accepted_send: None,
+        }
+    }
+}
+
+pub(crate) trait ToolTransportResult: From<astra_tools::ToolResult> + Send {
+    fn result_mut(&mut self) -> &mut astra_tools::ToolResult;
+}
+
+impl ToolTransportResult for astra_tools::ToolResult {
+    fn result_mut(&mut self) -> &mut astra_tools::ToolResult {
+        self
+    }
+}
+
+impl ToolTransportResult for RuntimeToolExecutionResult {
+    fn result_mut(&mut self) -> &mut astra_tools::ToolResult {
+        &mut self.result
+    }
+}
+
+pub(crate) async fn execute_local_transport<L, R>(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
     result_workspace: &WorkspaceBinding,
@@ -30,9 +62,10 @@ pub(crate) async fn execute_local_transport<L>(
     result_transport: ToolTransportKind,
     local_transport: &L,
     cancel_token: Option<CancellationToken>,
-) -> astra_tools::ToolResult
+) -> R
 where
-    L: ServerLocalToolTransport + ?Sized,
+    L: ServerLocalToolTransport<R> + ?Sized,
+    R: ToolTransportResult,
 {
     if cancel_token
         .as_ref()
@@ -45,7 +78,8 @@ where
             binding,
             result_transport,
             false,
-        );
+        )
+        .into();
     }
     let mut execution =
         Box::pin(local_transport.execute_server_local_tool(request, cancel_token.as_ref()));
@@ -91,7 +125,7 @@ where
                         // at most one such terminal owner per workspace and
                         // prevents every later writer from entering.
                         std::mem::forget(execution);
-                        result
+                        result.into()
                     }
                 }
             },

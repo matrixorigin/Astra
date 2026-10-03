@@ -92,6 +92,7 @@ pub(crate) async fn execute_tool_pure(
                     dispatch_control = deferred.dispatch_control;
                     execution.pending_runtime_completion = deferred.pending;
                     execution.confirmed_invocation = deferred.confirmed_invocation;
+                    execution.accepted_send = deferred.accepted_send;
                     deferred.result
                 }
                 HeadlessInvocationScope::Incomplete => astra_tools::ToolResult::error(
@@ -177,6 +178,7 @@ mod runtime_tool_result_tests {
             tool_result_fields: None,
             authoritative_is_error: None,
             pending_runtime_completion: None,
+            accepted_send: None,
             confirmed_invocation: None,
             edge_duration_ms: 0,
             is_edge_tool: false,
