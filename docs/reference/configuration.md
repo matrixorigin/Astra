@@ -139,6 +139,20 @@ Scoped credentials drive login, refresh, memory proxy, explicit tools, recall, e
 
 ### Runtime tuning (optional)
 
+Runtime configuration exposes controls consumed by execution: compression,
+retrieval, token budgets, tool policy and tracing. The retired `verification`,
+`memory_pressure` and `context_window` sections are not supported. Model context
+window metadata and tool verification contracts retain their existing owners.
+
+Unknown top-level runtime fields are rejected by the configuration parser.
+`--settings` reports the parse error. A saved session override must parse and
+satisfy the current invariants before resume changes the active session; invalid
+snapshots remain unchanged and are not migrated or filtered. This also rejects
+full snapshots that contain the retired sections, even if their values were defaults.
+The existing disk
+configuration loader reports a warning and skips an invalid user/project layer.
+
+
 - `ASTRA_MAX_TURNS` — optional positive ordinary execution-round cap. Bounded settlement/closing allowances remain separate, so this is not an absolute cap on all model calls or cost. Unset means renewable slices without an implicit round cap; it does not disable cancellation, execution-health checks, or individual operation timeouts.
 - `ASTRA_PLAN_SUBTASK_MAX_TURNS` — optional positive plan-subtask cap; unset inherits `ASTRA_MAX_TURNS`. Explicit zero or malformed round caps are rejected, not treated as unlimited.
 - `ASTRA_TURN_TIMEOUT_S`

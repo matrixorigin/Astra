@@ -7199,77 +7199,6 @@ impl JournalEvent {
         evt.metadata = Some(metadata);
         evt
     }
-    /// Focus drift detected — emitted when drift analysis finds significant drift.
-    pub fn drift_detected(
-        session_id: Option<&str>,
-        turn: u32,
-        severity: f64,
-        cause: astra_core::DriftCause,
-        evidence: Vec<astra_core::DriftEvidence>,
-        recovery_suggestion: &str,
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::DriftDetected, session_id);
-        evt.turn = Some(turn);
-        evt.metadata = Some(serde_json::json!({
-            "severity": severity,
-            "cause": cause,
-            "evidence_count": evidence.len(),
-            "evidence": evidence,
-            "recovery_suggestion": recovery_suggestion,
-        }));
-        evt
-    }
-
-    /// Adaptive scenario applied — emitted once per session when the adaptive
-    /// profile selects a scenario and applies config adjustments.
-    #[allow(clippy::too_many_arguments)]
-    pub fn adaptive_scenario_applied(
-        session_id: Option<&str>,
-        turn: u32,
-        scenario: &str,
-        confidence: f64,
-        config_changes: Vec<(String, String, String)>, // (key, from, to)
-        experiment_id: Option<&str>,
-        variant_id: Option<&str>,
-        baseline_applied: bool,
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::AdaptiveScenarioApplied, session_id);
-        evt.turn = Some(turn);
-        let changes: Vec<serde_json::Value> = config_changes
-            .iter()
-            .map(|(k, from, to)| serde_json::json!({"key": k, "from": from, "to": to}))
-            .collect();
-        evt.metadata = Some(serde_json::json!({
-            "scenario": scenario,
-            "confidence": confidence,
-            "config_changes": changes,
-            "experiment_id": experiment_id,
-            "variant_id": variant_id,
-            "baseline_applied": baseline_applied,
-        }));
-        evt
-    }
-
-    /// Per-turn micro-adaptation applied — emitted when per-turn adaptation
-    /// modifies runtime config based on immediate signals.
-    pub fn adaptive_per_turn_applied(
-        session_id: Option<&str>,
-        turn: u32,
-        changes: Vec<(String, String, String)>, // (key, from, to)
-        triggers: Vec<String>,                  // reason strings
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::AdaptivePerTurnApplied, session_id);
-        evt.turn = Some(turn);
-        let change_vals: Vec<serde_json::Value> = changes
-            .iter()
-            .map(|(k, from, to)| serde_json::json!({"key": k, "from": from, "to": to}))
-            .collect();
-        evt.metadata = Some(serde_json::json!({
-            "changes": change_vals,
-            "triggers": triggers,
-        }));
-        evt
-    }
 
     /// Record a structured interruption (budget exhaustion, rate limit, cancel, etc.).
     pub fn interruption_recorded(
@@ -8742,7 +8671,6 @@ fn dir_size(path: &Path) -> std::io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_core::{DriftCause, DriftEvidence, EvidenceType};
     use tempfile::tempdir;
 
     #[test]
@@ -9057,22 +8985,11 @@ mod tests {
 
     #[test]
     fn journal_event_drift_detected_round_trips_structured_cause_and_evidence() {
-        let evt = JournalEvent::drift_detected(
-            Some("sid-drift"),
-            7,
-            0.75,
-            DriftCause::MemoryMiss {
-                expected_but_not_retrieved: vec!["session history".into(), "repo context".into()],
-                query_used: "debug repeated session start".into(),
-            },
-            vec![DriftEvidence {
-                turn: 6,
-                evidence_type: EvidenceType::MemoryMismatch,
-                description: "Retrieved unrelated CI memories instead of resume context".into(),
-                confidence: 0.9.into(),
-            }],
-            "Re-query with explicit session-resume terms",
-        );
+        let evt: JournalEvent = serde_json::from_value(serde_json::json!({
+            "type": "drift_detected", "ts": "2026-10-03T00:00:00Z", "session_id": "sid-drift", "turn": 7,
+            "metadata": {"severity": 0.75, "cause": {"type": "MemoryMiss", "expected_but_not_retrieved": ["session history", "repo context"], "query_used": "debug repeated session start"}, "evidence_count": 1,
+             "evidence": [{"turn": 6, "evidence_type": "MemoryMismatch", "description": "Retrieved unrelated CI memories instead of resume context", "confidence": 0.9}], "recovery_suggestion": "Re-query with explicit session-resume terms"}
+        })).unwrap();
 
         assert_eq!(evt.event_type, JournalEventType::DriftDetected);
         assert_eq!(evt.turn, Some(7));

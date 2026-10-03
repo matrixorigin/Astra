@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 /// Complete runtime configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     /// Opt-in Server Auto routing. Pair must be qualified by the operator;
     /// absence disables Auto. This never grants access to either Offering.
@@ -51,18 +52,6 @@ pub struct RuntimeConfig {
     /// Token budget configuration.
     #[serde(default)]
     pub token_budget: TokenBudgetConfig,
-
-    /// Adaptive verification / review strictness.
-    #[serde(default)]
-    pub verification: VerificationConfig,
-
-    /// Adaptive memory-retrieval pressure.
-    #[serde(default)]
-    pub memory_pressure: MemoryPressureConfig,
-
-    /// Adaptive context-window / token-burn management.
-    #[serde(default)]
-    pub context_window: ContextWindowConfig,
 
     /// Safety-guard configuration.
     ///
@@ -415,9 +404,6 @@ impl Default for RuntimeConfig {
             tool_policy: ToolPolicyConfig::default(),
             trace: SessionTraceConfig::default(),
             token_budget: TokenBudgetConfig::default(),
-            verification: VerificationConfig::default(),
-            memory_pressure: MemoryPressureConfig::default(),
-            context_window: ContextWindowConfig::default(),
             safety: SafetyConfig::default(),
             fork_prefix: ForkPrefixConfig::default(),
             tool_surface: ToolSurfaceConfig::default(),
@@ -1739,174 +1725,6 @@ impl Default for TokenBudgetConfig {
     }
 }
 
-// ─── Verification Configuration ──────────────────────────────────────────────
-
-/// Configuration for adaptive verification / review strictness.
-///
-/// When adaptive is enabled, the runtime raises or lowers review strictness
-/// based on user corrections, drift, and failure patterns.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerificationConfig {
-    /// Whether adaptive strictness adjustment is active.
-    #[serde(default = "default_true")]
-    pub adaptive: bool,
-
-    /// Current strictness level (0.0 = lenient, 1.0 = maximum).
-    #[serde(default = "default_verification_strictness")]
-    pub strictness: f64,
-
-    /// Minimum strictness (clamped).
-    #[serde(default = "default_verification_min")]
-    pub min_strictness: f64,
-
-    /// Maximum strictness (clamped).
-    #[serde(default = "default_verification_max")]
-    pub max_strictness: f64,
-
-    /// Whether corrections should automatically raise strictness.
-    #[serde(default = "default_true")]
-    pub increase_on_correction: bool,
-
-    /// Whether detected focus-drift should raise strictness.
-    #[serde(default)]
-    pub increase_on_drift: bool,
-}
-
-fn default_verification_strictness() -> f64 {
-    0.5
-}
-fn default_verification_min() -> f64 {
-    0.2
-}
-fn default_verification_max() -> f64 {
-    0.9
-}
-
-impl Default for VerificationConfig {
-    fn default() -> Self {
-        Self {
-            adaptive: true,
-            strictness: default_verification_strictness(),
-            min_strictness: default_verification_min(),
-            max_strictness: default_verification_max(),
-            increase_on_correction: true,
-            increase_on_drift: false,
-        }
-    }
-}
-
-// ─── Memory Pressure Configuration ──────────────────────────────────────────
-
-/// Configuration for adaptive memory-retrieval pressure.
-///
-/// When adaptive is enabled, retrieval top-k and history preservation
-/// expand or contract based on tool churn, focus drift, and corrections.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryPressureConfig {
-    /// Whether adaptive memory pressure is active.
-    #[serde(default = "default_true")]
-    pub adaptive: bool,
-
-    /// Minimum retrieval top-k (adaptive floor).
-    #[serde(default = "default_retrieval_min")]
-    pub retrieval_min: u32,
-
-    /// Maximum retrieval top-k (adaptive ceiling).
-    #[serde(default = "default_retrieval_max")]
-    pub retrieval_max: u32,
-
-    /// Expand memory retrieval on tool churn (repeated failures).
-    #[serde(default = "default_true")]
-    pub expand_on_churn: bool,
-
-    /// Expand memory retrieval on detected focus drift.
-    #[serde(default = "default_true")]
-    pub expand_on_drift: bool,
-
-    /// Expand memory retrieval on user corrections.
-    #[serde(default)]
-    pub expand_on_correction: bool,
-}
-
-fn default_retrieval_min() -> u32 {
-    3
-}
-fn default_retrieval_max() -> u32 {
-    15
-}
-
-impl Default for MemoryPressureConfig {
-    fn default() -> Self {
-        Self {
-            adaptive: true,
-            retrieval_min: default_retrieval_min(),
-            retrieval_max: default_retrieval_max(),
-            expand_on_churn: true,
-            expand_on_drift: true,
-            expand_on_correction: false,
-        }
-    }
-}
-
-// ─── Context-Window Configuration ───────────────────────────────────────────
-
-/// Configuration for adaptive token-budget and compression management.
-///
-/// When adaptive is enabled, the runtime adjusts token budgets per-turn
-/// based on actual burn rate, compression frequency, and error patterns.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextWindowConfig {
-    /// Whether adaptive token budgets are active.
-    #[serde(default = "default_true")]
-    pub adaptive: bool,
-
-    /// Whether the compression threshold adjusts automatically.
-    #[serde(default = "default_true")]
-    pub dynamic_compression: bool,
-
-    /// Minimum compression threshold (adaptive floor).
-    #[serde(default = "default_compression_threshold_min")]
-    pub compression_threshold_min: f64,
-
-    /// Maximum compression threshold (adaptive ceiling).
-    #[serde(default = "default_compression_threshold_max")]
-    pub compression_threshold_max: f64,
-
-    /// Fraction of remaining budget to allocate per remaining turn.
-    #[serde(default = "default_remaining_turn_factor")]
-    pub remaining_turn_factor: f64,
-
-    /// Tokens reserved for error recovery retries.
-    #[serde(default = "default_error_recovery_reserve")]
-    pub error_recovery_reserve: u32,
-}
-
-fn default_compression_threshold_min() -> f64 {
-    0.5
-}
-fn default_compression_threshold_max() -> f64 {
-    0.95
-}
-fn default_remaining_turn_factor() -> f64 {
-    0.33
-}
-fn default_error_recovery_reserve() -> u32 {
-    10_000
-}
-
-impl Default for ContextWindowConfig {
-    fn default() -> Self {
-        Self {
-            adaptive: true,
-            dynamic_compression: true,
-            compression_threshold_min: default_compression_threshold_min(),
-            compression_threshold_max: default_compression_threshold_max(),
-            remaining_turn_factor: default_remaining_turn_factor(),
-            error_recovery_reserve: default_error_recovery_reserve(),
-        }
-    }
-}
-
 fn merge_if_non_default<T: PartialEq>(slot: &mut T, incoming: T, default: T) {
     if incoming != default {
         *slot = incoming;
@@ -2075,9 +1893,6 @@ impl RuntimeConfig {
             tool_policy,
             trace,
             token_budget,
-            verification,
-            memory_pressure,
-            context_window,
             safety,
             fork_prefix,
             tool_surface,
@@ -2470,111 +2285,6 @@ impl RuntimeConfig {
             default_tools_reserve(),
         );
 
-        let VerificationConfig {
-            adaptive,
-            strictness,
-            min_strictness,
-            max_strictness,
-            increase_on_correction,
-            increase_on_drift,
-        } = verification;
-        merge_if_non_default(&mut self.verification.adaptive, adaptive, default_true());
-        merge_if_non_default(
-            &mut self.verification.strictness,
-            strictness,
-            default_verification_strictness(),
-        );
-        merge_if_non_default(
-            &mut self.verification.min_strictness,
-            min_strictness,
-            default_verification_min(),
-        );
-        merge_if_non_default(
-            &mut self.verification.max_strictness,
-            max_strictness,
-            default_verification_max(),
-        );
-        merge_if_non_default(
-            &mut self.verification.increase_on_correction,
-            increase_on_correction,
-            default_true(),
-        );
-        merge_if_non_default(
-            &mut self.verification.increase_on_drift,
-            increase_on_drift,
-            false,
-        );
-
-        let MemoryPressureConfig {
-            adaptive,
-            retrieval_min,
-            retrieval_max,
-            expand_on_churn,
-            expand_on_drift,
-            expand_on_correction,
-        } = memory_pressure;
-        merge_if_non_default(&mut self.memory_pressure.adaptive, adaptive, default_true());
-        merge_if_non_default(
-            &mut self.memory_pressure.retrieval_min,
-            retrieval_min,
-            default_retrieval_min(),
-        );
-        merge_if_non_default(
-            &mut self.memory_pressure.retrieval_max,
-            retrieval_max,
-            default_retrieval_max(),
-        );
-        merge_if_non_default(
-            &mut self.memory_pressure.expand_on_churn,
-            expand_on_churn,
-            default_true(),
-        );
-        merge_if_non_default(
-            &mut self.memory_pressure.expand_on_drift,
-            expand_on_drift,
-            default_true(),
-        );
-        merge_if_non_default(
-            &mut self.memory_pressure.expand_on_correction,
-            expand_on_correction,
-            false,
-        );
-
-        let ContextWindowConfig {
-            adaptive,
-            dynamic_compression,
-            compression_threshold_min,
-            compression_threshold_max,
-            remaining_turn_factor,
-            error_recovery_reserve,
-        } = context_window;
-        merge_if_non_default(&mut self.context_window.adaptive, adaptive, default_true());
-        merge_if_non_default(
-            &mut self.context_window.dynamic_compression,
-            dynamic_compression,
-            default_true(),
-        );
-        merge_if_non_default(
-            &mut self.context_window.compression_threshold_min,
-            compression_threshold_min,
-            default_compression_threshold_min(),
-        );
-        merge_if_non_default(
-            &mut self.context_window.compression_threshold_max,
-            compression_threshold_max,
-            default_compression_threshold_max(),
-        );
-        merge_if_non_default(
-            &mut self.context_window.remaining_turn_factor,
-            remaining_turn_factor,
-            default_remaining_turn_factor(),
-        );
-        merge_if_non_default(
-            &mut self.context_window.error_recovery_reserve,
-            error_recovery_reserve,
-            default_error_recovery_reserve(),
-        );
-
         // SafetyConfig: last layer with an explicit trust_mode wins.
         // Unset (None) preserves the earlier layer's value. This makes the
         // merge symmetric — a project config can both opt *in* to Trusted
@@ -2821,46 +2531,10 @@ mod tests {
     }
 
     #[test]
-    fn test_verification_config_defaults() {
-        let config = VerificationConfig::default();
-        assert!(config.adaptive);
-        assert!((config.strictness - 0.5).abs() < 0.001);
-        assert!((config.min_strictness - 0.2).abs() < 0.001);
-        assert!((config.max_strictness - 0.9).abs() < 0.001);
-        assert!(config.increase_on_correction);
-        assert!(!config.increase_on_drift);
-    }
-
-    #[test]
-    fn test_memory_pressure_config_defaults() {
-        let config = MemoryPressureConfig::default();
-        assert!(config.adaptive);
-        assert_eq!(config.retrieval_min, 3);
-        assert_eq!(config.retrieval_max, 15);
-        assert!(config.expand_on_churn);
-        assert!(config.expand_on_drift);
-        assert!(!config.expand_on_correction);
-    }
-
-    #[test]
-    fn test_context_window_config_defaults() {
-        let config = ContextWindowConfig::default();
-        assert!(config.adaptive);
-        assert!(config.dynamic_compression);
-        assert!((config.compression_threshold_min - 0.5).abs() < 0.001);
-        assert!((config.compression_threshold_max - 0.95).abs() < 0.001);
-        assert!((config.remaining_turn_factor - 0.33).abs() < 0.001);
-        assert_eq!(config.error_recovery_reserve, 10_000);
-    }
-
-    #[test]
     fn test_runtime_config_has_new_sub_configs() {
         let config = RuntimeConfig::default();
         // Just verify they exist and serialize
         let toml = config.to_toml().unwrap();
-        assert!(toml.contains("[verification]"));
-        assert!(toml.contains("[memory_pressure]"));
-        assert!(toml.contains("[context_window]"));
         assert!(toml.contains("[agent_binding_registry]"));
         assert_eq!(config.explain.effective_live_rows(), 5);
     }
@@ -2954,30 +2628,6 @@ mod tests {
                 system_prompt_reserve: 2000,
                 tools_reserve: 6000,
             },
-            verification: VerificationConfig {
-                adaptive: false,
-                strictness: 0.75,
-                min_strictness: 0.3,
-                max_strictness: 0.95,
-                increase_on_correction: false,
-                increase_on_drift: true,
-            },
-            memory_pressure: MemoryPressureConfig {
-                adaptive: false,
-                retrieval_min: 4,
-                retrieval_max: 20,
-                expand_on_churn: false,
-                expand_on_drift: false,
-                expand_on_correction: true,
-            },
-            context_window: ContextWindowConfig {
-                adaptive: false,
-                dynamic_compression: false,
-                compression_threshold_min: 0.45,
-                compression_threshold_max: 0.98,
-                remaining_turn_factor: 0.5,
-                error_recovery_reserve: 12000,
-            },
             safety: SafetyConfig::default(),
             fork_prefix: ForkPrefixConfig::default(),
             tool_surface: ToolSurfaceConfig::default(),
@@ -3041,27 +2691,6 @@ mod tests {
         assert_eq!(merged.token_budget.max_turn_input_tokens, 32000);
         assert_eq!(merged.token_budget.system_prompt_reserve, 2000);
         assert_eq!(merged.token_budget.tools_reserve, 6000);
-
-        assert!(!merged.verification.adaptive);
-        assert!((merged.verification.strictness - 0.75).abs() < 0.001);
-        assert!((merged.verification.min_strictness - 0.3).abs() < 0.001);
-        assert!((merged.verification.max_strictness - 0.95).abs() < 0.001);
-        assert!(!merged.verification.increase_on_correction);
-        assert!(merged.verification.increase_on_drift);
-
-        assert!(!merged.memory_pressure.adaptive);
-        assert_eq!(merged.memory_pressure.retrieval_min, 4);
-        assert_eq!(merged.memory_pressure.retrieval_max, 20);
-        assert!(!merged.memory_pressure.expand_on_churn);
-        assert!(!merged.memory_pressure.expand_on_drift);
-        assert!(merged.memory_pressure.expand_on_correction);
-
-        assert!(!merged.context_window.adaptive);
-        assert!(!merged.context_window.dynamic_compression);
-        assert!((merged.context_window.compression_threshold_min - 0.45).abs() < 0.001);
-        assert!((merged.context_window.compression_threshold_max - 0.98).abs() < 0.001);
-        assert!((merged.context_window.remaining_turn_factor - 0.5).abs() < 0.001);
-        assert_eq!(merged.context_window.error_recovery_reserve, 12000);
 
         assert_eq!(merged.agent_binding_registry.max_agent_md_bytes, 4096);
         let budget_policy = merged.budget_policy.expect("budget policy should merge");

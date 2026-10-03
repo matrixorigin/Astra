@@ -205,8 +205,6 @@ pub struct ExecutionState {
     pub token_budget: Option<TokenBudgetSnapshot>,
     /// Detected scenario (if any).
     pub scenario: Option<String>,
-    /// Active A/B experiment (if enrolled).
-    pub active_experiment: Option<String>,
     /// Session elapsed time in seconds.
     pub session_elapsed_secs: u64,
     /// Number of direct user corrections detected this session.
@@ -286,7 +284,6 @@ impl SelfModel {
         turn_number: u32,
         latest_budget: Option<&TokenBudgetTrace>,
         scenario: Option<&Scenario>,
-        active_experiment: Option<&str>,
         session_elapsed_secs: u64,
         correction_count: usize,
         compression_count: usize,
@@ -365,7 +362,6 @@ impl SelfModel {
             turn_number,
             token_budget,
             scenario: scenario.map(|s| format!("{:?}", s)),
-            active_experiment: active_experiment.map(|s| s.to_string()),
             session_elapsed_secs,
             correction_count,
             compression_count,
@@ -984,9 +980,6 @@ impl SelfModel {
         if let Some(ref scenario) = self.state.scenario {
             let _ = writeln!(s, "- Scenario: {}", scenario);
         }
-        if let Some(ref exp) = self.state.active_experiment {
-            let _ = writeln!(s, "- Active experiment: {}", exp);
-        }
         let _ = writeln!(s, "- Session elapsed: {}s", self.state.session_elapsed_secs);
         let _ = writeln!(
             s,
@@ -1151,7 +1144,6 @@ mod tests {
             3,
             None,
             None,
-            None,
             120,
             0,
             0,
@@ -1174,7 +1166,6 @@ mod tests {
             &[],
             None,
             8,
-            None,
             None,
             None,
             300,
@@ -1212,7 +1203,6 @@ mod tests {
             1,
             None,
             None,
-            None,
             10,
             0,
             0,
@@ -1238,7 +1228,6 @@ mod tests {
             &[],
             Some(&health),
             1,
-            None,
             None,
             None,
             10,
@@ -1292,7 +1281,6 @@ mod tests {
             &[],
             Some(&health),
             2,
-            None,
             None,
             None,
             10,
@@ -1357,7 +1345,6 @@ mod tests {
             5,
             Some(&budget),
             Some(&Scenario::Debugging),
-            None,
             240,
             0,
             0,
@@ -1395,7 +1382,6 @@ mod tests {
             3,
             None,
             None,
-            None,
             240,
             0,
             0,
@@ -1422,7 +1408,6 @@ mod tests {
             10,
             None,
             None,
-            Some("exp-123"),
             600,
             2,
             1,
@@ -1433,7 +1418,6 @@ mod tests {
         let text = model.to_detailed_text();
         assert!(text.contains("Agent Self-Model"));
         assert!(text.contains("Turn: 10"));
-        assert!(text.contains("exp-123"));
         assert!(text.contains("Direct user corrections: 2"));
         assert!(text.contains("Implement feature X"));
     }
@@ -1449,7 +1433,6 @@ mod tests {
             &[],
             None,
             1,
-            None,
             None,
             None,
             0,
@@ -1475,7 +1458,6 @@ mod tests {
             &[],
             None,
             1,
-            None,
             None,
             None,
             0,
@@ -1506,7 +1488,6 @@ mod tests {
             &[],
             None,
             0,
-            None,
             None,
             None,
             0,
@@ -1703,7 +1684,6 @@ mod tests {
             &[],
             None,
             0,
-            None,
             None,
             None,
             0,

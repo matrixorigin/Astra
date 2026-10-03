@@ -50,8 +50,6 @@ impl SelfSurfaceRuntimeSupport for CliSelfSurfaceRuntimeSupport {
         Ok(BudgetConfig {
             compression_threshold: config.compression.compression_threshold,
             max_turn_input_tokens: config.token_budget.max_turn_input_tokens,
-            compression_threshold_min: config.context_window.compression_threshold_min,
-            compression_threshold_max: config.context_window.compression_threshold_max,
         })
     }
 

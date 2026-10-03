@@ -108,12 +108,12 @@ fn typing_a_letter_filters_the_list_to_matching_ids_or_labels() {
 #[test]
 fn backspace_preserves_selected_item_when_still_visible() {
     let mut v = make_view();
-    for c in "compression_threshold".chars() {
+    for c in "compression.".chars() {
         v.handle_key(ch(c));
     }
     assert!(
         v.visible_ids().len() >= 2,
-        "precondition: threshold filter should expose multiple related settings"
+        "precondition: compression filter should expose multiple related settings"
     );
 
     v.handle_key(key(KeyCode::Down));
@@ -464,7 +464,7 @@ fn number_edit_round_trips_and_marks_dirty() {
 #[test]
 fn fractional_threshold_edit_round_trips_and_marks_dirty() {
     let mut v = make_view();
-    v.select_by_id("context_window.compression_threshold_min");
+    v.select_by_id("compression.compression_threshold");
     v.handle_key(key(KeyCode::Enter));
 
     for _ in 0..8 {
@@ -482,8 +482,8 @@ fn fractional_threshold_edit_round_trips_and_marks_dirty() {
     assert!(v.is_dirty());
     let actual = v
         .working_config_for_test()
-        .context_window
-        .compression_threshold_min;
+        .compression
+        .compression_threshold;
     assert!(
         (actual - 0.85).abs() < f64::EPSILON,
         "fractional threshold should round-trip, got {actual}"
@@ -493,7 +493,7 @@ fn fractional_threshold_edit_round_trips_and_marks_dirty() {
 #[test]
 fn fractional_number_editor_shows_inline_guidance_for_lone_decimal_before_enter() {
     let mut v = make_view();
-    v.select_by_id("context_window.compression_threshold_min");
+    v.select_by_id("compression.compression_threshold");
     v.handle_key(key(KeyCode::Enter));
 
     for _ in 0..8 {
@@ -520,7 +520,7 @@ fn fractional_number_editor_shows_inline_guidance_for_lone_decimal_before_enter(
 #[test]
 fn fractional_number_editor_clears_lone_decimal_guidance_when_value_becomes_valid() {
     let mut v = make_view();
-    v.select_by_id("context_window.compression_threshold_min");
+    v.select_by_id("compression.compression_threshold");
     v.handle_key(key(KeyCode::Enter));
 
     for _ in 0..8 {

@@ -5,10 +5,9 @@ use crossterm::style::Stylize;
 /// Handle `/telemetry` command — display observability session metrics.
 ///
 /// Subcommands:
-/// - (no arg)     Show summary: turns, timings, drift, decisions
+/// - (no arg)     Show summary: turns, timings, drift
 /// - `turns`      List per-turn timing breakdowns
 /// - `drift`      Check focus drift analysis
-/// - `decisions`  List tool surface decisions with confidence
 ///
 /// Used by the non-interactive telemetry bridge in `command_router`.
 /// The workbench does not hand terminal ownership to this printer.
@@ -38,7 +37,6 @@ pub(crate) fn handle_telemetry_command(arg: &str, state: &SessionState) {
         "" => show_summary(hub, session, state),
         "turns" => show_turn_timings(session),
         "drift" => show_drift_analysis(session, state),
-        "decisions" => show_decisions(session),
         "profile" => show_user_profile(hub, state),
         "context" => show_context_trace(session, sub_arg),
         "context-detail" => show_context_detail(session, sub_arg),
@@ -138,17 +136,6 @@ fn show_summary(
         session_guard.context_traces.len().to_string().magenta()
     );
 
-    // Decisions
-    eprintln!(
-        "  {:<18} {}",
-        "decisions:".dim(),
-        session_guard
-            .decision_explanations
-            .len()
-            .to_string()
-            .magenta()
-    );
-
     // Recent queries for drift
     eprintln!(
         "  {:<18} {}",
@@ -237,7 +224,7 @@ fn show_summary(
     eprintln!();
     eprintln!(
         "  {}",
-        "Use /telemetry turns|drift|decisions|profile for details".dim()
+        "Use /telemetry turns|drift|profile for details".dim()
     );
     eprintln!();
 }
@@ -336,97 +323,6 @@ fn show_drift_analysis(
     eprintln!();
 }
 
-fn show_decisions(
-    session: &std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
-) {
-    let session_guard = astra_core::sync_poison::recover_rwlock_read(&session);
-
-    if session_guard.decision_explanations.is_empty() {
-        eprintln!("{}", "  No decision data yet.".yellow());
-        return;
-    }
-
-    eprintln!(
-        "\n{}",
-        "─── Decision History ────────────────────────────"
-            .bold()
-            .magenta()
-    );
-
-    for (i, decision) in session_guard.decision_explanations.iter().enumerate() {
-        let conf_str = format!("{:.0}%", decision.confidence * 100.0);
-        let conf_color = if decision.confidence > 0.7 {
-            conf_str.green()
-        } else if decision.confidence > 0.4 {
-            conf_str.yellow()
-        } else {
-            conf_str.red()
-        };
-
-        // Format decision type nicely
-        use astra_turn_core::decision_explainer::DecisionType;
-        let type_label = match &decision.decision_type {
-            DecisionType::ToolSurface {
-                visible_tools,
-                total_available,
-            } => {
-                format!("ToolSurface ({}/{})", visible_tools.len(), total_available)
-            }
-            DecisionType::HistoryCompression {
-                turns_compressed,
-                turns_retained,
-                compression_ratio,
-            } => {
-                format!(
-                    "HistoryCompression (-{}/+{}, {:.0}%)",
-                    turns_compressed.len(),
-                    turns_retained.len(),
-                    compression_ratio * 100.0
-                )
-            }
-            DecisionType::MemoryRetrieval {
-                memories_selected,
-                total_candidates,
-            } => {
-                format!(
-                    "MemoryRetrieval ({}/{})",
-                    memories_selected.len(),
-                    total_candidates
-                )
-            }
-            DecisionType::StrategyChoice { strategy, .. } => {
-                format!("StrategyChoice: {}", strategy)
-            }
-            DecisionType::ModelRouting { selected_model, .. } => {
-                format!("ModelRouting → {}", selected_model)
-            }
-        };
-
-        eprintln!(
-            "  {} {} — {} confidence",
-            format!("[{}]", i + 1).dim(),
-            type_label.magenta(),
-            conf_color
-        );
-
-        // Inputs summary
-        if !decision.inputs.is_empty() {
-            let inputs_count = decision.inputs.len();
-            eprintln!("      {}: {} input(s)", "inputs".dim(), inputs_count);
-        }
-
-        // Reasoning preview
-        let reasoning_preview: String = decision.reasoning.chars().take(80).collect();
-        let suffix = if decision.reasoning.len() > 80 {
-            "…"
-        } else {
-            ""
-        };
-        eprintln!("      {}: {}{}", "reason".dim(), reasoning_preview, suffix);
-    }
-    eprintln!();
-}
-
 fn show_user_profile(
     hub: &std::sync::Arc<astra_runtime::observability::ObservabilityHub>,
     state: &SessionState,
@@ -515,10 +411,6 @@ fn show_help() {
     eprintln!(
         "  {}    Check focus drift analysis",
         "/telemetry drift".magenta()
-    );
-    eprintln!(
-        "  {}  List tool surface decisions",
-        "/telemetry decisions".magenta()
     );
     eprintln!(
         "  {}  Show user profile/preferences",

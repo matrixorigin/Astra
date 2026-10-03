@@ -948,7 +948,7 @@ pub(crate) struct SessionCaptureDownloadArgs {
 
 #[derive(Subcommand, Debug)]
 #[command(
-    after_help = "Examples:\n  astra self snapshot\n  astra self reflect\n  astra self profile 550e8400-e29b-41d4-a716-446655440000\n  astra self mutate preview --path verification.strictness --value 0.8\n  astra self mutate apply --session-id 550e8400-e29b-41d4-a716-446655440000 --path token_budget.max_turn_input_tokens --value 90000"
+    after_help = "Examples:\n  astra self snapshot\n  astra self reflect\n  astra self profile 550e8400-e29b-41d4-a716-446655440000\n  astra self mutate preview --path compression.compression_threshold --value 0.8\n  astra self mutate apply --session-id 550e8400-e29b-41d4-a716-446655440000 --path token_budget.max_turn_input_tokens --value 90000"
 )]
 pub(crate) enum SelfCmd {
     /// Full persistent self snapshot for a session
@@ -1022,7 +1022,7 @@ pub(crate) struct SelfMutateConfigArgs {
     /// Session id or unique prefix (defaults to the most recent resumable session)
     #[arg(long)]
     pub session_id: Option<String>,
-    /// Dotted RuntimeConfig path (for example: verification.strictness)
+    /// Dotted RuntimeConfig path (for example: compression.compression_threshold)
     #[arg(long)]
     pub path: String,
     /// New value as JSON (falls back to a raw string when not valid JSON)

@@ -277,14 +277,6 @@ impl SessionModelChoice {
     }
 }
 
-/// Adaptive engine state persisted between sessions.
-/// Holds anti-flap dampening, experiment enrollment, and tuned config so the
-/// adaptive engine doesn't oscillate or lose progress on session restart.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct PersistedAdaptiveState {
-    pub tuned_config_json: Option<String>,
-}
-
 // NOTE: SessionState is per-session and NOT shared across sessions. In future
 // server/multi-session mode, ensure each session gets its own SessionState
 // instance to prevent cross-session data leakage (permissions, history, tokens).
@@ -522,8 +514,8 @@ pub(crate) struct SessionState {
     pub observability_session: Option<
         std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     >,
-    /// Adaptive state restored from workspace, applied when ObservabilitySession is created.
-    pub pending_adaptive_state: Option<PersistedAdaptiveState>,
+    /// Validated explicit configuration awaiting an ObservabilitySession.
+    pub pending_runtime_config: Option<astra_config::RuntimeConfig>,
 
     // ── User Profile (M5) ──
     /// User profile manager for preferences and scenario detection.
@@ -705,7 +697,7 @@ impl Default for SessionState {
             // Observability: hub is created at REPL startup, session on first turn
             observability_hub: None,
             observability_session: None,
-            pending_adaptive_state: None,
+            pending_runtime_config: None,
             user_profile_manager: {
                 let store =
                     std::sync::Arc::new(astra_config::user_profile::UserProfileStore::new());
@@ -867,7 +859,7 @@ impl SessionState {
         self.latest_turn_quality_feedback = None;
         self.cloud_plan_mirror = None;
         self.observability_session = None;
-        self.pending_adaptive_state = None;
+        self.pending_runtime_config = None;
         self.csl_manager = None;
         self.perm_manager.clear_session_overrides();
         self.pending_bg_notifications.clear();
@@ -876,7 +868,7 @@ impl SessionState {
     /// Reset live state before restoring a different session into this REPL.
     ///
     /// Stronger than `reset_for_new_session()`: resume must also drop the
-    /// current session binding and any workspace-derived skill/adaptive state
+    /// current session binding and any workspace-derived skills and configuration
     /// so the next restore cannot inherit stale values from the previous
     /// session. Call `prepare_for_session_rebind().await` first so any
     /// root mailbox tied to the old session is unregistered before the

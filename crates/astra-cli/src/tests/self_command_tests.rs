@@ -45,14 +45,14 @@ fn cli_self_mutate_preview_parses() {
         "mutate",
         "preview",
         "--path",
-        "verification.strictness",
+        "compression.compression_threshold",
         "--value",
         "0.8",
     ])
     .unwrap();
     match cli.command {
         Some(Command::SelfInspect(SelfCmd::Mutate(SelfMutateCmd::Preview(args)))) => {
-            assert_eq!(args.path, "verification.strictness");
+            assert_eq!(args.path, "compression.compression_threshold");
             assert_eq!(args.value, "0.8");
         }
         _ => panic!("expected self mutate preview"),

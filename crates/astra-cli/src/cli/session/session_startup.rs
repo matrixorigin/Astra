@@ -44,36 +44,19 @@ pub(crate) fn steer_observability_goal(
     None
 }
 
-/// Apply persisted adaptive engine state to a newly created ObservabilitySession.
-/// Called when pending_adaptive_state was stashed during workspace restore and the
-/// ObservabilitySession is now available to receive it.
-pub(crate) fn apply_pending_adaptive_state(state: &mut SessionState) {
-    let adaptive = match state.pending_adaptive_state.take() {
-        Some(a) => a,
-        None => return,
+/// Install the configuration validated at the workspace restore boundary.
+pub(crate) fn apply_pending_runtime_config(state: &mut SessionState) {
+    let Some(obs) = &state.observability_session else {
+        return;
     };
-    let obs = match &state.observability_session {
-        Some(o) => o,
-        None => {
-            state.pending_adaptive_state = Some(adaptive);
-            return;
-        }
+    let Ok(mut guard) = obs.write() else {
+        return;
     };
-    let mut guard = match obs.write() {
-        Ok(guard) => guard,
-        Err(_) => {
-            state.pending_adaptive_state = Some(adaptive);
-            return;
-        }
+    let Some(saved) = state.pending_runtime_config.take() else {
+        return;
     };
-    if let Some(json) = &adaptive.tuned_config_json {
-        if let Ok(saved_config) =
-            serde_json::from_str::<astra_config::runtime_config::RuntimeConfig>(json)
-        {
-            let current = std::mem::take(&mut guard.config);
-            guard.config = current.merge(saved_config);
-        }
-    }
+    let current = std::mem::take(&mut guard.config);
+    guard.config = current.merge(saved);
 }
 
 pub(crate) fn initialize_journal_pub(state: &mut SessionState, session_id: &str) {
@@ -273,7 +256,7 @@ fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
                 astra_runtime::observability::ObservabilitySession::new_simple(session_id),
             ))
         });
-        apply_pending_adaptive_state(state);
+        apply_pending_runtime_config(state);
     }
 }
 
@@ -789,7 +772,7 @@ pub(crate) async fn complete_session_startup(
 #[cfg(test)]
 mod tests {
     use super::{
-        CliSessionMemoryMemoriaPort, apply_pending_adaptive_state, build_cli_session_memory_port,
+        CliSessionMemoryMemoriaPort, apply_pending_runtime_config, build_cli_session_memory_port,
         initialize_journal, prune_stale_pending_recovery,
     };
     use crate::cli::session::session_state::SessionState;
@@ -1156,17 +1139,56 @@ mod tests {
     }
 
     #[test]
-    fn apply_pending_adaptive_state_requeues_when_lock_is_poisoned() {
+    fn restored_configuration_waits_for_observability_then_applies_once() {
+        let mut config = astra_config::RuntimeConfig::default();
+        config.memory.retrieval_top_k = 7;
+        let mut state = SessionState {
+            pending_runtime_config: Some(config),
+            ..Default::default()
+        };
+        apply_pending_runtime_config(&mut state);
+        assert!(state.pending_runtime_config.is_some());
+        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability::ObservabilitySession::new_simple("config-restore"),
+        )));
+        apply_pending_runtime_config(&mut state);
+        assert!(state.pending_runtime_config.is_none());
+        assert_eq!(
+            state
+                .observability_session
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap()
+                .config
+                .memory
+                .retrieval_top_k,
+            7
+        );
+        apply_pending_runtime_config(&mut state);
+        assert_eq!(
+            state
+                .observability_session
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap()
+                .config
+                .memory
+                .retrieval_top_k,
+            7
+        );
+    }
+
+    #[test]
+    fn apply_pending_runtime_config_requeues_when_lock_is_poisoned() {
         let mut state = SessionState::default();
-        state.pending_adaptive_state =
-            Some(crate::cli::session::session_state::PersistedAdaptiveState {
-                tuned_config_json: None,
-            });
+        state.pending_runtime_config = Some(astra_config::RuntimeConfig::default());
         state.observability_session = Some(poisoned_observability_session("sid-adaptive"));
 
-        apply_pending_adaptive_state(&mut state);
+        apply_pending_runtime_config(&mut state);
 
-        assert!(state.pending_adaptive_state.is_some());
+        assert!(state.pending_runtime_config.is_some());
     }
 
     #[test]

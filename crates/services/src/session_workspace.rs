@@ -362,13 +362,7 @@ pub struct WorkspaceMetadata {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deprioritized_tools: Vec<String>,
 
-    // ─── Adaptive engine state (for resume without oscillation) ───
-    /// Active A/B experiment ID (if enrolled in an experiment).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_experiment_id: Option<String>,
-    /// Active A/B experiment variant (if enrolled).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_variant: Option<String>,
+    // ─── Explicit runtime configuration (for resume) ───
     /// RuntimeConfig override snapshot (JSON) persisted for local resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tuned_config_json: Option<String>,
@@ -495,8 +489,6 @@ impl WorkspaceMetadata {
             discovered_skills: Vec::new(),
             pinned_tools: Vec::new(),
             deprioritized_tools: Vec::new(),
-            active_experiment_id: None,
-            active_variant: None,
             tuned_config_json: None,
             projection_revision: 0,
             config_mutation_revision: 0,
@@ -540,8 +532,6 @@ impl WorkspaceMetadata {
             discovered_skills: Vec::new(),
             pinned_tools: Vec::new(),
             deprioritized_tools: Vec::new(),
-            active_experiment_id: None,
-            active_variant: None,
             tuned_config_json: None,
             projection_revision: 0,
             config_mutation_revision: 0,
@@ -2016,18 +2006,14 @@ mod tests {
     }
 
     #[test]
-    fn workspace_adaptive_state_round_trip() {
+    fn workspace_tuned_config_round_trip() {
         let mut ws =
             WorkspaceMetadata::with_context("adapt-sess", "gpt-4", "/tmp", Some("feature-x"));
-        ws.active_experiment_id = Some("exp-001".to_string());
-        ws.active_variant = Some("treatment-a".to_string());
         ws.tuned_config_json = Some(r#"{"max_tokens":4096}"#.to_string());
 
         let yaml = serde_yaml_ng::to_string(&ws).unwrap();
         let parsed: WorkspaceMetadata = serde_yaml_ng::from_str(&yaml).unwrap();
 
-        assert_eq!(parsed.active_experiment_id.as_deref(), Some("exp-001"));
-        assert_eq!(parsed.active_variant.as_deref(), Some("treatment-a"));
         assert_eq!(
             parsed.tuned_config_json.as_deref(),
             Some(r#"{"max_tokens":4096}"#)
@@ -2035,24 +2021,17 @@ mod tests {
     }
 
     #[test]
-    fn workspace_adaptive_state_defaults_on_missing_fields() {
-        // YAML from older versions without adaptive fields should deserialize cleanly
+    fn workspace_tuned_config_defaults_on_missing_fields() {
+        // A session without an explicit override uses the configured defaults.
         let yaml = "session_id: s\ncwd: /tmp\nmodel: m\ncreated_at: '2025-01-01T00:00:00Z'\nupdated_at: '2025-01-01T00:00:00Z'\nturn_count: 5\ntotal_tokens_in: 100\ntotal_tokens_out: 50\nstatus: active\nprojection_revision: 0\nconfig_mutation_revision: 0\n";
         let ws: WorkspaceMetadata = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(ws.active_experiment_id, None);
-        assert_eq!(ws.active_variant, None);
         assert_eq!(ws.tuned_config_json, None);
     }
 
     #[test]
-    fn workspace_adaptive_state_omitted_when_default() {
+    fn workspace_tuned_config_omitted_when_default() {
         let ws = WorkspaceMetadata::with_context("s", "m", "/tmp", None);
         let yaml = serde_yaml_ng::to_string(&ws).unwrap();
-        assert!(
-            !yaml.contains("active_experiment_id"),
-            "should omit None fields"
-        );
-        assert!(!yaml.contains("active_variant"), "should omit None fields");
         assert!(
             !yaml.contains("tuned_config_json"),
             "should omit None fields"

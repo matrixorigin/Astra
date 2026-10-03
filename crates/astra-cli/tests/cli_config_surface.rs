@@ -141,10 +141,7 @@ fn catalog_includes_knobs_that_motivated_this_refactor() {
         "token_budget.max_turn_input_tokens",
         "token_budget.system_prompt_reserve",
         "token_budget.tools_reserve",
-        "context_window.adaptive",
         "trace.llm_exchanges",
-        "context_window.compression_threshold_min",
-        "context_window.compression_threshold_max",
         "compression.compression_threshold",
         "compression.preserve_recent_turns",
         "memory.retrieval_top_k",
@@ -188,12 +185,12 @@ fn fractional_threshold_knobs_accept_decimal_edits() {
     let config = RuntimeConfig::default();
     let updated = apply_edit(
         config,
-        "context_window.compression_threshold_min",
+        "compression.compression_threshold",
         serde_json::json!(0.85),
     )
     .expect("fractional threshold edit must succeed");
 
-    assert!((updated.context_window.compression_threshold_min - 0.85).abs() < f64::EPSILON);
+    assert!((updated.compression.compression_threshold - 0.85).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -209,23 +206,6 @@ fn apply_edit_rejects_fractional_threshold_outside_range() {
     assert!(
         err.to_string().to_lowercase().contains("range"),
         "range violation should be explicit: {err}"
-    );
-}
-
-#[test]
-fn apply_edit_rejects_compression_threshold_min_above_max() {
-    let config = RuntimeConfig::default();
-    let err = apply_edit(
-        config,
-        "context_window.compression_threshold_min",
-        serde_json::json!(0.99),
-    )
-    .expect_err("min threshold must not exceed max threshold");
-
-    assert!(
-        err.to_string().to_lowercase().contains("min")
-            && err.to_string().to_lowercase().contains("max"),
-        "cross-field invariant should be clear: {err}"
     );
 }
 
@@ -345,5 +325,49 @@ fn every_catalog_item_is_editable_via_apply_edit() {
                 id = item.id
             )
         });
+    }
+}
+
+#[test]
+fn retired_controls_are_absent_and_rejected_at_configuration_entrypoints() {
+    let config = RuntimeConfig::default();
+    let serialized = serde_json::to_value(&config).unwrap();
+    let catalog = build_settings_catalog(&config);
+    for section in ["verification", "memory_pressure", "context_window"] {
+        assert!(serialized.get(section).is_none());
+        assert!(
+            !catalog
+                .iter()
+                .any(|item| item.id.starts_with(&format!("{section}.")))
+        );
+        let overlay = serde_json::json!({section: {}}).to_string();
+        assert!(
+            apply_settings_json(config.clone(), &overlay)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field")
+        );
+    }
+    for path in [
+        "verification.strictness",
+        "memory_pressure.adaptive",
+        "context_window.compression_threshold_min",
+    ] {
+        assert!(apply_edit(config.clone(), path, serde_json::json!(0.8)).is_err());
+        let mut candidate = config.clone();
+        let before = serde_json::to_value(&candidate).unwrap();
+        let error = astra_config::apply_governed_config_mutation(
+            &mut candidate,
+            path,
+            &serde_json::json!(0.8),
+            true,
+            0.3,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            astra_config::GovernedConfigMutationError::UnsupportedPath { .. }
+        ));
+        assert_eq!(serde_json::to_value(&candidate).unwrap(), before);
     }
 }

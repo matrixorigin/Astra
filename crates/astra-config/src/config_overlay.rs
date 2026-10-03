@@ -83,8 +83,7 @@ pub fn parse_settings_source(raw: &str) -> Result<String, OverlayError> {
 }
 
 /// Apply a JSON overlay onto `base`. The JSON is deserialized as a
-/// [`RuntimeConfig`] (every field defaults — see the 91 `#[serde(default)]`
-/// attributes in `runtime_config.rs`), then merged via
+/// [`RuntimeConfig`] (omitted fields default; unknown top-level fields are rejected), then merged via
 /// `RuntimeConfig::merge` which only copies non-default fields. Net
 /// effect: anything the operator omitted stays as-is; anything they set
 /// wins. The one caveat — setting a field *to its default* looks like
@@ -193,39 +192,6 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
                 allow_fraction: false,
             },
             value: Value::from(config.token_budget.tools_reserve),
-        },
-        // ── Context window / adaptive ──
-        SettingItem {
-            id: "context_window.adaptive".to_string(),
-            label: "Adaptive context-window tuning".to_string(),
-            kind: SettingKind::Bool,
-            value: Value::from(config.context_window.adaptive),
-        },
-        SettingItem {
-            id: "context_window.dynamic_compression".to_string(),
-            label: "Dynamic compression threshold".to_string(),
-            kind: SettingKind::Bool,
-            value: Value::from(config.context_window.dynamic_compression),
-        },
-        SettingItem {
-            id: "context_window.compression_threshold_min".to_string(),
-            label: "Compression threshold (min)".to_string(),
-            kind: SettingKind::Number {
-                min: 0.0,
-                max: 1.0,
-                allow_fraction: true,
-            },
-            value: Value::from(config.context_window.compression_threshold_min),
-        },
-        SettingItem {
-            id: "context_window.compression_threshold_max".to_string(),
-            label: "Compression threshold (max)".to_string(),
-            kind: SettingKind::Number {
-                min: 0.0,
-                max: 1.0,
-                allow_fraction: true,
-            },
-            value: Value::from(config.context_window.compression_threshold_max),
         },
         // ── Compression pipeline ──
         SettingItem {
@@ -458,14 +424,6 @@ pub fn apply_edit(
         }
         Ok(())
     }
-    fn ensure_threshold_order(min: f64, max: f64) -> Result<(), OverlayError> {
-        if min > max {
-            return Err(OverlayError::InvalidInvariant(format!(
-                "context_window.compression_threshold_min ({min}) must be <= context_window.compression_threshold_max ({max})"
-            )));
-        }
-        Ok(())
-    }
     fn describe(v: &Value) -> String {
         match v {
             Value::Null => "null".into(),
@@ -496,24 +454,6 @@ pub fn apply_edit(
             let n = as_u32(&new_value, id)?;
             ensure_range(n as f64, 1_000.0, 64_000.0, id)?;
             config.token_budget.tools_reserve = n;
-        }
-        "context_window.adaptive" => {
-            config.context_window.adaptive = as_bool(&new_value, id)?;
-        }
-        "context_window.dynamic_compression" => {
-            config.context_window.dynamic_compression = as_bool(&new_value, id)?;
-        }
-        "context_window.compression_threshold_min" => {
-            let n = as_f64(&new_value, id)?;
-            ensure_range(n, 0.0, 1.0, id)?;
-            ensure_threshold_order(n, config.context_window.compression_threshold_max)?;
-            config.context_window.compression_threshold_min = n;
-        }
-        "context_window.compression_threshold_max" => {
-            let n = as_f64(&new_value, id)?;
-            ensure_range(n, 0.0, 1.0, id)?;
-            ensure_threshold_order(config.context_window.compression_threshold_min, n)?;
-            config.context_window.compression_threshold_max = n;
         }
         "compression.compression_threshold" => {
             let n = as_f64(&new_value, id)?;

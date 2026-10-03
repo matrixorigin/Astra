@@ -1604,25 +1604,9 @@ pub(crate) fn verify_runtime_config(tuned_config_json: Option<&str>) -> Vec<Chec
 
     let invariant_validation = astra_config::governed_config_invariant_validation(&config);
     checks.push(CheckResult {
-        name: "verification_bounds".to_string(),
-        ok: invariant_validation.verification_bounds,
-        detail: format!(
-            "min={} strictness={} max={}",
-            config.verification.min_strictness,
-            config.verification.strictness,
-            config.verification.max_strictness
-        ),
-    });
-
-    checks.push(CheckResult {
         name: "compression_bounds".to_string(),
         ok: invariant_validation.compression_bounds,
-        detail: format!(
-            "compression={} window=[{}, {}]",
-            config.compression.compression_threshold,
-            config.context_window.compression_threshold_min,
-            config.context_window.compression_threshold_max
-        ),
+        detail: format!("compression={}", config.compression.compression_threshold,),
     });
 
     let available_tools = cli_provider_visible_tool_names().len();
@@ -2300,14 +2284,13 @@ mod tests {
 
     #[test]
     fn verify_runtime_config_flags_invalid_bounds() {
-        let checks = verify_runtime_config(Some(
-            r#"{"verification":{"strictness":0.2,"min_strictness":0.6,"max_strictness":0.9}}"#,
-        ));
+        let checks =
+            verify_runtime_config(Some(r#"{"compression":{"compression_threshold":1.2}}"#));
 
         assert!(
             checks
                 .iter()
-                .any(|check| { check.name == "verification_bounds" && !check.ok })
+                .any(|check| { check.name == "compression_bounds" && !check.ok })
         );
     }
 
@@ -2346,7 +2329,6 @@ mod tests {
         let session_id = "self-snapshot-session";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
         ws.discovered_skills = vec!["goal-driven-evolution".to_string()];
-        ws.active_experiment_id = Some("exp-42".to_string());
         ws.last_context_trace = Some(ContextTraceSignal {
             turn_id: "turn-7".to_string(),
             captured_at: Some(Utc::now().to_rfc3339()),

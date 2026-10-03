@@ -99,8 +99,6 @@ pub struct EnvironmentSurface {
     pub tool_names: Vec<String>,
     pub health_avoidance_tools: Vec<String>,
     pub discovered_skills: Vec<String>,
-    pub active_experiment_id: Option<String>,
-    pub active_variant: Option<String>,
     pub tuned_config_present: bool,
     pub last_context_trace_preview: Option<String>,
 }
@@ -148,8 +146,6 @@ pub struct DecisionRecord {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EvolutionSurface {
-    pub active_experiment_id: Option<String>,
-    pub active_variant: Option<String>,
     pub records: Vec<EvolutionRecord>,
 }
 
@@ -244,8 +240,6 @@ pub struct TraceSurface {
 pub struct BudgetConfig {
     pub compression_threshold: f64,
     pub max_turn_input_tokens: u32,
-    pub compression_threshold_min: f64,
-    pub compression_threshold_max: f64,
 }
 
 impl Default for BudgetConfig {
@@ -253,8 +247,6 @@ impl Default for BudgetConfig {
         Self {
             compression_threshold: 0.0,
             max_turn_input_tokens: 0,
-            compression_threshold_min: 0.0,
-            compression_threshold_max: 0.0,
         }
     }
 }
@@ -266,8 +258,6 @@ pub struct BudgetSurface {
     pub budget: Option<BudgetState>,
     pub compression_threshold: f64,
     pub max_turn_input_tokens: u32,
-    pub compression_threshold_min: f64,
-    pub compression_threshold_max: f64,
     pub risk_flags: Vec<String>,
 }
 
@@ -641,8 +631,6 @@ fn build_environment_surface(
         tool_names,
         health_avoidance_tools: merged_health_avoidance_tools(artifacts),
         discovered_skills: merged_skills(workspace),
-        active_experiment_id: workspace.and_then(|ws| ws.active_experiment_id.clone()),
-        active_variant: workspace.and_then(|ws| ws.active_variant.clone()),
         tuned_config_present: workspace
             .and_then(|ws| ws.tuned_config_json.as_ref())
             .is_some(),
@@ -876,8 +864,6 @@ fn build_budget_surface(
         budget: snapshot.run.budget.clone(),
         compression_threshold: budget_config.compression_threshold,
         max_turn_input_tokens: budget_config.max_turn_input_tokens,
-        compression_threshold_min: budget_config.compression_threshold_min,
-        compression_threshold_max: budget_config.compression_threshold_max,
         risk_flags: snapshot.run.risk_flags.clone(),
     })
 }
@@ -1235,17 +1221,7 @@ fn build_evolution_surface(artifacts: &SessionArtifacts, journal_limit: usize) -
         .take(journal_limit)
         .collect();
 
-    EvolutionSurface {
-        active_experiment_id: artifacts
-            .workspace
-            .as_ref()
-            .and_then(|ws| ws.active_experiment_id.clone()),
-        active_variant: artifacts
-            .workspace
-            .as_ref()
-            .and_then(|ws| ws.active_variant.clone()),
-        records,
-    }
+    EvolutionSurface { records }
 }
 
 fn evolution_record_from_event(event: &JournalEvent) -> Option<EvolutionRecord> {
@@ -1948,8 +1924,6 @@ mod tests {
             Ok(BudgetConfig {
                 compression_threshold: 0.7,
                 max_turn_input_tokens: 120000,
-                compression_threshold_min: 0.5,
-                compression_threshold_max: 0.9,
             })
         }
 

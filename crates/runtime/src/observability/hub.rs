@@ -108,7 +108,6 @@ impl ObservabilityHub {
             turns: session.turn_number,
             detected_scenario: session.profile.current_scenario,
             context_traces: session.context_traces.len() as u32,
-            decisions_explained: session.decision_explanations.len() as u32,
             fuzzy_match_events: session.fuzzy_match_events.len() as u32,
         })
     }
@@ -239,7 +238,6 @@ pub struct SessionSummary {
     pub turns: u32,
     pub detected_scenario: Option<Scenario>,
     pub context_traces: u32,
-    pub decisions_explained: u32,
     pub fuzzy_match_events: u32,
 }
 

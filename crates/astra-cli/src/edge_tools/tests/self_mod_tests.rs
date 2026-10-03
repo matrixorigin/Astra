@@ -75,9 +75,14 @@ async fn adjust_config_respects_drift_ceiling_without_force() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn adjust_config_rejects_strictness_above_effective_maximum() {
+async fn adjust_config_rejects_retired_verification_control() {
     let (_tmp, _guard, exe, session, session_id) = executor_with_persisted_session();
-    let baseline = session.read().unwrap().config.verification.strictness;
+    let baseline = session
+        .read()
+        .unwrap()
+        .config
+        .compression
+        .compression_threshold;
 
     let rejected: Value = serde_json::from_str(
         &exe.execute(
@@ -91,10 +96,14 @@ async fn adjust_config_rejects_strictness_above_effective_maximum() {
         .await,
     )
     .unwrap();
-    assert_eq!(rejected["error"], "invalid_runtime_config");
-    assert_eq!(rejected["invariant"], "verification_bounds");
+    assert_eq!(rejected["error"], "Unsupported config path");
     assert_eq!(
-        session.read().unwrap().config.verification.strictness,
+        session
+            .read()
+            .unwrap()
+            .config
+            .compression
+            .compression_threshold,
         baseline
     );
     assert_eq!(

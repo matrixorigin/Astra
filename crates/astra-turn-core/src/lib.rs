@@ -123,7 +123,6 @@ pub mod turn_trace_collector;
 pub mod view;
 
 // Re-exports: old flat module names → new directory paths
-pub mod decision_explainer;
 pub mod delegation_tree;
 pub mod llm_request_dump;
 

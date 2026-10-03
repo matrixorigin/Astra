@@ -565,3 +565,9 @@ debug_bundle_created_total
 debug_bundle_access_total
 debug_bundle_expired_total
 ```
+
+The retired process-local decision-explainer recorder had no production writer;
+its empty `/telemetry decisions` view and counters are removed. Context assembly
+explanations, provider decisions, durable journal evidence and Explain Analyze
+remain with their existing producers and readers. Retiring unused adaptive/drift
+journal construction helpers does not remove decoding of durable event records.

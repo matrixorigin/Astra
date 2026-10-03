@@ -1463,8 +1463,8 @@ pub(crate) fn initialize_session_state(
             .clone()
             .unwrap_or_else(|| "anonymous".to_string());
         state.observability_session = Some(hub.start_session(&user_id, "pending"));
-        // Apply any adaptive state stashed during workspace restore.
-        super::session_startup::apply_pending_adaptive_state(&mut state);
+        // Apply the explicit configuration stashed during workspace restore.
+        super::session_startup::apply_pending_runtime_config(&mut state);
     }
 
     state

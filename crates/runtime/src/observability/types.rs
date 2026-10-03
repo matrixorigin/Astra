@@ -13,7 +13,6 @@ use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
 use astra_core::feedback::FeedbackSignal;
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
-use astra_turn_core::decision_explainer::DecisionExplanation;
 
 pub struct ObservabilitySession {
     /// User ID for this session.
@@ -33,9 +32,6 @@ pub struct ObservabilitySession {
 
     /// Context assembly traces for this session.
     pub context_traces: Vec<ContextAssemblyTrace>,
-
-    /// Decision explanations for this session.
-    pub decision_explanations: Vec<DecisionExplanation>,
 
     /// Drift detector state.
 

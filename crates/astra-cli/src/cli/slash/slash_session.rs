@@ -27,7 +27,7 @@ use crate::cli::{
         preflight_remote_resume_session,
     },
     session::session_state::SessionState,
-    session::{session_continuation, session_projection, session_startup, session_state},
+    session::{session_continuation, session_projection, session_startup},
     stream::stream_render,
     theme,
 };
@@ -3496,10 +3496,6 @@ fn handle_session_adaptive(_arg: &str, state: &SessionState) {
                 guard.config.memory.retrieval_top_k
             );
             eprintln!(
-                "      verification.strictness             = {:.3}",
-                guard.config.verification.strictness
-            );
-            eprintln!(
                 "      compression.compression_threshold   = {:.3}",
                 guard.config.compression.compression_threshold
             );
@@ -4850,34 +4846,43 @@ struct PreparedWorkspaceRestore {
     workspace: Option<session_workspace::WorkspaceMetadata>,
     session_persistence_error: Option<String>,
     discovered_skills: std::collections::HashSet<String>,
-    pending_adaptive_state: Option<session_state::PersistedAdaptiveState>,
+    pending_runtime_config: Option<astra_config::RuntimeConfig>,
 }
 
 fn prepared_workspace_restore_from_workspace(
     ws: session_workspace::WorkspaceMetadata,
-) -> PreparedWorkspaceRestore {
-    let pending_adaptive_state =
-        ws.tuned_config_json
-            .as_ref()
-            .map(|json| session_state::PersistedAdaptiveState {
-                tuned_config_json: Some(json.clone()),
-            });
-    PreparedWorkspaceRestore {
+) -> Result<PreparedWorkspaceRestore, String> {
+    let pending_runtime_config = ws
+        .tuned_config_json
+        .as_deref()
+        .map(|json| {
+            let saved: astra_config::RuntimeConfig = serde_json::from_str(json)
+                .map_err(|error| format!("saved runtime configuration is invalid: {error}"))?;
+            astra_config::validate_governed_config_candidate(&saved).map_err(|error| {
+                format!(
+                    "saved runtime configuration is invalid: {}",
+                    error.to_json()
+                )
+            })?;
+            Ok::<_, String>(saved)
+        })
+        .transpose()?;
+    Ok(PreparedWorkspaceRestore {
         session_persistence_error: ws.last_persistence_error.clone(),
         discovered_skills: ws.discovered_skills.iter().cloned().collect(),
-        pending_adaptive_state,
+        pending_runtime_config,
         workspace: Some(ws),
-    }
+    })
 }
 
 fn load_prepared_workspace_restore(
     restored: &RestoredSession,
 ) -> Result<PreparedWorkspaceRestore, String> {
     if let Some(workspace) = restored.workspace.clone() {
-        return Ok(prepared_workspace_restore_from_workspace(workspace));
+        return prepared_workspace_restore_from_workspace(workspace);
     }
     match session_workspace::read_workspace(&restored.session_id) {
-        Ok(ws) => Ok(prepared_workspace_restore_from_workspace(ws)),
+        Ok(ws) => prepared_workspace_restore_from_workspace(ws),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Ok(PreparedWorkspaceRestore::default())
         }
@@ -4901,7 +4906,7 @@ fn load_prepared_workspace_restore(
             workspace.last_persistence_error = Some(format!(
                 "workspace metadata unreadable during resume; rebuilt from journal/checkpoint ({e})"
             ));
-            Ok(prepared_workspace_restore_from_workspace(workspace))
+            prepared_workspace_restore_from_workspace(workspace)
         }
         Err(e) => Err(format!(
             "read workspace state for session {}: {e}",
@@ -4913,8 +4918,8 @@ fn load_prepared_workspace_restore(
 fn apply_prepared_workspace_restore(state: &mut SessionState, prepared: &PreparedWorkspaceRestore) {
     state.session_persistence_error = prepared.session_persistence_error.clone();
     state.discovered_skills = prepared.discovered_skills.clone();
-    state.pending_adaptive_state = prepared.pending_adaptive_state.clone();
-    session_startup::apply_pending_adaptive_state(state);
+    state.pending_runtime_config = prepared.pending_runtime_config.clone();
+    session_startup::apply_pending_runtime_config(state);
 }
 
 fn persist_resumed_workspace_metadata(
@@ -6927,6 +6932,63 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn resume_rejects_invalid_configuration_without_rebinding_or_rewriting_workspace() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        for invalid in [
+            r#"{"verification":{"strictness":0.8}}"#,
+            r#"{"compression":{"compression_threshold":1.1}}"#,
+        ] {
+            let session_id = format!("resume-invalid-config-{}", uuid::Uuid::new_v4());
+            write_local_resumable_session(&session_id, 2);
+            session_workspace::update_existing_workspace_config(
+                &session_id,
+                |workspace| {
+                    workspace.tuned_config_json = Some(invalid.into());
+                    Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue(()))
+                },
+                |_, _, _| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(
+                session_workspace::read_workspace(&session_id)
+                    .unwrap()
+                    .tuned_config_json
+                    .as_deref(),
+                Some(invalid)
+            );
+            let mut state = SessionState {
+                session_id: Some("current-session".into()),
+                turn: 7,
+                history: vec![("current query".into(), "current answer".into())],
+                ..Default::default()
+            };
+            let error = switch_session_into_state(&session_id, None, &api, &mut state)
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("saved runtime configuration is invalid"),
+                "{error}"
+            );
+            assert_eq!(state.session_id.as_deref(), Some("current-session"));
+            assert_eq!(state.turn, 7);
+            assert_eq!(
+                state.history,
+                vec![("current query".to_string(), "current answer".to_string())]
+            );
+            assert_eq!(
+                session_workspace::read_workspace(&session_id)
+                    .unwrap()
+                    .tuned_config_json
+                    .as_deref(),
+                Some(invalid)
+            );
+            assert!(state.pending_runtime_config.is_none());
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn apply_restored_session_ignores_corrupt_checkpoint_when_journal_is_recoverable() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-bad-step-{}", uuid::Uuid::new_v4());
@@ -7578,7 +7640,7 @@ mod resume_tests {
             state.session_persistence_error.as_deref(),
             Some("failed to append turn event")
         );
-        assert!(state.pending_adaptive_state.is_none());
+        assert!(state.pending_runtime_config.is_none());
         assert!(
             state.journal.is_some(),
             "switch should initialize a journal"

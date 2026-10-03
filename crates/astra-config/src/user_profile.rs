@@ -33,9 +33,6 @@ pub struct UserProfile {
     /// Scenario selected from the latest accepted typed turn intent.
     pub current_scenario: Option<Scenario>,
 
-    /// Active A/B experiments for this user.
-    pub active_experiments: Vec<String>,
-
     /// Profile creation time.
     pub created_at: SystemTime,
 
@@ -54,7 +51,6 @@ impl UserProfile {
             user_id: user_id.into(),
             preferences: UserPreferences::default(),
             current_scenario: None,
-            active_experiments: Vec::new(),
             created_at: now,
             updated_at: now,
             stats: UserStats::default(),
@@ -86,21 +82,6 @@ impl UserProfile {
             self.current_scenario = None;
             self.touch();
         }
-    }
-
-    /// Enroll in an A/B experiment.
-    pub fn enroll_experiment(&mut self, experiment_id: impl Into<String>) {
-        let id = experiment_id.into();
-        if !self.active_experiments.contains(&id) {
-            self.active_experiments.push(id);
-            self.touch();
-        }
-    }
-
-    /// Leave an A/B experiment.
-    pub fn leave_experiment(&mut self, experiment_id: &str) {
-        self.active_experiments.retain(|id| id != experiment_id);
-        self.touch();
     }
 }
 
@@ -686,70 +667,60 @@ impl Scenario {
                 prefer_read_only: true,
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(7),
-                verification_strictness: Some(0.7),
             },
             Scenario::Debugging => ScenarioStrategy {
                 max_tools_per_turn: 100,
                 prefer_read_only: false,
                 detail_level: Verbosity::Debug,
                 memory_top_k: Some(8),
-                verification_strictness: None,
             },
             Scenario::Exploration => ScenarioStrategy {
                 max_tools_per_turn: 100,
                 prefer_read_only: true,
                 detail_level: Verbosity::Normal,
                 memory_top_k: Some(10),
-                verification_strictness: None,
             },
             Scenario::Planning => ScenarioStrategy {
                 max_tools_per_turn: 60,
                 prefer_read_only: true,
                 detail_level: Verbosity::Verbose,
                 memory_top_k: None,
-                verification_strictness: None,
             },
             Scenario::Implementation => ScenarioStrategy {
                 max_tools_per_turn: 100,
                 prefer_read_only: false,
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
-                verification_strictness: Some(0.6),
             },
             Scenario::Refactoring => ScenarioStrategy {
                 max_tools_per_turn: 100,
                 prefer_read_only: false,
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(7),
-                verification_strictness: Some(0.65),
             },
             Scenario::Testing => ScenarioStrategy {
                 max_tools_per_turn: 100,
                 prefer_read_only: false,
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
-                verification_strictness: Some(0.55),
             },
             Scenario::Documentation => ScenarioStrategy {
                 max_tools_per_turn: 60,
                 prefer_read_only: false,
                 detail_level: Verbosity::Verbose,
                 memory_top_k: None,
-                verification_strictness: None,
             },
             Scenario::DevOps => ScenarioStrategy {
                 max_tools_per_turn: 80,
                 prefer_read_only: false,
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
-                verification_strictness: Some(0.6),
             },
             Scenario::Learning => ScenarioStrategy {
                 max_tools_per_turn: 80,
                 prefer_read_only: true,
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(10),
-                verification_strictness: None,
             },
             // QuickAnswer is intentionally the tightest profile in the set.
             // The execution cap keeps short factual questions from drifting into
@@ -759,14 +730,12 @@ impl Scenario {
                 prefer_read_only: true,
                 detail_level: Verbosity::Normal,
                 memory_top_k: Some(5),
-                verification_strictness: None,
             },
             Scenario::BenchmarkComparison => ScenarioStrategy {
                 max_tools_per_turn: 80,
                 prefer_read_only: true,
                 detail_level: Verbosity::Verbose,
                 memory_top_k: None,
-                verification_strictness: Some(0.6),
             },
         }
     }
@@ -780,8 +749,6 @@ pub struct ScenarioStrategy {
     pub detail_level: Verbosity,
     /// Suggested memory retrieval top-k override (None = use default).
     pub memory_top_k: Option<u32>,
-    /// Suggested verification strictness override (None = use default).
-    pub verification_strictness: Option<f64>,
 }
 
 // ─── User Stats ─────────────────────────────────────────────────────────────
@@ -992,21 +959,6 @@ mod tests {
         let profile = UserProfile::new("user123");
         assert_eq!(profile.user_id, "user123");
         assert!(profile.current_scenario.is_none());
-        assert!(profile.active_experiments.is_empty());
-    }
-
-    #[test]
-    fn test_experiment_enrollment() {
-        let mut profile = UserProfile::new("user123");
-        profile.enroll_experiment("exp-001");
-        profile.enroll_experiment("exp-002");
-        profile.enroll_experiment("exp-001"); // Duplicate
-
-        assert_eq!(profile.active_experiments.len(), 2);
-
-        profile.leave_experiment("exp-001");
-        assert_eq!(profile.active_experiments.len(), 1);
-        assert_eq!(profile.active_experiments[0], "exp-002");
     }
 
     #[test]
@@ -1160,12 +1112,12 @@ mod tests {
         let profile1 = store.get_or_create("user1");
         assert_eq!(profile1.user_id, "user1");
 
-        let mut modified = profile1.clone();
-        modified.enroll_experiment("exp1");
+        let mut modified = profile1;
+        modified.stats.record_tool_use("read_file");
         store.update(modified);
 
         let retrieved = store.get("user1").unwrap();
-        assert_eq!(retrieved.active_experiments.len(), 1);
+        assert_eq!(retrieved.stats.tool_usage.get("read_file"), Some(&1));
     }
 
     #[test]

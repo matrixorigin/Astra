@@ -13,7 +13,6 @@ use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
 use astra_core::feedback::FeedbackSignal;
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
-use astra_turn_core::decision_explainer::DecisionExplanation;
 
 use super::types::*;
 
@@ -82,7 +81,6 @@ impl ObservabilitySession {
             profile,
             config,
             context_traces: Vec::new(),
-            decision_explanations: Vec::new(),
 
             recent_queries: Vec::new(),
             compressed_turns: Vec::new(),
@@ -118,7 +116,6 @@ impl ObservabilitySession {
             profile: UserProfile::new("anonymous"),
             config: RuntimeConfig::load(),
             context_traces: Vec::new(),
-            decision_explanations: Vec::new(),
 
             recent_queries: Vec::new(),
             compressed_turns: Vec::new(),
@@ -345,11 +342,6 @@ impl ObservabilitySession {
             self.context_traces.drain(..1);
         }
         self.context_traces.push(trace);
-    }
-
-    /// Record a decision explanation.
-    pub fn record_decision(&mut self, explanation: DecisionExplanation) {
-        self.decision_explanations.push(explanation);
     }
 
     /// Record turn timing.
