@@ -78,8 +78,10 @@ astra team run delivery <task>
 
 In the TUI, use `/team run delivery <task>`;
 configuration remains in the CLI. Subsequent ordinary input retains that selection. Canonical turn commit atomically
-retains the admitted Team/lead selection as intent for the next root. Resume
-returns it only at the matching canonical cursor; a new root reauthorizes the
+retains the admitted Team/lead selection as intent for the next root.
+Authenticated CLI resume reads the Server-owned generation even when a local
+replica exists; local-only restore is reserved for an unauthenticated session.
+Resume returns it only at the matching canonical cursor; a new root reauthorizes the
 current owner-scoped configuration. Switching or clearing a session drops the
 previous selection, while an explicit Team launch overrides restored intent.
 Same-run recovery continues to use its frozen admitted profiles.

@@ -6,8 +6,7 @@ use crate::cli::session::session_continuation::{
     portable_resume_descriptor, sanitize_continuation_messages,
 };
 use crate::cli::session::session_restore_client::{
-    fetch_cloud_session_snapshot_with_client, list_cloud_resumable_sessions,
-    restore_session_snapshot_with_client,
+    has_server_auth, list_cloud_resumable_sessions, restore_session_snapshot_with_client,
 };
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -215,9 +214,9 @@ async fn load_one_shot_resume_metadata(
         return Ok(OneShotSessionResumeMetadata::default());
     };
 
-    let mut restored = match restore_session_snapshot_with_client(profile, api, session_id).await {
+    let restored = match restore_session_snapshot_with_client(profile, api, session_id).await {
         Ok(restored) => restored,
-        Err(error) if server_session => {
+        Err(error) if server_session || has_server_auth(profile) => {
             return Err(format!(
                 "selected Server session {session_id} could not be restored: {error}"
             ));
@@ -231,44 +230,6 @@ async fn load_one_shot_resume_metadata(
             return Ok(OneShotSessionResumeMetadata::default());
         }
     };
-    if server_session
-        && restored
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.restored_from_cloud)
-    {
-        // The Server owns both the canonical conversation and turn sequence
-        // for an attached session. Local state can locate that session, but
-        // cannot replace missing Server resume authority.
-        match fetch_cloud_session_snapshot_with_client(profile, api, session_id).await {
-            Ok(Some(remote)) => {
-                if let Some(local) = restored.as_mut() {
-                    // The Server turn clock is authoritative for a networked
-                    // session. Conversation selection remains cursor/root
-                    // based in `continuation`; do not splice remote messages
-                    // into a local snapshot based on turn counts.
-                    local.turn_count = remote.turn_count;
-                    // Conversation-sensitive provider state must come from
-                    // the same server-selected generation. An absent value is
-                    // meaningful; retaining a richer local value would splice
-                    // stale provider state into the remote conversation.
-                    local.model = remote.model.clone();
-                    local.permission_mode = remote.permission_mode.clone();
-                    local.conversation_messages = remote.conversation_messages;
-                    local.resume_bundle = remote.resume_bundle;
-                }
-            }
-            Ok(None) => {
-                return Err(format!(
-                    "selected Server session {session_id} has no authoritative restore bundle"
-                ));
-            }
-            Err(error) => {
-                return Err(format!(
-                    "selected Server session {session_id} could not load its authoritative restore bundle: {error}"
-                ));
-            }
-        }
-    }
 
     match restored {
         Some(restored) => {
@@ -293,7 +254,7 @@ async fn load_one_shot_resume_metadata(
                 resume_bundle: restored.resume_bundle,
             })
         }
-        None if server_session => Err(format!(
+        None if server_session || has_server_auth(profile) => Err(format!(
             "selected Server session {session_id} has no restorable canonical state"
         )),
         None => Ok(OneShotSessionResumeMetadata::default()),
@@ -350,7 +311,9 @@ pub(crate) async fn resolve_one_shot_session_routing(
         return attach_one_shot_resume_metadata(routing, api, profile).await;
     }
 
-    let local_session_id = local_resumable_last_session_id(profile);
+    let local_session_id = (!has_server_auth(profile))
+        .then(|| local_resumable_last_session_id(profile))
+        .flatten();
     let remote_session_id = match list_cloud_resumable_sessions(profile, api).await {
         Ok(sessions) => sessions
             .into_iter()
@@ -966,11 +929,13 @@ mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
+    #[serial_test::serial]
     #[tokio::test]
-    async fn resolve_one_shot_session_routing_keeps_local_continuation_when_cloud_has_no_session() {
+    async fn resolve_one_shot_session_routing_keeps_unauthenticated_local_continuation() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _home_guard = crate::tests::HomeGuard::temp();
+        let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         let session_id = uuid::Uuid::new_v4().to_string();
         write_local_resumable_session_with_checkpoint(&session_id);
 
@@ -978,7 +943,6 @@ mod tests {
         creds.profiles.insert(
             "default".to_string(),
             Profile {
-                access_token: Some("test-token".to_string()),
                 last_session_id: Some(session_id.clone()),
                 ..Default::default()
             },
@@ -986,7 +950,6 @@ mod tests {
         save_credentials(&creds).unwrap();
 
         let server = MockServer::start().await;
-        mock_empty_cloud_resumable_list(&server).await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
         let routing = resolve_one_shot_session_routing(&api, Some("default"), None, true)
@@ -1013,6 +976,7 @@ mod tests {
         assert_eq!(continuation.len(), 2);
         assert_eq!(continuation[0]["content"], "previous question");
         assert_eq!(continuation[1]["content"], "previous answer");
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[serial_test::serial]
@@ -1021,11 +985,14 @@ mod tests {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
 
+        let session_id = uuid::Uuid::new_v4().to_string();
+        write_local_resumable_session_with_checkpoint(&session_id);
         let mut creds = CredentialsFile::default();
         creds.profiles.insert(
             "default".to_string(),
             Profile {
                 access_token: Some("test-token".to_string()),
+                last_session_id: Some(session_id),
                 ..Default::default()
             },
         );

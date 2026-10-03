@@ -498,15 +498,12 @@ async fn run_async() -> i32 {
 
         // For -c, resolve the last session ID from credentials
         let resolved_sid = if continue_last && session_id.is_none() {
-            if cli::session::session_runtime::resolve_cloud_base().is_some()
-                && cli::session::session_runtime::current_access_token(profile.as_deref()).is_some()
-            {
+            if cli::session::session_restore_client::has_server_auth(profile.as_deref()) {
                 cli::cli_config::cli_utils::validated_resumable_last_session_id(
                     &api,
                     profile.as_deref(),
                 )
                 .await
-                .or_else(|| local_resumable_last_session_id(profile.as_deref()))
             } else {
                 local_resumable_last_session_id(profile.as_deref())
             }

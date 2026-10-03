@@ -578,9 +578,10 @@ pub(crate) async fn preflight_remote_resume_session(
     cli_profile: Option<&str>,
     session_id: &str,
 ) -> SessionResumePreflight {
-    let Some(token) = crate::cli::session::session_runtime::current_access_token(cli_profile)
-    else {
-        return SessionResumePreflight::NoAuth;
+    let token = match crate::cli::session::session_runtime::current_access_token(cli_profile) {
+        Some(token) => token,
+        None if crate::cli::native_auth::active().is_some() => String::new(),
+        None => return SessionResumePreflight::NoAuth,
     };
 
     match api.get_session(Some(&token), session_id).await {
@@ -601,9 +602,6 @@ pub(crate) async fn validated_resumable_last_session_id(
         SessionResumePreflight::Valid | SessionResumePreflight::Unknown => Some(session_id),
         SessionResumePreflight::NoAuth => {
             local_resumable_last_session_id(cli_profile).filter(|local| local == &session_id)
-        }
-        SessionResumePreflight::Missing if local_session_is_resumable(&session_id) => {
-            Some(session_id)
         }
         SessionResumePreflight::Missing => {
             clear_profile_last_session_if_matches_or_warn(
@@ -2010,7 +2008,8 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn validated_resumable_last_session_id_keeps_local_state_when_remote_404s() {
+    async fn validated_resumable_last_session_id_clears_remote_404_pointer_without_deleting_local_copy()
+     {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("stale-session-{}", uuid::Uuid::new_v4());
@@ -2029,13 +2028,14 @@ mod tests {
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let resolved = validated_resumable_last_session_id(&api, None).await;
-        assert_eq!(resolved.as_deref(), Some(session_id.as_str()));
+        assert_eq!(resolved, None);
+        assert!(local_session_is_resumable(&session_id));
         assert_eq!(
             load_credentials()
                 .profiles
                 .get("default")
                 .and_then(|profile| profile.last_session_id.as_deref()),
-            Some(session_id.as_str())
+            None
         );
     }
 

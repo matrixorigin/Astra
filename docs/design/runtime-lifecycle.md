@@ -65,6 +65,11 @@ archived
 
 A run may be resumed when its state and checkpoint indicate resumability. Resume must not guess from UI state.
 
+Authenticated CLI session continuation reads the Server-owned canonical resume
+bundle. A local replica cannot override Server ownership, deletion, or a failed
+restore request. Local-only continuation remains available without Server
+authentication; clearing a stale remote pointer does not delete the replica.
+
 Server recovery preserves the opaque execution handoff checkpoint and fences
 its custody to the adopted owner generation. It does not reconstruct execution
 of the original run. Continuing a session in a new run consumes canonical
