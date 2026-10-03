@@ -144,6 +144,21 @@ targets and requests for an explicit deferred replacement use separate cases.
 - SaaS capability test plan: [`docs/testing/saas-test-plan.md`](../testing/saas-test-plan.md) (`make test-saas`; Rust HTTP E2E plus optional remote `@astra/sdk` coverage).
 - Coverage matrix (what replaced stub tests, large-binary audit): [`docs/testing/coverage-matrix.md`](../testing/coverage-matrix.md).
 
+The native Team PTY journey is a separate opt-in live lane. Set
+`ASTRA_TUI_LIVE_API_URL`, `ASTRA_TUI_LIVE_MODEL`, and
+`ASTRA_TUI_LIVE_ACCESS_TOKEN` for an isolated local Server and account with a
+configured real provider. It creates a temporary lead/builder/reviewer Team,
+verifies actual CSV artifacts and child execution identities, checks the
+builder-to-reviewer order, reopens a completed child's transcript, then restarts
+the CLI and requests a revision through ordinary input in the same session.
+It uses real model calls and removes its Team after successful validation.
+
+```bash
+cargo test -p astra-cli --test tui_pty_journey \
+  live_team_delivers_dependent_member_results_and_reworks_after_client_restart \
+  -- --ignored --exact
+```
+
 ## Terminal resize and reflow
 
 The inline TUI regression drives the real binary through a controlling PTY and

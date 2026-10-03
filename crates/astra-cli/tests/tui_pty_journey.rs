@@ -22,8 +22,6 @@ const UI_TRANSITION_TIMEOUT: Duration = Duration::from_secs(10);
 const LIVE_TEAM_API_URL_ENV: &str = "ASTRA_TUI_LIVE_API_URL";
 const LIVE_TEAM_MODEL_ENV: &str = "ASTRA_TUI_LIVE_MODEL";
 const LIVE_TEAM_ACCESS_TOKEN_ENV: &str = "ASTRA_TUI_LIVE_ACCESS_TOKEN";
-const LIVE_TEAM_NAME_ENV: &str = "ASTRA_TUI_LIVE_TEAM";
-const LIVE_TEAM_LEAD_ENV: &str = "ASTRA_TUI_LIVE_TEAM_LEAD_AGENT_ID";
 
 /// A PTY journey owns a controlling terminal and flips the child into raw
 /// mode. Keep those process-level terminal journeys serial even though their
@@ -52,7 +50,7 @@ struct PtyAstra {
 
 impl PtyAstra {
     fn spawn(home: &std::path::Path, api_url: &str) -> Self {
-        Self::spawn_with_config(home, api_url, "mock-model", "pty-journey-token")
+        Self::spawn_with_config(home, api_url, "mock-model", "pty-journey-token", &[])
     }
 
     fn spawn_with_config(
@@ -60,6 +58,7 @@ impl PtyAstra {
         api_url: &str,
         model: &str,
         access_token: &str,
+        launch_args: &[&str],
     ) -> Self {
         let size = Winsize {
             ws_row: 30,
@@ -75,6 +74,7 @@ impl PtyAstra {
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_astra"));
         child
+            .args(launch_args)
             .args([
                 "--api-url",
                 api_url,
@@ -97,6 +97,7 @@ impl PtyAstra {
             .env("ASTRA_ACCESS_TOKEN", access_token)
             .env("ASTRA_API_URL", api_url)
             .env("TERM", "xterm-256color")
+            .env_remove("ASTRA_CLI_CREDENTIALS_DIR")
             .env_remove("TMUX")
             .env_remove("ZELLIJ_SESSION_NAME")
             .stdin(Stdio::from(stdin))
@@ -159,8 +160,11 @@ impl PtyAstra {
         self.write(b"\x1b[200~");
         self.write(text.as_bytes());
         self.write(b"\x1b[201~");
-        let expected = text
-            .chars()
+        // Long pastes scroll the composer; its visible suffix confirms delivery.
+        let suffix = text.chars().rev().take(120).collect::<Vec<_>>();
+        let expected = suffix
+            .into_iter()
+            .rev()
             .filter(|character| !character.is_whitespace())
             .collect::<String>();
         let deadline = Instant::now() + timeout;
@@ -181,6 +185,21 @@ impl PtyAstra {
             self.receive(Duration::from_millis(25));
         }
         self.write(b"\r");
+    }
+
+    fn select_conversation(&mut self, name: &str) {
+        self.write(&[0x07]);
+        self.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
+        self.wait_for(name, UI_TRANSITION_TIMEOUT);
+        let choice = self
+            .current_screen()
+            .lines()
+            .find_map(|line| {
+                let (prefix, _) = line.split_once(&format!(". {name}"))?;
+                prefix.split_whitespace().last()?.parse::<usize>().ok()
+            })
+            .expect("conversation is selectable in the picker");
+        self.write(format!("{choice}\r").as_bytes());
     }
 
     fn signal(&self, signal: nix::sys::signal::Signal) {
@@ -344,23 +363,6 @@ fn required_live_env(name: &str) -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| panic!("ignored live PTY journey requires {name}"))
-}
-
-async fn wait_for_rendered_child_done(astra: &mut PtyAstra, child_name: &str, timeout: Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let expected = format!("{child_name} · done");
-    loop {
-        if astra.current_screen().contains(&expected) {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the public Team projection did not render child {child_name:?} as done\n{}",
-            astra.screen_diagnostic()
-        );
-        astra.receive(Duration::from_millis(25));
-        tokio::task::yield_now().await;
-    }
 }
 
 fn seed_trusted_workspace(home: &std::path::Path) {
@@ -632,55 +634,353 @@ fn assert_committed_mock_write(
     assert_eq!(callbacks[0]["status"], "completed");
 }
 
-#[ignore = "opt-in native live Team navigation; requires ASTRA_TUI_LIVE_API_URL, ASTRA_TUI_LIVE_MODEL, ASTRA_TUI_LIVE_ACCESS_TOKEN, ASTRA_TUI_LIVE_TEAM, and ASTRA_TUI_LIVE_TEAM_LEAD_AGENT_ID"]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_team_run_reopens_completed_child_content_in_a_real_pty() {
-    let _journey = pty_journey_lock().lock().await;
-    let api_url = required_live_env(LIVE_TEAM_API_URL_ENV);
-    let model = required_live_env(LIVE_TEAM_MODEL_ENV);
-    let access_token = required_live_env(LIVE_TEAM_ACCESS_TOKEN_ENV);
-    let team = required_live_env(LIVE_TEAM_NAME_ENV);
-    let lead_agent_id = required_live_env(LIVE_TEAM_LEAD_ENV);
-    let home = tempfile::tempdir().expect("temporary isolated Astra home");
-    seed_trusted_workspace(home.path());
-    let mut astra = PtyAstra::spawn_with_config(home.path(), &api_url, &model, &access_token);
+async fn live_team_json(
+    client: &reqwest::Client,
+    api: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut request = client.request(method, format!("{api}{path}"));
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    request
+        .send()
+        .await
+        .expect("live API request")
+        .error_for_status()
+        .expect("live API accepted request")
+        .json()
+        .await
+        .expect("live API JSON")
+}
 
+fn wait_for_live_session_id(astra: &mut PtyAstra, home: &std::path::Path) -> String {
+    let store = astra_credentials::CredentialStore::with_path(home.join(".astra/credentials.json"));
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        if let Ok(credentials) = store.load()
+            && let Some(id) = credentials
+                .profiles
+                .get("pty-journey")
+                .and_then(|profile| profile.last_session_id.as_ref())
+        {
+            return id.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "CLI did not persist its admitted session identity"
+        );
+        astra.receive(Duration::from_millis(100));
+    }
+}
+
+fn live_tool_json(value: &serde_json::Value) -> serde_json::Value {
+    match value.as_str() {
+        Some(text) => serde_json::from_str(text).expect("structured tool arguments"),
+        None => value.clone(),
+    }
+}
+
+async fn assert_live_team_round(
+    astra: &mut PtyAstra,
+    client: &reqwest::Client,
+    api: &str,
+    session_id: &str,
+    team: &serde_json::Value,
+    round: usize,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let tree = loop {
+        astra.receive(Duration::from_millis(25));
+        let tree = live_team_json(
+            client,
+            api,
+            reqwest::Method::GET,
+            &format!("/sessions/{session_id}/runs"),
+            None,
+        )
+        .await;
+        let roots: Vec<_> = tree["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|run| run["depth"] == 0)
+            .collect();
+        if roots.len() == round && roots.iter().all(|run| run["status"] == "completed") {
+            break tree;
+        }
+        assert!(
+            roots.iter().all(|run| !matches!(
+                run["status"].as_str(),
+                Some("failed" | "cancelled" | "interrupted" | "paused")
+            )),
+            "live root did not deliver: {roots:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "live Team turn did not settle: {roots:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(tree["truncated"], false);
+    let runs = tree["runs"].as_array().expect("durable run tree");
+    let roots: Vec<_> = runs.iter().filter(|run| run["depth"] == 0).collect();
+    assert_eq!(roots.len(), round, "each user turn owns one root");
+    let root = roots
+        .iter()
+        .max_by_key(|run| run["created_at"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(root["status"], "completed");
+    let root_id = root["run_id"].as_str().unwrap();
+    let children: Vec<_> = runs
+        .iter()
+        .filter(|run| run["parent_run_id"] == root_id)
+        .collect();
+    assert_eq!(children.len(), 2, "builder and reviewer each execute once");
+    let root_projection = live_team_json(
+        client,
+        api,
+        reqwest::Method::GET,
+        &format!("/chat/runs/{root_id}/projection?recent_limit=500"),
+        None,
+    )
+    .await;
+    assert!(
+        root_projection["run_event_high_watermark"]
+            .as_i64()
+            .unwrap()
+            < 500,
+        "bounded journey must retain its complete public event sequence"
+    );
+    let root_events = root_projection["recent_events"].as_array().unwrap();
+    let mut member_ids = std::collections::BTreeMap::new();
+    for spawn in root_events
+        .iter()
+        .filter(|event| event["type"] == "agent_spawned")
+    {
+        let profile = spawn["agent_type"].as_str().unwrap();
+        let child_id = spawn["run_id"].as_str().unwrap();
+        let child = children
+            .iter()
+            .find(|run| run["run_id"] == child_id)
+            .unwrap();
+        assert_eq!(child["agent_id"], spawn["agent_id"]);
+        assert_eq!(spawn["parent_run_id"], root_id);
+        assert_eq!(child["status"], "completed");
+        assert_eq!(child["root_run_id"], root_id);
+        assert!(
+            member_ids
+                .insert(profile.to_string(), child_id.to_string())
+                .is_none()
+        );
+        let projection = live_team_json(
+            client,
+            api,
+            reqwest::Method::GET,
+            &format!("/chat/runs/{child_id}/projection?recent_limit=500"),
+            None,
+        )
+        .await;
+        assert!(projection["run_event_high_watermark"].as_i64().unwrap() < 500);
+        let events = projection["recent_events"].as_array().unwrap();
+        let expected: &[(&str, &str)] = if profile == "builder" {
+            &[("read_file", "source.csv"), ("write_file", "report.json")]
+        } else {
+            &[
+                ("read_file", "source.csv"),
+                ("read_file", "report.json"),
+                ("write_file", "review.json"),
+            ]
+        };
+        for (tool, path) in expected {
+            let (request, end) = events
+                .iter()
+                .filter(|event| {
+                    event["type"] == "tool_request"
+                        && event["tool"] == *tool
+                        && live_tool_json(&event["args"])["path"]
+                            .as_str()
+                            .is_some_and(|value| std::path::Path::new(value).ends_with(path))
+                })
+                .find_map(|request| {
+                    events
+                        .iter()
+                        .find(|event| {
+                            event["type"] == "tool_call_end"
+                                && event["call_id"] == request["request_id"]
+                                && event["status"] == "completed"
+                        })
+                        .map(|end| (request, end))
+                })
+                .unwrap_or_else(|| panic!("{profile} must successfully {tool} {path}"));
+            assert_eq!(request["run_id"], child_id);
+            assert_eq!(end["success"], true);
+            assert_eq!(end["transport"], "edge_ledger");
+        }
+    }
+    assert_eq!(
+        member_ids.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["builder", "reviewer"]
+    );
+    assert!(
+        root_events
+            .iter()
+            .filter(|event| event["type"] == "tool_request" && event["run_id"] == root_id)
+            .all(|event| !matches!(event["tool"].as_str(), Some("write_file" | "bash"))),
+        "lead must delegate artifact production"
+    );
+    let builder_done = root_events
+        .iter()
+        .position(|event| {
+            event["type"] == "agent_completed" && event["run_id"] == member_ids["builder"]
+        })
+        .expect("observed builder completion");
+    let reviewer_started = root_events
+        .iter()
+        .position(|event| {
+            event["type"] == "agent_spawned" && event["run_id"] == member_ids["reviewer"]
+        })
+        .unwrap();
+    assert!(
+        builder_done < reviewer_started,
+        "reviewer consumes a settled builder result"
+    );
+    let resume = live_team_json(
+        client,
+        api,
+        reqwest::Method::POST,
+        &format!("/sessions/{session_id}/resume"),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(
+        resume["resume_bundle"]["projections"]["provider"]["payload"]["agent_profile_selection"]["team_id"],
+        team["team_id"]
+    );
+    assert_eq!(
+        resume["resume_bundle"]["projections"]["provider"]["payload"]["agent_profile_selection"]["lead_agent_id"],
+        "lead"
+    );
+    root_id.to_string()
+}
+
+#[ignore = "opt-in native live Team delivery; requires ASTRA_TUI_LIVE_API_URL, ASTRA_TUI_LIVE_MODEL, and ASTRA_TUI_LIVE_ACCESS_TOKEN"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_team_delivers_dependent_member_results_and_reworks_after_client_restart() {
+    let _journey = pty_journey_lock().lock().await;
+    let api = required_live_env(LIVE_TEAM_API_URL_ENV);
+    let model = required_live_env(LIVE_TEAM_MODEL_ENV);
+    let token = required_live_env(LIVE_TEAM_ACCESS_TOKEN_ENV);
+    let client = reqwest::Client::builder()
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        )]))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .unwrap();
+    let team_name = format!("pty-delivery-{}", uuid::Uuid::new_v4().simple());
+    let members: Vec<_> = ["lead", "builder", "reviewer"].into_iter().map(|role|
+        serde_json::json!({
+            "role":role, "agent_id":role, "skills":[], "mcp_servers":[],
+            "system_prompt": if role == "lead" {
+                "Coordinate builder then reviewer using their exact profile identities. Wait for each actual result. Never edit files yourself. Ask reviewer to independently read source CSV and the generated report."
+            } else { "Carry out the delegated file task using actual tools, then report the observed result." },
+            "allow_tools": if role == "lead" { vec!["agent", "tool_search", "introspect", "read_file", "write_file"] }
+                else { vec!["read_file", "write_file", "tool_search"] },
+            "initial_turns":6, "max_turns": if role == "lead" {24} else {12},
+            "can_delegate": role == "lead", "max_delegation_depth": if role == "lead" {1} else {0}
+        })
+    ).collect();
+    let team = live_team_json(
+        &client,
+        &api,
+        reqwest::Method::POST,
+        "/teams",
+        Some(
+            serde_json::json!({"name":team_name, "description":"Dependent CSV delivery",
+            "coordination":{"type":"sequential","stop_on_success":false},
+            "members":members,"context":{},"worktree_mode":"shared","max_parallel":1}),
+        ),
+    )
+    .await;
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    astra_credentials::CredentialStore::with_path(home.path().join(".astra/credentials.json"))
+        .mutate(|credentials| {
+            credentials.profiles.insert(
+                "pty-journey".into(),
+                astra_credentials::Profile {
+                    account_id: Some(team["user_id"].as_str().unwrap().to_string()),
+                    access_token: Some(token.clone()),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+
+    std::fs::write(
+        home.path().join("source.csv"),
+        "id,value\na,2\nb,3\na,7\nc,5\n",
+    )
+    .unwrap();
+    let mut astra = PtyAstra::spawn_with_config(home.path(), &api, &model, &token, &["--yes"]);
     astra.wait_for("Message Astra", Duration::from_secs(15));
     let task = format!(
-        "/team run {team} --lead-agent-id {lead_agent_id} \"Ask one team member to calculate 2 + 2. Give its task the description Arithmetic checkpoint and ask it to return checkpoint=4. Wait for its actual result, then answer concisely. Do not modify files.\""
+        "/team run {team_name} --lead-agent-id lead \"Deliver a CSV report using builder, then reviewer. Give their tasks the descriptions CSV builder and CSV reviewer. Count all source.csv data rows, including duplicate ids. Builder must read source.csv and write report.json with version=1, count and total (sum of value). After builder completes, reviewer must independently read source.csv and report.json, verify count and total, then write review.json with version=1, approved=true, count and total. Do not invent file results.\""
     );
     astra.paste_and_submit(&task, UI_TRANSITION_TIMEOUT);
-    astra.wait_for("Sending", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("Shift+↓ manage", Duration::from_secs(30));
-
-    // The numeric row is intentional: the configured Team has one known
-    // calculator child, while the root conversation is not numbered.
-    astra.write(&[0x07]); // Ctrl+G
-    astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
-    let child_name = "Arithmetic checkpoint";
-    let child_row = format!("1. {child_name}");
-    astra.wait_for(&child_row, UI_TRANSITION_TIMEOUT);
-    astra.write(b"1\r");
-    let child_title = format!("{child_name} · Transcript");
-    astra.wait_for(&child_title, UI_TRANSITION_TIMEOUT);
-
-    // Ctrl+O moves to the retained compact root workspace. Do not assert
-    // provider text or claim a transport receipt from this rendered view.
-    astra.write(&[0x0f]); // Ctrl+O
+    let session_id = wait_for_live_session_id(&mut astra, home.path());
+    let first_root = assert_live_team_round(&mut astra, &client, &api, &session_id, &team, 1).await;
+    for artifact in ["report.json", "review.json"] {
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.path().join(artifact)).unwrap()).unwrap();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["count"], 4);
+        assert_eq!(value["total"], 17);
+        if artifact == "review.json" {
+            assert_eq!(value["approved"], true);
+        }
+    }
+    // Completed children retain their transcripts across conversation switches.
+    astra.select_conversation("CSV builder");
+    astra.wait_for("CSV builder · Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("source.csv", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x0f]);
     astra.wait_for("Main conversation ·", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("checkpoint=4", Duration::from_secs(30));
-
-    // This verifies rendered navigation and retained content, not exact run
-    // identity or live updates. Shared projection contracts verify ownership.
-    astra.write(&[0x07]); // Ctrl+G
-    astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
-    astra.wait_for(&child_row, UI_TRANSITION_TIMEOUT);
-    wait_for_rendered_child_done(&mut astra, child_name, UI_TRANSITION_TIMEOUT).await;
-    astra.write(b"1\r");
-    astra.wait_for(&child_title, UI_TRANSITION_TIMEOUT);
-    astra.wait_for("checkpoint=4", UI_TRANSITION_TIMEOUT);
-
+    astra.select_conversation("CSV builder");
+    astra.wait_for("CSV builder · Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("source.csv", UI_TRANSITION_TIMEOUT);
     astra.signal(nix::sys::signal::Signal::SIGHUP);
-    let status = astra.wait_for_exit(Duration::from_secs(10));
-    assert!(status.success(), "Astra exit status: {status}");
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+    let mut astra = PtyAstra::spawn_with_config(home.path(), &api, &model, &token, &["--yes"]);
+    astra.wait_for("Message Astra", Duration::from_secs(15));
+    astra.paste_and_submit(&format!("/resume {session_id}"), UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Resumed", Duration::from_secs(30));
+    astra.paste_and_submit("Change the duplicate rule: keep the last row for each id. Continue with the same builder and reviewer, in that order, and rewrite report.json and review.json with version=2, count and total. Reviewer must independently reread source.csv and the new report. Each member must read its existing output before rewriting it.", UI_TRANSITION_TIMEOUT);
+    let second_root =
+        assert_live_team_round(&mut astra, &client, &api, &session_id, &team, 2).await;
+    assert_ne!(first_root, second_root);
+    for artifact in ["report.json", "review.json"] {
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.path().join(artifact)).unwrap()).unwrap();
+        assert_eq!(value["version"], 2);
+        assert_eq!(value["count"], 3);
+        assert_eq!(value["total"], 15);
+        if artifact == "review.json" {
+            assert_eq!(value["approved"], true);
+        }
+    }
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+    live_team_json(
+        &client,
+        &api,
+        reqwest::Method::DELETE,
+        &format!("/teams/{team_name}"),
+        None,
+    )
+    .await;
 }
