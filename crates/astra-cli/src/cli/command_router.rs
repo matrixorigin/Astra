@@ -1723,11 +1723,9 @@ async fn execute_cli_command_impl(
             let mut state =
                 initialize_session_state(profile.as_deref(), global_model.as_deref(), cli_context);
             fresh_access_token_or_error(api, profile.as_deref()).await?;
-            state.team_store =
-                std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(
-                    api.api_origin(),
-                    profile.as_deref(),
-                ));
+            state.team_store = std::sync::Arc::new(
+                crate::cli::http_team_store::HttpTeamStore::new(api, profile.as_deref()),
+            );
             slash_team::handle_team_command(
                 &render_team_args(&args),
                 api,

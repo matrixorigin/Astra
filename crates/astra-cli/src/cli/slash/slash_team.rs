@@ -25,7 +25,7 @@ pub(crate) async fn resolve_team_run_chat_request(
     if task.trim().is_empty() {
         return Err("Team run task cannot be empty".into());
     }
-    let store = crate::cli::http_team_store::HttpTeamStore::new(api.api_origin(), profile);
+    let store = crate::cli::http_team_store::HttpTeamStore::new(api, profile);
     let team = TeamPersistenceService::load_team(&store, "", team_name_or_id)
         .await
         .map_err(|error| format!("failed to load team '{team_name_or_id}': {error}"))?
@@ -769,10 +769,8 @@ mod tests {
         let original = make_team(&["first"]);
         let expected = serde_json::to_value(&original).unwrap();
         let mut state = SessionState::default();
-        state.team_store = std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(
-            server.uri(),
-            None,
-        ));
+        state.team_store =
+            std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(&api, None));
         state.team_registry.merge_from_store(vec![original]);
         state.team_registry.store_loaded = true;
         for command in [
@@ -858,10 +856,8 @@ mod tests {
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let store = std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(
-            server.uri(),
-            None,
-        ));
+        let store =
+            std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(&api, None));
         let mut initial = SessionState::default();
         initial.team_store = store.clone();
         super::handle_team_command("snapshot test local-label", &api, None, &mut initial)

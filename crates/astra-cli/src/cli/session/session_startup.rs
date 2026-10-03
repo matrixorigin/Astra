@@ -717,8 +717,7 @@ pub(crate) async fn complete_session_startup(
         build_cli_session_memory_port(api, profile).await
     };
     state.team_store = std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(
-        api.api_origin(),
-        profile,
+        api, profile,
     ));
     tracer.phase("matrix_pool");
 
