@@ -6281,6 +6281,92 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_retry_hint_passes_fanout_admission_and_preserves_slot_precedence() {
+        use crate::server::model_execution_admission::validate_reasoning_control;
+        use astra_services::models::ThinkingCapability;
+        use astra_turn_core::thinking_config::ThinkingConfig;
+
+        let mut execution = astra_services::AdmittedModelExecution::from_endpoint(
+            "offering".into(),
+            "model".into(),
+            "openai".into(),
+            "http://127.0.0.1:1/chat/completions".into(),
+            "Bearer fixture".into(),
+            None,
+            128_000,
+        );
+        execution.thinking_capability = Some(ThinkingCapability::Both);
+        let rejection = validate_reasoning_control(&execution, &ThinkingConfig::Off).unwrap_err();
+        let defaults_hint: Value = serde_json::from_str(
+            rejection
+                .split("for agent_fanout use ")
+                .nth(1)
+                .unwrap()
+                .split(". If")
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let slot_hint: Value = serde_json::from_str(
+            rejection
+                .split("replace that slot's reasoning with ")
+                .nth(1)
+                .unwrap()
+                .split(" instead:")
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut args = json!({
+            "action": "start", "target_count": 2,
+            "slots": [
+                {"description": "Inherited", "prompt": "Review one"},
+                {"description": "Explicit", "prompt": "Review two", "reasoning": {"mode": "off"}}
+            ]
+        });
+        args["defaults"] = defaults_hint["defaults"].clone();
+        let mut input = validated_agent_fanout_start_input(&args)
+            .unwrap_or_else(|error| panic!("{}", error.message()));
+        let explicit = input.slots.pop().unwrap();
+        let inherited = input.slots.pop().unwrap();
+        let inherited = fanout_slot_spawn_input(&input, inherited, "group", "group", 2, 0);
+        let explicit = fanout_slot_spawn_input(&input, explicit, "group", "group", 2, 1);
+        assert!(
+            validate_reasoning_control(&execution, &inherited.reasoning.unwrap().config()).is_ok()
+        );
+        assert!(
+            validate_reasoning_control(&execution, &explicit.reasoning.unwrap().config()).is_err()
+        );
+
+        args["slots"][1]["reasoning"] = slot_hint;
+        let mut input = validated_agent_fanout_start_input(&args)
+            .unwrap_or_else(|error| panic!("{}", error.message()));
+        let explicit = input.slots.pop().unwrap();
+        let retried = fanout_slot_spawn_input(&input, explicit, "group", "group", 2, 1);
+        assert!(
+            validate_reasoning_control(&execution, &retried.reasoning.unwrap().config()).is_ok()
+        );
+
+        let agent_hint: Value = serde_json::from_str(
+            rejection
+                .split("for agent use ")
+                .nth(1)
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        args["reasoning"] = agent_hint["reasoning"].clone();
+        assert!(
+            validated_agent_fanout_start_input(&args)
+                .unwrap_err()
+                .message()
+                .contains("unknown field `reasoning`")
+        );
+    }
+
+    #[test]
     fn fanout_model_and_reasoning_resolve_slot_over_shared_default() {
         let mut input: AgentFanoutStartInput = serde_json::from_value(json!({
             "action": "start",
