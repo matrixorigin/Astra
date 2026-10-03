@@ -1842,7 +1842,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                         "Review the task for correctness and provide evidence-backed findings. Do not modify code."
                             .to_string(),
                     ),
-                    skills: vec!["review-changes".to_string()],
+                    skills: vec![],
                     model_selection: None,
                     mcp_servers: vec![],
                     can_delegate: false,
@@ -1857,7 +1857,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                          Provide actionable feedback."
                             .to_string(),
                     ),
-                    skills: vec!["review-changes".to_string()],
+                    skills: vec![],
                     model_selection: None,
                     mcp_servers: vec![],
                     can_delegate: true,
@@ -1888,7 +1888,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                          Output structured findings."
                             .to_string(),
                     ),
-                    skills: vec!["analyze-session".to_string()],
+                    skills: vec![],
                     model_selection: None,
                     mcp_servers: vec![],
                     can_delegate: false,
@@ -1958,7 +1958,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     system_prompt: Some(
                         "You write and run tests, verifying acceptance criteria.".to_string(),
                     ),
-                    skills: vec!["verify-task".to_string()],
+                    skills: vec![],
                     model_selection: None,
                     mcp_servers: vec![],
                     can_delegate: false,
@@ -2281,6 +2281,28 @@ mod tests {
     }
 
     // ── Builtins ──
+
+    #[test]
+    fn builtin_member_profiles_do_not_require_workspace_skills() {
+        for team in builtin_teams("u1", "2026-01-01T00:00:00Z") {
+            for member in &team.members {
+                let profile = resolve_member_to_profile(member, &team);
+                assert!(
+                    profile.skill_filter.is_empty(),
+                    "builtin {}/{} requires skills absent from an ordinary workspace",
+                    team.name,
+                    member.role
+                );
+            }
+        }
+        // Explicit user requirements remain part of the admitted profile.
+        let mut team = test_team();
+        team.members[0].skills = vec!["user-required-skill".into()];
+        assert_eq!(
+            resolve_member_to_profile(&team.members[0], &team).skill_filter,
+            vec!["user-required-skill"]
+        );
+    }
 
     #[test]
     fn builtin_review_team_uses_parallel_execution() {
