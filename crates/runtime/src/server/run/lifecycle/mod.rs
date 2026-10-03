@@ -13077,6 +13077,10 @@ impl AgenticRunLifecycleService {
             volatile_pending: facts.original.pending_context,
             current_session_id: Some(session_id.to_string()),
             current_run_id: Some(run_id.to_string()),
+            self_agent_id: request
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "root-agent".to_string()),
             context_manifest_pool: self.shared_pool.clone(),
             context_manifest_model_name: request.model.clone(),
             final_text: facts.original.final_text,

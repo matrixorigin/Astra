@@ -1658,6 +1658,7 @@ mod tests {
         let mut host = MockHost::new(vec![text_result("Handled request.")]);
         let mut state = make_state();
         state.current_run_id = Some("parent-execution".into());
+        state.self_agent_id = "cli-request-agent".into();
         state.messaging.mailbox = Some(parent_mb);
         state.permission_context = Some(PermissionSyncContext::shared_root(PermissionMode::Auto));
 
@@ -1686,6 +1687,27 @@ mod tests {
             host.communication_events
                 .iter()
                 .all(|event| event.observed_by.run_id == "parent-execution")
+        );
+        assert!(
+            host.communication_events
+                .iter()
+                .all(|event| event.observed_by.agent_id == "cli-request-agent")
+        );
+        assert_eq!(
+            host.communication_events[0].from.run_id,
+            child_address.run_id
+        );
+        assert_eq!(
+            host.communication_events[0].from.agent_id,
+            child_address.agent_id
+        );
+        assert_eq!(
+            host.communication_events[1].from.run_id,
+            parent_address.run_id
+        );
+        assert_eq!(
+            host.communication_events[1].from.agent_id,
+            parent_address.agent_id
         );
         match &response.payload {
             MessagePayload::Response { accepted, data, .. } => {

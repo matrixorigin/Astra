@@ -25646,11 +25646,31 @@ fn build_initial_state_sets_user_message() {
     assert_eq!(state.messages[0]["content"], "write a test");
     assert_eq!(state.current_session_id, Some("sess-1".to_string()));
     assert_eq!(state.current_run_id, Some("run-1".to_string()));
+    assert_eq!(state.self_agent_id, "root-agent");
     assert_eq!(state.max_turns, expected_budget.initial_turns);
     assert_eq!(state.remaining_turns, expected_budget.initial_turns);
     assert_eq!(state.agentic_turn_budget, expected_budget);
     assert_eq!(state.message, "write a test");
     assert!(state.cancellation.token.is_none());
+}
+
+#[test]
+fn build_initial_state_binds_root_observer_to_request_agent() {
+    let svc = test_service();
+    let mut request = test_request("continue as the admitted root agent");
+    request.agent_id = Some("cli-request-agent".to_string());
+
+    let state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-root-observer",
+        "run-root-observer",
+        None,
+        None,
+        None,
+    );
+
+    assert_eq!(state.self_agent_id, "cli-request-agent");
 }
 
 #[test]

@@ -79,6 +79,7 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
         if let Some(run_id) = state.current_run_id.as_ref() {
             observer.run_id.clone_from(run_id);
         }
+        observer.agent_id.clone_from(&state.self_agent_id);
         let mut parts = Vec::new();
         let self_echo = msg.from == *address
             && matches!(

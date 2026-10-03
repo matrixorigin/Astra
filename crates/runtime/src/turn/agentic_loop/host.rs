@@ -3673,8 +3673,8 @@ pub struct AgenticLoopState {
     /// Inherited from parent delegation and appended with parent agent_id.
     /// Format: ["orchestrator", "coder", "reviewer"] means orchestrator→coder→reviewer.
     pub delegation_chain: Vec<String>,
-    /// Agent ID of this agent itself. Set from delegation config for sub-agents;
-    /// falls back to "orchestrator" for the root agent.
+    /// Execution agent identity, bound by the root request or delegated profile.
+    /// A longer-lived transport mailbox may have a different agent identity.
     pub self_agent_id: String,
 
     // ── Composite Snapshot ──
