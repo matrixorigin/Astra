@@ -1,5 +1,6 @@
 import { AstraClient, AstraApiError, chatRequestToWire } from "../client";
 import { PATH_SESSIONS } from "../paths";
+import type { SessionAuditSummary } from "../index";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -253,7 +254,7 @@ describe("AstraClient — Sessions", () => {
   });
 
   test.each([null, 0, 900])("getSessionAudit preserves cache evidence %s", async (cacheRead) => {
-    const summary = {
+    const summary: SessionAuditSummary = {
       session_id: "s4",
       status: "closed",
       turn_count: 2,
@@ -262,12 +263,15 @@ describe("AstraClient — Sessions", () => {
       request_usage: {
         scope: "session_all_runs",
         request_count: 2,
-        fresh_input_tokens: 10,
-        cache_read_tokens: cacheRead,
-        cache_creation_tokens: 0,
-        output_tokens: 20,
+        nonterminal_attempt_count: 0,
+        fresh_input_tokens: { known_tokens: 10, observed_attempts: 2 },
+        cache_read_tokens: { known_tokens: cacheRead, observed_attempts: cacheRead === null ? 0 : 2 },
+        cache_creation_tokens: { known_tokens: 0, observed_attempts: 2 },
+        output_tokens: { known_tokens: 20, observed_attempts: 2 },
       },
-      cost: { priced_turn_count: 0, unpriced_turn_count: 2 },
+      cost: cacheRead === null
+        ? { unavailable_reason: "historical_attempt_coverage_incomplete" }
+        : { estimated_cost_usd: cacheRead === 0 ? 0 : 0.003 },
       tool_calls_total: 3,
       tool_calls_failed: 0,
       error_count: 0,
@@ -289,10 +293,8 @@ describe("AstraClient — Sessions", () => {
     const result = await createClient().getSessionAudit("s4");
     expect(result.session_id).toBe("s4");
     expect(result.turn_count).toBe(2);
-    expect(result.request_usage.cache_read_tokens).toBe(cacheRead);
-    expect(result.request_usage.cache_creation_tokens).toBe(0);
-    expect(result.cost.unpriced_turn_count).toBe(2);
-    expect(result.cost.estimated_cost_usd).toBeUndefined();
+    expect(result.request_usage).toEqual(summary.request_usage);
+    expect(result.cost).toEqual(summary.cost);
   });
 });
 

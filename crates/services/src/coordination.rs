@@ -1002,7 +1002,12 @@ mod tests {
 
         let sys = system_agent("s1");
         let delegates = reg.find_delegates(&sys);
-        assert_eq!(delegates.len(), 1); // u1 only
+        let mut ids: Vec<_> = delegates
+            .iter()
+            .map(|agent| agent.agent_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["orch-1", "s2", "u1"]);
     }
 
     #[test]
