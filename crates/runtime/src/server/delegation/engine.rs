@@ -3388,7 +3388,6 @@ impl DelegationEngine {
                 }),
                 work_revision: 1,
                 messaging_address: config.mailbox.as_ref().map(|mailbox| mailbox.registration()),
-                worktree_path: None,
                 started_at: std::time::SystemTime::now(),
                 ended_at: None,
                 metrics: Default::default(),
@@ -3398,7 +3397,6 @@ impl DelegationEngine {
                     &config.context, &config.run_id,
                 ),
                 spawn_tool_call_id: None,
-                run_in_background: true,
                 fanout_slot: None,
                 execution_metadata: config.execution_metadata.clone(),
                 prepared_model: config.prepared_model.as_ref().map(|model| PreparedSpawnModelIdentity {
@@ -8128,13 +8126,12 @@ mod tests {
             description: "ordinary sibling".into(),
             prompt: "work".into(),
             agent_type: "explore".into(),
-            run_in_background: true,
             ..Default::default()
         };
-        let ordinary_id = match spawner.spawn(input.clone(), &context).await.unwrap() {
-            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
-            other => panic!("ordinary dynamic admission must remain available: {other:?}"),
-        };
+        let SpawnAgentOutput::Launched {
+            agent_id: ordinary_id,
+            ..
+        } = spawner.spawn(input.clone(), &context).await.unwrap();
         parent_cancel.cancel();
         tokio::time::timeout(Duration::from_secs(1), cancel_observed.notified())
             .await

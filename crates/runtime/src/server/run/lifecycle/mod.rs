@@ -21917,8 +21917,6 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             pause_flag: config.pause_flag.clone(),
             cancel_token: config.cancel_token.clone(),
             execution_owner_generation: sink,
-            #[cfg(feature = "e2e-hooks")]
-            test_child_llm_rounds: Vec::new(),
             #[cfg(feature = "harness")]
             harness_sink: config.harness_sink.clone(),
         };
@@ -22612,16 +22610,7 @@ impl ServerSpawnAgentExecutor {
                 child_runtime_context.edge_tools.clone(),
             )
             .with_provider_scope_bound(context.provider_run_owner.is_some())
-            .with_model_catalog_reader(child_runtime_context.model_catalog_reader.clone())
-            .with_admitted_execution_deadline(config.execution_deadline);
-            .with_model_catalog_reader(child_runtime_context.model_catalog_reader.clone())
-            .with_admitted_execution_deadline(config.execution_deadline);
-        #[cfg(feature = "e2e-hooks")]
-        let executor = if !context.test_child_llm_rounds.is_empty() {
-            executor.with_test_llm_rounds(context.test_child_llm_rounds.clone())
-        } else {
-            executor
-        };
+            .with_model_catalog_reader(child_runtime_context.model_catalog_reader.clone());
         let execution = AssertUnwindSafe(executor.execute_with_frontier(subrun))
             .catch_unwind()
             .await;

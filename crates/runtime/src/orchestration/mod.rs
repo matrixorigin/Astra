@@ -69,6 +69,5 @@ pub use spawner::{
     SpawnExecution, SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunFrontier,
     SpawnRunResult, SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics,
     SpawnedAgentState, WaitForAgentOutcome, project_subrun_status_to_spawn,
-    selector_for_admitted_spawn_input,
-    spawn_completion_status_from_finish_reason,
+    selector_for_admitted_spawn_input, spawn_completion_status_from_finish_reason,
 };

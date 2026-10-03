@@ -7422,7 +7422,22 @@ mod resume_tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let mut state = SessionState::default();
+        let mut state = SessionState {
+            model: Some(
+                crate::cli::session::session_state::SessionModelChoice::Selected(
+                    crate::cli::session::session_runtime::ServerModelSelection {
+                        name: "chosen-model(thinking:high)".into(),
+                        offering_id: "chosen-offering".into(),
+                        context_window: Some(64_000),
+                        pricing: None,
+                    },
+                ),
+            ),
+            ..SessionState::default()
+        };
+        state
+            .cli_context
+            .select_model(Some("chosen-model(thinking:high)"));
         restore_session_into_state(&session_id, None, &api, &mut state)
             .await
             .expect(
@@ -7431,6 +7446,11 @@ mod resume_tests {
 
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
         assert_eq!(state.turn, 3);
+        assert_eq!(state.model.as_deref(), Some("chosen-model(thinking:high)"));
+        assert_eq!(
+            state.model.as_ref().and_then(|model| model.offering_id()),
+            Some("chosen-offering")
+        );
         assert_eq!(
             crate::cli::cli_config::cli_utils::load_credentials()
                 .profiles

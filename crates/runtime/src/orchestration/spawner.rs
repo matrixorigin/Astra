@@ -2603,10 +2603,6 @@ pub(crate) type SpawnExecutionOutcome<T = SpawnRunResult> =
 pub(crate) type ChildExecutionReceipt<T = SpawnRunResult> =
     tokio::sync::oneshot::Receiver<(SpawnExecutionOutcome<T>, u64)>;
 
-fn borrowed_spawn_result(result: &SpawnRunResult) -> std::borrow::Cow<'_, SpawnRunResult> {
-    std::borrow::Cow::Borrowed(result)
-}
-
 /// One cancellation grace deadline shared by all children of an admitted batch.
 /// This is request-local control, not another task owner or durable projection.
 #[derive(Clone)]
@@ -2684,14 +2680,13 @@ pub trait SpawnAgentExecutor: Send + Sync {
         &self,
         _config: &crate::server::delegation::engine::SubRunConfig,
         _execution: &astra_services::AdmittedModelExecution,
-    ) -> Result<
-        Option<crate::server::delegation::engine::ExecutionOwnerGenerationGuard>,
-        String,
-    > {
+    ) -> Result<Option<crate::server::delegation::engine::ExecutionOwnerGenerationGuard>, String>
+    {
         Ok(None)
     }
 
-    async fn settle_admitted_child_runtime(&self, _run_id: &str, _binding_id: &str, _status: &str) {}
+    async fn settle_admitted_child_runtime(&self, _run_id: &str, _binding_id: &str, _status: &str) {
+    }
 
     /// Admit and freeze every member of a batch before launching any child.
     #[cfg(not(any(test, feature = "e2e-hooks")))]
@@ -6881,8 +6876,14 @@ impl DynamicAgentSpawner {
         execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
         reservation_owner_id: Option<&str>,
     ) -> Result<SpawnAgentOutput, SpawnError> {
+        let mut input = input;
+        let parent_selection = input.resolved_model_selection.clone();
         let _parent = self.fanout_parent(&context.parent_run_id);
-        self.validate_spawn_inputs(std::slice::from_ref(&input), context)?;
+        self.validate_spawn_inputs(
+            std::slice::from_mut(&mut input),
+            context,
+            parent_selection.as_ref(),
+        )?;
         let mut preparations = self
             .prepare_spawn_batch(
                 std::slice::from_ref(&input),
@@ -6952,12 +6953,11 @@ impl DynamicAgentSpawner {
         &self,
         mut state: SpawnedAgentState,
     ) -> Result<(), SpawnError> {
-        let cancellation_fence = self.cancelling_parent_runs.read().await;
-        if cancellation_fence.contains(&state.parent_run_id) {
-            return Err(SpawnError::Race(
-                "parent cancelled before child adoption".into(),
-            ));
-        }
+        // Use the same execution-owned fence as dynamic spawn admission. A
+        // parent cancellation either closes its admission before this read
+        // guard, or waits until this exact child is installed in active state.
+        let cancellation_fence = self.spawn_cancellation_fence.read().await;
+        let parent = self.fanout_parent(&state.parent_run_id);
         let mut active = self.active_agents.write().await;
         let admission = self
             .background_task_admission
@@ -6966,6 +6966,15 @@ impl DynamicAgentSpawner {
         if !*admission {
             return Err(SpawnError::LifecycleShuttingDown);
         }
+        let parent_state = astra_core::sync_poison::recover_mutex_lock(&parent.state);
+        parent.check_state(
+            &parent_state,
+            state
+                .fanout_slot
+                .as_ref()
+                .map(|slot| slot.group_id.as_str()),
+            false,
+        )?;
         if state.cancellation_binding_id.is_none()
             || !state
                 .committed_frontier
@@ -6979,6 +6988,7 @@ impl DynamicAgentSpawner {
         }
         state.capacity_admission = ChildCapacityAdmission::Precreated;
         active.insert(state.agent_id.clone(), state.clone());
+        drop(parent_state);
         drop(admission);
         drop(active);
         drop(cancellation_fence);
@@ -7038,7 +7048,6 @@ impl DynamicAgentSpawner {
             .insert(agent_id.to_string(), Arc::clone(&notify));
         let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
         let spawner = self.clone_for_task();
-        let repair = self.clone_for_task();
         let id = agent_id.to_string();
         let started_at = state.started_at;
         let task = async move {
@@ -7107,22 +7116,19 @@ impl DynamicAgentSpawner {
             .await;
             let receipt = match finalized {
                 Ok(result) => result,
-                Err(panic) => {
-                    repair.repair_fanout_slot_count().await;
-                    (
-                        Err((
-                            format!(
-                                "agent finalization panicked: {}",
-                                panic_payload_message(panic.as_ref())
-                            ),
-                            Some("panic"),
-                        )),
-                        started_at
-                            .elapsed()
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0),
-                    )
-                }
+                Err(panic) => (
+                    Err((
+                        format!(
+                            "agent finalization panicked: {}",
+                            panic_payload_message(panic.as_ref())
+                        ),
+                        Some("panic"),
+                    )),
+                    started_at
+                        .elapsed()
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                ),
             };
             let _ = terminal_tx.send(receipt);
         };
@@ -14551,11 +14557,16 @@ pub(crate) mod tests {
                     profiles,
                 }));
             for worker in &workers {
-                let mut input = make_sync_input();
+                let mut input = make_bg_input();
                 input.agent_type = worker.clone();
+                let agent_id = match spawner.spawn(input, &context).await.unwrap() {
+                    SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+                };
                 assert!(matches!(
-                    spawner.spawn(input, &context).await.unwrap(),
-                    SpawnAgentOutput::Completed { .. }
+                    spawner
+                        .wait_for_agent(&agent_id, Duration::from_secs(2))
+                        .await,
+                    Some(AgentStatus::Completed { .. })
                 ));
                 assert!(executor.take_captured().is_some());
             }
@@ -14563,7 +14574,7 @@ pub(crate) mod tests {
                 profile_id: workers[0].clone(),
                 ancestor_profile_ids: Vec::new(),
             };
-            let mut input = make_sync_input();
+            let mut input = make_bg_input();
             input.agent_type = lead_id;
             assert!(matches!(
                 spawner.spawn(input, &context).await,
@@ -14621,7 +14632,7 @@ pub(crate) mod tests {
             offering_id: "offering-flash".into(),
         };
 
-        let mut omitted = make_sync_input();
+        let mut omitted = make_bg_input();
         omitted.agent_type = "profile-glm".into();
         spawner
             .validate_spawn_inputs(
@@ -14636,9 +14647,14 @@ pub(crate) mod tests {
                 offering_id: "offering-glm".into(),
             })
         );
+        let agent_id = match spawner.spawn(omitted, &context).await.unwrap() {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+        };
         assert!(matches!(
-            spawner.spawn(omitted, &context).await.unwrap(),
-            SpawnAgentOutput::Completed { .. }
+            spawner
+                .wait_for_agent(&agent_id, Duration::from_secs(2))
+                .await,
+            Some(AgentStatus::Completed { .. })
         ));
         assert_eq!(
             executor
@@ -14653,7 +14669,7 @@ pub(crate) mod tests {
         let override_selection = ModelSelection {
             offering_id: "offering-override".into(),
         };
-        let mut explicit = make_sync_input();
+        let mut explicit = make_bg_input();
         explicit.agent_type = "profile-glm".into();
         explicit.requested_model_policy = Some(RequestedModelPolicy::Fixed {
             selector: ModelSelector::OfferingId {
@@ -14668,9 +14684,14 @@ pub(crate) mod tests {
                 Some(&parent_selection),
             )
             .unwrap();
+        let agent_id = match spawner.spawn(explicit, &context).await.unwrap() {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+        };
         assert!(matches!(
-            spawner.spawn(explicit, &context).await.unwrap(),
-            SpawnAgentOutput::Completed { .. }
+            spawner
+                .wait_for_agent(&agent_id, Duration::from_secs(2))
+                .await,
+            Some(AgentStatus::Completed { .. })
         ));
         assert_eq!(
             executor
@@ -14680,7 +14701,7 @@ pub(crate) mod tests {
             Some(override_selection)
         );
 
-        let mut no_default = make_sync_input();
+        let mut no_default = make_bg_input();
         no_default.agent_type = "profile-none".into();
         spawner
             .validate_spawn_inputs(
@@ -14693,9 +14714,14 @@ pub(crate) mod tests {
             no_default.resolved_model_selection,
             Some(parent_selection.clone())
         );
+        let agent_id = match spawner.spawn(no_default, &context).await.unwrap() {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+        };
         assert!(matches!(
-            spawner.spawn(no_default, &context).await.unwrap(),
-            SpawnAgentOutput::Completed { .. }
+            spawner
+                .wait_for_agent(&agent_id, Duration::from_secs(2))
+                .await,
+            Some(AgentStatus::Completed { .. })
         ));
         assert_eq!(
             executor
@@ -14705,7 +14731,7 @@ pub(crate) mod tests {
             Some(parent_selection.clone())
         );
 
-        let mut explicit_inherit = make_sync_input();
+        let mut explicit_inherit = make_bg_input();
         explicit_inherit.agent_type = "profile-glm".into();
         explicit_inherit.requested_model_policy = Some(RequestedModelPolicy::Inherit);
         spawner
@@ -14722,7 +14748,7 @@ pub(crate) mod tests {
             })
         );
 
-        let mut valid_slot = make_sync_input();
+        let mut valid_slot = make_bg_input();
         valid_slot.agent_type = "profile-glm".into();
         valid_slot.fanout_group_id = Some("model-matrix".into());
         valid_slot.fanout_target_count = Some(2);
@@ -14806,7 +14832,7 @@ pub(crate) mod tests {
             let mut denied = context.clone();
             denied.parent_profile_authority = authority;
             denied.recursion_depth = depth;
-            let mut input = make_sync_input();
+            let mut input = make_bg_input();
             input.agent_type = target.into();
             assert!(spawner.spawn(input, &denied).await.is_err(), "{target}");
             assert!(executor.take_captured().is_none());
@@ -14814,11 +14840,16 @@ pub(crate) mod tests {
         }
 
         for (target, ancestors) in [("beta", vec!["alpha"]), ("gamma", vec!["alpha", "beta"])] {
-            let mut input = make_sync_input();
+            let mut input = make_bg_input();
             input.agent_type = target.into();
+            let agent_id = match spawner.spawn(input, &context).await.unwrap() {
+                SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            };
             assert!(matches!(
-                spawner.spawn(input, &context).await.unwrap(),
-                SpawnAgentOutput::Completed { .. }
+                spawner
+                    .wait_for_agent(&agent_id, Duration::from_secs(2))
+                    .await,
+                Some(AgentStatus::Completed { .. })
             ));
             let child = executor
                 .take_captured()
@@ -14843,7 +14874,7 @@ pub(crate) mod tests {
             context.recursion_depth = child.recursion_depth;
             context.delegation_chain.push(child.agent_id.clone());
         }
-        let mut cycle = make_sync_input();
+        let mut cycle = make_bg_input();
         cycle.agent_type = "alpha".into();
         assert!(
             matches!(spawner.spawn(cycle, &context).await, Err(SpawnError::InvalidInput(error)) if error.contains("circular"))
@@ -14903,10 +14934,17 @@ pub(crate) mod tests {
         ordinary.admitted_agent_profiles = Some(Arc::new(ordinary_snapshot));
         ordinary.parent_profile_authority = ParentProfileAuthority::OrdinaryRoot;
         ordinary.trace_context = context.trace_context.clone();
-        let mut input = make_sync_input();
+        let mut input = make_bg_input();
         input.agent_type = "beta".into();
-        let output = spawner.spawn(input, &ordinary).await.unwrap();
-        assert!(matches!(output, SpawnAgentOutput::Completed { .. }));
+        let agent_id = match spawner.spawn(input, &ordinary).await.unwrap() {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+        };
+        assert!(matches!(
+            spawner
+                .wait_for_agent(&agent_id, Duration::from_secs(2))
+                .await,
+            Some(AgentStatus::Completed { .. })
+        ));
         assert_eq!(
             executor.take_captured().unwrap().profile_authority,
             ParentProfileAuthority::AdmittedMember {
@@ -14970,7 +15008,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn spawn_tool_override_is_effective_but_cannot_widen_parent_authority() {
-        let executor = Arc::new(CapturingSpawnConfigExecutor::new());
+        let executor = Arc::new(CapturingToolBoundsExecutor::new());
         let spawner = DynamicAgentSpawner::new(mock_router())
             .with_executor(executor.clone() as Arc<dyn SpawnAgentExecutor>);
         let input = SpawnAgentInput {
@@ -15023,6 +15061,9 @@ pub(crate) mod tests {
             matches!(status, Some(AgentStatus::Completed { .. })),
             "{status:?}"
         );
+        let (run_tools, permission_tools) = executor
+            .take_captured()
+            .expect("executor captured effective tool policy");
         assert_eq!(
             run_tools,
             vec!["settle_work_item".to_string(), "web_fetch".to_string()]
@@ -15403,7 +15444,7 @@ pub(crate) mod tests {
 
     struct CapturingToolBoundsExecutor {
         captured:
-            std::sync::Mutex<Option<(Vec<String>, Option<std::collections::HashSet<String>>) >>,
+            std::sync::Mutex<Option<(Vec<String>, Option<std::collections::HashSet<String>>)>>,
     }
 
     struct CapturingSpawnConfigExecutor {
@@ -15725,6 +15766,15 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl SpawnAgentExecutor for CapturingSpawnConfigExecutor {
+        async fn prepare_batch(
+            self: Arc<Self>,
+            inputs: &[SpawnAgentInput],
+            _: &SpawnContext,
+            _: Option<&astra_turn_types::ModelSelection>,
+        ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
+            Ok(prepare_fixture_batch(self, inputs.len()))
+        }
+
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             let result = SpawnRunResult {
                 agent_id: config.agent_id.clone(),
@@ -16628,56 +16678,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_spawn_returns_interrupted_output_for_interrupted_run() {
-        let spawner = DynamicAgentSpawner::new(mock_router()).with_executor(Arc::new(
-            ImmediateStatusExecutor {
-                status: "interrupted",
-                finish_reason: "budget_exhausted",
-                output: Some("partial"),
-                error: None,
-            },
-        ));
-        let context = SpawnContext {
-            parent_profile_authority: ParentProfileAuthority::Unbound,
-            admitted_agent_profiles: None,
-            delegation_model_admission: None,
-            parent_model_reasoning: None,
-            parent_run_id: "parent-123".to_string(),
-            parent_agent_id: "main".to_string(),
-            resolved_model_name: None,
-            recursion_depth: 0,
-            parent_is_fork_child: false,
-            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
-            inherited_skills: vec![],
-            working_dir: PathBuf::from("/tmp"),
-            live_event_sink: None,
-            client_tool_delivery_tx: None,
-            trace_context: None,
-            spawn_tool_call_id: None,
-            execution_metadata: None,
-            workspace_mutation: Default::default(),
-            delegation_chain: Vec::new(),
-        };
-        let input = SpawnAgentInput {
-            description: "Sync interrupted agent".to_string(),
-            prompt: "Stop before normal completion".to_string(),
-            agent_type: "explore".to_string(),
-            run_in_background: false,
-            ..Default::default()
-        };
-
-        let result = spawner.spawn(input, &context).await.unwrap();
-        assert!(matches!(
-            result,
-            SpawnAgentOutput::Interrupted {
-                result,
-                finish_reason,
-                ..
-            } if result == "partial" && finish_reason == "budget_exhausted"
-        ));
-    }
-
-    #[tokio::test]
     async fn test_spawn_rejects_when_recursion_depth_limit_reached() {
         let spawner = DynamicAgentSpawner::new(mock_router());
         let context = SpawnContext {
@@ -16711,52 +16711,6 @@ pub(crate) mod tests {
 
         let result = spawner.spawn(input, &context).await;
         assert!(matches!(result, Err(SpawnError::DepthLimitExceeded(_))));
-    }
-
-    #[tokio::test]
-    async fn test_sync_spawn_returns_failed_output_for_failed_run() {
-        let spawner = DynamicAgentSpawner::new(mock_router()).with_executor(Arc::new(
-            ImmediateStatusExecutor {
-                status: "failed",
-                finish_reason: "failed",
-                output: None,
-                error: Some("boom"),
-            },
-        ));
-        let context = SpawnContext {
-            parent_profile_authority: ParentProfileAuthority::Unbound,
-            admitted_agent_profiles: None,
-            delegation_model_admission: None,
-            parent_model_reasoning: None,
-            parent_run_id: "parent-123".to_string(),
-            parent_agent_id: "main".to_string(),
-            resolved_model_name: None,
-            recursion_depth: 0,
-            parent_is_fork_child: false,
-            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
-            inherited_skills: vec![],
-            working_dir: PathBuf::from("/tmp"),
-            live_event_sink: None,
-            client_tool_delivery_tx: None,
-            trace_context: None,
-            spawn_tool_call_id: None,
-            execution_metadata: None,
-            workspace_mutation: Default::default(),
-            delegation_chain: Vec::new(),
-        };
-        let input = SpawnAgentInput {
-            description: "Sync agent".to_string(),
-            prompt: "Fail immediately".to_string(),
-            agent_type: "explore".to_string(),
-            run_in_background: false, // drive the synchronous Failed path
-            ..Default::default()
-        };
-
-        let result = spawner.spawn(input, &context).await.unwrap();
-        assert!(matches!(
-            result,
-            SpawnAgentOutput::Failed { ref error, .. } if error == "boom"
-        ));
     }
 
     #[tokio::test]
@@ -16962,120 +16916,6 @@ pub(crate) mod tests {
         assert_eq!(model.offering_id, "offer-reviewed");
         assert_eq!(model.model_name, "same-display-name");
         assert_eq!(model.provenance, "local_journal");
-    }
-
-    #[tokio::test]
-    async fn sync_spawn_unknown_status_fails_closed() {
-        let spawner = DynamicAgentSpawner::new(mock_router()).with_executor(Arc::new(
-            ImmediateStatusExecutor {
-                status: "mystery",
-                finish_reason: "unknown",
-                output: Some("partial"),
-                error: None,
-            },
-        ));
-        let context = SpawnContext {
-            parent_profile_authority: ParentProfileAuthority::Unbound,
-            admitted_agent_profiles: None,
-            delegation_model_admission: None,
-            parent_model_reasoning: None,
-            parent_run_id: "parent-123".to_string(),
-            parent_agent_id: "main".to_string(),
-            resolved_model_name: None,
-            recursion_depth: 0,
-            parent_is_fork_child: false,
-            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
-            inherited_skills: vec![],
-            working_dir: PathBuf::from("/tmp"),
-            live_event_sink: None,
-            client_tool_delivery_tx: None,
-            trace_context: None,
-            spawn_tool_call_id: None,
-            execution_metadata: None,
-            workspace_mutation: Default::default(),
-            delegation_chain: Vec::new(),
-        };
-        let input = SpawnAgentInput {
-            description: "Unknown status".to_string(),
-            prompt: "Should fail closed".to_string(),
-            agent_type: "explore".to_string(),
-            run_in_background: false,
-            ..Default::default()
-        };
-
-        let result = spawner.spawn(input, &context).await.unwrap();
-        assert!(matches!(
-            result,
-            SpawnAgentOutput::Failed { ref error, .. } if error.contains("unknown status 'mystery'")
-        ));
-    }
-
-    #[tokio::test]
-    async fn sync_spawn_waiting_emits_waiting_progress_and_archives_status() {
-        let spawner = DynamicAgentSpawner::new(mock_router()).with_executor(Arc::new(
-            ImmediateStatusExecutor {
-                status: SPAWN_STATUS_WAITING,
-                finish_reason: "waiting",
-                output: Some("executor_offline"),
-                error: None,
-            },
-        ));
-        let mut progress = spawner.subscribe_progress();
-        let context = SpawnContext {
-            parent_profile_authority: ParentProfileAuthority::Unbound,
-            admitted_agent_profiles: None,
-            delegation_model_admission: None,
-            parent_model_reasoning: None,
-            parent_run_id: "parent-123".to_string(),
-            parent_agent_id: "main".to_string(),
-            resolved_model_name: None,
-            recursion_depth: 0,
-            parent_is_fork_child: false,
-            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
-            inherited_skills: vec![],
-            working_dir: PathBuf::from("/tmp"),
-            live_event_sink: None,
-            client_tool_delivery_tx: None,
-            trace_context: None,
-            spawn_tool_call_id: None,
-            execution_metadata: None,
-            workspace_mutation: Default::default(),
-            delegation_chain: Vec::new(),
-        };
-        let input = SpawnAgentInput {
-            description: "Waiting status".to_string(),
-            prompt: "Should wait".to_string(),
-            agent_type: "explore".to_string(),
-            run_in_background: false,
-            ..Default::default()
-        };
-
-        let result = spawner.spawn(input, &context).await.unwrap();
-        assert!(matches!(
-            result,
-            SpawnAgentOutput::Waiting { ref reason, .. } if reason == "executor_offline"
-        ));
-        let completed = spawner.completed_agents.read().await;
-        assert!(matches!(
-            completed.front().map(|state| &state.status),
-            Some(AgentStatus::Waiting { reason }) if reason == "executor_offline"
-        ));
-        drop(completed);
-
-        let mut saw_waiting = false;
-        while let Ok(event) = progress.try_recv() {
-            if matches!(
-                event.event_type,
-                ProgressEventType::Waiting { ref reason } if reason == "executor_offline"
-            ) {
-                saw_waiting = true;
-                break;
-            }
-        }
-        assert!(
-            saw_waiting,
-            "sync waiting spawn must emit agent_waiting progress"
-        );
     }
 
     #[tokio::test]
@@ -23938,17 +23778,28 @@ pub(crate) mod tests {
             }
         }
         let spawner = DynamicAgentSpawner::new(mock_router()).with_executor(Arc::new(Executor));
-        let mut input = make_bg_input();
-        input.run_in_background = false;
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            spawner.spawn(input, &make_bg_context()),
+            spawner.spawn(make_bg_input(), &make_bg_context()),
         )
         .await
         .expect("panic payload cleanup must not strand the foreground waiter")
         .unwrap();
+        let agent_id = match result {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+        };
+        let status = spawner
+            .wait_for_agent(&agent_id, Duration::from_secs(2))
+            .await;
         assert!(
-            matches!(result, SpawnAgentOutput::Failed { finish_reason, .. } if finish_reason == "panic")
+            matches!(
+                status,
+                Some(AgentStatus::Failed {
+                    finish_reason: Some(ref reason),
+                    ..
+                }) if reason == "panic"
+            ),
+            "panic payload must settle as a failed background child: {status:?}"
         );
         let archived = spawner.completed_agents.read().await;
         assert_eq!(archived.len(), 1);
@@ -23960,31 +23811,33 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn foreground_agent_panic_returns_failed_and_archives() {
+    async fn background_agent_panic_remains_queryable_after_terminalization() {
         let spawner = DynamicAgentSpawner::new(mock_router())
             .with_executor(Arc::new(PanicExecutor) as Arc<dyn SpawnAgentExecutor>);
-        let mut input = make_bg_input();
-        input.run_in_background = false;
 
-        let result = spawner.spawn(input, &make_bg_context()).await.unwrap();
+        let result = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .unwrap();
         let agent_id = match result {
-            SpawnAgentOutput::Failed { ref error, .. } if error.contains("executor panicked") => {
-                spawner
-                    .completed_agents
-                    .read()
-                    .await
-                    .back()
-                    .expect("foreground panic should archive failed state")
-                    .agent_id
-                    .clone()
-            }
-            other => panic!("expected foreground Failed output for panic, got {other:?}"),
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
         };
+        let status = spawner
+            .wait_for_agent(&agent_id, Duration::from_secs(2))
+            .await;
+        assert!(
+            matches!(
+                status,
+                Some(AgentStatus::Failed { ref error, .. })
+                    if error.contains("executor panicked")
+            ),
+            "background panic must settle as failed: {status:?}"
+        );
 
         let archived = spawner
             .get_agent_state_any(&agent_id)
             .await
-            .expect("foreground panic should remain queryable");
+            .expect("background panic should remain queryable");
         assert!(
             matches!(archived.status, AgentStatus::Failed { .. }),
             "archived status must be failed: {:?}",
@@ -23992,7 +23845,7 @@ pub(crate) mod tests {
         );
         assert!(
             spawner.active_agents.read().await.is_empty(),
-            "foreground panic must not leave active agent state"
+            "background panic must not leave active agent state"
         );
     }
 
