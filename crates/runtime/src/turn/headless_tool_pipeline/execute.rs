@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn typed_execution_failure_remains_authoritative() {
         let fields = Map::from_iter([
-            ("status".to_string(), Value::String("failed".to_string())),
+            ("status".to_string(), Value::String("completed".to_string())),
             (
                 "exit_semantics".to_string(),
                 Value::String("execution_error".to_string()),
@@ -470,7 +470,7 @@ mod tests {
             ),
         ]);
 
-        assert!(execution_result_is_error(Some(&fields), Some(true),));
+        assert!(execution_result_is_error(Some(&fields), Some(false),));
     }
 
     #[test]

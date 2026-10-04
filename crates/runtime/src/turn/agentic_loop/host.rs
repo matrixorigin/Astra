@@ -5109,8 +5109,6 @@ fn apply_harness_pause_recovery_threshold(
 }
 
 use super::super::agentic::adaptive_runtime::record_loop_completion_feedback;
-#[cfg(test)]
-pub(crate) use super::tool_support::delegate_tool_schema;
 pub(crate) use super::tool_support::{extract_file_path_from_tool, record_edge_tool_observability};
 
 // ─── Loop exit ───────────────────────────────────────────────────────────────

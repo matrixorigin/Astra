@@ -48179,16 +48179,25 @@ mod tests {
             .with_execution_binding_snapshot(edge_runtime_snapshot())
             .build();
 
-        assert!(!host.valid_tool_names().contains("delegate"));
+        assert!(
+            !host
+                .valid_tool_names()
+                .contains(crate::turn::skill_tool::SKILL_TOOL_NAME)
+        );
         let initial_count = host.tool_schemas.len();
 
-        use crate::turn::agentic_loop::host::delegate_tool_schema;
-        host.inject_tool_schema(delegate_tool_schema());
+        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
 
-        assert!(host.valid_tool_names().contains("delegate"));
+        assert!(
+            host.valid_tool_names()
+                .contains(crate::turn::skill_tool::SKILL_TOOL_NAME)
+        );
         assert_eq!(host.tool_schemas.len(), initial_count + 1);
         let last = host.tool_schemas.last().unwrap();
-        assert_eq!(last["function"]["name"], "delegate");
+        assert_eq!(
+            last["function"]["name"],
+            crate::turn::skill_tool::SKILL_TOOL_NAME
+        );
     }
 
     #[test]
@@ -48198,11 +48207,10 @@ mod tests {
             .with_execution_binding_snapshot(edge_runtime_snapshot())
             .build();
 
-        use crate::turn::agentic_loop::host::delegate_tool_schema;
         let initial_count = host.tool_schemas.len();
 
-        host.inject_tool_schema(delegate_tool_schema());
-        host.inject_tool_schema(delegate_tool_schema());
+        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
+        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
 
         // Only one injection — duplicate is skipped
         assert_eq!(host.tool_schemas.len(), initial_count + 1);

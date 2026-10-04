@@ -20,65 +20,10 @@ pub(crate) fn has_typed_executor_failure(fields: &Map<String, Value>) -> bool {
         })
 }
 
-fn structured_edge_exit_code(fields: Option<&Map<String, Value>>) -> Option<i32> {
-    let fields = fields?;
-    if let Some(semantics) = fields
-        .get("exit_semantics")
-        .and_then(Value::as_str)
-        .and_then(|tag| {
-            serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(Value::String(
-                tag.to_string(),
-            ))
-            .ok()
-        })
-    {
-        return Some(if semantics.is_tool_error() { 1 } else { 0 });
-    }
-    if let Some(result_class) = fields
-        .get("result_class")
-        .and_then(Value::as_str)
-        .and_then(|tag| {
-            serde_json::from_value::<astra_tools::exit_semantics::CommandResultClass>(
-                Value::String(tag.to_string()),
-            )
-            .ok()
-        })
-    {
-        return Some(if result_class.is_tool_error() { 1 } else { 0 });
-    }
-    None
-}
-
-fn edge_tool_observability_exit_code(edge_result: &EdgeToolExecResult) -> Option<i32> {
-    if edge_tool_status_exit_code(&edge_result.status) == Some(1)
-        && edge_result
-            .tool_result_fields
-            .as_ref()
-            .is_some_and(has_typed_executor_failure)
-    {
-        return Some(1);
-    }
-    structured_edge_exit_code(edge_result.tool_result_fields.as_ref())
-        .or_else(|| edge_tool_status_exit_code(&edge_result.status))
-}
-
 pub(crate) fn record_edge_tool_observability(
     state: &mut AgenticLoopState,
     edge_tool_round: &[EdgeToolExecResult],
 ) {
-    if let Some(session) = &state.telemetry.observability_session {
-        for edge_result in edge_tool_round {
-            session
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .record_tool_result(
-                    &edge_result.tool,
-                    &edge_result.output,
-                    edge_tool_observability_exit_code(edge_result),
-                );
-        }
-    }
-
     if let Some(hub) = &state.telemetry.observability_hub {
         let user_id = state
             .telemetry
@@ -94,57 +39,6 @@ pub(crate) fn record_edge_tool_observability(
             crate::observability::on_tool_executed(hub, &user_id, &edge_result.tool);
         }
     }
-}
-
-/// Generate the OpenAI-compatible tool schema for the "delegate" tool.
-#[cfg(test)]
-pub(crate) fn delegate_tool_schema() -> Value {
-    serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": "delegate",
-            "description": "Delegate a task to specialized sub-agents for parallel, sequential, pipeline, or review workflows.",
-            "parameters": {
-                "type": "object",
-                "required": ["task", "agents"],
-                "properties": {
-                    "task": {
-                        "type": "string",
-                        "description": "The task description/prompt for the delegated agents."
-                    },
-                    "agents": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Agent IDs to delegate to. Available: 'coder' (code tasks), 'reviewer' (code review), 'writer' (documentation)."
-                    },
-                    "pattern": {
-                        "type": "string",
-                        "enum": ["sequential", "fan_out", "fork", "auto"],
-                        "description": "Explicit coordination topology. Omit it to select from the agent count and has_dependencies hint; task prose and scenario labels do not change topology."
-                    },
-                    "tasks": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "minItems": 2,
-                        "description": "Explicit sub-task list required by the fork pattern."
-                    },
-                    "has_dependencies": {
-                        "type": "boolean",
-                        "description": "Typed hint for auto/default selection; true keeps agents ordered."
-                    },
-                    "timeout": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Per-agent timeout in seconds; zero disables the timeout."
-                    },
-                    "context": {
-                        "type": "object",
-                        "description": "Additional context to pass to sub-agents."
-                    }
-                }
-            }
-        }
-    })
 }
 
 /// Extract a file path from an edge tool's name + arguments.
@@ -192,86 +86,30 @@ mod tests {
     }
 
     #[test]
-    fn edge_tool_observability_exit_code_uses_structured_exit_semantics() {
-        let result = EdgeToolExecResult {
-            execution_completion: None,
-            request_id: "call-1".into(),
-            tool: "bash".into(),
-            args: json!({"command": "grep needle haystack.txt"}),
-            output: "No matches found".into(),
-            tool_result_fields: Some(serde_json::Map::from_iter([
-                ("exit_semantics".to_string(), json!("empty_result")),
-                ("result_class".to_string(), json!("empty_result")),
-            ])),
-            status: "failed".into(),
-            duration_ms: 10,
-        };
-
-        assert_eq!(edge_tool_observability_exit_code(&result), Some(0));
-    }
-
-    #[test]
-    fn edge_tool_observability_exit_code_structured_error_overrides_status() {
-        let result = EdgeToolExecResult {
-            execution_completion: None,
-            request_id: "call-1".into(),
-            tool: "bash".into(),
-            args: json!({"command": "exit 7"}),
-            output: "Error: command failed (exit code 7)".into(),
-            tool_result_fields: Some(serde_json::Map::from_iter([
-                ("exit_semantics".to_string(), json!("execution_error")),
-                ("result_class".to_string(), json!("execution_error")),
-            ])),
-            status: "completed".into(),
-            duration_ms: 10,
-        };
-
-        assert_eq!(edge_tool_observability_exit_code(&result), Some(1));
-    }
-
-    #[test]
-    fn executor_failure_remains_visible_after_successful_process_exit() {
-        let result = EdgeToolExecResult {
-            execution_completion: None,
-            request_id: "verify-unavailable".into(),
-            tool: "bash".into(),
-            args: json!({"command": "true", "mode": "verify"}),
-            output: String::new(),
-            tool_result_fields: Some(Map::from_iter([
-                ("exit_semantics".into(), json!("success")),
-                ("exit_code".into(), json!(0)),
-                ("error_kind".into(), json!("tool_unavailable")),
-            ])),
-            status: "failed".into(),
-            duration_ms: 1,
-        };
-        assert_eq!(edge_tool_observability_exit_code(&result), Some(1));
-    }
-
-    #[test]
-    fn delegate_tool_schema_has_correct_structure() {
-        let schema = delegate_tool_schema();
-        assert_eq!(schema["type"], "function");
-        assert_eq!(schema["function"]["name"], "delegate");
-
-        let params = &schema["function"]["parameters"];
-        assert_eq!(params["type"], "object");
-
-        let required = params["required"].as_array().unwrap();
-        assert!(required.contains(&json!("task")));
-        assert!(required.contains(&json!("agents")));
-
-        let props = &params["properties"];
-        assert!(props["task"].is_object());
-        assert!(props["agents"].is_object());
-        assert!(props["pattern"].is_object());
-        assert!(props["tasks"].is_object());
-        assert!(props.get("needs_review").is_none());
-        assert!(props["has_dependencies"].is_object());
-        assert!(props.get("max_rounds").is_none());
-        assert!(props.get("max_turns").is_none());
-        assert!(props["timeout"].is_object());
-        assert!(props["context"].is_object());
+    fn edge_tool_observation_records_usage_for_the_bound_profile() {
+        use super::super::host::tests::{make_edge_tool, make_state};
+        use std::sync::Arc;
+        let hub = Arc::new(crate::observability::ObservabilityHub::new());
+        let session = hub.start_session("tool-owner", "tool-session");
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.telemetry.observability_session = Some(session);
+        let mut failed = make_edge_tool("read_file", "missing");
+        failed.status = "failed".into();
+        record_edge_tool_observability(
+            &mut state,
+            &[make_edge_tool("read_file", "contents"), failed],
+        );
+        let profile = hub.profiles().get_profile("tool-owner");
+        assert_eq!(profile.stats.total_tool_calls, 2);
+        assert_eq!(profile.stats.tool_usage.get("read_file"), Some(&2));
+        assert_eq!(
+            hub.profiles()
+                .get_profile("unrelated-owner")
+                .stats
+                .total_tool_calls,
+            0
+        );
     }
 
     #[test]

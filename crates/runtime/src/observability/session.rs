@@ -503,10 +503,6 @@ impl ObservabilitySession {
         self.started_at.elapsed()
     }
 
-    /// Record a tool result (no-op; previously fed the goal tracker).
-    pub fn record_tool_result(&mut self, _tool_name: &str, _output: &str, _exit_code: Option<i32>) {
-    }
-
     pub fn rollback_snapshot(&self) -> ObservabilitySessionRollbackSnapshot {
         record_observability_rollback_history(
             astra_core::history_work::HistoryWorkSite::ObservabilityRollbackSnapshotClone,
