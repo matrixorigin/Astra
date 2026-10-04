@@ -26,6 +26,8 @@ mod tests {
     use astra_messaging::router::AgentMailboxRouter;
     use astra_messaging::types::*;
 
+    const DELEGATION_ID: &str = "del-mailbox-test";
+
     // ── Custom executor that uses mailbox to communicate ────────────────────
 
     /// An executor where each "agent" sends a message to parent via mailbox,
@@ -55,10 +57,11 @@ mod tests {
                 let _ = mailbox.send(hello_msg).await;
 
                 // 2. Broadcast to all peers in the delegation group.
-                let did = mailbox.delegation_id.clone().unwrap_or_default();
                 let broadcast_msg = AgentMessage::new(
                     mailbox.address.clone(),
-                    MessageTarget::Broadcast { delegation_id: did },
+                    MessageTarget::Broadcast {
+                        delegation_id: DELEGATION_ID.into(),
+                    },
                     MessagePayload::Text {
                         content: format!("{agent_id} reporting in"),
                         summary: None,
@@ -135,7 +138,7 @@ mod tests {
     fn fan_out_request(agents: Vec<&str>) -> DelegationRequest {
         DelegationRequest {
             session_id: "test-session".into(),
-            delegation_id: "del-mailbox-test".into(),
+            delegation_id: DELEGATION_ID.into(),
             parent_run_id: "parent-run".into(),
             task: "test task with mailbox".into(),
             pattern: CoordinationPattern::FanOut {
