@@ -2947,7 +2947,8 @@ pub(crate) fn volatile_injection_edge_profile(
         payload: injection.payload.clone(),
         round_index: injection.round_index,
         authority_lifetime: (injection.kind == VolatileKind::ActiveTurnFrame
-            || is_retained_mailbox_context(injection))
+            || is_retained_mailbox_context(injection)
+            || is_direct_child_result(injection))
         .then_some(RuntimeAuthorityLifetime::CurrentUserTurn),
     }
 }
@@ -4462,9 +4463,9 @@ impl AgenticLoopState {
 
     /// Persist provider-visible runtime authority without claiming human-turn
     /// provenance or adding it to a child run's conversational transcript.
-    /// This is the only runtime-context class allowed in canonical prompt
-    /// history because its physical append position is part of the provider
-    /// cache contract.
+    /// This delivery class preserves semantic input and provider-required
+    /// authority across retries, recovery and compaction. Wire projection
+    /// retains the provider's cache layout without changing semantic lifetime.
     pub fn extend_append_only_runtime_messages<I>(
         &mut self,
         messages: I,
@@ -4482,7 +4483,14 @@ impl AgenticLoopState {
                 "canonical append-only runtime history received a message from another delivery lane",
             ));
         }
-        self.messages.extend(messages);
+        for message in messages {
+            if !crate::turn::wire_assembly::append_only_runtime_authority_is_redundant(
+                &self.messages,
+                &message,
+            ) {
+                self.messages.push(message);
+            }
+        }
         Ok(())
     }
 

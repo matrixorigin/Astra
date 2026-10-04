@@ -1785,18 +1785,24 @@ pub(crate) fn assemble_context_pipeline(
             astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
         ),
     );
-    volatile_preamble.extend(
-        runtime_volatile_injections
-            .iter()
-            .filter(|injection| {
-                matches!(
-                    injection.delivery_class,
-                    astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
-                        | astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::DecisionFeedback
-                )
-            })
-            .filter_map(crate::turn::wire_assembly::runtime_volatile_preamble_message),
-    );
+    for injection in runtime_volatile_injections.iter().filter(|injection| {
+        matches!(
+            injection.delivery_class,
+            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
+                | astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::DecisionFeedback
+        )
+    }) {
+        volatile_preamble.extend(
+            crate::turn::wire_assembly::runtime_volatile_preamble_messages(injection).map_err(
+                |error| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        error.to_string(),
+                    )
+                },
+            )?,
+        );
+    }
     let stable_system_message_count = system_messages.len();
     let volatile_preamble_count = volatile_preamble.len();
     let system_prompt_tokens = system_messages

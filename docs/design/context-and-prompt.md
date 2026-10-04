@@ -81,6 +81,14 @@ Platform integrations must put invariant rules in `stable_runtime_system_prompt`
 and per-turn data in `runtime_system_prompt`. Switching a runtime policy can
 change the system prefix; changing round facts must not.
 
+Semantic mailbox input and terminal child results survive temporary delivery
+retirement for the current human turn. They use the existing typed canonical
+runtime history, deduplication, checkpoint and compaction path independently of
+provider cache placement. Other layouts re-home those frames into their required
+context lane; they do not turn them into human requests. Transport acceptance
+and model observation remain distinct, and retries do not consume an unanswered
+question's obligation before the matching answer is observed.
+
 The explicitly selected append-only layout keeps its existing runtime-owned
 user frames, lifetimes, and durable history protocol. It is already a single-
 system wire shape and is not flattened into ordinary human messages. On other
