@@ -112,13 +112,6 @@ fn inspect_debug_source(
 
     // If journal has no turns but checkpoints exist, offer checkpoint-only inspection.
     if turns.is_empty() {
-        if checkpoints.is_empty() {
-            eprintln!(
-                "\n  {}",
-                "No turn data yet. Complete a conversation turn first.".dim()
-            );
-            return true;
-        }
         eprintln!(
             "\n  {}",
             "No journal turns (journal may not have been initialized).".dim()
@@ -1117,11 +1110,8 @@ mod tests {
 
     #[serial_test::serial]
     #[test]
-    fn initialized_account_debug_reads_only_attached_sources_with_owner_checkpoints() {
-        use astra_services::{
-            SessionArtifactStore,
-            session_journal::{JournalEvent, JournalWriter},
-        };
+    fn initialized_account_debug_rejects_foreign_sessions_and_cursors() {
+        use astra_services::session_journal::JournalEvent;
         let _home = crate::test_utils::HomeGuard::temp();
         let _root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
         let _credentials = crate::tests::isolate_credentials();
@@ -1140,91 +1130,15 @@ mod tests {
         let (local, account) =
             crate::cli::cli_config::cli_utils::attached_journal_owners().unwrap();
         let account = account.unwrap();
-        let store = astra_services::local_session_artifact_store();
         let session = uuid::Uuid::new_v4().to_string();
+        let other_session = uuid::Uuid::new_v4().to_string();
+        let unrelated = astra_services::OwnerScope::user("unrelated-account").unwrap();
         let turn = |session: &str, text: &str| {
             JournalEvent::turn(Some(session), 1, None, text, "done", 0, 12, 3, 2)
         };
-        for (owner, text) in [(&local, "profile turn"), (&account, "account turn")] {
-            let writer = if owner == &local {
-                JournalWriter::new(&session)
-            } else {
-                JournalWriter::for_user(owner.id(), &session)
-            }
-            .unwrap();
-            writer.append(&turn(&session, text)).unwrap();
-            let base = store.session_dir_for_owner(owner, &session).unwrap();
-            let checkpoints = base.join("step_checkpoints");
-            std::fs::create_dir_all(&checkpoints).unwrap();
-            std::fs::write(
-                checkpoints.join("000001-heavy.json"),
-                serde_json::to_vec(&json!({
-                    "Heavy": {"messages": [{"role":"user", "content":text}]}
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-            let sources =
-                crate::cli::journal_digest::read_attached_journal_sources(&session).unwrap();
-            let source = sources
-                .iter()
-                .find(|source| &source.owner == owner)
-                .unwrap();
-            if owner == &local {
-                assert!(sources[1].events.is_empty());
-            }
-            let turns = super::project_journal_turns(&source.events);
-            assert_eq!(turns.len(), 1);
-            assert_eq!(turns[0].user_input, text);
-            let files = list_heavy_checkpoints(&base);
-            let view = build_turn_messages_view(1, &files).unwrap();
-            assert_eq!(view.full[0]["content"], text);
-            assert_eq!(resolve_session_id(&session[..8]).unwrap(), session);
-        }
-        let clock_session = uuid::Uuid::new_v4().to_string();
-        let mut first = turn(&clock_session, "first appended");
-        first.ts = "2030-01-01T00:00:00Z".into();
-        let mut second = turn(&clock_session, "second appended");
-        second.turn = Some(2);
-        second.ts = "2020-01-01T00:00:00Z".into();
-        let writer = JournalWriter::new(&clock_session).unwrap();
-        writer.append(&first).unwrap();
-        writer.append(&second).unwrap();
-        let sources =
-            crate::cli::journal_digest::read_attached_journal_sources(&clock_session).unwrap();
-        let turns = super::project_journal_turns(&sources[0].events);
-        assert_eq!(
-            turns
-                .iter()
-                .map(|turn| turn.user_input.as_str())
-                .collect::<Vec<_>>(),
-            vec!["first appended", "second appended"]
-        );
-        // Only the installed identity attaches storage owners.
-        let unrelated = astra_services::OwnerScope::user("unrelated-account").unwrap();
-        let other_session = uuid::Uuid::new_v4().to_string();
-        let writer = JournalWriter::for_user(unrelated.id(), &other_session).unwrap();
-        writer.append(&turn(&other_session, "private")).unwrap();
-        let sources =
-            crate::cli::journal_digest::read_attached_journal_sources(&other_session).unwrap();
-        assert!(sources.iter().all(|source| source.events.is_empty()));
-        assert!(sources.iter().all(|source| source.owner != unrelated));
-        // Missing profile data must not block account-only data.
         let path =
             astra_services::session_journal::journal_file_path_for_owner(&local, &session).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        let sources = crate::cli::journal_digest::read_attached_journal_sources(&session).unwrap();
-        assert!(sources[0].events.is_empty());
-        assert_eq!(
-            super::project_journal_turns(&sources[1].events)[0]
-                .user_input
-                .as_str(),
-            "account turn"
-        );
-        assert!(
-            !list_heavy_checkpoints(&store.session_dir_for_owner(&local, &session).unwrap())
-                .is_empty()
-        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         // A file in an attached partition still cannot claim another session.
         std::fs::write(
             path,
@@ -1254,6 +1168,7 @@ mod tests {
         let account_path =
             astra_services::session_journal::journal_file_path_for_owner(&account, &session)
                 .unwrap();
+        std::fs::create_dir_all(account_path.parent().unwrap()).unwrap();
         std::fs::write(account_path, serde_json::to_vec(&foreign_cursor).unwrap()).unwrap();
         assert!(
             crate::cli::journal_digest::read_attached_journal_sources(&session)

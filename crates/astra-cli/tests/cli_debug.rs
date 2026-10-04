@@ -133,7 +133,7 @@ async fn debug_reads_attached_journals_and_pairs_checkpoints_in_append_order() {
         &session,
         &[("account-paired-evidence", timestamp)],
     );
-    let output = run(&session, "1\n6\n1\nb\nn\n1\n6\n1\nb\nq\n");
+    let output = run(&session, "1\n6\n1\n5\n7\nb\nn\n1\n6\n1\n5\n7\nb\nq\n");
     assert!(
         output.contains("profile-paired-evidence") && output.contains("account-paired-evidence"),
         "{output}"
@@ -163,6 +163,74 @@ async fn debug_reads_attached_journals_and_pairs_checkpoints_in_append_order() {
         !output[account_source..].contains("profile-paired-evidence"),
         "{output}"
     );
+    let exports = output
+        .lines()
+        .filter_map(|line| {
+            line.split_once("Written to ")
+                .map(|(_, path)| path.split('\u{1b}').next().unwrap().trim())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(exports.len(), 4, "{output}");
+    for (index, path) in exports.iter().enumerate() {
+        let payload: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(path)
+                .unwrap_or_else(|error| panic!("export {path:?}: {error}; output: {output}")),
+        )
+        .unwrap();
+        let (owner, text) = if index < 2 {
+            (&profile, "profile-paired-evidence")
+        } else {
+            (&account, "account-paired-evidence")
+        };
+        assert_eq!(payload["owner_id"], owner.id());
+        assert_eq!(payload["session_id"], session);
+        let messages = if index % 2 == 0 {
+            &payload["messages_delta"]
+        } else {
+            &payload["messages"]
+        };
+        assert_eq!(messages, &json!([{"role":"user", "content":text}]));
+        std::fs::remove_file(path).unwrap();
+    }
+    // No journal exists: exercise the checkpoint-only display and export entrypoint.
+    let checkpoint_session = uuid::Uuid::new_v4().to_string();
+    let checkpoint_dir = store
+        .session_dir_for_owner(&profile, &checkpoint_session)
+        .unwrap()
+        .join("step_checkpoints");
+    std::fs::create_dir_all(&checkpoint_dir).unwrap();
+    std::fs::write(
+        checkpoint_dir.join("000001-heavy.json"),
+        serde_json::to_vec(
+            &json!({"Heavy":{"messages":[{"role":"user","content":"checkpoint-only-evidence"}]}}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run(&checkpoint_session, "1\n7\nb\n");
+    assert!(
+        output.contains("No journal turns") && output.contains("checkpoint-only-evidence"),
+        "{output}"
+    );
+    let path = output
+        .lines()
+        .find_map(|line| {
+            line.split_once("Written to ")
+                .map(|(_, path)| path.split('\u{1b}').next().unwrap().trim())
+        })
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path)
+            .unwrap_or_else(|error| panic!("export {path:?}: {error}; output: {output}")),
+    )
+    .unwrap();
+    assert_eq!(payload["owner_id"], profile.id());
+    assert_eq!(payload["session_id"], checkpoint_session);
+    assert_eq!(
+        payload["messages"],
+        json!([{"role":"user","content":"checkpoint-only-evidence"}])
+    );
+    std::fs::remove_file(path).unwrap();
     let clock_session = uuid::Uuid::new_v4().to_string();
     write_source(
         &profile,
@@ -210,7 +278,7 @@ async fn debug_reads_attached_journals_and_pairs_checkpoints_in_append_order() {
         "{output}"
     );
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 6);
     assert!(
         requests
             .iter()
