@@ -1,7 +1,7 @@
 //! Realistic team HTTP API integration tests — complex lifecycle scenarios.
 //!
 //! Exercises the full team management surface through HTTP requests:
-//! CRUD with budget/max_parallel, validation edge-cases, execution history,
+//! CRUD and draft persistence, validation edge-cases,
 //! concurrent team mutations, upsert semantics, and large-team handling.
 //!
 //! Uses Tower oneshot (no network), InMemoryTeamStore (no DB required).
@@ -21,7 +21,7 @@ use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
 };
-use astra_services::team_persistence::{InMemoryTeamStore, TeamPersistenceService};
+use astra_services::team_persistence::InMemoryTeamStore;
 
 // ─── Stubs ──────────────────────────────────────────────────────────────────
 
@@ -97,13 +97,6 @@ fn build_test_app() -> Router {
 fn build_test_app_without_team_store() -> Router {
     let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth));
-    build_app(state)
-}
-
-fn build_test_app_with_store(store: Arc<InMemoryTeamStore>) -> Router {
-    let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
-        .with_auth_service(Arc::new(StubAuth))
-        .with_team_store(store);
     build_app(state)
 }
 
@@ -191,7 +184,6 @@ fn dev_team_payload() -> Value {
     json!({
         "name": "dev-cycle",
         "description": "Full dev cycle: plan, implement, test, review",
-        "coordination": { "type": "sequential", "stop_on_success": false },
         "members": [
             {
                 "role": "planner",
@@ -234,13 +226,6 @@ fn dev_team_payload() -> Value {
             "language": "rust",
             "test_cmd": "cargo test --workspace"
         },
-        "worktree_mode": "isolated",
-        "budget": {
-            "max_cost_usd": 25.0,
-            "max_tokens": 2000000,
-            "max_duration_secs": 1800
-        },
-        "max_parallel": 2
     })
 }
 
@@ -248,10 +233,6 @@ fn ordered_review_payload() -> Value {
     json!({
         "name": "ordered-review",
         "description": "Produce an output and review it in order",
-        "coordination": {
-            "type": "sequential",
-            "stop_on_success": false
-        },
         "members": [
             {
                 "role": "producer",
@@ -270,11 +251,6 @@ fn ordered_review_payload() -> Value {
                 "max_delegation_depth": 0
             }
         ],
-        "budget": {
-            "max_cost_usd": 10.0,
-            "max_tokens": 500000,
-            "max_duration_secs": 600
-        }
     })
 }
 
@@ -282,10 +258,6 @@ fn fanout_research_payload() -> Value {
     json!({
         "name": "parallel-research",
         "description": "Fan-out: 3 researchers investigate in parallel, results merged",
-        "coordination": {
-            "type": "fan_out",
-            "aggregation": "all_results"
-        },
         "members": [
             {
                 "role": "researcher-api",
@@ -312,12 +284,6 @@ fn fanout_research_payload() -> Value {
                 "max_delegation_depth": 0
             }
         ],
-        "max_parallel": 3,
-        "budget": {
-            "max_cost_usd": 5.0,
-            "max_tokens": 300000,
-            "max_duration_secs": 300
-        }
     })
 }
 
@@ -325,10 +291,6 @@ fn sequential_migration_payload() -> Value {
     json!({
         "name": "db-migration",
         "description": "Sequential: analyze schema, write migration, test, deploy",
-        "coordination": {
-            "type": "sequential",
-            "stop_on_success": false
-        },
         "members": [
             {
                 "role": "schema-analyst",
@@ -359,7 +321,7 @@ async fn scenario_full_team_lifecycle() {
     let app = build_test_app();
     let user = "lifecycle-user";
 
-    // ── Create 4 teams with different coordination patterns ──
+    // ── Create 4 teams with distinct member rosters ──
     let teams = [
         ("dev-cycle", dev_team_payload()),
         ("ordered-review", ordered_review_payload()),
@@ -391,56 +353,28 @@ async fn scenario_full_team_lifecycle() {
     assert!(names.contains(&"research"));
     assert!(names.contains(&"dev"));
 
-    // Verify budget/max_parallel visible in list summary
-    let dev_summary = team_list.iter().find(|t| t["name"] == "dev-cycle").unwrap();
-    assert_eq!(dev_summary["max_parallel"], 2);
-    assert_eq!(dev_summary["budget"]["max_cost_usd"], 25.0);
-    assert_eq!(dev_summary["coordination"]["type"], "sequential");
-    assert_eq!(dev_summary["worktree_mode"], "isolated");
-    let migration_summary = team_list
-        .iter()
-        .find(|t| t["name"] == "db-migration")
-        .unwrap();
-    assert_eq!(migration_summary["max_parallel"], 0);
-    assert!(migration_summary.get("budget").is_none() || migration_summary["budget"].is_null());
-
-    // ── Get detail for dev-cycle: verify budget & max_parallel ──
+    // ── Get detail for dev-cycle: verify members ──
     let (status, body) = get(app.clone(), "/teams/dev-cycle", user).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["name"], "dev-cycle");
     assert_eq!(body["members"].as_array().unwrap().len(), 4);
-    assert_eq!(body["max_parallel"], 2);
-    let budget = &body["budget"];
-    assert_eq!(budget["max_cost_usd"], 25.0);
-    assert_eq!(budget["max_tokens"], 2_000_000);
-    assert_eq!(budget["max_duration_secs"], 1800);
-    assert_eq!(body["worktree_mode"], "isolated");
-    assert_eq!(body["coordination"]["type"], "sequential");
 
     // ── Get detail for ordered-review ──
     let (status, body) = get(app.clone(), "/teams/ordered-review", user).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["coordination"]["type"], "sequential");
-    assert_eq!(body["coordination"]["stop_on_success"], false);
     assert_eq!(body["members"].as_array().unwrap().len(), 2);
 
-    // ── Update dev-cycle: change budget and add max_parallel ──
+    // ── Update dev-cycle: change description ──
     let mut updated = dev_team_payload();
     updated["description"] = json!("Updated: full dev cycle v2");
-    updated["budget"]["max_cost_usd"] = json!(50.0);
-    updated["max_parallel"] = json!(4);
     let (status, body) = post(app.clone(), "/teams", user, updated).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["description"], "Updated: full dev cycle v2");
-    assert_eq!(body["budget"]["max_cost_usd"], 50.0);
-    assert_eq!(body["max_parallel"], 4);
 
     // Re-fetch to confirm persistence
     let (status, body) = get(app.clone(), "/teams/dev-cycle", user).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["description"], "Updated: full dev cycle v2");
-    assert_eq!(body["budget"]["max_cost_usd"], 50.0);
-    assert_eq!(body["max_parallel"], 4);
 
     // ── Delete db-migration ──
     let (status, body) = delete(app.clone(), "/teams/db-migration", user).await;
@@ -532,11 +466,11 @@ async fn scenario_fresh_owner_lazily_receives_isolated_builtin_teams() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn scenario_validation_rejects_bad_teams() {
+async fn scenario_draft_persistence_and_validation() {
     let app = build_test_app();
     let user = "validator";
 
-    // Empty members
+    // Empty rosters are persisted drafts.
     let (status, body) = post(
         app.clone(),
         "/teams",
@@ -544,35 +478,15 @@ async fn scenario_validation_rejects_bad_teams() {
         json!({
             "name": "empty-team",
             "description": "no members",
-            "coordination": { "type": "sequential", "stop_on_success": false },
             "members": []
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "empty members: {body}");
-
-    // Retired coordination strategy is rejected, not silently translated
-    let (status, body) = post(
-        app.clone(),
-        "/teams",
-        user,
-        json!({
-            "name": "bad-adversarial",
-            "description": "unsupported coordination strategy",
-            "coordination": { "type": "adversarial", "max_rounds": 3, "threshold": 0.8 },
-            "members": [
-                { "role": "a", "skills": [], "mcp_servers": [] },
-                { "role": "b", "skills": [], "mcp_servers": [] },
-                { "role": "c", "skills": [], "mcp_servers": [] }
-            ]
-        }),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "retired strategy schema rejection: {body}"
-    );
+    assert_eq!(status, StatusCode::OK, "empty roster draft: {body}");
+    assert_eq!(body["members"], json!([]));
+    let (status, saved) = get(app.clone(), "/teams/empty-team", user).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved, body);
 
     // Duplicate roles
     let (status, body) = post(
@@ -582,7 +496,6 @@ async fn scenario_validation_rejects_bad_teams() {
         json!({
             "name": "dup-roles",
             "description": "duplicate role names",
-            "coordination": { "type": "sequential", "stop_on_success": false },
             "members": [
                 { "role": "coder", "skills": [], "mcp_servers": [] },
                 { "role": "coder", "skills": [], "mcp_servers": [] }
@@ -591,24 +504,6 @@ async fn scenario_validation_rejects_bad_teams() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "duplicate roles: {body}");
-
-    // Negative budget
-    let (status, body) = post(
-        app.clone(),
-        "/teams",
-        user,
-        json!({
-            "name": "neg-budget",
-            "description": "negative cost",
-            "coordination": { "type": "sequential", "stop_on_success": false },
-            "members": [
-                { "role": "coder", "skills": [], "mcp_servers": [] }
-            ],
-            "budget": { "max_cost_usd": -5.0 }
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "negative budget: {body}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -635,33 +530,8 @@ async fn scenario_upsert_preserves_team_id() {
         "team_id must be stable across upserts"
     );
     assert_eq!(body2["description"], "Updated migration workflow v2");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Scenario 5: Execution history through orchestrator-level store
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn scenario_execution_history_via_api() {
-    let app = build_test_app();
-    let user = "exec-user";
-
-    // Create team
-    let (s, body) = post(app.clone(), "/teams", user, fanout_research_payload()).await;
-    assert_eq!(s, StatusCode::OK);
-    let team_name = body["name"].as_str().unwrap();
-    let team_id = body["team_id"].as_str().unwrap();
-
-    // No executions yet
-    let (s, body) = get(app.clone(), &format!("/teams/{team_name}/executions"), user).await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(body["executions"].as_array().unwrap().len(), 0);
-    assert_eq!(body["team_name"], team_name);
-
-    let (s, body) = get(app.clone(), &format!("/teams/{team_id}/executions"), user).await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(body["team_id"], team_id);
-    assert_eq!(body["team_name"], team_name);
+    let created_at = body1["created_at"].as_str().expect("created_at");
+    assert_eq!(body2["created_at"].as_str(), Some(created_at));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -707,10 +577,6 @@ async fn scenario_complex_team_full_roundtrip() {
     let payload = json!({
         "name": "mega-team",
         "description": "Complex team exercising every field",
-        "coordination": {
-            "type": "fan_out",
-            "aggregation": "all_results"
-        },
         "members": [
             {
                 "role": "lead",
@@ -765,13 +631,6 @@ async fn scenario_complex_team_full_roundtrip() {
             "deploy_target": "kubernetes",
             "branch": "feature/team-system"
         },
-        "worktree_mode": "isolated",
-        "budget": {
-            "max_cost_usd": 100.0,
-            "max_tokens": 5000000,
-            "max_duration_secs": 3600
-        },
-        "max_parallel": 3
     });
 
     // Create
@@ -786,18 +645,6 @@ async fn scenario_complex_team_full_roundtrip() {
     assert_eq!(team["name"], "mega-team");
     assert_eq!(team["description"], "Complex team exercising every field");
     assert_eq!(team["user_id"], user);
-    assert_eq!(team["worktree_mode"], "isolated");
-    assert_eq!(team["max_parallel"], 3);
-
-    // Coordination
-    assert_eq!(team["coordination"]["type"], "fan_out");
-    assert_eq!(team["coordination"]["aggregation"], "all_results");
-
-    // Budget
-    let b = &team["budget"];
-    assert_eq!(b["max_cost_usd"], 100.0);
-    assert_eq!(b["max_tokens"], 5_000_000);
-    assert_eq!(b["max_duration_secs"], 3600);
 
     // Members
     let members = team["members"].as_array().unwrap();
@@ -839,30 +686,10 @@ async fn scenario_complex_team_full_roundtrip() {
     assert_eq!(team["context"]["ci"], "github-actions");
     assert_eq!(team["context"]["deploy_target"], "kubernetes");
     assert_eq!(team["context"]["branch"], "feature/team-system");
-
-    // ── Upsert: reduce budget, change member ──
-    let mut updated = payload.clone();
-    updated["budget"]["max_cost_usd"] = json!(50.0);
-    updated["max_parallel"] = json!(5);
-    let created_at_first = team["created_at"].as_str().unwrap().to_string();
-
-    let (status, body) = post(app.clone(), "/teams", user, updated).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        body["team_id"], team["team_id"],
-        "team_id stable after upsert"
-    );
-    assert_eq!(body["budget"]["max_cost_usd"], 50.0);
-    assert_eq!(body["max_parallel"], 5);
-    assert_eq!(
-        body["created_at"].as_str(),
-        Some(created_at_first.as_str()),
-        "created_at must be preserved on upsert"
-    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Scenario 9: Team without optional fields — budget=null, max_parallel=0
+// Scenario 9: Team without optional fields
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -876,8 +703,7 @@ async fn scenario_minimal_team_defaults() {
         user,
         json!({
             "name": "bare-minimum",
-            "description": "No budget, no max_parallel, shared worktree",
-            "coordination": { "type": "sequential", "stop_on_success": false },
+            "description": "Minimal member configuration",
             "members": [
                 { "role": "worker", "skills": [], "mcp_servers": [] }
             ]
@@ -886,21 +712,9 @@ async fn scenario_minimal_team_defaults() {
     .await;
     assert_eq!(status, StatusCode::OK, "minimal team: {body}");
 
-    let (_, team) = get(app, "/teams/bare-minimum", user).await;
-    assert!(team.get("budget").is_none() || team["budget"].is_null());
-    assert_eq!(team["max_parallel"], 0);
-    assert_eq!(team["worktree_mode"], "shared");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Scenario 10: Execution history for non-existent team → 404
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn scenario_executions_nonexistent_team_404() {
-    let app = build_test_app();
-    let (status, _) = get(app, "/teams/ghost/executions", "anyone").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, saved) = get(app, "/teams/bare-minimum", user).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved, body);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -922,85 +736,24 @@ async fn scenario_team_routes_without_store_return_503() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Scenario 12: Malformed JSON on POST /teams
+// Scenario 12: Malformed JSON and unknown fields on POST /teams
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn scenario_post_teams_invalid_json_is_4xx() {
+async fn scenario_post_teams_invalid_payload_is_4xx() {
     let app = build_test_app();
-    let (status, _) = post_raw(app, "/teams", "u1", "{not valid json").await;
+    let (status, _) = post_raw(app.clone(), "/teams", "u1", "{not valid json").await;
     assert!(
         status.is_client_error(),
         "expected 4xx for invalid JSON, got {status}"
     );
-}
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Scenario 13: Execution history reflects store records (limit clamp)
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn scenario_execution_history_and_limit_clamp() {
-    let store = Arc::new(InMemoryTeamStore::new());
-    let app = build_test_app_with_store(store.clone());
-    let user = "exec-history-user";
-
-    let (status, created) = post(
-        app.clone(),
-        "/teams",
-        user,
-        json!({
-            "name": "exec-history-team",
-            "description": "for execution listing",
-            "coordination": { "type": "sequential", "stop_on_success": false },
-            "members": [{ "role": "solo", "skills": [], "mcp_servers": [] }]
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "create team: {created}");
-
-    let team_id = created["team_id"].as_str().unwrap();
-
-    for i in 0..5 {
-        let eid = format!("exec-{i}");
-        store
-            .record_execution_start(&eid, team_id, user, &format!("task {i}"))
-            .await
-            .unwrap();
-    }
-
-    let (status, body) = get(
-        app.clone(),
-        "/teams/exec-history-team/executions?limit=2",
-        user,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["executions"].as_array().unwrap().len(), 2);
-
-    // limit=0 → handler uses default window (50); we have 5 rows
-    let (status, body) = get(
-        app.clone(),
-        "/teams/exec-history-team/executions?limit=0",
-        user,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["executions"].as_array().unwrap().len(), 5);
-
-    store
-        .record_execution_complete("exec-0", "completed", Some(r#"{"ok":true}"#))
-        .await
-        .unwrap();
-
-    let (status, body) = get(app, "/teams/exec-history-team/executions?limit=10", user).await;
-    assert_eq!(status, StatusCode::OK);
-    let execs = body["executions"].as_array().unwrap();
-    let done = execs
-        .iter()
-        .find(|e| e["execution_id"] == "exec-0")
-        .unwrap();
-    assert_eq!(done["status"], "completed");
+    let mut payload = dev_team_payload();
+    payload["unexpected"] = json!(true);
+    let (status, _) = post(app.clone(), "/teams", "u1", payload).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _) = get(app, "/teams/dev-cycle", "u1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

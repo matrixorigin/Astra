@@ -95,8 +95,7 @@ pub use delegation_model_admission::{
     DelegationModelAdmissionOutcome, DelegationModelInstructionSource,
     DelegationModelSlotConstraint, DelegationReasoningEffort, DelegationReasoningRequirement,
     DelegationRequirementPropagation, DelegationRequirementStrength,
-    DelegationUserRequirementSource, DirectDelegationCommandIdentity, DirectDelegationModelPlan,
-    MAX_DIRECT_DELEGATION_SLOTS, MAX_MODEL_ADMISSION_SLOTS,
+    DelegationUserRequirementSource, MAX_MODEL_ADMISSION_SLOTS,
 };
 pub use explain_analyze::{
     EXPLAIN_ANALYZE_EVENT_TYPE, EXPLAIN_ANALYZE_MAX_SAFE_INTEGER, EXPLAIN_ANALYZE_SCHEMA_VERSION,

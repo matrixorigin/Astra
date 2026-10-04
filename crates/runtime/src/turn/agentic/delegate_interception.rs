@@ -58,8 +58,6 @@ async fn execute_delegation(
             admitted_model_execution.cloned(),
             parent_model_reasoning,
             live_event_sink,
-            None,
-            None,
         )
         .await
 }

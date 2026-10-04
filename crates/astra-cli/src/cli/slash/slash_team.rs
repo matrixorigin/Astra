@@ -1,8 +1,7 @@
-use crate::cli::surface::run_status_surface::run_status_icon;
 use crate::cli::{
     cli_config::cli_utils::truncate_str, session::session_state::SessionState, theme,
 };
-use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode};
+use astra_services::team_persistence::TeamPersistenceService;
 use crossterm::style::Stylize;
 use std::collections::HashMap;
 
@@ -272,46 +271,17 @@ pub(crate) async fn handle_team_command(
         }
 
         "create" => {
-            // /team create <name> [--mode fanout|sequential] [description]
+            // /team create <name> [description]
             let mut parts = sub_arg.splitn(2, ' ');
             let name = parts.next().unwrap_or("").trim();
             let rest = parts.next().unwrap_or("").trim();
             if name.is_empty() {
-                return Err(
-                    "Usage: /team create <name> [--mode fanout|sequential] [description]".into(),
-                );
+                return Err("Usage: /team create <name> [description]".into());
             }
-            let (coordination, desc) = if rest.starts_with("--mode ") {
-                let after_flag = &rest[7..];
-                let mut mode_parts = after_flag.splitn(2, ' ');
-                let mode_str = mode_parts.next().unwrap_or("");
-                let d = mode_parts.next().unwrap_or("").trim();
-                let coord = match mode_str {
-                    "fanout" | "fan-out" => {
-                        Some(astra_services::team_persistence::TeamCoordination::FanOut {
-                            aggregation:
-                                astra_services::team_persistence::TeamAggregation::AllResults,
-                        })
-                    }
-                    "sequential" => Some(
-                        astra_services::team_persistence::TeamCoordination::Sequential {
-                            stop_on_success: false,
-                        },
-                    ),
-                    other => {
-                        return Err(format!(
-                            "Unknown mode '{other}'. Options: fanout, sequential"
-                        ));
-                    }
-                };
-                (coord, d)
-            } else {
-                (None, rest)
-            };
-            let description = if desc.is_empty() {
+            let description = if rest.is_empty() {
                 format!("Custom team: {name}")
             } else {
-                desc.to_string()
+                rest.to_string()
             };
             let user_id = state
                 .ingestion_user_id
@@ -326,16 +296,8 @@ pub(crate) async fn handle_team_command(
                 user_id,
                 name: name.to_string(),
                 description,
-                coordination: coordination.unwrap_or(
-                    astra_services::team_persistence::TeamCoordination::FanOut {
-                        aggregation: astra_services::team_persistence::TeamAggregation::AllResults,
-                    },
-                ),
                 members: Vec::new(),
                 context: HashMap::new(),
-                worktree_mode: WorktreeMode::Shared,
-                budget: None,
-                max_parallel: 0,
                 created_at: now.clone(),
                 updated_at: now,
             };
@@ -441,7 +403,6 @@ pub(crate) async fn handle_team_command(
                     );
                     eprintln!("  {} {}", "Description:".dim(), t.description);
                     eprintln!("  {} {}", "Created:".dim(), t.created_at);
-                    eprintln!("  {} {:?}", "Coordination:".dim(), t.coordination);
                     eprintln!("\n  {}", "Members:".bold());
                     for m in &t.members {
                         let agent_id =
@@ -530,38 +491,6 @@ pub(crate) async fn handle_team_command(
             );
         }
 
-        "history" => {
-            let name = sub_arg.trim();
-            if name.is_empty() {
-                return Err("Usage: /team history <team>".into());
-            }
-            let team = state
-                .team_registry
-                .get(name)
-                .ok_or_else(|| format!("Team '{name}' not found"))?;
-            let entries = state
-                .team_store
-                .list_executions(&team.team_id, 50)
-                .await
-                .map_err(|error| format!("failed to load team history: {error}"))?;
-            eprintln!("\n─── Team batch execution history: {name} ───");
-            if entries.is_empty() {
-                eprintln!(
-                    "  No batch execution records. Interactive lead turns use the ordinary session trace."
-                );
-            }
-            for entry in entries {
-                eprintln!(
-                    "  {} {} · {} · {}",
-                    run_status_icon(&entry.status),
-                    entry.execution_id,
-                    entry.status,
-                    entry.started_at
-                );
-                eprintln!("    {}", truncate_str(&entry.task, 70));
-            }
-        }
-
         "snapshot" => {
             // /team snapshot <team> [label]
             let mut parts = sub_arg.splitn(2, ' ');
@@ -588,7 +517,7 @@ pub(crate) async fn handle_team_command(
             };
 
             // Persist the complete canonical definition, not a display-only
-            // projection that would discard member capabilities or budgets.
+            // projection that would discard member capabilities or context.
             let team_def_json = Some(
                 serde_json::to_string(&team_definition)
                     .map_err(|error| format!("failed to encode team snapshot: {error}"))?,
@@ -683,7 +612,7 @@ pub(crate) async fn handle_team_command(
 }
 
 fn team_subcommands_hint() -> &'static str {
-    "Subcommands: /team list · info · create · add-member · context · run · history · snapshot · restore · delete · help"
+    "Subcommands: /team list · info · create · add-member · context · run · snapshot · restore · delete · help"
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -693,7 +622,6 @@ mod tests {
     use super::{Team, TeamMember, TeamRegistry, git_head_sha, team_subcommands_hint};
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use crate::cli::session::session_state::SessionState;
-    use astra_services::team_persistence::WorktreeMode;
     use std::collections::HashMap;
 
     #[test]
@@ -717,12 +645,6 @@ mod tests {
     #[test]
     fn canonical_projection_preserves_member_and_team_fields() {
         let mut team = make_team(&["coder"]);
-        team.budget = Some(astra_services::team_persistence::TeamBudget {
-            max_cost_usd: 2.5,
-            max_tokens: 900,
-            max_duration_secs: 30,
-        });
-        team.max_parallel = 2;
         team.members[0].agent_id = Some("stable-coder".into());
         team.members[0].mcp_servers = vec!["docs".into()];
         team.members[0].can_delegate = true;
@@ -732,8 +654,6 @@ mod tests {
         reg.merge_from_store(vec![team.clone()]);
         let stored = reg.get("test").unwrap();
         assert_eq!(stored.team_id, team.team_id);
-        assert_eq!(stored.budget, team.budget);
-        assert_eq!(stored.max_parallel, team.max_parallel);
         assert_eq!(stored.members[0].agent_id, team.members[0].agent_id);
         assert_eq!(stored.members[0].mcp_servers, team.members[0].mcp_servers);
         assert_eq!(stored.members[0].can_delegate, team.members[0].can_delegate);
@@ -825,12 +745,6 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let mut saved = make_team(&["first"]);
         saved.context.insert("contract".into(), "before".into());
-        saved.max_parallel = 2;
-        saved.budget = Some(astra_services::team_persistence::TeamBudget {
-            max_cost_usd: 1.0,
-            max_tokens: 100,
-            max_duration_secs: 30,
-        });
         saved.members[0].mcp_servers = vec!["fixture-mcp".into()];
         saved.members[0].can_delegate = true;
         saved.members[0].max_delegation_depth = 2;
@@ -892,8 +806,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/teams"))
             .and(wiremock::matchers::body_partial_json(serde_json::json!({
-                "context": saved.context, "budget": saved.budget,
-                "max_parallel": saved.max_parallel, "members": saved.members,
+                "context": saved.context, "members": saved.members,
             })))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&expected))
             .expect(1)
@@ -1002,18 +915,12 @@ mod tests {
                 })
                 .collect(),
             context: HashMap::new(),
-            worktree_mode: WorktreeMode::Shared,
-            coordination: astra_services::team_persistence::TeamCoordination::FanOut {
-                aggregation: astra_services::team_persistence::TeamAggregation::AllResults,
-            },
-            budget: None,
-            max_parallel: 0,
             created_at: now.clone(),
             updated_at: now,
         }
     }
 
-    // ── History / Snapshot tests ─────────────────────────────────
+    // ── Snapshot tests ─────────────────────────────────
 
     #[test]
     fn git_head_sha_returns_some_in_git_repo() {
@@ -1092,9 +999,7 @@ mod tests {
 
     #[test]
     fn merge_from_store_replaces_stale_same_name() {
-        use astra_services::team_persistence::{
-            TeamCoordination, TeamDefinition, TeamMemberDef, WorktreeMode,
-        };
+        use astra_services::team_persistence::{TeamDefinition, TeamMemberDef};
         let mut reg = TeamRegistry::new();
 
         let foreign = TeamDefinition {
@@ -1102,14 +1007,8 @@ mod tests {
             user_id: "u".into(),
             name: "review".into(),
             description: "foreign review".into(),
-            coordination: TeamCoordination::Sequential {
-                stop_on_success: false,
-            },
             members: vec![],
             context: HashMap::new(),
-            worktree_mode: WorktreeMode::Shared,
-            budget: None,
-            max_parallel: 0,
             created_at: "2025-01-01T00:00:00Z".into(),
             updated_at: "2025-01-01T00:00:00Z".into(),
         };
@@ -1122,9 +1021,6 @@ mod tests {
             user_id: "u".into(),
             name: "from-store".into(),
             description: "loaded from store".into(),
-            coordination: TeamCoordination::FanOut {
-                aggregation: astra_services::team_persistence::TeamAggregation::AllResults,
-            },
             members: vec![TeamMemberDef {
                 role: "worker".into(),
                 agent_id: None,
@@ -1137,9 +1033,6 @@ mod tests {
                 ..Default::default()
             }],
             context: HashMap::new(),
-            worktree_mode: WorktreeMode::Shared,
-            budget: None,
-            max_parallel: 0,
             created_at: "2025-01-01T00:00:00Z".into(),
             updated_at: "2025-01-01T00:00:00Z".into(),
         };

@@ -1,4 +1,4 @@
-//! Team CRUD Matrix E2E: `POST/GET/DELETE /teams`, `GET .../executions`, `team_definitions` rows.
+//! Team CRUD Matrix E2E: `POST/GET/DELETE /teams`, `team_definitions` rows.
 //!
 //! Runs against real [`astra_services::team_persistence::MatrixOneTeamStore`] via `build_server_state`.
 
@@ -12,7 +12,6 @@ fn minimal_team_payload(name: &str, description: &str) -> Value {
     json!({
         "name": name,
         "description": description,
-        "coordination": { "type": "sequential", "stop_on_success": false },
         "members": [
             {
                 "role": "coder",
@@ -30,8 +29,6 @@ fn minimal_team_payload(name: &str, description: &str) -> Value {
             }
         ],
         "context": { "suite": "matrix_team_crud" },
-        "worktree_mode": "shared",
-        "max_parallel": 1
     })
 }
 
@@ -63,15 +60,6 @@ pub async fn run_team_crud_db() {
     let (st_get, get_j) = get_json(&ctx.app, &path_detail, Some(auth), &[]).await;
     assert_eq!(st_get, StatusCode::OK, "GET team: {get_j}");
     assert_eq!(get_j["team_id"].as_str(), Some(team_id.as_str()));
-
-    let path_exec = format!("/teams/{team_name}/executions");
-    let (st_ex, ex_j) = get_json(&ctx.app, &path_exec, Some(auth), &[]).await;
-    assert_eq!(st_ex, StatusCode::OK, "GET executions: {ex_j}");
-    assert_eq!(
-        ex_j["executions"].as_array().map(|a| a.len()),
-        Some(0),
-        "no runs yet: {ex_j}"
-    );
 
     let row = sqlx::query(
         "SELECT team_id, user_id, name FROM team_definitions WHERE user_id = ? AND name = ?",

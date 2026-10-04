@@ -1514,6 +1514,7 @@ fn chat_request_into_data_maps_all_fields() {
     let req = ChatRequest {
         message: "hello".into(),
         conversation_authority: None,
+        agent_profile_selection: None,
         user_intent: Some("pure hello".into()),
         parts: vec![json!({"type": "text", "text": "hello"})],
         attachments: vec![json!({"id": "att-1", "kind": "file"})],
@@ -1723,6 +1724,7 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
     let req = ChatRequest {
         message: "do step".into(),
         conversation_authority: None,
+        agent_profile_selection: None,
         user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),

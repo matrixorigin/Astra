@@ -700,7 +700,6 @@ fn char_literal() { let slash = '/'; }
             "plan_step_runs",
             "infra_sandbox_metadata",
             "team_definitions",
-            "team_execution_history",
             "team_snapshots",
         }
         for table in session_workflow_tables:
@@ -758,10 +757,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "mutable team config",
             self.tables["team_definitions"]["merge_guidance"],
-        )
-        self.assertIn(
-            "execution history",
-            self.tables["team_execution_history"]["merge_guidance"],
         )
         self.assertIn(
             "point-in-time audit records",
@@ -876,7 +871,6 @@ fn char_literal() { let slash = '/'; }
             "session_history_chunks",
             "session_artifacts_grants",
             "data_versioning_checkpoints",
-            "team_execution_history + team_snapshots",
         }
         self.assertEqual(set(self.p1_5_reviews), expected)
 
@@ -915,12 +909,6 @@ fn char_literal() { let slash = '/'; }
             "rollback/list",
             self.p1_5_reviews["data_versioning_checkpoints"]["user_api_impact"],
         )
-        self.assertIn(
-            "different resources",
-            self.p1_5_reviews[
-                "team_execution_history + team_snapshots"
-            ]["user_api_impact"],
-        )
 
     def test_p1_5_consolidation_source_evidence_still_exists(self) -> None:
         expectations = {
@@ -938,10 +926,7 @@ fn char_literal() { let slash = '/'; }
                 "verify_core_schema_shape",
             ],
             "crates/services/src/team_persistence.rs": [
-                "team_execution_history",
                 "team_snapshots",
-                "record_execution_start",
-                "list_executions_page",
                 "save_snapshot",
                 "list_snapshots_page",
             ],

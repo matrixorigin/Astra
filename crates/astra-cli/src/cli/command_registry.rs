@@ -377,7 +377,6 @@ const TEAM_SUBCOMMANDS: &[(&str, &str)] = &[
     ("create", "Create new team"),
     ("delete", "Delete a team"),
     ("help", "Show team overview and examples"),
-    ("history", "Show team execution history"),
     ("info", "Show team information"),
     ("list", "List all teams"),
     ("restore", "Restore team snapshot"),
@@ -677,7 +676,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── Team & account ───────────────────────────────────────────────────
     CommandMeta::new(
         "/team",
-        "Teams: list|info|create|add-member|context|run|history|snapshot|restore|delete|help",
+        "Teams: list|info|create|add-member|context|run|snapshot|restore|delete|help",
         CommandGroup::Work,
     )
     .with_subcommands(TEAM_SUBCOMMANDS)

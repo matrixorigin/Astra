@@ -115,37 +115,6 @@ pub fn fork_child_prompt(
     )
 }
 
-/// Budget awareness prompt injected when team has resource constraints.
-pub fn budget_awareness_prompt(max_tokens: Option<u64>, max_duration_secs: Option<u64>) -> String {
-    let mut parts = Vec::new();
-
-    if let Some(tokens) = max_tokens.filter(|&t| t > 0) {
-        let k = tokens / 1000;
-        parts.push(format!(
-            "- Token budget: ~{k}K tokens shared across all team agents. Be efficient."
-        ));
-    }
-
-    if let Some(secs) = max_duration_secs.filter(|&s| s > 0) {
-        let mins = secs / 60;
-        if mins > 0 {
-            parts.push(format!(
-                "- Time budget: {mins} minute(s). Prioritize impact."
-            ));
-        } else {
-            parts.push(format!(
-                "- Time budget: {secs} second(s). Be extremely focused."
-            ));
-        }
-    }
-
-    if parts.is_empty() {
-        return String::new();
-    }
-
-    format!("\n\n## Resource Constraints\n{}", parts.join("\n"))
-}
-
 /// Combine a coordination prompt with the original task.
 ///
 /// Prepends the team context block before the actual task, separated by a
@@ -226,30 +195,6 @@ mod tests {
     fn fork_child_no_context() {
         let prompt = fork_child_prompt(2, 3, false);
         assert!(prompt.contains("No parent context"));
-    }
-
-    #[test]
-    fn budget_awareness_tokens() {
-        let prompt = budget_awareness_prompt(Some(100_000), None);
-        assert!(prompt.contains("100K"));
-    }
-
-    #[test]
-    fn budget_awareness_duration() {
-        let prompt = budget_awareness_prompt(None, Some(300));
-        assert!(prompt.contains("5 minute"));
-    }
-
-    #[test]
-    fn budget_awareness_empty_when_no_limits() {
-        let prompt = budget_awareness_prompt(None, None);
-        assert!(prompt.is_empty());
-    }
-
-    #[test]
-    fn budget_awareness_zero_values_treated_as_none() {
-        let prompt = budget_awareness_prompt(Some(0), Some(0));
-        assert!(prompt.is_empty());
     }
 
     #[test]

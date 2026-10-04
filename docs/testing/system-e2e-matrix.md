@@ -66,10 +66,10 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 | `e2e_matrix_memory_proxy_user_isolation` | `journey_extended.rs` | Unauthenticated `POST /memory/store` (401); spoofed `user_id`/`session_id` in body → forwarder receives JWT `user_id` for both fields |
 | `e2e_matrix_models_admin_crud` | `journey_extended.rs` | SQL `astra_admin` role grant + `POST/PUT/DELETE /models` with DB checks |
 | `e2e_matrix_saas_events_and_audit_cross_user_isolation` | `journey_saas_platform_matrix.rs` | Foreign-user `GET /events`, session audit, and activity return 404; filtered global events do not leak the foreign session |
-| `e2e_matrix_team_crud_and_db` | `journey_team_crud_matrix.rs` | Team CRUD + upsert via second `POST /teams`, empty `GET .../executions`, SQL `team_definitions` |
+| `e2e_matrix_team_crud_and_db` | `journey_team_crud_matrix.rs` | Team CRUD + upsert via second `POST /teams`, SQL `team_definitions` |
 | `e2e_matrix_team_snapshots_and_db` | `journey_team_snapshots_matrix.rs` | `POST/GET .../snapshots`, `DELETE /teams/snapshots/{id}`, SQL `team_snapshots` |
-| `e2e_matrix_team_http_negative_paths` | `journey_team_http_negatives_matrix.rs` | Auth 401, GET/DELETE 404, validation 400 (empty members, duplicate roles, bad budget), schema rejection 422 (unsupported coordination strategy) |
-| `e2e_matrix_team_http_db_fidelity` | `journey_team_data_fidelity_matrix.rs` | `GET` detail vs `team_definitions` JSON columns; list `len` = SQL `COUNT(*)`; snapshot blob + list fields; `executions?limit=` |
+| `e2e_matrix_team_http_negative_paths` | `journey_team_http_negatives_matrix.rs` | Auth 401, GET/DELETE 404, validation 400 (duplicate roles) |
+| `e2e_matrix_team_http_db_fidelity` | `journey_team_data_fidelity_matrix.rs` | `GET` detail vs `team_definitions` JSON columns; list `len` = SQL `COUNT(*)`; snapshot blob + list fields |
 | `e2e_matrix_team_cross_user_isolation` | `journey_team_isolation_matrix.rs` | Second user: 404 on other user's team; list has no foreign team name |
 | `e2e_matrix_meta_health` | `journey_meta_matrix.rs` | `GET /`, `GET /health` (root metadata, DB connected, persist counters) |
 | `e2e_matrix_session_http_db` | `journey_session_http_db_matrix.rs` | `GET`/`PUT /sessions/{id}` vs `agent_sessions` (`title`, `user_id`) |
@@ -120,7 +120,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Admin | P1 | `GET /admin/tokens` | — | `e2e_matrix_saas_admin_tokens_rbac_smoke` |
 | WebSocket | — | `/chat/ws` | — | — |
 | Delegation | P1 | `GET .../delegations`, `POST .../delegate` (validation-only path) | **In-memory** tracker | `e2e_matrix_delegate_http_boundaries` |
-| Team | P1 | `/teams`, `/teams/{name}`, `/teams/{name}/executions`, `/teams/.../snapshots` (+ HTTP negatives, DB fidelity, user isolation) | `team_definitions`, `team_snapshots` | `e2e_matrix_team_crud_and_db`, `e2e_matrix_team_snapshots_and_db`, `e2e_matrix_team_http_negative_paths`, `e2e_matrix_team_http_db_fidelity`, `e2e_matrix_team_cross_user_isolation`; **`POST .../execute`** stays offline (**`team_execute_http_integration`**, mock `SubRunExecutor`) |
+| Team | P1 | `/teams`, `/teams/{name}`, `/teams/.../snapshots` (+ HTTP negatives, DB fidelity, user isolation) | `team_definitions`, `team_snapshots` | `e2e_matrix_team_crud_and_db`, `e2e_matrix_team_snapshots_and_db`, `e2e_matrix_team_http_negative_paths`, `e2e_matrix_team_http_db_fidelity`, `e2e_matrix_team_cross_user_isolation`; native Team delivery and rework use the opt-in real-provider PTY journey |
 
 ## CI
 
@@ -145,7 +145,7 @@ Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../crates/ru
 | sandbox | `/sandbox` | Yes | |
 | platform | `/platform/` | Partial | `GET /platform/snapshot` in `product_matrix_*` |
 | runs | `/runs` | Partial | List in `product_matrix_*`; lifecycle in `e2e_matrix_chat_run_pause_resume_http` |
-| teams | `/teams` | Partial | CRUD + snapshots + negatives + `team_definitions` / `team_snapshots` in `e2e_matrix_team_*`; `POST .../execute` still covered only in offline `team_execute_http_integration` (mock executor) — not in system E2E |
+| teams | `/teams` | Partial | CRUD + snapshots + negatives + `team_definitions` / `team_snapshots` in `e2e_matrix_team_*`; native lead/member delivery is covered by the opt-in real-provider PTY journey |
 
 Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **context** (`/context`), **decisions** (`/decisions`), **models** (`/models`), **data-versioning** (`/data-versioning`), **replay guardrails** (`/sessions/.../replay`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
 
@@ -164,5 +164,4 @@ Additional route families in `router_builder` not named above: **memory** (`/mem
 - **Evaluation writes**: add a focused test when `validate_gate` / `run_drift_pipeline` return **200** with stable response shapes.
 - **Branches / admin HTTP** (beyond cost estimate + token list): optional deeper journeys when routes stabilize.
 - **`/chat/ws`**, **successful delegation execute** (long-running): optional fixtures; validation-only delegation is in `e2e_matrix_delegate_http_boundaries`.
-- **Teams execute**: optional `system_matrix_http_e2e` for `POST /teams/{name}/execute` with real `ServerSubRunExecutor` (long-running; not added by default). CRUD/snapshots/DB for `/teams` are in `e2e_matrix_team_*`.
 - **Real Memoria**: optional second target with a Memoria test double URL instead of the stub forwarder.

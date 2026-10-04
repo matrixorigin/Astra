@@ -548,7 +548,6 @@ mod tests {
             turn: 1,
             round: 0,
             logical_attempt: 0,
-            command_intent_id: None,
             model_selection: Some(astra_turn_types::ModelSelection {
                 offering_id: offering_id.to_string(),
             }),

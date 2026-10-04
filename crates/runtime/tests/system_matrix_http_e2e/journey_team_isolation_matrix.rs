@@ -16,7 +16,6 @@ pub async fn run_team_cross_user_isolation() {
     let payload = json!({
         "name": team_name,
         "description": "owner A only",
-        "coordination": { "type": "sequential", "stop_on_success": false },
         "members": [
             {
                 "role": "a1",
@@ -34,8 +33,6 @@ pub async fn run_team_cross_user_isolation() {
             }
         ],
         "context": {},
-        "worktree_mode": "shared",
-        "max_parallel": 1
     });
 
     let (st_up, _) = post_json(&ctx.app, "/teams", Some(auth_a), payload).await;

@@ -1,17 +1,9 @@
 mod completions;
 #[cfg(feature = "server")]
-pub mod conflict_resolver;
-#[cfg(feature = "server")]
 pub mod edge_connection_pool;
 pub mod edge_ws_protocol;
 mod model_admission;
 pub mod session_run_tree;
-#[cfg(feature = "server")]
-pub mod team_orchestrator_traits;
-#[cfg(feature = "server")]
-pub mod team_orchestrator_types;
-#[cfg(feature = "server")]
-pub mod worktree_isolation;
 #[cfg(feature = "server")]
 pub mod ws_progress_callback;
 

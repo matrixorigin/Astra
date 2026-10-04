@@ -3374,7 +3374,6 @@ pub(crate) fn canonical_delegation_slot_briefs(
                 .map_err(|error| error.to_string())?;
             Ok(vec![DelegationSlotBrief {
                 description: input.description,
-                system_prompt: None,
                 prompt: input.prompt,
                 requested_model_policy: input.requested_model_policy,
                 reasoning: input
@@ -3392,7 +3391,6 @@ pub(crate) fn canonical_delegation_slot_briefs(
                 .into_iter()
                 .map(|slot| DelegationSlotBrief {
                     description: slot.description,
-                    system_prompt: None,
                     prompt: slot.prompt,
                     requested_model_policy: slot.requested_model_policy.or_else(|| {
                         input

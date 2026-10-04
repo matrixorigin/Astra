@@ -1,6 +1,6 @@
 //! HTTP-backed team persistence for CLI clients.
 //!
-//! Team CRUD/history/snapshots belong to the server's cloud authority. The CLI
+//! Team definitions and snapshots belong to the server's cloud authority. The CLI
 //! keeps an in-memory registry for the current process, but persisted team state
 //! flows through the runtime HTTP API rather than direct MatrixOne access.
 
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use astra_services::team_persistence::{
-    TeamDefinition, TeamExecutionRecord, TeamPersistenceService, TeamSnapshotRecord,
+    TeamDefinition, TeamPersistenceService, TeamSnapshotRecord,
 };
 
 const TEAM_HTTP_TIMEOUT_SECS: u64 = 15;
@@ -18,22 +18,6 @@ const TEAM_HTTP_TIMEOUT_SECS: u64 = 15;
 #[derive(Debug, Deserialize)]
 struct TeamListResponse {
     teams: Vec<TeamDefinition>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ExecutionListResponse {
-    executions: Vec<ExecutionWire>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ExecutionWire {
-    execution_id: String,
-    team_id: String,
-    task: String,
-    status: String,
-    result_json: Option<String>,
-    started_at: String,
-    completed_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,14 +45,9 @@ struct DeleteResponse {
 struct UpsertTeamRequest<'a> {
     name: &'a str,
     description: &'a str,
-    coordination: &'a astra_services::team_persistence::TeamCoordination,
     members: &'a Vec<astra_services::team_persistence::TeamMemberDef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<&'a std::collections::HashMap<String, String>>,
-    worktree_mode: &'a astra_services::team_persistence::WorktreeMode,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    budget: Option<&'a astra_services::team_persistence::TeamBudget>,
-    max_parallel: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -249,16 +228,12 @@ impl TeamPersistenceService for HttpTeamStore {
         let body = UpsertTeamRequest {
             name: &team.name,
             description: &team.description,
-            coordination: &team.coordination,
             members: &team.members,
             context: if team.context.is_empty() {
                 None
             } else {
                 Some(&team.context)
             },
-            worktree_mode: &team.worktree_mode,
-            budget: team.budget.as_ref(),
-            max_parallel: team.max_parallel,
         };
         self.post_json("/teams", &body)
             .await
@@ -317,35 +292,6 @@ impl TeamPersistenceService for HttpTeamStore {
             Err(error) if error.is_not_found() => Ok(false),
             Err(error) => Err(error.to_string()),
         }
-    }
-
-    async fn list_executions(
-        &self,
-        team_id: &str,
-        limit: u32,
-    ) -> Result<Vec<TeamExecutionRecord>, String> {
-        let team_id = Self::team_path_segment(team_id);
-        let response: ExecutionListResponse = self
-            .get_json(
-                &format!("/teams/{team_id}/executions"),
-                &[("limit", limit.to_string())],
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(response
-            .executions
-            .into_iter()
-            .map(|entry| TeamExecutionRecord {
-                execution_id: entry.execution_id,
-                team_id: entry.team_id,
-                user_id: String::new(),
-                task: entry.task,
-                status: entry.status,
-                result_json: entry.result_json,
-                started_at: entry.started_at,
-                completed_at: entry.completed_at,
-            })
-            .collect())
     }
 
     async fn save_snapshot(
@@ -440,7 +386,7 @@ mod tests {
     use super::HttpTeamStore;
     use astra_credentials::{CredentialsFile, Profile};
     use astra_services::team_persistence::TeamPersistenceService;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn write_test_profile() {
@@ -464,12 +410,6 @@ mod tests {
         let mut requested =
             astra_services::team_persistence::builtin_teams("user-1", "2026-10-03T00:00:00Z")
                 .remove(0);
-        requested.max_parallel = 2;
-        requested.budget = Some(astra_services::team_persistence::TeamBudget {
-            max_cost_usd: 1.0,
-            max_tokens: 100,
-            max_duration_secs: 30,
-        });
         requested.members[0].can_delegate = true;
         requested.members[0].max_delegation_depth = 2;
         requested.members[0].mcp_servers = vec!["fixture-mcp".into()];
@@ -479,8 +419,6 @@ mod tests {
             .and(path("/teams"))
             .and(header("authorization", "Bearer test-token"))
             .and(wiremock::matchers::body_partial_json(serde_json::json!({
-                "max_parallel": 2,
-                "budget": requested.budget,
                 "members": requested.members,
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(&accepted))
@@ -664,42 +602,5 @@ mod tests {
                     .unwrap()
             );
         }
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn list_executions_uses_team_id_path_directly() {
-        let _creds_guard = crate::tests::isolate_credentials();
-        write_test_profile();
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/teams/team-1/executions"))
-            .and(query_param("limit", "3"))
-            .and(header("authorization", "Bearer test-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "team_id": "team-1",
-                "team_name": "known-name",
-                "executions": [{
-                    "execution_id": "exec-1",
-                    "team_id": "team-1",
-                    "task": "review",
-                    "status": "completed",
-                    "result_json": null,
-                    "started_at": "2026-05-17T00:00:00Z",
-                    "completed_at": "2026-05-17T00:01:00Z"
-                }]
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let store = HttpTeamStore::new(
-            &astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
-            None,
-        );
-        let executions = store.list_executions("team-1", 3).await.unwrap();
-        assert_eq!(executions.len(), 1);
-        assert_eq!(executions[0].team_id, "team-1");
     }
 }

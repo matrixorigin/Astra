@@ -10,7 +10,6 @@ fn minimal_team_payload(name: &str, description: &str) -> Value {
     json!({
         "name": name,
         "description": description,
-        "coordination": { "type": "sequential", "stop_on_success": false },
         "members": [
             {
                 "role": "alpha",
@@ -28,8 +27,6 @@ fn minimal_team_payload(name: &str, description: &str) -> Value {
             }
         ],
         "context": { "suite": "matrix_team_snapshots" },
-        "worktree_mode": "shared",
-        "max_parallel": 1
     })
 }
 

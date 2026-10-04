@@ -141,39 +141,8 @@ pub struct DelegationModelAdmission {
     pub child_requirements: Vec<DelegationIntentRequirements>,
 }
 
-/// Trusted, command-scoped selection for the local Team execution path.
-/// Unlike a Server tool admission, it has no fabricated run, turn-chain,
-/// generation, or invocation identity. The executor verifies the authenticated
-/// command source and the canonical slot-plan digest before starting children.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DirectDelegationCommandIdentity {
-    pub command_intent_id: String,
-    pub session_turn: u32,
-}
-
-impl DirectDelegationCommandIdentity {
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if !is_canonical_command_intent_id(&self.command_intent_id) {
-            return Err("direct delegation command identity is invalid");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DirectDelegationModelPlan {
-    pub source: DelegationUserRequirementSource,
-    pub slot_plan_digest: String,
-    pub outcome: DelegationModelAdmissionOutcome,
-    pub child_requirements: Vec<DelegationIntentRequirements>,
-}
-
-/// Maximum slots accepted by the shared model-admission contract. The public
-/// agent fanout contract is 50 slots; direct Team keeps its narrower
-/// `MAX_DIRECT_DELEGATION_SLOTS` boundary because it has a separate command
-/// contract.
+/// Maximum slots accepted by the shared model-admission contract.
 pub const MAX_MODEL_ADMISSION_SLOTS: usize = 50;
-pub const MAX_DIRECT_DELEGATION_SLOTS: usize = 32;
 
 /// Human instruction provenance survives child creation. It is deliberately
 /// separate from the current run's dispatch epoch and invocation identity.
@@ -205,66 +174,6 @@ impl DelegationUserRequirementSource {
         }
         Ok(())
     }
-}
-
-impl DirectDelegationModelPlan {
-    #[allow(clippy::too_many_arguments)]
-    pub fn validate_identity(
-        &self,
-        command: &DirectDelegationCommandIdentity,
-        user_id: &str,
-        session_id: &str,
-        task_digest: &str,
-        slot_plan_digest: &str,
-        expected_slots: usize,
-    ) -> Result<(), &'static str> {
-        command.validate()?;
-        self.source.validate()?;
-        if self.source.user_id != user_id
-            || self.source.session_id != session_id
-            || self.source.session_turn != command.session_turn
-            || self.source.command_intent_id.as_deref() != Some(command.command_intent_id.as_str())
-            || self.source.applied_intent_id.is_some()
-            || self.source.user_intent_digest != task_digest
-            || self.slot_plan_digest != slot_plan_digest
-            || !is_sha256_digest(&self.slot_plan_digest)
-        {
-            return Err("direct delegation model plan belongs to another command or slot plan");
-        }
-        if self.child_requirements.len() != expected_slots {
-            return Err("direct delegation child requirements have wrong slot count");
-        }
-        for child in &self.child_requirements {
-            child.validate()?;
-            let origin = match child {
-                DelegationIntentRequirements::Unassessed => None,
-                DelegationIntentRequirements::Unconstrained { source }
-                | DelegationIntentRequirements::Unresolved { source, .. }
-                | DelegationIntentRequirements::Unavailable { source, .. }
-                | DelegationIntentRequirements::CatalogResolutionFailed { source, .. }
-                | DelegationIntentRequirements::Requirements { source, .. } => Some(source),
-            }
-            .ok_or("direct delegation child requirement is unassessed")?;
-            if origin.user_id != self.source.user_id
-                || origin.session_id != self.source.session_id
-                || origin.session_turn != self.source.session_turn
-                || origin.applied_intent_id != self.source.applied_intent_id
-                || origin.command_intent_id != self.source.command_intent_id
-                || origin.user_intent_digest != self.source.user_intent_digest
-            {
-                return Err("direct delegation child requirement source changed");
-            }
-        }
-        self.outcome
-            .validate_slots(expected_slots, MAX_DIRECT_DELEGATION_SLOTS)?;
-        Ok(())
-    }
-}
-
-fn is_sha256_digest(value: &str) -> bool {
-    value
-        .strip_prefix("sha256:")
-        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn is_canonical_command_intent_id(value: &str) -> bool {
@@ -591,118 +500,6 @@ mod tests {
             admission(MAX_MODEL_ADMISSION_SLOTS + 1)
                 .validate_identity("call", "args", 2, MAX_MODEL_ADMISSION_SLOTS + 1,)
                 .is_err()
-        );
-    }
-
-    #[test]
-    fn direct_team_plan_is_bound_to_command_task_and_ordered_slots() {
-        let command_id = "6bca9f9c-6d18-4579-bce1-2b45f573a098";
-        let command = DirectDelegationCommandIdentity {
-            command_intent_id: command_id.into(),
-            session_turn: 4,
-        };
-        let source = DelegationUserRequirementSource {
-            user_id: "user".into(),
-            session_id: "session".into(),
-            session_turn: 4,
-            applied_intent_id: None,
-            command_intent_id: Some(command_id.into()),
-            user_intent_digest: "sha256:task-digest".into(),
-        };
-        let child = DelegationIntentRequirements::Unconstrained {
-            source: source.clone(),
-        };
-        let mut plan = DirectDelegationModelPlan {
-            source,
-            slot_plan_digest: format!("sha256:{}", "a".repeat(64)),
-            outcome: DelegationModelAdmissionOutcome::Constrained {
-                slots: vec![DelegationModelSlotConstraint {
-                    slot_index: 0,
-                    model_selection: Some(ModelSelection {
-                        offering_id: "authorized-offering".into(),
-                    }),
-                    requested_model_policy: None,
-                    model_strength: Some(DelegationRequirementStrength::Hard),
-                    reasoning: None,
-                    reasoning_strength: None,
-                    task_scope_quote: None,
-                }],
-            },
-            child_requirements: vec![child],
-        };
-        let plan_digest = plan.slot_plan_digest.clone();
-        assert!(
-            plan.validate_identity(
-                &command,
-                "user",
-                "session",
-                "sha256:task-digest",
-                &plan_digest,
-                1,
-            )
-            .is_ok()
-        );
-        assert!(
-            plan.validate_identity(
-                &command,
-                "other-user",
-                "session",
-                "sha256:task-digest",
-                &plan_digest,
-                1,
-            )
-            .is_err()
-        );
-        assert!(
-            plan.validate_identity(
-                &command,
-                "user",
-                "session",
-                "sha256:changed-task",
-                &plan_digest,
-                1,
-            )
-            .is_err()
-        );
-        assert!(
-            plan.validate_identity(
-                &command,
-                "user",
-                "session",
-                "sha256:task-digest",
-                &plan_digest,
-                2,
-            )
-            .is_err()
-        );
-        plan.slot_plan_digest = "sha256:truncated".into();
-        assert!(
-            plan.validate_identity(
-                &command,
-                "user",
-                "session",
-                "sha256:task-digest",
-                &plan_digest,
-                1,
-            )
-            .is_err()
-        );
-        plan.slot_plan_digest = plan_digest.clone();
-        let other_command = DirectDelegationCommandIdentity {
-            command_intent_id: "a6f7e88f-7dd5-4cfb-b4b2-3c1db1a8e72c".into(),
-            session_turn: 4,
-        };
-        assert!(
-            plan.validate_identity(
-                &other_command,
-                "user",
-                "session",
-                "sha256:task-digest",
-                &plan_digest,
-                1,
-            )
-            .is_err(),
-            "a plan cannot be replayed under a different authenticated command"
         );
     }
 

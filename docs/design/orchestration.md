@@ -13,7 +13,7 @@ Orchestration owns multi-agent coordination, delegation, fanout/fanin, model cho
 - Delegation failure should degrade the relevant branch, not corrupt the parent run.
 
 Agent profiles are explicitly selected; they do not expose keyword-based
-auto-activation triggers. Team coordination has two execution strategies:
+auto-activation triggers. Generic delegation has two coordination policies:
 `Sequential` passes each output to the next agent with optional early exit;
 `FanOut` runs independent agents with explicit aggregation. A context-sharing
 `Fork` additionally has its own bounded child contract. There is no separate
@@ -51,7 +51,7 @@ Team definitions have one owner-scoped persistence contract. CLI commands use
 the existing HTTP adapter; their registry is a display projection, not a second
 configuration store or template authority. An empty roster is a valid draft,
 but execution rejects it before admitting children. Configuration edits retain
-the complete definition, including member capabilities, budget and concurrency.
+the complete definition, including member profiles, capabilities and shared context.
 The accepted save response supplies the persisted identity without a follow-up
 read. Failed reads or writes must not publish success or a locally committed
 configuration, and standalone commands must return a failing exit status.
@@ -139,8 +139,8 @@ ordinary root admissions are not a replacement for internal child admission:
 sharing a parent's session writer causes contention, while opening unrelated
 sessions loses authoritative lineage. Native CLI/TUI must retain the ordinary
 root's authenticated Edge delivery, callback, cancellation and observation
-channels when retiring local orchestration. The existing JSON-only Team batch
-endpoint does not currently carry those channels.
+channels. Team execution uses this ordinary root-turn entrypoint rather than a
+separate batch executor.
 
 Multi-step collaboration uses the existing Work dependency and attempt owner.
 Member execution, messages, user guidance, cancellation, pause and recovery use
@@ -175,11 +175,10 @@ Team summaries are aggregates, not additional billable provider usage;
 unknown usage, cache or price coverage must remain explicit. Acceptance must
 exercise a real multi-step exchange and recovery, not only fixed fanout.
 
-Team execution responses label their summaries `usage_scope=child_results_only`.
-Without a returned child-result aggregate, token and tool counts are `null`,
-not zero. Returned counts do not establish full coverage of physical provider
-attempts, auxiliary judgments, cache billing or historical prices; those facts
-remain owned by inference observations and Audit.
+Session Audit aggregates physical provider attempts across root and child runs
+with `request_usage.scope=session_all_runs`. Missing token, cache or price observations
+remain unknown rather than zero. Historical price estimates do not establish
+actual provider billing; inference observations and Audit own these facts.
 
 The agent executing an objective owns its relevant skill selection, evidence
 gathering, and result. When the user assigns an objective to a child, the parent

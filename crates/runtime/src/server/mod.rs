@@ -28,7 +28,6 @@ mod auth_handlers;
 mod capability_handlers;
 mod chat_handlers;
 mod cleanup_retry;
-pub mod conflict_resolver;
 pub(crate) mod context_history_artifact;
 pub mod delegation;
 pub(crate) mod deployment_tool_policy;

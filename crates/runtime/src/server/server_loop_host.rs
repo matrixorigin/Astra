@@ -18170,7 +18170,6 @@ fn delegation_scope_inputs_match(
     right: &astra_services::delegation_model_requirement::DelegationSlotBrief,
 ) -> bool {
     left.description == right.description
-        && left.system_prompt == right.system_prompt
         && left.prompt == right.prompt
         && left.requested_model_policy == right.requested_model_policy
         && left.reasoning == right.reasoning
@@ -24016,7 +24015,6 @@ mod tests {
 
         let slot = |call_id: &str, group_id: Option<&str>| DelegationSlotBrief {
             description: "review".into(),
-            system_prompt: Some("review safely".into()),
             prompt: "Review the change".into(),
             requested_model_policy: None,
             reasoning: None,
@@ -40609,7 +40607,6 @@ mod tests {
         let slots = vec![DelegationSlotBrief {
             description: "private-description".into(),
             prompt: "private-slot-prompt".into(),
-            system_prompt: Some("private-system-prompt".into()),
             ..Default::default()
         }];
         let resolved = json!({
@@ -40744,7 +40741,6 @@ mod tests {
                 "private-access-label",
                 "private-description",
                 "private-slot-prompt",
-                "private-system-prompt",
                 "private provider payload",
                 "https://private.invalid",
                 "sk-test-do-not-record",

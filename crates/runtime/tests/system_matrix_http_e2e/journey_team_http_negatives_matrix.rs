@@ -24,19 +24,9 @@ pub async fn run_team_http_negative_paths() {
     let (st_404_del, _) = delete_json(&ctx.app, &format!("/teams/{ghost}"), Some(auth)).await;
     assert_eq!(st_404_del, StatusCode::NOT_FOUND);
 
-    let bad_empty_members: Value = json!({
-        "name": format!("bad_empty_{}", ctx.suffix),
-        "description": "should fail validation",
-        "coordination": { "type": "sequential", "stop_on_success": false },
-        "members": []
-    });
-    let (st_bad, bad_j) = post_json(&ctx.app, "/teams", Some(auth), bad_empty_members).await;
-    assert_eq!(st_bad, StatusCode::BAD_REQUEST, "empty members: {bad_j}");
-
     let dup_roles: Value = json!({
         "name": format!("bad_dup_roles_{}", ctx.suffix),
         "description": "duplicate roles",
-        "coordination": { "type": "sequential", "stop_on_success": false },
         "members": [
             {
                 "role": "twin",
@@ -56,99 +46,5 @@ pub async fn run_team_http_negative_paths() {
     });
     let (st_dup, dup_j) = post_json(&ctx.app, "/teams", Some(auth), dup_roles).await;
     assert_eq!(st_dup, StatusCode::BAD_REQUEST, "duplicate roles: {dup_j}");
-
-    let budget_all_zero: Value = json!({
-        "name": format!("bad_budget_all_zero_{}", ctx.suffix),
-        "description": "invalid budget",
-        "coordination": { "type": "sequential", "stop_on_success": false },
-        "members": [
-            {
-                "role": "only",
-                "skills": [],
-                "mcp_servers": [],
-                "can_delegate": false,
-                "max_delegation_depth": 0
-            },
-            {
-                "role": "second",
-                "skills": [],
-                "mcp_servers": [],
-                "can_delegate": false,
-                "max_delegation_depth": 0
-            }
-        ],
-        "budget": {
-            "max_cost_usd": 0.0,
-            "max_tokens": 0,
-            "max_duration_secs": 0
-        }
-    });
-    let (st_bz, bz_j) = post_json(&ctx.app, "/teams", Some(auth), budget_all_zero).await;
-    assert_eq!(st_bz, StatusCode::BAD_REQUEST, "budget all zero: {bz_j}");
-
-    let budget_negative: Value = json!({
-        "name": format!("bad_budget_neg_{}", ctx.suffix),
-        "description": "negative usd",
-        "coordination": { "type": "sequential", "stop_on_success": false },
-        "members": [
-            {
-                "role": "x1",
-                "skills": [],
-                "mcp_servers": [],
-                "can_delegate": false,
-                "max_delegation_depth": 0
-            },
-            {
-                "role": "x2",
-                "skills": [],
-                "mcp_servers": [],
-                "can_delegate": false,
-                "max_delegation_depth": 0
-            }
-        ],
-        "budget": {
-            "max_cost_usd": -1.0,
-            "max_tokens": 100,
-            "max_duration_secs": 60
-        }
-    });
-    let (st_bn, bn_j) = post_json(&ctx.app, "/teams", Some(auth), budget_negative).await;
-    assert_eq!(st_bn, StatusCode::BAD_REQUEST, "negative budget: {bn_j}");
-
-    let retired_coordination: Value = json!({
-        "name": format!("bad_adv_count_{}", ctx.suffix),
-        "description": "unsupported coordination strategy",
-        "coordination": { "type": "adversarial", "max_rounds": 3, "threshold": 0.8 },
-        "members": [
-            {
-                "role": "p",
-                "skills": [],
-                "mcp_servers": [],
-                "can_delegate": false,
-                "max_delegation_depth": 0
-            },
-            {
-                "role": "r",
-                "skills": [],
-                "mcp_servers": [],
-                "can_delegate": false,
-                "max_delegation_depth": 0
-            },
-            {
-                "role": "extra",
-                "skills": [],
-                "mcp_servers": [],
-                "can_delegate": false,
-                "max_delegation_depth": 0
-            }
-        ]
-    });
-    let (st_adv, adv_j) = post_json(&ctx.app, "/teams", Some(auth), retired_coordination).await;
-    assert_eq!(
-        st_adv,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "retired strategy schema rejection: {adv_j}"
-    );
-
     b.ctx.close().await;
 }

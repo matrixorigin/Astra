@@ -12,28 +12,20 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 
-use crate::coordination::{
-    AgentProfile, AgentTier, AggregationStrategy, CoordinationPattern, DelegationRequest,
-};
+use crate::coordination::{AgentProfile, AgentTier};
 
 const MAX_TEAM_LIST_ROWS: usize = 200;
-const MAX_TEAM_EXECUTION_LIST_ROWS: u32 = 500;
 const MAX_TEAM_SNAPSHOT_LIST_ROWS: u32 = 200;
 const BUILTIN_OWNER_INIT_CACHE_CAPACITY: usize = 4096;
 const TEAM_LIST_SELECT_SQL: &str = "\
-    SELECT team_id, user_id, name, description, coordination, \
-           members_json, context_json, worktree_mode, \
-           budget_json, max_parallel, \
+    SELECT team_id, user_id, name, description, \
+           members_json, context_json, \
            CAST(created_at AS CHAR) AS created_at, \
            CAST(updated_at AS CHAR) AS updated_at \
     FROM team_definitions \
     WHERE user_id = ? \
     ORDER BY name \
     LIMIT ?";
-
-fn validate_team_execution_list_limit(limit: u32) -> u32 {
-    limit.clamp(1, MAX_TEAM_EXECUTION_LIST_ROWS)
-}
 
 fn validate_team_snapshot_list_limit(limit: u32) -> u32 {
     limit.clamp(1, MAX_TEAM_SNAPSHOT_LIST_ROWS)
@@ -80,88 +72,16 @@ fn team_cursor_required_id(
 
 /// Persistent team definition stored in MatrixOne.
 ///
-/// ```sql
-/// CREATE TABLE IF NOT EXISTS team_definitions (
-///     team_id       VARCHAR(64)  PRIMARY KEY,
-///     user_id       VARCHAR(128)  NOT NULL,
-///     name          VARCHAR(128) NOT NULL,
-///     description   TEXT,
-///     coordination  TEXT         NOT NULL,
-///     members_json  TEXT         NOT NULL,
-///     context_json  TEXT,
-///     worktree_mode VARCHAR(32)  DEFAULT 'shared',
-///     budget_json   TEXT,
-///     max_parallel  INT UNSIGNED NOT NULL DEFAULT 0,
-///     created_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-///     updated_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-///     UNIQUE KEY uq_team_user_name (user_id, name)
-/// );
-/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamDefinition {
     pub team_id: String,
     pub user_id: String,
     pub name: String,
     pub description: String,
-    pub coordination: TeamCoordination,
     pub members: Vec<TeamMemberDef>,
     pub context: HashMap<String, String>,
-    pub worktree_mode: WorktreeMode,
-    /// Optional budget constraints for the team execution.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget: Option<TeamBudget>,
-    /// Maximum number of agents that may execute concurrently (0 = unlimited).
-    #[serde(default)]
-    pub max_parallel: u32,
     pub created_at: String,
     pub updated_at: String,
-}
-
-/// Budget constraints applied to a team execution.
-///
-/// `max_duration_secs` requests cooperative cancellation after the execution
-/// phase budget; preparation and cleanup are not currently included.
-/// `max_tokens` is checked against returned child usage after execution.
-/// `max_cost_usd` is configuration only: cost enforcement is not yet wired.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TeamBudget {
-    /// Requested cost limit in USD; currently not enforced.
-    #[serde(default)]
-    pub max_cost_usd: f64,
-    /// Maximum total tokens (prompt + completion) across all agents.
-    #[serde(default)]
-    pub max_tokens: u64,
-    /// Execution-phase cancellation budget in seconds (excludes preparation).
-    #[serde(default)]
-    pub max_duration_secs: u64,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TeamAggregation {
-    FirstSuccess,
-    AllResults,
-    Consensus,
-}
-
-impl From<TeamAggregation> for AggregationStrategy {
-    fn from(value: TeamAggregation) -> Self {
-        match value {
-            TeamAggregation::FirstSuccess => Self::FirstSuccess,
-            TeamAggregation::AllResults => Self::AllResults,
-            TeamAggregation::Consensus => Self::Consensus,
-        }
-    }
-}
-
-/// Coordination strategy for a team — maps to [`CoordinationPattern`] at execution time.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum TeamCoordination {
-    /// Parallel dispatch with aggregation.
-    FanOut { aggregation: TeamAggregation },
-    /// One-by-one with optional early exit.
-    Sequential { stop_on_success: bool },
 }
 
 /// Lightweight member declaration within a team.
@@ -199,19 +119,6 @@ pub struct TeamMemberDef {
     /// Only meaningful when `can_delegate` is true.
     #[serde(default)]
     pub max_delegation_depth: u32,
-}
-
-/// How the team's agents share the workspace file system.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WorktreeMode {
-    /// All agents share the same working directory (current behaviour).
-    #[default]
-    Shared,
-    /// Each agent gets an independent git worktree.
-    Isolated,
-    /// Agents work in a MatrixOne stage area; changes committed on success.
-    Staged,
 }
 
 // ─── Resolve: TeamMemberDef → AgentProfile ──────────────────────────────────
@@ -296,14 +203,10 @@ pub fn resolve_member_to_profile(member: &TeamMemberDef, team: &TeamDefinition) 
 /// Validation errors for a team definition.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TeamValidationError {
-    /// A team requires at least 1 member.
-    EmptyMembers,
     /// Duplicate role names within the same team.
     DuplicateRoles(Vec<String>),
     /// Duplicate agent IDs (explicit or generated).
     DuplicateAgentIds(Vec<String>),
-    /// Budget contains invalid values.
-    InvalidBudget(String),
     /// A member contains an invalid canonical profile control.
     InvalidMember(String),
 }
@@ -311,15 +214,11 @@ pub enum TeamValidationError {
 impl std::fmt::Display for TeamValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyMembers => write!(f, "team must have at least one member"),
             Self::DuplicateRoles(roles) => {
                 write!(f, "duplicate roles: {}", roles.join(", "))
             }
             Self::DuplicateAgentIds(ids) => {
                 write!(f, "duplicate agent IDs: {}", ids.join(", "))
-            }
-            Self::InvalidBudget(msg) => {
-                write!(f, "invalid budget: {msg}")
             }
             Self::InvalidMember(msg) => {
                 write!(f, "invalid team member: {msg}")
@@ -399,124 +298,11 @@ pub fn validate_team(team: &TeamDefinition) -> Result<(), Vec<TeamValidationErro
         errors.push(TeamValidationError::DuplicateAgentIds(dup_ids));
     }
 
-    // Budget validation
-    if let Some(budget) = &team.budget {
-        if !budget.max_cost_usd.is_finite() {
-            errors.push(TeamValidationError::InvalidBudget(
-                "max_cost_usd must be a finite number".into(),
-            ));
-        } else if budget.max_cost_usd < 0.0 {
-            errors.push(TeamValidationError::InvalidBudget(
-                "max_cost_usd must be non-negative".into(),
-            ));
-        }
-        if budget.max_cost_usd == 0.0 && budget.max_tokens == 0 && budget.max_duration_secs == 0 {
-            errors.push(TeamValidationError::InvalidBudget(
-                "budget specified but all limits are zero (no work possible)".into(),
-            ));
-        }
-    }
-
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
     }
-}
-
-// ─── Bulk Resolve ───────────────────────────────────────────────────────────
-
-/// Resolve all team members, validate, and produce profiles + delegation request.
-///
-/// This is the high-level entry point for team execution. It:
-/// 1. Validates the team definition
-/// 2. Resolves all members from the owner-scoped team definition
-/// 3. Builds the delegation request
-/// 4. Returns everything needed for the orchestrator
-pub fn resolve_team(
-    team: &TeamDefinition,
-    task: &str,
-    parent_run_id: &str,
-    session_id: &str,
-) -> Result<(DelegationRequest, Vec<AgentProfile>), String> {
-    if team.members.is_empty() {
-        return Err(TeamValidationError::EmptyMembers.to_string());
-    }
-    // Validate first
-    validate_team(team).map_err(|errs| {
-        errs.iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join("; ")
-    })?;
-
-    let profiles: Vec<AgentProfile> = team
-        .members
-        .iter()
-        .map(|m| resolve_member_to_profile(m, team))
-        .collect();
-
-    let pattern = build_coordination_pattern(&team.coordination, &profiles);
-
-    let context: HashMap<String, serde_json::Value> = team
-        .context
-        .iter()
-        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-        .collect();
-
-    let request = DelegationRequest {
-        delegation_id: uuid::Uuid::new_v4().to_string(),
-        session_id: session_id.to_string(),
-        parent_run_id: parent_run_id.to_string(),
-        task: task.to_string(),
-        pattern,
-        user_id: team.user_id.clone(),
-        depth: 0,
-        delegation_chain: Vec::new(),
-        context,
-        execution_metadata: None,
-    };
-
-    Ok((request, profiles))
-}
-
-fn build_coordination_pattern(
-    coordination: &TeamCoordination,
-    profiles: &[AgentProfile],
-) -> CoordinationPattern {
-    match coordination {
-        TeamCoordination::FanOut { aggregation } => CoordinationPattern::FanOut {
-            agent_ids: profiles.iter().map(|p| p.agent_id.clone()).collect(),
-            aggregation: (*aggregation).into(),
-            timeout_sec: 300,
-        },
-        TeamCoordination::Sequential { stop_on_success } => CoordinationPattern::Sequential {
-            agent_ids: profiles.iter().map(|p| p.agent_id.clone()).collect(),
-            stop_on_success: *stop_on_success,
-            timeout_sec: 0,
-        },
-    }
-}
-
-fn validate_optional_json(label: &'static str, raw: Option<&str>) -> Result<(), String> {
-    if let Some(raw) = raw {
-        serde_json::from_str::<serde_json::Value>(raw)
-            .map_err(|error| format!("{label} must be valid JSON: {error}"))?;
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamExecutionListCursor {
-    pub started_at: String,
-    pub execution_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TeamExecutionListPage {
-    pub executions: Vec<TeamExecutionRecord>,
-    pub limit: u32,
-    pub next_cursor: Option<TeamExecutionListCursor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -532,18 +318,6 @@ pub struct TeamSnapshotListPage {
     pub next_cursor: Option<TeamSnapshotListCursor>,
 }
 
-pub fn team_execution_cursor_db_started_at(
-    cursor: &TeamExecutionListCursor,
-) -> Result<String, String> {
-    team_cursor_db_timestamp("started_at", &cursor.started_at, "team execution list")
-}
-
-pub fn team_execution_cursor_execution_id(
-    cursor: &TeamExecutionListCursor,
-) -> Result<String, String> {
-    team_cursor_required_id("execution_id", &cursor.execution_id, "team execution list")
-}
-
 pub fn team_snapshot_cursor_db_created_at(
     cursor: &TeamSnapshotListCursor,
 ) -> Result<String, String> {
@@ -552,15 +326,6 @@ pub fn team_snapshot_cursor_db_created_at(
 
 pub fn team_snapshot_cursor_snapshot_id(cursor: &TeamSnapshotListCursor) -> Result<String, String> {
     team_cursor_required_id("snapshot_id", &cursor.snapshot_id, "team snapshot list")
-}
-
-fn sort_team_executions_recent(executions: &mut [TeamExecutionRecord]) {
-    executions.sort_by(|left, right| {
-        right
-            .started_at
-            .cmp(&left.started_at)
-            .then_with(|| right.execution_id.cmp(&left.execution_id))
-    });
 }
 
 fn sort_team_snapshots_recent(snapshots: &mut [TeamSnapshotRecord]) {
@@ -572,42 +337,12 @@ fn sort_team_snapshots_recent(snapshots: &mut [TeamSnapshotRecord]) {
     });
 }
 
-fn team_execution_after_cursor(
-    execution: &TeamExecutionRecord,
-    cursor: &TeamExecutionListCursor,
-) -> bool {
-    execution.started_at < cursor.started_at
-        || (execution.started_at == cursor.started_at
-            && execution.execution_id < cursor.execution_id)
-}
-
 fn team_snapshot_after_cursor(
     snapshot: &TeamSnapshotRecord,
     cursor: &TeamSnapshotListCursor,
 ) -> bool {
     snapshot.created_at < cursor.created_at
         || (snapshot.created_at == cursor.created_at && snapshot.snapshot_id < cursor.snapshot_id)
-}
-
-fn team_execution_cursor_from_record(
-    execution: &TeamExecutionRecord,
-) -> Result<TeamExecutionListCursor, String> {
-    if execution.started_at.trim().is_empty() {
-        return Err(format!(
-            "invalid team_execution_history cursor: execution_id={}, column=started_at, value is empty",
-            execution.execution_id
-        ));
-    }
-    if execution.execution_id.trim().is_empty() {
-        return Err(
-            "invalid team_execution_history cursor: column=execution_id, value is empty"
-                .to_string(),
-        );
-    }
-    Ok(TeamExecutionListCursor {
-        started_at: execution.started_at.clone(),
-        execution_id: execution.execution_id.clone(),
-    })
 }
 
 fn team_snapshot_cursor_from_record(
@@ -627,37 +362,6 @@ fn team_snapshot_cursor_from_record(
     Ok(TeamSnapshotListCursor {
         created_at: snapshot.created_at.clone(),
         snapshot_id: snapshot.snapshot_id.clone(),
-    })
-}
-
-fn team_execution_page_from_records(
-    mut executions: Vec<TeamExecutionRecord>,
-    limit: u32,
-    cursor: Option<TeamExecutionListCursor>,
-) -> Result<TeamExecutionListPage, String> {
-    let limit = validate_team_execution_list_limit(limit);
-    sort_team_executions_recent(&mut executions);
-    if let Some(cursor) = &cursor {
-        team_execution_cursor_db_started_at(cursor)?;
-        team_execution_cursor_execution_id(cursor)?;
-        executions.retain(|execution| team_execution_after_cursor(execution, cursor));
-    }
-    let has_more = executions.len() > limit as usize;
-    if has_more {
-        executions.truncate(limit as usize);
-    }
-    let next_cursor = if has_more {
-        executions
-            .last()
-            .map(team_execution_cursor_from_record)
-            .transpose()?
-    } else {
-        None
-    };
-    Ok(TeamExecutionListPage {
-        executions,
-        limit,
-        next_cursor,
     })
 }
 
@@ -694,7 +398,7 @@ fn team_snapshot_page_from_records(
 
 // ─── Persistence Trait ──────────────────────────────────────────────────────
 
-/// CRUD operations for team definitions, execution history, and snapshots.
+/// CRUD operations for team definitions and snapshots.
 #[async_trait]
 pub trait TeamPersistenceService: Send + Sync {
     /// Materialize the standard team templates for an authenticated owner.
@@ -713,50 +417,6 @@ pub trait TeamPersistenceService: Send + Sync {
     ) -> Result<Option<TeamDefinition>, String>;
     async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamDefinition>, String>;
     async fn delete_team(&self, user_id: &str, name: &str) -> Result<bool, String>;
-
-    // ── Execution history ───────────────────────────────────────
-
-    /// Record the start of a team execution. Default: no-op.
-    async fn record_execution_start(
-        &self,
-        _execution_id: &str,
-        _team_id: &str,
-        _user_id: &str,
-        _task: &str,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Record completion of a team execution. Default: no-op.
-    async fn record_execution_complete(
-        &self,
-        _execution_id: &str,
-        _status: &str,
-        _result_json: Option<&str>,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// List execution history for a team. Default: empty.
-    async fn list_executions(
-        &self,
-        _team_id: &str,
-        _limit: u32,
-    ) -> Result<Vec<TeamExecutionRecord>, String> {
-        Ok(vec![])
-    }
-
-    async fn list_executions_page(
-        &self,
-        team_id: &str,
-        limit: u32,
-        cursor: Option<TeamExecutionListCursor>,
-    ) -> Result<TeamExecutionListPage, String> {
-        let executions = self
-            .list_executions(team_id, MAX_TEAM_EXECUTION_LIST_ROWS)
-            .await?;
-        team_execution_page_from_records(executions, limit, cursor)
-    }
 
     // ── Snapshots ───────────────────────────────────────────────
 
@@ -807,7 +467,6 @@ pub trait TeamPersistenceService: Send + Sync {
 /// In-memory implementation suitable for CLI use and testing.
 pub struct InMemoryTeamStore {
     teams: RwLock<HashMap<String, TeamDefinition>>,
-    executions: RwLock<Vec<TeamExecutionRecord>>,
     snapshots: RwLock<Vec<TeamSnapshotRecord>>,
 }
 
@@ -815,7 +474,6 @@ impl InMemoryTeamStore {
     pub fn new() -> Self {
         Self {
             teams: RwLock::new(HashMap::new()),
-            executions: RwLock::new(Vec::new()),
             snapshots: RwLock::new(Vec::new()),
         }
     }
@@ -896,97 +554,6 @@ impl TeamPersistenceService for InMemoryTeamStore {
         let key = format!("{user_id}:{name}");
         let mut map = self.teams.write().map_err(|e| e.to_string())?;
         Ok(map.remove(&key).is_some())
-    }
-
-    // ── Execution history ───────────────────────────────────────
-
-    async fn record_execution_start(
-        &self,
-        execution_id: &str,
-        team_id: &str,
-        user_id: &str,
-        task: &str,
-    ) -> Result<(), String> {
-        let mut execs = self.executions.write().map_err(|e| e.to_string())?;
-
-        // Retain at most 100 completed records per team to prevent unbounded growth.
-        const MAX_COMPLETED_PER_TEAM: usize = 100;
-        let completed_count = execs
-            .iter()
-            .filter(|e| e.team_id == team_id && e.completed_at.is_some())
-            .count();
-        if completed_count >= MAX_COMPLETED_PER_TEAM {
-            // Remove oldest completed records for this team (keep running ones)
-            let mut removed = 0;
-            let to_remove = completed_count - MAX_COMPLETED_PER_TEAM + 1;
-            execs.retain(|e| {
-                if removed < to_remove && e.team_id == team_id && e.completed_at.is_some() {
-                    removed += 1;
-                    false
-                } else {
-                    true
-                }
-            });
-        }
-
-        execs.push(TeamExecutionRecord {
-            execution_id: execution_id.to_string(),
-            team_id: team_id.to_string(),
-            user_id: user_id.to_string(),
-            task: task.to_string(),
-            status: "running".to_string(),
-            result_json: None,
-            started_at: chrono::Utc::now().to_rfc3339(),
-            completed_at: None,
-        });
-        Ok(())
-    }
-
-    async fn record_execution_complete(
-        &self,
-        execution_id: &str,
-        status: &str,
-        result_json: Option<&str>,
-    ) -> Result<(), String> {
-        validate_optional_json("team execution result_json", result_json)?;
-        let mut execs = self.executions.write().map_err(|e| e.to_string())?;
-        if let Some(rec) = execs.iter_mut().find(|r| r.execution_id == execution_id) {
-            rec.status = status.to_string();
-            rec.result_json = result_json.map(|s| s.to_string());
-            rec.completed_at = Some(chrono::Utc::now().to_rfc3339());
-        }
-        Ok(())
-    }
-
-    async fn list_executions(
-        &self,
-        team_id: &str,
-        limit: u32,
-    ) -> Result<Vec<TeamExecutionRecord>, String> {
-        let execs = self.executions.read().map_err(|e| e.to_string())?;
-        let mut matching: Vec<_> = execs
-            .iter()
-            .filter(|r| r.team_id == team_id)
-            .cloned()
-            .collect();
-        sort_team_executions_recent(&mut matching);
-        matching.truncate(limit as usize);
-        Ok(matching)
-    }
-
-    async fn list_executions_page(
-        &self,
-        team_id: &str,
-        limit: u32,
-        cursor: Option<TeamExecutionListCursor>,
-    ) -> Result<TeamExecutionListPage, String> {
-        let execs = self.executions.read().map_err(|e| e.to_string())?;
-        let matching: Vec<_> = execs
-            .iter()
-            .filter(|r| r.team_id == team_id)
-            .cloned()
-            .collect();
-        team_execution_page_from_records(matching, limit, cursor)
     }
 
     // ── Snapshots ───────────────────────────────────────────────
@@ -1118,9 +685,7 @@ impl OwnerInitializationCache {
 /// Uses sqlx connection pool with parameterized queries. The schema is created
 /// by [`crate::storage::ensure_core_schema`].
 ///
-/// Serialization: `coordination`, `members`, and `context` are stored as JSON
-/// text columns. `worktree_mode` is stored as a lowercase string ("shared",
-/// "isolated", "staged").
+/// Member declarations and shared context are stored as JSON text columns.
 pub struct MatrixOneTeamStore {
     pool: sqlx::Pool<sqlx::MySql>,
     owner_initializations: OwnerInitializationCache,
@@ -1157,38 +722,22 @@ impl MatrixOneTeamStore {
     }
 
     async fn insert_builtin_if_absent(&self, team: &TeamDefinition) -> Result<(), String> {
-        let coordination_json =
-            serde_json::to_string(&team.coordination).map_err(|e| e.to_string())?;
         let members_json = serde_json::to_string(&team.members).map_err(|e| e.to_string())?;
         let context_json = serde_json::to_string(&team.context).map_err(|e| e.to_string())?;
-        let worktree_str = serde_json::to_string(&team.worktree_mode)
-            .map_err(|e| e.to_string())?
-            .trim_matches('"')
-            .to_string();
-        let budget_json = team
-            .budget
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| e.to_string())?;
 
         match sqlx::query(
             "INSERT INTO team_definitions \
-             (team_id, user_id, name, description, coordination, members_json, \
-              context_json, worktree_mode, budget_json, max_parallel, \
+             (team_id, user_id, name, description, members_json, \
+              context_json, \
               created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+             VALUES (?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
         )
         .bind(&team.team_id)
         .bind(&team.user_id)
         .bind(&team.name)
         .bind(&team.description)
-        .bind(&coordination_json)
         .bind(&members_json)
         .bind(&context_json)
-        .bind(&worktree_str)
-        .bind(&budget_json)
-        .bind(team.max_parallel)
         .execute(&self.pool)
         .await
         {
@@ -1215,40 +764,24 @@ impl TeamPersistenceService for MatrixOneTeamStore {
     }
 
     async fn save_team(&self, team: &TeamDefinition) -> Result<TeamDefinition, String> {
-        let coordination_json =
-            serde_json::to_string(&team.coordination).map_err(|e| e.to_string())?;
         let members_json = serde_json::to_string(&team.members).map_err(|e| e.to_string())?;
         let context_json = serde_json::to_string(&team.context).map_err(|e| e.to_string())?;
-        let worktree_str = serde_json::to_string(&team.worktree_mode)
-            .map_err(|e| e.to_string())?
-            .trim_matches('"')
-            .to_string();
-        let budget_json: Option<String> = team
-            .budget
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| e.to_string())?;
 
         // Insert first so concurrent creates collapse into a duplicate-key path, then
         // update only the logical team identified by UNIQUE(user_id, name).
         match sqlx::query(
             "INSERT INTO team_definitions \
-             (team_id, user_id, name, description, coordination, members_json, \
-              context_json, worktree_mode, budget_json, max_parallel, \
+             (team_id, user_id, name, description, members_json, \
+              context_json, \
               created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+             VALUES (?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
         )
         .bind(&team.team_id)
         .bind(&team.user_id)
         .bind(&team.name)
         .bind(&team.description)
-        .bind(&coordination_json)
         .bind(&members_json)
         .bind(&context_json)
-        .bind(&worktree_str)
-        .bind(&budget_json)
-        .bind(team.max_parallel)
         .execute(&self.pool)
         .await
         {
@@ -1258,23 +791,15 @@ impl TeamPersistenceService for MatrixOneTeamStore {
                     "UPDATE team_definitions SET \
                          team_id       = ?, \
                          description   = ?, \
-                         coordination  = ?, \
                          members_json  = ?, \
                          context_json  = ?, \
-                         worktree_mode = ?, \
-                         budget_json   = ?, \
-                         max_parallel  = ?, \
                          updated_at    = NOW(6) \
                      WHERE user_id = ? AND name = ?",
                 )
                 .bind(&team.team_id)
                 .bind(&team.description)
-                .bind(&coordination_json)
                 .bind(&members_json)
                 .bind(&context_json)
-                .bind(&worktree_str)
-                .bind(&budget_json)
-                .bind(team.max_parallel)
                 .bind(&team.user_id)
                 .bind(&team.name)
                 .execute(&self.pool)
@@ -1296,9 +821,8 @@ impl TeamPersistenceService for MatrixOneTeamStore {
 
     async fn load_team(&self, user_id: &str, name: &str) -> Result<Option<TeamDefinition>, String> {
         let row = sqlx::query(
-            "SELECT team_id, user_id, name, description, coordination, \
-                    members_json, context_json, worktree_mode, \
-                    budget_json, max_parallel, \
+            "SELECT team_id, user_id, name, description, \
+                    members_json, context_json, \
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM team_definitions WHERE user_id = ? AND name = ?",
@@ -1324,9 +848,8 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         team_id: &str,
     ) -> Result<Option<TeamDefinition>, String> {
         let row = sqlx::query(
-            "SELECT team_id, user_id, name, description, coordination, \
-                    members_json, context_json, worktree_mode, \
-                    budget_json, max_parallel, \
+            "SELECT team_id, user_id, name, description, \
+                    members_json, context_json, \
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM team_definitions WHERE user_id = ? AND team_id = ?",
@@ -1370,160 +893,6 @@ impl TeamPersistenceService for MatrixOneTeamStore {
             .map_err(|e| format!("team DELETE failed: {e}"))?;
 
         Ok(result.rows_affected() > 0)
-    }
-
-    // ── Execution history ───────────────────────────────────────
-
-    async fn record_execution_start(
-        &self,
-        execution_id: &str,
-        team_id: &str,
-        user_id: &str,
-        task: &str,
-    ) -> Result<(), String> {
-        // Retention: prune oldest completed rows beyond limit.
-        // Only completed records are pruned — running records are preserved.
-        // Uses a subquery instead of DELETE ... ORDER BY ... LIMIT because
-        // MatrixOne does not support ORDER BY in multi-table DELETE syntax.
-        const MAX_COMPLETED_PER_TEAM: u32 = 100;
-        sqlx::query(
-            "DELETE FROM team_execution_history \
-             WHERE team_id = ? AND status != 'running' AND execution_id NOT IN ( \
-                 SELECT execution_id FROM ( \
-                     SELECT execution_id FROM team_execution_history \
-                     WHERE team_id = ? AND status != 'running' \
-                     ORDER BY started_at DESC \
-                     LIMIT ? \
-                 ) AS recent \
-             )",
-        )
-        .bind(team_id)
-        .bind(team_id)
-        .bind(MAX_COMPLETED_PER_TEAM)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("execution retention prune failed: {e}"))?;
-
-        sqlx::query(
-            "INSERT INTO team_execution_history \
-             (execution_id, team_id, user_id, `task`, status, started_at) \
-             VALUES (?, ?, ?, ?, 'running', NOW(6))",
-        )
-        .bind(execution_id)
-        .bind(team_id)
-        .bind(user_id)
-        .bind(task)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("execution INSERT failed: {e}"))?;
-        Ok(())
-    }
-
-    async fn record_execution_complete(
-        &self,
-        execution_id: &str,
-        status: &str,
-        result_json: Option<&str>,
-    ) -> Result<(), String> {
-        validate_optional_json("team execution result_json", result_json)?;
-        sqlx::query(
-            "UPDATE team_execution_history SET \
-                 status       = ?, \
-                 result_json  = ?, \
-                 completed_at = NOW(6) \
-             WHERE execution_id = ?",
-        )
-        .bind(status)
-        .bind(result_json)
-        .bind(execution_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("execution UPDATE failed: {e}"))?;
-        Ok(())
-    }
-
-    async fn list_executions(
-        &self,
-        team_id: &str,
-        limit: u32,
-    ) -> Result<Vec<TeamExecutionRecord>, String> {
-        let rows = sqlx::query(
-            "SELECT execution_id, team_id, user_id, `task`, status, \
-                    result_json, CAST(started_at AS CHAR) AS started_at, \
-                    CAST(completed_at AS CHAR) AS completed_at \
-             FROM team_execution_history \
-             WHERE team_id = ? \
-             ORDER BY started_at DESC, execution_id DESC \
-             LIMIT ?",
-        )
-        .bind(team_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("execution SELECT failed: {e}"))?;
-
-        let mut records = Vec::with_capacity(rows.len());
-        for row in &rows {
-            records.push(row_to_team_execution_record(row)?);
-        }
-        Ok(records)
-    }
-
-    async fn list_executions_page(
-        &self,
-        team_id: &str,
-        limit: u32,
-        cursor: Option<TeamExecutionListCursor>,
-    ) -> Result<TeamExecutionListPage, String> {
-        let limit = validate_team_execution_list_limit(limit);
-        let mut qb = QueryBuilder::<MySql>::new(
-            "SELECT execution_id, team_id, user_id, `task`, status, \
-                    result_json, DATE_FORMAT(started_at, '%Y-%m-%dT%H:%i:%s.%f') AS started_at, \
-                    DATE_FORMAT(completed_at, '%Y-%m-%dT%H:%i:%s.%f') AS completed_at \
-             FROM team_execution_history \
-             WHERE team_id = ",
-        );
-        qb.push_bind(team_id);
-        if let Some(cursor) = &cursor {
-            let started_at = team_execution_cursor_db_started_at(cursor)?;
-            let execution_id = team_execution_cursor_execution_id(cursor)?;
-            qb.push(" AND (started_at < ");
-            qb.push_bind(started_at.clone());
-            qb.push(" OR (started_at = ");
-            qb.push_bind(started_at);
-            qb.push(" AND execution_id < ");
-            qb.push_bind(execution_id);
-            qb.push("))");
-        }
-        qb.push(" ORDER BY started_at DESC, execution_id DESC LIMIT ");
-        qb.push_bind(team_list_query_limit(limit));
-
-        let rows = qb
-            .build()
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| format!("execution page SELECT failed: {e}"))?;
-        let mut executions = rows
-            .iter()
-            .map(row_to_team_execution_record)
-            .collect::<Result<Vec<_>, _>>()?;
-        let has_more = executions.len() > limit as usize;
-        if has_more {
-            executions.truncate(limit as usize);
-        }
-        let next_cursor = if has_more {
-            executions
-                .last()
-                .map(team_execution_cursor_from_record)
-                .transpose()?
-        } else {
-            None
-        };
-        Ok(TeamExecutionListPage {
-            executions,
-            limit,
-            next_cursor,
-        })
     }
 
     // ── Snapshots ───────────────────────────────────────────────
@@ -1703,17 +1072,6 @@ fn row_optional_string(
         .map_err(|error| row_decode_error(table, column, error))
 }
 
-fn row_u32(
-    row: &sqlx::mysql::MySqlRow,
-    table: &'static str,
-    column: &'static str,
-) -> Result<u32, String> {
-    use sqlx::Row;
-
-    row.try_get::<u32, _>(column)
-        .map_err(|error| row_decode_error(table, column, error))
-}
-
 fn parse_row_json<T: DeserializeOwned>(
     table: &'static str,
     column: &'static str,
@@ -1729,54 +1087,23 @@ fn row_to_team_definition(row: &sqlx::mysql::MySqlRow) -> Result<TeamDefinition,
     let user_id = row_string(row, TABLE, "user_id")?;
     let name = row_string(row, TABLE, "name")?;
     let description = row_string(row, TABLE, "description")?;
-    let coord_json = row_string(row, TABLE, "coordination")?;
     let members_str = row_string(row, TABLE, "members_json")?;
     let context_str = row_string(row, TABLE, "context_json")?;
-    let wt_str = row_string(row, TABLE, "worktree_mode")?;
-    let budget_str = row_optional_string(row, TABLE, "budget_json")?;
-    let max_parallel = row_u32(row, TABLE, "max_parallel")?;
     let created_at = row_string(row, TABLE, "created_at")?;
     let updated_at = row_string(row, TABLE, "updated_at")?;
 
-    let coordination: TeamCoordination = parse_row_json(TABLE, "coordination", &coord_json)?;
     let members: Vec<TeamMemberDef> = parse_row_json(TABLE, "members_json", &members_str)?;
     let context: HashMap<String, String> = parse_row_json(TABLE, "context_json", &context_str)?;
-    let worktree_mode: WorktreeMode =
-        parse_row_json(TABLE, "worktree_mode", &format!("\"{wt_str}\""))?;
-    let budget: Option<TeamBudget> = budget_str
-        .map(|raw| parse_row_json(TABLE, "budget_json", &raw))
-        .transpose()?;
 
     Ok(TeamDefinition {
         team_id,
         user_id,
         name,
         description,
-        coordination,
         members,
         context,
-        worktree_mode,
-        budget,
-        max_parallel,
         created_at,
         updated_at,
-    })
-}
-
-fn row_to_team_execution_record(
-    row: &sqlx::mysql::MySqlRow,
-) -> Result<TeamExecutionRecord, String> {
-    const TABLE: &str = "team_execution_history";
-
-    Ok(TeamExecutionRecord {
-        execution_id: row_string(row, TABLE, "execution_id")?,
-        team_id: row_string(row, TABLE, "team_id")?,
-        user_id: row_string(row, TABLE, "user_id")?,
-        task: row_string(row, TABLE, "task")?,
-        status: row_string(row, TABLE, "status")?,
-        result_json: row_optional_string(row, TABLE, "result_json")?,
-        started_at: row_string(row, TABLE, "started_at")?,
-        completed_at: row_optional_string(row, TABLE, "completed_at")?,
     })
 }
 
@@ -1793,21 +1120,6 @@ fn row_to_team_snapshot_record(row: &sqlx::mysql::MySqlRow) -> Result<TeamSnapsh
         team_definition_json: row_optional_string(row, TABLE, "team_definition_json")?,
         created_at: row_string(row, TABLE, "created_at")?,
     })
-}
-
-// ─── Execution History ──────────────────────────────────────────────────────
-
-/// A record of a team execution in the `team_execution_history` table.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TeamExecutionRecord {
-    pub execution_id: String,
-    pub team_id: String,
-    pub user_id: String,
-    pub task: String,
-    pub status: String,
-    pub result_json: Option<String>,
-    pub started_at: String,
-    pub completed_at: Option<String>,
 }
 
 /// A team snapshot record, capturing team state + git commit for restore.
@@ -1833,7 +1145,6 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
             user_id: user_id.to_string(),
             name: "review".to_string(),
             description: "Independent code reviews with aggregated findings".to_string(),
-            coordination: TeamCoordination::FanOut { aggregation: TeamAggregation::AllResults },
             members: vec![
                 TeamMemberDef {
                     role: "correctness_reviewer".to_string(),
@@ -1866,9 +1177,6 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                 },
             ],
             context: HashMap::new(),
-            worktree_mode: WorktreeMode::Shared,
-            budget: None,
-            max_parallel: 0,
             created_at: now.to_string(),
             updated_at: now.to_string(),
         },
@@ -1878,7 +1186,6 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
             name: "research".to_string(),
             description: "Deep research: explorer gathers info, synthesizer produces report"
                 .to_string(),
-            coordination: TeamCoordination::Sequential { stop_on_success: false },
             members: vec![
                 TeamMemberDef {
                     role: "explorer".to_string(),
@@ -1910,9 +1217,6 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                 },
             ],
             context: HashMap::new(),
-            worktree_mode: WorktreeMode::Shared,
-            budget: None,
-            max_parallel: 0,
             created_at: now.to_string(),
             updated_at: now.to_string(),
         },
@@ -1923,7 +1227,6 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
             description:
                 "Full development cycle: planner decomposes, implementer codes, tester verifies"
                     .to_string(),
-            coordination: TeamCoordination::Sequential { stop_on_success: false },
             members: vec![
                 TeamMemberDef {
                     role: "planner".to_string(),
@@ -1967,9 +1270,6 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                 },
             ],
             context: HashMap::new(),
-            worktree_mode: WorktreeMode::Isolated,
-            budget: None,
-            max_parallel: 0,
             created_at: now.to_string(),
             updated_at: now.to_string(),
         },
@@ -1995,9 +1295,6 @@ mod tests {
             user_id: "user-1".to_string(),
             name: "test-team".to_string(),
             description: "A test team".to_string(),
-            coordination: TeamCoordination::Sequential {
-                stop_on_success: false,
-            },
             members: vec![
                 TeamMemberDef {
                     role: "coder".to_string(),
@@ -2012,7 +1309,6 @@ mod tests {
                     mcp_servers: vec![],
                     can_delegate: false,
                     max_delegation_depth: 0,
-                    ..Default::default()
                 },
                 TeamMemberDef {
                     role: "reviewer".to_string(),
@@ -2027,9 +1323,6 @@ mod tests {
                 },
             ],
             context: HashMap::from([("project".to_string(), "test-project".to_string())]),
-            worktree_mode: WorktreeMode::Isolated,
-            budget: None,
-            max_parallel: 0,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
@@ -2305,63 +1598,6 @@ mod tests {
     }
 
     #[test]
-    fn builtin_review_team_uses_parallel_execution() {
-        let teams = builtin_teams("u1", "2026-01-01T00:00:00Z");
-        let review = teams.iter().find(|t| t.name == "review").unwrap();
-        assert!(matches!(
-            review.coordination,
-            TeamCoordination::FanOut {
-                aggregation: TeamAggregation::AllResults
-            }
-        ));
-        assert_eq!(review.members.len(), 2);
-    }
-
-    #[test]
-    fn builtin_dev_team_is_ordered_with_isolated_worktree() {
-        let teams = builtin_teams("u1", "2026-01-01T00:00:00Z");
-        let dev = teams.iter().find(|t| t.name == "dev").unwrap();
-        assert_eq!(
-            dev.coordination,
-            TeamCoordination::Sequential {
-                stop_on_success: false
-            }
-        );
-        assert_eq!(dev.worktree_mode, WorktreeMode::Isolated);
-        assert_eq!(dev.members.len(), 3);
-    }
-
-    #[test]
-    fn worktree_mode_serde_roundtrip() {
-        let json = serde_json::to_string(&WorktreeMode::Isolated).unwrap();
-        assert_eq!(json, "\"isolated\"");
-        let parsed: WorktreeMode = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, WorktreeMode::Isolated);
-    }
-
-    #[test]
-    fn coordination_json_roundtrips_through_matrixone_format() {
-        // Simulate what MatrixOneTeamStore does: serialize to JSON text, store, deserialize
-        let coords = vec![
-            TeamCoordination::FanOut {
-                aggregation: TeamAggregation::Consensus,
-            },
-            TeamCoordination::Sequential {
-                stop_on_success: false,
-            },
-            TeamCoordination::Sequential {
-                stop_on_success: true,
-            },
-        ];
-
-        for coord in &coords {
-            let json = serde_json::to_string(coord).unwrap();
-            let parsed: TeamCoordination = serde_json::from_str(&json).unwrap();
-            assert_eq!(*coord, parsed, "roundtrip failed for {json}");
-        }
-    }
-
-    #[test]
     fn members_json_roundtrip() {
         let members = vec![
             TeamMemberDef {
@@ -2397,131 +1633,12 @@ mod tests {
     }
 
     #[test]
-    fn worktree_mode_string_format() {
-        // MatrixOneTeamStore stores worktree_mode as a bare string, not JSON
-        for (mode, expected) in [
-            (WorktreeMode::Shared, "shared"),
-            (WorktreeMode::Isolated, "isolated"),
-            (WorktreeMode::Staged, "staged"),
-        ] {
-            let json = serde_json::to_string(&mode).unwrap();
-            // serde produces "\"shared\"", trim quotes for DB storage
-            let bare = json.trim_matches('"');
-            assert_eq!(bare, expected);
-            // Reverse: wrap in quotes for deserialization
-            let restored: WorktreeMode = serde_json::from_str(&format!("\"{bare}\"")).unwrap();
-            assert_eq!(restored, mode);
-        }
-    }
-
-    #[test]
     fn context_json_handles_empty() {
         let empty: HashMap<String, String> = HashMap::new();
         let json = serde_json::to_string(&empty).unwrap();
         assert_eq!(json, "{}");
         let parsed: HashMap<String, String> = serde_json::from_str(&json).unwrap();
         assert!(parsed.is_empty());
-    }
-
-    #[test]
-    fn team_execution_record_serde_roundtrip() {
-        let record = TeamExecutionRecord {
-            execution_id: "exec-1".to_string(),
-            team_id: "team-1".to_string(),
-            user_id: "user-1".to_string(),
-            task: "Fix auth bug".to_string(),
-            status: "completed".to_string(),
-            result_json: Some(r#"{"merged":true}"#.to_string()),
-            started_at: "2026-01-01T00:00:00Z".to_string(),
-            completed_at: Some("2026-01-01T00:05:00Z".to_string()),
-        };
-        let json = serde_json::to_string(&record).unwrap();
-        let parsed: TeamExecutionRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.execution_id, "exec-1");
-        assert_eq!(parsed.status, "completed");
-        assert!(parsed.completed_at.is_some());
-    }
-
-    #[test]
-    fn team_execution_cursor_accepts_db_and_rfc3339_timestamps() {
-        let db_cursor = TeamExecutionListCursor {
-            started_at: "2026-10-01T12:34:56.123456".to_string(),
-            execution_id: "exec-1".to_string(),
-        };
-        assert_eq!(
-            team_execution_cursor_db_started_at(&db_cursor).unwrap(),
-            "2026-10-01 12:34:56.123456"
-        );
-        assert_eq!(
-            team_execution_cursor_execution_id(&db_cursor).unwrap(),
-            "exec-1"
-        );
-
-        let rfc3339_cursor = TeamExecutionListCursor {
-            started_at: "2026-10-01T20:34:56.123456+08:00".to_string(),
-            execution_id: "exec-1".to_string(),
-        };
-        assert_eq!(
-            team_execution_cursor_db_started_at(&rfc3339_cursor).unwrap(),
-            "2026-10-01 12:34:56.123456"
-        );
-
-        let missing_id = TeamExecutionListCursor {
-            started_at: "2026-10-01T12:34:56.123456".to_string(),
-            execution_id: " ".to_string(),
-        };
-        assert!(team_execution_cursor_execution_id(&missing_id).is_err());
-    }
-
-    fn test_execution_record(execution_id: &str, started_at: &str) -> TeamExecutionRecord {
-        TeamExecutionRecord {
-            execution_id: execution_id.to_string(),
-            team_id: "team-1".to_string(),
-            user_id: "user-1".to_string(),
-            task: format!("task {execution_id}"),
-            status: "completed".to_string(),
-            result_json: None,
-            started_at: started_at.to_string(),
-            completed_at: None,
-        }
-    }
-
-    #[test]
-    fn team_execution_page_uses_stable_seek_cursor() {
-        let executions = vec![
-            test_execution_record("exec-a", "2026-10-01T12:00:00.000000"),
-            test_execution_record("exec-c", "2026-10-01T12:00:00.000000"),
-            test_execution_record("exec-b", "2026-10-01T12:00:00.000000"),
-            test_execution_record("exec-old", "2026-09-30T12:00:00.000000"),
-        ];
-
-        let first = team_execution_page_from_records(executions.clone(), 2, None).unwrap();
-        assert_eq!(
-            first
-                .executions
-                .iter()
-                .map(|execution| execution.execution_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["exec-c", "exec-b"]
-        );
-        assert_eq!(
-            first.next_cursor,
-            Some(TeamExecutionListCursor {
-                started_at: "2026-10-01T12:00:00.000000".to_string(),
-                execution_id: "exec-b".to_string(),
-            })
-        );
-
-        let second = team_execution_page_from_records(executions, 2, first.next_cursor).unwrap();
-        assert_eq!(
-            second
-                .executions
-                .iter()
-                .map(|execution| execution.execution_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["exec-a", "exec-old"]
-        );
-        assert!(second.next_cursor.is_none());
     }
 
     #[test]
@@ -2613,7 +1730,6 @@ mod tests {
         let parsed: TeamDefinition = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.team_id, team.team_id);
         assert_eq!(parsed.name, team.name);
-        assert_eq!(parsed.worktree_mode, WorktreeMode::Isolated);
         assert_eq!(parsed.members.len(), 2);
         assert!(parsed.context.contains_key("project"));
     }
@@ -2621,14 +1737,10 @@ mod tests {
     // ─── T-2: Validation Tests ─────────────────────────────────────────────
 
     #[test]
-    fn draft_team_is_valid_but_cannot_execute() {
+    fn draft_team_is_valid() {
         let mut team = test_team();
         team.members.clear();
         assert!(validate_team(&team).is_ok());
-        assert_eq!(
-            resolve_team(&team, "task", "parent", "session").unwrap_err(),
-            TeamValidationError::EmptyMembers.to_string()
-        );
     }
 
     #[test]
@@ -2659,83 +1771,6 @@ mod tests {
     fn validate_team_valid_pipeline() {
         let team = test_team(); // pipeline with 2 distinct members
         assert!(validate_team(&team).is_ok());
-    }
-
-    #[test]
-    fn validate_team_negative_budget_rejected() {
-        let mut team = test_team();
-        team.budget = Some(TeamBudget {
-            max_cost_usd: -1.0,
-            max_tokens: 100_000,
-            max_duration_secs: 60,
-        });
-        let errs = validate_team(&team).unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|e| matches!(e, TeamValidationError::InvalidBudget(_)))
-        );
-    }
-
-    #[test]
-    fn validate_team_all_zero_budget_rejected() {
-        let mut team = test_team();
-        team.budget = Some(TeamBudget {
-            max_cost_usd: 0.0,
-            max_tokens: 0,
-            max_duration_secs: 0,
-        });
-        let errs = validate_team(&team).unwrap_err();
-        assert!(errs.iter().any(|e| {
-            matches!(e, TeamValidationError::InvalidBudget(msg) if msg.contains("all limits are zero"))
-        }));
-    }
-
-    #[test]
-    fn validate_team_valid_budget_accepted() {
-        let mut team = test_team();
-        team.budget = Some(TeamBudget {
-            max_cost_usd: 5.0,
-            max_tokens: 100_000,
-            max_duration_secs: 300,
-        });
-        assert!(validate_team(&team).is_ok());
-    }
-
-    #[test]
-    fn budget_serde_roundtrip() {
-        let budget = TeamBudget {
-            max_cost_usd: 10.0,
-            max_tokens: 500_000,
-            max_duration_secs: 600,
-        };
-        let json = serde_json::to_string(&budget).unwrap();
-        let back: TeamBudget = serde_json::from_str(&json).unwrap();
-        assert_eq!(budget, back);
-    }
-
-    #[test]
-    fn team_definition_serde_with_budget() {
-        let mut team = test_team();
-        team.budget = Some(TeamBudget {
-            max_cost_usd: 2.5,
-            max_tokens: 50_000,
-            max_duration_secs: 120,
-        });
-        team.max_parallel = 3;
-        let json = serde_json::to_string(&team).unwrap();
-        let back: TeamDefinition = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.max_parallel, 3);
-        assert_eq!(back.budget.unwrap().max_cost_usd, 2.5);
-    }
-
-    #[test]
-    fn team_definition_serde_without_budget() {
-        let team = test_team();
-        let json = serde_json::to_string(&team).unwrap();
-        assert!(!json.contains("budget"));
-        let back: TeamDefinition = serde_json::from_str(&json).unwrap();
-        assert!(back.budget.is_none());
-        assert_eq!(back.max_parallel, 0);
     }
 
     #[test]
@@ -2825,40 +1860,6 @@ mod tests {
         assert!(!profile.metadata.contains_key("team_context"));
     }
 
-    // ─── T-2: resolve_team bulk tests ──────────────────────────────────────
-
-    #[test]
-    fn resolve_team_returns_profiles_and_request() {
-        let team = test_team();
-        let (request, profiles) = resolve_team(&team, "Fix auth", "run-1", "test-session").unwrap();
-
-        assert_eq!(profiles.len(), 2);
-        assert_eq!(request.task, "Fix auth");
-        assert_eq!(request.parent_run_id, "run-1");
-        assert_eq!(request.session_id, "test-session");
-        assert_eq!(request.user_id, team.user_id);
-        assert_eq!(request.depth, 0);
-    }
-
-    #[test]
-    fn resolve_team_rejects_invalid() {
-        let mut team = test_team();
-        team.members.clear();
-        let result = resolve_team(&team, "task", "run-1", "test-session");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("at least one member"));
-    }
-
-    #[test]
-    fn resolve_team_context_propagated_to_request() {
-        let team = test_team();
-        let (request, _) = resolve_team(&team, "task", "run-1", "test-session").unwrap();
-        assert_eq!(
-            request.context.get("project"),
-            Some(&serde_json::Value::String("test-project".to_string()))
-        );
-    }
-
     // ─── T-2: can_delegate / max_delegation_depth serde ────────────────────
 
     #[test]
@@ -2892,225 +1893,6 @@ mod tests {
         let member: TeamMemberDef = serde_json::from_str(json).unwrap();
         assert!(member.can_delegate);
         assert_eq!(member.max_delegation_depth, 3);
-    }
-
-    // ─── T-2: build_coordination_pattern via resolve_team ──────────────────
-
-    #[test]
-    fn resolve_team_sequential_member_order() {
-        let team = test_team();
-        let (request, _) = resolve_team(&team, "task", "run-1", "test-session").unwrap();
-        match &request.pattern {
-            CoordinationPattern::Sequential {
-                agent_ids,
-                stop_on_success,
-                ..
-            } => {
-                assert!(!stop_on_success);
-                assert_eq!(agent_ids, &["coder-agent", "team-test-team-reviewer"]);
-            }
-            _ => panic!("expected Sequential pattern"),
-        }
-    }
-
-    #[test]
-    fn resolve_team_fan_out_pattern() {
-        let mut team = test_team();
-        team.coordination = TeamCoordination::FanOut {
-            aggregation: TeamAggregation::AllResults,
-        };
-        let (request, _) = resolve_team(&team, "task", "run-1", "test-session").unwrap();
-        match &request.pattern {
-            CoordinationPattern::FanOut {
-                agent_ids,
-                aggregation: AggregationStrategy::AllResults,
-                ..
-            } => {
-                assert_eq!(agent_ids.len(), 2);
-            }
-            _ => panic!("expected FanOut pattern"),
-        }
-    }
-
-    #[test]
-    fn team_coordination_rejects_unsupported_controls() {
-        for value in [
-            serde_json::json!({"type":"fan_out","aggregation":"merge"}),
-            serde_json::json!({"type":"adversarial","max_rounds":1,"threshold":0.9}),
-        ] {
-            assert!(serde_json::from_value::<TeamCoordination>(value).is_err());
-        }
-    }
-
-    // ── Execution Recording ──
-
-    #[tokio::test]
-    async fn in_memory_store_execution_recording() {
-        let store = InMemoryTeamStore::new();
-
-        // Record start
-        store
-            .record_execution_start("exec-1", "team-1", "user-1", "build the app")
-            .await
-            .unwrap();
-
-        // List should show 1 running execution
-        let list = store.list_executions("team-1", 10).await.unwrap();
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].execution_id, "exec-1");
-        assert_eq!(list[0].task, "build the app");
-        assert_eq!(list[0].status, "running");
-
-        // Complete it
-        store
-            .record_execution_complete("exec-1", "completed", Some(r#"{"ok":true}"#))
-            .await
-            .unwrap();
-
-        let list = store.list_executions("team-1", 10).await.unwrap();
-        assert_eq!(list[0].status, "completed");
-        assert!(list[0].result_json.is_some());
-    }
-
-    #[tokio::test]
-    async fn in_memory_store_execution_list_limit() {
-        let store = InMemoryTeamStore::new();
-        for i in 0..5 {
-            store
-                .record_execution_start(
-                    &format!("exec-{i}"),
-                    "team-1",
-                    "user-1",
-                    &format!("task {i}"),
-                )
-                .await
-                .unwrap();
-        }
-        let list = store.list_executions("team-1", 3).await.unwrap();
-        assert_eq!(list.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn in_memory_store_execution_complete_unknown_id() {
-        let store = InMemoryTeamStore::new();
-        // Completing a non-existent execution should succeed silently (no-op)
-        let result = store
-            .record_execution_complete("nonexistent", "completed", None)
-            .await;
-        assert!(result.is_ok());
-    }
-
-    // ── Execution Retention ──
-
-    #[tokio::test]
-    async fn execution_retention_prunes_oldest_when_limit_exceeded() {
-        let store = InMemoryTeamStore::new();
-        // Fill to exactly MAX (100) and complete them so they're eligible for pruning
-        for i in 0..100 {
-            store
-                .record_execution_start(
-                    &format!("exec-{i}"),
-                    "team-ret",
-                    "user-1",
-                    &format!("task {i}"),
-                )
-                .await
-                .unwrap();
-            store
-                .record_execution_complete(&format!("exec-{i}"), "completed", None)
-                .await
-                .unwrap();
-        }
-        let all = store.list_executions("team-ret", 200).await.unwrap();
-        assert_eq!(all.len(), 100);
-
-        // Adding one more triggers prune of oldest completed (exec-0)
-        store
-            .record_execution_start("exec-100", "team-ret", "user-1", "task 100")
-            .await
-            .unwrap();
-
-        let all = store.list_executions("team-ret", 200).await.unwrap();
-        // 100 completed - 1 pruned + 1 new running = 100
-        assert_eq!(all.len(), 100);
-        assert!(
-            all.iter().all(|r| r.execution_id != "exec-0"),
-            "oldest completed execution should have been pruned"
-        );
-        assert!(all.iter().any(|r| r.execution_id == "exec-1"));
-        assert!(all.iter().any(|r| r.execution_id == "exec-100"));
-    }
-
-    #[tokio::test]
-    async fn execution_retention_does_not_prune_other_teams() {
-        let store = InMemoryTeamStore::new();
-        // Fill team-a to 100 completed
-        for i in 0..100 {
-            store
-                .record_execution_start(
-                    &format!("a-exec-{i}"),
-                    "team-a",
-                    "user-1",
-                    &format!("task {i}"),
-                )
-                .await
-                .unwrap();
-            store
-                .record_execution_complete(&format!("a-exec-{i}"), "completed", None)
-                .await
-                .unwrap();
-        }
-        // Add 3 for team-b
-        for i in 0..3 {
-            store
-                .record_execution_start(
-                    &format!("b-exec-{i}"),
-                    "team-b",
-                    "user-1",
-                    &format!("task {i}"),
-                )
-                .await
-                .unwrap();
-        }
-
-        // Trigger prune on team-a
-        store
-            .record_execution_start("a-exec-100", "team-a", "user-1", "overflow")
-            .await
-            .unwrap();
-
-        // team-b should be untouched
-        let b_list = store.list_executions("team-b", 200).await.unwrap();
-        assert_eq!(b_list.len(), 3);
-
-        // team-a should be capped at 100
-        let a_list = store.list_executions("team-a", 200).await.unwrap();
-        assert_eq!(a_list.len(), 100);
-    }
-
-    #[tokio::test]
-    async fn execution_retention_preserves_running_records() {
-        let store = InMemoryTeamStore::new();
-        // Create 100 running (not completed) records
-        for i in 0..100 {
-            store
-                .record_execution_start(
-                    &format!("exec-{i}"),
-                    "team-run",
-                    "user-1",
-                    &format!("task {i}"),
-                )
-                .await
-                .unwrap();
-        }
-        // Add one more — running records should NOT be pruned
-        store
-            .record_execution_start("exec-100", "team-run", "user-1", "task 100")
-            .await
-            .unwrap();
-
-        let all = store.list_executions("team-run", 200).await.unwrap();
-        assert_eq!(all.len(), 101, "running records must not be pruned");
     }
 
     // ── Snapshot CRUD ──

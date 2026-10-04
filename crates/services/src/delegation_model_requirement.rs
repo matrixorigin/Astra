@@ -722,9 +722,6 @@ fn json_object_payload(raw: &str) -> &str {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DelegationSlotBrief {
     pub description: String,
-    /// Effective child identity prompt when the caller already has a trusted
-    /// profile snapshot (e.g. a direct Team command).
-    pub system_prompt: Option<String>,
     /// Actual child task, not just the provider-authored display label.
     pub prompt: String,
     /// Structured model control already validated from this exact tool slot.
@@ -763,10 +760,6 @@ fn delegation_slot_projection(index: usize, slot: &DelegationSlotBrief) -> Value
 fn slot_brief_exceeds_bounds(slot: &DelegationSlotBrief) -> bool {
     slot.description.chars().count() > 256
         || slot.prompt.chars().count() > 4_096
-        || slot
-            .system_prompt
-            .as_ref()
-            .is_some_and(|prompt| prompt.chars().count() > 4_096)
         || slot.invocation.as_ref().is_some_and(|invocation| {
             invocation.tool_call_id.len() > 256
                 || invocation.tool_name.len() > 64
@@ -775,70 +768,6 @@ fn slot_brief_exceeds_bounds(slot: &DelegationSlotBrief) -> bool {
                     .as_ref()
                     .is_some_and(|id| id.len() > 256)
         })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CanonicalDelegationSlotPlan {
-    pub briefs: Vec<DelegationSlotBrief>,
-    pub digest: String,
-}
-
-/// Build the same ordered profile/task basis for scope binding and later
-/// executor verification. Runtime coordination wrappers are derived from this
-/// pattern and task; they are not independent user-scope evidence.
-pub fn canonical_team_delegation_slot_plan(
-    request: &crate::coordination::DelegationRequest,
-    profiles: &[crate::coordination::AgentProfile],
-) -> Result<CanonicalDelegationSlotPlan, String> {
-    use crate::coordination::CoordinationPattern;
-
-    let agent_ids = match &request.pattern {
-        CoordinationPattern::FanOut { agent_ids, .. }
-        | CoordinationPattern::Sequential { agent_ids, .. } => agent_ids.clone(),
-        CoordinationPattern::Fork { .. } => {
-            return Err("direct Team model plans do not support fork patterns".into());
-        }
-    };
-    if agent_ids.is_empty() || agent_ids.len() > astra_turn_types::MAX_DIRECT_DELEGATION_SLOTS {
-        return Err("direct Team has an invalid canonical slot count".into());
-    }
-    let profiles_by_id = profiles
-        .iter()
-        .map(|profile| (profile.agent_id.as_str(), profile))
-        .collect::<std::collections::HashMap<_, _>>();
-    let ordered_profiles = agent_ids
-        .iter()
-        .map(|agent_id| {
-            profiles_by_id
-                .get(agent_id.as_str())
-                .copied()
-                .map(|profile| (agent_id, profile))
-                .ok_or_else(|| format!("canonical Team slot has no profile: {agent_id}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let briefs = ordered_profiles
-        .iter()
-        .map(|(_, profile)| DelegationSlotBrief {
-            description: profile.name.clone(),
-            system_prompt: profile.system_prompt.clone(),
-            prompt: request.task.clone(),
-            requested_model_policy: None,
-            reasoning: None,
-            invocation: None,
-        })
-        .collect::<Vec<_>>();
-    let canonical = json!({
-        "task": &request.task,
-        "pattern": &request.pattern,
-        "slots": ordered_profiles.iter().map(|(agent_id, profile)| json!({
-            "agent_id": agent_id,
-            "profile": profile,
-        })).collect::<Vec<_>>(),
-    });
-    let bytes =
-        serde_json::to_vec(&canonical).map_err(|_| "failed to encode canonical Team slots")?;
-    let digest = format!("sha256:{:x}", sha2::Sha256::digest(bytes));
-    Ok(CanonicalDelegationSlotPlan { briefs, digest })
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1664,7 +1593,6 @@ mod tests {
         assert!(input["slots"][1]["requested_model_policy"].is_null());
         assert!(input["slots"][1]["reasoning"].is_null());
         assert!(input["slots"][1]["invocation"].is_null());
-        assert!(input["slots"][1]["system_prompt"].is_null());
         let mut controlled_slots = slots.clone();
         controlled_slots[1].requested_model_policy = Some(RequestedModelPolicy::Fixed {
             selector: ModelSelector::ConfiguredName {
@@ -1691,7 +1619,6 @@ mod tests {
         assert!(controlled["slots"][1]["reasoning"].is_null());
         assert_eq!(controlled["slots"][1]["index"], 1);
         assert!(controlled["slots"][1]["invocation"].is_null());
-        assert!(controlled["slots"][1]["system_prompt"].is_null());
         let mut raw = candidate_response("Model-7", 0);
         let item = &mut raw["requirements"][0];
         item["slots"] = json!([1]);
@@ -2600,53 +2527,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_team_slot_plan_binds_ordered_profiles_and_task() {
-        use crate::coordination::{
-            AgentProfile, AgentTier, AggregationStrategy, CoordinationPattern, DelegationRequest,
-        };
-
-        let request = DelegationRequest {
-            delegation_id: "random-run-id".into(),
-            session_id: "session".into(),
-            parent_run_id: "random-parent-run".into(),
-            task: "Review the patch".into(),
-            pattern: CoordinationPattern::FanOut {
-                agent_ids: vec!["reviewer".into(), "investigator".into()],
-                aggregation: AggregationStrategy::AllResults,
-                timeout_sec: 60,
-            },
-            user_id: "user".into(),
-            depth: 0,
-            delegation_chain: Vec::new(),
-            context: std::collections::HashMap::new(),
-            execution_metadata: None,
-        };
-        let mut reviewer = AgentProfile::new("reviewer", "Reviewer", AgentTier::User);
-        reviewer.system_prompt = Some("Review for correctness and security.".into());
-        let investigator = AgentProfile::new("investigator", "Investigator", AgentTier::User);
-        let profiles = vec![investigator.clone(), reviewer.clone()];
-
-        let plan = canonical_team_delegation_slot_plan(&request, &profiles).unwrap();
-        assert_eq!(plan.briefs[0].description, "Reviewer");
-        assert_eq!(
-            plan.briefs[0].system_prompt.as_deref(),
-            Some("Review for correctness and security.")
-        );
-        assert_eq!(plan.briefs[0].prompt, "Review the patch");
-        assert_eq!(plan.briefs[1].description, "Investigator");
-        let reordered =
-            canonical_team_delegation_slot_plan(&request, &[reviewer, investigator]).unwrap();
-        assert_eq!(plan.digest, reordered.digest);
-
-        let changed_task = DelegationRequest {
-            task: "Investigate the patch".into(),
-            ..request
-        };
-        let changed = canonical_team_delegation_slot_plan(&changed_task, &profiles).unwrap();
-        assert_ne!(plan.digest, changed.digest);
-    }
-
-    #[test]
     fn configured_selector_is_exact_authorized_and_fail_closed() {
         let mut inactive = offered("inactive", "provider-a", "offer-inactive");
         inactive.is_active = false;
@@ -2769,7 +2649,6 @@ mod tests {
             None,
             &[DelegationSlotBrief {
                 description: "review".into(),
-                system_prompt: None,
                 prompt: "Review the change".into(),
                 requested_model_policy: Some(configured.clone()),
                 reasoning: None,
@@ -2834,7 +2713,6 @@ mod tests {
             None,
             &[DelegationSlotBrief {
                 description: "review".into(),
-                system_prompt: None,
                 prompt: "Review the change".into(),
                 requested_model_policy: Some(RequestedModelPolicy::Inherit),
                 reasoning: None,
@@ -2876,7 +2754,6 @@ mod tests {
         };
         let equivalent_name = DelegationSlotBrief {
             description: "review".into(),
-            system_prompt: None,
             prompt: "Review the change".into(),
             requested_model_policy: Some(RequestedModelPolicy::Fixed {
                 selector: ModelSelector::ConfiguredName {

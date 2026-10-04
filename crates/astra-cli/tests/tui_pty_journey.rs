@@ -919,8 +919,7 @@ async fn live_team_delivers_dependent_member_results_and_reworks_after_client_re
         "/teams",
         Some(
             serde_json::json!({"name":team_name, "description":"Dependent CSV delivery",
-            "coordination":{"type":"sequential","stop_on_success":false},
-            "members":members,"context":{},"worktree_mode":"shared","max_parallel":1}),
+            "members":members,"context":{}}),
         ),
     )
     .await;

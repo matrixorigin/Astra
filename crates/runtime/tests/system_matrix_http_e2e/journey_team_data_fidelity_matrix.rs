@@ -1,5 +1,5 @@
 //! Team HTTP ↔ Matrix row fidelity: JSON columns match GET responses; snapshot blob matches definition;
-//! list length vs SQL count; executions `limit` query still OK when empty.
+//! list length matches the owner-scoped SQL count.
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -11,7 +11,6 @@ fn fidelity_team_payload(name: &str) -> Value {
     json!({
         "name": name,
         "description": "data fidelity probe",
-        "coordination": { "type": "sequential", "stop_on_success": false },
         "members": [
             {
                 "role": "coder",
@@ -34,13 +33,6 @@ fn fidelity_team_payload(name: &str) -> Value {
             }
         ],
         "context": { "suite": "matrix_team_data_fidelity", "k": "v" },
-        "worktree_mode": "isolated",
-        "max_parallel": 2,
-        "budget": {
-            "max_cost_usd": 10.0,
-            "max_tokens": 50000,
-            "max_duration_secs": 600
-        }
     })
 }
 
@@ -60,8 +52,7 @@ pub async fn run_team_http_db_fidelity() {
     assert_eq!(st_get, StatusCode::OK, "GET detail: {get_j}");
 
     let row = sqlx::query(
-        "SELECT description, coordination, members_json, context_json, \
-                worktree_mode, budget_json, max_parallel \
+        "SELECT description, members_json, context_json \
          FROM team_definitions WHERE user_id = ? AND name = ?",
     )
     .bind(&ctx.user_id)
@@ -73,14 +64,6 @@ pub async fn run_team_http_db_fidelity() {
     assert_eq!(
         row.get::<String, _>("description"),
         get_j["description"].as_str().unwrap_or("")
-    );
-
-    let coord_db: String = row.get("coordination");
-    let coord_http = get_j["coordination"].clone();
-    let coord_parsed: Value = serde_json::from_str(&coord_db).expect("coordination JSON from DB");
-    assert_eq!(
-        coord_parsed, coord_http,
-        "coordination DB vs GET detail mismatch"
     );
 
     let members_db: String = row.get("members_json");
@@ -104,39 +87,6 @@ pub async fn run_team_http_db_fidelity() {
         "context_json DB vs GET detail mismatch"
     );
 
-    assert_eq!(
-        row.get::<String, _>("worktree_mode").to_ascii_lowercase(),
-        get_j["worktree_mode"]
-            .as_str()
-            .unwrap_or("")
-            .to_ascii_lowercase(),
-        "worktree_mode DB vs GET"
-    );
-
-    let budget_db: Option<String> = row.try_get("budget_json").ok().flatten();
-    match (budget_db.as_deref(), get_j.get("budget")) {
-        (Some(bs), Some(bv)) if !bs.is_empty() => {
-            let bv_db: Value = serde_json::from_str(bs).expect("budget_json");
-            assert_eq!(bv_db, *bv, "budget_json DB vs GET");
-        }
-        _ => panic!(
-            "budget roundtrip missing: db={budget_db:?} http={:?}",
-            get_j.get("budget")
-        ),
-    }
-
-    let mp_db: i64 = row
-        .try_get::<i64, _>("max_parallel")
-        .or_else(|_| row.try_get::<u32, _>("max_parallel").map(|x| x as i64))
-        .unwrap_or(0);
-    assert_eq!(
-        mp_db,
-        get_j["max_parallel"]
-            .as_i64()
-            .unwrap_or_else(|| { get_j["max_parallel"].as_u64().expect("max_parallel") as i64 }),
-        "max_parallel DB vs GET"
-    );
-
     let (st_list, list_j) = get_json(&ctx.app, "/teams", Some(auth), &[]).await;
     assert_eq!(st_list, StatusCode::OK);
     let listed = list_j["teams"].as_array().expect("teams");
@@ -150,17 +100,6 @@ pub async fn run_team_http_db_fidelity() {
         listed.len() as i64,
         sql_count,
         "GET /teams len should match SQL COUNT(*) for user"
-    );
-
-    let path_exec_limited = format!("/teams/{team_name}/executions?limit=3",);
-    let (st_ex, ex_j) = get_json(&ctx.app, &path_exec_limited, Some(auth), &[]).await;
-    assert_eq!(st_ex, StatusCode::OK, "GET executions limited: {ex_j}");
-    assert!(
-        ex_j["executions"]
-            .as_array()
-            .map(|a| a.is_empty())
-            .unwrap_or(false),
-        "still no executions: {ex_j}"
     );
 
     let snap_body = json!({

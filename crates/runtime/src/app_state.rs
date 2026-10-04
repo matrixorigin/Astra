@@ -225,7 +225,7 @@ pub struct AppState {
     pub(crate) agent_profile_registry: Arc<astra_services::AgentProfileRegistry>,
     /// Delegation engine — coordinates multi-agent runs.
     pub(crate) delegation_engine: Option<Arc<crate::server::delegation::engine::DelegationEngine>>,
-    /// Team persistence store — CRUD for team definitions and execution history.
+    /// Team persistence store — definitions and immutable snapshots.
     pub(crate) team_store:
         Option<Arc<dyn astra_services::team_persistence::TeamPersistenceService>>,
     /// Per-user resource governor for limit checking and usage tracking (Phase 5).

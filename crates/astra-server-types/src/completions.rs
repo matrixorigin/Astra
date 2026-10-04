@@ -18,7 +18,6 @@ pub enum CompletionOperation {
     ToolResultRerank,
     TurnIntent,
     SkillAutoRoute,
-    DelegationIntentExtraction,
     VerificationJudge,
 }
 
@@ -38,7 +37,6 @@ impl CompletionOperation {
             Self::ToolResultRerank => astra_turn_types::InferencePurpose::ToolResultRerank,
             Self::TurnIntent => astra_turn_types::InferencePurpose::Introspection,
             Self::SkillAutoRoute => astra_turn_types::InferencePurpose::Introspection,
-            Self::DelegationIntentExtraction => astra_turn_types::InferencePurpose::Introspection,
             Self::VerificationJudge => astra_turn_types::InferencePurpose::VerificationJudge,
         }
     }
@@ -51,17 +49,13 @@ impl CompletionOperation {
             Self::ToolResultRerank => "completion_proxy:tool_result_rerank",
             Self::TurnIntent => "completion_proxy:turn_intent",
             Self::SkillAutoRoute => "completion_proxy:skill_auto_route",
-            Self::DelegationIntentExtraction => "delegation_intent",
             Self::VerificationJudge => "completion_proxy:verification_judge",
         }
     }
 
     #[must_use]
     pub const fn accepts_free_form_output(self) -> bool {
-        matches!(
-            self,
-            Self::MemoryExtraction | Self::DelegationIntentExtraction
-        )
+        matches!(self, Self::MemoryExtraction)
     }
 }
 
@@ -79,11 +73,6 @@ pub struct CompletionRequest {
     pub turn: u32,
     pub round: u32,
     pub logical_attempt: u32,
-    /// Per-command identity for direct Team model-requirement extraction.
-    /// The Server combines it with the fixed operation namespace; callers
-    /// cannot choose an arbitrary inference operation identity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command_intent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_selection: Option<astra_turn_types::ModelSelection>,
     pub messages: Vec<Value>,
@@ -114,7 +103,6 @@ impl CompletionRequest {
             turn,
             round,
             logical_attempt,
-            command_intent_id: None,
             model_selection: None,
             messages,
             max_tokens: default_max_tokens(),
@@ -159,12 +147,6 @@ impl CompletionRequest {
     }
 
     #[must_use]
-    pub fn with_command_intent_id(mut self, command_intent_id: impl Into<String>) -> Self {
-        self.command_intent_id = Some(command_intent_id.into());
-        self
-    }
-
-    #[must_use]
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
         self
@@ -178,20 +160,6 @@ impl CompletionRequest {
                 "max_tokens must be between 1 and {MAX_COMPLETION_OUTPUT_TOKENS}"
             ));
         }
-        let command_stage = matches!(
-            self.operation,
-            CompletionOperation::DelegationIntentExtraction
-        );
-        match (command_stage, self.command_intent_id.as_deref()) {
-            (true, Some(value)) if is_canonical_command_intent_id(value) => {}
-            (true, _) => {
-                return Err("delegation completion requires a canonical command_intent_id".into());
-            }
-            (false, Some(_)) => {
-                return Err("command_intent_id is only valid for delegation completions".into());
-            }
-            (false, None) => {}
-        }
         Ok(())
     }
 
@@ -202,34 +170,14 @@ impl CompletionRequest {
 
     #[must_use]
     pub fn invocation_scope(&self) -> astra_turn_types::InferenceInvocationScope {
-        let operation_id = match self.operation {
-            CompletionOperation::DelegationIntentExtraction => format!(
-                "{}:{}",
-                self.operation.operation_id(),
-                self.command_intent_id
-                    .as_deref()
-                    .expect("delegation completion was validated")
-            ),
-            _ => self.operation.operation_id().to_string(),
-        };
         astra_turn_types::InferenceInvocationScope::Session {
             session_id: self.session_id.clone(),
             turn: self.turn,
             round: self.round,
-            operation_id,
+            operation_id: self.operation.operation_id().to_string(),
             logical_attempt: self.logical_attempt,
         }
     }
-}
-
-fn is_canonical_command_intent_id(value: &str) -> bool {
-    if value.len() != 36 || value.to_ascii_lowercase() != value {
-        return false;
-    }
-    value.bytes().enumerate().all(|(index, byte)| match index {
-        8 | 13 | 18 | 23 => byte == b'-',
-        _ => byte.is_ascii_hexdigit(),
-    })
 }
 
 const fn default_max_tokens() -> u32 {
@@ -367,42 +315,6 @@ mod tests {
     }
 
     #[test]
-    fn delegation_completion_identity_is_server_namespaced_and_command_scoped() {
-        let command_id = "eb1b8c4a-4fc0-4a56-86e8-c1fc36d0d21a";
-        let operation = CompletionOperation::DelegationIntentExtraction;
-        let request = CompletionRequest::new(operation, "session-1", 0, 0, 0, vec![])
-            .with_command_intent_id(command_id);
-        request.validate().expect("valid direct-command identity");
-        assert_eq!(
-            request.invocation_scope().operation_id(),
-            format!("delegation_intent:{command_id}")
-        );
-        assert_eq!(
-            request.purpose(),
-            astra_turn_types::InferencePurpose::Introspection
-        );
-        assert!(!operation.is_typed_judgment());
-    }
-
-    #[test]
-    fn delegation_completion_rejects_missing_noncanonical_and_unrelated_intent_ids() {
-        let mut request = CompletionRequest::new(
-            CompletionOperation::DelegationIntentExtraction,
-            "session-1",
-            0,
-            0,
-            0,
-            vec![],
-        );
-        assert!(request.validate().is_err());
-        request.command_intent_id = Some("EB1B8C4A-4FC0-4A56-86E8-C1FC36D0D21A".into());
-        assert!(request.validate().is_err());
-        request.command_intent_id = Some("eb1b8c4a-4fc0-4a56-86e8-c1fc36d0d21a".into());
-        request.operation = CompletionOperation::MemoryExtraction;
-        assert!(request.validate().is_err());
-    }
-
-    #[test]
     fn request_validation_keeps_output_budget_server_bounded() {
         let mut request = CompletionRequest::new(
             CompletionOperation::MemoryExtraction,
@@ -423,12 +335,7 @@ mod tests {
 
     #[test]
     fn free_form_operations_skip_typed_output_contract() {
-        for operation in [
-            CompletionOperation::MemoryExtraction,
-            CompletionOperation::DelegationIntentExtraction,
-        ] {
-            assert!(!operation.is_typed_judgment());
-        }
+        assert!(!CompletionOperation::MemoryExtraction.is_typed_judgment());
         for operation in [
             CompletionOperation::MemoryRetrievalRerank,
             CompletionOperation::ToolResultRerank,

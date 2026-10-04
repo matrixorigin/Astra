@@ -101,7 +101,6 @@ pub(crate) fn render_team_args(args: &TeamArgs) -> String {
                     .join(" ")
             )
         }
-        Some(TeamSubcommand::History(cmd)) => format!("history {}", cmd.name),
         Some(TeamSubcommand::Snapshot(cmd)) => {
             let suffix = join_words(&cmd.label);
             if suffix.is_empty() {

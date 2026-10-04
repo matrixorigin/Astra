@@ -1145,21 +1145,11 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         semantic_owner="astra_services::team_persistence",
         state_class="durable team definition fact",
         primary_query="team create/update/get/list/delete by user_id, team_id, name, and updated_at",
-        retention_policy="retain while a named team can be executed or snapshotted; delete should also consider execution history and snapshots for audit needs",
-        rebuildability="not rebuildable after coordination, members_json, context_json, worktree_mode, and budget_json are lost",
-        merge_guidance="keep separate from team_execution_history and team_snapshots; definitions are mutable team config, history/snapshots are execution/audit facts",
+        retention_policy="retain while a named member roster can be selected or snapshotted; snapshots retain their own owner-scoped lifecycle",
+        rebuildability="not rebuildable after member declarations and shared context are lost",
+        merge_guidance="keep separate from team_snapshots; definitions are mutable team config, snapshots preserve point-in-time definitions",
         migration_owner="astra_services::storage / team_persistence",
         product_owner="team management and multi-agent orchestration",
-    ),
-    "team_execution_history": TableMetadata(
-        semantic_owner="astra_services::team_persistence",
-        state_class="durable team execution audit fact",
-        primary_query="execution history by user_id, team_id, execution_id, started_at, status, and completed_at",
-        retention_policy="retain while team execution audit, result display, and debugging need result_json/status/timestamps; cleanup should be bounded by team/user history policy",
-        rebuildability="not rebuildable after task, result_json, status, and timing are lost",
-        merge_guidance="keep separate from team_definitions; this is append-like execution history with different retention pressure",
-        migration_owner="astra_services::storage / team_persistence",
-        product_owner="team execution history and result audit",
     ),
     "team_snapshots": TableMetadata(
         semantic_owner="astra_services::team_persistence",
@@ -1969,37 +1959,7 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
             "small table size is not evidence of redundancy; it is the durable root for rollback/list identity"
         ),
     ),
-    ConsolidationReview(
-        candidate="team_execution_history + team_snapshots",
-        decision="keep_separate",
-        current_read_paths=[
-            "crates/services/src/team_persistence.rs::list_executions_page",
-            "crates/services/src/team_persistence.rs::list_snapshots_page",
-        ],
-        current_write_paths=[
-            "crates/services/src/team_persistence.rs::record_execution_start",
-            "crates/services/src/team_persistence.rs::save_snapshot",
-        ],
-        user_api_impact=(
-            "/teams/{name}/executions and /teams/{name}/snapshots expose different resources: "
-            "execution result audit versus point-in-time team definition snapshots"
-        ),
-        migration_backfill=(
-            "no merge; both APIs now have seek pagination and different cursor keys"
-        ),
-        rollback=(
-            "current split tables avoid backfill risk; merging would require reversible event_type mapping "
-            "and separate cursor compatibility"
-        ),
-        test_evidence=[
-            "crates/services/tests/team_persistence_integration.rs",
-            "crates/runtime/tests/system_matrix_http_e2e/journey_team_snapshots_matrix.rs",
-            "crates/runtime/src/server/team_handlers.rs::team handler cursor tests",
-        ],
-        rationale=(
-            "execution history is append-like run audit; snapshots are named reproducibility artifacts"
-        ),
-    ),
+
 )
 
 

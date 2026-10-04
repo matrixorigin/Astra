@@ -528,8 +528,6 @@ pub(crate) enum TeamSubcommand {
     Context(TeamContextArgs),
     /// Execute a task with a team
     Run(TeamRunArgs),
-    /// Show execution history for a team
-    History(TeamNameArgs),
     /// Save a team snapshot
     Snapshot(TeamSnapshotArgs),
     /// Restore a team snapshot

@@ -1,10 +1,7 @@
 //! Phase F — Track #3: nested sub-run cancellation propagation (2+ levels deep).
 //!
-//! The audit flagged that while single-level cancel was covered by
-//! `team_execution_respects_cancellation` (via `JoinHandle::abort`), the
-//! `cancel_token` propagation path — which is how real sub-runs inside
-//! `DelegationEngine` are asked to wind down gracefully — had no test at
-//! nesting depth > 1.
+//! Exercise cooperative cancellation beyond a single delegated level.
+//! The root token must reach nested tasks through `SubRunConfig::cancel_token`.
 //!
 //! These tests use `DelegationEngine` plus a mock `SubRunExecutor` that
 //! spawns two additional task levels internally, both holding a clone of the
