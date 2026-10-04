@@ -464,7 +464,15 @@ fn hidden_run_tree_receives_updates_while_an_agent_transcript_is_focused() {
     let mut buffer = Buffer::empty(area);
     pane.render(area, &mut buffer);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
+    assert!(rendered.contains("No active agent runs"), "{rendered}");
+    assert!(rendered.contains("H history"), "{rendered}");
+
+    pane.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+    let mut buffer = Buffer::empty(area);
+    pane.render(area, &mut buffer);
+    let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(rendered.contains("done"), "{rendered}");
+    assert!(rendered.contains("reviewer"), "{rendered}");
 }
 
 #[test]

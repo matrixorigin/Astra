@@ -41047,8 +41047,8 @@ mod tests {
         let error =
             crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 2)
                 .await
-            .err()
-            .expect("repeated refusals exhaust the execution budget");
+                .err()
+                .expect("repeated refusals exhaust the execution budget");
         assert!(error.to_string().contains("Turn budget exhausted"));
         assert_eq!(
             state.max_turns, old_limit,

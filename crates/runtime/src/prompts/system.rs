@@ -789,7 +789,7 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
 "         - Delegation fast path: when the user asks for a child and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. For absent actions or fields, follow the Tool Availability Protocol; never drop requested constraints. Default `agent_type` is bounded read-only `explore`; use `code-review` for review, `task`/`general-purpose` for mutation/full capabilities. For user model names, omit `requested_model_policy`: runtime admission resolves the authorized catalog; fixed selectors are programmatic. `model_catalog` serves requested availability/comparison, not a spawn prerequisite. Never select from workspace configuration/credentials or silently substitute unavailable/prohibited models.\n",
         );
         body.push_str(
-            "         - Launch before tools for the assigned objective: resource/evidence checks belong to the child, not parent preflight. Preserve each user-assigned model/task pair; work assigned to the current/main agent stays with the parent and does not replace the child task. One objective normally needs one child; use fanout for group control, not speculative duplication.\n",
+            "         - Spawn before task-specific checks; those belong to the child. Preserve user-assigned model/task pairs: parent work stays with the parent, never replaces child work. Use one child per objective; fanout is for group control, not duplication.\n",
         );
         body.push_str(
             "         - After spawn, continue only independent parent work needed for the user's request. Otherwise propose final without polling or shell sleep: the runtime waits for terminal results; synthesize when continuation is available. A get_result still-running snapshot is not failure.\n",
@@ -1736,9 +1736,7 @@ mod tests {
         assert!(
             combined_surface.contains("the first native call is `agent(action=\"spawn\", ...)`")
         );
-        assert!(
-            combined_surface.contains("use fanout for group control, not speculative duplication")
-        );
+        assert!(combined_surface.contains("fanout is for group control, not duplication"));
 
         let stable_work_surface = build_main_system_prompt(
             &[
@@ -1865,10 +1863,9 @@ mod tests {
         assert!(prompt.contains("runtime admission resolves the authorized catalog"));
         assert!(prompt.contains("the first native call is `agent(action=\"spawn\", ...)`"));
         assert!(prompt.contains("when the user asks for a child"));
-        assert!(prompt.contains("Launch before tools for the assigned objective"));
-        assert!(
-            prompt.contains("resource/evidence checks belong to the child, not parent preflight")
-        );
+        assert!(prompt.contains("Spawn before task-specific checks; those belong to the child"));
+        assert!(prompt.contains("Preserve user-assigned model/task pairs"));
+        assert!(prompt.contains("parent work stays with the parent, never replaces child work"));
     }
 
     #[test]

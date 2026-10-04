@@ -768,6 +768,11 @@ impl BottomPaneView for InFlightAgentsView {
                     "  No current rows · durable agent snapshot is stale",
                     Style::default().fg(theme.warn),
                 ),
+                ServerAgentTruthState::Confirmed | ServerAgentTruthState::Unbound
+                    if !self.hidden_terminal_rows.is_empty() =>
+                {
+                    ("  No active agent runs · H history", dim)
+                }
                 ServerAgentTruthState::Confirmed => {
                     ("  No agent runs in this session · server confirmed", dim)
                 }
