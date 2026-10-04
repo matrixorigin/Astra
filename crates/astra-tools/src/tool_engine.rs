@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
@@ -10,6 +11,24 @@ use tracing;
 
 use crate::ToolResult;
 use crate::schemas::schema_exists_for_tool;
+
+/// Apply the canonical tool panic classification without discarding private
+/// execution facts from a successful handler return.
+pub async fn execute_tool_with_panic_boundary<R>(
+    name: &str,
+    execution: impl Future<Output = R>,
+) -> R
+where
+    R: From<ToolResult>,
+{
+    AssertUnwindSafe(execution)
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            tracing::error!(tool_name = %name, "tool handler panicked; returning error to caller");
+            ToolResult::error(format!("Internal error: tool '{name}' panicked")).into()
+        })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ToolEngineRegistrationError {
@@ -256,21 +275,11 @@ impl<C: Sync> ToolEngine<C> {
     ) -> Option<ToolResult> {
         if let Some(handler) = self.handlers.get(name) {
             return Some(
-                AssertUnwindSafe(handler.execute_invocation(
-                    context,
-                    args,
-                    invocation,
-                    cancel_token,
-                ))
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|_| {
-                    tracing::error!(
-                        tool_name = %name,
-                        "tool handler panicked; returning error to caller"
-                    );
-                    ToolResult::error(format!("Internal error: tool '{name}' panicked"))
-                }),
+                execute_tool_with_panic_boundary(
+                    name,
+                    handler.execute_invocation(context, args, invocation, cancel_token),
+                )
+                .await,
             );
         }
         let handler = self
@@ -278,22 +287,13 @@ impl<C: Sync> ToolEngine<C> {
             .iter()
             .find(|entry| entry.matches(name))?;
         Some(
-            AssertUnwindSafe(handler.handler.execute_invocation(
+            execute_tool_with_panic_boundary(
                 name,
-                context,
-                args,
-                invocation,
-                cancel_token,
-            ))
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|_| {
-                tracing::error!(
-                    tool_name = %name,
-                    "prefix handler panicked; returning error to caller"
-                );
-                ToolResult::error(format!("Internal error: tool '{name}' panicked"))
-            }),
+                handler
+                    .handler
+                    .execute_invocation(name, context, args, invocation, cancel_token),
+            )
+            .await,
         )
     }
 }

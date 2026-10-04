@@ -559,6 +559,7 @@ async fn prompt_replay_and_write_recovery_do_not_self_wait_for_pool_capacity() {
     let plan = plan_prompt_request(PromptRequestPlanInput {
         user_id: &user_id,
         session_id: &session_id,
+        run_id: Some(&run_id),
         turn: 1,
         round: 0,
         attempt: 0,
@@ -601,6 +602,48 @@ async fn prompt_replay_and_write_recovery_do_not_self_wait_for_pool_capacity() {
         );
     }
 
+    // Identical coordinates and content in another run must not reuse this
+    // run's diagnostic attribution; persistence still uses the same owner.
+    let sibling_run_id = format!("prompt-sibling-{suffix}");
+    let sibling_plan = plan_prompt_request(PromptRequestPlanInput {
+        user_id: &user_id,
+        session_id: &session_id,
+        run_id: Some(&sibling_run_id),
+        turn: 1,
+        round: 0,
+        attempt: 0,
+        source: "turn",
+        messages: &messages,
+        tools: &[],
+        max_output_tokens: None,
+    })
+    .expect("plan sibling diagnostic");
+    let sibling_input = PromptRequestPersistInput {
+        run_id: Some(sibling_run_id.clone()),
+        ..input.clone()
+    };
+    assert!(
+        persist_prompt_request(&shared_pool, &sibling_input, &plan)
+            .await
+            .is_err()
+    );
+    for _ in 0..2 {
+        persist_prompt_request(&shared_pool, &sibling_input, &sibling_plan)
+            .await
+            .expect("persist or replay sibling diagnostic");
+    }
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT request_id, run_id FROM prompt_request_records WHERE user_id = ? AND session_id = ? ORDER BY run_id",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_all(pool)
+    .await
+    .expect("read actual diagnostic attribution");
+    assert_eq!(rows.len(), 2);
+    assert!(rows.contains(&(plan.request_id.clone(), run_id.clone())));
+    assert!(rows.contains(&(sibling_plan.request_id, sibling_run_id)));
+
     let invalid_input = PromptRequestPersistInput {
         turn: 2,
         model: "x".repeat(1024),
@@ -609,6 +652,7 @@ async fn prompt_replay_and_write_recovery_do_not_self_wait_for_pool_capacity() {
     let invalid_plan = plan_prompt_request(PromptRequestPlanInput {
         user_id: &user_id,
         session_id: &session_id,
+        run_id: Some(&run_id),
         turn: 2,
         round: 0,
         attempt: 0,

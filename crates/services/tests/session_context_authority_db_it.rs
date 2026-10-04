@@ -1406,7 +1406,7 @@ async fn independent_sessions_share_one_physical_checkout() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn commit_reactivates_matching_legacy_staged_manifest() {
+async fn canonical_commit_preserves_selection_across_replay_and_clears_it_on_plain_turn() {
     let pool = common::setup_pool().await;
     let owner_id = format!("staged-manifest-owner-{}", Uuid::new_v4());
     let session_id = format!("staged-manifest-session-{}", Uuid::new_v4());
@@ -1414,8 +1414,8 @@ async fn commit_reactivates_matching_legacy_staged_manifest() {
     let actor = ActorContextV1::owner_user(
         &owner_id,
         "staged-manifest-db-it",
-        ActorKindV1::Server,
-        SessionSurfaceV1::Server,
+        ActorKindV1::Cli,
+        SessionSurfaceV1::Cli,
         None,
         AuthorityEpochsV1::default(),
     );
@@ -1508,23 +1508,25 @@ async fn commit_reactivates_matching_legacy_staged_manifest() {
     .await
     .expect("stage legacy manifest reference");
 
+    let selection = astra_turn_types::AgentProfileSelection {
+        team_id: "delivery".into(),
+        lead_agent_id: Some("lead".into()),
+    };
+    let delta = CanonicalTurnDeltaV1 {
+        agent_profile_selection: Some(selection.clone()),
+        schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+        completed_turn: 1,
+        journal_event_seq: 1,
+        conversation_seq: 1,
+        compaction_generation: 0,
+        config_version_id: None,
+        mode: CanonicalDeltaModeV1::Append,
+        logical_segments: vec![messages.clone()],
+    };
     let outcome = coordinator
-        .commit_turn(
-            &reservation,
-            CanonicalTurnDeltaV1 {
-                schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
-                completed_turn: 1,
-                journal_event_seq: 1,
-                conversation_seq: 1,
-                compaction_generation: 0,
-                config_version_id: None,
-                mode: CanonicalDeltaModeV1::Append,
-                logical_segments: vec![messages.clone()],
-            },
-            "commit-staged-manifest",
-        )
+        .commit_turn(&reservation, delta.clone(), "commit-staged-manifest")
         .await
-        .expect("commit over legacy staged manifest");
+        .expect("commit over staged manifest");
     let cursor = match outcome {
         CoordinatorMutationV1::Applied { cursor } => cursor,
         other => panic!("unexpected commit outcome: {other:?}"),
@@ -1554,6 +1556,73 @@ async fn commit_reactivates_matching_legacy_staged_manifest() {
         .await
         .expect("materialize reactivated manifest");
     assert_eq!(materialized.messages, messages);
+
+    let snapshot = coordinator.load_admission_snapshot(&key).await.unwrap();
+    assert_eq!(snapshot.agent_profile_selection, Some(selection));
+    assert_eq!(snapshot.head.unwrap().cursor, cursor);
+    assert!(matches!(
+        coordinator
+            .commit_turn(&reservation, delta.clone(), "commit-staged-manifest")
+            .await
+            .unwrap(),
+        CoordinatorMutationV1::AlreadyApplied { .. }
+    ));
+    let mut changed = delta.clone();
+    changed.agent_profile_selection = None;
+    assert!(matches!(
+        coordinator
+            .commit_turn(&reservation, changed, "commit-staged-manifest")
+            .await,
+        Err(SessionContextCoordinatorError::IdempotencyMismatch)
+    ));
+    let next = match coordinator
+        .reserve_turn(&lease, Some(&cursor), Duration::from_secs(30), "next", None)
+        .await
+        .unwrap()
+    {
+        ReserveTurnOutcome::Reserved(next) => next,
+        other => panic!("unexpected reservation: {other:?}"),
+    };
+    let mut plain = delta.clone();
+    plain.agent_profile_selection = None;
+    plain.completed_turn = 2;
+    plain.journal_event_seq = 2;
+    plain.conversation_seq = 2;
+    plain.logical_segments = vec![vec![
+        serde_json::json!({"role":"assistant","content":"plain follow-up"}),
+    ]];
+    coordinator
+        .commit_turn(&next, plain, "plain-commit")
+        .await
+        .unwrap();
+    assert!(
+        coordinator
+            .load_admission_snapshot(&key)
+            .await
+            .unwrap()
+            .agent_profile_selection
+            .is_none()
+    );
+    // The first receipt has now been archived; replay must still bind selection.
+    let mut changed = delta.clone();
+    changed
+        .agent_profile_selection
+        .as_mut()
+        .unwrap()
+        .lead_agent_id = Some("other-lead".into());
+    assert!(matches!(
+        coordinator
+            .commit_turn(&reservation, changed, "commit-staged-manifest")
+            .await,
+        Err(SessionContextCoordinatorError::IdempotencyMismatch)
+    ));
+    assert!(matches!(
+        coordinator
+            .commit_turn(&reservation, delta, "commit-staged-manifest")
+            .await
+            .unwrap(),
+        CoordinatorMutationV1::AlreadyApplied { .. }
+    ));
 
     for table in [
         "conversation_manifest_segments",

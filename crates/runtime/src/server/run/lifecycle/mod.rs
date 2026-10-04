@@ -3518,10 +3518,13 @@ async fn park_server_root_mailbox(state: &mut AgenticLoopState) {
 
 // ─── Skill wiring for server paths ──────────────────────────────────────────
 
-type ServerSkillResolverBundle = (
-    Option<Arc<crate::skills::UnifiedSkillRegistry>>,
-    Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
-);
+#[derive(Clone, Default)]
+struct ServerSkillResolverBundle {
+    /// Keep the unfiltered registry for conditional activation and source
+    /// provenance. The resolver below is the request-scoped execution view.
+    registry: Option<Arc<crate::skills::UnifiedSkillRegistry>>,
+    resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+}
 
 /// Post-loop session-memory settlement shared by `create_run` and
 /// `stream_chat`. A terminal turn is not a session close: this worker drains
@@ -3910,27 +3913,28 @@ async fn run_post_loop_memory_cleanup_work(
 /// skills visible to the authenticated user. Request `allow_skills` is a
 /// selector/execution filter over that catalog, not a switch that enables the
 /// catalog.
-fn build_server_skill_resolver(
+async fn build_server_skill_resolver(
     skill_service: Option<Arc<dyn SkillService>>,
     user_id: &str,
 ) -> ServerSkillResolverBundle {
     use crate::turn::skill_tool::SkillResolver as _;
 
-    let Some(registry) = crate::capabilities::build_server_skill_registry(skill_service, user_id)
+    let Some(registry) =
+        crate::capabilities::build_server_skill_registry(skill_service, user_id).await
     else {
-        return (None, None);
+        return ServerSkillResolverBundle::default();
     };
 
     let resolver_impl = Arc::new(crate::skills::UnifiedSkillResolver::new(Arc::clone(
         &registry,
     )));
     let skills = resolver_impl.available_skills();
-    let resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>> = if skills.is_empty() {
-        None
-    } else {
-        Some(resolver_impl)
-    };
-    (Some(registry), resolver)
+    let resolver = (!skills.is_empty())
+        .then_some(resolver_impl as Arc<dyn crate::turn::skill_tool::SkillResolver>);
+    ServerSkillResolverBundle {
+        registry: Some(registry),
+        resolver,
+    }
 }
 
 async fn load_active_personal_skills(
@@ -4721,6 +4725,7 @@ struct ResolvedAgentBindingRuntime {
 struct PreparedRuntimeCapabilities {
     mcp_bundle: Option<runtime_mcp::RuntimeMcpBundle>,
     request_scoped_skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+    server_skill_resolver: ServerSkillResolverBundle,
     agent_binding: Option<PreparedAgentBindingLoopContext>,
 }
 
@@ -5488,6 +5493,7 @@ pub struct AgenticRunLifecycleService {
     test_inference_ledger: Option<crate::turn::llm::durable::TestInferenceLedgerPersistence>,
     /// Optional delegation engine for multi-agent coordination.
     delegation_engine: Option<Arc<crate::server::delegation::engine::DelegationEngine>>,
+    team_store: Option<Arc<dyn astra_services::team_persistence::TeamPersistenceService>>,
     /// Bounded process-local fork-prefix store shared by root loops and their
     /// session-scoped dynamic-agent spawners. Run IDs are globally unique;
     /// the store itself enforces TTL and capacity bounds.
@@ -5637,6 +5643,7 @@ impl AgenticRunLifecycleService {
             #[cfg(any(test, feature = "e2e-hooks"))]
             test_inference_ledger: None,
             delegation_engine: None,
+            team_store: None,
             fork_prefix_store: Arc::new(
                 astra_turn_core::fork_prefix_store::InMemoryPrefixStore::new(),
             ),
@@ -6117,6 +6124,7 @@ impl AgenticRunLifecycleService {
         rewrite_proof: Option<&CanonicalRewriteProof>,
         allow_empty_delta: bool,
         run_id: &str,
+        agent_profile_selection: Option<astra_turn_types::AgentProfileSelection>,
     ) -> Result<Option<astra_turn_types::SessionCursorV1>, astra_core::ClassifiedError> {
         let Some(admission) = admission else {
             return Ok(None);
@@ -6136,6 +6144,7 @@ impl AgenticRunLifecycleService {
             let base = admission.reservation.expected_cursor.as_ref();
             let replaces_history = mode == astra_turn_types::CanonicalDeltaModeV1::Replace;
             let delta = astra_turn_types::CanonicalTurnDeltaV1 {
+                agent_profile_selection,
                 schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
                 completed_turn: admission.reservation.reserved_turn,
                 journal_event_seq: base
@@ -6327,6 +6336,14 @@ impl AgenticRunLifecycleService {
         engine: Arc<crate::server::delegation::engine::DelegationEngine>,
     ) -> Self {
         self.delegation_engine = Some(engine);
+        self
+    }
+
+    pub fn with_team_store(
+        mut self,
+        store: Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
+    ) -> Self {
+        self.team_store = Some(store);
         self
     }
 
@@ -6706,6 +6723,16 @@ impl AgenticRunLifecycleService {
             join,
             sent_lifecycle_events,
         }
+    }
+
+    pub(crate) async fn delegation_child_supervisor(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Arc<DynamicAgentSpawner> {
+        self.server_agent_spawner_for_session(user_id, session_id)
+            .await
+            .spawner
     }
 
     async fn server_agent_spawner_for_session(
@@ -7118,6 +7145,32 @@ impl AgenticRunLifecycleService {
             )?,
         );
         constraints.delegated_model_requirements = delegated_model_requirements;
+        if let Some(snapshot) = request.admitted_agent_profiles.as_ref()
+            && let Some(lead_id) = snapshot.lead_agent_id.as_ref()
+        {
+            let lead = snapshot
+                .profiles
+                .iter()
+                .find(|profile| &profile.agent_id == lead_id)
+                .ok_or_else(|| "selected lead is not an admitted member".to_string())?;
+            if let Some(tools) = lead.allow_tools.as_ref() {
+                let allowed =
+                    normalize_request_allowlist(Some(tools.as_slice()), "profile allow_tools")?
+                        .unwrap_or_default();
+                constraints.allowed_tools =
+                    astra_turn_core::tool_allowlist::compute_effective_allowlist(
+                        constraints.allowed_tools.as_ref(),
+                        Some(&allowed),
+                    );
+            }
+            if !lead.skill_filter.is_empty() {
+                let skills: HashSet<String> = lead.skill_filter.iter().cloned().collect();
+                constraints.allowed_skills = Some(match constraints.allowed_skills.take() {
+                    Some(inherited) => inherited.intersection(&skills).cloned().collect(),
+                    None => skills,
+                });
+            }
+        }
         Ok(constraints)
     }
 
@@ -7145,6 +7198,20 @@ impl AgenticRunLifecycleService {
         let mut inherited =
             InheritedPermissions::new(Self::root_permission_mode_from_request(request));
         inherited.allowed_tools = constraints.allowed_tools.clone();
+        if request
+            .admitted_agent_profiles
+            .as_ref()
+            .is_some_and(|snapshot| {
+                snapshot.lead_agent_id.as_ref().is_some_and(|lead_id| {
+                    snapshot
+                        .profiles
+                        .iter()
+                        .any(|profile| &profile.agent_id == lead_id && profile.read_only)
+                })
+            })
+        {
+            inherited.read_only_execution = true;
+        }
         if execution_bindings.is_some_and(|snapshot| {
             snapshot.workspace.authority == astra_runtime_env::WorkspaceAuthority::ReadOnly
         }) {
@@ -7291,6 +7358,19 @@ impl AgenticRunLifecycleService {
             .unwrap_or_else(|| "root-agent".to_string());
         let active_work_registry = entry.active_work_registry.clone();
         executor.set_agent_tool_context(AgentToolContext {
+            parent_profile_authority: match request.admitted_agent_profiles.as_ref() {
+                Some(snapshot) => match snapshot.lead_agent_id.as_ref() {
+                    Some(id) => {
+                        crate::orchestration::spawner::ParentProfileAuthority::AdmittedMember {
+                            profile_id: id.clone(),
+                            ancestor_profile_ids: Vec::new(),
+                        }
+                    }
+                    None => crate::orchestration::spawner::ParentProfileAuthority::OrdinaryRoot,
+                },
+                None => crate::orchestration::spawner::ParentProfileAuthority::Unbound,
+            },
+            admitted_agent_profiles: request.admitted_agent_profiles.clone(),
             fanout_admission: entry.spawner.attach_fanout_parent(run_id).await,
             reply_obligations: Arc::new(Default::default()),
             delegation_model_admission: None,
@@ -8031,6 +8111,7 @@ impl AgenticRunLifecycleService {
     fn configure_loop_state_runtime_controls(
         &self,
         loop_state: &mut AgenticLoopState,
+        child_supervisor: &Arc<DynamicAgentSpawner>,
         cancel_flag: &Arc<AtomicBool>,
         pause_flag: &Arc<AtomicBool>,
         llm_cancel_token: CancellationToken,
@@ -8040,7 +8121,10 @@ impl AgenticRunLifecycleService {
         loop_state.cancellation.pause_flag = Some(pause_flag.clone());
         loop_state.cancellation.token = Some(Arc::new(llm_cancel_token));
         loop_state.cancellation.execution_lease_lost = Some(execution_lease_lost);
-        loop_state.delegation_engine = self.delegation_engine.clone();
+        loop_state.delegation_engine = self
+            .delegation_engine
+            .as_ref()
+            .map(|engine| Arc::new(engine.for_execution(child_supervisor.clone())));
         // Wire cross-pod cancel/pause provider so the agentic loop can poll
         // DB for control signals from other pods in horizontally-scaled deployments.
         loop_state.run_control = Some(Arc::new(self.run_engine.clone()));
@@ -9154,9 +9238,8 @@ impl AgenticRunLifecycleService {
         if !request.has_agent_binding_runtime() && request.runtime_skill_binding.is_none() {
             let skill_policy = request_constraints.skill_surfacing_policy();
             if skill_policy.requires_catalog_validation() {
-                let (_, resolver) =
-                    build_server_skill_resolver(self.skill_service.clone(), user_id);
-                apply_normalized_skill_allowlist(resolver, &request_constraints)
+                let bundle = build_server_skill_resolver(self.skill_service.clone(), user_id).await;
+                apply_normalized_skill_allowlist(bundle.resolver, &request_constraints)
                     .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
             }
         }
@@ -10169,6 +10252,163 @@ impl AgenticRunLifecycleService {
             ));
         }
         Self::prepare_effective_user_input(&mut request)?;
+        // Validate the incoming authority before a profile can provide the
+        // Server-default selection. A default must not repair conflicting input.
+        if request.model_selection_mode == ModelSelectionMode::ServerDefault
+            && (request.provider_runtime_authorized
+                || request.model_selection.is_some()
+                || request.resolved_model_selection.is_some()
+                || request.admitted_model_execution.is_some()
+                || request.expected_model_name.is_some()
+                || request.model.is_some())
+        {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "Server-default model selection cannot be combined with explicit or expected model identity",
+                "model_selection_invalid",
+            ));
+        }
+        if request.admitted_agent_profiles.is_none()
+            && let Some(selection) = request.agent_profile_selection.as_ref()
+        {
+            if selection.team_id.trim().is_empty()
+                || selection.team_id.len() > 256
+                || selection
+                    .lead_agent_id
+                    .as_ref()
+                    .is_some_and(|id| id.trim().is_empty() || id.len() > 256)
+            {
+                return Err(error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "selected team and lead identities must be nonempty and bounded",
+                    "agent_profile_invalid",
+                ));
+            }
+            let store = self.team_store.as_ref().ok_or_else(|| {
+                error_response_coded(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "agent profile configuration is unavailable",
+                    "agent_profile_unavailable",
+                )
+            })?;
+            let team = store
+                .load_team_by_id(user_id, &selection.team_id)
+                .await
+                .map_err(|_| {
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "agent profile configuration could not be read",
+                        "agent_profile_unavailable",
+                    )
+                })?
+                .ok_or_else(|| {
+                    error_response_coded(
+                        StatusCode::NOT_FOUND,
+                        "selected team was not found",
+                        "agent_profile_not_found",
+                    )
+                })?;
+            if team.user_id != user_id || team.team_id != selection.team_id {
+                return Err(error_response_coded(
+                    StatusCode::NOT_FOUND,
+                    "selected team was not found",
+                    "agent_profile_not_found",
+                ));
+            }
+            if team.members.is_empty() || team.members.len() > 64 {
+                return Err(error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "selected team must contain between 1 and 64 members",
+                    "agent_profile_invalid",
+                ));
+            }
+            astra_services::team_persistence::validate_team(&team).map_err(|_| {
+                error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "selected team configuration is invalid",
+                    "agent_profile_invalid",
+                )
+            })?;
+            let snapshot = astra_services::runs::AgentProfileSnapshot {
+                owner_user_id: user_id.to_string(),
+                source_team_id: team.team_id.clone(),
+                lead_agent_id: selection.lead_agent_id.clone(),
+                profiles: team
+                    .members
+                    .iter()
+                    .map(|member| {
+                        astra_services::team_persistence::resolve_member_to_profile(member, &team)
+                    })
+                    .collect(),
+            };
+            request.admitted_agent_profiles = Some(Arc::new(snapshot));
+        }
+        if let Some(snapshot) = request.admitted_agent_profiles.as_ref() {
+            snapshot.registry(user_id).map_err(|error| {
+                error_response_coded(StatusCode::BAD_REQUEST, error, "agent_profile_invalid")
+            })?;
+            if let Some(lead_id) = snapshot.lead_agent_id.as_ref() {
+                let lead = snapshot
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.agent_id == lead_id)
+                    .expect("validated snapshot contains its lead");
+                if matches!(
+                    request.requested_model_policy,
+                    None | Some(astra_turn_types::RequestedModelPolicy::Inherit)
+                ) && request.execution_policy.model_routing
+                    != astra_turn_types::model_routing::ModelRoutingMode::Auto
+                    && matches!(
+                        request.model_selection_mode,
+                        ModelSelectionMode::ExplicitOffering | ModelSelectionMode::ServerDefault
+                    )
+                    && let Some(selection) = lead.model_selection.as_ref()
+                {
+                    // A provider's resolved identity and gateway grant are one
+                    // authority. A configuration default cannot rebind either
+                    // or silently fall back to Server catalog credentials.
+                    if request.provider_runtime_authorized
+                        && request.model_selection.as_ref() != Some(selection)
+                    {
+                        return Err(error_response_coded(
+                            StatusCode::CONFLICT,
+                            "lead default Offering differs from the provider-bound model; select a matching lead or request an explicit authorized model",
+                            "model_offering_mismatch",
+                        ));
+                    }
+                    request.model_selection = Some(selection.clone());
+                    request.model_selection_mode = ModelSelectionMode::ExplicitOffering;
+                }
+                let mut budget =
+                    request
+                        .execution_budget
+                        .unwrap_or(astra_services::runs::ExecutionBudget {
+                            initial_turns: None,
+                            hard_turn_limit: None,
+                        });
+                if let Some(limit) = lead.max_turns {
+                    budget.hard_turn_limit = Some(
+                        budget
+                            .hard_turn_limit
+                            .map_or(limit, |current| current.min(limit)),
+                    );
+                }
+                if let Some(initial) = lead.initial_turns {
+                    budget.initial_turns = Some(
+                        budget
+                            .initial_turns
+                            .map_or(initial, |current| current.min(initial)),
+                    );
+                }
+                if let (Some(initial), Some(limit)) = (budget.initial_turns, budget.hard_turn_limit)
+                {
+                    budget.initial_turns = Some(initial.min(limit));
+                }
+                if lead.max_turns.is_some() || lead.initial_turns.is_some() {
+                    request.execution_budget = Some(budget);
+                }
+            }
+        }
         match request.requested_model_policy.as_ref() {
             Some(astra_turn_types::RequestedModelPolicy::Auto { .. })
                 if request.model_selection.is_none() =>
@@ -10267,19 +10507,6 @@ impl AgenticRunLifecycleService {
             .await;
         }
         if request.model_selection_mode == ModelSelectionMode::ServerDefault {
-            if request.provider_runtime_authorized
-                || request.model_selection.is_some()
-                || request.resolved_model_selection.is_some()
-                || request.admitted_model_execution.is_some()
-                || request.expected_model_name.is_some()
-                || request.model.is_some()
-            {
-                return Err(error_response_coded(
-                    StatusCode::BAD_REQUEST,
-                    "Server-default model selection cannot be combined with explicit or expected model identity",
-                    "model_selection_invalid",
-                ));
-            }
             let offering_id = self
                 .model_service
                 .default_chat_model_offering_id(user_id.to_string())
@@ -10754,7 +10981,7 @@ impl AgenticRunLifecycleService {
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str())),
         );
-        let mut request_identity = json!({
+        let request_identity = json!({
             "version": 1,
             "message": request.message,
             "user_intent": request.user_intent,
@@ -10766,8 +10993,10 @@ impl AgenticRunLifecycleService {
             "work_binding": request.work_binding,
             "full_llm_capture": request.full_llm_capture,
             "agent_id": request.agent_id,
+            "agent_profile_selection": request.agent_profile_selection,
             "model": request.model,
             "model_selection": request.model_selection,
+            "requested_model_policy": request.requested_model_policy,
             "resolved_model_selection": request.resolved_model_selection,
             "capability_descriptors": request.capability_descriptors,
             "agent_bindings": request.agent_bindings,
@@ -10801,14 +11030,6 @@ impl AgenticRunLifecycleService {
             "interaction_mode": request.interaction_mode,
             "interactive_client": request.interactive_client,
         });
-        // Preserve the existing fingerprint for ordinary requests while
-        // binding explicit delegation policy to provider-task retries. A
-        // changed policy must not attach to a run admitted under another one
-        // or bypass Auto's fail-closed preparation check.
-        if let Some(policy) = request.requested_model_policy.as_ref() {
-            request_identity["requested_model_policy"] = serde_json::to_value(policy)
-                .expect("requested model policy must remain JSON serializable");
-        }
         let request_fingerprint = format!(
             "{:x}",
             Sha256::digest(astra_core::canonical_json_string(&request_identity).as_bytes())
@@ -10963,6 +11184,7 @@ impl AgenticRunLifecycleService {
 
     async fn prepare_runtime_capabilities(
         &self,
+        user_id: &str,
         request: &ChatRequestData,
         request_constraints: &RequestConstraints,
     ) -> Result<PreparedRuntimeCapabilities, (StatusCode, Json<ErrorResponse>)> {
@@ -10984,9 +11206,20 @@ impl AgenticRunLifecycleService {
                 } else {
                     None
                 };
+            let server_skill_resolver = if request.runtime_skill_binding.is_none() {
+                let mut bundle =
+                    build_server_skill_resolver(self.skill_service.clone(), user_id).await;
+                bundle.resolver =
+                    apply_normalized_skill_allowlist(bundle.resolver, request_constraints)
+                        .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+                bundle
+            } else {
+                ServerSkillResolverBundle::default()
+            };
             return Ok(PreparedRuntimeCapabilities {
                 mcp_bundle,
                 request_scoped_skill_resolver,
+                server_skill_resolver,
                 agent_binding: None,
             });
         };
@@ -11107,6 +11340,7 @@ impl AgenticRunLifecycleService {
         Ok(PreparedRuntimeCapabilities {
             mcp_bundle: Some(bundle),
             request_scoped_skill_resolver: None,
+            server_skill_resolver: ServerSkillResolverBundle::default(),
             agent_binding: Some(PreparedAgentBindingLoopContext {
                 bindings,
                 skill_resolver,
@@ -11967,7 +12201,37 @@ impl AgenticRunLifecycleService {
         stable_runtime_system_prompt: Option<&str>,
         runtime_system_prompt: Option<&str>,
         request_context: Option<&Map<String, Value>>,
+        admitted_profiles: Option<&astra_services::runs::AgentProfileSnapshot>,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if let Some(snapshot) = admitted_profiles {
+            let members: Vec<Value> = snapshot.profiles.iter().map(|profile| json!({
+                "agent_type": profile.agent_id,
+                "description": astra_text_utils::str_preview::truncate_str(&profile.name, 256),
+                "model_selection": profile.model_selection,
+                "read_only": profile.read_only,
+                "allow_tools": profile.allow_tools,
+                "can_delegate": profile.can_delegate,
+                "delegate_to": profile.delegate_to,
+            })).collect();
+            Self::append_runtime_stable_prompt_text(
+                edge_profile,
+                format!(
+                    "Admitted agent profiles for this run: {}. For agent spawn or agent_fanout, select an exact agent_type from this directory. This directory replaces the builtin persona list for this run; do not omit agent_type or substitute a builtin persona unless it appears here. Delegation permissions still apply.",
+                    Value::Array(members)
+                ),
+            );
+        }
+        if let Some(snapshot) = admitted_profiles
+            && let Some(lead) = snapshot.lead_agent_id.as_ref().and_then(|id| {
+                snapshot
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.agent_id == id)
+            })
+            && let Some(prompt) = lead.system_prompt.as_ref()
+        {
+            Self::append_runtime_stable_prompt_text(edge_profile, prompt.clone());
+        }
         let turn_context_section = match (agent_binding_context, request_context) {
             (Some(_), Some(context)) => Self::agent_binding_turn_context_section(context)?,
             _ => None,
@@ -12368,6 +12632,7 @@ impl AgenticRunLifecycleService {
                 EdgeContext::default()
             }
         };
+        let prepared_capabilities = PreparedRuntimeCapabilities::default();
         self.build_initial_state_inner(
             user_id,
             request,
@@ -12381,8 +12646,7 @@ impl AgenticRunLifecycleService {
             request_constraints,
             &edge_context,
             None,
-            None,
-            None,
+            &prepared_capabilities,
             None,
         )
         .expect("valid test execution budget")
@@ -12403,29 +12667,22 @@ impl AgenticRunLifecycleService {
         request_constraints: &RequestConstraints,
         edge_context: &EdgeContext,
         edge_profile_override: Option<&Map<String, Value>>,
-        request_scoped_skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
-        agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
+        prepared_capabilities: &PreparedRuntimeCapabilities,
         execution_owner_generation: Option<u64>,
     ) -> LoopEnvironment {
-        let (skill_registry, skill_resolver) = if let Some(binding_context) = agent_binding_context
-        {
-            (None, binding_context.skill_resolver.clone())
-        } else if let Some(skill_resolver) = request_scoped_skill_resolver {
-            (None, Some(skill_resolver))
-        } else {
-            let (skill_registry, raw_skill_resolver) =
-                build_server_skill_resolver(self.skill_service.clone(), user_id);
-            let skill_resolver =
-                    apply_normalized_skill_allowlist(raw_skill_resolver, request_constraints)
-                        .unwrap_or_else(|err| {
-                            tracing::error!(
-                                error = %err,
-                                "skill allowlist failed in build_initial_state; upstream caller should validate first",
-                            );
-                            None
-                        });
-            (skill_registry, skill_resolver)
-        };
+        let (skill_registry, skill_resolver) =
+            if let Some(binding_context) = prepared_capabilities.agent_binding.as_ref() {
+                (None, binding_context.skill_resolver.clone())
+            } else if let Some(skill_resolver) =
+                prepared_capabilities.request_scoped_skill_resolver.clone()
+            {
+                (None, Some(skill_resolver))
+            } else {
+                (
+                    prepared_capabilities.server_skill_resolver.registry.clone(),
+                    prepared_capabilities.server_skill_resolver.resolver.clone(),
+                )
+            };
         let root_permissions = Self::inherited_permissions_from_request(
             request,
             request_constraints,
@@ -12584,8 +12841,7 @@ impl AgenticRunLifecycleService {
         request_constraints: RequestConstraints,
         edge_context: &EdgeContext,
         edge_profile_override: Option<&Map<String, Value>>,
-        request_scoped_skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
-        agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
+        runtime_capabilities: &PreparedRuntimeCapabilities,
         execution_owner_generation: Option<u64>,
     ) -> Result<AgenticLoopState, (StatusCode, Json<ErrorResponse>)> {
         let facts = self.prepare_initial_execution_facts(
@@ -12609,8 +12865,7 @@ impl AgenticRunLifecycleService {
             &request_constraints,
             edge_context,
             edge_profile_override,
-            request_scoped_skill_resolver,
-            agent_binding_context,
+            runtime_capabilities,
             execution_owner_generation,
         );
         Ok(self.assemble_loop_state(
@@ -12620,7 +12875,7 @@ impl AgenticRunLifecycleService {
             run_id,
             request_constraints,
             edge_context,
-            agent_binding_context,
+            runtime_capabilities.agent_binding.as_ref(),
             environment,
             facts,
         ))
@@ -12824,6 +13079,10 @@ impl AgenticRunLifecycleService {
             volatile_pending: facts.original.pending_context,
             current_session_id: Some(session_id.to_string()),
             current_run_id: Some(run_id.to_string()),
+            self_agent_id: request
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "root-agent".to_string()),
             context_manifest_pool: self.shared_pool.clone(),
             context_manifest_model_name: request.model.clone(),
             final_text: facts.original.final_text,
@@ -12932,6 +13191,7 @@ impl AgenticRunLifecycleService {
                 &resolved_tool_policy,
                 astra_turn_types::InferencePurpose::PrimaryAgent,
                 facts.original.evaluation_thresholds,
+                astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             )
         }
     }
@@ -14558,6 +14818,12 @@ impl AgenticRunLifecycleService {
         let bg_shared_pool = self.shared_pool.clone();
         let bg_trace_ingestion = self.trace_ingestion.clone();
         let bg_explain = request.explain;
+        let bg_profile_selection = request.admitted_agent_profiles.as_ref().map(|snapshot| {
+            astra_turn_types::AgentProfileSelection {
+                team_id: snapshot.source_team_id.clone(),
+                lead_agent_id: snapshot.lead_agent_id.clone(),
+            }
+        });
         let missing_lifecycle_spawner = descendant_spawner;
         let bg_metrics_registry = self.metrics_registry.clone();
         let bg_cancel_flag = cancel_flag.clone();
@@ -15657,6 +15923,7 @@ impl AgenticRunLifecycleService {
                             || bg_cancel_flag.load(Ordering::Acquire)
                             || bg_llm_cancel_token.is_cancelled(),
                         &bg_run_id,
+                        bg_profile_selection,
                     )
                     .await
                     {
@@ -16071,7 +16338,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 edge_context.has_tools(),
             );
         let runtime_capabilities = self
-            .prepare_runtime_capabilities(&request, &request_constraints)
+            .prepare_runtime_capabilities(&user_id, &request, &request_constraints)
             .await?;
         let mut edge_profile =
             Self::edge_profile_with_skill_listing(&edge_context, &request_constraints);
@@ -16081,6 +16348,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.stable_runtime_system_prompt.as_deref(),
             request.runtime_system_prompt.as_deref(),
             request.context.as_ref(),
+            request.admitted_agent_profiles.as_deref(),
         )?;
         if let Some(binding) = work_runtime_binding.as_ref() {
             crate::server::work_context::install_canonical_work_context(
@@ -16423,8 +16691,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request_constraints.clone(),
             &edge_context,
             Some(&edge_profile),
-            runtime_capabilities.request_scoped_skill_resolver.clone(),
-            runtime_capabilities.agent_binding.as_ref(),
+            &runtime_capabilities,
             Some(execution_owner_generation),
         )?;
         install_active_personal_skills(&mut loop_state, active_personal_skills);
@@ -16536,8 +16803,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         };
 
+        let agent_spawner_entry = self
+            .server_agent_spawner_for_session(&user_id, &session_id)
+            .await;
         self.configure_loop_state_runtime_controls(
             &mut loop_state,
+            &agent_spawner_entry.spawner,
             &cancel_flag,
             &pause_flag,
             (*llm_cancel_token).clone(),
@@ -16557,9 +16828,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // internal runtime scratch dir; execution routing still follows the
         // explicit workspace/executor binding and cannot silently fall back.
         let mut root_runtime_context_guard = None;
-        let agent_spawner_entry = self
-            .server_agent_spawner_for_session(&user_id, &session_id)
-            .await;
         if let Some(workspace) = server_tool_executor_workspace {
             let mut executor = self.build_root_runtime_tool_executor(
                 workspace.clone(),
@@ -16838,15 +17106,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         self.require_invocation_composition()?;
         let start_identity = self.run_start_idempotency(&user_id, &request)?;
         let request = if let Some(identity) = start_identity.as_ref() {
-            // Idempotent retries may omit runtime context needed only for a
-            // new execution. The durable lookup stays authoritative while
-            // independent request preparation overlaps its read latency.
+            // Replays attach to existing execution facts. Preparing first
+            // would reread mutable member configuration and re-admit a model
+            // even though no new execution will be started.
             let requested_session_id = request.session_id.clone();
-            let (durable, prepared) = tokio::join!(
-                self.load_durable_run_for_user(identity.run_id(), &user_id),
-                self.prepare_chat_request(&user_id, request),
-            );
-            if let Some(durable) = durable? {
+            if let Some(durable) = self
+                .load_durable_run_for_user(identity.run_id(), &user_id)
+                .await?
+            {
                 Self::validate_start_request_session(
                     identity,
                     requested_session_id.as_deref(),
@@ -16860,7 +17127,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     .stream_run_live(identity.run_id().to_string(), user_id, 0)
                     .await;
             }
-            prepared?
+            self.prepare_chat_request(&user_id, request).await?
         } else {
             self.prepare_chat_request(&user_id, request).await?
         };
@@ -16928,7 +17195,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 edge_context.has_tools(),
             );
         let runtime_capabilities = self
-            .prepare_runtime_capabilities(&request, &request_constraints)
+            .prepare_runtime_capabilities(&user_id, &request, &request_constraints)
             .await?;
         let mut edge_profile =
             Self::edge_profile_with_skill_listing(&edge_context, &request_constraints);
@@ -16938,6 +17205,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.stable_runtime_system_prompt.as_deref(),
             request.runtime_system_prompt.as_deref(),
             request.context.as_ref(),
+            request.admitted_agent_profiles.as_deref(),
         )?;
         if let Some(binding) = work_runtime_binding.as_ref() {
             crate::server::work_context::install_canonical_work_context(
@@ -17574,8 +17842,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request_constraints.clone(),
             &edge_context,
             Some(&edge_profile),
-            runtime_capabilities.request_scoped_skill_resolver.clone(),
-            runtime_capabilities.agent_binding.as_ref(),
+            &runtime_capabilities,
             execution_owner_generation,
         )?;
         install_active_personal_skills(&mut state, active_personal_skills);
@@ -17991,13 +18258,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             }
         }
-        self.configure_loop_state_runtime_controls(
-            &mut state,
-            &cancel_flag,
-            &pause_flag,
-            (*llm_cancel_token).clone(),
-            execution_lease_lost.clone(),
-        );
         let transcript_turn = state.session_turn;
         let persist_user_transcript = async {
             let Some(pool) = &self.shared_pool else {
@@ -18025,6 +18285,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         self.configure_loop_state_runtime_controls(
             &mut state,
+            &stream_agent_spawner_entry.spawner,
             &cancel_flag,
             &pause_flag,
             (*llm_cancel_token).clone(),
@@ -20577,7 +20838,6 @@ impl ServerSpawnAgentExecutor {
     fn build_subrun_executor(
         &self,
         inherited_permissions: InheritedPermissions,
-        dynamic_agent_spawner: Arc<DynamicAgentSpawner>,
         client_tool_delivery_tx: Option<mpsc::Sender<Value>>,
         admitted_model_execution: Option<&astra_services::AdmittedModelExecution>,
         edge_tools: Arc<Vec<Value>>,
@@ -20623,7 +20883,6 @@ impl ServerSpawnAgentExecutor {
             .with_reflect_service(Arc::clone(&self.reflect_service))
             .with_auxiliary_event_writer(self.auxiliary_event_writer.clone())
             .with_trace_ingestion(self.trace_ingestion.clone())
-            .with_dynamic_agent_spawner(dynamic_agent_spawner)
             .with_client_tool_delivery_tx(client_tool_delivery_tx);
         executor
     }
@@ -21074,6 +21333,35 @@ fn spawn_child_request_constraints(
         parent.allowed_skills.clone(),
         parent.allowed_skill_sources.clone(),
     );
+    let profile = match (
+        config.admitted_agent_profiles.as_ref(),
+        &config.profile_authority,
+    ) {
+        (
+            Some(snapshot),
+            crate::orchestration::spawner::ParentProfileAuthority::AdmittedMember {
+                profile_id,
+                ..
+            },
+        ) => Some(
+            snapshot
+                .profiles
+                .iter()
+                .find(|profile| &profile.agent_id == profile_id)
+                .ok_or("spawn profile is absent from the admitted roster")?,
+        ),
+        (None, crate::orchestration::spawner::ParentProfileAuthority::Unbound) => None,
+        _ => return Err("spawn profile authority and admitted roster must be supplied together"),
+    };
+    if let Some(profile) = profile {
+        if !profile.skill_filter.is_empty() {
+            let member_skills: HashSet<_> = profile.skill_filter.iter().cloned().collect();
+            constraints.allowed_skills = Some(match parent.allowed_skills.as_ref() {
+                Some(inherited) => inherited.intersection(&member_skills).cloned().collect(),
+                None => member_skills,
+            });
+        }
+    }
     config.delegated_model_requirements.validate()?;
     constraints.delegated_model_requirements = config.delegated_model_requirements.clone();
     Ok(constraints)
@@ -21383,43 +21671,86 @@ fn server_subrun_waiting_for<'a>(
 fn durable_subrun_host_terminal_events(
     events: Vec<Value>,
     execution_owner_generation: Option<u64>,
+    run_id: &str,
 ) -> Vec<Value> {
-    events
+    let retained = events
         .into_iter()
         .filter_map(|mut event| {
-            (durable_event_type(&event) == Some("tool_call_end")).then(|| {
-                if let Some(object) = event.as_object_mut() {
-                    object.remove(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD);
-                    object.remove(DURABLE_EVENT_COMMITTED_FIELD);
+            let (prefix, identity) = match durable_event_type(&event) {
+                Some("tool_call_end") => (
+                    "subrun-tool-terminal",
+                    event
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("idless")
+                        .to_string(),
+                ),
+                Some("agent_communication") => {
+                    let communication = serde_json::from_value::<
+                        astra_turn_types::AgentCommunicationEvent,
+                    >(event.clone())
+                    .ok()?;
+                    if !communication.payload_kind.is_durable() {
+                        return None;
+                    }
+                    (
+                        "subrun-communication",
+                        astra_turn_types::AgentTranscriptEvidence::AgentCommunication {
+                            event: communication,
+                        }
+                        .stable_key(),
+                    )
                 }
-                event
-            })
-        })
-        .map(|mut event| {
-            if let Some(execution_owner_generation) = execution_owner_generation {
-                let call_id = event
-                    .as_object_mut()
-                    .map(|object| {
-                        object.remove("idempotency_key");
-                        object
-                            .get("call_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("idless")
-                            .to_string()
-                    })
-                    .unwrap_or_else(|| "idless".to_string());
-                if let Some(object) = event.as_object_mut() {
+                Some("explain_analyze") => {
+                    let fact = astra_turn_types::decode_explain_analyze_wire(&event).ok()?;
+                    if fact.run_id != run_id {
+                        return None;
+                    }
+                    let identity = fact.event_id.clone();
+                    event = json!({"event_type":"explain_analyze", "data":fact});
+                    ("subrun-explain", identity)
+                }
+                _ => return None,
+            };
+            if let Some(object) = event.as_object_mut() {
+                object.remove(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD);
+                object.remove(DURABLE_EVENT_COMMITTED_FIELD);
+                if let Some(generation) = execution_owner_generation {
+                    object.remove("idempotency_key");
                     object.insert(
                         "idempotency_key".to_string(),
-                        Value::String(format!(
-                            "subrun-tool-terminal:{execution_owner_generation}:{call_id}"
-                        )),
+                        Value::String(format!("{prefix}:{generation}:{identity}")),
                     );
                 }
             }
-            event
+            Some(event)
         })
-        .collect()
+        .collect();
+    let budget = DurableRunEventBatchBudget::default();
+    enforce_durable_run_event_batch_budget_with_budget(retained, budget, |original, mut summary| {
+        summary["event_type"] = json!("stream_gap");
+        summary["data"]["run_id"] = json!(run_id);
+        summary["data"]["dropped_event_count"] = summary["data"]["dropped_events"].clone();
+        summary["data"]["repair"] = json!("refresh_run_snapshot");
+        summary["data"]["explain_analyze_recovered"] = json!(false);
+        if let Some(generation) = execution_owner_generation {
+            let mut digest = Sha256::new();
+            digest.update(b"astra.subrun-compaction.v1\0");
+            digest.update((budget.row_budget as u64).to_be_bytes());
+            digest.update((budget.byte_budget as u64).to_be_bytes());
+            digest.update((original.len() as u64).to_be_bytes());
+            for event in original {
+                let encoded = astra_core::canonical_json_string(event);
+                digest.update((encoded.len() as u64).to_be_bytes());
+                digest.update(encoded.as_bytes());
+            }
+            summary["idempotency_key"] = json!(format!(
+                "subrun-compaction:{generation}:{:x}",
+                digest.finalize()
+            ));
+        }
+        summary
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21584,6 +21915,78 @@ impl PreparedSpawn for ServerPreparedSpawn {
 
 #[async_trait]
 impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
+    async fn bind_admitted_child_runtime(
+        &self,
+        config: &SubRunConfig,
+        execution: &astra_services::AdmittedModelExecution,
+    ) -> Result<Option<ExecutionOwnerGenerationGuard>, String> {
+        let generation = config
+            .execution_owner_generation
+            .ok_or("precreated child is missing its admitted generation")?;
+        let binding = config
+            .cancellation_binding_id
+            .clone()
+            .ok_or("precreated child is missing its execution binding")?;
+        let sink = config
+            .execution_owner_generation_sink
+            .clone()
+            .ok_or("precreated child is missing its generation publication")?;
+        let supervisor = config
+            .child_supervisor
+            .clone()
+            .ok_or("precreated child is missing its supervisor")?;
+        let guard = sink.guard();
+        sink.publish(generation);
+        let context = ServerSpawnRuntimeContext {
+            model_catalog_reader: None,
+            parent_run_id: config.run_id.clone(),
+            runtime_context_id: Uuid::new_v4().to_string(),
+            publication_capability: self.publication_capability_for_run(&config.run_id),
+            cancellation_binding_id: Some(binding),
+            user_id: config.user_id.clone(),
+            session_id: config.session_id.clone(),
+            trace_context: trace_context_from_subrun_context(&config.context, &config.run_id)
+                .unwrap_or_else(|| {
+                    let mut trace = server_trace_context(
+                        &config.user_id,
+                        &config.session_id,
+                        &config.run_id,
+                        0,
+                    );
+                    trace.causal_chain_id = server_trace_context(
+                        &config.user_id,
+                        &config.session_id,
+                        &config.parent_run_id,
+                        0,
+                    )
+                    .causal_chain_id;
+                    trace
+                }),
+            forward_headers: config.forward_headers.clone(),
+            admitted_model_execution: Some(execution.clone()),
+            interaction_mode: config.interaction_mode,
+            edge_tools: Arc::new(Vec::new()),
+            request_constraints: config.request_constraints.clone(),
+            execution_metadata: config.execution_metadata.clone(),
+            provider_run_owner: inherited_provider_run_owner(&config.context)?,
+            spawner: supervisor,
+            pause_flag: config.pause_flag.clone(),
+            cancel_token: config.cancel_token.clone(),
+            execution_owner_generation: sink,
+            #[cfg(feature = "harness")]
+            harness_sink: config.harness_sink.clone(),
+        };
+        if !self.set_runtime_context(context).await {
+            return Err("precreated child runtime publication was fenced".into());
+        }
+        Ok(Some(guard))
+    }
+
+    async fn settle_admitted_child_runtime(&self, run_id: &str, binding: &str, status: &str) {
+        self.settle_runtime_context_after_execute(run_id, binding, status)
+            .await;
+    }
+
     async fn prepare_batch(
         self: Arc<Self>,
         inputs: &[astra_turn_core::orchestration_spawn_tool::SpawnAgentInput],
@@ -22090,6 +22493,38 @@ impl ServerSpawnAgentExecutor {
         let request_constraints =
             spawn_child_request_constraints(&context.request_constraints, &config)
                 .map_err(str::to_string)?;
+        let admitted_profile = match (
+            config.admitted_agent_profiles.as_ref(),
+            &config.profile_authority,
+        ) {
+            (
+                Some(snapshot),
+                crate::orchestration::spawner::ParentProfileAuthority::AdmittedMember {
+                    profile_id,
+                    ..
+                },
+            ) => {
+                if snapshot.owner_user_id != context.user_id {
+                    return Err("spawn profile belongs to another owner".into());
+                }
+                Some(
+                    snapshot
+                        .profiles
+                        .iter()
+                        .find(|profile| &profile.agent_id == profile_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            "spawn profile is absent from the admitted roster".to_string()
+                        })?,
+                )
+            }
+            (None, crate::orchestration::spawner::ParentProfileAuthority::Unbound) => None,
+            _ => {
+                return Err(
+                    "spawn profile identity and admitted roster must be supplied together".into(),
+                );
+            }
+        };
         let (child_runtime_context, _generation_publication_guard) = self
             .register_child_runtime_context(
                 &context,
@@ -22099,17 +22534,26 @@ impl ServerSpawnAgentExecutor {
             )
             .await?;
 
-        let mut profile =
-            AgentProfile::new(&config.agent_id, &config.description, AgentTier::System);
+        let profile_id = admitted_profile
+            .as_ref()
+            .map(|profile| profile.agent_id.clone())
+            .unwrap_or_else(|| config.agent_type.clone());
+        let mut profile = admitted_profile.unwrap_or_else(|| {
+            AgentProfile::new(&config.agent_id, &config.description, AgentTier::System)
+        });
+        // Runtime identity addresses this child; profile identity governs its
+        // capabilities and remains separate in trusted execution context.
+        profile.agent_id = config.agent_id.clone();
         profile.system_prompt = Some(spawn_system_prompt(&config));
         profile.model_selection = Some(ModelSelection {
             offering_id: admitted_model_execution.offering_id.clone(),
         });
-        profile.skill_filter = config.allowed_tools.clone();
-        profile.metadata.insert(
-            "spawn_agent_type".to_string(),
-            json!(config.agent_type.clone()),
-        );
+        profile.allow_tools = (!config.allowed_tools.iter().any(|tool| tool == "*"))
+            .then(|| config.allowed_tools.clone());
+        profile.read_only = config.read_only;
+        profile
+            .metadata
+            .insert("spawn_agent_type".to_string(), json!(profile_id.clone()));
         profile
             .metadata
             .insert("spawn_read_only".to_string(), json!(config.read_only));
@@ -22124,10 +22568,7 @@ impl ServerSpawnAgentExecutor {
             json!(config.working_dir.to_string_lossy().to_string()),
         );
         subrun_context.insert("spawn_agent_id".to_string(), json!(config.agent_id.clone()));
-        subrun_context.insert(
-            "spawn_agent_type".to_string(),
-            json!(config.agent_type.clone()),
-        );
+        subrun_context.insert("spawn_agent_type".to_string(), json!(profile_id));
         subrun_context.insert(
             "parent_run_id".to_string(),
             json!(context.parent_run_id.clone()),
@@ -22174,8 +22615,11 @@ impl ServerSpawnAgentExecutor {
         let mut child_permissions = config.inherited_permissions.clone();
         child_permissions.allowed_tools = request_constraints.allowed_tools.clone();
         let subrun = SubRunConfig {
+            profile_authority: config.profile_authority.clone(),
             max_output_tokens: config.max_output_tokens,
             execution_owner_generation: None,
+            cancellation_binding_id: Some(config.cancellation_binding_id.clone()),
+            child_supervisor: Some(Arc::downgrade(&dynamic_agent_spawner)),
             execution_owner_generation_sink: Some(Arc::clone(
                 &child_runtime_context.execution_owner_generation,
             )),
@@ -22202,6 +22646,7 @@ impl ServerSpawnAgentExecutor {
             progress_emitter: config.progress_emitter.clone(),
             live_event_sink: config.live_event_sink.clone(),
             cancel_token: child_runtime_context.cancel_token.clone(),
+            execution_deadline: config.execution_deadline,
             inherited_prefix: config.inherited_prefix,
             execution_metadata: config
                 .execution_metadata
@@ -22216,14 +22661,12 @@ impl ServerSpawnAgentExecutor {
         let executor = self
             .build_subrun_executor(
                 child_permissions,
-                dynamic_agent_spawner,
                 config.client_tool_delivery_tx.clone(),
                 Some(&admitted_model_execution),
                 child_runtime_context.edge_tools.clone(),
             )
             .with_provider_scope_bound(context.provider_run_owner.is_some())
-            .with_model_catalog_reader(child_runtime_context.model_catalog_reader.clone())
-            .with_admitted_execution_deadline(config.execution_deadline);
+            .with_model_catalog_reader(child_runtime_context.model_catalog_reader.clone());
         let execution = AssertUnwindSafe(executor.execute_with_frontier(subrun))
             .catch_unwind()
             .await;
@@ -22354,7 +22797,6 @@ pub struct ServerSubRunExecutor {
     /// Short-lived material inherited from an already admitted live parent.
     /// Recovery executors leave this empty and re-materialize by durable ID.
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
-    admitted_execution_deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
@@ -22368,7 +22810,6 @@ pub struct ServerSubRunExecutor {
     /// Present for dynamic `agent(action='spawn')` descendants.  Delegation
     /// engine sub-runs can omit it; dynamic children must receive the same
     /// session-owned spawner so they can create governed grandchildren.
-    dynamic_agent_spawner: Option<Arc<DynamicAgentSpawner>>,
     /// Parent-owned delivery lane for browser/edge callback tool execution.
     client_tool_delivery_tx: Option<mpsc::Sender<Value>>,
     /// Parent-admitted request-scoped schemas. The child's request constraints
@@ -22440,7 +22881,6 @@ impl ServerSubRunExecutor {
             invocation_ledger: None,
             shared_pool: None,
             admitted_model_execution: None,
-            admitted_execution_deadline: None,
             edge_callback_ledger,
             edge_connection_pool: None,
             edge_dispatch_service: None,
@@ -22451,7 +22891,6 @@ impl ServerSubRunExecutor {
             auxiliary_event_writer: None,
             trace_ingestion: None,
             inherited_permissions: InheritedPermissions::auto_approve(),
-            dynamic_agent_spawner: None,
             client_tool_delivery_tx: None,
             edge_tools: Arc::new(Vec::new()),
             tool_execution_service: None,
@@ -22484,14 +22923,6 @@ impl ServerSubRunExecutor {
         self
     }
 
-    pub fn with_admitted_execution_deadline(
-        mut self,
-        deadline: Option<astra_services::runs::ExecutionDeadlineAuthority>,
-    ) -> Self {
-        self.admitted_execution_deadline = deadline;
-        self
-    }
-
     pub fn with_memory_extraction_service(
         mut self,
         svc: Arc<crate::session_memory::MemoryExtractionService>,
@@ -22505,11 +22936,6 @@ impl ServerSubRunExecutor {
         inherited_permissions: InheritedPermissions,
     ) -> Self {
         self.inherited_permissions = inherited_permissions;
-        self
-    }
-
-    fn with_dynamic_agent_spawner(mut self, spawner: Arc<DynamicAgentSpawner>) -> Self {
-        self.dynamic_agent_spawner = Some(spawner);
         self
     }
 
@@ -22593,6 +23019,23 @@ impl ServerSubRunExecutor {
         config: &SubRunConfig,
         execution: Option<&astra_services::AdmittedModelExecution>,
     ) -> Result<Option<DurableSubrunAdmission>, String> {
+        let execution_deadline = config
+            .execution_deadline
+            .map(|deadline| tokio::time::Instant::from_std(deadline.monotonic_deadline()));
+        let check_admission = || {
+            if config
+                .cancel_token
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+            {
+                return Err("sub-run cancelled before durable admission".to_string());
+            }
+            if execution_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return Err("sub-run deadline expired before durable admission".to_string());
+            }
+            Ok(())
+        };
+        check_admission()?;
         let Some(run_engine) = self.durable_run_engine() else {
             return Ok(None);
         };
@@ -22603,6 +23046,40 @@ impl ServerSubRunExecutor {
             .ok_or_else(|| "durable sub-run parent disappeared before admission".to_string())?;
         if parent.session_id != config.session_id {
             return Err("durable sub-run parent belongs to another session".into());
+        }
+        let admitted_agent_profiles =
+            crate::server::run::engine::durable_run_agent_profiles(&parent, &config.user_id)?;
+        let parent_profile_authority =
+            crate::server::run::engine::durable_run_profile_authority(&parent, &config.user_id)?;
+        let expected_profile_authority =
+            match (admitted_agent_profiles.as_ref(), &config.profile_authority) {
+                (
+                    Some(snapshot),
+                    crate::orchestration::spawner::ParentProfileAuthority::AdmittedMember {
+                        profile_id,
+                        ..
+                    },
+                ) => {
+                    if !snapshot
+                        .profiles
+                        .iter()
+                        .any(|profile| &profile.agent_id == profile_id)
+                    {
+                        return Err("child profile is absent from the durable parent roster".into());
+                    }
+                    parent_profile_authority.for_child(profile_id)?
+                }
+                (None, crate::orchestration::spawner::ParentProfileAuthority::Unbound) => {
+                    crate::orchestration::spawner::ParentProfileAuthority::Unbound
+                }
+                _ => {
+                    return Err(
+                        "child profile authority does not match its durable parent roster".into(),
+                    );
+                }
+            };
+        if config.profile_authority != expected_profile_authority {
+            return Err("child profile ancestry does not match its durable parent".into());
         }
         // Reuse the durable parent already read for admission. Nested children
         // exclude the ancestor root, not their immediate parent, during Explain
@@ -22617,6 +23094,18 @@ impl ServerSubRunExecutor {
                 .ok_or_else(|| "durable sub-run parent has no ancestor root".to_string())?
         };
         if let Some(existing) = existing {
+            if crate::server::run::engine::durable_run_profile_authority(
+                &existing,
+                &config.user_id,
+            )? != config.profile_authority
+            {
+                return Err("durable sub-run retry changed its profile authority".into());
+            }
+            if crate::server::run::engine::durable_run_agent_profiles(&existing, &config.user_id)?
+                != admitted_agent_profiles
+            {
+                return Err("durable sub-run retry changed its admitted agent profiles".into());
+            }
             if crate::server::run::engine::durable_run_requested_model_policy(&existing)?
                 != config.requested_model_policy
             {
@@ -22766,8 +23255,9 @@ impl ServerSubRunExecutor {
                 )
             }
         };
+        check_admission()?;
         run_engine
-            .start_run_ext_with_context(
+            .start_run_ext_with_context_with_deadline(
                 &config.run_id,
                 &config.user_id,
                 &config.session_id,
@@ -22776,7 +23266,10 @@ impl ServerSubRunExecutor {
                 Some(config.agent_profile.agent_id.as_str()),
                 None,
                 crate::server::run::engine::RunStartContext {
+                    admitted_agent_profiles,
+                    profile_authority: config.profile_authority.clone(),
                     interaction_mode: config.interaction_mode,
+                    child_runtime_id: Some(config.agent_profile.agent_id.clone()),
                     requested_model_policy: config.requested_model_policy.clone(),
                     generation_controls: Some(crate::server::run::engine::RunGenerationControls {
                         thinking: config.thinking.clone(),
@@ -22805,6 +23298,7 @@ impl ServerSubRunExecutor {
                     validated_work_item_assignment: config.work_item.is_some(),
                     ..Default::default()
                 },
+                execution_deadline,
             )
             .await
             .map(|authority| {
@@ -23772,10 +24266,14 @@ impl SubRunExecutor for ServerSubRunExecutor {
     async fn execute(
         &self,
         config: SubRunConfig,
-    ) -> Result<astra_services::coordination::AgentResult, String> {
-        self.execute_with_frontier(config)
-            .await
-            .map(|(result, _)| result)
+    ) -> Result<
+        (
+            astra_services::coordination::AgentResult,
+            Option<crate::orchestration::SpawnRunFrontier>,
+        ),
+        String,
+    > {
+        self.execute_with_frontier(config).await
     }
 }
 
@@ -23796,6 +24294,16 @@ impl ServerSubRunExecutor {
         // Both direct and trait callers share the same boxed execution body.
         // Do not embed this large lifecycle future in every caller's stack.
         Box::pin(async move {
+            config.agent_profile.validate_capability_bounds()?;
+            let dynamic_agent_spawner = config
+                .child_supervisor
+                .as_ref()
+                .map(|owner| {
+                    owner
+                        .upgrade()
+                        .ok_or_else(|| "child supervisor is unavailable".to_string())
+                })
+                .transpose()?;
             let runtime_ceiling = astra_config::RuntimeConfig::cached()
                 .runtime_limits
                 .resolve_turn_ceiling(
@@ -23869,7 +24377,7 @@ impl ServerSubRunExecutor {
                         if exact_cancellation {
                             return Ok(settle_subrun_activation_cancellation(
                                 engine,
-                                self.dynamic_agent_spawner.as_deref(),
+                                dynamic_agent_spawner.as_deref(),
                                 &config,
                                 authority.owner_generation,
                             )
@@ -23891,7 +24399,7 @@ impl ServerSubRunExecutor {
                         if local_cancel_token.is_cancelled() {
                             return Ok(settle_subrun_activation_cancellation(
                                 engine,
-                                self.dynamic_agent_spawner.as_deref(),
+                                dynamic_agent_spawner.as_deref(),
                                 &config,
                                 authority.owner_generation,
                             )
@@ -23939,7 +24447,9 @@ impl ServerSubRunExecutor {
             let mut durable_terminal_committed = false;
             let mut atomic_terminal_attempted = false;
             let mut committed_frontier = None;
-            let execution = AssertUnwindSafe(async {
+            // Keep the large child body out of the enclosing lifecycle poll
+            // frame. This remains one supervised task and one unwind boundary.
+            let execution = AssertUnwindSafe(Box::pin(async {
             let durable_run = match self.durable_run_engine() {
                 Some(engine) => Some(
                     engine
@@ -24051,8 +24561,11 @@ impl ServerSubRunExecutor {
         );
         let subrun_workspace =
             self.provision_subrun_workspace(&config.session_id, &config.run_id)?;
-        let child_workspace_mutation =
-            crate::orchestration::workspace_mutation_from_context(&config.context);
+        let child_workspace_mutation = if config.agent_profile.read_only {
+            astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
+        } else {
+            crate::orchestration::workspace_mutation_from_context(&config.context)
+        };
         let execution_bindings = if child_workspace_mutation
             == astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
         {
@@ -24090,7 +24603,7 @@ impl ServerSubRunExecutor {
             self.provider_scope_bound || inherited_provider_run_owner(&config.context)?.is_some(),
         )
         .with_admitted_model_execution(admitted_model_execution)
-        .with_admitted_execution_deadline(self.admitted_execution_deadline)
+        .with_admitted_execution_deadline(config.execution_deadline)
         .with_inference_owner_pod_id(
             self.run_engine
                 .as_ref()
@@ -24231,8 +24744,10 @@ impl ServerSubRunExecutor {
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
 
-        let (skill_registry, raw_skill_resolver) =
-            build_server_skill_resolver(self.skill_service.clone(), &config.user_id);
+        let server_skill_resolver =
+            build_server_skill_resolver(self.skill_service.clone(), &config.user_id).await;
+        let skill_registry = server_skill_resolver.registry;
+        let raw_skill_resolver = server_skill_resolver.resolver;
         let skill_resolver =
             apply_normalized_skill_allowlist(raw_skill_resolver, &config.request_constraints)?;
 
@@ -24241,7 +24756,7 @@ impl ServerSubRunExecutor {
         let runtime_config = astra_config::RuntimeConfig::load();
         let resolved_tool_policy = runtime_config.tool_selection.resolve_for_model(child_model_name.as_deref());
         let mut effective_inherited_permissions = self.inherited_permissions.clone();
-        if child_workspace_mutation
+        if config.agent_profile.read_only || child_workspace_mutation
             == astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
             || execution_bindings.as_ref().is_some_and(|snapshot| {
                 snapshot.workspace.authority == astra_runtime_env::WorkspaceAuthority::ReadOnly
@@ -24345,6 +24860,7 @@ impl ServerSubRunExecutor {
                 &resolved_tool_policy,
                 astra_turn_types::InferencePurpose::SubAgent,
                 crate::turn::runtime_policy::evaluation_thresholds_from_policy(&runtime_config.tool_policy),
+                astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             )
         };
         if let Some(trace_context) =
@@ -24378,7 +24894,7 @@ impl ServerSubRunExecutor {
                 memoria_base,
                 None,
             )
-            .with_admitted_execution_deadline(self.admitted_execution_deadline);
+            .with_admitted_execution_deadline(config.execution_deadline);
             executor = executor.with_model_catalog_reader(self.model_catalog_reader.clone());
             if let (Some(engine), Some(admission)) =
                 (durable_run_engine.as_ref(), durable_admission.as_ref())
@@ -24496,7 +25012,7 @@ impl ServerSubRunExecutor {
             if let Some(snapshot) = execution_bindings {
                 executor.set_execution_binding_snapshot(snapshot);
             }
-            if let Some(spawner) = self.dynamic_agent_spawner.clone() {
+            if let Some(spawner) = dynamic_agent_spawner.clone() {
                 // A dynamic child is a full agent, not a terminal worker.
                 // Reinstall the same typed runtime capability that roots
                 // receive so a child may spawn and govern descendants.  This
@@ -24505,7 +25021,17 @@ impl ServerSubRunExecutor {
                 let workspace_mutation =
                     crate::orchestration::WorkspaceMutationAuthority::default();
                 workspace_mutation.set(inherited_workspace_mutation);
+                let admitted_agent_profiles = durable_run.as_ref()
+                    .map(|run| crate::server::run::engine::durable_run_agent_profiles(run, &config.user_id))
+                    .transpose()?.flatten();
                 executor.set_agent_tool_context(AgentToolContext {
+                    parent_profile_authority: match durable_run.as_ref() {
+                        Some(run) => crate::server::run::engine::durable_run_profile_authority(run, &config.user_id)?,
+                        None if config.profile_authority == crate::orchestration::spawner::ParentProfileAuthority::Unbound =>
+                            crate::orchestration::spawner::ParentProfileAuthority::Unbound,
+                        None => return Err("admitted child profile authority requires durable run facts".into()),
+                    },
+                    admitted_agent_profiles,
                     fanout_admission: spawner.fanout_parent(&config.run_id),
                     reply_obligations: Arc::clone(&loop_state.messaging.reply_obligations),
                     delegation_model_admission: None,
@@ -24535,7 +25061,7 @@ impl ServerSubRunExecutor {
                         &config.run_id,
                     ),
                     execution_metadata: config.execution_metadata.clone(),
-                    execution_deadline: self.admitted_execution_deadline,
+                    execution_deadline: config.execution_deadline,
                     workspace_mutation,
                     transcript_location: AgentTranscriptLocation::DurableServer,
                 });
@@ -24613,7 +25139,7 @@ impl ServerSubRunExecutor {
             // terminal and canonical persistence; remote durability remains
             // detached until this subrun owns an authoritative terminal.
             AgenticRunLifecycleService::converge_local_user_cancelled_run_descendants(
-                self.dynamic_agent_spawner.as_deref(),
+                                dynamic_agent_spawner.as_deref(),
                 &config.user_id,
                 &config.session_id,
                 &config.run_id,
@@ -24627,6 +25153,7 @@ impl ServerSubRunExecutor {
         let retained_tool_terminals = durable_subrun_host_terminal_events(
             retained_host_events,
             execution_owner_generation,
+            &config.run_id,
         );
         // The thin client owns presentation on the currently attached Edge
         // callback lane, but it does not own durable replay. Commit semantic
@@ -25000,7 +25527,7 @@ impl ServerSubRunExecutor {
             {
                 if !local_user_descendants_seized {
                     AgenticRunLifecycleService::converge_local_user_cancelled_run_descendants(
-                        self.dynamic_agent_spawner.as_deref(),
+                                dynamic_agent_spawner.as_deref(),
                         &config.user_id,
                         &config.session_id,
                         &config.run_id,
@@ -25220,7 +25747,7 @@ impl ServerSubRunExecutor {
                 tool_calls: loop_state.total_tool_calls,
             }),
         }
-        })
+        }))
         .catch_unwind()
         .await;
             let execution_result = match execution {

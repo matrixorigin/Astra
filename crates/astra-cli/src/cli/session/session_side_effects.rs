@@ -327,6 +327,13 @@ pub(crate) fn append_one_shot_journal_events(
     // not actually be part of the journal batch.
     require_intended_conversation_commit(&turn_event, &intended_commit, session_id)?;
     append_events.push(turn_event);
+    append_events.extend(
+        crate::cli::stream::streaming_types::root_run_transcript_events(
+            Some(session_id),
+            result.run_id.as_deref(),
+            &result.run_transcript_messages,
+        ),
+    );
     match writer.append_canonical_commit_cas(
         execution_lease,
         expected_base_cursor.as_ref(),

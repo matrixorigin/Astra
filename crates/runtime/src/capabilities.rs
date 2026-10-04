@@ -300,11 +300,11 @@ pub fn surface_uses_server_skill_catalog(surface: CapabilitySurface) -> bool {
 }
 
 /// Build the server-visible skill registry for Web / remote CLI execution.
-pub fn build_server_skill_registry(
+pub async fn build_server_skill_registry(
     skill_service: Option<Arc<dyn SkillService>>,
     user_id: &str,
 ) -> Option<Arc<UnifiedSkillRegistry>> {
-    crate::skills::catalog::build_server_visible_skill_registry(skill_service, user_id)
+    crate::skills::catalog::build_server_visible_skill_registry(skill_service, user_id).await
 }
 
 /// Build the local CLI skill registry.
@@ -319,24 +319,28 @@ pub fn build_server_skill_registry(
 /// the process current directory is used (legacy standalone behavior). Pass an
 /// explicit root when tool execution runs in a workspace that differs from the
 /// process cwd so that workspace skills stay visible.
-pub fn build_cli_local_skill_registry(
+pub async fn build_cli_local_skill_registry(
     remote_catalog: Option<RemoteSkillCatalogProvider>,
     project_root: Option<&std::path::Path>,
 ) -> Arc<UnifiedSkillRegistry> {
     let registry = cli_local_skill_registry(remote_catalog, project_root);
-    crate::skills::catalog::discover_registry_now(&registry);
+    if let Err(source) = registry.discover_all().await {
+        tracing::warn!(error = %source, "skill catalog discovery failed");
+    }
     registry
 }
 
 /// Build the immediately usable CLI registry without contacting external
 /// providers. Interactive clients use this baseline, then converge the same
 /// registry asynchronously once their event loop is live.
-pub fn build_cli_local_skill_registry_bootstrap(
+pub async fn build_cli_local_skill_registry_bootstrap(
     remote_catalog: Option<RemoteSkillCatalogProvider>,
     project_root: Option<&std::path::Path>,
 ) -> Arc<UnifiedSkillRegistry> {
     let registry = cli_local_skill_registry(remote_catalog, project_root);
-    crate::skills::catalog::discover_local_registry_now(&registry);
+    if let Err(source) = registry.discover_local_bootstrap().await {
+        tracing::warn!(error = %source, "local skill catalog discovery failed");
+    }
     registry
 }
 

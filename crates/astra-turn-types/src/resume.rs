@@ -188,6 +188,7 @@ pub struct ResumeActivationProjectionV1 {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResumeProviderProjectionV1 {
+    pub agent_profile_selection: Option<crate::AgentProfileSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -198,7 +199,10 @@ pub struct ResumeProviderProjectionV1 {
 
 impl ResumeProviderProjectionV1 {
     pub fn is_empty(&self) -> bool {
-        self.model.is_none() && self.permission_mode.is_none() && self.config_version_id.is_none()
+        self.agent_profile_selection.is_none()
+            && self.model.is_none()
+            && self.permission_mode.is_none()
+            && self.config_version_id.is_none()
     }
 }
 

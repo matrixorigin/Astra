@@ -2082,6 +2082,18 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
     };
     let event =
         json!({"event_type": EVENT_TYPE, "idempotency_key": DECISION_KEY, "data": decision});
+    let mut batch = vec![event.clone()];
+    batch.extend((0..24).map(|index| {
+        json!({
+            "event_type":"explain_analyze", "idempotency_key":format!("explain-{index}"),
+            "data": {"schema_version":1, "event_id":format!("fact-{index}"),
+                "run_id":run.run_id, "turn_id":"turn", "node_id":format!("node-{index}"),
+                "producer_id":"server", "clock_domain_id":"clock", "kind":"turn",
+                "label":"Turn", "transition":"finished", "elapsed_ms":10,
+                "start_elapsed_ms":0, "duration_ms":10, "outcome":"completed"}
+        })
+    }));
+    batch.push(batch[1].clone());
     for (owner, session, generation, status) in [
         (
             "wrong-owner",
@@ -2116,7 +2128,7 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
                     &run.run_id,
                     generation,
                     &[status],
-                    std::slice::from_ref(&event),
+                    &batch,
                 )
                 .await
                 .unwrap()
@@ -2132,7 +2144,22 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
                 &run.run_id,
                 run.run_generation,
                 &["running"],
-                &[invalid],
+                &[invalid, batch[1].clone()],
+            )
+            .await
+            .is_err()
+    );
+    let mut staged_conflict = batch[1].clone();
+    staged_conflict["data"]["outcome"] = json!("failed");
+    assert!(
+        store
+            .append_events_if_current_generation_and_status(
+                &run.user_id,
+                &run.session_id,
+                &run.run_id,
+                run.run_generation,
+                &["running"],
+                &[event.clone(), batch[1].clone(), staged_conflict],
             )
             .await
             .is_err()
@@ -2143,6 +2170,12 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
         .unwrap()
         .unwrap();
     assert_eq!(unchanged.model_offering_id.as_deref(), Some("strong"));
+    assert!(
+        !unchanged
+            .events
+            .iter()
+            .any(|event| event["event_type"] == "explain_analyze")
+    );
     assert!(
         !unchanged
             .events
@@ -2158,7 +2191,7 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
                     &run.run_id,
                     run.run_generation,
                     &["running"],
-                    std::slice::from_ref(&event),
+                    &batch,
                 )
                 .await
                 .unwrap()
@@ -2181,6 +2214,31 @@ async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &Durab
             .filter(|e| e["event_type"] == EVENT_TYPE)
             .count(),
         1
+    );
+    let facts = committed
+        .events
+        .iter()
+        .filter(|event| event["event_type"] == "explain_analyze")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        facts.len(),
+        24,
+        "same-batch and committed retries must not duplicate facts"
+    );
+    let mut fact_conflict = batch[1].clone();
+    fact_conflict["data"]["outcome"] = json!("failed");
+    assert!(
+        store
+            .append_events_if_current_generation_and_status(
+                &run.user_id,
+                &run.session_id,
+                &run.run_id,
+                run.run_generation,
+                &["running"],
+                &[fact_conflict],
+            )
+            .await
+            .is_err()
     );
     let mut conflict = event;
     conflict["data"]["selected_offering_id"] = json!("strong");

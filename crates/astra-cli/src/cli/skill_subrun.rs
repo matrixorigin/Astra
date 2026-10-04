@@ -10,9 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use astra_pipeline::{step_protocol::InMemoryIdempotencyCache, step_recorder::StepRecorder};
+use astra_pipeline::step_recorder::StepRecorder;
 use astra_runtime::{
-    semantic_dedup::SemanticDedup,
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
     turn::agentic_loop::host::{
@@ -486,6 +485,10 @@ impl AgenticLoopHost for SubRunHost {
                 "Child transcript persistence is unavailable; the sub-run stopped before accumulating non-durable conversation history.",
             ));
         }
+        let executor_id =
+            crate::cli::chat_stream::try_edge_executor_instance_id().map_err(|error| {
+                astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
+            })?;
         self.executor
             .set_send_message_context(state.messaging.mailbox.as_ref().map(|mailbox| {
                 let run_id = state
@@ -538,7 +541,7 @@ impl AgenticLoopHost for SubRunHost {
             interaction_mode: Some(interaction_mode.label()),
             explain_verbose: false,
             explain_on: false,
-            edge_executor_id: "subrun",
+            edge_executor_id: executor_id,
             capabilities: astra_thin_client::builtin_capability_preset(),
             project_root: &self.project_root,
             git_branch: None,
@@ -717,7 +720,7 @@ impl AgenticLoopHost for SubRunHost {
         let edge_ctx = EdgeSseContext {
             api: &self.api,
             token: &self.token,
-            executor_id: "subrun",
+            executor_id,
             executor: std::sync::Arc::clone(&self.executor),
             render_policy: RenderPolicy::Silent,
             perm_manager: Some(&mut self.perm_manager),
@@ -1352,7 +1355,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
                 task_profile,
                 runtime_ceiling,
             );
-        let initial_turns = agentic_turn_budget.initial_turns;
         let user_id = cli_user_id();
         let step_recorder = StepRecorder::with_persistence_for_run(
             &user_id,
@@ -1362,24 +1364,9 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         );
 
         let mut state = AgenticLoopState {
-            evaluation_thresholds:
-                astra_runtime::turn::runtime_policy::evaluation_thresholds_from_policy(
-                    &tool_policy_config,
-                ),
-            observation_journal: Default::default(),
-            tool_ledger_receipt: Default::default(),
             messages,
-            run_transcript_capture: None,
-            volatile_pending: Vec::new(),
-            recent_rounds: Vec::new(),
-            tool_results: Vec::new(),
-            session_memory_state: Default::default(),
             current_session_id: Some(parent_session_id.to_string()),
             current_run_id: Some(parent_run_id.to_string()),
-            current_run_owner_generation: None,
-            provider_canonical_wal_head: None,
-            inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
-            context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
             context_manifest_model_name: effective_model.clone(),
             runtime_manifest: runtime_manifest_for_model(
@@ -1388,44 +1375,9 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
                 effective_model.as_deref(),
             ),
             recursion_depth: child_recursion_depth,
-            final_text: String::new(),
-            current_model_item_id: None,
-            final_text_model_item_id: None,
-            final_text_streamed: false,
-            final_output_ready_notified: false,
-            total_prompt: 0,
-            total_completion: 0,
-            total_cache_read: 0,
-            total_cache_creation: 0,
-            total_tool_calls: 0,
-            last_finish_reason: None,
-            total_observation_tool_calls: 0,
-            has_any_usage: false,
-            qualified_usage: None,
-            last_request_usage: None,
-            max_turns: initial_turns,
-            remaining_turns: initial_turns,
-            charged_iterations: 0,
-            agentic_turn_budget,
             budget_is_explicit: true,
-            loop_entry: Default::default(),
-            current_round_index: 0,
-            llm_rounds_completed: 0,
-            last_request_message_count: None,
             turn_guard: TurnGuard::with_profile(task_profile),
-            budget_policy: None,
             restricted_tools,
-            step_recorder,
-            idempotency_cache: InMemoryIdempotencyCache::new(),
-            semantic_dedup: SemanticDedup::new(
-                astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
-            ),
-            call_counts: HashMap::new(),
-            max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
-            max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
-            max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
-            stall: Default::default(),
-            telemetry: Default::default(),
             skills: SkillState {
                 resolver: self.skill_resolver.clone(),
                 quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
@@ -1440,8 +1392,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
                 workspace_root_hint: Some(self.project_root.to_string_lossy().into_owned()),
                 ..Default::default()
             },
-            messaging: Default::default(),
-            user_intents: Default::default(),
             cancellation: CancellationState {
                 flag: None,
                 pause_flag: None,
@@ -1449,9 +1399,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
                 execution_lease_lost: None,
                 resolved_origin: None,
             },
-            error_recovery: Default::default(),
-            provider_adaptation: Default::default(),
-            run_control: None,
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
                     astra_turn_core::pipeline_config::PipelineConfig::default(),
@@ -1462,54 +1409,25 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             ),
             message: task_context.to_string(),
             user_intent: task_context.to_string(),
-            recent_tools: Vec::new(),
-            deferred_tool_activations: Vec::new(),
-            has_prior_assistant_turn: false,
-            turn_intent: None,
-            task_profile: infer_task_execution_profile(task_context),
-            last_turn_policy: TurnInteractionPolicy::default(),
-            api: self.api.clone(),
+            task_profile,
             api_token: self.token.clone(),
-            delegation_engine: None,
-            delegations_this_turn: 0,
-            delegation_chain: Vec::new(),
             self_agent_id: "skill_subrun".to_string(),
-            project_context: None,
-            last_llm_context_manifest_trace: None,
-            rate_limit_cooldown: Default::default(),
-            last_composite_snapshot: None,
-            last_measured_prompt_tokens: None,
-            consecutive_context_window_errors: 0,
-            compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
-            sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens,
-            budget_wrapup_injected: false,
-            context_compression_triggered: false,
-            canonical_rewrite_state: Default::default(),
-            provider_canonical_wal_base: None,
-            budget_wrapup_ignored_rounds: 0,
-            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
-            skill_produced_output: false,
             thinking,
             permission_context: Some(permission_context),
-            applied_permission_mode: None,
-            permission_handler: None,
-            runtime_tool_executor: None,
-            interruption: None,
-            session_facts: Default::default(),
-            memory_extraction_service: None,
             compact_strategy,
-            approval_overrides: None,
-            confidence_trend: Default::default(),
-            last_confidence_diagnosis: None,
-            session_turn: 0,
             canonical_turn_chain_id: Some(child_turn_chain_id),
             root_user_query_event_id: Some(child_user_query_event_id),
-            turn_event_buffer: None,
-            canonical_turn_started_at: Default::default(),
-            canonical_trace_time_bounds: Default::default(),
-            harness: astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
+            ..AgenticLoopState::fresh(
+                step_recorder,
+                agentic_turn_budget,
+                &resolved_tool_policy,
+                astra_turn_types::InferencePurpose::SubAgent,
+                astra_runtime::turn::runtime_policy::evaluation_thresholds_from_policy(
+                    &tool_policy_config,
+                ),
+                self.api.clone(),
+            )
         };
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
@@ -1997,6 +1915,9 @@ mod tests {
         let requests = mock.received_requests();
         assert_eq!(requests.len(), 3);
         for (index, request) in requests.iter().enumerate() {
+            let executor_id = crate::cli::chat_stream::try_edge_executor_instance_id().unwrap();
+            assert_eq!(request["edge_executor_id"], executor_id);
+            assert_eq!(request["executor_binding"]["executor_id"], executor_id);
             assert_eq!(
                 request["context"]["thinking"],
                 serde_json::to_value(&state.thinking).unwrap()
@@ -2084,6 +2005,16 @@ mod tests {
                 callback_count,
                 "{scenario:?} callback observations must remain exact"
             );
+            let executor_id = crate::cli::chat_stream::try_edge_executor_instance_id().unwrap();
+            for request in mock.received_requests() {
+                assert_eq!(request["edge_executor_id"], executor_id);
+                assert_eq!(request["executor_binding"]["executor_id"], executor_id);
+                assert_eq!(request["agent_id"], host.agent_id);
+            }
+            for callback in mock.tool_results() {
+                // The mock accepts this record only after checking the Edge header.
+                assert_eq!(callback["edge_agent_id"], executor_id);
+            }
         }
     }
 

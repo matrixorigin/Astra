@@ -2608,11 +2608,21 @@ pub struct TurnDetail {
     pub child_events: Vec<ChildEvent>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionCostSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
-    pub unavailable_reason: SessionCostUnavailableReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<SessionCostUnavailableReason>,
+}
+
+impl Default for SessionCostSummary {
+    fn default() -> Self {
+        Self {
+            estimated_cost_usd: None,
+            unavailable_reason: Some(SessionCostUnavailableReason::default()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2668,13 +2678,24 @@ struct SessionAttemptUsageRow {
     protocol: String,
     usage_status: String,
     counts: [i64; 4],
+    price_snapshot_json: Option<String>,
 }
 
-fn summarize_session_request_usage(
+#[derive(Debug, Default)]
+struct SessionRequestProjection {
+    usage: SessionRequestUsageSummary,
+    cost: SessionCostSummary,
+}
+
+fn summarize_session_request_projection(
     attempts: impl IntoIterator<Item = SessionAttemptUsageRow>,
-) -> AuditResult<SessionRequestUsageSummary> {
+) -> AuditResult<SessionRequestProjection> {
     let mut summary = SessionRequestUsageSummary::default();
+    let mut estimated_cost_usd = 0.0;
+    let mut cost_complete = true;
+    let mut has_attempt = false;
     for attempt in attempts {
+        has_attempt = true;
         summary.request_count = summary
             .request_count
             .checked_add(1)
@@ -2684,6 +2705,7 @@ fn summarize_session_request_usage(
                 .nonterminal_attempt_count
                 .checked_add(1)
                 .ok_or_else(|| internal_error("session nonterminal attempt count overflow"))?;
+            cost_complete = false;
             continue;
         }
         let usage = crate::inference_execution::projected_auxiliary_usage(
@@ -2701,20 +2723,65 @@ fn summarize_session_request_usage(
             summary
                 .cache_creation_tokens
                 .observe(usage.cache_creation_tokens)?;
+
+            let attempt_cost = attempt
+                .price_snapshot_json
+                .as_deref()
+                .and_then(crate::models::InferencePriceSnapshot::from_stored)
+                .and_then(|snapshot| {
+                    snapshot.estimated_cost_usd(
+                        usage.fresh_input_tokens,
+                        usage.output_tokens,
+                        usage.cache_read_tokens,
+                        usage.cache_creation_tokens,
+                    )
+                });
+            match attempt_cost {
+                Some(attempt_cost) if attempt_cost.is_finite() => {
+                    let next_cost = estimated_cost_usd + attempt_cost;
+                    if next_cost.is_finite() {
+                        estimated_cost_usd = next_cost;
+                    } else {
+                        cost_complete = false;
+                    }
+                }
+                _ => cost_complete = false,
+            }
+        } else {
+            cost_complete = false;
         }
     }
-    Ok(summary)
+    let cost = if has_attempt && cost_complete && estimated_cost_usd.is_finite() {
+        SessionCostSummary {
+            estimated_cost_usd: Some(estimated_cost_usd),
+            unavailable_reason: None,
+        }
+    } else {
+        SessionCostSummary::default()
+    };
+    Ok(SessionRequestProjection {
+        usage: summary,
+        cost,
+    })
 }
 
 async fn load_session_request_usage(
     pool: &sqlx::Pool<sqlx::MySql>,
     user_id: &str,
     session_id: &str,
-) -> AuditResult<SessionRequestUsageSummary> {
+) -> AuditResult<SessionRequestProjection> {
     let rows = query(
-        "SELECT status, provider_protocol, usage_status, input_tokens, output_tokens, \
-                cache_read_tokens, cache_creation_tokens \
-         FROM inference_provider_attempts WHERE user_id = ? AND session_id = ?",
+        "SELECT a.status, a.provider_protocol, a.usage_status, a.input_tokens, a.output_tokens, \
+                a.cache_read_tokens, a.cache_creation_tokens, \
+                CAST(r.price_snapshot_json AS CHAR) AS price_snapshot_json \
+         FROM inference_provider_attempts AS a \
+         LEFT JOIN inference_invocations AS i \
+           ON i.user_id = a.user_id AND i.session_id = a.session_id \
+          AND i.invocation_id = a.invocation_id \
+         LEFT JOIN inference_routes AS r \
+           ON r.user_id = i.user_id AND r.session_id = i.session_id \
+          AND r.route_id = i.route_id \
+         WHERE a.user_id = ? AND a.session_id = ?",
     )
     .bind(user_id)
     .bind(session_id)
@@ -2735,10 +2802,15 @@ async fn load_session_request_usage(
                     audit_row_i64(&row, context, "cache_read_tokens")?,
                     audit_row_i64(&row, context, "cache_creation_tokens")?,
                 ],
+                price_snapshot_json: audit_row_optional_string(
+                    &row,
+                    context,
+                    "price_snapshot_json",
+                )?,
             })
         })
         .collect::<AuditResult<Vec<_>>>()?;
-    summarize_session_request_usage(attempts)
+    summarize_session_request_projection(attempts)
 }
 
 /// A child event (tool call or error) linked to a turn via parent_event_id.
@@ -3360,12 +3432,9 @@ impl SessionAuditService for DatabaseSessionAuditService {
         merge_session_durable_metrics(&mut metrics, durable_metrics);
         let duration_secs =
             compute_duration_secs(metrics.first_at.as_deref(), metrics.last_at.as_deref());
-        let request_usage = load_session_request_usage(&pool, user_id, session_id).await?;
-        // Routes now retain optional admission prices, but this projection
-        // does not yet join and price every physical attempt in the task tree.
-        // Keep cost unknown until that coverage can be proven; today's catalog
-        // prices must never substitute for missing historical evidence.
-        let cost = SessionCostSummary::default();
+        let request_projection = load_session_request_usage(&pool, user_id, session_id).await?;
+        let request_usage = request_projection.usage;
+        let cost = request_projection.cost;
 
         Ok(SessionAuditSummary {
             session_id: session_id.to_string(),
@@ -5739,8 +5808,9 @@ mod tests {
                 protocol: protocol.into(),
                 usage_status: usage_status.into(),
                 counts,
+                price_snapshot_json: None,
             };
-        let summary = summarize_session_request_usage([
+        let summary = summarize_session_request_projection([
             attempt(
                 "succeeded",
                 "openai_compatible",
@@ -5767,7 +5837,8 @@ mod tests {
             ),
             attempt("started", "openai_compatible", "unavailable", [0, 0, 0, 0]),
         ])
-        .unwrap();
+        .unwrap()
+        .usage;
         assert_eq!(summary.request_count, 5);
         assert_eq!(summary.nonterminal_attempt_count, 1);
         assert_eq!(
@@ -5798,7 +5869,7 @@ mod tests {
                 observed_attempts: 1
             }
         );
-        let empty = summarize_session_request_usage([]).unwrap();
+        let empty = summarize_session_request_projection([]).unwrap().usage;
         assert_eq!(empty.request_count, 0);
         assert_eq!(empty.fresh_input_tokens.known_tokens, None);
         assert_eq!(SessionCostSummary::default().estimated_cost_usd, None);
@@ -5816,6 +5887,57 @@ mod tests {
         };
         assert!(lane.observe(Some(1)).is_err());
         assert_eq!(lane.known_tokens, Some(u64::MAX));
+    }
+
+    #[test]
+    fn session_request_cost_uses_each_terminal_attempt_snapshot_and_cache_lane() {
+        let snapshot = || {
+            Some(
+                r#"{"calculation_version":1,"currency":"USD","unit":"per_token","source":"configured","prompt":0.000002,"completion":0.000008,"cache_read":0.0000005,"cache_write":0.0000015,"configuration_updated_at":"2026-09-30"}"#.to_string(),
+            )
+        };
+        let attempt = |status: &str, usage_status: &str, counts, price_snapshot_json| {
+            SessionAttemptUsageRow {
+                status: status.into(),
+                protocol: "openai_compatible".into(),
+                usage_status: usage_status.into(),
+                counts,
+                price_snapshot_json,
+            }
+        };
+
+        let projection = summarize_session_request_projection([
+            attempt("succeeded", "provider_exact", [100, 20, 80, 5], snapshot()),
+            attempt("failed", "provider_exact", [30, 4, 0, 0], snapshot()),
+        ])
+        .unwrap();
+        assert_eq!(projection.usage.request_count, 2);
+        assert!((projection.cost.estimated_cost_usd.unwrap() - 0.0004995).abs() < 1e-12);
+        assert_eq!(projection.cost.unavailable_reason, None);
+
+        let incomplete = summarize_session_request_projection([
+            attempt("started", "provider_exact", [100, 20, 0, 0], snapshot()),
+            attempt("succeeded", "provider_exact", [30, 4, 0, 0], None),
+        ])
+        .unwrap();
+        assert_eq!(incomplete.cost.estimated_cost_usd, None);
+        assert_eq!(
+            incomplete.cost.unavailable_reason,
+            Some(SessionCostUnavailableReason::HistoricalAttemptCoverageIncomplete)
+        );
+
+        let unknown_lane = summarize_session_request_projection([attempt(
+            "failed",
+            "provider_partial",
+            [30, 0, 0, 0],
+            snapshot(),
+        )])
+        .unwrap();
+        assert_eq!(unknown_lane.cost.estimated_cost_usd, None);
+        assert_eq!(
+            unknown_lane.cost.unavailable_reason,
+            Some(SessionCostUnavailableReason::HistoricalAttemptCoverageIncomplete)
+        );
     }
 
     #[test]

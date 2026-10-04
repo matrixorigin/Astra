@@ -86,11 +86,30 @@ pub async fn build_server_state(
                 encoded
             });
 
+    let run_lifecycle = Arc::new(wiring.run_lifecycle);
+    let lifecycle_owner = Arc::downgrade(&run_lifecycle);
+    let delegation_engine = Arc::new(
+        wiring
+            .delegation_engine
+            .as_ref()
+            .clone()
+            .with_supervisor_resolver(Arc::new(move |user_id, session_id| {
+                let lifecycle_owner = lifecycle_owner.clone();
+                Box::pin(async move {
+                    let lifecycle = lifecycle_owner
+                        .upgrade()
+                        .ok_or_else(|| "run lifecycle owner is unavailable".to_string())?;
+                    Ok(lifecycle
+                        .delegation_child_supervisor(&user_id, &session_id)
+                        .await)
+                })
+            })),
+    );
     let state = state
         .with_artifact_signing_secret(artifact_signing_secret)
-        .with_run_lifecycle_service(Arc::new(wiring.run_lifecycle))
+        .with_run_lifecycle_service(run_lifecycle)
         .with_agent_profile_registry(Arc::clone(&wiring.profile_registry))
-        .with_delegation_engine(Arc::clone(&wiring.delegation_engine))
+        .with_delegation_engine(delegation_engine)
         .with_team_store(Arc::clone(&wiring.team_store))
         .with_resource_governor(Arc::clone(&wiring.resource_governor))
         .with_auxiliary_pools(control_pool.into_iter().collect());
@@ -137,14 +156,51 @@ mod tests {
 
         let coder = registry.get("coder").expect("coder profile");
         assert_eq!(coder.tier, AgentTier::System);
-        assert!(coder.skill_filter.iter().any(|tool| tool == "write_file"));
+        assert!(
+            coder
+                .allow_tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|tool| tool == "write_file")
+        );
+        assert!(coder.skill_filter.is_empty());
 
         let reviewer = registry.get("reviewer").expect("reviewer profile");
-        assert_eq!(reviewer.skill_filter, vec!["read_file", "bash"]);
+        assert_eq!(
+            reviewer.allow_tools.as_deref(),
+            Some(["read_file".to_string(), "bash".to_string()].as_slice())
+        );
+        assert!(reviewer.skill_filter.is_empty());
 
         let writer = registry.get("writer").expect("writer profile");
         assert_eq!(writer.tier, AgentTier::User);
         assert!(!writer.can_delegate);
+
+        // Builtin target scopes remain explicit configuration, not a tier
+        // exception inside the shared delegation authorization contract.
+        for source in registry.list() {
+            for target in registry.list() {
+                let expected = match source.agent_id.as_str() {
+                    "orchestrator" => target.agent_id != "orchestrator",
+                    "coder" | "reviewer" => target.agent_id == "writer",
+                    _ => false,
+                };
+                assert_eq!(
+                    source.can_delegate_to_agent(target),
+                    expected,
+                    "{} -> {}",
+                    source.agent_id,
+                    target.agent_id
+                );
+            }
+            let other = astra_services::coordination::AgentProfile::new(
+                "unselected",
+                "Unselected",
+                AgentTier::User,
+            );
+            assert!(!source.can_delegate_to_agent(&other));
+        }
     }
 
     #[test]

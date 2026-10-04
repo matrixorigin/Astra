@@ -15,7 +15,7 @@ use astra_tools::tool_engine::{
 
 use super::{RuntimeToolExecutor, memory_producer_id};
 use crate::server::tool_agent_info::{AgentInfoIdentity, render_agent_info};
-use crate::server::tool_agent_runtime::{execute_agent_fanout_tool, execute_agent_tool};
+use crate::server::tool_agent_runtime::execute_agent_fanout_tool;
 use crate::server::tool_database_snapshots::{execute_mo_query, rollback_database_snapshots};
 use crate::server::tool_execution_result::tool_result_from_output;
 use crate::server::tool_file_runtime::{
@@ -92,7 +92,6 @@ pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
         "propose_work_criteria",
         ProposeWorkCriteriaToolHandler
     );
-    register_handler_or_log!(engine, "agent", AgentToolHandler);
     register_handler_or_log!(engine, "agent_fanout", AgentFanoutToolHandler);
     register_handler_or_log!(engine, "ask_user", AskUserToolHandler);
     register_handler_or_log!(engine, "enter_plan_mode", EnterPlanModeToolHandler);
@@ -665,48 +664,6 @@ impl ToolHandler<RuntimeToolExecutor> for ProposeWorkCriteriaToolHandler {
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         crate::server::tool_work_criteria::propose(context, args, invocation, cancel_token).await
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct AgentToolHandler;
-
-#[async_trait]
-impl ToolHandler<RuntimeToolExecutor> for AgentToolHandler {
-    async fn execute(
-        &self,
-        context: &RuntimeToolExecutor,
-        args: &Value,
-        cancel_token: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
-        self.execute_invocation(
-            context,
-            args,
-            ToolInvocationMetadata::default(),
-            cancel_token,
-        )
-        .await
-    }
-
-    async fn execute_invocation(
-        &self,
-        context: &RuntimeToolExecutor,
-        args: &Value,
-        invocation: ToolInvocationMetadata<'_>,
-        cancel_token: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
-        // P2-C: Cooperative cancellation check at heavy handler entry
-        if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::cancelled_tool_result("agent", false);
-        }
-        execute_agent_tool(
-            &context.default_executor,
-            context.agent_tool_context_snapshot().as_ref(),
-            args,
-            invocation.tool_call_id,
-            invocation.delegation_model_admission,
-        )
-        .await
     }
 }
 

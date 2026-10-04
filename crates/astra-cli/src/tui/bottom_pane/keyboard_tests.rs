@@ -18,6 +18,52 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 
 #[test]
+fn binding_retained_root_preserves_child_and_navigator_focus() {
+    for durable in [false, true] {
+        for child_visible in [false, true] {
+            let mut pane = BottomPane::new();
+            if durable {
+                pane.ensure_durable_root_transcript("session".into(), 80, 24);
+            } else {
+                pane.push_view(Box::new(TranscriptView::from_snapshot(
+                    TranscriptSnapshot::new(vec![]),
+                    24,
+                    80,
+                )));
+            }
+            if child_visible {
+                pane.push_view(Box::new(AgentTranscriptView::live_unbound(
+                    "child".into(),
+                    "Child".into(),
+                    "child-run".into(),
+                    None,
+                    "agents",
+                    80,
+                    24,
+                )));
+            } else {
+                pane.push_view(Box::new(InFlightAgentsView::new(Vec::<AgentRow>::new())));
+            }
+            let focused = pane.active_conversation_tab_id();
+            let view_count = pane.view_stack.len();
+            assert_eq!(
+                pane.promote_open_root_transcript_to_durable("session".into(), 80, 24),
+                !durable,
+            );
+            assert_eq!(pane.active_conversation_tab_id(), focused);
+            assert_eq!(pane.view_stack.len(), view_count);
+            assert!(!pane.promote_open_root_transcript_to_durable("session".into(), 80, 24));
+            assert_eq!(pane.active_conversation_tab_id(), focused);
+            assert!(!pane.ensure_durable_root_transcript("session".into(), 80, 24));
+            assert_eq!(
+                pane.active_conversation_tab_id(),
+                Some(super::view::ConversationTabId::Root)
+            );
+        }
+    }
+}
+
+#[test]
 fn cancelling_task_status_ignores_late_activity_until_terminal_settlement() {
     let mut pane = BottomPane::new();
     let started_at = Instant::now();

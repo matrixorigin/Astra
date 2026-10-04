@@ -59,6 +59,7 @@ fn test_team(suffix: &str, coord: TeamCoordination) -> TeamDefinition {
                 mcp_servers: vec![],
                 can_delegate: false,
                 max_delegation_depth: 0,
+                ..Default::default()
             },
             TeamMemberDef {
                 role: "tester".into(),
@@ -71,6 +72,7 @@ fn test_team(suffix: &str, coord: TeamCoordination) -> TeamDefinition {
                 mcp_servers: vec![],
                 can_delegate: true,
                 max_delegation_depth: 2,
+                ..Default::default()
             },
         ],
         context: HashMap::from([("repo".into(), "test-repo".into())]),

@@ -1048,10 +1048,20 @@ pub(crate) fn durable_transcript_items(
         .iter()
         .filter_map(|item| {
             let result = item.tool_result.as_ref()?;
-            (!result.tool_use_id.is_empty()).then_some((result.tool_use_id.as_str(), item))
+            (!result.tool_use_id.is_empty())
+                .then_some(((item.run_id.as_deref(), result.tool_use_id.as_str()), item))
         })
         .collect::<std::collections::HashMap<_, _>>();
-    let mut paired_tool_result_seqs = std::collections::HashSet::new();
+    let paired_tool_result_seqs = items
+        .iter()
+        .flat_map(|item| {
+            item.tool_calls.iter().filter_map(|call| {
+                tool_results
+                    .get(&(item.run_id.as_deref(), call.tool_use_id.as_str()))
+                    .map(|result| result.item_seq)
+            })
+        })
+        .collect::<std::collections::HashSet<_>>();
     let mut projected = Vec::new();
     for item in items {
         let canonical_id = transcript_item_identity(item);
@@ -1080,8 +1090,10 @@ pub(crate) fn durable_transcript_items(
                 )),
                 1,
             )),
-            "assistant" => {
-                if !item.content.trim().is_empty() {
+            "assistant" | "tool_observation" | "tool_observation_preview"
+                if item.role == "assistant" || !item.tool_calls.is_empty() =>
+            {
+                if item.role == "assistant" && !item.content.trim().is_empty() {
                     projected.push(TranscriptItem::committed(
                         id,
                         Arc::new(
@@ -1093,14 +1105,16 @@ pub(crate) fn durable_transcript_items(
                     ));
                 }
                 for (index, call) in item.tool_calls.iter().enumerate() {
-                    let result_item = tool_results.get(call.tool_use_id.as_str()).copied();
+                    let result_item = tool_results
+                        .get(&(item.run_id.as_deref(), call.tool_use_id.as_str()))
+                        .copied();
                     // A delegation's prompt and result belong to the child run.
                     // The invoking run needs a compact control receipt only.
                     let delegation = crate::tui::agent_control_status::delegation_target(
                         &call.name,
                         &call.arguments,
                     );
-                    let description = if delegation.is_some() {
+                    let mut description = if delegation.is_some() {
                         crate::tui::agent_control_status::compact_delegation_description(
                             &call.name,
                             &call.arguments,
@@ -1108,15 +1122,30 @@ pub(crate) fn durable_transcript_items(
                     } else {
                         call.arguments.clone()
                     };
+                    if item.role != "assistant" {
+                        description = format!("Observed locally · {description}");
+                    }
+                    if let Some(result_item) = result_item {
+                        if result_item.role == "tool_observation_preview" {
+                            description = format!("Partial retained output · {description}");
+                        }
+                        if item.role == "assistant"
+                            && matches!(
+                                result_item.role.as_str(),
+                                "tool_observation" | "tool_observation_preview"
+                            )
+                        {
+                            description = format!("Observed locally · {description}");
+                        }
+                    }
                     let mut cell = crate::tui::history_cell::tool::ToolCell::new_running(
                         call.name.clone(),
                         description.clone(),
                     );
                     if let Some(result_item) = result_item {
-                        paired_tool_result_seqs.insert(result_item.item_seq);
                         let result = result_item.tool_result.as_ref().unwrap();
                         cell.complete(
-                            result.status.as_deref().unwrap_or("success"),
+                            result.status.as_deref().unwrap_or("uncertain"),
                             result.duration_ms.unwrap_or_default(),
                             description,
                             if delegation.is_some() {
@@ -1125,7 +1154,13 @@ pub(crate) fn durable_transcript_items(
                                     Some(&result_item.content),
                                 ))
                             } else {
-                                result_item.content.lines().next().map(ToString::to_string)
+                                result_item.content.lines().next().map(|line| {
+                                    if result_item.role == "tool_observation_preview" {
+                                        format!("Partial retained output · {line}")
+                                    } else {
+                                        line.to_string()
+                                    }
+                                })
                             },
                             delegation.is_none().then(|| result_item.content.clone()),
                         );
@@ -1142,7 +1177,7 @@ pub(crate) fn durable_transcript_items(
                     ));
                 }
             }
-            "tool" => {
+            "tool" | "tool_observation" | "tool_observation_preview" => {
                 if paired_tool_result_seqs.contains(&item.item_seq) {
                     continue;
                 }
@@ -1164,11 +1199,16 @@ pub(crate) fn durable_transcript_items(
                 cell.complete(
                     result
                         .and_then(|result| result.status.as_deref())
-                        .unwrap_or("success"),
+                        .unwrap_or("uncertain"),
                     result
                         .and_then(|result| result.duration_ms)
                         .unwrap_or_default(),
-                    "Tool result".into(),
+                    match item.role.as_str() {
+                        "tool_observation" => "Observed locally",
+                        "tool_observation_preview" => "Observed locally · partial retained output",
+                        _ => "Tool result",
+                    }
+                    .into(),
                     if unresolved_carrier {
                         Some("Deferred tool result · details unavailable on this page".into())
                     } else if delegation {
@@ -1556,6 +1596,55 @@ mod tests {
             viewport_width,
             terminal_height,
         )
+    }
+
+    #[test]
+    fn durable_tool_pairing_is_run_scoped_and_handles_local_observations() {
+        let mut observed = page().items.remove(0);
+        observed.item_seq = 1;
+        observed.run_id = Some("root-a".into());
+        observed.role = "tool_observation_preview".into();
+        observed.content = "output-a".into();
+        observed.reasoning = None;
+        observed.tool_calls = vec![astra_thin_client::SessionTranscriptToolCall {
+            tool_use_id: "same-call".into(),
+            name: "write_file".into(),
+            arguments: r#"{"path":"a.txt"}"#.into(),
+        }];
+        observed.tool_result = Some(astra_thin_client::SessionTranscriptToolResult {
+            tool_use_id: "same-call".into(),
+            name: Some("write_file".into()),
+            status: Some("completed".into()),
+            duration_ms: Some(1),
+        });
+        let mut result = observed.clone();
+        result.item_seq = 2;
+        result.run_id = Some("root-b".into());
+        result.role = "tool".into();
+        result.content = "output-b".into();
+        result.tool_calls.clear();
+        result.tool_result.as_mut().unwrap().status = None;
+        let mut call = result.clone();
+        call.item_seq = 3;
+        call.role = "assistant".into();
+        call.content.clear();
+        call.tool_result = None;
+        call.tool_calls = observed.tool_calls.clone();
+        call.tool_calls[0].arguments = r#"{"path":"b.txt"}"#.into();
+        let projected = durable_transcript_items(&[observed, result, call]);
+        assert_eq!(
+            projected.len(),
+            2,
+            "result-before-call must not duplicate a row"
+        );
+        let view = TranscriptView::from_snapshot(TranscriptSnapshot::new(projected), 24, 100);
+        let text = view.export_plain_lines().join("\n");
+        assert!(text.contains("Observed locally"), "{text}");
+        assert!(text.contains("Partial retained output"), "{text}");
+        assert!(
+            text.contains("output-a") && text.contains("output-b"),
+            "{text}"
+        );
     }
 
     #[test]

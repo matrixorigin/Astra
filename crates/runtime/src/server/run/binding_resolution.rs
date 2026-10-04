@@ -96,7 +96,18 @@ pub(crate) fn execution_bindings_from_metadata_with_authority(
         workspace.cwd = Some(server_workspace.display().to_string());
     }
     if let Some(authority) = authority_override {
-        workspace.authority = authority;
+        workspace.authority = match (workspace.authority, authority) {
+            (WorkspaceAuthority::None, _) | (_, WorkspaceAuthority::None) => {
+                WorkspaceAuthority::None
+            }
+            (WorkspaceAuthority::Unknown, _) | (_, WorkspaceAuthority::Unknown) => {
+                WorkspaceAuthority::Unknown
+            }
+            (WorkspaceAuthority::ReadOnly, _) | (_, WorkspaceAuthority::ReadOnly) => {
+                WorkspaceAuthority::ReadOnly
+            }
+            _ => authority,
+        };
     }
     let executor: ExecutorBinding =
         serde_json::from_value(metadata.get("executor")?.clone()).ok()?;
@@ -212,7 +223,19 @@ pub(crate) fn run_start_context_from_request(
                 .collect()
         });
     RunStartContext {
+        profile_authority: match request.admitted_agent_profiles.as_ref() {
+            None => crate::orchestration::ParentProfileAuthority::Unbound,
+            Some(snapshot) => match snapshot.lead_agent_id.as_ref() {
+                Some(profile_id) => crate::orchestration::ParentProfileAuthority::AdmittedMember {
+                    profile_id: profile_id.clone(),
+                    ancestor_profile_ids: Vec::new(),
+                },
+                None => crate::orchestration::ParentProfileAuthority::OrdinaryRoot,
+            },
+        },
+        admitted_agent_profiles: request.admitted_agent_profiles.clone(),
         delegated_model_requirements: None,
+        child_runtime_id: None,
         interaction_mode: super::engine::effective_requested_interaction_mode(
             request.interaction_mode,
             request.interactive_client,
@@ -549,6 +572,8 @@ mod tests {
 
     fn test_request(message: &str) -> astra_services::runs::ChatRequestData {
         astra_services::runs::ChatRequestData {
+            agent_profile_selection: None,
+            admitted_agent_profiles: None,
             model_catalog_reader: None,
             message: message.to_string(),
             conversation_authority: None,
@@ -963,7 +988,7 @@ mod tests {
 
     #[test]
     fn child_authority_override_narrows_inherited_read_write_binding() {
-        let metadata = json!({
+        let mut metadata = json!({
             "workspace": {
                 "kind": "edge_workspace",
                 "display_name": "Edge workspace",
@@ -987,5 +1012,21 @@ mod tests {
         .expect("metadata should resolve");
         assert_eq!(snapshot.workspace.authority, WorkspaceAuthority::ReadOnly);
         assert_eq!(snapshot.executor.kind, ExecutorBindingKind::EdgeAgent);
+        metadata["workspace"]["authority"] = json!("none");
+        let snapshot = execution_bindings_from_metadata_with_authority(
+            Some(&metadata),
+            Path::new("/current/workspace"),
+            Some(WorkspaceAuthority::ReadOnly),
+        )
+        .expect("metadata should resolve");
+        assert_eq!(snapshot.workspace.authority, WorkspaceAuthority::None);
+        metadata["workspace"]["authority"] = json!("read_only");
+        let snapshot = execution_bindings_from_metadata_with_authority(
+            Some(&metadata),
+            Path::new("/current/workspace"),
+            Some(WorkspaceAuthority::ReadWrite),
+        )
+        .expect("metadata should resolve");
+        assert_eq!(snapshot.workspace.authority, WorkspaceAuthority::ReadOnly);
     }
 }

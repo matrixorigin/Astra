@@ -277,10 +277,12 @@ delivery as attempts; each token lane reports a known sum and the number of
 attempts that observed that lane. A missing lane is unknown, not zero. This
 snapshot is not proof that retained records cover the session's lifetime.
 Inference routes retain optional admission-time price snapshots. Session Audit
-does not yet join those snapshots with every physical attempt or prove complete
-historical price and usage coverage, so its cost remains unavailable with
-`historical_attempt_coverage_incomplete`. Current catalog prices or a display
-model name cannot fill those gaps or price historical requests reliably.
+prices each retained physical attempt once, including priced retries and failures,
+using its retained snapshot and separately observed fresh-input, output, cache-read
+and cache-creation lanes. The USD estimate is not a provider invoice or proof of
+complete lifetime coverage. Empty ledgers, nonterminal attempts or missing price
+or usage evidence keep cost unavailable with `historical_attempt_coverage_incomplete`.
+Current catalog prices or a display model name never fill those gaps or reprice history.
 
 Live runtime and feedback cache-read percentages require a positive observed
 input-token denominator. With no input measurement they display `unknown`, not

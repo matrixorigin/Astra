@@ -379,7 +379,7 @@ async fn run_async() -> i32 {
     }
 
     let _ = (startup_trace, bare);
-    let cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
+    let mut cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
         no_journal_content,
         &allowed_tools,
         &disallowed_tools,
@@ -463,6 +463,8 @@ async fn run_async() -> i32 {
     } else {
         None
     };
+    // Preserve explicit intent before merging with the configured default.
+    cli_context.select_model(cli_model.as_deref());
     let resolved_model = normalize_model_override_owned(cli_model.or(config_default_model));
 
     // Make the resolved model available to slash commands that print
@@ -496,15 +498,12 @@ async fn run_async() -> i32 {
 
         // For -c, resolve the last session ID from credentials
         let resolved_sid = if continue_last && session_id.is_none() {
-            if cli::session::session_runtime::resolve_cloud_base().is_some()
-                && cli::session::session_runtime::current_access_token(profile.as_deref()).is_some()
-            {
+            if cli::session::session_restore_client::has_server_auth(profile.as_deref()) {
                 cli::cli_config::cli_utils::validated_resumable_last_session_id(
                     &api,
                     profile.as_deref(),
                 )
                 .await
-                .or_else(|| local_resumable_last_session_id(profile.as_deref()))
             } else {
                 local_resumable_last_session_id(profile.as_deref())
             }

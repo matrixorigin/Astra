@@ -114,33 +114,23 @@ pub(crate) fn cloud_resume_client() -> Result<Option<astra_thin_client::ThinClie
         .map_err(|error| format!("Create cloud API client failed: {error}"))
 }
 
+pub(crate) fn has_server_auth(profile: Option<&str>) -> bool {
+    crate::cli::native_auth::active().is_some()
+        || session_runtime::current_access_token(profile).is_some()
+}
+
 pub(crate) async fn restore_session_snapshot_with_client(
     profile: Option<&str>,
     api: &astra_thin_client::ThinClient,
     session_id: &str,
 ) -> Result<Option<RestoredSession>, String> {
     validate_remote_session_id(session_id)?;
-    let local = HybridRestoreService::local_only()
+    if has_server_auth(profile) {
+        return fetch_cloud_session_snapshot_with_client(profile, api, session_id).await;
+    }
+    HybridRestoreService::local_only()
         .restore_local_session(session_id)
-        .await?;
-    if local.is_some() {
-        return Ok(local);
-    }
-
-    let Some(token) = session_runtime::current_access_token(profile) else {
-        return Ok(None);
-    };
-    let path = astra_thin_client::paths::session_resume(session_id);
-    match api
-        .post_bearer_path_empty_json::<RestoredSession>(&token, &path)
         .await
-    {
-        Ok(restored) => Ok(Some(validate_restored_session(session_id, restored)?)),
-        Err(astra_thin_client::ThinClientError::Api { status, .. }) if status.as_u16() == 404 => {
-            Ok(None)
-        }
-        Err(error) => Err(format!("Resume failed: {error}")),
-    }
 }
 
 pub(crate) async fn fetch_cloud_session_snapshot_with_client(
@@ -149,39 +139,10 @@ pub(crate) async fn fetch_cloud_session_snapshot_with_client(
     session_id: &str,
 ) -> Result<Option<RestoredSession>, String> {
     validate_remote_session_id(session_id)?;
-    let Some(token) = session_runtime::current_access_token(profile) else {
-        return Ok(None);
-    };
-    let path = astra_thin_client::paths::session_resume(session_id);
-    match api
-        .post_bearer_path_empty_json::<RestoredSession>(&token, &path)
-        .await
-    {
-        Ok(restored) => Ok(Some(validate_restored_session(session_id, restored)?)),
-        Err(astra_thin_client::ThinClientError::Api { status, .. }) if status.as_u16() == 404 => {
-            Ok(None)
-        }
-        Err(error) => Err(format!("Resume failed: {error}")),
-    }
-}
-
-pub(crate) async fn restore_session_snapshot(
-    profile: Option<&str>,
-    session_id: &str,
-) -> Result<Option<RestoredSession>, String> {
-    validate_remote_session_id(session_id)?;
-    let local = HybridRestoreService::local_only()
-        .restore_local_session(session_id)
-        .await?;
-    if local.is_some() {
-        return Ok(local);
-    }
-
-    let Some(api) = cloud_resume_client()? else {
-        return Ok(None);
-    };
-    let Some(token) = session_runtime::current_access_token(profile) else {
-        return Ok(None);
+    let token = match session_runtime::current_access_token(profile) {
+        Some(token) => token,
+        None if crate::cli::native_auth::active().is_some() => String::new(),
+        None => return Ok(None),
     };
     let path = astra_thin_client::paths::session_resume(session_id);
     match api

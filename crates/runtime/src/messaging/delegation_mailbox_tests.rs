@@ -35,7 +35,10 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for MailboxTestExecutor {
-        async fn execute(&self, mut config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            mut config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<crate::orchestration::SpawnRunFrontier>), String> {
             let agent_id = config.agent_profile.agent_id.clone();
             let run_id = config.run_id.clone();
 
@@ -79,27 +82,33 @@ mod tests {
                     .send_progress(0, 0, "completed", Some(format!("{agent_id} done")))
                     .await;
 
-                Ok(AgentResult {
-                    agent_id,
-                    run_id,
-                    status: "completed".to_string(),
-                    output: Some(format!("mailbox=true, sent=2, received={}", received.len())),
-                    error: None,
-                    prompt_tokens: 10,
-                    completion_tokens: 5,
-                    tool_calls: 0,
-                })
+                Ok((
+                    AgentResult {
+                        agent_id,
+                        run_id,
+                        status: "completed".to_string(),
+                        output: Some(format!("mailbox=true, sent=2, received={}", received.len())),
+                        error: None,
+                        prompt_tokens: 10,
+                        completion_tokens: 5,
+                        tool_calls: 0,
+                    },
+                    None,
+                ))
             } else {
-                Ok(AgentResult {
-                    agent_id,
-                    run_id,
-                    status: "completed".to_string(),
-                    output: Some("mailbox=false".to_string()),
-                    error: None,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                })
+                Ok((
+                    AgentResult {
+                        agent_id,
+                        run_id,
+                        status: "completed".to_string(),
+                        output: Some("mailbox=false".to_string()),
+                        error: None,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    },
+                    None,
+                ))
             }
         }
     }
@@ -180,7 +189,10 @@ mod tests {
             tracker.clone(),
             Arc::new(MailboxTestExecutor),
         )
-        .with_mailbox_router(router.clone());
+        .with_mailbox_router(router.clone())
+        .for_execution(Arc::new(crate::orchestration::DynamicAgentSpawner::new(
+            router.clone(),
+        )));
 
         let request = fan_out_request(vec!["coder", "reviewer"]);
         persist_request_parent(&run_engine, &request).await.unwrap();
@@ -222,7 +234,10 @@ mod tests {
             tracker.clone(),
             Arc::new(MailboxTestExecutor),
         )
-        .with_mailbox_router(router.clone());
+        .with_mailbox_router(router.clone())
+        .for_execution(Arc::new(crate::orchestration::DynamicAgentSpawner::new(
+            router.clone(),
+        )));
 
         let request = fan_out_request(vec!["coder", "reviewer"]);
         persist_request_parent(&run_engine, &request).await.unwrap();
@@ -284,7 +299,10 @@ mod tests {
             tracker.clone(),
             Arc::new(MailboxTestExecutor),
         )
-        .with_mailbox_router(router.clone());
+        .with_mailbox_router(router.clone())
+        .for_execution(Arc::new(crate::orchestration::DynamicAgentSpawner::new(
+            router.clone(),
+        )));
 
         let request = fan_out_request(vec!["coder", "reviewer", "tester"]);
         persist_request_parent(&run_engine, &request).await.unwrap();
@@ -329,12 +347,19 @@ mod tests {
         let tracker = Arc::new(DelegationTracker::new());
 
         // No mailbox_router → agents should get mailbox=None.
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker.clone(),
+        ));
         let engine = DelegationEngine::with_executor(
             profiles,
             run_engine.clone(),
             tracker,
             Arc::new(MailboxTestExecutor),
-        );
+        )
+        .for_execution(Arc::new(crate::orchestration::DynamicAgentSpawner::new(
+            router,
+        )));
         // Intentionally NOT calling .with_mailbox_router()
 
         let request = fan_out_request(vec!["coder"]);
@@ -368,7 +393,10 @@ mod tests {
             tracker.clone(),
             Arc::new(MailboxTestExecutor),
         )
-        .with_mailbox_router(router);
+        .with_mailbox_router(router.clone())
+        .for_execution(Arc::new(crate::orchestration::DynamicAgentSpawner::new(
+            router,
+        )));
 
         let request = fan_out_request(vec!["coder", "reviewer"]);
         persist_request_parent(&run_engine, &request).await.unwrap();

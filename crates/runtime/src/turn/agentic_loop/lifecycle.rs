@@ -73,6 +73,13 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
         };
         let has_more = lease.has_more();
         let address = &lease.mailbox().address;
+        // A root mailbox may outlive one execution. Observe through the
+        // current run without changing transport identity or reply matching.
+        let mut observer = address.clone();
+        if let Some(run_id) = state.current_run_id.as_ref() {
+            observer.run_id.clone_from(run_id);
+        }
+        observer.agent_id.clone_from(&state.self_agent_id);
         let mut parts = Vec::new();
         let self_echo = msg.from == *address
             && matches!(
@@ -87,7 +94,7 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
             );
             if !is_transient_progress {
                 host.on_agent_communication(astra_messaging::agent_communication_event(
-                    address,
+                    &observer,
                     astra_messaging::AgentCommunicationDirection::Received,
                     &msg,
                 ));
@@ -125,7 +132,7 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                     // parent task can continue without replaying it forever.
                 } else {
                     host.on_agent_communication(astra_messaging::agent_communication_event(
-                        address,
+                        &observer,
                         astra_messaging::AgentCommunicationDirection::Sent,
                         &response_msg,
                     ));
@@ -1032,7 +1039,10 @@ struct ParallelAgentSummary {
 
 struct CompletedParallelAgent {
     label: String,
-    result: String,
+    /// The provider-observed terminal result may have been compacted from the
+    /// bounded required-context lane after repeated leases. Terminal success
+    /// remains authoritative even when this presentation copy is gone.
+    result: Option<String>,
 }
 
 struct UnfinishedParallelAgent {
@@ -1116,6 +1126,27 @@ fn collect_parallel_agent_budget_rollup(
                 }
                 let entry = summaries.entry(agent_id).or_default();
                 apply_parallel_agent_budget_projection(entry, &projection);
+                if !entry.terminal
+                    && let Some(observed_child) =
+                        super::execution_phase::observed_direct_child_for_nonterminal_receipt(
+                            state, record,
+                        )
+                {
+                    entry.terminal = true;
+                    let observed_result = observed_child["result"]
+                        .as_str()
+                        .filter(|result| !result.trim().is_empty())
+                        .map(str::to_owned);
+                    // The shared proof above is producer-owned terminal
+                    // evidence: exact child identity, completed status, and
+                    // provider observation. After two provider leases the
+                    // host deliberately compacts the presentation result,
+                    // so missing `result` is not a child failure.
+                    entry.successful = true;
+                    entry.completed_result = observed_result;
+                    entry.partial_result = None;
+                    entry.incomplete_reason = None;
+                }
             }
             AgentToolRecordActionKind::Other => {}
         }
@@ -1125,13 +1156,10 @@ fn collect_parallel_agent_budget_rollup(
         .iter()
         .filter_map(|agent_id| {
             summaries.get(agent_id).and_then(|entry| {
-                (entry.successful)
-                    .then_some(entry.completed_result.as_ref())
-                    .flatten()
-                    .map(|result| CompletedParallelAgent {
-                        label: entry.label.clone().unwrap_or_else(|| agent_id.clone()),
-                        result: result.clone(),
-                    })
+                entry.successful.then_some(CompletedParallelAgent {
+                    label: entry.label.clone().unwrap_or_else(|| agent_id.clone()),
+                    result: entry.completed_result.clone(),
+                })
             })
         })
         .collect();
@@ -1209,12 +1237,12 @@ fn parallel_agent_budget_exhaustion_summary(
         lines.push(String::new());
         lines.push("Completed sub-agent results:".to_string());
         for (idx, entry) in rollup.completed.iter().enumerate() {
-            lines.push(format!(
-                "{}. {} — {}",
-                idx + 1,
-                entry.label,
-                summarize_agent_tool_budget_result(&entry.result)
-            ));
+            let detail = entry
+                .result
+                .as_deref()
+                .map(summarize_agent_tool_budget_result)
+                .unwrap_or_else(|| "completed; result was already observed".to_string());
+            lines.push(format!("{}. {} — {}", idx + 1, entry.label, detail));
         }
     }
     if !rollup.terminal_issues.is_empty() {
@@ -7211,8 +7239,125 @@ mod tests {
         assert_eq!(rollup.unfinished.len(), 0);
         assert_eq!(rollup.completed.len(), 1);
         assert_eq!(rollup.completed[0].label, "Direct review");
-        assert_eq!(rollup.completed[0].result, "Direct review finished.");
+        assert_eq!(
+            rollup.completed[0].result.as_deref(),
+            Some("Direct review finished.")
+        );
         assert!(unfinished_parallel_agent_ids(&state).is_empty());
+    }
+
+    #[test]
+    fn parallel_budget_rollup_adopts_provider_observed_child_completion_after_launch() {
+        let mut state = make_state();
+        state.current_run_id = Some("fixture-parent".into());
+        let mut launch = agent_record(
+            "spawn",
+            json!({
+                "action": "spawn",
+                "description": "Observed child"
+            }),
+            Some(json!({
+                "status": "launched",
+                "agent_id": "agent-a",
+                "description": "Observed child"
+            })),
+            None,
+        );
+        launch.disposition = Some(astra_services::session_journal::ToolCallDisposition::Executed);
+        state.stall.tool_call_records = vec![launch];
+        state.push_volatile_payload(
+            VolatileKind::BackgroundTaskNotification,
+            json!({
+                "schema": super::super::host::DIRECT_CHILD_RESULT_SCHEMA,
+                "parent_run_id": "fixture-parent",
+                "observed_by_provider": true,
+                "children": [{
+                    "agent_id": "agent-a",
+                    "run_id": "run-agent-a",
+                    "status": "completed",
+                    "result": "Observed child finished."
+                }]
+            }),
+        );
+
+        let rollup = collect_parallel_agent_budget_rollup(&state).expect("agent rollup");
+        assert!(rollup.unfinished.is_empty());
+        assert_eq!(rollup.completed.len(), 1);
+        assert_eq!(rollup.completed[0].label, "Observed child");
+        assert_eq!(
+            rollup.completed[0].result.as_deref(),
+            Some("Observed child finished.")
+        );
+        assert!(unfinished_parallel_agent_ids(&state).is_empty());
+    }
+
+    #[test]
+    fn parallel_budget_rollup_accepts_provider_compacted_child_after_lease_cycle() {
+        let mut state = make_state();
+        state.current_run_id = Some("fixture-parent".into());
+        let mut launch = agent_record(
+            "spawn",
+            json!({
+                "action": "spawn",
+                "description": "Compacted child"
+            }),
+            Some(json!({
+                "status": "launched",
+                "agent_id": "agent-a",
+                "description": "Compacted child"
+            })),
+            None,
+        );
+        launch.disposition = Some(astra_services::session_journal::ToolCallDisposition::Executed);
+        state.stall.tool_call_records = vec![launch];
+        state.push_volatile_payload(
+            VolatileKind::BackgroundTaskNotification,
+            json!({
+                "schema": super::super::host::DIRECT_CHILD_RESULT_SCHEMA,
+                "parent_run_id": "fixture-parent",
+                "children": [{
+                    "agent_id": "agent-a",
+                    "run_id": "run-agent-a",
+                    "status": "completed",
+                    "status_fingerprint": "completed:fixture",
+                    "result": "Observed before provider compaction.",
+                    "result_bytes": 36
+                }]
+            }),
+        );
+
+        // Exercise the real host lease lifecycle. Its second commit keeps
+        // terminal identity/status but intentionally removes the result.
+        state
+            .lease_volatile_pending()
+            .expect("first provider lease");
+        state.commit_volatile_attempt_lease();
+        state
+            .lease_volatile_pending()
+            .expect("second provider lease");
+        state.commit_volatile_attempt_lease();
+        let compacted = state
+            .volatile_pending
+            .iter()
+            .flat_map(|injection| injection.payload["children"].as_array())
+            .flatten()
+            .find(|child| child["agent_id"] == "agent-a")
+            .expect("compacted child evidence");
+        assert_eq!(compacted["status"], "completed");
+        assert!(compacted.get("result").is_none());
+        assert_eq!(compacted["result_bytes"], 36);
+
+        let rollup = collect_parallel_agent_budget_rollup(&state).expect("agent rollup");
+        assert_eq!(rollup.completed.len(), 1);
+        assert!(rollup.completed[0].result.is_none());
+        assert!(rollup.terminal_issues.is_empty());
+        assert!(rollup.unfinished.is_empty());
+        assert!(unfinished_parallel_agent_ids(&state).is_empty());
+        let summary = parallel_agent_budget_exhaustion_summary(&state, &HashSet::new())
+            .expect("compacted completion summary");
+        assert!(summary.contains(
+            "1 parallel sub-agent result(s) completed; 0 terminated without a successful result; 0 remain live."
+        ));
     }
 
     #[test]

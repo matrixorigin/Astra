@@ -22,9 +22,8 @@ use crate::cli::surface::session_workspace_status_surface::session_workspace_sta
 use crate::cli::tool_call_groups;
 use crate::cli::{
     cli_config::cli_utils::{
-        SessionResumePreflight, clear_profile_last_session_if_matches_or_warn,
-        normalize_model_override, persist_profile_last_session_or_warn,
-        preflight_remote_resume_session,
+        clear_profile_last_session_if_matches_or_warn, normalize_model_override,
+        persist_profile_last_session_or_warn,
     },
     session::session_state::SessionState,
     session::{session_continuation, session_projection, session_startup},
@@ -5259,6 +5258,12 @@ async fn apply_restored_session(
     ) {
         (_, None) => false,
         (None, Some(_)) => true,
+        (_, Some(remote))
+            if restored.restored_from_cloud
+                && remote.resume.source == astra_turn_types::ResumeSourceV1::CanonicalJournal =>
+        {
+            true
+        }
         (Some(local), Some(remote)) => {
             let candidates = [
                 session_continuation::portable_resume_descriptor(local.clone()),
@@ -5562,12 +5567,27 @@ async fn apply_restored_session(
         eprintln!("  {} Restored step checkpoint from cloud", "☁".magenta());
     }
 
-    match normalize_model_override(restored.model.as_deref()) {
+    state.cli_context.agent_profile_selection = typed_continuation
+        .as_ref()
+        .filter(|_| use_typed_continuation)
+        .and_then(|continuation| continuation.agent_profile_selection.clone());
+
+    // A restored effective model does not establish user intent. Preserve a
+    // current explicit selection; otherwise restore only the model baseline.
+    let restored_model = if matches!(
+        state.cli_context.requested_model_policy,
+        Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
+    ) {
+        state.model.clone()
+    } else {
+        restored.model.clone().map(Into::into)
+    };
+    match normalize_model_override(restored_model.as_deref()) {
         Some(m) => {
-            state.model = Some((m.to_string()).into());
             let base = astra_turn_core::thinking_config::resolve_model_thinking(m).0;
             state.context_budget =
                 prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(base));
+            state.model = restored_model;
         }
         None => {
             state.model = None;
@@ -5684,17 +5704,14 @@ pub(crate) async fn restore_session_into_state(
         session_restore_client::restore_session_snapshot_with_client(profile, api, session_id)
             .await?;
     let Some(restored) = restored else {
-        if matches!(
-            preflight_remote_resume_session(api, profile, session_id).await,
-            SessionResumePreflight::Missing
-        ) {
+        if session_restore_client::has_server_auth(profile) {
             clear_profile_last_session_if_matches_or_warn(
                 profile,
                 session_id,
                 "slash_session:restore_session_snapshot",
             );
             return Err(format!(
-                "Session {session_id} no longer exists on the server and has no local resumable state."
+                "Session {session_id} no longer exists or is not owned by the authenticated user."
             ));
         }
         return Err(format!(
@@ -6167,6 +6184,35 @@ mod resume_tests {
         .expect("valid test resume bundle")
     }
 
+    async fn mock_canonical_resume(server: &MockServer, session_id: &str, turn: u32) {
+        let mut bundle = typed_resume_bundle(
+            session_id,
+            turn,
+            vec![
+                serde_json::json!({"role":"user","content":"continue"}),
+                serde_json::json!({"role":"assistant","content":"remote restored"}),
+            ],
+        );
+        bundle.source = astra_turn_types::ResumeSourceV1::CanonicalJournal;
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{session_id}/resume")))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(RestoredSession {
+                session_id: session_id.into(),
+                turn_count: turn,
+                restored_from_cloud: true,
+                resume_bundle: Some(bundle),
+                total_tokens_in: 15,
+                total_tokens_out: 7,
+                total_cache_read_tokens: 9,
+                total_cache_creation_tokens: 3,
+                ..Default::default()
+            }))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
     fn write_local_resumable_session(session_id: &str, turn_count: u32) {
         let writer = session_journal::JournalWriter::new(session_id).unwrap();
         writer
@@ -6569,6 +6615,10 @@ mod resume_tests {
             compaction_generation: 0,
             config_version_id: None,
         };
+        let selection = astra_turn_types::AgentProfileSelection {
+            team_id: "delivery".into(),
+            lead_agent_id: Some("lead".into()),
+        };
         let bundle = astra_turn_types::ResumeBundleV1 {
             schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
             cursor: cursor.clone(),
@@ -6577,7 +6627,16 @@ mod resume_tests {
             materialized_conversation_root_hash: None,
             degraded_reasons: vec![astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback],
             repair_actions: Vec::new(),
-            projections: Default::default(),
+            projections: astra_turn_types::ResumeProjectionSetV1 {
+                provider: Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                    cursor.clone(),
+                    astra_turn_types::ResumeProviderProjectionV1 {
+                        agent_profile_selection: Some(selection.clone()),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
         };
         let restored = RestoredSession {
             session_id: session_id.clone(),
@@ -6587,14 +6646,37 @@ mod resume_tests {
             last_status: "active".into(),
             ..Default::default()
         };
+        let mut server_restored = restored.clone();
+        server_restored.resume_bundle.as_mut().unwrap().source =
+            astra_turn_types::ResumeSourceV1::CanonicalJournal;
+        server_restored
+            .resume_bundle
+            .as_mut()
+            .unwrap()
+            .cursor
+            .journal_event_seq = 100;
+        // Align the provider envelope with the authoritative Server cursor.
+        let server_bundle = server_restored.resume_bundle.as_mut().unwrap();
+        server_bundle
+            .projections
+            .provider
+            .as_mut()
+            .unwrap()
+            .source_cursor = Some(server_bundle.cursor.clone());
         let mut state = SessionState::default();
 
         apply_restored_session(None, &api, &mut state, restored)
             .await
             .expect("apply typed cloud resume");
 
+        assert_eq!(
+            state.cli_context.agent_profile_selection,
+            Some(selection.clone())
+        );
+
         let active = state
             .active_conversation
+            .as_ref()
             .expect("typed cloud resume must install active conversation");
         assert_eq!(active.cursor(), &cursor);
         assert_eq!(active.messages(), messages);
@@ -6603,6 +6685,16 @@ mod resume_tests {
                 .history
                 .iter()
                 .any(|(_, assistant)| assistant == "done")
+        );
+        write_local_resumable_session(&session_id, 20);
+        apply_restored_session(None, &api, &mut state, server_restored)
+            .await
+            .expect("Server journal authority must not compare replica clocks");
+        assert_eq!(state.turn, 3);
+        assert_eq!(state.cli_context.agent_profile_selection, Some(selection));
+        assert_eq!(
+            state.active_conversation.as_ref().unwrap().messages(),
+            messages
         );
     }
 
@@ -6934,6 +7026,8 @@ mod resume_tests {
     #[tokio::test]
     async fn resume_rejects_invalid_configuration_without_rebinding_or_rewriting_workspace() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _creds_guard = crate::tests::isolate_credentials();
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         for invalid in [
             r#"{"verification":{"strictness":0.8}}"#,
@@ -7071,17 +7165,25 @@ mod resume_tests {
             objective,
             serde_json::json!({"role": "assistant", "content": "cloud fallback"}),
         ];
+        let mut bundle = typed_resume_bundle(&session_id, 2, conversation_messages.clone());
+        bundle.projections.provider =
+            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                bundle.cursor.clone(),
+                astra_turn_types::ResumeProviderProjectionV1 {
+                    agent_profile_selection: Some(astra_turn_types::AgentProfileSelection {
+                        team_id: "stale-cloud-team".into(),
+                        lead_agent_id: None,
+                    }),
+                    ..Default::default()
+                },
+            ));
         let restored = RestoredSession {
             session_id: session_id.clone(),
             turn_count: 2,
             model: Some("gpt-5".into()),
             last_status: "active".into(),
             restored_from_cloud: true,
-            resume_bundle: Some(typed_resume_bundle(
-                &session_id,
-                2,
-                conversation_messages.clone(),
-            )),
+            resume_bundle: Some(bundle),
             interruption: Some(serde_json::json!({
                 "kind": "context_overflow",
                 "resumable": true,
@@ -7109,6 +7211,7 @@ mod resume_tests {
         assert!(!guidance.contains("objective: repair session lifecycle"));
         assert!(!guidance.contains("3 attempt(s)"));
         assert_eq!(state.runtime_compaction_state, None);
+        assert!(state.cli_context.agent_profile_selection.is_none());
     }
 
     #[serial_test::serial]
@@ -7405,83 +7508,94 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn restore_session_into_state_prefers_local_state_over_stale_remote_preflight() {
+    async fn restore_session_into_state_restores_unauthenticated_local_session() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
+        let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         let session_id = format!("resume-stale-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 3);
-        write_profile_with_token(&session_id);
 
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(format!("/sessions/{session_id}")))
-            .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                "detail": "Session not found"
-            })))
-            .mount(&server)
-            .await;
+
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let mut state = SessionState::default();
+        let mut state = SessionState {
+            model: Some(
+                crate::cli::session::session_state::SessionModelChoice::Selected(
+                    crate::cli::session::session_runtime::ServerModelSelection {
+                        name: "chosen-model(thinking:high)".into(),
+                        offering_id: "chosen-offering".into(),
+                        context_window: Some(64_000),
+                        pricing: None,
+                    },
+                ),
+            ),
+            ..SessionState::default()
+        };
+        state
+            .cli_context
+            .select_model(Some("chosen-model(thinking:high)"));
         restore_session_into_state(&session_id, None, &api, &mut state)
             .await
-            .expect(
-                "local journal/workspace should restore even when cloud no longer has the session",
-            );
+            .expect("unauthenticated local journal/workspace should restore");
 
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
         assert_eq!(state.turn, 3);
+        assert_eq!(state.model.as_deref(), Some("chosen-model(thinking:high)"));
         assert_eq!(
-            crate::cli::cli_config::cli_utils::load_credentials()
-                .profiles
-                .get("default")
-                .and_then(|profile| profile.last_session_id.as_deref()),
-            Some(session_id.as_str())
+            state.model.as_ref().and_then(|model| model.offering_id()),
+            Some("chosen-offering")
         );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn restore_session_into_state_clears_cloud_only_stale_pointer() {
+    async fn authenticated_restore_does_not_fall_back_to_local_state_on_server_failure() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
-        let session_id = format!("resume-cloud-stale-{}", uuid::Uuid::new_v4());
-        write_profile_with_token(&session_id);
-
+        let session_id = format!("resume-stale-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 3);
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path(format!("/sessions/{session_id}/resume")))
-            .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                "detail": "Session not found"
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(format!("/sessions/{session_id}")))
-            .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
-                "detail": "Session not found"
-            })))
-            .mount(&server)
-            .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-
-        let mut state = SessionState::default();
-        let err = restore_session_into_state(&session_id, None, &api, &mut state)
-            .await
-            .expect_err("cloud-only stale session should fail");
-
-        assert!(err.contains("has no local resumable state"), "got: {err}");
-        assert_eq!(state.session_id, None);
-        assert_eq!(
-            crate::cli::cli_config::cli_utils::load_credentials()
-                .profiles
-                .get("default")
-                .and_then(|profile| profile.last_session_id.as_deref()),
-            None
-        );
+        for status in [404, 403, 503] {
+            write_profile_with_token(&session_id);
+            Mock::given(method("POST"))
+                .and(path(format!("/sessions/{session_id}/resume")))
+                .and(header_exists("authorization"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(serde_json::json!({"detail":"Session unavailable"})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut state = SessionState {
+                session_id: Some("current-session".into()),
+                turn: 7,
+                ..Default::default()
+            };
+            restore_session_into_state(&session_id, None, &api, &mut state)
+                .await
+                .expect_err("local replica cannot override Server failure");
+            assert_eq!(state.session_id.as_deref(), Some("current-session"));
+            assert_eq!(state.turn, 7);
+            let credentials = crate::cli::cli_config::cli_utils::load_credentials();
+            assert_eq!(
+                credentials
+                    .profiles
+                    .get("default")
+                    .and_then(|profile| profile.last_session_id.as_deref()),
+                if status == 404 {
+                    None
+                } else {
+                    Some(session_id.as_str())
+                }
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            server.verify().await;
+            server.reset().await;
+        }
     }
 
     #[serial_test::serial]
@@ -7608,6 +7722,8 @@ mod resume_tests {
     #[tokio::test]
     async fn switch_session_into_state_restores_workspace_scoped_state() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         let session_id = format!("switch-restore-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 2);
 
@@ -7764,15 +7880,7 @@ mod resume_tests {
         write_profile_with_token(&session_id);
 
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(format!("/sessions/{session_id}")))
-            .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "session_id": session_id,
-                "status": "active"
-            })))
-            .mount(&server)
-            .await;
+        mock_canonical_resume(&server, &session_id, 3).await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
         let mut state = SessionState::default();
@@ -7781,7 +7889,23 @@ mod resume_tests {
             .unwrap();
 
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
-        assert_eq!(state.turn, 2);
+        assert_eq!(state.turn, 3);
+        assert!(
+            state
+                .history
+                .iter()
+                .any(|(_, answer)| answer == "remote restored")
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.url.path() == format!("/sessions/{session_id}/resume"))
+                .count(),
+            1
+        );
         assert_eq!(state.total_prompt_tokens, 15);
         assert_eq!(state.total_completion_tokens, 7);
         assert_eq!(state.total_cache_read_tokens, 9);
@@ -7863,15 +7987,7 @@ mod resume_tests {
         );
 
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(format!("/sessions/{session_id}")))
-            .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "session_id": session_id,
-                "status": "active"
-            })))
-            .mount(&server)
-            .await;
+        mock_canonical_resume(&server, &session_id, 3).await;
         Mock::given(method("POST"))
             .and(path("/memory/retrieve"))
             .and(header_exists("authorization"))
@@ -7911,15 +8027,7 @@ mod resume_tests {
         write_profile_with_token(&session_id);
 
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(format!("/sessions/{session_id}")))
-            .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "session_id": session_id,
-                "status": "active"
-            })))
-            .mount(&server)
-            .await;
+        mock_canonical_resume(&server, &session_id, 3).await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
         let mut state = SessionState {
@@ -7947,15 +8055,7 @@ mod resume_tests {
         write_profile_with_token(&session_id);
 
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(format!("/sessions/{session_id}")))
-            .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "session_id": session_id,
-                "status": "active"
-            })))
-            .mount(&server)
-            .await;
+        mock_canonical_resume(&server, &session_id, 3).await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
         let mut state = SessionState::default();
@@ -7981,15 +8081,7 @@ mod resume_tests {
         write_profile_with_token(&session_id);
 
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(format!("/sessions/{session_id}")))
-            .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "session_id": session_id,
-                "status": "active"
-            })))
-            .mount(&server)
-            .await;
+        mock_canonical_resume(&server, &session_id, 3).await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
         let mut state = SessionState {

@@ -76,6 +76,10 @@ pub(crate) async fn delegate_run_handler(
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e))?;
 
     // Execute the delegation.
+    let engine = engine
+        .for_session(&request.user_id, &request.session_id)
+        .await
+        .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))?;
     let result = engine
         .execute_with_forward_headers(request, &source_agent_id, None, forward_headers, None)
         .await

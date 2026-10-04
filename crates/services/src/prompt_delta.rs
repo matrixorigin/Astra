@@ -490,6 +490,8 @@ fn decode_stored_prompt_delta(
 pub struct PromptRequestPlanInput<'a> {
     pub user_id: &'a str,
     pub session_id: &'a str,
+    /// None denotes a session-scoped diagnostic without an execution run.
+    pub run_id: Option<&'a str>,
     pub turn: u32,
     pub round: u32,
     pub attempt: u32,
@@ -500,6 +502,9 @@ pub struct PromptRequestPlanInput<'a> {
 }
 
 pub fn plan_prompt_request(input: PromptRequestPlanInput<'_>) -> Result<PromptRequestPlan, String> {
+    if input.run_id.is_some_and(|run_id| run_id.trim().is_empty()) {
+        return Err("prompt request run identity must not be blank".into());
+    }
     let mut chunks = Vec::with_capacity(input.messages.len() + input.tools.len());
     for (index, message) in input.messages.iter().enumerate() {
         let logical_key = format!(
@@ -542,6 +547,7 @@ pub fn plan_prompt_request(input: PromptRequestPlanInput<'_>) -> Result<PromptRe
         request_id: prompt_request_id(
             input.user_id,
             input.session_id,
+            input.run_id,
             input.turn,
             input.round,
             input.attempt,
@@ -561,6 +567,23 @@ pub async fn persist_prompt_request(
     input: &PromptRequestPersistInput,
     plan: &PromptRequestPlan,
 ) -> Result<PromptRequestPersistResult, String> {
+    if input
+        .run_id
+        .as_deref()
+        .is_some_and(|run_id| run_id.trim().is_empty())
+        || plan.request_id
+            != prompt_request_id(
+                &input.user_id,
+                &input.session_id,
+                input.run_id.as_deref(),
+                input.turn,
+                input.round,
+                input.attempt,
+                &input.source,
+            )
+    {
+        return Err("prompt request plan does not match persistence identity".into());
+    }
     let db = pool.get();
     let mut connection = CancellationSafePoolConnection::acquire(db)
         .await
@@ -1411,13 +1434,24 @@ fn hash_prompt_plan(chunks: &[PromptChunkPlan], max_output_tokens: Option<u32>) 
 fn prompt_request_id(
     user_id: &str,
     session_id: &str,
+    run_id: Option<&str>,
     turn: u32,
     round: u32,
     attempt: u32,
     source: &str,
 ) -> String {
-    let digest =
-        sha256_hex(format!("{user_id}|{session_id}|{turn}|{round}|{attempt}|{source}").as_bytes());
+    let identity = serde_json::to_vec(&(
+        "astra.prompt-request",
+        user_id,
+        session_id,
+        run_id,
+        turn,
+        round,
+        attempt,
+        source,
+    ))
+    .expect("prompt request identity contains only JSON primitives");
+    let digest = sha256_hex(&identity);
     format!("promptreq-{}", &digest[..24])
 }
 
@@ -1571,6 +1605,7 @@ mod tests {
         let plan_a = plan_prompt_request(PromptRequestPlanInput {
             user_id: "user-1",
             session_id: "session-1",
+            run_id: None,
             turn: 1,
             round: 0,
             attempt: 0,
@@ -1584,6 +1619,7 @@ mod tests {
         let plan_b = plan_prompt_request(PromptRequestPlanInput {
             user_id: "user-1",
             session_id: "session-1",
+            run_id: None,
             turn: 1,
             round: 0,
             attempt: 0,
@@ -1604,6 +1640,7 @@ mod tests {
             plan_prompt_request(PromptRequestPlanInput {
                 user_id: "owner-a",
                 session_id: "session-a",
+                run_id: None,
                 turn: 1,
                 round: 0,
                 attempt: 0,
@@ -1631,6 +1668,7 @@ mod tests {
         let first = plan_prompt_request(PromptRequestPlanInput {
             user_id: "owner-a",
             session_id: "long-session",
+            run_id: None,
             turn: 1_024,
             round: 0,
             attempt: 0,
@@ -1644,6 +1682,7 @@ mod tests {
         let second = plan_prompt_request(PromptRequestPlanInput {
             user_id: "owner-a",
             session_id: "long-session",
+            run_id: None,
             turn: 1_025,
             round: 0,
             attempt: 0,
@@ -1686,6 +1725,7 @@ mod tests {
         let plan = plan_prompt_request(PromptRequestPlanInput {
             user_id: "owner",
             session_id: "session",
+            run_id: None,
             turn: 1,
             round: 0,
             attempt: 0,
@@ -1839,6 +1879,7 @@ mod tests {
         let plan = plan_prompt_request(PromptRequestPlanInput {
             user_id: "user-1",
             session_id: "session-1",
+            run_id: None,
             turn: 2,
             round: 1,
             attempt: 0,
@@ -1863,6 +1904,7 @@ mod tests {
         let owner_a = plan_prompt_request(PromptRequestPlanInput {
             user_id: "owner-a",
             session_id: "shared-session",
+            run_id: None,
             turn: 2,
             round: 1,
             attempt: 0,
@@ -1875,6 +1917,7 @@ mod tests {
         let owner_b = plan_prompt_request(PromptRequestPlanInput {
             user_id: "owner-b",
             session_id: "shared-session",
+            run_id: None,
             turn: 2,
             round: 1,
             attempt: 0,
@@ -1896,11 +1939,42 @@ mod tests {
     }
 
     #[test]
+    fn prompt_plan_separates_runs_without_changing_content_hash() {
+        let messages = [json!({"role": "user", "content": "shared content"})];
+        let plan = |run_id| {
+            plan_prompt_request(PromptRequestPlanInput {
+                user_id: "owner",
+                session_id: "session",
+                run_id,
+                turn: 1,
+                round: 0,
+                attempt: 0,
+                source: "server_loop_host",
+                messages: &messages,
+                tools: &[],
+                max_output_tokens: None,
+            })
+        };
+        let parent = plan(Some("parent")).unwrap();
+        for run_id in [Some("child"), Some("sibling"), None] {
+            let other = plan(run_id).unwrap();
+            assert_ne!(parent.request_id, other.request_id);
+            assert_eq!(parent.request_hash, other.request_hash);
+            assert_eq!(other.request_id, plan(run_id).unwrap().request_id);
+        }
+        assert_eq!(parent.request_id, plan(Some("parent")).unwrap().request_id);
+        for run_id in ["", " ", "\t"] {
+            assert!(plan(Some(run_id)).is_err());
+        }
+    }
+
+    #[test]
     fn existing_prompt_request_accepts_only_matching_hash() {
         let messages = [json!({"role": "user", "content": "same prompt"})];
         let plan = plan_prompt_request(PromptRequestPlanInput {
             user_id: "owner-a",
             session_id: "session-a",
+            run_id: None,
             turn: 2,
             round: 1,
             attempt: 0,

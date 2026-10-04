@@ -470,6 +470,8 @@ async fn run_turn(
     .await?;
 
     let (_, _, _, token) = get_profile_and_token(ctx.auth_profile.as_deref())?;
+    let mut cli_context = crate::cli::cli_config::cli_context::CliContext::default();
+    cli_context.select_model(params.get("model").and_then(Value::as_str));
     let model = params
         .get("model")
         .and_then(Value::as_str)
@@ -530,7 +532,7 @@ async fn run_turn(
     });
 
     let _pipeline =
-        session_runtime::create_pipeline_modules_quiet(&ctx.api, ctx.auth_profile.as_deref());
+        session_runtime::create_pipeline_modules_quiet(&ctx.api, ctx.auth_profile.as_deref()).await;
     let mut pm = PermissionManager::with_load_policy(
         permission_mode,
         &std::env::current_dir().unwrap_or_default(),
@@ -563,7 +565,7 @@ async fn run_turn(
         render_md: false,
         verbose_mode: false,
         render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
-        cli_context: None,
+        cli_context: Some(&cli_context),
         unified_skill_registry,
         agent_spawner: Some(agent_spawner),
         root_agent_id: Some("gateway-root"),

@@ -1188,6 +1188,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 &resolved_tool_policy,
                 astra_turn_types::InferencePurpose::SubAgent,
                 crate::turn::runtime_policy::evaluation_thresholds_from_policy(&runtime_config.tool_policy),
+                astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             )
         };
 

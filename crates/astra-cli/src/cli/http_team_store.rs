@@ -82,14 +82,13 @@ struct CreateSnapshotRequest<'a> {
 }
 
 pub(crate) struct HttpTeamStore {
-    cloud_base: String,
+    api: astra_thin_client::ThinClient,
     profile: Option<String>,
 }
 
 #[derive(Debug)]
 enum TeamHttpError {
     AuthenticationRequired,
-    ClientInit(String),
     Network {
         method: &'static str,
         path: String,
@@ -124,7 +123,6 @@ impl fmt::Display for TeamHttpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AuthenticationRequired => write!(f, "team API requires authentication"),
-            Self::ClientInit(error) => write!(f, "http client init: {error}"),
             Self::Network {
                 method,
                 path,
@@ -146,26 +144,56 @@ impl fmt::Display for TeamHttpError {
 }
 
 impl HttpTeamStore {
-    pub(crate) fn new(cloud_base: impl Into<String>, profile: Option<&str>) -> Self {
+    pub(crate) fn new(api: &astra_thin_client::ThinClient, profile: Option<&str>) -> Self {
         Self {
-            cloud_base: cloud_base.into(),
+            api: api.clone(),
             profile: profile.map(str::to_string),
         }
     }
 
-    fn authed_client(&self) -> Result<(reqwest::Client, String), TeamHttpError> {
-        let token =
-            crate::cli::session::session_runtime::current_access_token(self.profile.as_deref())
-                .ok_or(TeamHttpError::AuthenticationRequired)?;
-        let client = astra_core::net::client_builder_for_target(&self.cloud_base)
+    async fn request_json<T: DeserializeOwned>(
+        &self,
+        method: &'static str,
+        path: &str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T, TeamHttpError> {
+        let token = crate::cli::session::session_runtime::fresh_access_token(
+            &self.api,
+            self.profile.as_deref(),
+        )
+        .await
+        .ok_or(TeamHttpError::AuthenticationRequired)?;
+        let response = request
+            .bearer_auth(token)
             .timeout(std::time::Duration::from_secs(TEAM_HTTP_TIMEOUT_SECS))
-            .build()
-            .map_err(|e| TeamHttpError::ClientInit(e.to_string()))?;
-        Ok((client, token))
+            .send()
+            .await
+            .map_err(|error| TeamHttpError::Network {
+                method,
+                path: path.to_string(),
+                error: error.to_string(),
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(TeamHttpError::Http {
+                method,
+                path: path.to_string(),
+                status,
+                body: response.text().await.unwrap_or_default(),
+            });
+        }
+        response
+            .json::<T>()
+            .await
+            .map_err(|error| TeamHttpError::Decode {
+                method,
+                path: path.to_string(),
+                error: error.to_string(),
+            })
     }
 
     fn url(&self, path: &str) -> String {
-        format!("{}{}", self.cloud_base.trim_end_matches('/'), path)
+        format!("{}{}", self.api.api_origin(), path)
     }
 
     async fn get_json<T: DeserializeOwned>(
@@ -173,31 +201,12 @@ impl HttpTeamStore {
         path: &str,
         query: &[(&str, String)],
     ) -> Result<T, TeamHttpError> {
-        let (client, token) = self.authed_client()?;
-        let mut req = client.get(self.url(path)).bearer_auth(token);
-        if !query.is_empty() {
-            req = req.query(query);
-        }
-        let resp = req.send().await.map_err(|e| TeamHttpError::Network {
-            method: "GET",
-            path: path.to_string(),
-            error: e.to_string(),
-        })?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(TeamHttpError::Http {
-                method: "GET",
-                path: path.to_string(),
-                status,
-                body,
-            });
-        }
-        resp.json::<T>().await.map_err(|e| TeamHttpError::Decode {
-            method: "GET",
-            path: path.to_string(),
-            error: e.to_string(),
-        })
+        self.request_json(
+            "GET",
+            path,
+            self.api.http_client().get(self.url(path)).query(query),
+        )
+        .await
     }
 
     async fn post_json<B: Serialize, T: DeserializeOwned>(
@@ -205,62 +214,21 @@ impl HttpTeamStore {
         path: &str,
         body: &B,
     ) -> Result<T, TeamHttpError> {
-        let (client, token) = self.authed_client()?;
-        let resp = client
-            .post(self.url(path))
-            .bearer_auth(token)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| TeamHttpError::Network {
-                method: "POST",
-                path: path.to_string(),
-                error: e.to_string(),
-            })?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(TeamHttpError::Http {
-                method: "POST",
-                path: path.to_string(),
-                status,
-                body,
-            });
-        }
-        resp.json::<T>().await.map_err(|e| TeamHttpError::Decode {
-            method: "POST",
-            path: path.to_string(),
-            error: e.to_string(),
-        })
+        self.request_json(
+            "POST",
+            path,
+            self.api.http_client().post(self.url(path)).json(body),
+        )
+        .await
     }
 
     async fn delete_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, TeamHttpError> {
-        let (client, token) = self.authed_client()?;
-        let resp = client
-            .delete(self.url(path))
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(|e| TeamHttpError::Network {
-                method: "DELETE",
-                path: path.to_string(),
-                error: e.to_string(),
-            })?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(TeamHttpError::Http {
-                method: "DELETE",
-                path: path.to_string(),
-                status,
-                body,
-            });
-        }
-        resp.json::<T>().await.map_err(|e| TeamHttpError::Decode {
-            method: "DELETE",
-            path: path.to_string(),
-            error: e.to_string(),
-        })
+        self.request_json(
+            "DELETE",
+            path,
+            self.api.http_client().delete(self.url(path)),
+        )
+        .await
     }
 
     fn team_path_segment(value: &str) -> String {
@@ -277,7 +245,7 @@ impl TeamPersistenceService for HttpTeamStore {
         self.list_teams(user_id).await.map(|_| ())
     }
 
-    async fn save_team(&self, team: &TeamDefinition) -> Result<(), String> {
+    async fn save_team(&self, team: &TeamDefinition) -> Result<TeamDefinition, String> {
         let body = UpsertTeamRequest {
             name: &team.name,
             description: &team.description,
@@ -292,11 +260,9 @@ impl TeamPersistenceService for HttpTeamStore {
             budget: team.budget.as_ref(),
             max_parallel: team.max_parallel,
         };
-        let _: TeamDefinition = self
-            .post_json("/teams", &body)
+        self.post_json("/teams", &body)
             .await
-            .map_err(|e| e.to_string())?;
-        Ok(())
+            .map_err(|e| e.to_string())
     }
 
     async fn load_team(
@@ -331,15 +297,12 @@ impl TeamPersistenceService for HttpTeamStore {
         }
     }
 
-    async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamDefinition>, String> {
+    async fn list_teams(&self, _user_id: &str) -> Result<Vec<TeamDefinition>, String> {
         let list: TeamListResponse = self
             .get_json("/teams", &[])
             .await
             .map_err(|e| e.to_string())?;
         let mut teams = list.teams;
-        for team in &mut teams {
-            team.user_id = user_id.to_string();
-        }
         teams.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(teams)
     }
@@ -385,17 +348,29 @@ impl TeamPersistenceService for HttpTeamStore {
             .collect())
     }
 
-    async fn save_snapshot(&self, snapshot: &TeamSnapshotRecord) -> Result<(), String> {
+    async fn save_snapshot(
+        &self,
+        snapshot: &TeamSnapshotRecord,
+    ) -> Result<TeamSnapshotRecord, String> {
         let body = CreateSnapshotRequest {
             label: (!snapshot.label.is_empty()).then_some(snapshot.label.as_str()),
             git_commit: snapshot.git_commit.as_deref(),
             session_id: snapshot.session_id.as_deref(),
         };
-        let _: SnapshotWire = self
+        let accepted: SnapshotWire = self
             .post_json(&format!("/teams/{}/snapshots", snapshot.team_name), &body)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(())
+        Ok(TeamSnapshotRecord {
+            snapshot_id: accepted.snapshot_id,
+            team_name: accepted.team_name,
+            user_id: snapshot.user_id.clone(),
+            label: accepted.label,
+            git_commit: accepted.git_commit,
+            session_id: accepted.session_id,
+            team_definition_json: accepted.team_definition_json,
+            created_at: accepted.created_at,
+        })
     }
 
     async fn list_snapshots(
@@ -482,6 +457,52 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn save_team_returns_server_identity_without_an_extra_read() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        write_test_profile();
+        let server = MockServer::start().await;
+        let mut requested =
+            astra_services::team_persistence::builtin_teams("user-1", "2026-10-03T00:00:00Z")
+                .remove(0);
+        requested.max_parallel = 2;
+        requested.budget = Some(astra_services::team_persistence::TeamBudget {
+            max_cost_usd: 1.0,
+            max_tokens: 100,
+            max_duration_secs: 30,
+        });
+        requested.members[0].can_delegate = true;
+        requested.members[0].max_delegation_depth = 2;
+        requested.members[0].mcp_servers = vec!["fixture-mcp".into()];
+        let mut accepted = requested.clone();
+        accepted.team_id = "server-assigned-team".into();
+        Mock::given(method("POST"))
+            .and(path("/teams"))
+            .and(header("authorization", "Bearer test-token"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "max_parallel": 2,
+                "budget": requested.budget,
+                "members": requested.members,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&accepted))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let saved = HttpTeamStore::new(
+            &astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            None,
+        )
+        .save_team(&requested)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(saved).unwrap(),
+            serde_json::to_value(accepted).unwrap()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn load_team_returns_none_on_404() {
         let _creds_guard = crate::tests::isolate_credentials();
         write_test_profile();
@@ -495,32 +516,154 @@ mod tests {
             .mount(&server)
             .await;
 
-        let store = HttpTeamStore::new(server.uri(), None);
+        let store = HttpTeamStore::new(
+            &astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            None,
+        );
         let team = store.load_team("user-1", "missing-team").await.unwrap();
         assert!(team.is_none());
     }
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn delete_snapshot_returns_false_on_404() {
+    async fn load_team_refreshes_credentials_before_dispatch_and_fails_closed() {
         let _creds_guard = crate::tests::isolate_credentials();
-        write_test_profile();
+        let _env_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let expired = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjF9.sig";
+        let valid = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjQxMDAwMDAwMDB9.sig";
+        let team =
+            astra_services::team_persistence::builtin_teams("user-1", "2026-10-03T00:00:00Z")
+                .remove(0);
+        let team_path = format!("/teams/{}", team.name);
 
-        let server = MockServer::start().await;
-        Mock::given(method("DELETE"))
-            .and(path("/teams/snapshots/missing-snapshot"))
-            .and(header("authorization", "Bearer test-token"))
-            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
-            .expect(1)
-            .mount(&server)
+        for (access_token, refresh_status, expected_token) in [
+            (Some(valid), None, Some(valid)),
+            (Some(expired), Some(200), Some("fresh-access")),
+            (None, Some(200), Some("fresh-access")),
+            (Some(expired), Some(503), None),
+            (None, Some(503), None),
+        ] {
+            let mut credentials = CredentialsFile::default();
+            credentials.profiles.insert(
+                "default".into(),
+                Profile {
+                    access_token: Some("other-profile-token".into()),
+                    ..Default::default()
+                },
+            );
+            credentials.profiles.insert(
+                "team-profile".into(),
+                Profile {
+                    account_id: Some("user-1".into()),
+                    access_token: access_token.map(str::to_string),
+                    refresh_token: Some("refresh-old".into()),
+                    ..Default::default()
+                },
+            );
+            crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+
+            let server = MockServer::start().await;
+            let refresh_count = u64::from(refresh_status.is_some());
+            let team_count = u64::from(expected_token.is_some());
+            Mock::given(method("POST"))
+                .and(path("/auth/refresh"))
+                .and(wiremock::matchers::body_json(serde_json::json!({
+                    "refresh_token": "refresh-old"
+                })))
+                .respond_with(
+                    ResponseTemplate::new(refresh_status.unwrap_or(503)).set_body_json(
+                        serde_json::json!({
+                            "user_id": "user-1",
+                            "access_token": "fresh-access",
+                            "refresh_token": "fresh-refresh"
+                        }),
+                    ),
+                )
+                .expect(refresh_count)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(&team_path))
+                .and(header(
+                    "authorization",
+                    format!("Bearer {}", expected_token.unwrap_or("fresh-access")),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&team))
+                .expect(team_count)
+                .mount(&server)
+                .await;
+
+            let result = HttpTeamStore::new(
+                &astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+                Some("team-profile"),
+            )
+            .load_team("user-1", &team.name)
             .await;
+            if expected_token.is_some() {
+                assert_eq!(
+                    serde_json::to_value(result.unwrap().expect("authorized team")).unwrap(),
+                    serde_json::to_value(&team).unwrap()
+                );
+            } else {
+                assert_eq!(result.unwrap_err(), "team API requires authentication");
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len() as u64, refresh_count + team_count);
+            if refresh_status.is_some() {
+                assert_eq!(requests[0].url.path(), "/auth/refresh");
+            }
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.url.path() == team_path)
+                    .count() as u64,
+                team_count
+            );
+            let saved = crate::cli::cli_config::cli_utils::load_credentials();
+            assert_eq!(
+                saved.profiles["team-profile"].access_token.as_deref(),
+                expected_token.or(access_token)
+            );
+            assert_eq!(
+                saved.profiles["default"].access_token.as_deref(),
+                Some("other-profile-token")
+            );
+        }
+    }
 
-        let store = HttpTeamStore::new(server.uri(), None);
-        let deleted = store
-            .delete_snapshot("missing-snapshot", "user-1")
-            .await
-            .unwrap();
-        assert!(!deleted);
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn delete_snapshot_refreshes_credentials_on_the_shared_transport() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let server = MockServer::start().await;
+        let api =
+            astra_thin_client::ThinClient::new(&server.uri(), Some("stale-default-token".into()))
+                .unwrap();
+        let store = HttpTeamStore::new(&api, None);
+        for token in ["first-token", "rotated-token"] {
+            let mut creds = CredentialsFile::default();
+            creds.profiles.insert(
+                "default".into(),
+                Profile {
+                    access_token: Some(token.into()),
+                    ..Default::default()
+                },
+            );
+            crate::cli::cli_config::cli_utils::save_credentials(&creds).unwrap();
+            Mock::given(method("DELETE"))
+                .and(path("/teams/snapshots/missing-snapshot"))
+                .and(header("authorization", format!("Bearer {token}")))
+                .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert!(
+                !store
+                    .delete_snapshot("missing-snapshot", "user-1")
+                    .await
+                    .unwrap()
+            );
+        }
     }
 
     #[serial_test::serial]
@@ -551,7 +694,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let store = HttpTeamStore::new(server.uri(), None);
+        let store = HttpTeamStore::new(
+            &astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            None,
+        );
         let executions = store.list_executions("team-1", 3).await.unwrap();
         assert_eq!(executions.len(), 1);
         assert_eq!(executions[0].team_id, "team-1");

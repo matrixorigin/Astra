@@ -2093,11 +2093,13 @@ pub(crate) async fn resume_session_handler(
         .await
         .map_err(internal_error)?;
     let key = server_session_key(&user_id, &session.session_id);
-    let canonical_head = match state.session_context_coordinator.as_ref() {
-        Some(coordinator) => coordinator
-            .load_head(&key)
-            .await
-            .map_err(session_context_http_error)?,
+    let canonical_snapshot = match state.session_context_coordinator.as_ref() {
+        Some(coordinator) => Some(
+            coordinator
+                .load_admission_snapshot(&key)
+                .await
+                .map_err(session_context_http_error)?,
+        ),
         None => None,
     };
     let mut restored = legacy.unwrap_or_else(|| astra_services::session_restore::RestoredSession {
@@ -2106,7 +2108,9 @@ pub(crate) async fn resume_session_handler(
         restored_from_cloud: true,
         ..Default::default()
     });
-    if let Some(head) = canonical_head {
+    if let Some(snapshot) = canonical_snapshot
+        && let Some(head) = snapshot.head
+    {
         let coordinator = state
             .session_context_coordinator
             .as_ref()
@@ -2126,7 +2130,16 @@ pub(crate) async fn resume_session_handler(
                 materialized_conversation_root_hash: Some(materialized_root),
                 degraded_reasons: Vec::new(),
                 repair_actions: Vec::new(),
-                projections: Default::default(),
+                projections: astra_turn_types::ResumeProjectionSetV1 {
+                    provider: Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                        head.cursor.clone(),
+                        astra_turn_types::ResumeProviderProjectionV1 {
+                            agent_profile_selection: snapshot.agent_profile_selection,
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
             }],
         )
         .map_err(internal_error)?;

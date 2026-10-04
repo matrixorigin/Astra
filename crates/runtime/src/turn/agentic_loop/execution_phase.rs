@@ -3288,48 +3288,37 @@ fn terminally_relevant_unresolved_tool_outcomes(
 /// result; once the child completion has been staged and adopted, retaining the
 /// queued acknowledgement as an unresolved `agent_incomplete` outcome makes a
 /// healthy parent turn impossible to finalize.
-pub(crate) fn nonterminal_child_receipt_superseded(
-    state: &AgenticLoopState,
+pub(crate) fn observed_direct_child_for_nonterminal_receipt<'a>(
+    state: &'a AgenticLoopState,
     record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    if record.name == "agent_fanout" && fanout_start_receipt_superseded(state, record) {
-        return true;
-    }
+) -> Option<&'a serde_json::Value> {
     if record.name != "agent"
         || !record.ok
         || record.disposition
             != Some(astra_services::session_journal::ToolCallDisposition::Executed)
     {
-        return false;
+        return None;
     }
-    let Some(args) = record
+    let args = record
         .authoritative_args_full()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-    else {
-        return false;
-    };
-    let Some(result) = record
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())?;
+    let result = record
         .runtime_model_result_full
         .as_deref()
         .or(record.result_full.as_deref())
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-    else {
-        return false;
-    };
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())?;
     let action = args["action"].as_str();
     let agent_id = match action {
         Some("spawn") | Some("get_result") => {
-            let Some(agent_id) = result["agent_id"].as_str() else {
-                return false;
-            };
+            let agent_id = result["agent_id"].as_str()?;
             if action == Some("get_result") && args["agent_id"] != agent_id {
-                return false;
+                return None;
             }
             if !matches!(
                 (action, result["status"].as_str()),
                 (Some("spawn"), Some("launched")) | (Some("get_result"), Some("still_running"))
             ) {
-                return false;
+                return None;
             }
             agent_id
         }
@@ -3338,28 +3327,57 @@ pub(crate) fn nonterminal_child_receipt_superseded(
             // answers a question.  Do not accept a display name or a generic
             // target here: the terminal result must be correlated to the
             // same producer-owned child.
-            let Some(agent_id) = args["to"].as_str().map(str::trim) else {
-                return false;
-            };
+            let agent_id = args["to"].as_str().map(str::trim)?;
             if agent_id.is_empty() || result["status"].as_str() != Some("queued") {
-                return false;
+                return None;
             }
             agent_id
         }
-        _ => return false,
+        _ => return None,
     };
-    state.volatile_pending.iter().any(|entry| {
-        entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
-            && entry.payload["parent_run_id"].as_str() == state.current_run_id.as_deref()
-            && entry.payload["observed_by_provider"] == true
-            && entry.payload["children"]
-                .as_array()
-                .is_some_and(|children| {
-                    children.iter().any(|child| {
-                        child["agent_id"] == agent_id && child["status"] == "completed"
-                    })
+    state
+        .volatile_pending
+        .iter()
+        .filter(|entry| {
+            entry.payload["schema"] == DIRECT_CHILD_RESULT_SCHEMA
+                && entry.payload["parent_run_id"].as_str() == state.current_run_id.as_deref()
+                && entry.payload["observed_by_provider"] == true
+        })
+        .find_map(|entry| {
+            let delivery_count = entry.payload["delivery_count"].as_u64().unwrap_or_default();
+            entry.payload["children"].as_array().and_then(|children| {
+                children.iter().find(|child| {
+                    if child["agent_id"] != agent_id || child["status"] != "completed" {
+                        return false;
+                    }
+                    if child["result"]
+                        .as_str()
+                        .is_some_and(|result| !result.trim().is_empty())
+                    {
+                        return true;
+                    }
+                    // `AgenticLoopState::commit_volatile_attempt_lease` is
+                    // the sole producer of this compacted shape: after two
+                    // observed leases it removes the presentation result but
+                    // retains the positive byte count and delivery count.
+                    delivery_count >= 2
+                        && child.get("result").is_none()
+                        && child["result_bytes"]
+                            .as_u64()
+                            .is_some_and(|bytes| bytes > 0)
                 })
-    })
+            })
+        })
+}
+
+pub(crate) fn nonterminal_child_receipt_superseded(
+    state: &AgenticLoopState,
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    if record.name == "agent_fanout" && fanout_start_receipt_superseded(state, record) {
+        return true;
+    }
+    observed_direct_child_for_nonterminal_receipt(state, record).is_some()
 }
 
 /// A fanout start is deliberately non-terminal: it only acknowledges that the
@@ -6228,6 +6246,24 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
         },
     );
+    // A failed remote stream can still contain completed local callbacks.
+    // Retain audit facts before Fatal skips the tool phase, without granting
+    // local continuation or adding to the Server's aggregate usage/counts.
+    if continuation_authority == ContinuationAuthority::RemoteServer {
+        let mut observed_ids = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter_map(|record| record.tool_call_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for result in &turn_result.edge_tool_round {
+            if observed_ids.insert(result.request_id.clone()) {
+                state.stall.tool_call_records.push(
+                    astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(result),
+                );
+            }
+        }
+    }
     // Apply weak/partial quarantine on the same boundary as newly ingested
     // records, and checkpoint the first transition immediately.
     if let Some(records) = state.stall.tool_call_records.get(tool_record_floor..) {
@@ -10864,6 +10900,7 @@ mod tests {
             let sender = AgentAddress::new("sender-run", "peer-agent");
             let mut state = make_state();
             state.recursion_depth = depth;
+            state.current_run_id = Some(format!("{run_id}-first-execution"));
             state.messaging.mailbox = Some(router.register(address.clone(), None).await.unwrap());
             let _sender_mailbox = router.register(sender.clone(), None).await.unwrap();
             let mut host = MockHost::new(vec![]);
@@ -10893,8 +10930,10 @@ mod tests {
 
             router
                 .send(AgentMessage::new(
-                    sender,
-                    MessageTarget::Direct { address },
+                    sender.clone(),
+                    MessageTarget::Direct {
+                        address: address.clone(),
+                    },
                     MessagePayload::Text {
                         content: "Review the cancellation path before editing.".into(),
                         summary: None,
@@ -10908,6 +10947,43 @@ mod tests {
                     .unwrap()
                     .model_context_changed,
                 "semantic input must supersede the stale tool action"
+            );
+            assert_eq!(host.communication_events.len(), 1);
+            assert_eq!(
+                host.communication_events[0].observed_by.run_id,
+                format!("{run_id}-first-execution")
+            );
+            state.current_run_id = Some(format!("{run_id}-second-execution"));
+            let message = AgentMessage::new(
+                sender.clone(),
+                MessageTarget::Direct {
+                    address: address.clone(),
+                },
+                MessagePayload::Text {
+                    content: "Queued follow-up".into(),
+                    summary: None,
+                },
+            );
+            let message_id = message.id.clone();
+            router.send(message).await.unwrap();
+            runtime_input_boundary(&mut host, &mut state, RuntimeInputBoundary::Action)
+                .await
+                .unwrap();
+            let event = host.communication_events.last().unwrap();
+            assert_eq!(
+                event.observed_by.run_id,
+                format!("{run_id}-second-execution")
+            );
+            assert_eq!(event.message_id, message_id);
+            assert_eq!(event.from.run_id, sender.run_id);
+            assert_eq!(
+                event.to,
+                astra_turn_types::AgentCommunicationTarget::Direct {
+                    address: astra_turn_types::AgentCommunicationParty {
+                        run_id: address.run_id.clone(),
+                        agent_id: address.agent_id.clone()
+                    },
+                }
             );
             assert!(
                 serde_json::to_string(&state.volatile_pending)
@@ -11051,7 +11127,12 @@ mod tests {
             serde_json::json!({
                 "schema": DIRECT_CHILD_RESULT_SCHEMA,
                 "parent_run_id": "parent-run",
-                "children": [{"agent_id":"child@run","status":"completed"}]
+                "children": [{
+                    "agent_id":"child@run",
+                    "status":"completed",
+                    "result":"child completed",
+                    "result_bytes": 15
+                }]
             }),
         );
         assert!(!nonterminal_child_receipt_superseded(&state, &record));

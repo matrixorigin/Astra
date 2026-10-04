@@ -479,9 +479,32 @@ pub(crate) struct ChatArgs {
     pub max_wall_time_seconds: Option<u64>,
 }
 
+impl ChatArgs {
+    pub(crate) fn one_shot_message(message: String) -> Self {
+        Self {
+            message: Some(message),
+            session_id: None,
+            no_resume: false,
+            model: None,
+            #[cfg(feature = "harness")]
+            benchmark_profile: None,
+            explain: None,
+            auto_approve: false,
+            permission_mode: None,
+            quiet: false,
+            json: false,
+            stdin: false,
+            no_color: false,
+            append_system_prompt: None,
+            stream_events: None,
+            max_wall_time_seconds: None,
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra team list\n  astra team create dev Frontend delivery team\n  astra team add-member dev planner Break work into steps\n  astra team run dev 在/tmp下实现一个登录页面"
+    after_help = "Examples:\n  astra team list\n  astra team create dev Frontend delivery team\n  astra team add-member dev planner Break work into steps\n  astra team run review --lead-agent-id team-review-reviewer 在/tmp下实现一个登录页面"
 )]
 pub(crate) struct TeamArgs {
     #[command(subcommand)]
@@ -528,6 +551,15 @@ pub(crate) struct TeamAddMemberArgs {
     pub team: String,
     /// Member role
     pub role: String,
+    /// Allow this member to delegate within the authorized Team roster.
+    #[arg(long)]
+    pub can_delegate: bool,
+    /// Absolute nested delegation depth ceiling for this member.
+    #[arg(long, requires = "can_delegate", value_parser = clap::value_parser!(u32).range(1..))]
+    pub max_delegation_depth: Option<u32>,
+    /// Available model name selected for this member.
+    #[arg(long)]
+    pub model: Option<String>,
     /// Optional description for the member
     #[arg(trailing_var_arg = true)]
     pub description: Vec<String>,
@@ -554,6 +586,18 @@ pub(crate) struct TeamContextArgs {
 pub(crate) struct TeamRunArgs {
     /// Team name
     pub team: String,
+    /// Lead agent ID; defaults to the sole delegation-capable member.
+    #[arg(long = "lead-agent-id", value_name = "AGENT_ID")]
+    pub lead_agent_id: Option<String>,
+    /// Output the completed root turn as JSON (implies quiet output).
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+    /// Start an isolated one-shot conversation instead of resuming recent history.
+    #[arg(long)]
+    pub no_resume: bool,
+    /// Write the existing structured JSONL turn events to this machine-event file.
+    #[arg(long = "stream-events", hide = true, value_name = "PATH")]
+    pub stream_events: Option<PathBuf>,
     /// Task description
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pub task: Vec<String>,

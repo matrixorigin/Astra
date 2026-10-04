@@ -303,6 +303,7 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     pub auth_profile: Option<&'a str>,
     pub offering_id: Option<String>,
     pub model: Option<&'a str>,
+    pub cli_context: Option<&'a crate::cli::cli_config::cli_context::CliContext>,
     pub context_window_tokens: u32,
     pub explain: ExplainMode,
     pub render_md: bool,
@@ -1230,6 +1231,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                     auth_profile: self.auth_profile,
                     offering_id: effective_offering_id,
                     model: effective_model,
+                    cli_context: self.cli_context,
                     context_window_tokens: self.context_window_tokens,
                     effective_input_budget_tokens: state.max_turn_input_tokens,
                     explain: self.explain,
@@ -1328,6 +1330,17 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         state.approval_overrides = self.perm_manager.export_session_overrides();
 
         let mut turn_result = turn_result?;
+
+        // Capture observed coordination before ingest can reject an incomplete
+        // remote terminal. The existing success/failure journal commit owns
+        // durability; evidence never enters provider-facing prompt history.
+        state.record_prompt_history_messages(
+            turn_result
+                .core
+                .transcript_evidence
+                .iter()
+                .map(|evidence| serde_json::json!({"role": "event", "evidence": evidence})),
+        );
 
         // Step events are collected before the HTTP admission response so the
         // live projection can render preparation phases.  Persist them only

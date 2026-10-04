@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::server::tool_execution_binding::ToolExecutionRequest;
 use crate::server::tool_execution_result::annotate_default_executor_cancel_if_needed;
 use crate::server::tool_execution_service::ToolExecutionService;
-use crate::server::tool_local_transport::ServerLocalToolTransport;
+use crate::server::tool_local_transport::{RuntimeToolExecutionResult, ServerLocalToolTransport};
 use crate::server::tool_route_boundary::ToolRouteBoundary;
 use crate::server::tool_route_selection::ToolExecutionRouteKind;
 use crate::server::tool_work_surface_events::{
@@ -37,7 +37,7 @@ pub(crate) trait ToolRouteObserver: Send + Sync {
 
 pub(crate) struct ToolRouteRuntimeContext<'a, L>
 where
-    L: ServerLocalToolTransport + ?Sized,
+    L: ServerLocalToolTransport<RuntimeToolExecutionResult> + ?Sized,
 {
     pub(crate) execution_service: &'a ToolExecutionService,
     pub(crate) local_transport: &'a L,
@@ -50,6 +50,7 @@ where
 pub(crate) struct ExecutedToolRoute {
     pub(crate) boundary: ToolRouteBoundary,
     pub(crate) result: astra_tools::ToolResult,
+    pub(crate) accepted_send: Option<crate::orchestration::agent_tool::AcceptedAgentSend>,
     pub(crate) duration_ms: u64,
 }
 
@@ -59,7 +60,7 @@ pub(crate) async fn execute_tool_route_before_completion_events<L>(
     route: ToolExecutionRouteKind,
 ) -> ExecutedToolRoute
 where
-    L: ServerLocalToolTransport + ?Sized,
+    L: ServerLocalToolTransport<RuntimeToolExecutionResult> + ?Sized,
 {
     let boundary = ToolRouteBoundary::new(request, route);
     emit_optional_work_surface_event(
@@ -85,7 +86,10 @@ where
     if let Some(observer) = context.route_observer.as_deref() {
         observer.note_dispatch_started(&boundary, dispatch_started_at);
     }
-    let mut result = context
+    let RuntimeToolExecutionResult {
+        mut result,
+        accepted_send,
+    } = context
         .execution_service
         .execute_boundary_with_cancel(
             &boundary,
@@ -107,6 +111,7 @@ where
     ExecutedToolRoute {
         boundary,
         result,
+        accepted_send,
         duration_ms,
     }
 }

@@ -681,8 +681,9 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Work,
     )
     .with_subcommands(TEAM_SUBCOMMANDS)
+    .with_tui_subcommands(&[("run", "Start an ordinary lead turn with a configured team")])
     .with_arg_hint("[list|info|create|add-member|context|run|…]")
-    .with_tui_route(TuiCommandRoute::Unavailable),
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/agent",
         "Open the agent monitor to inspect and manage runs",
@@ -1299,6 +1300,7 @@ mod tests {
                 "/info",
                 "/skill",
                 "/mcp",
+                "/team",
                 "/agent",
                 "/login",
                 "/register",

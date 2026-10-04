@@ -5444,6 +5444,101 @@ fn project_local_agent_transcript_page(
     }
 }
 
+/// A retained callback is local observation evidence, not an assistant
+/// message or a server execution receipt. Only the root failure producer may
+/// supply this facet; neither a missing parent nor a turn number proves scope.
+fn local_root_tool_observations(
+    session_id: &str,
+    event: &astra_services::session_journal::JournalEvent,
+) -> Vec<astra_thin_client::SessionTranscriptItem> {
+    use astra_services::session_journal::{JournalEventType, ToolCallDisposition};
+
+    let Some(scope) = event.producer_scope.as_ref().filter(|scope| {
+        event.event_type == JournalEventType::TurnError
+            && event.session_id.as_deref() == Some(session_id)
+            && scope.agent_id.as_deref() == Some("root")
+            && scope.parent_run_id.is_none()
+            && !scope.run_id.trim().is_empty()
+            && event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("run_id"))
+                .is_none_or(|run_id| run_id.as_str() == Some(scope.run_id.as_str()))
+    }) else {
+        return Vec::new();
+    };
+    event
+        .tool_calls
+        .iter()
+        .flatten()
+        .filter_map(|record| {
+            let call_id = record
+                .tool_call_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())?;
+            if record.name.trim().is_empty() {
+                return None;
+            }
+            let status = match record.disposition {
+                Some(ToolCallDisposition::Executed) if record.ok => "completed",
+                Some(ToolCallDisposition::Executed) => "failed",
+                Some(ToolCallDisposition::Rejected) => "rejected",
+                _ => "uncertain",
+            };
+            // A preview (or an out-of-line artifact reference) is not full output.
+            // Never fetch artifacts or reconstruct arguments from display previews.
+            let full = record
+                .result_full
+                .as_deref()
+                .filter(|_| record.result_artifact.is_none());
+            let content = full
+                .or(record.result_preview.as_deref())
+                .or(record.error.as_deref())
+                .unwrap_or("No retained tool output.")
+                .to_string();
+            let tool_calls = record
+                .args_full
+                .as_deref()
+                .filter(|args| serde_json::from_str::<serde_json::Value>(args).is_ok())
+                .map(|args| astra_thin_client::SessionTranscriptToolCall {
+                    tool_use_id: call_id.to_string(),
+                    name: record.name.clone(),
+                    arguments: args.to_string(),
+                })
+                .into_iter()
+                .collect();
+            Some(astra_thin_client::SessionTranscriptItem {
+                model_item_id: None,
+                session_id: session_id.to_string(),
+                item_seq: 0,
+                run_id: Some(scope.run_id.clone()),
+                role: if full.is_some() {
+                    "tool_observation"
+                } else {
+                    "tool_observation_preview"
+                }
+                .into(),
+                content,
+                reasoning: None,
+                reasoning_status: None,
+                tool_calls,
+                tool_result: Some(astra_thin_client::SessionTranscriptToolResult {
+                    tool_use_id: call_id.to_string(),
+                    name: Some(record.name.clone()),
+                    status: Some(status.into()),
+                    duration_ms: Some(record.ms),
+                }),
+                evidence: None,
+                source_event_id: Some(format!(
+                    "local-tool-observation:{}",
+                    serde_json::json!([session_id, scope.run_id, call_id])
+                )),
+                created_at: event.ts.clone(),
+            })
+        })
+        .collect()
+}
+
 /// Project the root's append-ordered canonical journal lane into the same
 /// page contract returned by the server. `item_seq` is a root-conversation
 /// cursor, deliberately separate from each run's local item sequence. It is
@@ -5456,28 +5551,88 @@ fn project_local_root_transcript_page(
 ) -> astra_thin_client::SessionTranscriptPage {
     let tool_names = local_transcript_tool_names(&events, None);
     let mut source_ids = std::collections::HashSet::new();
+    let mut call_ids = std::collections::HashSet::new();
+    let mut result_ids = std::collections::HashSet::new();
+    // Canonical components win regardless of replication/append order. A
+    // local observation fills gaps, never removes a later canonical message.
+    for event in &events {
+        if event.session_id.as_deref() != Some(session_id) {
+            continue;
+        }
+        let Some(payload) = event
+            .transcript_item
+            .as_ref()
+            .filter(|p| p.agent_id == "root")
+        else {
+            continue;
+        };
+        for call in local_transcript_tool_calls(&payload.message) {
+            call_ids.insert((Some(payload.run_id.clone()), call.tool_use_id));
+        }
+        if let Some(result) = local_transcript_tool_result(&payload.message) {
+            result_ids.insert((Some(payload.run_id.clone()), result.tool_use_id));
+        }
+    }
     let mut root_seq = 0i64;
     let mut items = Vec::new();
     for event in events {
-        let Some(payload) = event.transcript_item else {
-            continue;
-        };
-        if payload.agent_id != "root" {
+        if event.session_id.as_deref() != Some(session_id) {
             continue;
         }
-        let identity = if payload.source_event_id.trim().is_empty() {
-            format!("{}:{}", payload.run_id, payload.item_seq)
+        let candidates = if let Some(payload) = event.transcript_item.as_ref() {
+            if payload.agent_id != "root" || payload.run_id.trim().is_empty() {
+                continue;
+            }
+            let identity = if payload.source_event_id.trim().is_empty() {
+                format!("{}:{}", payload.run_id, payload.item_seq)
+            } else {
+                payload.source_event_id.clone()
+            };
+            local_transcript_item(session_id, payload.clone(), 0, event.ts.clone())
+                .map(|mut item| {
+                    item.source_event_id = Some(identity);
+                    item
+                })
+                .into_iter()
+                .collect()
         } else {
-            payload.source_event_id.clone()
+            local_root_tool_observations(session_id, &event)
         };
-        if !source_ids.insert(identity) {
-            continue;
-        }
-        root_seq = root_seq.saturating_add(1);
-        if before_seq.is_some_and(|before| root_seq >= before) {
-            continue;
-        }
-        if let Some(mut item) = local_transcript_item(session_id, payload, root_seq, event.ts) {
+        for mut item in candidates {
+            if !source_ids.insert(item.source_event_id.clone()) {
+                continue;
+            }
+            // Reserve first-seen source slots even when all tool components
+            // are mirrors. Later appends must not renumber an earlier page.
+            root_seq = root_seq.saturating_add(1);
+            item.item_seq = root_seq;
+            if matches!(
+                item.role.as_str(),
+                "tool_observation" | "tool_observation_preview"
+            ) {
+                item.tool_calls.retain(|call| {
+                    call_ids.insert((item.run_id.clone(), call.tool_use_id.clone()))
+                });
+                if let Some(result) = item.tool_result.as_ref()
+                    && !result_ids.insert((item.run_id.clone(), result.tool_use_id.clone()))
+                {
+                    item.tool_result = None;
+                }
+            }
+            let tool_only = matches!(
+                item.role.as_str(),
+                "tool" | "tool_observation" | "tool_observation_preview"
+            );
+            if (tool_only && item.tool_calls.is_empty() && item.tool_result.is_none())
+                || (item.role == "assistant"
+                    && item.content.is_empty()
+                    && item.reasoning.is_none()
+                    && item.evidence.is_none()
+                    && item.tool_calls.is_empty())
+                || before_seq.is_some_and(|before| root_seq >= before)
+            {
+                continue;
+            }
             recover_local_tool_result_name(&mut item, &tool_names);
             items.push(item);
         }
@@ -8343,6 +8498,34 @@ pub(crate) async fn run_tui_session(
                                 }
 
                                 let mut inline_chat_submit = None;
+                                let mut pending_team_run = None;
+                                let (slash_command, slash_args) = text.trim().split_once(char::is_whitespace)
+                                    .unwrap_or((text.trim(), ""));
+                                if matches!(crate::cli::command_registry::resolve_command(slash_command), Ok("/team"))
+                                    && slash_args.split_whitespace().next() == Some("run")
+                                {
+                                    let parsed = match crate::cli::command_router::parse_team_bridge_command(slash_args) {
+                                        Ok(crate::cli::cli_config::cli_args::Command::Team(args)) => match args.command {
+                                            Some(crate::cli::cli_config::cli_args::TeamSubcommand::Run(run)) if run.no_resume => {
+                                                Err("--no-resume is only supported for one-shot CLI runs. Use /clear, confirm the new session was created, then run /team run without --no-resume.".to_string())
+                                            }
+                                            Some(crate::cli::cli_config::cli_args::TeamSubcommand::Run(run)) => Ok(run),
+                                            _ => Err("Use /team run to start a lead turn.".to_string()),
+                                        },
+                                        Ok(_) => Err("Use /team run to start a lead turn.".to_string()),
+                                        Err(error) => Err(error),
+                                    };
+                                    match parsed {
+                                        Ok(run) => pending_team_run = Some(run),
+                                        Err(error) => {
+                                            chat_widget.commit_system(history_cell::system::SystemCell::error(error));
+                                            finish_submission_feedback(&mut bottom_pane, &mut status_indicator);
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            frame_requester.schedule_frame();
+                                            continue;
+                                        }
+                                    }
+                                }
                                 if let Some(plan_goal) = slash_plan_goal(&text) {
                                     let before = capture_plan_mode_ui_snapshot(&state);
                                     crate::cli::slash::slash_plan::enter_local_plan_mode_with_goal(
@@ -8374,6 +8557,7 @@ pub(crate) async fn run_tui_session(
 
                                 if text.trim_start().starts_with('/')
                                     && inline_chat_submit.is_none()
+                                    && pending_team_run.is_none()
                                 {
                                     // Snapshot the session identity before a
                                     // native slash action so the existing
@@ -8651,6 +8835,7 @@ pub(crate) async fn run_tui_session(
                                     frame_requester.schedule_frame();
                                 } else {
                                     let submit_text = inline_chat_submit.unwrap_or(text);
+                                    let pending_team_run = pending_team_run;
                                     if !runtime_notification_submission
                                         && crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(
                                             &state,
@@ -8818,11 +9003,38 @@ pub(crate) async fn run_tui_session(
                                             restore_input_queue.clone(),
                                             turn_submission_id.clone(),
                                         );
+                                        let team_run_cancel_token = tui_cancel_token.clone();
                                         // Authentication is part of the polled turn future, not
                                         // an await in the UI event handler. Slow refreshes therefore
                                         // leave transcript, composer, resize, and interrupt input
                                         // responsive while the visible state remains `Sending`.
                                         let fut = async {
+                                            let pending_team_request = if let Some(run) = pending_team_run {
+                                                if team_run_cancel_token.is_cancelled() {
+                                                    return Err("Team run cancelled before admission".to_string());
+                                                }
+                                                let team_name = run.team;
+                                                let lead_agent_id = run.lead_agent_id;
+                                                let task = run.task.join(" ");
+                                                let request = tokio::select! {
+                                                    _ = team_run_cancel_token.cancelled() => {
+                                                        return Err("Team run cancelled before admission".to_string());
+                                                    }
+                                                    request = crate::cli::slash::slash_team::resolve_team_run_chat_request(
+                                                        api,
+                                                        profile,
+                                                        &team_name,
+                                                        lead_agent_id.as_deref(),
+                                                        &task,
+                                                    ) => request?,
+                                                };
+                                                if team_run_cancel_token.is_cancelled() {
+                                                    return Err("Team run cancelled before admission".to_string());
+                                                }
+                                                Some(request)
+                                            } else {
+                                                None
+                                            };
                                             let access = crate::cli::session::session_runtime::presented_access_token(api, profile).await;
                                             let (token, missing_access) = match access {
                                                 Ok(token) => (Some(token), crate::cli::session::session_runtime::AccessMiss::NotLoggedIn),
@@ -8837,6 +9049,15 @@ pub(crate) async fn run_tui_session(
                                                 )
                                                 .await
                                             } else {
+                                                let submit_text = if let Some(request) = pending_team_request {
+                                                    if team_run_cancel_token.is_cancelled() {
+                                                        return Err("Team run cancelled before admission".to_string());
+                                                    }
+                                                    state.cli_context.agent_profile_selection = Some(request.selection);
+                                                    request.message
+                                                } else {
+                                                    submit_text
+                                                };
                                                 crate::cli::turn::turn_entry::handle_chat_input_with_ui(
                                                     submit_text,
                                                     token.as_deref(),
@@ -11003,6 +11224,7 @@ pub(crate) async fn run_tui_session(
                                             entry.and_then(|model| model.thinking_protocol).unwrap_or_default(),
                                         );
                                         if opts.is_empty() {
+                                            state.cli_context.select_model(Some(&base_model));
                                             state.model = Some((base_model.clone()).into());
                                             if let Some(mut selection) = entry.and_then(crate::cli::session::session_runtime::model_selection_from_list_entry) {
                                                 selection.name = state.model.as_deref().unwrap().to_string();
@@ -11074,6 +11296,7 @@ pub(crate) async fn run_tui_session(
                                         );
                                         let suffix = astra_turn_core::thinking_config::thinking_suffix_for(config);
                                         let composed = format!("{base_model}{suffix}");
+                                        state.cli_context.select_model(Some(&composed));
                                         state.model = Some((composed.clone()).into());
                                         if let Some(mut selection) = entry.and_then(crate::cli::session::session_runtime::model_selection_from_list_entry) {
                                                 selection.name = state.model.as_deref().unwrap().to_string();
@@ -12449,7 +12672,7 @@ mod tests {
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let modules = session_runtime::create_tui_pipeline_modules(&api, None, None);
+        let modules = session_runtime::create_tui_pipeline_modules(&api, None, None).await;
         let mut state = crate::cli::session::session_state::SessionState::default();
         state.unified_skill_registry = modules.unified_skill_registry.clone();
         state.mcp_manager = modules.mcp_manager.clone();
@@ -15242,6 +15465,115 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(astra_journal_content_redact_env)]
+    fn local_root_failure_tools_require_scope_and_preserve_canonical_facets() {
+        use astra_services::session_journal::{
+            JournalEvent, JournalProducerScope, ToolCallDisposition, ToolCallRecord,
+        };
+        astra_services::session_journal::set_journal_content_redact_override(Some(false));
+        let mut observed =
+            JournalEvent::turn_error(Some("session-1"), 1, None, "request", "missing terminal", 0);
+        observed.producer_scope = Some(JournalProducerScope {
+            run_id: "actual-root".into(),
+            parent_run_id: None,
+            agent_id: Some("root".into()),
+            local_turn: None,
+        });
+        observed.tool_calls = Some(vec![ToolCallRecord {
+            tool_call_id: Some("call-1".into()),
+            name: "write_file".into(),
+            ok: true,
+            disposition: Some(ToolCallDisposition::Executed),
+            args_full: Some(r#"{"path":"output.txt"}"#.into()),
+            result_preview: Some("retained output".into()),
+            ..Default::default()
+        }]);
+        for (mirror_call, mirror_result) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut events = vec![observed.clone(), observed.clone()];
+            if mirror_call {
+                events.push(JournalEvent::transcript_item("session-1", "actual-root", "root", 1,
+                    &serde_json::json!({"role":"assistant", "tool_calls":[{"id":"call-1","function":{"name":"write_file","arguments":"{\"path\":\"output.txt\"}"}}]})).unwrap());
+            }
+            if mirror_result {
+                events.push(JournalEvent::transcript_item("session-1", "actual-root", "root", 2,
+                    &serde_json::json!({"role":"tool", "tool_call_id":"call-1", "content":"canonical result"})).unwrap());
+            }
+            let page = project_local_root_transcript_page("session-1", events.clone(), None, 20);
+            assert_eq!(
+                page.items
+                    .iter()
+                    .map(|item| item.tool_calls.len())
+                    .sum::<usize>(),
+                1
+            );
+            assert_eq!(
+                page.items
+                    .iter()
+                    .filter(|item| item.tool_result.is_some())
+                    .count(),
+                1
+            );
+            if mirror_result {
+                assert!(
+                    page.items
+                        .iter()
+                        .any(|item| item.content == "canonical result")
+                );
+            }
+            let recent = project_local_root_transcript_page("session-1", events.clone(), None, 1);
+            if recent.has_more {
+                let older = project_local_root_transcript_page(
+                    "session-1",
+                    events,
+                    recent.next_before_seq,
+                    20,
+                );
+                assert!(
+                    older
+                        .items
+                        .iter()
+                        .all(|item| item.item_seq < recent.items[0].item_seq)
+                );
+            }
+        }
+        let mut unknown = observed.clone();
+        unknown.producer_scope = None;
+        let mut child = observed.clone();
+        child.producer_scope.as_mut().unwrap().parent_run_id = Some("parent".into());
+        let mut conflicting = observed.clone();
+        conflicting.metadata = Some(serde_json::json!({"run_id":"different"}));
+        let synthetic_user = JournalEvent::transcript_item(
+            "session-1",
+            "synthetic-user-run",
+            "root",
+            1,
+            &serde_json::json!({"role":"user","content":"request"}),
+        )
+        .unwrap();
+        let page = project_local_root_transcript_page(
+            "session-1",
+            vec![synthetic_user, unknown, child, conflicting],
+            None,
+            20,
+        );
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].role, "user");
+        observed.tool_calls.as_mut().unwrap()[0].disposition = None;
+        assert_eq!(
+            local_root_tool_observations("session-1", &observed)[0]
+                .tool_result
+                .as_ref()
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("uncertain")
+        );
+        astra_services::session_journal::set_journal_content_redact_override(None);
+    }
+
+    #[test]
     fn empty_initial_server_root_page_yields_visible_local_history_without_changing_pagination() {
         let durable_page = astra_thin_client::SessionTranscriptPage {
             session_id: "session-1".into(),
@@ -15940,6 +16272,8 @@ mod tests {
 
     fn test_spawn_context() -> astra_runtime::orchestration::SpawnContext {
         astra_runtime::orchestration::SpawnContext {
+            parent_profile_authority: astra_runtime::orchestration::ParentProfileAuthority::Unbound,
+            admitted_agent_profiles: None,
             parent_run_id: "root".to_string(),
             parent_agent_id: "root".to_string(),
             resolved_model_name: None,

@@ -271,8 +271,7 @@ async fn prune_stale_pending_recovery(
     if matches!(
         preflight_remote_resume_session(api, profile, &session_id).await,
         SessionResumePreflight::Missing
-    ) && !crate::cli::cli_config::cli_utils::local_session_is_resumable(&session_id)
-    {
+    ) {
         clear_profile_last_session_if_matches_or_warn(
             profile,
             &session_id,
@@ -632,7 +631,8 @@ pub(crate) async fn complete_session_startup(
         api,
         profile,
         resolved_session_project_root().as_deref(),
-    );
+    )
+    .await;
     tracer.phase("pipeline_modules");
 
     // Load cross-session tool-health state from local files.
@@ -669,8 +669,7 @@ pub(crate) async fn complete_session_startup(
         build_cli_session_memory_port(api, profile).await
     };
     state.team_store = std::sync::Arc::new(crate::cli::http_team_store::HttpTeamStore::new(
-        api.api_origin(),
-        profile,
+        api, profile,
     ));
     tracer.phase("matrix_pool");
 
@@ -728,7 +727,11 @@ pub(crate) async fn complete_session_startup(
     if state.session_id.is_none()
         && let Some(sid) = resume_session_id
     {
+        let launch_selection = state.cli_context.agent_profile_selection.clone();
         slash_session::restore_session_into_state(sid, profile, api, state).await?;
+        if launch_selection.is_some() {
+            state.cli_context.agent_profile_selection = launch_selection;
+        }
     }
 
     print_session_banner(profile, state, banner_native_auth);
@@ -903,7 +906,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn prune_stale_pending_recovery_keeps_local_state_when_remote_is_stale() {
+    async fn prune_stale_pending_recovery_clears_remote_404_without_deleting_local_copy() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("pending-stale-{}", uuid::Uuid::new_v4());
@@ -927,13 +930,14 @@ mod tests {
         };
         prune_stale_pending_recovery(&api, None, &mut state).await;
 
-        assert_eq!(state.pending_recovery.as_deref(), Some(session_id.as_str()));
+        assert_eq!(state.pending_recovery, None);
+        assert!(crate::cli::cli_config::cli_utils::local_session_is_resumable(&session_id));
         assert_eq!(
             crate::cli::cli_config::cli_utils::load_credentials()
                 .profiles
                 .get("default")
                 .and_then(|profile| profile.last_session_id.as_deref()),
-            Some(session_id.as_str())
+            None
         );
     }
 

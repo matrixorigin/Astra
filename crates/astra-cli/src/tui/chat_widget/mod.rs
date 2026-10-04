@@ -219,6 +219,7 @@ pub(crate) struct TurnStats {
 ///
 struct AgentRunProjection {
     detail: Box<TaskCell>,
+    label_kind: AgentRunLabelKind,
     state: AgentRunState,
     state_observed_at: std::time::Instant,
     terminal_at: Option<std::time::Instant>,
@@ -249,6 +250,15 @@ struct AgentRunProjection {
     live_transcript_dropped: u64,
 }
 
+/// Display evidence is independent of lifecycle authority: a durable profile
+/// name must not replace the description of the work that profile is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AgentRunLabelKind {
+    RoutingFallback,
+    BindingName,
+    TaskDescription,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct RuntimeFactSources {
     runtime_profile: Option<AgentProjectionSource>,
@@ -262,9 +272,11 @@ struct RuntimeFactSources {
 }
 
 impl AgentRunProjection {
-    fn new(id: String, label: String, state: AgentRunState) -> Self {
+    fn new(id: String, label: String, label_kind: AgentRunLabelKind, state: AgentRunState) -> Self {
+        let fallback = agent_display_name(&id, None);
         let mut projection = Self {
-            detail: Box::new(TaskCell::new_running(id, label)),
+            detail: Box::new(TaskCell::new_running(id, fallback)),
+            label_kind: AgentRunLabelKind::RoutingFallback,
             state,
             state_observed_at: std::time::Instant::now(),
             terminal_at: None,
@@ -290,8 +302,16 @@ impl AgentRunProjection {
             live_transcript_bytes: 0,
             live_transcript_dropped: 0,
         };
+        projection.set_label(label, label_kind);
         projection.sync_detail_status();
         projection
+    }
+
+    fn set_label(&mut self, label: String, kind: AgentRunLabelKind) {
+        if !label.trim().is_empty() && kind >= self.label_kind {
+            self.detail.description = label;
+            self.label_kind = kind;
+        }
     }
 
     fn set_state(&mut self, state: AgentRunState) -> bool {
@@ -655,6 +675,7 @@ struct AgentRunSignature {
     id: String,
     state: AgentRunState,
     description: String,
+    label_kind: AgentRunLabelKind,
     reported_tool_calls: usize,
     reported_child_agents: usize,
     messages_sent: usize,
@@ -949,11 +970,12 @@ impl AgentRunRegistry {
         &mut self,
         id: String,
         label: String,
+        label_kind: AgentRunLabelKind,
         state: AgentRunState,
         tool_use_id: &str,
         action: AgentControlAction,
     ) {
-        self.ensure(id.clone(), label, state);
+        self.ensure(id.clone(), label, label_kind, state);
         self.bind_tool_use(tool_use_id, id, action);
     }
 
@@ -966,19 +988,23 @@ impl AgentRunRegistry {
             });
     }
 
-    fn ensure(&mut self, id: String, label: String, state: AgentRunState) -> bool {
+    fn ensure(
+        &mut self,
+        id: String,
+        label: String,
+        label_kind: AgentRunLabelKind,
+        state: AgentRunState,
+    ) -> bool {
         if let Some(projection) = self.runs.get_mut(&id) {
-            if state.source_rank() >= projection.state.source_rank()
-                || projection.detail.description == projection.detail.tool_use_id
-            {
-                projection.detail.description = label;
-            }
+            projection.set_label(label, label_kind);
             return projection.set_state(state);
         }
 
         self.order.push(id.clone());
-        self.runs
-            .insert(id.clone(), AgentRunProjection::new(id, label, state));
+        self.runs.insert(
+            id.clone(),
+            AgentRunProjection::new(id, label, label_kind, state),
+        );
         true
     }
 
@@ -1041,6 +1067,7 @@ impl AgentRunRegistry {
                         id: id.clone(),
                         state: projection.state,
                         description: projection.detail.description.clone(),
+                        label_kind: projection.label_kind,
                         reported_tool_calls: projection.reported_tool_calls,
                         reported_child_agents: projection.reported_child_agents,
                         messages_sent: projection.messages_sent,
@@ -1069,6 +1096,7 @@ impl AgentRunRegistry {
 }
 
 fn merge_agent_projections(target: &mut AgentRunProjection, source: AgentRunProjection) {
+    target.set_label(source.detail.description.clone(), source.label_kind);
     let source_state = source.state;
     let source_state_observed_at = source.state_observed_at;
     let source_terminal_at = source.terminal_at;
@@ -1172,8 +1200,8 @@ fn merge_agent_task_cells(
     use crate::tui::history_cell::task::ChildStatus;
 
     let crate::tui::history_cell::task::TaskCell {
-        tool_use_id,
-        description,
+        tool_use_id: _,
+        description: _,
         status,
         started_at,
         completed_at,
@@ -1187,9 +1215,6 @@ fn merge_agent_task_cells(
 
     if started_at < target.started_at {
         target.started_at = started_at;
-    }
-    if target.description == target.tool_use_id && description != tool_use_id {
-        target.description = description;
     }
     if accept_lifecycle && lifecycle_changed {
         // A newer lifecycle snapshot supersedes status-scoped error detail.
@@ -1972,12 +1997,17 @@ impl ChatWidget {
                 present.insert(agent.agent_id.clone());
                 let status = local_agent_run_status(&agent.status);
                 let state = AgentRunState::confirmed_local(status);
-                let label = if agent.description.trim().is_empty() {
-                    agent_display_name(&agent.agent_id, Some(&agent.agent_type))
+                let (label, label_kind) = if agent.description.trim().is_empty() {
+                    (agent.agent_type.clone(), AgentRunLabelKind::BindingName)
                 } else {
-                    agent.description.clone()
+                    (
+                        agent.description.clone(),
+                        AgentRunLabelKind::TaskDescription,
+                    )
                 };
-                let accepted = self.agent_runs.ensure(agent.agent_id.clone(), label, state);
+                let accepted =
+                    self.agent_runs
+                        .ensure(agent.agent_id.clone(), label, label_kind, state);
                 if let Some(projection) = self.agent_runs.get_mut(&agent.agent_id) {
                     let (depth, child_agents) = local_runtime_metadata
                         .get(agent.agent_id.as_str())
@@ -2053,6 +2083,7 @@ impl ChatWidget {
             self.agent_runs.ensure(
                 restored_agent.id.clone(),
                 restored_agent.title.clone(),
+                AgentRunLabelKind::TaskDescription,
                 AgentRunState::stale_workspace(status),
             );
             if let Some(projection) = self.agent_runs.get_mut(&restored_agent.id) {
@@ -2113,14 +2144,18 @@ impl ChatWidget {
                     self.agent_runs
                         .key_for_live_event(&run.agent_id, &run.run_id)
                 });
-            let label = if run.description.trim().is_empty() {
-                agent_display_name(&run.agent_id, None)
+            let (label, label_kind) = if run.description.trim().is_empty() {
+                (
+                    agent_display_name(&run.agent_id, None),
+                    AgentRunLabelKind::RoutingFallback,
+                )
             } else {
-                run.description.clone()
+                (run.description.clone(), AgentRunLabelKind::TaskDescription)
             };
             let accepted = self.agent_runs.ensure(
                 run_key.clone(),
                 label,
+                label_kind,
                 AgentRunState::confirmed_local_journal(status),
             );
             let Some(projection) = self.agent_runs.get_mut(&run_key) else {
@@ -2203,14 +2238,23 @@ impl ChatWidget {
 
                         let status = server_agent_run_status(node.status);
                         let state = AgentRunState::confirmed_server(status);
-                        let label = node
+                        let (label, label_kind) = node
                             .agent_name
                             .as_deref()
-                            .or(node.agent_id.as_deref())
                             .filter(|label| !label.trim().is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| agent_display_name(&node.run_id, None));
-                        let accepted = self.agent_runs.ensure(run_key.clone(), label, state);
+                            .map(|label| (label.to_string(), AgentRunLabelKind::BindingName))
+                            .unwrap_or_else(|| {
+                                (
+                                    agent_display_name(
+                                        node.agent_id.as_deref().unwrap_or(&node.run_id),
+                                        None,
+                                    ),
+                                    AgentRunLabelKind::RoutingFallback,
+                                )
+                            });
+                        let accepted =
+                            self.agent_runs
+                                .ensure(run_key.clone(), label, label_kind, state);
                         let Some(projection) = self.agent_runs.get_mut(&run_key) else {
                             continue;
                         };
@@ -3303,13 +3347,16 @@ impl ChatWidget {
         {
             self.agent_runs.rename(&existing, key.clone());
         }
+        let (label, label_kind) = match action {
+            AgentControlAction::Spawn => (label, AgentRunLabelKind::TaskDescription),
+            AgentControlAction::GetResult => (
+                agent_display_name(&key, None),
+                AgentRunLabelKind::RoutingFallback,
+            ),
+        };
         if self.agent_runs.contains_key(&key) {
             if let Some(projection) = self.agent_runs.get_mut(&key) {
-                projection.detail.description = if action == AgentControlAction::GetResult {
-                    agent_display_name(&key, Some(&label))
-                } else {
-                    label
-                };
+                projection.set_label(label, label_kind);
             }
             self.agent_runs
                 .bind_tool_use(&tool_use_id, key.clone(), action);
@@ -3320,13 +3367,14 @@ impl ChatWidget {
                     AgentRunState::unconfirmed(AgentRunStatus::Running)
                 }
             };
-            let label = if action == AgentControlAction::GetResult {
-                agent_display_name(&key, Some(&label))
-            } else {
-                label
-            };
-            self.agent_runs
-                .ensure_for_tool_use(key.clone(), label, state, &tool_use_id, action);
+            self.agent_runs.ensure_for_tool_use(
+                key.clone(),
+                label,
+                label_kind,
+                state,
+                &tool_use_id,
+                action,
+            );
         }
         self.agent_runs
             .set_fanout_membership(&key, fanout_membership);
@@ -3384,6 +3432,21 @@ impl ChatWidget {
         if key != provisional && self.agent_runs.contains_key(&provisional) {
             self.agent_runs.rename(&provisional, key.clone());
         }
+        let (label, label_kind) = if let Some(description) = parsed
+            .as_ref()
+            .and_then(|value| value.get("description"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|description| !description.trim().is_empty())
+        {
+            (description.to_string(), AgentRunLabelKind::TaskDescription)
+        } else if control_action == AgentControlAction::Spawn {
+            (label, AgentRunLabelKind::TaskDescription)
+        } else {
+            (
+                agent_display_name(&key, surface.display_name_hint()),
+                AgentRunLabelKind::RoutingFallback,
+            )
+        };
         if !self.agent_runs.contains_key(&key) {
             // A failed spawn control call without an assigned Agent identity
             // never created an Agent run. Its generic ToolCell carries the
@@ -3391,6 +3454,7 @@ impl ChatWidget {
             self.agent_runs.ensure(
                 key.clone(),
                 label.clone(),
+                label_kind,
                 AgentRunState::unconfirmed(AgentRunStatus::Running),
             );
         }
@@ -3399,14 +3463,7 @@ impl ChatWidget {
         let Some(projection) = self.agent_runs.get_mut(&key) else {
             return;
         };
-        if AgentRunState::observed(AgentRunStatus::Running).source_rank()
-            >= projection.state.source_rank()
-        {
-            projection.detail.description = agent_id
-                .as_deref()
-                .map(|id| agent_display_name(id, surface.display_name_hint()))
-                .unwrap_or(label);
-        }
+        projection.set_label(label, label_kind);
         if let Some(run_id) = canonical_run_id {
             projection.set_runtime_metadata(
                 AgentProjectionSource::LiveStream,
@@ -3636,6 +3693,11 @@ impl ChatWidget {
             let state_accepted = self.agent_runs.ensure(
                 agent_id.clone(),
                 slot_label.to_string(),
+                if requested_description.is_some() {
+                    AgentRunLabelKind::TaskDescription
+                } else {
+                    AgentRunLabelKind::RoutingFallback
+                },
                 AgentRunState::observed(state),
             );
             self.agent_runs
@@ -3743,17 +3805,6 @@ impl ChatWidget {
             return;
         }
 
-        let label = self
-            .agent_runs
-            .get(&run_key)
-            .map(|projection| projection.detail.description.trim())
-            .filter(|description| {
-                !description.is_empty()
-                    && *description != routing_agent_id
-                    && *description != run_key
-            })
-            .map(str::to_owned)
-            .unwrap_or_else(|| agent_display_name(routing_agent_id, None));
         let observed_status = match &event.kind {
             AgentLiveEventKind::AgentTerminated { termination, .. } => {
                 use astra_turn_core::agent_live_event::AgentLiveTermination;
@@ -3783,7 +3834,8 @@ impl ChatWidget {
         };
         let state_accepted = self.agent_runs.ensure(
             run_key.clone(),
-            label.clone(),
+            agent_display_name(routing_agent_id, None),
+            AgentRunLabelKind::RoutingFallback,
             AgentRunState::observed(observed_status),
         );
         if is_terminal_event && !state_accepted {
@@ -3880,9 +3932,6 @@ impl ChatWidget {
                 projection.set_attention_summary(Some(agent_live_signal_summary(signal)));
             }
             let cell = &mut projection.detail;
-            if cell.description == event.agent_id {
-                cell.description = label;
-            }
             match event.kind {
                 AgentLiveEventKind::OutputDelta { text, .. }
                 | AgentLiveEventKind::ThinkingDelta { text, .. } => {
@@ -3978,10 +4027,10 @@ impl ChatWidget {
         let run_key = self
             .agent_runs
             .key_for_live_event(&gap.agent_id, &gap.run_id);
-        let label = agent_display_name(&gap.agent_id, None);
         self.agent_runs.ensure(
             run_key.clone(),
-            label.clone(),
+            agent_display_name(&gap.agent_id, None),
+            AgentRunLabelKind::RoutingFallback,
             AgentRunState::observed(AgentRunStatus::Running),
         );
         let Some(projection) = self.agent_runs.get_mut(&run_key) else {
@@ -3995,9 +4044,6 @@ impl ChatWidget {
                 projection.depth,
                 projection.reported_child_agents,
             );
-        }
-        if projection.detail.description == gap.agent_id {
-            projection.detail.description = label;
         }
         projection.set_attention_summary(Some(format!(
             "Live activity incomplete · {} update{} skipped · syncing durable state",
@@ -7715,13 +7761,13 @@ mod tests {
         let mut w = fresh();
         w.handle_event(AppEvent::wire(agent_control_started(
             "spawn",
-            "arch-reviewer",
+            "Review architecture",
             "spawn-arch",
             None,
         )));
         w.handle_event(AppEvent::wire(agent_control_completed(
             "spawn",
-            "arch-reviewer",
+            "Review architecture",
             "completed",
             0,
             Some(&spawn_receipt_wire(
@@ -7739,13 +7785,77 @@ mod tests {
             "spawn control cell must not appear as its own agent row"
         );
         assert_eq!(rows[0].agent_id, "arch-reviewer@abc12345");
-        assert_eq!(rows[0].name, "arch-reviewer");
+        assert_eq!(rows[0].name, "Review architecture");
         assert_eq!(rows[0].state.status, AgentRunStatus::Running);
 
         let detail = w
             .task_cell_anywhere("arch-reviewer@abc12345")
             .expect("logical agent row should be drillable");
-        assert_eq!(detail.description, "arch-reviewer");
+        assert_eq!(detail.description, "Review architecture");
+
+        // Routing-only activity and the durable binding name describe the
+        // same execution, but neither replaces its explicit task description.
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(
+            astra_turn_core::agent_live_event::AgentLiveEvent {
+                run_id: "run-arch-reviewer".into(),
+                agent_id: "arch-reviewer@abc12345".into(),
+                kind: astra_turn_core::agent_live_event::AgentLiveEventKind::OutputDelta {
+                    model_item_id: Some("answer".into()),
+                    text: "review evidence".into(),
+                },
+            },
+        )));
+        assert_eq!(w.agent_monitor_snapshot(5)[0].name, "Review architecture");
+        w.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![server_run_node(
+                "run-arch-reviewer",
+                astra_thin_client::SessionRunLifecycleStatus::Completed,
+                4,
+            )],
+            false,
+        ));
+        assert_eq!(w.agent_monitor_snapshot(5)[0].name, "Review architecture");
+        w.handle_event(AppEvent::wire(agent_control_started(
+            "get_result",
+            "Wait for review",
+            "wait-arch",
+            Some("arch-reviewer@abc12345"),
+        )));
+        w.handle_event(AppEvent::wire(agent_control_completed(
+            "get_result",
+            "Wait for review",
+            "completed",
+            42,
+            Some(&child_result_wire(
+                "arch-reviewer@abc12345",
+                "completed",
+                Some("review evidence"),
+                None,
+            )),
+            "wait-arch",
+            Some("arch-reviewer@abc12345"),
+        )));
+        let rows = w.agent_monitor_snapshot(5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Review architecture");
+        assert_eq!(rows[0].run_id.as_deref(), Some("run-arch-reviewer"));
+        assert_eq!(
+            rows[0].state,
+            AgentRunState::confirmed_server(AgentRunStatus::Completed)
+        );
+        assert_eq!(
+            rows[0].control_target,
+            Some(
+                crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                    run_id: "run-arch-reviewer".into(),
+                }
+            )
+        );
+        assert_eq!(
+            rows[0].transcript_target,
+            Some(crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer)
+        );
     }
 
     #[test]
@@ -8300,6 +8410,28 @@ mod tests {
         assert_eq!(completed.status, TaskStatus::Completed);
         assert_eq!(completed.error, None);
         assert_eq!(completed.output_summary, None);
+        assert_eq!(
+            widget
+                .agent_runs
+                .get("reviewer@failure-replay")
+                .unwrap()
+                .label_kind,
+            AgentRunLabelKind::RoutingFallback
+        );
+        widget.agent_runs.ensure(
+            "reviewer@failure-replay".into(),
+            "Arithmetic checkpoint".into(),
+            AgentRunLabelKind::TaskDescription,
+            AgentRunState::observed(AgentRunStatus::Completed),
+        );
+        widget.on_agent_fanout_launch_receipt(&receipt("completed", None));
+        assert_eq!(
+            widget
+                .agent_run_cell("reviewer@failure-replay")
+                .unwrap()
+                .description,
+            "Arithmetic checkpoint"
+        );
     }
 
     #[test]
@@ -8598,6 +8730,7 @@ mod tests {
                 registry.ensure(
                     id.clone(),
                     format!("{group} slot {slot}"),
+                    AgentRunLabelKind::TaskDescription,
                     AgentRunState::observed(state),
                 );
                 registry.set_fanout_membership(
@@ -9388,6 +9521,17 @@ mod tests {
                 text: "early child evidence".into(),
             },
         })));
+        assert_eq!(widget.agent_monitor_snapshot(5)[0].name, "agent-child");
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![server_run_node(
+                "run-child",
+                astra_thin_client::SessionRunLifecycleStatus::Completed,
+                4,
+            )],
+            false,
+        ));
+        assert_eq!(widget.agent_monitor_snapshot(5)[0].name, "Durable reviewer");
         widget.handle_event(AppEvent::wire(agent_control_started(
             "spawn",
             "Mock child review",
@@ -9404,6 +9548,10 @@ mod tests {
         assert_eq!(rows[0].agent_id, "agent-child");
         assert_eq!(rows[0].name, "Mock child review");
         assert_eq!(rows[0].run_id.as_deref(), Some("run-child"));
+        assert_eq!(
+            rows[0].state,
+            AgentRunState::confirmed_server(AgentRunStatus::Completed)
+        );
         assert_eq!(
             widget.agent_runs.key_for_tool_use("call-spawn-child"),
             Some("agent-child")
@@ -9422,6 +9570,7 @@ mod tests {
         registry.ensure_for_tool_use(
             "pending:spawn-tu-1".into(),
             "reviewer-A".into(),
+            AgentRunLabelKind::TaskDescription,
             AgentRunState::observed(AgentRunStatus::Starting),
             "spawn-tu-1",
             AgentControlAction::Spawn,
@@ -9429,6 +9578,7 @@ mod tests {
         registry.ensure_for_tool_use(
             "late-other-key".into(),
             "reviewer-B".into(),
+            AgentRunLabelKind::TaskDescription,
             AgentRunState::observed(AgentRunStatus::Starting),
             "spawn-tu-1",
             AgentControlAction::Spawn,
@@ -9963,6 +10113,7 @@ mod tests {
             "root conversation run is not a sub-agent row"
         );
         assert_eq!(rows[0].agent_id, "child-run");
+        assert_eq!(rows[0].name, "Durable reviewer");
         assert_eq!(rows[0].state.status, AgentRunStatus::Paused);
         assert_eq!(rows[0].state.source, AgentProjectionSource::DurableServer);
         assert_eq!(
@@ -10711,6 +10862,7 @@ mod tests {
         let mut projection = AgentRunProjection::new(
             "agent".into(),
             "agent".into(),
+            AgentRunLabelKind::RoutingFallback,
             AgentRunState::confirmed_local(AgentRunStatus::Completed),
         );
         projection.set_state(AgentRunState::observed(AgentRunStatus::Failed));
@@ -10729,6 +10881,7 @@ mod tests {
         let mut repaired = AgentRunProjection::new(
             "agent".into(),
             "agent".into(),
+            AgentRunLabelKind::RoutingFallback,
             AgentRunState::observed(AgentRunStatus::Completed),
         );
         repaired.set_state(AgentRunState::confirmed_local(AgentRunStatus::Running));
@@ -10748,27 +10901,44 @@ mod tests {
 
     #[test]
     fn accepted_projection_merge_clears_old_error_but_keeps_live_output() {
-        let mut target = AgentRunProjection::new(
-            "agent".into(),
-            "agent".into(),
-            AgentRunState::observed(AgentRunStatus::Running),
-        );
-        target.detail.output_summary = Some("finding from the live stream".into());
-        target.detail.error = Some("stale failure".into());
+        for task_first in [false, true] {
+            let task = ("Review architecture", AgentRunLabelKind::TaskDescription);
+            let binding = ("Reviewer", AgentRunLabelKind::BindingName);
+            let (target_label, source_label) = if task_first {
+                (task, binding)
+            } else {
+                (binding, task)
+            };
+            let mut target = AgentRunProjection::new(
+                "agent".into(),
+                target_label.0.into(),
+                target_label.1,
+                AgentRunState::observed(AgentRunStatus::Running),
+            );
+            target.detail.output_summary = Some("finding from the live stream".into());
+            target.detail.error = Some("stale failure".into());
 
-        let source = AgentRunProjection::new(
-            "agent".into(),
-            "agent".into(),
-            AgentRunState::observed(AgentRunStatus::Completed),
-        );
-        merge_agent_projections(&mut target, source);
+            let source = AgentRunProjection::new(
+                "agent".into(),
+                source_label.0.into(),
+                source_label.1,
+                AgentRunState::confirmed_server(AgentRunStatus::Completed),
+            );
+            merge_agent_projections(&mut target, source);
+            target.set_label("  ".into(), AgentRunLabelKind::TaskDescription);
 
-        assert_eq!(target.state.status, AgentRunStatus::Completed);
-        assert_eq!(
-            target.detail.output_summary.as_deref(),
-            Some("finding from the live stream")
-        );
-        assert_eq!(target.detail.error, None);
+            assert_eq!(target.detail.description, "Review architecture");
+            assert_eq!(target.label_kind, AgentRunLabelKind::TaskDescription);
+            assert_eq!(
+                target.state,
+                AgentRunState::confirmed_server(AgentRunStatus::Completed)
+            );
+            assert_eq!(
+                target.detail.output_summary.as_deref(),
+                Some("finding from the live stream")
+            );
+            assert_eq!(target.detail.error, None);
+        }
     }
 
     #[test]
@@ -10776,6 +10946,7 @@ mod tests {
         let mut projection = AgentRunProjection::new(
             "agent".into(),
             "agent".into(),
+            AgentRunLabelKind::RoutingFallback,
             AgentRunState::confirmed_local(AgentRunStatus::Running),
         );
         projection.set_runtime_facts(
@@ -10817,6 +10988,7 @@ mod tests {
         let mut projection = AgentRunProjection::new(
             "agent".into(),
             "agent".into(),
+            AgentRunLabelKind::RoutingFallback,
             AgentRunState::confirmed_server(AgentRunStatus::Running),
         );
         projection.available_actions = vec![astra_thin_client::SessionRunAction::Pause];
@@ -11011,6 +11183,7 @@ mod tests {
         widget.agent_runs.ensure(
             "reviewer".into(),
             "Review patch".into(),
+            AgentRunLabelKind::TaskDescription,
             AgentRunState::observed(AgentRunStatus::Running),
         );
         widget
@@ -11123,6 +11296,7 @@ mod tests {
             registry.ensure(
                 key.to_string(),
                 key.to_string(),
+                AgentRunLabelKind::RoutingFallback,
                 AgentRunState::observed(status),
             );
             registry.get_mut(key).unwrap().set_runtime_metadata(

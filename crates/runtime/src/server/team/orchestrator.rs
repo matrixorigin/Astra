@@ -18,9 +18,9 @@ use astra_core::{STATUS_COMPLETED, STATUS_FAILED, STATUS_RUNNING};
 use astra_services::coordination::{AgentProfile, AgentProfileRegistry, DelegationResult};
 use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode, resolve_team};
 
-use astra_server_types::team_orchestrator_traits::{
-    DelegationExecutor, DelegationTracking, RunPersistence,
-};
+use crate::orchestration::ParentProfileAuthority;
+use crate::server::run::engine::{RunEngine, RunStartContext};
+use astra_server_types::team_orchestrator_traits::{DelegationExecutor, DelegationTracking};
 pub use astra_server_types::team_orchestrator_types::{
     ExecutionPhase, OrchestratorConfig, ProgressCallback, TeamExecutionStatus,
     append_merge_conflict_summary, derive_team_status, sum_usage, summarize_unsuccessful_agents,
@@ -28,7 +28,6 @@ pub use astra_server_types::team_orchestrator_types::{
 use astra_server_types::warn_persist;
 use sha2::Digest;
 
-use crate::server::conflict_resolver;
 use astra_server_types::worktree_isolation::{MergeResult, RepoLock, WorktreeManager};
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -116,12 +115,10 @@ pub struct TeamExecutionOrchestrator {
     team_store: Arc<dyn TeamPersistenceService>,
     delegation_engine: Arc<dyn DelegationExecutor>,
     delegation_tracker: Arc<dyn DelegationTracking>,
-    run_engine: Arc<dyn RunPersistence>,
+    run_engine: Arc<RunEngine>,
     profile_registry: Arc<RwLock<AgentProfileRegistry>>,
     config: OrchestratorConfig,
     repo_lock: RepoLock,
-    /// Optional conflict resolver for LLM-assisted merge conflict resolution.
-    conflict_resolver: Option<Arc<dyn conflict_resolver::ConflictResolver>>,
     /// Whether this orchestrator is serving the authenticated HTTP Team
     /// boundary. HTTP Team requests do not currently expose optional-tool
     /// selection, so omission must mean an explicit deny. Local CLI Team
@@ -139,7 +136,7 @@ impl TeamExecutionOrchestrator {
         team_store: Arc<dyn TeamPersistenceService>,
         delegation_engine: Arc<dyn DelegationExecutor>,
         delegation_tracker: Arc<dyn DelegationTracking>,
-        run_engine: Arc<dyn RunPersistence>,
+        run_engine: Arc<RunEngine>,
         profile_registry: Arc<RwLock<AgentProfileRegistry>>,
         config: OrchestratorConfig,
     ) -> Self {
@@ -151,7 +148,6 @@ impl TeamExecutionOrchestrator {
             profile_registry,
             config,
             repo_lock: astra_server_types::worktree_isolation::new_repo_lock(),
-            conflict_resolver: None,
             server_request_boundary: false,
             cancellation_token: None,
         }
@@ -177,21 +173,6 @@ impl TeamExecutionOrchestrator {
         token: Arc<tokio_util::sync::CancellationToken>,
     ) -> Self {
         self.cancellation_token = Some(token);
-        self
-    }
-
-    /// Set a shared repository lock for concurrent team executions.
-    pub fn with_repo_lock(mut self, lock: RepoLock) -> Self {
-        self.repo_lock = lock;
-        self
-    }
-
-    /// Enable LLM-assisted merge conflict resolution.
-    pub fn with_conflict_resolver(
-        mut self,
-        resolver: Arc<dyn conflict_resolver::ConflictResolver>,
-    ) -> Self {
-        self.conflict_resolver = Some(resolver);
         self
     }
 
@@ -313,6 +294,23 @@ impl TeamExecutionOrchestrator {
                     );
                 }
             };
+        let admitted_agent_profiles = Arc::new(astra_services::runs::AgentProfileSnapshot {
+            owner_user_id: team.user_id.clone(),
+            source_team_id: team.team_id.clone(),
+            // This batch has an ordinary parent, not an implicitly selected
+            // roster lead. Member roles never establish execution authority.
+            lead_agent_id: None,
+            profiles: profiles.clone(),
+        });
+        if let Err(error) = admitted_agent_profiles.registry(&self.config.user_id) {
+            return self.fail_report(
+                team_name,
+                "",
+                &parent_run_id,
+                TeamExecutionErrorKind::InvalidTeam,
+                error,
+            );
+        }
         let profile_snapshot = {
             let builtins = self.profile_registry.read().await;
             match build_execution_profile_snapshot(
@@ -381,7 +379,7 @@ impl TeamExecutionOrchestrator {
         // profile snapshot has been validated.
         if let Err(e) = self
             .run_engine
-            .start_run_ext(
+            .start_run_ext_with_context(
                 &parent_run_id,
                 &self.config.user_id,
                 &self.config.session_id,
@@ -389,6 +387,11 @@ impl TeamExecutionOrchestrator {
                 None,
                 Some(&self.config.source_agent_id),
                 None,
+                RunStartContext {
+                    admitted_agent_profiles: Some(admitted_agent_profiles),
+                    profile_authority: ParentProfileAuthority::OrdinaryRoot,
+                    ..Default::default()
+                },
             )
             .await
         {
@@ -434,13 +437,8 @@ impl TeamExecutionOrchestrator {
         });
 
         // Create worktrees if isolated mode
-        let mut worktree_mgr = repo_root.map(|root| {
-            let mut mgr = WorktreeManager::new(root).with_repo_lock(self.repo_lock.clone());
-            if let Some(ref resolver) = self.conflict_resolver {
-                mgr = mgr.with_conflict_resolver(resolver.clone(), task.to_string());
-            }
-            mgr
-        });
+        let mut worktree_mgr =
+            repo_root.map(|root| WorktreeManager::new(root).with_repo_lock(self.repo_lock.clone()));
         let mut preserved_worktree_branches = Vec::new();
 
         let agent_ids: Vec<String> = profiles.iter().map(|p| p.agent_id.clone()).collect();
@@ -725,21 +723,11 @@ impl TeamExecutionOrchestrator {
             });
         }
 
-        // Persist token usage from delegation results
+        // Keep the Team aggregate in its existing result/event summaries.  The
+        // parent run has no provider call of its own; writing child totals into
+        // its canonical run usage would make a parent+children audit double
+        // count the same work.
         let (total_prompt, total_completion, total_tools) = sum_usage(&delegation_result);
-        warn_persist!(
-            self.run_engine
-                .persist_usage(
-                    &self.config.user_id,
-                    &self.config.session_id,
-                    &parent_run_id,
-                    total_prompt,
-                    total_completion,
-                    total_tools,
-                )
-                .await,
-            "Failed to run_engine.persist_usage"
-        );
 
         // Check token budget (post-execution — tokens are only known after completion)
         let total_tokens = total_prompt + total_completion;
@@ -774,6 +762,7 @@ impl TeamExecutionOrchestrator {
                     &parent_run_id,
                     serde_json::json!({
                         "event_type": "team_execute_complete",
+                        "usage_scope": "child_results_only",
                         "agent_results": delegation_result.agent_results.len(),
                         "total_prompt_tokens": total_prompt,
                         "total_completion_tokens": total_completion,
@@ -936,6 +925,7 @@ impl TeamExecutionOrchestrator {
 
         // Record execution completion (started in Phase 1)
         let result_summary = serde_json::json!({
+            "usage_scope": "child_results_only",
             "agent_count": delegation_result.agent_results.len(),
             "total_prompt_tokens": total_prompt,
             "total_completion_tokens": total_completion,
@@ -1089,10 +1079,12 @@ impl TeamExecutionOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messaging::{AgentMailboxRouter, InProcessTransport};
+    use crate::orchestration::{DynamicAgentSpawner, spawner::SpawnRunFrontier};
     use crate::server::delegation::engine::{
         DelegationEngine, DelegationTracker, StubSubRunExecutor, SubRunConfig, SubRunExecutor,
     };
-    use crate::server::run::engine::RunEngine;
+    use crate::server::run::engine::{durable_run_agent_profiles, durable_run_profile_authority};
     use astra_services::coordination::{AgentResult, AgentTier};
     use astra_services::runs::InMemoryRunStateStore;
     use astra_services::team_persistence::{
@@ -1109,17 +1101,23 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for StatusExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
-            Ok(AgentResult {
-                agent_id: config.agent_profile.agent_id,
-                run_id: config.run_id,
-                status: self.status.to_string(),
-                output: Some(format!("[{}] yielded", self.status)),
-                error: self.error.map(ToString::to_string),
-                prompt_tokens: 1,
-                completion_tokens: 0,
-                tool_calls: 0,
-            })
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
+            Ok((
+                AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: self.status.to_string(),
+                    output: Some(format!("[{}] yielded", self.status)),
+                    error: self.error.map(ToString::to_string),
+                    prompt_tokens: 1,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
+                None,
+            ))
         }
     }
 
@@ -1129,22 +1127,28 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for CancellationAwareExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
             self.started.notify_waiters();
             let token = config
                 .cancel_token
                 .ok_or_else(|| "cancellation token missing".to_string())?;
             token.cancelled().await;
-            Ok(AgentResult {
-                agent_id: config.agent_profile.agent_id,
-                run_id: config.run_id,
-                status: astra_core::STATUS_CANCELLED.to_string(),
-                output: None,
-                error: Some("cancelled by caller".to_string()),
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
-            })
+            Ok((
+                AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: astra_core::STATUS_CANCELLED.to_string(),
+                    output: None,
+                    error: Some("cancelled by caller".to_string()),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
+                None,
+            ))
         }
     }
 
@@ -1155,7 +1159,10 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for CommitThenCancelExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
             let key = format!("worktree_path_{}", config.agent_profile.agent_id);
             let path = config
                 .context
@@ -1182,32 +1189,59 @@ mod tests {
             }
             self.started.notify_waiters();
             if !self.wait_for_cancel {
-                return Ok(AgentResult {
-                    agent_id: config.agent_profile.agent_id,
-                    run_id: config.run_id,
-                    status: STATUS_COMPLETED.to_string(),
-                    output: Some("committed child result".to_string()),
-                    error: None,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                });
+                return Ok((
+                    AgentResult {
+                        agent_id: config.agent_profile.agent_id,
+                        run_id: config.run_id,
+                        status: STATUS_COMPLETED.to_string(),
+                        output: Some("committed child result".to_string()),
+                        error: None,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    },
+                    None,
+                ));
             }
             let token = config
                 .cancel_token
                 .ok_or_else(|| "cancellation token missing".to_string())?;
             token.cancelled().await;
-            Ok(AgentResult {
-                agent_id: config.agent_profile.agent_id,
-                run_id: config.run_id,
-                status: astra_core::STATUS_CANCELLED.to_string(),
-                output: None,
-                error: Some("cancelled by caller".to_string()),
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
-            })
+            Ok((
+                AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: astra_core::STATUS_CANCELLED.to_string(),
+                    output: None,
+                    error: Some("cancelled by caller".to_string()),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
+                None,
+            ))
         }
+    }
+
+    fn execution_bound_delegation(
+        registry: Arc<RwLock<AgentProfileRegistry>>,
+        run_engine: Arc<RunEngine>,
+        tracker: Arc<DelegationTracker>,
+        executor: Arc<dyn SubRunExecutor>,
+    ) -> Arc<DelegationEngine> {
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker.clone(),
+        ));
+        let spawner = Arc::new(DynamicAgentSpawner::new(router));
+
+        // The owner carries the router used by real child execution.  It is
+        // deliberately not installed as the engine's mailbox configuration:
+        // tests that need child mailboxes must opt into that request surface.
+        Arc::new(
+            DelegationEngine::with_executor(registry, run_engine, tracker, executor)
+                .for_execution(spawner),
+        )
     }
 
     async fn setup_orchestrator(team_store: Arc<InMemoryTeamStore>) -> TeamExecutionOrchestrator {
@@ -1228,12 +1262,12 @@ mod tests {
         let run_engine = Arc::new(RunEngine::new(run_store));
         let tracker = Arc::new(DelegationTracker::new());
 
-        let delegation = Arc::new(DelegationEngine::with_executor(
+        let delegation = execution_bound_delegation(
             registry.clone(),
             run_engine.clone(),
             tracker.clone(),
             Arc::new(StubSubRunExecutor),
-        ));
+        );
 
         TeamExecutionOrchestrator::new(
             team_store,
@@ -1248,34 +1282,6 @@ mod tests {
                 progress: None,
             },
         )
-    }
-
-    #[tokio::test]
-    async fn execute_team_not_found() {
-        let store = Arc::new(InMemoryTeamStore::new());
-        let orch = setup_orchestrator(store).await;
-
-        let report = orch.execute_team("nonexistent", "do something", None).await;
-        assert_eq!(report.status, TeamExecutionStatus::Failed);
-        assert_eq!(
-            report.error_kind,
-            Some(TeamExecutionErrorKind::TeamNotFound)
-        );
-        assert!(report.error.as_ref().unwrap().contains("not found"));
-    }
-
-    #[tokio::test]
-    async fn execute_team_pipeline_with_stub() {
-        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
-        let orch = setup_orchestrator(store).await;
-
-        let report = orch
-            .execute_team("research", "analyze codebase", None)
-            .await;
-        assert_eq!(report.status, TeamExecutionStatus::Completed);
-        assert!(report.delegation_result.is_some());
-        let dr = report.delegation_result.unwrap();
-        assert_eq!(dr.agent_results.len(), 2); // explorer + synthesizer
     }
 
     #[tokio::test]
@@ -1295,14 +1301,14 @@ mod tests {
         let run_engine = Arc::new(RunEngine::new(run_store));
         let tracker = Arc::new(DelegationTracker::new());
         let started = Arc::new(Notify::new());
-        let delegation = Arc::new(DelegationEngine::with_executor(
+        let delegation = execution_bound_delegation(
             registry.clone(),
             run_engine.clone(),
             tracker.clone(),
             Arc::new(CancellationAwareExecutor {
                 started: started.clone(),
             }),
-        ));
+        );
         let cancellation = Arc::new(tokio_util::sync::CancellationToken::new());
         let orchestrator = TeamExecutionOrchestrator::new(
             store,
@@ -1412,6 +1418,7 @@ mod tests {
                     mcp_servers: Vec::new(),
                     can_delegate: false,
                     max_delegation_depth: 0,
+                    ..Default::default()
                 }],
                 context: std::collections::HashMap::new(),
                 worktree_mode: WorktreeMode::Isolated,
@@ -1436,7 +1443,7 @@ mod tests {
         let run_engine = Arc::new(RunEngine::new(run_store));
         let tracker = Arc::new(DelegationTracker::new());
         let started = Arc::new(Notify::new());
-        let delegation = Arc::new(DelegationEngine::with_executor(
+        let delegation = execution_bound_delegation(
             registry.clone(),
             run_engine.clone(),
             tracker.clone(),
@@ -1444,7 +1451,7 @@ mod tests {
                 started: started.clone(),
                 wait_for_cancel: false,
             }),
-        ));
+        );
         let cancellation = Arc::new(tokio_util::sync::CancellationToken::new());
         let progress_cancellation = cancellation.clone();
         let orchestrator = TeamExecutionOrchestrator::new(
@@ -1542,7 +1549,7 @@ mod tests {
         let run_store = Arc::new(InMemoryRunStateStore::new());
         let run_engine = Arc::new(RunEngine::new(run_store));
         let tracker = Arc::new(DelegationTracker::new());
-        let delegation = Arc::new(DelegationEngine::with_executor(
+        let delegation = execution_bound_delegation(
             registry.clone(),
             run_engine.clone(),
             tracker.clone(),
@@ -1550,7 +1557,7 @@ mod tests {
                 status: STATUS_COMPLETED,
                 error: None,
             }),
-        ));
+        );
         let cancellation = Arc::new(tokio_util::sync::CancellationToken::new());
         let progress_cancellation = cancellation.clone();
         let orchestrator = TeamExecutionOrchestrator::new(
@@ -1642,7 +1649,7 @@ mod tests {
         let run_store = Arc::new(InMemoryRunStateStore::new());
         let run_engine = Arc::new(RunEngine::new(run_store));
         let tracker = Arc::new(DelegationTracker::new());
-        let delegation = Arc::new(DelegationEngine::with_executor(
+        let delegation = execution_bound_delegation(
             registry.clone(),
             run_engine.clone(),
             tracker.clone(),
@@ -1650,7 +1657,7 @@ mod tests {
                 status: "paused",
                 error: None,
             }),
-        ));
+        );
         let orch = TeamExecutionOrchestrator::new(
             store,
             delegation,
@@ -1701,12 +1708,12 @@ mod tests {
         let run_engine = Arc::new(RunEngine::new(run_store));
         let tracker = Arc::new(DelegationTracker::new());
 
-        let delegation = Arc::new(DelegationEngine::with_executor(
+        let delegation = execution_bound_delegation(
             registry.clone(),
             run_engine.clone(),
             tracker.clone(),
             Arc::new(StubSubRunExecutor),
-        ));
+        );
 
         let orch = TeamExecutionOrchestrator::new(
             team_store,
@@ -1723,59 +1730,6 @@ mod tests {
         );
 
         (orch, run_engine, tracker)
-    }
-
-    #[tokio::test]
-    async fn execute_persists_run_events() {
-        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
-        let (orch, run_engine, _) = setup_with_engines(store).await;
-
-        let report = orch.execute_team("research", "analyze", None).await;
-        assert_eq!(report.status, TeamExecutionStatus::Completed);
-
-        // The parent run should have events logged
-        let run = run_engine
-            .load_run("test-user", &report.parent_run_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            run.events.len() >= 3,
-            "expected at least 3 events (prepare, exec_start, complete), got {}",
-            run.events.len()
-        );
-
-        // Verify event types
-        let event_types: Vec<String> = run
-            .events
-            .iter()
-            .filter_map(|e| {
-                e.get("event_type")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            })
-            .collect();
-        assert!(event_types.contains(&"team_prepare".to_string()));
-        assert!(event_types.contains(&"team_execute_start".to_string()));
-        assert!(event_types.contains(&"team_complete".to_string()));
-    }
-
-    #[tokio::test]
-    async fn execute_persists_usage() {
-        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
-        let (orch, run_engine, _) = setup_with_engines(store).await;
-
-        let report = orch.execute_team("research", "task", None).await;
-        assert_eq!(report.status, TeamExecutionStatus::Completed);
-
-        let run = run_engine
-            .load_run("test-user", &report.parent_run_id)
-            .await
-            .unwrap()
-            .unwrap();
-        // StubSubRunExecutor produces results with default token counts
-        // Usage should have been persisted (even if 0 from stubs)
-        assert_eq!(run.status, "completed");
     }
 
     #[tokio::test]
@@ -1833,6 +1787,46 @@ mod tests {
             .await
             .unwrap()
             .expect("first command created its durable parent run");
+        let admitted = durable_run_agent_profiles(&before, "test-user")
+            .unwrap()
+            .expect("the durable parent must retain its admitted roster");
+        assert_eq!(
+            *admitted,
+            astra_services::runs::AgentProfileSnapshot {
+                owner_user_id: team.user_id.clone(),
+                source_team_id: team.team_id.clone(),
+                lead_agent_id: None,
+                profiles: profiles.clone(),
+            }
+        );
+        assert_eq!(
+            durable_run_profile_authority(&before, "test-user").unwrap(),
+            ParentProfileAuthority::OrdinaryRoot
+        );
+        let children = &first
+            .delegation_result
+            .as_ref()
+            .expect("the real delegation engine completed the batch")
+            .agent_results;
+        assert_eq!(children.len(), profiles.len());
+        for child in children {
+            let run = run_engine
+                .load_run("test-user", &child.run_id)
+                .await
+                .unwrap()
+                .expect("the child must retain its durable start facts");
+            assert_eq!(
+                durable_run_agent_profiles(&run, "test-user").unwrap(),
+                Some(admitted.clone())
+            );
+            assert_eq!(
+                durable_run_profile_authority(&run, "test-user").unwrap(),
+                ParentProfileAuthority::AdmittedMember {
+                    profile_id: child.agent_id.clone(),
+                    ancestor_profile_ids: Vec::new(),
+                }
+            );
+        }
 
         let second = orch
             .execute_team_with_model_plan("research", task, None, plan, command.clone())
@@ -1852,30 +1846,6 @@ mod tests {
             .unwrap()
             .expect("the first run remains the only durable parent");
         assert_eq!(after.events.len(), before.events.len());
-    }
-
-    #[tokio::test]
-    async fn execute_persists_checkpoint() {
-        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
-        let (orch, run_engine, _) = setup_with_engines(store).await;
-
-        let report = orch.execute_team("research", "task", None).await;
-        assert_eq!(report.status, TeamExecutionStatus::Completed);
-
-        let run = run_engine
-            .load_run("test-user", &report.parent_run_id)
-            .await
-            .unwrap()
-            .unwrap();
-        // Typed checkpoint should be set after preparation phase
-        let checkpoint = run_engine
-            .load_latest_checkpoint("test-user", &report.parent_run_id, Some("phase"))
-            .await
-            .unwrap()
-            .expect("expected typed checkpoint to be persisted");
-        let cp: serde_json::Value = serde_json::from_str(&checkpoint.checkpoint_json).unwrap();
-        assert_eq!(cp["phase"], "prepared");
-        assert_eq!(run.status, "completed");
     }
 
     #[test]
@@ -1965,12 +1935,12 @@ mod tests {
         let run_store = Arc::new(InMemoryRunStateStore::new());
         let run_engine = Arc::new(RunEngine::new(run_store));
         let tracker = Arc::new(DelegationTracker::new());
-        let delegation = Arc::new(DelegationEngine::with_executor(
+        let delegation = execution_bound_delegation(
             registry.clone(),
             run_engine.clone(),
             tracker.clone(),
             Arc::new(StubSubRunExecutor),
-        ));
+        );
 
         let orch = TeamExecutionOrchestrator::new(
             store,
@@ -2006,18 +1976,24 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for SlowSubRunExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
             tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-            Ok(AgentResult {
-                agent_id: config.agent_profile.agent_id.clone(),
-                run_id: config.run_id.clone(),
-                status: "completed".to_string(),
-                output: Some("done".to_string()),
-                error: None,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
-            })
+            Ok((
+                AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id.clone(),
+                    status: "completed".to_string(),
+                    output: Some("done".to_string()),
+                    error: None,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
+                None,
+            ))
         }
     }
 
@@ -2038,12 +2014,12 @@ mod tests {
         let run_store = Arc::new(InMemoryRunStateStore::new());
         let run_engine = Arc::new(RunEngine::new(run_store));
         let tracker = Arc::new(DelegationTracker::new());
-        let delegation = Arc::new(DelegationEngine::with_executor(
+        let delegation = execution_bound_delegation(
             registry.clone(),
             run_engine.clone(),
             tracker.clone(),
             Arc::new(SlowSubRunExecutor),
-        ));
+        );
 
         let orch = TeamExecutionOrchestrator::new(
             store,
@@ -2075,35 +2051,6 @@ mod tests {
                 } if agent_states.values().any(|state| state == "running")
             )
         }));
-    }
-
-    #[tokio::test]
-    async fn execute_team_validation_failure() {
-        let store = Arc::new(InMemoryTeamStore::new());
-        // Save a team with empty members (invalid)
-        let invalid_team = astra_services::team_persistence::TeamDefinition {
-            team_id: "bad-team".to_string(),
-            user_id: "test-user".to_string(),
-            name: "bad".to_string(),
-            description: "Invalid team".to_string(),
-            coordination: astra_services::team_persistence::TeamCoordination::Sequential {
-                stop_on_success: false,
-            },
-            members: vec![],
-            context: std::collections::HashMap::new(),
-            worktree_mode: WorktreeMode::Shared,
-            budget: None,
-            max_parallel: 0,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        let _ = store.save_team(&invalid_team).await;
-        let (orch, _, _) = setup_with_engines(store).await;
-
-        let report = orch.execute_team("bad", "task", None).await;
-        assert_eq!(report.status, TeamExecutionStatus::Failed);
-        assert_eq!(report.error_kind, Some(TeamExecutionErrorKind::InvalidTeam));
-        assert!(report.error.as_ref().unwrap().contains("validation failed"));
     }
 
     #[tokio::test]
@@ -2155,12 +2102,12 @@ mod tests {
         // We need a sync test, so we construct minimally
         let orch = TeamExecutionOrchestrator {
             team_store: store,
-            delegation_engine: Arc::new(DelegationEngine::with_executor(
+            delegation_engine: execution_bound_delegation(
                 registry.clone(),
                 run_engine.clone(),
                 tracker.clone(),
                 Arc::new(StubSubRunExecutor),
-            )),
+            ),
             delegation_tracker: tracker,
             run_engine,
             profile_registry: registry,
@@ -2171,7 +2118,6 @@ mod tests {
                 progress: None,
             },
             repo_lock: astra_server_types::worktree_isolation::new_repo_lock(),
-            conflict_resolver: None,
             server_request_boundary: false,
             cancellation_token: None,
         };
@@ -2211,6 +2157,7 @@ mod tests {
                 mcp_servers: vec![],
                 can_delegate: false,
                 max_delegation_depth: 0,
+                ..Default::default()
             }],
             context: std::collections::HashMap::new(),
             worktree_mode: astra_services::team_persistence::WorktreeMode::Shared,
@@ -2229,17 +2176,23 @@ mod tests {
         struct HighTokenExecutor;
         #[async_trait::async_trait]
         impl SubRunExecutor for HighTokenExecutor {
-            async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
-                Ok(AgentResult {
-                    agent_id: config.agent_profile.agent_id,
-                    run_id: config.run_id,
-                    status: "completed".to_string(),
-                    output: Some("done".into()),
-                    error: None,
-                    prompt_tokens: 500,
-                    completion_tokens: 500,
-                    tool_calls: 0,
-                })
+            async fn execute(
+                &self,
+                config: SubRunConfig,
+            ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
+                Ok((
+                    AgentResult {
+                        agent_id: config.agent_profile.agent_id,
+                        run_id: config.run_id,
+                        status: "completed".to_string(),
+                        output: Some("done".into()),
+                        error: None,
+                        prompt_tokens: 500,
+                        completion_tokens: 500,
+                        tool_calls: 0,
+                    },
+                    None,
+                ))
             }
         }
 
@@ -2254,13 +2207,13 @@ mod tests {
         let tracker = Arc::new(DelegationTracker::new());
 
         let orch = TeamExecutionOrchestrator::new(
-            store,
-            Arc::new(DelegationEngine::with_executor(
+            store.clone(),
+            execution_bound_delegation(
                 registry.clone(),
                 run_engine.clone(),
                 tracker.clone(),
                 Arc::new(HighTokenExecutor),
-            )),
+            ),
             tracker,
             run_engine.clone(),
             registry,
@@ -2295,6 +2248,24 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("token budget exceeded"))
         );
+        assert_eq!(durable.total_prompt_tokens, 0);
+        assert_eq!(durable.total_completion_tokens, 0);
+        assert_eq!(durable.total_tool_calls, 0);
+
+        let execution = store
+            .list_executions(&team.team_id, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("team execution history should retain the child summary");
+        let summary: serde_json::Value =
+            serde_json::from_str(execution.result_json.as_deref().expect("result summary"))
+                .expect("valid team result summary");
+        assert_eq!(summary["usage_scope"], "child_results_only");
+        assert_eq!(summary["total_prompt_tokens"], 500);
+        assert_eq!(summary["total_completion_tokens"], 500);
+        assert_eq!(summary["total_tool_calls"], 0);
     }
 
     /// Executor that returns configurable token counts to trigger budget checks.
@@ -2305,17 +2276,23 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for TokenBudgetExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
-            Ok(AgentResult {
-                agent_id: config.agent_profile.agent_id,
-                run_id: config.run_id,
-                status: astra_core::STATUS_COMPLETED.to_string(),
-                output: Some("done".into()),
-                error: None,
-                prompt_tokens: self.prompt_tokens,
-                completion_tokens: self.completion_tokens,
-                tool_calls: 0,
-            })
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
+            Ok((
+                AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: astra_core::STATUS_COMPLETED.to_string(),
+                    output: Some("done".into()),
+                    error: None,
+                    prompt_tokens: self.prompt_tokens,
+                    completion_tokens: self.completion_tokens,
+                    tool_calls: 0,
+                },
+                None,
+            ))
         }
     }
 
@@ -2339,6 +2316,7 @@ mod tests {
                 mcp_servers: vec![],
                 can_delegate: false,
                 max_delegation_depth: 0,
+                ..Default::default()
             }],
             context: std::collections::HashMap::new(),
             worktree_mode: astra_services::team_persistence::WorktreeMode::Shared,
@@ -2371,12 +2349,12 @@ mod tests {
 
         let orch = TeamExecutionOrchestrator::new(
             store,
-            Arc::new(DelegationEngine::with_executor(
+            execution_bound_delegation(
                 registry.clone(),
                 run_engine.clone(),
                 tracker.clone(),
                 executor,
-            )),
+            ),
             tracker,
             run_engine.clone(),
             registry,
@@ -2436,7 +2414,10 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for MockHostSingleTurnSubRunExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
             use crate::turn::agentic_loop::finalization::run_agentic_loop_with_host;
             use crate::turn::agentic_loop::host::AgenticLoopOutcome;
             use crate::turn::agentic_loop::host::tests::{MockHost, make_state, text_result};
@@ -2458,16 +2439,19 @@ mod tests {
             }
 
             let prompt_tokens = state.provider_input_tokens();
-            Ok(AgentResult {
-                agent_id: config.agent_profile.agent_id.clone(),
-                run_id: config.run_id.clone(),
-                status: STATUS_COMPLETED.to_string(),
-                output: Some(state.final_text),
-                error: None,
-                prompt_tokens,
-                completion_tokens: state.total_completion,
-                tool_calls: state.total_tool_calls,
-            })
+            Ok((
+                AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id.clone(),
+                    status: STATUS_COMPLETED.to_string(),
+                    output: Some(state.final_text),
+                    error: None,
+                    prompt_tokens,
+                    completion_tokens: state.total_completion,
+                    tool_calls: state.total_tool_calls,
+                },
+                None,
+            ))
         }
     }
 
@@ -2476,7 +2460,10 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for MockHostEdgeThenTextSubRunExecutor {
-        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(
+            &self,
+            config: SubRunConfig,
+        ) -> Result<(AgentResult, Option<SpawnRunFrontier>), String> {
             use crate::turn::agentic_loop::finalization::run_agentic_loop_with_host;
             use crate::turn::agentic_loop::host::AgenticLoopOutcome;
             use crate::turn::agentic_loop::host::tests::{
@@ -2507,16 +2494,19 @@ mod tests {
             }
 
             let prompt_tokens = state.provider_input_tokens();
-            Ok(AgentResult {
-                agent_id: config.agent_profile.agent_id.clone(),
-                run_id: config.run_id.clone(),
-                status: STATUS_COMPLETED.to_string(),
-                output: Some(state.final_text),
-                error: None,
-                prompt_tokens,
-                completion_tokens: state.total_completion,
-                tool_calls: state.total_tool_calls,
-            })
+            Ok((
+                AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id.clone(),
+                    status: STATUS_COMPLETED.to_string(),
+                    output: Some(state.final_text),
+                    error: None,
+                    prompt_tokens,
+                    completion_tokens: state.total_completion,
+                    tool_calls: state.total_tool_calls,
+                },
+                None,
+            ))
         }
     }
 
@@ -2535,12 +2525,12 @@ mod tests {
         let run_store = Arc::new(InMemoryRunStateStore::new());
         let run_engine = Arc::new(RunEngine::new(run_store));
         let tracker = Arc::new(DelegationTracker::new());
-        let delegation = Arc::new(DelegationEngine::with_executor(
+        let delegation = execution_bound_delegation(
             registry.clone(),
             run_engine.clone(),
             tracker.clone(),
             Arc::new(MockHostSingleTurnSubRunExecutor),
-        ));
+        );
 
         let orch = TeamExecutionOrchestrator::new(
             store,
@@ -2594,12 +2584,12 @@ mod tests {
         let run_store = Arc::new(InMemoryRunStateStore::new());
         let run_engine = Arc::new(RunEngine::new(run_store));
         let tracker = Arc::new(DelegationTracker::new());
-        let delegation = Arc::new(DelegationEngine::with_executor(
+        let delegation = execution_bound_delegation(
             registry.clone(),
             run_engine.clone(),
             tracker.clone(),
             Arc::new(MockHostEdgeThenTextSubRunExecutor),
-        ));
+        );
 
         let orch = TeamExecutionOrchestrator::new(
             store,

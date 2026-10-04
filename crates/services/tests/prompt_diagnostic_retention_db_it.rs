@@ -129,6 +129,7 @@ async fn prompt_expiry_retains_an_expired_reuse_prefix_ancestor() {
     let plan = plan_prompt_request(PromptRequestPlanInput {
         user_id: &user_id,
         session_id: &session_id,
+        run_id: None,
         turn: 3,
         round: 0,
         attempt: 0,

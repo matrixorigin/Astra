@@ -1,5 +1,10 @@
 use super::*;
 use crate::orchestration::ProgressEventType;
+use astra_services::skills::{
+    SkillInfoRecord, SkillListCursor, SkillListItem, SkillListRecord, SkillPublishRequestData,
+    SkillRecord, SkillService, SkillStatusRecord, SkillVersionRecord,
+};
+use async_trait::async_trait;
 
 #[path = "trace_ingestion_tests.rs"]
 mod trace_ingestion_tests;
@@ -2465,6 +2470,7 @@ impl UserIntentProvider for StaticRunControlProvider {
 
 struct ActiveTestModelService {
     base_url: String,
+    offering_requests: StdMutex<Vec<String>>,
     batch_requests: StdMutex<Vec<Vec<String>>>,
     catalog_requests: StdMutex<usize>,
 }
@@ -2473,6 +2479,7 @@ impl ActiveTestModelService {
     fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
+            offering_requests: StdMutex::new(Vec::new()),
             batch_requests: StdMutex::new(Vec::new()),
             catalog_requests: StdMutex::new(0),
         }
@@ -2632,6 +2639,10 @@ impl astra_services::ModelService for ActiveTestModelService {
         &self,
         offering_id: String,
     ) -> Result<astra_services::ResolvedModelOffering, (StatusCode, Json<ErrorResponse>)> {
+        self.offering_requests
+            .lock()
+            .unwrap()
+            .push(offering_id.clone());
         if offering_id != "model-test-model" {
             return Err(error_response_coded(
                 StatusCode::NOT_FOUND,
@@ -3825,6 +3836,10 @@ async fn fanout_parent_receipts_are_isolated_by_user_and_session() {
         .server_agent_spawner_for_session("user-a", "session-a")
         .await;
     assert!(Arc::ptr_eq(&first.spawner, &same.spawner));
+    let delegation = service
+        .delegation_child_supervisor("user-a", "session-a")
+        .await;
+    assert!(Arc::ptr_eq(&first.spawner, &delegation));
     first
         .spawner
         .publish_fanout_fixture("review", "first", 1, None, "parent", None)
@@ -4080,6 +4095,8 @@ async fn idle_spawner_prune_revalidates_touch_and_pending_owner_before_remove() 
     }
 
     let context = crate::orchestration::SpawnContext {
+        parent_profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
+        admitted_agent_profiles: None,
         delegation_model_admission: None,
         parent_model_reasoning: None,
         parent_run_id: "prune-root".to_string(),
@@ -4207,6 +4224,8 @@ async fn shutdown_fence_reports_pending_session_child_reconciliation_after_root_
         },
     );
     let context = crate::orchestration::SpawnContext {
+        parent_profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
+        admitted_agent_profiles: None,
         delegation_model_admission: None,
         parent_model_reasoning: None,
         parent_run_id: "shutdown-root".to_string(),
@@ -4294,6 +4313,8 @@ async fn shutdown_stays_bounded_while_stalled_child_control_remains_pending() {
         },
     );
     let context = crate::orchestration::SpawnContext {
+        parent_profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
+        admitted_agent_profiles: None,
         delegation_model_admission: None,
         parent_model_reasoning: None,
         parent_run_id: "shutdown-root".to_string(),
@@ -4375,6 +4396,8 @@ async fn missing_agent_lifecycle_stream_uses_spawner_archive() {
         "transport": "server_local"
     });
     let context = crate::orchestration::SpawnContext {
+        parent_profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
+        admitted_agent_profiles: None,
         delegation_model_admission: None,
         parent_model_reasoning: None,
         parent_run_id: "root-run".to_string(),
@@ -4463,6 +4486,8 @@ async fn missing_agent_lifecycle_stream_reconstructs_waiting_child() {
     let spawner =
         DynamicAgentSpawner::new(router).with_executor(Arc::new(WaitingLifecycleExecutor));
     let context = crate::orchestration::SpawnContext {
+        parent_profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
+        admitted_agent_profiles: None,
         delegation_model_admission: None,
         parent_model_reasoning: None,
         parent_run_id: "root-run".to_string(),
@@ -5060,6 +5085,8 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
         execution_metadata: None,
         is_fork_child: false,
         delegation_chain: Vec::new(),
+        profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
+        admitted_agent_profiles: None,
         work_item: None,
     }
 }
@@ -5124,6 +5151,8 @@ fn test_spawn_runtime_context(parent_run_id: &str, user_id: &str) -> ServerSpawn
 
 fn test_spawn_context(parent_run_id: &str) -> crate::orchestration::SpawnContext {
     crate::orchestration::SpawnContext {
+        parent_profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
+        admitted_agent_profiles: None,
         delegation_model_admission: None,
         parent_model_reasoning: None,
         parent_run_id: parent_run_id.into(),
@@ -7099,6 +7128,8 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
         .set_runtime_context(test_spawn_runtime_context("root-run", "user-a"))
         .await;
     let context = crate::orchestration::SpawnContext {
+        parent_profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
+        admitted_agent_profiles: None,
         delegation_model_admission: None,
         parent_model_reasoning: None,
         parent_run_id: "root-run".to_string(),
@@ -8721,6 +8752,94 @@ fn spawn_child_constraints_intersect_parent_and_agent_allowlists() {
         .into_iter()
         .collect()
     );
+}
+
+#[tokio::test]
+async fn admitted_spawn_member_skills_cannot_expand_parent_scope() {
+    use crate::turn::skill_tool::{SkillContext, execute_skill_inline};
+
+    let mut config = test_spawn_run_config(vec!["read_file"], false);
+    let mut member = AgentProfile::new("member", "Member", AgentTier::System);
+    member.skill_filter = vec!["a".into(), "outside-parent".into()];
+    config.profile_authority =
+        crate::orchestration::spawner::ParentProfileAuthority::AdmittedMember {
+            profile_id: "member".into(),
+            ancestor_profile_ids: Vec::new(),
+        };
+    config.admitted_agent_profiles = Some(Arc::new(astra_services::runs::AgentProfileSnapshot {
+        owner_user_id: "u1".into(),
+        source_team_id: "team".into(),
+        lead_agent_id: None,
+        profiles: vec![member],
+    }));
+    let mut parent = RequestConstraints::default();
+    parent.allowed_skills = Some(["a".to_string(), "b".to_string()].into_iter().collect());
+    let constraints = spawn_child_request_constraints(&parent, &config).unwrap();
+    assert_eq!(
+        constraints.allowed_skills.as_ref().unwrap(),
+        &["a".to_string()].into_iter().collect()
+    );
+
+    let provider = astra_skills::providers::bundled::BundledSkillProvider::new();
+    for name in ["a", "b", "outside-parent"] {
+        provider
+            .register_from_skill_md(&format!(
+                "---\nname: {name}\ndescription: Scoped skill fixture\n---\nInstruction body for {name}."
+            ))
+            .unwrap();
+    }
+    let mut registry = crate::skills::UnifiedSkillRegistry::new();
+    registry.add_provider(Box::new(provider));
+    registry.discover_all().await.unwrap();
+    for name in ["a", "b", "outside-parent"] {
+        registry.load(name).await.unwrap();
+    }
+    let resolver: Arc<dyn crate::turn::skill_tool::SkillResolver> =
+        Arc::new(crate::skills::UnifiedSkillResolver::new(Arc::new(registry)));
+    let skill_context = SkillContext::default();
+    let baseline = execute_skill_inline(
+        resolver.as_ref(),
+        "skill",
+        &json!({"skill_name": "b"}),
+        &skill_context,
+    )
+    .await;
+    assert!(baseline.success);
+    assert!(baseline.activation.is_some());
+
+    // Use the same resolver boundary as ServerSubRunExecutor, then execute
+    // real skill calls: exclusion must prevent activation, not just listing.
+    let scoped = apply_normalized_skill_allowlist(Some(resolver), &constraints)
+        .unwrap()
+        .unwrap();
+    for name in ["a", "b", "outside-parent"] {
+        let result = execute_skill_inline(
+            scoped.as_ref(),
+            "skill",
+            &json!({"skill_name": name}),
+            &skill_context,
+        )
+        .await;
+        assert_eq!(result.success, name == "a", "{name}: {}", result.output);
+        assert_eq!(result.activation.is_some(), name == "a");
+        if name != "a" {
+            assert!(matches!(
+                scoped.resolve_for_execution(name).await,
+                Err(crate::skills::SkillError::PermissionDenied(_))
+            ));
+            assert!(
+                !result
+                    .output
+                    .contains(&format!("Instruction body for {name}."))
+            );
+        }
+    }
+    config.profile_authority =
+        crate::orchestration::spawner::ParentProfileAuthority::AdmittedMember {
+            profile_id: "missing".into(),
+            ancestor_profile_ids: Vec::new(),
+        };
+    assert!(spawn_child_request_constraints(&parent, &config).is_err());
 }
 
 #[test]
@@ -11042,7 +11161,7 @@ async fn non_streaming_user_convergence_cancels_archived_child_and_grandchild_ex
         .await
         .unwrap();
     engine
-        .start_run_ext(
+        .start_run_ext_with_context(
             "archived-child",
             "user-1",
             "session-1",
@@ -11050,11 +11169,15 @@ async fn non_streaming_user_convergence_cancels_archived_child_and_grandchild_ex
             None,
             Some("reviewer"),
             None,
+            crate::server::run::engine::RunStartContext {
+                child_runtime_id: Some("reviewer".into()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
     engine
-        .start_run_ext(
+        .start_run_ext_with_context(
             "archived-grandchild",
             "user-1",
             "session-1",
@@ -11062,6 +11185,10 @@ async fn non_streaming_user_convergence_cancels_archived_child_and_grandchild_ex
             None,
             Some("verifier"),
             None,
+            crate::server::run::engine::RunStartContext {
+                child_runtime_id: Some("verifier".into()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -11219,7 +11346,7 @@ async fn subrun_user_convergence_reaches_recovered_durable_grandchild_absent_fro
         .await
         .unwrap();
     engine
-        .start_run_ext(
+        .start_run_ext_with_context(
             "local-child",
             "user-1",
             "session-1",
@@ -11227,6 +11354,10 @@ async fn subrun_user_convergence_reaches_recovered_durable_grandchild_absent_fro
             None,
             Some("local-worker"),
             None,
+            crate::server::run::engine::RunStartContext {
+                child_runtime_id: Some("local-worker".into()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -12214,8 +12345,11 @@ fn build_durable_event_pressure_batch(
         .iter()
         .map(durable_run_event_estimated_bytes)
         .sum::<usize>();
-    let budgeted_events =
-        enforce_durable_run_event_batch_budget_with_budget(durable_candidates, budget);
+    let budgeted_events = enforce_durable_run_event_batch_budget_with_budget(
+        durable_candidates,
+        budget,
+        |_, summary| summary,
+    );
     let budgeted_bytes = budgeted_events
         .iter()
         .map(durable_run_event_estimated_bytes)
@@ -12430,6 +12564,8 @@ async fn seed_lifecycle_run_for_pause_resume_it(
 
 fn test_request(message: &str) -> ChatRequestData {
     ChatRequestData {
+        agent_profile_selection: None,
+        admitted_agent_profiles: None,
         model_catalog_reader: None,
         message: message.to_string(),
         conversation_authority: None,
@@ -12684,9 +12820,12 @@ async fn work_runtime_binding_validation_is_explicit_owner_safe_and_branch_exact
     .with_run_engine(service.run_engine.clone())
     .with_pool(pool.clone());
     let mut child_config = SubRunConfig {
+        profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
         max_output_tokens: None,
         execution_owner_generation: None,
+        cancellation_binding_id: None,
         execution_owner_generation_sink: None,
+        child_supervisor: None,
         run_id: child_run_id.clone(),
         parent_run_id: run_id.clone(),
         agent_profile: AgentProfile::new("work-child", "Work child", AgentTier::User),
@@ -12710,6 +12849,7 @@ async fn work_runtime_binding_validation_is_explicit_owner_safe_and_branch_exact
         progress_emitter: None,
         live_event_sink: None,
         cancel_token: None,
+        execution_deadline: None,
         inherited_prefix: None,
         execution_metadata: None,
         delegation_chain: Vec::new(),
@@ -13376,10 +13516,13 @@ fn test_executable_subrun_config(
     admitted_model_execution: astra_services::AdmittedModelExecution,
 ) -> SubRunConfig {
     SubRunConfig {
+        profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
         max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: run_id.to_string(),
+        cancellation_binding_id: None,
+        child_supervisor: None,
         parent_run_id: "authority-parent-run".to_string(),
         agent_profile: AgentProfile::new(run_id, "Authority child", AgentTier::User),
         task: "Return one short result.".to_string(),
@@ -13402,6 +13545,7 @@ fn test_executable_subrun_config(
         progress_emitter: None,
         live_event_sink: None,
         cancel_token: None,
+        execution_deadline: None,
         inherited_prefix: None,
         execution_metadata: None,
         delegation_chain: Vec::new(),
@@ -13409,6 +13553,96 @@ fn test_executable_subrun_config(
         #[cfg(feature = "harness")]
         harness_sink: None,
     }
+}
+
+#[tokio::test]
+async fn precreated_child_runtime_reuses_admitted_controls_and_retains_pause() {
+    let service = test_service();
+    let entry = service
+        .server_agent_spawner_for_session("user-1", "session-1")
+        .await;
+    let execution = astra_services::AdmittedModelExecution::from_endpoint(
+        "test-offering".into(),
+        "test-model".into(),
+        "openai".into(),
+        "http://127.0.0.1:1/chat/completions".into(),
+        "Bearer test".into(),
+        None,
+        128_000,
+    );
+    let mut config = test_executable_subrun_config("adopted-child", execution.clone());
+    config.execution_owner_generation = Some(7);
+    config.cancellation_binding_id = Some("adopted-child-binding".into());
+    config.child_supervisor = Some(Arc::downgrade(&entry.spawner));
+    config.execution_owner_generation_sink =
+        Some(Arc::new(ExecutionOwnerGenerationSink::preparing(7)));
+    let pause = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(CancellationToken::new());
+    config.pause_flag = Some(pause.clone());
+    config.cancel_token = Some(cancel.clone());
+    let _guard = entry
+        .executor
+        .bind_admitted_child_runtime(&config, &execution)
+        .await
+        .unwrap();
+    let context = entry
+        .executor
+        .runtime_context_for_parent_run(&config.run_id)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(context.pause_flag.as_ref().unwrap(), &pause));
+    assert!(Arc::ptr_eq(context.cancel_token.as_ref().unwrap(), &cancel));
+    assert_eq!(
+        context.trace_context.turn_id,
+        server_trace_context(&config.user_id, &config.session_id, &config.run_id, 0).turn_id
+    );
+    assert_eq!(
+        context.trace_context.causal_chain_id,
+        server_trace_context(
+            &config.user_id,
+            &config.session_id,
+            &config.parent_run_id,
+            0
+        )
+        .causal_chain_id
+    );
+    assert!(Arc::ptr_eq(
+        &context.spawner.upgrade().unwrap(),
+        &entry.spawner
+    ));
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            context
+                .execution_owner_generation
+                .wait_until_published_or_stopped()
+        )
+        .await
+        .unwrap(),
+        ExecutionOwnerGenerationPublication::Acquired(7),
+    );
+    entry
+        .executor
+        .settle_admitted_child_runtime(&config.run_id, "adopted-child-binding", STATUS_PAUSED)
+        .await;
+    assert!(
+        entry
+            .executor
+            .runtime_context_for_parent_run(&config.run_id)
+            .await
+            .is_ok()
+    );
+    entry
+        .executor
+        .settle_admitted_child_runtime(&config.run_id, "adopted-child-binding", STATUS_COMPLETED)
+        .await;
+    assert!(
+        entry
+            .executor
+            .runtime_context_for_parent_run(&config.run_id)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -13594,7 +13828,7 @@ async fn durable_subrun_retry_requires_the_exact_prestarted_generation_before_pr
         .expect("prestart exact child")
         .expect("durable authority");
     exact.execution_owner_generation = Some(exact_authority.owner_generation);
-    let exact_result = executor
+    let (exact_result, _) = executor
         .execute(exact)
         .await
         .expect("exact prestarted authority reaches provider");
@@ -13769,7 +14003,7 @@ async fn durable_subrun_user_cancel_during_authority_confirmation_projects_durab
     );
     cancel_token.cancel();
 
-    let result = tokio::time::timeout(Duration::from_secs(1), execution)
+    let (result, _) = tokio::time::timeout(Duration::from_secs(1), execution)
         .await
         .expect("activation cancellation must settle promptly")
         .expect("subrun executor must not panic")
@@ -13835,7 +14069,7 @@ async fn durable_subrun_refused_activation_renewal_projects_exact_user_marker() 
             .expect("record cross-pod user cancellation")
     );
 
-    let result = executor
+    let (result, _) = executor
         .execute(config)
         .await
         .expect("marker-proven activation refusal is a typed cancellation");
@@ -14135,10 +14369,13 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
     )
     .with_run_engine(run_engine.clone());
     let mut config = SubRunConfig {
+        profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
         max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: "child-run".to_string(),
+        cancellation_binding_id: None,
+        child_supervisor: None,
         parent_run_id: "parent-run".to_string(),
         agent_profile: AgentProfile::new("child-agent", "Child", AgentTier::User),
         task: "verify the durable route".to_string(),
@@ -14161,6 +14398,7 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
         progress_emitter: None,
         live_event_sink: None,
         cancel_token: None,
+        execution_deadline: None,
         inherited_prefix: None,
         execution_metadata: None,
         delegation_chain: Vec::new(),
@@ -14355,10 +14593,13 @@ async fn generic_subrun_does_not_inherit_parent_canonical_work_identity() {
     )
     .with_run_engine(run_engine.clone());
     let mut config = SubRunConfig {
+        profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
         max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: "generic-child-run".to_string(),
+        cancellation_binding_id: None,
+        child_supervisor: None,
         parent_run_id: "work-parent-run".to_string(),
         agent_profile: AgentProfile::new("generic-child", "Generic child", AgentTier::User),
         task: "perform an independent delegated observation".to_string(),
@@ -14381,6 +14622,7 @@ async fn generic_subrun_does_not_inherit_parent_canonical_work_identity() {
         progress_emitter: None,
         live_event_sink: None,
         cancel_token: None,
+        execution_deadline: None,
         inherited_prefix: None,
         execution_metadata: None,
         delegation_chain: Vec::new(),
@@ -14388,6 +14630,47 @@ async fn generic_subrun_does_not_inherit_parent_canonical_work_identity() {
         #[cfg(feature = "harness")]
         harness_sink: None,
     };
+
+    let cancelled = Arc::new(tokio_util::sync::CancellationToken::new());
+    cancelled.cancel();
+    config.cancel_token = Some(cancelled);
+    assert!(
+        executor
+            .ensure_durable_subrun_started(&config, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        run_engine
+            .load_run("user-1", &config.run_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    config.cancel_token = None;
+    config.execution_deadline = Some(
+        astra_services::runs::ExecutionDeadlineAuthority::from_budget_at(
+            astra_services::runs::ExecutionTimeBudget {
+                remaining_seconds: 0,
+            },
+            0,
+        )
+        .unwrap(),
+    );
+    assert!(
+        executor
+            .ensure_durable_subrun_started(&config, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        run_engine
+            .load_run("user-1", &config.run_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    config.execution_deadline = None;
 
     let authority = executor
         .ensure_durable_subrun_started(&config, None)
@@ -14454,6 +14737,7 @@ async fn server_subrun_rejects_work_item_without_parent_work_before_child_insert
     )
     .with_run_engine(run_engine.clone());
     let config = SubRunConfig {
+        profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
         max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
@@ -14461,6 +14745,8 @@ async fn server_subrun_rejects_work_item_without_parent_work_before_child_insert
         parent_run_id: "parent-run".to_string(),
         agent_profile: AgentProfile::new("child-agent", "Child", AgentTier::User),
         task: "attempt an unbound assignment".to_string(),
+        cancellation_binding_id: None,
+        child_supervisor: None,
         session_id: "session-1".to_string(),
         user_id: "user-1".to_string(),
         previous_output: None,
@@ -14480,6 +14766,7 @@ async fn server_subrun_rejects_work_item_without_parent_work_before_child_insert
         progress_emitter: None,
         live_event_sink: None,
         cancel_token: None,
+        execution_deadline: None,
         inherited_prefix: None,
         execution_metadata: None,
         delegation_chain: Vec::new(),
@@ -14691,15 +14978,44 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
         )
         .await
         .expect("pause child before settlement");
-    let terminals = durable_subrun_host_terminal_events(
-        vec![json!({
+    let mut host_events = vec![
+        json!({
             "type": "tool_call_end",
             "call_id": "edge-child-call",
             "status": "completed",
             "transport": "edge_ledger",
             "_astra_durable_event_committed": true,
-        })],
+        }),
+        json!({
+            "type": "agent_communication",
+            "schema_version": "astra.agent_communication.v1",
+            "direction": "received", "message_id": "answer-1",
+            "observed_by": {"run_id": "paused-child", "agent_id": "child"},
+            "from": {"run_id": "session-1", "agent_id": "root"},
+            "to": {"kind": "direct", "address": {"run_id": "paused-child", "agent_id": "child"}},
+            "payload_kind": "response", "related_message_id": "question-1",
+            "correlation_id": "question-1", "response_accepted": true,
+            "timestamp_ms": 1,
+        }),
+    ];
+    host_events.extend(
+        (0..=MAX_DURABLE_RUN_EVENT_BATCH_ROWS)
+            .map(|index| explain_turn_fact("paused-child", &format!("paused-fact-{index}"))),
+    );
+    let terminals = durable_subrun_host_terminal_events(
+        host_events,
         Some(authority.owner_generation),
+        "paused-child",
+    );
+    let mut progress = terminals[1].clone();
+    progress["payload_kind"] = json!("progress");
+    assert!(
+        durable_subrun_host_terminal_events(
+            vec![progress, json!({"type": "agent_communication"})],
+            Some(authority.owner_generation),
+            "child-run",
+        )
+        .is_empty()
     );
 
     for _ in 0..2 {
@@ -14736,6 +15052,69 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
         .expect("load paused child")
         .expect("paused child");
     assert_eq!(durable.status, STATUS_PAUSED);
+    let communication: Vec<_> = durable
+        .events
+        .iter()
+        .filter(|event| durable_event_type(event) == Some("agent_communication"))
+        .collect();
+    assert_eq!(
+        communication.len(),
+        1,
+        "settlement retry must not duplicate message evidence"
+    );
+    assert_eq!(communication[0]["message_id"], "answer-1");
+    assert_eq!(communication[0]["related_message_id"], "question-1");
+    assert_eq!(communication[0]["observed_by"]["run_id"], "paused-child");
+    assert_eq!(communication[0]["from"]["run_id"], "session-1");
+    let public = crate::server::run::handlers::transform_stream_run_events_for_client(
+        "paused-child",
+        durable.events.clone(),
+    );
+    assert!(
+        public
+            .iter()
+            .filter(|event| matches!(
+                event["type"].as_str(),
+                Some("explain_analyze" | "stream_gap")
+            ))
+            .all(|event| event.get("idempotency_key").is_none())
+    );
+    let facts = public
+        .iter()
+        .filter_map(|event| astra_turn_types::decode_explain_analyze_wire(event).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(facts.len(), MAX_DURABLE_RUN_EVENT_BATCH_ROWS - 3);
+    assert!(facts.iter().all(|fact| fact.run_id == "paused-child"));
+    assert_eq!(
+        facts
+            .iter()
+            .map(|fact| &fact.event_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        facts.len()
+    );
+    let gaps = public
+        .iter()
+        .filter(|event| event["type"] == "stream_gap")
+        .collect::<Vec<_>>();
+    assert_eq!(gaps.len(), 1, "settlement retry must not duplicate the gap");
+    assert_eq!(gaps[0]["explain_analyze_recovered"], false);
+    assert_eq!(gaps[0]["dropped_event_count"], 4);
+    assert_eq!(gaps[0]["run_id"], "paused-child");
+    assert_eq!(gaps[0]["repair"], "refresh_run_snapshot");
+    assert!(
+        ServerSubRunExecutor::persist_durable_subrun_tool_terminals(
+            &run_engine,
+            "user-1",
+            "session-1",
+            "paused-child",
+            authority.owner_generation + 1,
+            &terminals,
+        )
+        .await
+        .is_err(),
+        "a different generation must not publish these observations"
+    );
     let stored: Vec<_> = durable
         .events
         .iter()
@@ -14786,6 +15165,7 @@ async fn delegated_subrun_waiting_settlement_orders_tool_terminal_before_partial
             "transport": "edge_ledger",
         })],
         Some(authority.owner_generation),
+        "child-run",
     );
     assert_eq!(
         ServerSubRunExecutor::persist_durable_subrun_tool_terminals(
@@ -14871,6 +15251,7 @@ async fn delegated_subrun_retries_active_event_index_cas_loss_without_dropping_t
             "transport": "edge_ledger",
         })],
         Some(authority.owner_generation),
+        "child-run",
     );
 
     assert_eq!(
@@ -14950,6 +15331,7 @@ async fn delegated_subrun_cancel_wins_generation_fenced_terminal_append() {
             "transport": "edge_ledger",
         })],
         Some(authority.owner_generation),
+        "child-run",
     );
 
     assert_eq!(
@@ -15034,10 +15416,13 @@ async fn server_subrun_error_after_durable_start_commits_exact_failed_terminal()
     )
     .with_run_engine(run_engine.clone());
     let config = SubRunConfig {
+        profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
         max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
         run_id: "child-safe".to_string(),
+        cancellation_binding_id: None,
+        child_supervisor: None,
         parent_run_id: "parent-run".to_string(),
         agent_profile: AgentProfile::new("child-agent", "Child", AgentTier::User),
         task: "exercise a post-admission setup failure".to_string(),
@@ -15060,6 +15445,7 @@ async fn server_subrun_error_after_durable_start_commits_exact_failed_terminal()
         progress_emitter: None,
         live_event_sink: None,
         cancel_token: None,
+        execution_deadline: None,
         inherited_prefix: None,
         execution_metadata: None,
         delegation_chain: Vec::new(),
@@ -16727,6 +17113,250 @@ async fn prepare_chat_request_rejects_unavailable_or_conflicting_model_policy_be
     );
 }
 
+fn lead_model_snapshot(
+    owner: &str,
+    offering: Option<&str>,
+) -> Arc<astra_services::runs::AgentProfileSnapshot> {
+    let mut lead = astra_services::coordination::AgentProfile::new(
+        "lead",
+        "Lead",
+        astra_services::coordination::AgentTier::System,
+    );
+    lead.model_selection = offering.map(|offering_id| ModelSelection {
+        offering_id: offering_id.into(),
+    });
+    Arc::new(astra_services::runs::AgentProfileSnapshot {
+        owner_user_id: owner.into(),
+        source_team_id: "frozen-team".into(),
+        lead_agent_id: Some("lead".into()),
+        profiles: vec![lead],
+    })
+}
+
+#[tokio::test]
+async fn prepare_chat_request_admits_lead_default_once_below_explicit_model_policy() {
+    use astra_turn_types::{AutoModelStrategy, ModelSelector, RequestedModelPolicy};
+    let models = Arc::new(ActiveTestModelService::default());
+    let service = test_service().with_model_service(models.clone());
+    assert!(
+        service.team_store.is_none(),
+        "frozen profiles must not require a mutable Team read"
+    );
+    for policy in [
+        None,
+        Some(RequestedModelPolicy::Inherit),
+        Some(RequestedModelPolicy::Fixed {
+            selector: ModelSelector::OfferingId {
+                offering_id: "model-test-model".into(),
+            },
+        }),
+        Some(RequestedModelPolicy::Auto {
+            strategy: AutoModelStrategy::Balanced,
+        }),
+    ] {
+        let inherits = matches!(policy, None | Some(RequestedModelPolicy::Inherit));
+        let snapshot = lead_model_snapshot(
+            "u1",
+            Some(if inherits {
+                "model-test-model"
+            } else {
+                "unavailable-lead"
+            }),
+        );
+        let mut request = test_request("Use the admitted profile.");
+        request.agent_profile_selection = Some(astra_services::runs::AgentProfileSelection {
+            team_id: "frozen-team".into(),
+            lead_agent_id: Some("lead".into()),
+        });
+        request.admitted_agent_profiles = Some(snapshot.clone());
+        request.requested_model_policy = policy.clone();
+        if inherits {
+            // The ordinary CLI root sends no expected-name assertion. Its
+            // displayed default name is not authority over the lead Offering.
+            request.model = Some("previous-client-default".into());
+        }
+        request.model_selection = Some(ModelSelection {
+            offering_id: if inherits {
+                "unavailable-client-default"
+            } else {
+                "model-test-model"
+            }
+            .into(),
+        });
+        request.context = Some(serde_json::Map::from_iter([(
+            "thinking".into(),
+            json!({"mode":"model_default"}),
+        )]));
+        models.offering_requests.lock().unwrap().clear();
+        let prepared = service.prepare_chat_request("u1", request).await.unwrap();
+        assert_eq!(prepared.requested_model_policy, policy);
+        assert!(Arc::ptr_eq(
+            prepared.admitted_agent_profiles.as_ref().unwrap(),
+            &snapshot
+        ));
+        assert_eq!(
+            prepared.model_selection.as_ref().unwrap().offering_id,
+            "model-test-model"
+        );
+        assert_eq!(
+            prepared
+                .resolved_model_selection
+                .as_ref()
+                .unwrap()
+                .offering_id,
+            "model-test-model"
+        );
+        assert_eq!(
+            prepared
+                .admitted_model_execution
+                .as_ref()
+                .unwrap()
+                .offering_id,
+            "model-test-model"
+        );
+        assert_eq!(prepared.model.as_deref(), Some("test-model"));
+        assert!(prepared.expected_model_name.is_none());
+        assert_eq!(
+            AgenticRunLifecycleService::root_generation_controls(&prepared)
+                .unwrap()
+                .thinking,
+            astra_turn_core::thinking_config::ThinkingConfig::ModelDefault
+        );
+        assert_eq!(
+            *models.offering_requests.lock().unwrap(),
+            vec!["model-test-model".to_string()]
+        );
+    }
+    // ServerDefault is an input mode, not a second selector once a lead default
+    // supplies the Offering. Do not first resolve the global catalog default.
+    let mut request = test_request("Use the lead default.");
+    request.model_selection_mode = ModelSelectionMode::ServerDefault;
+    request.model_selection = None;
+    request.model = None;
+    request.admitted_agent_profiles = Some(lead_model_snapshot("u1", Some("model-test-model")));
+    models.offering_requests.lock().unwrap().clear();
+    let prepared = service.prepare_chat_request("u1", request).await.unwrap();
+    assert_eq!(
+        prepared.model_selection_mode,
+        ModelSelectionMode::ExplicitOffering
+    );
+    assert_eq!(
+        *models.offering_requests.lock().unwrap(),
+        vec!["model-test-model".to_string()]
+    );
+    assert_eq!(*models.catalog_requests.lock().unwrap(), 0);
+    assert!(service.runs.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn prepare_chat_request_profile_defaults_preserve_fail_closed_identity_guards() {
+    let models = Arc::new(ActiveTestModelService::default());
+    let service = test_service().with_model_service(models.clone());
+    for (owner, offering, expected_status, expected_calls) in [
+        (
+            "other-user",
+            "model-test-model",
+            StatusCode::BAD_REQUEST,
+            Vec::new(),
+        ),
+        (
+            "u1",
+            "unavailable-lead",
+            StatusCode::NOT_FOUND,
+            vec!["unavailable-lead".to_string()],
+        ),
+    ] {
+        let mut request = test_request("Do not substitute another model.");
+        request.admitted_agent_profiles = Some(lead_model_snapshot(owner, Some(offering)));
+        models.offering_requests.lock().unwrap().clear();
+        let error = service
+            .prepare_chat_request("u1", request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, expected_status);
+        assert_eq!(*models.offering_requests.lock().unwrap(), expected_calls);
+    }
+    for select_lead in [false, true] {
+        let mut snapshot = lead_model_snapshot("u1", None);
+        if !select_lead {
+            let snapshot = Arc::make_mut(&mut snapshot);
+            snapshot.lead_agent_id = None;
+            snapshot.profiles[0].model_selection = Some(ModelSelection {
+                offering_id: "unavailable-member".into(),
+            });
+        }
+        let mut request = test_request("Keep the ordinary root model.");
+        request.admitted_agent_profiles = Some(snapshot);
+        models.offering_requests.lock().unwrap().clear();
+        let prepared = service.prepare_chat_request("u1", request).await.unwrap();
+        assert_eq!(
+            prepared.model_selection.as_ref().unwrap().offering_id,
+            "model-test-model"
+        );
+        assert_eq!(
+            *models.offering_requests.lock().unwrap(),
+            vec!["model-test-model".to_string()]
+        );
+    }
+    let mut conflicting = test_request("Do not repair conflicting input.");
+    conflicting.model_selection_mode = ModelSelectionMode::ServerDefault;
+    conflicting.admitted_agent_profiles = Some(lead_model_snapshot("u1", Some("model-test-model")));
+    models.offering_requests.lock().unwrap().clear();
+    let error = service
+        .prepare_chat_request("u1", conflicting)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("model_selection_invalid")
+    );
+    assert!(models.offering_requests.lock().unwrap().is_empty());
+    for already_admitted in [false, true] {
+        let mut untrusted = test_request("Do not discard untrusted model material.");
+        untrusted.admitted_agent_profiles =
+            Some(lead_model_snapshot("u1", Some("model-test-model")));
+        if already_admitted {
+            untrusted.admitted_model_execution = Some(test_admitted_model_execution());
+        } else {
+            untrusted.resolved_model_selection = Some(ResolvedModelSelection {
+                offering_id: "model-test-model".into(),
+                model_name: "untrusted-name".into(),
+                source_identity: None,
+            });
+        }
+        let error = service
+            .prepare_chat_request("u1", untrusted)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some("model_selection_invalid")
+        );
+        assert!(models.offering_requests.lock().unwrap().is_empty());
+    }
+    for policy in [None, Some(astra_turn_types::RequestedModelPolicy::Inherit)] {
+        let mut expected_identity = test_request("Keep the expected model assertion.");
+        expected_identity.admitted_agent_profiles =
+            Some(lead_model_snapshot("u1", Some("model-test-model")));
+        expected_identity.requested_model_policy = policy;
+        expected_identity.expected_model_name = Some("previous-model".into());
+        models.offering_requests.lock().unwrap().clear();
+        let error = service
+            .prepare_chat_request("u1", expected_identity)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some("model_identity_changed")
+        );
+        assert_eq!(
+            *models.offering_requests.lock().unwrap(),
+            vec!["model-test-model".to_string()]
+        );
+    }
+    assert!(service.runs.read().await.is_empty());
+}
+
 #[test]
 fn delegated_model_handoff_requires_authenticated_user_and_session() {
     let source = astra_turn_types::DelegationUserRequirementSource {
@@ -17146,48 +17776,90 @@ fn runtime_executor_authorization_requires_versioned_transport_and_matching_scop
 
 #[tokio::test]
 async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_gateway() {
-    let service = test_service();
-    let mut request = prepared_test_request("hello");
-    request.provider_runtime_authorized = true;
-    request.admitted_model_execution = None;
-    request.runtime_auth = Some(RuntimeAuthRequest {
-        authorization: "Bearer runtime-grant".to_string(),
-    });
-    request.capability_descriptors =
-        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
-            model_gateway: Some(test_runtime_descriptor(
-                "moi-model-gateway",
-                "model_gateway",
-                "http://127.0.0.1/model-gateway",
-            )),
-            mcp: None,
-            skills: None,
-            edge_agent: None,
-            discovery_snapshot: None,
+    let models = Arc::new(ActiveTestModelService::default());
+    let service = test_service().with_model_service(models.clone());
+    for (lead_offering, explicit) in [
+        (None, false),
+        (Some("model-test-model"), false),
+        (Some("different-offering"), false),
+        (Some("different-offering"), true),
+    ] {
+        let mut request = prepared_test_request("hello");
+        request.admitted_agent_profiles =
+            lead_offering.map(|offering| lead_model_snapshot("u1", Some(offering)));
+        if explicit {
+            request.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Fixed {
+                selector: astra_turn_types::ModelSelector::OfferingId {
+                    offering_id: "model-test-model".into(),
+                },
+            });
+        }
+        request.provider_runtime_authorized = true;
+        request.admitted_model_execution = None;
+        request.runtime_auth = Some(RuntimeAuthRequest {
+            authorization: "Bearer runtime-grant".to_string(),
         });
+        request.capability_descriptors =
+            Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+                model_gateway: Some(test_runtime_descriptor(
+                    "moi-model-gateway",
+                    "model_gateway",
+                    "http://127.0.0.1/model-gateway",
+                )),
+                mcp: None,
+                skills: None,
+                edge_agent: None,
+                discovery_snapshot: None,
+            });
 
-    let prepared = service
-        .prepare_chat_request("u1", request)
-        .await
-        .expect("provider descriptor should become admitted_model_execution");
-    service
-        .validate_request_constraints("u1", &prepared)
-        .await
-        .expect("normalized provider execution should satisfy run invariants");
-    assert_eq!(
-        prepared
-            .admitted_model_execution
-            .as_ref()
-            .and_then(|execution| execution.completions_url_override.as_deref()),
-        Some("http://127.0.0.1/model-gateway")
-    );
-    assert_eq!(
-        prepared
-            .admitted_model_execution
-            .as_ref()
-            .map(|execution| execution.model_name.as_str()),
-        Some("test-model")
-    );
+        let resolved = request.resolved_model_selection.clone();
+        let descriptors = serde_json::to_value(&request.capability_descriptors).unwrap();
+        let prepared = service.prepare_chat_request("u1", request).await;
+        if lead_offering == Some("different-offering") && !explicit {
+            let error = prepared.unwrap_err();
+            assert_eq!(error.0, StatusCode::CONFLICT);
+            assert_eq!(
+                error.1.0.error_code.as_deref(),
+                Some("model_offering_mismatch")
+            );
+            assert!(
+                models.offering_requests.lock().unwrap().is_empty(),
+                "provider rebinding cannot fall back to the catalog"
+            );
+            continue;
+        }
+        let prepared =
+            prepared.expect("provider descriptor should become admitted_model_execution");
+        assert_eq!(prepared.resolved_model_selection, resolved);
+        assert_eq!(
+            serde_json::to_value(&prepared.capability_descriptors).unwrap(),
+            descriptors
+        );
+        assert_eq!(
+            prepared.runtime_auth.as_ref().unwrap().authorization,
+            "Bearer runtime-grant"
+        );
+        service
+            .validate_request_constraints("u1", &prepared)
+            .await
+            .expect("normalized provider execution should satisfy run invariants");
+        assert_eq!(
+            prepared
+                .admitted_model_execution
+                .as_ref()
+                .and_then(|execution| execution.completions_url_override.as_deref()),
+            Some("http://127.0.0.1/model-gateway")
+        );
+        assert_eq!(
+            prepared
+                .admitted_model_execution
+                .as_ref()
+                .map(|execution| execution.model_name.as_str()),
+            Some("test-model")
+        );
+    }
+    assert!(models.offering_requests.lock().unwrap().is_empty());
+    assert_eq!(*models.catalog_requests.lock().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -17445,137 +18117,144 @@ async fn validate_request_constraints_rejects_agent_binding_edge_skills() {
     );
 }
 
-#[tokio::test]
-async fn build_initial_state_includes_database_skill_provider_when_wired() {
-    use astra_services::skills::{
-        SkillInfoRecord, SkillListCursor, SkillListItem, SkillListRecord, SkillPublishRequestData,
-        SkillRecord, SkillService, SkillStatusRecord, SkillVersionRecord,
-    };
-    use async_trait::async_trait;
+#[derive(Default)]
+struct MockSkillService {
+    list_calls: std::sync::atomic::AtomicUsize,
+    unsupported_calls: std::sync::atomic::AtomicUsize,
+}
 
-    #[derive(Default)]
-    struct MockSkillService {
-        list_calls: std::sync::atomic::AtomicUsize,
-        unsupported_calls: std::sync::atomic::AtomicUsize,
+impl MockSkillService {
+    async fn yield_to_current_thread() {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            sender
+                .send(())
+                .expect("current-thread progress receiver should remain live");
+        });
+        receiver
+            .await
+            .expect("current-thread progress task should complete");
     }
 
-    impl MockSkillService {
-        fn unsupported<T>(&self, operation: &str) -> Result<T, (StatusCode, Json<ErrorResponse>)> {
-            self.unsupported_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err((
-                StatusCode::NOT_IMPLEMENTED,
-                Json(ErrorResponse::new(format!(
-                    "MockSkillService::{operation} is not implemented in this test"
-                ))),
-            ))
-        }
+    fn unsupported<T>(&self, operation: &str) -> Result<T, (StatusCode, Json<ErrorResponse>)> {
+        self.unsupported_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse::new(format!(
+                "MockSkillService::{operation} is not implemented in this test"
+            ))),
+        ))
     }
+}
 
-    #[async_trait]
-    impl SkillService for MockSkillService {
-        async fn list_skills(
-            &self,
-            _user_id: String,
-            limit: u32,
-            cursor: Option<SkillListCursor>,
-        ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
-            self.list_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if cursor.is_some() {
-                return Ok(SkillListRecord {
-                    skills: Vec::new(),
-                    total: Some(1),
-                    limit,
-                    next_cursor: None,
-                });
-            }
-            Ok(SkillListRecord {
-                skills: vec![SkillListItem {
-                    skill_id: "remote-db@1.0.0".to_string(),
-                    skill_name: "remote-db".to_string(),
-                    version: "1.0.0".to_string(),
-                    description: Some("Remote DB skill".to_string()),
-                    status: Some("active".to_string()),
-                    source: Some("user".to_string()),
-                    category: Some("integration".to_string()),
-                    created_at: None,
-                }],
+#[async_trait]
+impl SkillService for MockSkillService {
+    async fn list_skills(
+        &self,
+        _user_id: String,
+        limit: u32,
+        cursor: Option<SkillListCursor>,
+    ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.list_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self::yield_to_current_thread().await;
+        if cursor.is_some() {
+            return Ok(SkillListRecord {
+                skills: Vec::new(),
                 total: Some(1),
                 limit,
                 next_cursor: None,
-            })
+            });
         }
-
-        async fn get_skill(
-            &self,
-            _user_id: String,
-            skill_id: String,
-            _version: Option<String>,
-        ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
-            if skill_id == "remote-db" || skill_id == "remote-db@1.0.0" {
-                return Ok(SkillRecord {
-                    skill_id: "remote-db@1.0.0".to_string(),
-                    skill_name: "remote-db".to_string(),
-                    version: "1.0.0".to_string(),
-                    description: Some("Remote DB skill".to_string()),
-                    metadata: Some(serde_json::json!({
-                        "skill_type": "remote",
-                        "remote_url": "http://127.0.0.1:18080/remote-skill",
-                        "forward_headers": ["authorization", "x-workspace-id"],
-                        "required_headers": ["x-workspace-id"],
-                        "when_to_use": "when task needs remote orchestration"
-                    })),
-                    created_at: None,
-                });
-            }
-            Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new("not found".to_string())),
-            ))
-        }
-
-        async fn get_skill_info(
-            &self,
-            _: String,
-            _: String,
-        ) -> Result<SkillInfoRecord, (StatusCode, Json<ErrorResponse>)> {
-            self.unsupported("get_skill_info")
-        }
-
-        async fn list_skill_versions(
-            &self,
-            _: String,
-            _: String,
-        ) -> Result<Vec<SkillVersionRecord>, (StatusCode, Json<ErrorResponse>)> {
-            self.unsupported("list_skill_versions")
-        }
-
-        async fn get_skill_status(
-            &self,
-            _: String,
-            _: u32,
-        ) -> Result<SkillStatusRecord, (StatusCode, Json<ErrorResponse>)> {
-            self.unsupported("get_skill_status")
-        }
-
-        async fn publish_skill(
-            &self,
-            _: String,
-            _: SkillPublishRequestData,
-        ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
-            self.unsupported("publish_skill")
-        }
-
-        async fn unpublish_skill(
-            &self,
-            _: String,
-            _: String,
-        ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
-            self.unsupported("unpublish_skill")
-        }
+        Ok(SkillListRecord {
+            skills: vec![SkillListItem {
+                skill_id: "remote-db@1.0.0".to_string(),
+                skill_name: "remote-db".to_string(),
+                version: "1.0.0".to_string(),
+                description: Some("Remote DB skill".to_string()),
+                status: Some("active".to_string()),
+                source: Some("user".to_string()),
+                category: Some("integration".to_string()),
+                created_at: None,
+            }],
+            total: Some(1),
+            limit,
+            next_cursor: None,
+        })
     }
 
+    async fn get_skill(
+        &self,
+        _user_id: String,
+        skill_id: String,
+        _version: Option<String>,
+    ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
+        if skill_id == "remote-db" || skill_id == "remote-db@1.0.0" {
+            return Ok(SkillRecord {
+                skill_id: "remote-db@1.0.0".to_string(),
+                skill_name: "remote-db".to_string(),
+                version: "1.0.0".to_string(),
+                description: Some("Remote DB skill".to_string()),
+                metadata: Some(serde_json::json!({
+                    "skill_type": "remote",
+                    "remote_url": "http://127.0.0.1:18080/remote-skill",
+                    "forward_headers": ["authorization", "x-workspace-id"],
+                    "required_headers": ["x-workspace-id"],
+                    "when_to_use": "when task needs remote orchestration"
+                })),
+                created_at: None,
+            });
+        }
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new("not found".to_string())),
+        ))
+    }
+
+    async fn get_skill_info(
+        &self,
+        _: String,
+        _: String,
+    ) -> Result<SkillInfoRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.unsupported("get_skill_info")
+    }
+
+    async fn list_skill_versions(
+        &self,
+        _: String,
+        _: String,
+    ) -> Result<Vec<SkillVersionRecord>, (StatusCode, Json<ErrorResponse>)> {
+        self.unsupported("list_skill_versions")
+    }
+
+    async fn get_skill_status(
+        &self,
+        _: String,
+        _: u32,
+    ) -> Result<SkillStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.unsupported("get_skill_status")
+    }
+
+    async fn publish_skill(
+        &self,
+        _: String,
+        _: SkillPublishRequestData,
+    ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+        self.unsupported("publish_skill")
+    }
+
+    async fn unpublish_skill(
+        &self,
+        _: String,
+        _: String,
+    ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+        self.unsupported("unpublish_skill")
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn build_initial_state_includes_database_skill_provider_when_wired() {
     let skill_service = Arc::new(MockSkillService::default());
     let svc = test_service().with_skill_service(skill_service.clone());
 
@@ -17604,14 +18283,48 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
         "non-empty skill allowlist should perform exactly one catalog discovery"
     );
 
-    let default_state = svc.build_initial_state(
-        "test-user",
-        &default_request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
+    skill_service
+        .list_calls
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    let default_constraints = AgenticRunLifecycleService::try_request_constraints(&default_request)
+        .expect("default request constraints");
+    let default_capabilities = svc
+        .prepare_runtime_capabilities("test-user", &default_request, &default_constraints)
+        .await
+        .expect("server skill fallback should prepare asynchronously");
+    assert_eq!(
+        skill_service
+            .list_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "runtime capability preparation should discover the database catalog once"
+    );
+    let default_edge =
+        AgenticRunLifecycleService::extract_edge_context(&default_request).expect("edge context");
+    let default_state = svc
+        .build_initial_state_inner(
+            "test-user",
+            &default_request,
+            "session-1",
+            "run-1",
+            None,
+            None,
+            None,
+            None,
+            None,
+            default_constraints,
+            &default_edge,
+            None,
+            &default_capabilities,
+            None,
+        )
+        .expect("prepared server capabilities should assemble without rediscovery");
+    assert_eq!(
+        skill_service
+            .list_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "loop assembly must consume prepared server capabilities without rediscovery"
     );
     let default_resolver = default_state
         .skills
@@ -17632,58 +18345,51 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
         "unfiltered server catalog should be available for conditional activation"
     );
 
-    let mut request = test_request("hello");
-    request.allow_skills = Some(vec!["remote-db".to_string()]);
-    let state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
-    );
-    let resolver = state
-        .skills
-        .resolver
-        .as_ref()
-        .expect("skill resolver should be configured");
-    let names: Vec<String> = resolver
-        .available_skills()
-        .into_iter()
-        .map(|s| s.name)
-        .collect();
-    assert!(
-        names.iter().any(|name| name == "remote-db"),
-        "expected database skill in available skills: {names:?}"
-    );
-
-    let resolved = resolver
-        .resolve("remote-db")
-        .expect("resolver should load database skill");
-    assert_eq!(
-        resolved.remote_url.as_deref(),
-        Some("http://127.0.0.1:18080/remote-skill")
-    );
-    assert_eq!(
-        resolved.forward_headers,
-        vec!["authorization".to_string(), "x-workspace-id".to_string()]
-    );
-    assert_eq!(
-        resolved.required_headers,
-        vec!["x-workspace-id".to_string()]
-    );
-
     let mut filtered_request = test_request("hello");
     filtered_request.allow_skills = Some(vec!["remote-db".to_string()]);
-    let filtered_state = svc.build_initial_state(
-        "test-user",
-        &filtered_request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
+    skill_service
+        .list_calls
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    let filtered_constraints =
+        AgenticRunLifecycleService::try_request_constraints(&filtered_request)
+            .expect("filtered request constraints");
+    let filtered_capabilities = svc
+        .prepare_runtime_capabilities("test-user", &filtered_request, &filtered_constraints)
+        .await
+        .expect("filtered server skill fallback should prepare asynchronously");
+    assert_eq!(
+        skill_service
+            .list_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "filtered runtime capability preparation should discover once"
+    );
+    let filtered_edge =
+        AgenticRunLifecycleService::extract_edge_context(&filtered_request).expect("edge context");
+    let filtered_state = svc
+        .build_initial_state_inner(
+            "test-user",
+            &filtered_request,
+            "session-1",
+            "run-1",
+            None,
+            None,
+            None,
+            None,
+            None,
+            filtered_constraints,
+            &filtered_edge,
+            None,
+            &filtered_capabilities,
+            None,
+        )
+        .expect("filtered prepared capabilities should assemble without rediscovery");
+    assert_eq!(
+        skill_service
+            .list_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "filtered loop assembly must not rediscover the database catalog"
     );
     assert!(
         filtered_state.skills.registry_for_activation.is_none(),
@@ -17700,9 +18406,21 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
         .map(|skill| skill.name)
         .collect();
     assert_eq!(filtered_names, vec!["remote-db".to_string()]);
-    filtered_resolver
+    let resolved = filtered_resolver
         .resolve("remote-db")
         .expect("allowed remote-db skill should resolve");
+    assert_eq!(
+        resolved.remote_url.as_deref(),
+        Some("http://127.0.0.1:18080/remote-skill")
+    );
+    assert_eq!(
+        resolved.forward_headers,
+        vec!["authorization".to_string(), "x-workspace-id".to_string()]
+    );
+    assert_eq!(
+        resolved.required_headers,
+        vec!["x-workspace-id".to_string()]
+    );
     assert_eq!(
         skill_service
             .unsupported_calls
@@ -17974,6 +18692,9 @@ async fn completed_direct_child_supersedes_launch_receipt_in_final_evaluation() 
             "children": [{"agent_id":"child@run","status":"completed"}]
         }),
     );
+    assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+    state.volatile_pending.last_mut().unwrap().payload["children"][0]["result"] =
+        serde_json::json!("check complete");
     let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
     host.direct_child_owner = Some(
         crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
@@ -18043,7 +18764,7 @@ async fn completed_direct_child_is_resolved_even_with_unrelated_interruption() {
             "schema": "direct_child_completion.v1",
             "parent_run_id": "run-1",
             "observed_by_provider": true,
-            "children": [{"agent_id":"child@run","status":"completed"}]
+            "children": [{"agent_id":"child@run","status":"completed","result":"check complete"}]
         }),
     );
     let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
@@ -18084,7 +18805,7 @@ async fn mismatched_child_owner_cannot_retire_terminal_notification() {
             "schema": "direct_child_completion.v1",
             "parent_run_id": "run-1",
             "observed_by_provider": true,
-            "children": [{"agent_id":"child@run","status":"completed"}]
+            "children": [{"agent_id":"child@run","status":"completed","result":"check complete"}]
         }),
     );
     let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
@@ -19342,7 +20063,8 @@ fn explain_recovery_gap_survives_terminal_batch_compaction() {
         "repair": "refresh_run_snapshot"});
     events.push(gap.clone());
     events.push(json!({"type": "run_finished", "status": "completed"}));
-    let retained = enforce_durable_run_event_batch_budget_with_budget(events, budget);
+    let retained =
+        enforce_durable_run_event_batch_budget_with_budget(events, budget, |_, summary| summary);
     assert!(retained.len() <= budget.row_budget);
     assert!(
         retained.contains(&gap),
@@ -20029,6 +20751,94 @@ async fn provider_stream_chat_replays_the_run_bound_to_task_ref() {
     assert_eq!(stream.session_id, "session-provider-1");
 }
 
+#[tokio::test]
+async fn idempotent_stream_replays_frozen_run_before_team_or_model_preparation() {
+    let (svc, llm) = terminal_test_service().await;
+    assert!(
+        svc.team_store.is_none(),
+        "this replay fixture must leave the mutable Team store unavailable"
+    );
+    let run_id = "frozen-team-replay";
+    let session_id = "frozen-team-replay-session";
+    let fingerprint = "a".repeat(64);
+    svc.run_engine
+        .start_run_with_context(
+            run_id,
+            "user-1",
+            session_id,
+            RunStartContext {
+                admitted_agent_profiles: Some(Arc::new(
+                    astra_services::runs::AgentProfileSnapshot {
+                        owner_user_id: "user-1".into(),
+                        source_team_id: "original-team".into(),
+                        lead_agent_id: None,
+                        profiles: vec![astra_services::coordination::AgentProfile::new(
+                            "original-member",
+                            "Member",
+                            astra_services::coordination::AgentTier::System,
+                        )],
+                    },
+                )),
+                start_request_fingerprint: Some(fingerprint.clone()),
+                ..RunStartContext::default()
+            },
+        )
+        .await
+        .expect("seed durable replay run");
+    svc.run_engine
+        .persist_status("user-1", session_id, run_id, STATUS_COMPLETED, None, None)
+        .await
+        .expect("freeze durable replay run");
+    let before = svc
+        .run_engine
+        .load_run("user-1", run_id)
+        .await
+        .expect("load frozen replay run")
+        .expect("frozen replay run exists");
+
+    let mut request = test_request("retry the frozen team run");
+    request.session_id = Some(session_id.to_string());
+    request.agent_profile_selection = Some(astra_services::runs::AgentProfileSelection {
+        team_id: "mutated-team".to_string(),
+        lead_agent_id: Some("missing-lead".to_string()),
+    });
+    request.model_selection = None;
+    request.requested_model_policy = Some(astra_turn_types::RequestedModelPolicy::Auto {
+        strategy: astra_turn_types::AutoModelStrategy::Balanced,
+    });
+    request.run_start_idempotency = Some(
+        RunStartIdempotency::new(RunStartIdempotencyKind::WorkTurn, run_id, fingerprint)
+            .expect("frozen Work turn identity"),
+    );
+
+    // The terminal fixture has no TeamPersistenceService. Preparing this
+    // request first would therefore fail on the mutable team, and the model
+    // policy is independently invalid without a fresh Offering selection.
+    let replay = ok(svc.stream_chat("user-1".to_string(), request).await);
+    assert_eq!(replay.run_id, run_id);
+    assert_eq!(replay.session_id, session_id);
+    assert!(
+        replay.event_rx.is_none(),
+        "a frozen run must be returned as a durable replay, not attached to a new live owner"
+    );
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        0,
+        "an exact replay must not execute a child or make a model request"
+    );
+
+    let after = svc
+        .run_engine
+        .load_run("user-1", run_id)
+        .await
+        .expect("reload frozen replay run")
+        .expect("frozen replay run remains durable");
+    assert_eq!(
+        after.events, before.events,
+        "replay must not create a new run"
+    );
+}
+
 #[test]
 fn provider_task_ref_identity_is_tenant_scoped_and_request_bound() {
     let svc = test_service();
@@ -20077,6 +20887,25 @@ fn provider_task_ref_identity_is_tenant_scoped_and_request_bound() {
     );
 
     request.model = None;
+    let mut previous_fingerprint = user_one.request_fingerprint().to_string();
+    for (team_id, lead) in [
+        ("team-one", None),
+        ("team-two", None),
+        ("team-two", Some("lead")),
+    ] {
+        request.agent_profile_selection = Some(astra_services::runs::AgentProfileSelection {
+            team_id: team_id.into(),
+            lead_agent_id: lead.map(str::to_string),
+        });
+        let selected = svc
+            .provider_idempotency_identity("user-1", &request)
+            .expect("valid selected profile identity")
+            .expect("provider identity");
+        assert_eq!(user_one.run_id(), selected.run_id());
+        assert_ne!(previous_fingerprint, selected.request_fingerprint());
+        previous_fingerprint = selected.request_fingerprint().to_string();
+    }
+    request.agent_profile_selection = None;
     request.work_binding = Some(astra_services::runs::WorkRuntimeBindingRequest {
         work_id: "work-1".to_string(),
         branch_id: "branch-1".to_string(),
@@ -21248,6 +22077,7 @@ fn delegated_subrun_keeps_tool_terminals_for_atomic_settlement() {
             json!({"type": "agent_progress", "status": "working"}),
         ],
         Some(7),
+        "child-run",
     );
 
     assert_eq!(durable.len(), 1);
@@ -21269,10 +22099,85 @@ fn delegated_subrun_keeps_tool_terminals_for_atomic_settlement() {
             json!({"type":"tool_call_end","call_id":"child-call-1","status":"completed"}),
         ],
         Some(7),
+        "child-run",
     );
     assert_eq!(
         reordered[1]["idempotency_key"], durable[0]["idempotency_key"],
         "terminal identity must not depend on retained subset position"
+    );
+
+    let fact = explain_turn_fact("child-run", "finished");
+    let mut started = fact.clone();
+    started["event_id"] = json!("started");
+    started["transition"] = json!("started");
+    started["elapsed_ms"] = json!(0);
+    for field in ["start_elapsed_ms", "duration_ms", "outcome"] {
+        started.as_object_mut().unwrap().remove(field);
+    }
+    let explain = durable_subrun_host_terminal_events(
+        vec![fact.clone(), started.clone()],
+        Some(7),
+        "child-run",
+    );
+    assert_eq!(explain.len(), 2);
+    assert_eq!(explain[0]["idempotency_key"], "subrun-explain:7:finished");
+    assert_eq!(explain[1]["idempotency_key"], "subrun-explain:7:started");
+    let reversed =
+        durable_subrun_host_terminal_events(vec![started, fact.clone()], Some(7), "child-run");
+    assert_eq!(reversed[0], explain[1]);
+    assert_eq!(reversed[1], explain[0]);
+    let public =
+        crate::server::run::handlers::transform_stream_run_events_for_client("child-run", explain);
+    let decoded = astra_turn_types::decode_explain_analyze_wire(&public[0]).unwrap();
+    assert_eq!(decoded.run_id, "child-run");
+    assert_eq!(decoded.event_id, "finished");
+    assert!(astra_turn_types::decode_explain_analyze_wire(&public[1]).is_ok());
+    assert!(public[0].get("idempotency_key").is_none());
+    assert!(durable_subrun_host_terminal_events(vec![fact], Some(7), "other-child").is_empty());
+
+    let facts = (0..=MAX_DURABLE_RUN_EVENT_BATCH_ROWS)
+        .map(|index| explain_turn_fact("child-run", &format!("finished-{index}")))
+        .collect::<Vec<_>>();
+    let budgeted = durable_subrun_host_terminal_events(facts.clone(), Some(7), "child-run");
+    assert_eq!(budgeted.len(), MAX_DURABLE_RUN_EVENT_BATCH_ROWS);
+    let gap = budgeted
+        .iter()
+        .find(|event| durable_event_type(event) == Some("stream_gap"))
+        .unwrap();
+    assert_eq!(gap["data"]["dropped_event_count"], 2);
+    assert_eq!(gap["data"]["explain_analyze_recovered"], false);
+    assert_eq!(
+        durable_subrun_host_terminal_events(facts.clone(), Some(7), "child-run"),
+        budgeted,
+    );
+    let mut changed = facts.clone();
+    changed[0]["event_id"] = json!("different-fact");
+    let other = durable_subrun_host_terminal_events(changed, Some(7), "child-run");
+    let other_gap = other
+        .iter()
+        .find(|event| durable_event_type(event) == Some("stream_gap"))
+        .unwrap();
+    assert_ne!(gap["idempotency_key"], other_gap["idempotency_key"]);
+    assert!(
+        durable_subrun_host_terminal_events(facts, None, "child-run")
+            .iter()
+            .all(|event| event.get("idempotency_key").is_none())
+    );
+    let public =
+        crate::server::run::handlers::transform_stream_run_events_for_client("child-run", budgeted);
+    assert_eq!(
+        public
+            .iter()
+            .filter(|event| event["type"] == "stream_gap")
+            .count(),
+        1
+    );
+    assert_eq!(
+        public
+            .iter()
+            .filter(|event| astra_turn_types::decode_explain_analyze_wire(event).is_ok())
+            .count(),
+        MAX_DURABLE_RUN_EVENT_BATCH_ROWS - 1
     );
 }
 
@@ -21286,6 +22191,7 @@ fn delegated_subrun_same_call_id_conflicting_terminal_fails_exact_reconciliation
             "result": "first outcome",
         })],
         Some(11),
+        "child-run",
     );
     let conflicting = durable_subrun_host_terminal_events(
         vec![json!({
@@ -21295,6 +22201,7 @@ fn delegated_subrun_same_call_id_conflicting_terminal_fails_exact_reconciliation
             "result": "different outcome",
         })],
         Some(11),
+        "child-run",
     );
 
     assert_eq!(
@@ -21304,6 +22211,16 @@ fn delegated_subrun_same_call_id_conflicting_terminal_fails_exact_reconciliation
     let error = durable_subrun_terminal_events_match(&committed, &conflicting)
         .expect_err("conflicting payload under one terminal identity must fail closed");
     assert!(error.contains("conflicting durable facts"), "{error}");
+    let fact = explain_turn_fact("child-run", "same-fact");
+    let committed = durable_subrun_host_terminal_events(vec![fact.clone()], Some(11), "child-run");
+    let mut changed = fact;
+    changed["outcome"] = json!("failed");
+    let conflicting = durable_subrun_host_terminal_events(vec![changed], Some(11), "child-run");
+    assert_eq!(
+        committed[0]["idempotency_key"],
+        conflicting[0]["idempotency_key"]
+    );
+    assert!(durable_subrun_terminal_events_match(&committed, &conflicting).is_err());
 }
 
 #[tokio::test]
@@ -24714,6 +25631,8 @@ fn extract_edge_tools_from_context() {
         run_start_idempotency: None,
         full_llm_capture: false,
         agent_id: None,
+        agent_profile_selection: None,
+        admitted_agent_profiles: None,
         model: None,
         expected_model_name: None,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
@@ -24806,6 +25725,8 @@ fn extract_edge_profile_from_context() {
         run_start_idempotency: None,
         full_llm_capture: false,
         agent_id: None,
+        agent_profile_selection: None,
+        admitted_agent_profiles: None,
         model: None,
         expected_model_name: None,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
@@ -24866,11 +25787,31 @@ fn build_initial_state_sets_user_message() {
     assert_eq!(state.messages[0]["content"], "write a test");
     assert_eq!(state.current_session_id, Some("sess-1".to_string()));
     assert_eq!(state.current_run_id, Some("run-1".to_string()));
+    assert_eq!(state.self_agent_id, "root-agent");
     assert_eq!(state.max_turns, expected_budget.initial_turns);
     assert_eq!(state.remaining_turns, expected_budget.initial_turns);
     assert_eq!(state.agentic_turn_budget, expected_budget);
     assert_eq!(state.message, "write a test");
     assert!(state.cancellation.token.is_none());
+}
+
+#[test]
+fn build_initial_state_binds_root_observer_to_request_agent() {
+    let svc = test_service();
+    let mut request = test_request("continue as the admitted root agent");
+    request.agent_id = Some("cli-request-agent".to_string());
+
+    let state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-root-observer",
+        "run-root-observer",
+        None,
+        None,
+        None,
+    );
+
+    assert_eq!(state.self_agent_id, "cli-request-agent");
 }
 
 #[test]
@@ -25008,8 +25949,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
         &constraints,
         &edge,
         None,
-        None,
-        None,
+        &PreparedRuntimeCapabilities::default(),
         Some(3),
     );
     let state = svc.assemble_loop_state(
@@ -25166,8 +26106,7 @@ fn build_initial_state_shared_assembly_preserves_restored_workspace_evidence() {
         &constraints,
         &edge,
         None,
-        None,
-        None,
+        &PreparedRuntimeCapabilities::default(),
         Some(3),
     );
     let state = svc.assemble_loop_state(
@@ -25356,8 +26295,7 @@ fn build_initial_state_rejects_zero_execution_budget_cap() {
         RequestConstraints::default(),
         &EdgeContext::default(),
         None,
-        None,
-        None,
+        &PreparedRuntimeCapabilities::default(),
         None,
     );
     let (status, error) = result.err().expect("zero cap must be rejected");
@@ -25376,6 +26314,7 @@ fn agent_binding_prompt_context_does_not_modify_agent_override() {
     AgenticRunLifecycleService::apply_agent_binding_prompt_context(
         &mut edge_profile,
         Some(&context),
+        None,
         None,
         None,
         None,
@@ -25404,6 +26343,7 @@ fn agent_binding_prompt_context_keeps_runtime_system_prompt_out_of_agent_overrid
         Some(&context),
         None,
         Some(runtime_control),
+        None,
         None,
     )
     .expect("valid agent binding prompt context");
@@ -25476,6 +26416,7 @@ fn agent_binding_prompt_context_routes_turn_context_to_volatile_lane() {
         None,
         None,
         Some(&request_context),
+        None,
     )
     .expect("valid agent binding prompt context");
 
@@ -25603,6 +26544,7 @@ fn agent_binding_prompt_context_preserves_moi_authoring_contract() {
         None,
         None,
         Some(&request_context),
+        None,
     )
     .expect("valid agent binding prompt context");
 
@@ -25691,6 +26633,7 @@ fn agent_binding_prompt_context_keeps_complete_catalog_file_lists() {
         None,
         None,
         Some(&request_context),
+        None,
     )
     .expect("valid agent binding prompt context");
 
@@ -25742,6 +26685,7 @@ fn agent_binding_prompt_context_keeps_complete_authoring_resource_lists() {
         None,
         None,
         Some(&request_context),
+        None,
     )
     .expect("valid agent binding prompt context");
 
@@ -25788,6 +26732,7 @@ fn agent_binding_prompt_context_rejects_complete_manifest_over_aggregate_token_b
         None,
         None,
         Some(&request_context),
+        None,
     )
     .expect_err("oversized runtime context must be rejected explicitly");
 
@@ -25840,6 +26785,7 @@ fn agent_binding_prompt_context_keeps_stable_prompt_identical_when_turn_context_
         Some("Session-level runtime system prompt."),
         None,
         Some(&first_turn),
+        None,
     )
     .expect("valid first-turn agent binding prompt context");
     AgenticRunLifecycleService::apply_agent_binding_prompt_context(
@@ -25848,6 +26794,7 @@ fn agent_binding_prompt_context_keeps_stable_prompt_identical_when_turn_context_
         Some("Session-level runtime system prompt."),
         None,
         Some(&second_turn),
+        None,
     )
     .expect("valid second-turn agent binding prompt context");
 
@@ -25921,8 +26868,7 @@ fn late_streaming_start_binds_owner_generation_into_action_state() {
             RequestConstraints::default(),
             &edge_context,
             None,
-            None,
-            None,
+            &PreparedRuntimeCapabilities::default(),
             None,
         )
         .expect("valid test execution configuration");
@@ -25952,6 +26898,7 @@ fn build_initial_state_agent_binding_uses_binding_skills_and_request_budget() {
         None,
         None,
         req.context.as_ref(),
+        None,
     )
     .expect("valid agent binding prompt context");
 
@@ -25969,8 +26916,10 @@ fn build_initial_state_agent_binding_uses_binding_skills_and_request_budget() {
             RequestConstraints::default(),
             &edge_context,
             Some(&edge_profile),
-            None,
-            Some(&binding_context),
+            &PreparedRuntimeCapabilities {
+                agent_binding: Some(binding_context.clone()),
+                ..Default::default()
+            },
             None,
         )
         .expect("valid test execution configuration");
@@ -26018,6 +26967,10 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
         headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Json<Value> {
+        let empty_catalog = headers
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer empty-runtime-grant");
         capture.authorizations.lock().await.push(
             headers
                 .get(reqwest::header::AUTHORIZATION)
@@ -26027,6 +26980,11 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
         );
         capture.bodies.lock().await.push(body.clone());
         match body.get("method").and_then(Value::as_str) {
+            Some("skills/list") if empty_catalog => Json(json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {"skills": []}
+            })),
             Some("skills/list") => Json(json!({
                 "jsonrpc": "2.0",
                 "id": "astra-agent-binding-skills-list",
@@ -26088,7 +27046,7 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
     let request_constraints = AgenticRunLifecycleService::try_request_constraints(&request)
         .expect("skill allowlist should parse");
     let capabilities = svc
-        .prepare_runtime_capabilities(&request, &request_constraints)
+        .prepare_runtime_capabilities("external-user", &request, &request_constraints)
         .await
         .expect("provider skill capability should prepare a resolver");
 
@@ -26111,8 +27069,7 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
             request_constraints,
             &edge_context,
             None,
-            capabilities.request_scoped_skill_resolver.clone(),
-            capabilities.agent_binding.as_ref(),
+            &capabilities,
             None,
         )
         .expect("valid test execution configuration");
@@ -26166,6 +27123,76 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
                 "params": {"id": "moi-skill"}
             })
         ]
+    );
+
+    let fallback_skill_service = Arc::new(MockSkillService::default());
+    let fallback_svc = test_service().with_skill_service(fallback_skill_service.clone());
+    let mut empty_request = prepared_test_request("do not use an implicit server skill");
+    empty_request.runtime_skill_binding = Some(RuntimeSkillBindingRequest {
+        id: "empty-runtime-skills".to_string(),
+        url: endpoint,
+        authorization: "Bearer empty-runtime-grant".to_string(),
+    });
+    let empty_constraints = AgenticRunLifecycleService::try_request_constraints(&empty_request)
+        .expect("empty runtime skill binding constraints should parse");
+    let empty_capabilities = fallback_svc
+        .prepare_runtime_capabilities("external-user", &empty_request, &empty_constraints)
+        .await
+        .expect("empty provider skill capability should prepare without fallback");
+
+    assert!(
+        empty_capabilities.request_scoped_skill_resolver.is_none(),
+        "an empty explicit provider catalog must not create a resolver"
+    );
+    assert!(
+        empty_capabilities.server_skill_resolver.registry.is_none(),
+        "an empty explicit provider catalog must not prepare the server fallback registry"
+    );
+    assert!(
+        empty_capabilities.server_skill_resolver.resolver.is_none(),
+        "an empty explicit provider catalog must not prepare a fallback resolver"
+    );
+
+    let empty_edge_context = AgenticRunLifecycleService::extract_edge_context(&empty_request)
+        .expect("empty request edge context");
+    let empty_state = fallback_svc
+        .build_initial_state_inner(
+            "external-user",
+            &empty_request,
+            "session-empty-runtime",
+            "run-empty-runtime",
+            None,
+            None,
+            None,
+            None,
+            None,
+            empty_constraints,
+            &empty_edge_context,
+            None,
+            &empty_capabilities,
+            None,
+        )
+        .expect("empty provider capabilities should assemble without fallback");
+    assert!(
+        empty_state.skills.resolver.is_none(),
+        "empty explicit provider catalog must not activate a server fallback skill"
+    );
+    assert!(
+        empty_state.skills.registry_for_activation.is_none(),
+        "empty explicit provider catalog must not enable conditional server activation"
+    );
+    assert_eq!(
+        fallback_skill_service
+            .list_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "empty explicit provider catalog must not discover the server fallback catalog"
+    );
+    let bodies = capture.bodies.lock().await;
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(
+        bodies[2].get("method").and_then(Value::as_str),
+        Some("skills/list")
     );
     server.abort();
 }
@@ -26291,6 +27318,7 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
             semantic_read_capabilities: Default::default(),
         }),
         request_scoped_skill_resolver: None,
+        server_skill_resolver: ServerSkillResolverBundle::default(),
         agent_binding: Some({
             let mut context = test_prepared_agent_binding_context();
             context.skill_resolver = Some(static_skill_resolver("binding-only"));
@@ -26927,6 +27955,14 @@ fn explain_test_executor(
     executor
 }
 
+fn explain_turn_fact(run_id: &str, event_id: &str) -> Value {
+    json!({"type":"explain_analyze", "schema_version":1,
+        "event_id":event_id, "run_id":run_id, "turn_id":"turn-1", "node_id":"turn",
+        "producer_id":"server", "clock_domain_id":"clock", "kind":"turn",
+        "label":"User turn", "transition":"finished", "elapsed_ms":10,
+        "start_elapsed_ms":0, "duration_ms":10, "outcome":"completed"})
+}
+
 #[tokio::test]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn db_explain_publication_is_discoverable_and_readable() {
@@ -26968,11 +28004,7 @@ async fn db_explain_publication_is_discoverable_and_readable() {
         .unwrap()
         .unwrap()
         .run_generation;
-    let event = json!({"type":"explain_analyze", "schema_version":1,
-        "event_id":"finished", "run_id":run, "turn_id":"turn-1", "node_id":"turn",
-        "producer_id":"server", "clock_domain_id":"clock", "kind":"turn",
-        "label":"User turn", "transition":"finished", "elapsed_ms":10,
-        "start_elapsed_ms":0, "duration_ms":10, "outcome":"completed"});
+    let event = explain_turn_fact(&run, "finished");
     let artifact = crate::server::explain_analyze_artifact::persist_snapshot(
         Some(&pool),
         user,
@@ -27246,9 +28278,16 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
                 .expect("database invocation ledger"),
         )
         .with_model_service(Some(model_service.clone()));
-        let result = tokio::time::timeout(Duration::from_secs(15), delegated.execute(config))
+        // Production supervision polls children as independent tasks, not
+        // beneath the parent's setup/query future. JoinSet also aborts the
+        // owned child if this test times out or unwinds.
+        let mut children = tokio::task::JoinSet::new();
+        children.spawn(async move { delegated.execute(config).await });
+        let (result, _) = tokio::time::timeout(Duration::from_secs(15), children.join_next())
             .await
             .expect("bounded delegated Explain execution")
+            .expect("delegated Explain child task")
+            .expect("delegated Explain child did not panic")
             .expect("delegated Explain run");
         assert_eq!(result.status, STATUS_COMPLETED, "{result:?}");
         let outputs: Vec<(String,)> = sqlx::query_as(
@@ -28178,7 +29217,11 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
         "transport chunks must stay live-only before DB persistence"
     );
 
-    let budgeted = enforce_durable_run_event_batch_budget_with_budget(durable_candidates, budget);
+    let budgeted = enforce_durable_run_event_batch_budget_with_budget(
+        durable_candidates,
+        budget,
+        |_, summary| summary,
+    );
     assert_eq!(budgeted.len(), budget.row_budget);
     assert!(
         budgeted

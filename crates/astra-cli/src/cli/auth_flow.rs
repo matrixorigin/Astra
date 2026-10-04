@@ -951,7 +951,8 @@ async fn rebuild_browser_identity_services(
         api,
         profile,
         crate::cli::session::session_runtime::resolved_session_project_root().as_deref(),
-    );
+    )
+    .await;
     state.unified_skill_registry = modules.unified_skill_registry.clone();
     state.mcp_manager = modules.mcp_manager.clone();
     state.session_memory_port =

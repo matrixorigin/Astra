@@ -37,12 +37,31 @@ pub(crate) fn render_team_args(args: &TeamArgs) -> String {
             }
         }
         Some(TeamSubcommand::AddMember(cmd)) => {
-            let suffix = join_words(&cmd.description);
-            if suffix.is_empty() {
-                format!("add-member {} {}", cmd.team, cmd.role)
-            } else {
-                format!("add-member {} {} {}", cmd.team, cmd.role, suffix)
+            let mut rendered = format!(
+                "add-member {} {}",
+                shell_words::quote(&cmd.team),
+                shell_words::quote(&cmd.role)
+            );
+            if cmd.can_delegate {
+                rendered.push_str(" --can-delegate");
             }
+            if let Some(depth) = cmd.max_delegation_depth {
+                rendered.push_str(&format!(" --max-delegation-depth {depth}"));
+            }
+            if let Some(model) = cmd.model.as_deref() {
+                rendered.push_str(&format!(" --model {}", shell_words::quote(model)));
+            }
+            if !cmd.description.is_empty() {
+                rendered.push_str(" -- ");
+                rendered.push_str(
+                    &cmd.description
+                        .iter()
+                        .map(|word| shell_words::quote(word).into_owned())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+            rendered
         }
         Some(TeamSubcommand::Info(cmd)) => format!("info {}", cmd.name),
         Some(TeamSubcommand::Delete(cmd)) => format!("delete {}", cmd.name),
@@ -54,7 +73,34 @@ pub(crate) fn render_team_args(args: &TeamArgs) -> String {
                 join_words(&cmd.value)
             )
         }
-        Some(TeamSubcommand::Run(cmd)) => format!("run {} {}", cmd.team, join_words(&cmd.task)),
+        Some(TeamSubcommand::Run(cmd)) => {
+            let lead = cmd
+                .lead_agent_id
+                .as_deref()
+                .map(|id| format!(" --lead-agent-id {}", shell_words::quote(id)))
+                .unwrap_or_default();
+            let json = if cmd.json { " --json" } else { "" };
+            let stream_events = cmd
+                .stream_events
+                .as_deref()
+                .map(|path| {
+                    let path = path.display().to_string();
+                    format!(" --stream-events {}", shell_words::quote(&path))
+                })
+                .unwrap_or_default();
+            format!(
+                "run {}{}{}{} -- {}",
+                shell_words::quote(&cmd.team),
+                lead,
+                json,
+                stream_events,
+                cmd.task
+                    .iter()
+                    .map(|word| shell_words::quote(word))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        }
         Some(TeamSubcommand::History(cmd)) => format!("history {}", cmd.name),
         Some(TeamSubcommand::Snapshot(cmd)) => {
             let suffix = join_words(&cmd.label);
@@ -212,6 +258,112 @@ mod arg_render_tests {
     use crate::cli::cli_config::cli_args::{
         PermissionsArgs, PermissionsSubcommand, PermissionsTraceArgs,
     };
+
+    #[test]
+    fn team_member_rendering_preserves_explicit_controls_and_literal_description() {
+        use crate::cli::cli_config::cli_args::{Cli, Command, TeamSubcommand};
+        use clap::Parser;
+        for delegate in [false, true] {
+            let mut argv = vec!["astra", "team", "add-member", "team", "lead"];
+            if delegate {
+                argv.extend([
+                    "--can-delegate",
+                    "--max-delegation-depth",
+                    "3",
+                    "--model",
+                    "flash",
+                ]);
+            }
+            argv.extend(["--", "--can-delegate", "literal description"]);
+            let Some(Command::Team(args)) = Cli::try_parse_from(argv).unwrap().command else {
+                panic!("Team command")
+            };
+            let rendered = super::render_team_args(&args);
+            let Command::Team(reparsed) =
+                crate::cli::command_router::parse_team_bridge_command(&rendered).unwrap()
+            else {
+                panic!("Team command")
+            };
+            let Some(TeamSubcommand::AddMember(member)) = reparsed.command else {
+                panic!("AddMember command")
+            };
+            assert_eq!(member.can_delegate, delegate);
+            assert_eq!(member.max_delegation_depth, delegate.then_some(3));
+            assert_eq!(member.model.as_deref(), delegate.then_some("flash"));
+            assert_eq!(
+                member.description,
+                ["--can-delegate", "literal description"]
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "astra",
+                "team",
+                "add-member",
+                "team",
+                "lead",
+                "--max-delegation-depth",
+                "0"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "astra",
+                "team",
+                "add-member",
+                "team",
+                "lead",
+                "--max-delegation-depth",
+                "3"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn team_run_rendering_roundtrips_capture_controls() {
+        use crate::cli::cli_config::cli_args::{Cli, Command, TeamSubcommand};
+        use clap::Parser;
+        use std::path::Path;
+
+        let Some(Command::Team(args)) = Cli::try_parse_from([
+            "astra",
+            "team",
+            "run",
+            "dev",
+            "--lead-agent-id",
+            "lead",
+            "--json",
+            "--stream-events",
+            "events with spaces.jsonl",
+            "--",
+            "--json",
+            "task's quoted text",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("Team command")
+        };
+        let rendered = super::render_team_args(&args);
+        let Command::Team(reparsed) =
+            crate::cli::command_router::parse_team_bridge_command(&rendered).unwrap()
+        else {
+            panic!("Team command")
+        };
+        let Some(TeamSubcommand::Run(run)) = reparsed.command else {
+            panic!("Run command")
+        };
+        assert_eq!(run.team, "dev");
+        assert_eq!(run.lead_agent_id.as_deref(), Some("lead"));
+        assert!(run.json);
+        assert_eq!(
+            run.stream_events.as_deref(),
+            Some(Path::new("events with spaces.jsonl"))
+        );
+        assert_eq!(run.task, ["--json", "task's quoted text"]);
+    }
 
     #[test]
     fn bare_permissions_command_renders_empty_arg_for_explicit_selection() {

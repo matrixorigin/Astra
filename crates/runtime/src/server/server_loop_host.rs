@@ -1840,16 +1840,17 @@ fn server_fork_tool_schema_hash_dimensions(
 fn record_full_llm_request_event(
     state: &mut AgenticLoopState,
     full_llm_capture: bool,
-    user_id: &str,
     session_id: &str,
     source: &str,
     model: &str,
     provider: &str,
     cache_capability: astra_turn_core::cache_placement::CacheCapability,
+    round: u32,
     attempt: u32,
     messages: &[Value],
     tools: &[Value],
     max_output_tokens: Option<usize>,
+    prompt_request_plan: &astra_services::PromptRequestPlan,
     provider_attempts: &[crate::turn::llm::durable::DurableProviderAttemptFact],
 ) {
     if session_id.is_empty() || !full_llm_capture {
@@ -1858,29 +1859,6 @@ fn record_full_llm_request_event(
     let Some(buf) = state.turn_event_buffer.as_mut() else {
         return;
     };
-    let round = buf.current_round();
-    let mut prompt_request_plan =
-        astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
-            user_id,
-            session_id,
-            turn: state.session_turn,
-            round,
-            attempt,
-            source,
-            messages,
-            tools,
-            max_output_tokens,
-        })
-        .ok();
-    if let Some(summary) = prompt_request_plan
-        .as_mut()
-        .and_then(|plan| plan.summary_json.as_object_mut())
-    {
-        summary.insert(
-            "projection_authority".to_string(),
-            Value::String("planned_pre_client_projection_v1".to_string()),
-        );
-    }
     let trace = crate::turn::llm::exchange_capture::CaptureTrace {
         session_turn_source: Some("state"),
         turn_chain_id: None,
@@ -1931,16 +1909,9 @@ fn record_full_llm_request_event(
                 tools,
                 max_output_tokens,
             ),
-            "prompt_request_id": prompt_request_plan.as_ref().map(|plan| plan.request_id.as_str()),
-            "request_hash": prompt_request_plan.as_ref().map(|plan| plan.request_hash.as_str()),
-            "request_summary": prompt_request_plan
-                .as_ref()
-                .map(|plan| plan.summary_json.clone())
-                .unwrap_or_else(|| crate::turn::llm::exchange_capture::build_capture_request_summary_json(
-                    messages,
-                    tools,
-                    max_output_tokens,
-                )),
+            "prompt_request_id": prompt_request_plan.request_id,
+            "request_hash": prompt_request_plan.request_hash,
+            "request_summary": prompt_request_plan.summary_json,
         }),
     );
     evt.offset_ms = Some(buf.offset_ms());
@@ -21369,6 +21340,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 match astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
                     user_id: &self.user_id,
                     session_id: &self.session_id,
+                    run_id: state.current_run_id.as_deref(),
                     turn: state.session_turn,
                     round: prompt_round,
                     attempt: attempt_in_round,
@@ -21786,16 +21758,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 record_full_llm_request_event(
                     state,
                     self.full_llm_capture,
-                    &self.user_id,
                     &self.session_id,
                     "server_loop_host",
                     &llm_cfg.model_name,
                     &llm_cfg.provider,
                     cache_cap,
+                    prompt_round,
                     attempt_in_round,
                     attempt_llm_messages,
                     &final_tools,
                     Some(effective_max_output),
+                    &prompt_request_plan,
                     &provider_attempts,
                 );
                 // Prompt-delta persistence describes only a request that
@@ -32846,6 +32819,9 @@ mod tests {
         let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
         let spawner = Arc::new(crate::orchestration::DynamicAgentSpawner::new(router));
         executor.set_agent_tool_context(crate::orchestration::AgentToolContext {
+            parent_profile_authority:
+                crate::orchestration::spawner::ParentProfileAuthority::Unbound,
+            admitted_agent_profiles: None,
             fanout_admission: spawner.fanout_parent("run1"),
             reply_obligations: Arc::new(Default::default()),
             delegation_model_admission: None,
@@ -32903,6 +32879,89 @@ mod tests {
         let parsed: Value = serde_json::from_str(&result.output).expect("tool_search JSON");
         assert_eq!(parsed["status"], "completed");
         assert_eq!(parsed["matches"][0]["name"], "agent");
+
+        state.deferred_tool_activations =
+            astra_turn_core::tool::deferred_activation::deferred_tool_activations_from_tool_search_output(
+                &result.output,
+            );
+        assert_eq!(state.deferred_tool_activations.len(), 1);
+        let selected = state.deferred_tool_activations.clone();
+        host.bind_deferred_tool_activations(&mut state, &selected);
+        for agent_type in [json!("member-x7"), json!(""), json!(["member-x7"])] {
+            let valid = agent_type == json!("member-x7");
+            let arguments = json!({
+                "action": "spawn",
+                "agent_type": agent_type,
+                "description": "Inspect assigned material",
+                "prompt": "Report the requested observation"
+            });
+            for deferred in [false, true] {
+                let call = json!({
+                    "id": "profile-wire-call",
+                    "type": "function",
+                    "function": {
+                        "name": if deferred { "invoke_tool" } else { "agent" },
+                        "arguments": if deferred {
+                            json!({"name": "agent", "arguments": arguments}).to_string()
+                        } else {
+                            arguments.to_string()
+                        }
+                    }
+                });
+                let mut admission = host.resolve_deferred_tool_admission(
+                    &state,
+                    crate::turn::agentic::tool_interception::admit_tool_calls(
+                        &[call],
+                        Some("tool_calls"),
+                    ),
+                );
+                ServerAgenticLoopHost::reject_calls_outside_wire_schema(&mut admission, &visible);
+                // The selected carrier is validated as an envelope here.
+                // Its logical target arguments are validated by the executor,
+                // not by descriptor/digest resolution.
+                let host_admitted = valid || deferred;
+                assert_eq!(
+                    admission.admitted.len(),
+                    usize::from(host_admitted),
+                    "deferred={deferred}"
+                );
+                assert_eq!(
+                    admission.rejected.len(),
+                    usize::from(!host_admitted),
+                    "deferred={deferred}"
+                );
+                if host_admitted {
+                    let invocation = &admission.admitted[0];
+                    let logical = invocation.logical_target_call();
+                    let name = astra_turn_core::tool::args::shape::tool_call_name(logical)
+                        .expect("resolved target name");
+                    let target_args =
+                        astra_turn_core::tool::args::shape::tool_call_arguments_value(logical);
+                    assert_eq!(name, "agent");
+                    assert_eq!(target_args, arguments);
+                    if !valid {
+                        assert!(invocation.activation().is_some());
+                        let result = executor.execute_with_metadata(name, &target_args).await;
+                        assert!(result.is_error, "{result:?}");
+                        let metadata = result.metadata.as_ref().expect("typed schema rejection");
+                        assert_eq!(metadata.get("execution_started"), Some(&Value::Bool(false)));
+                        assert_eq!(
+                            metadata.get("error_kind").and_then(Value::as_str),
+                            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str()),
+                            "{result:?}"
+                        );
+                        assert_eq!(
+                            metadata
+                                .get("recovery_evidence")
+                                .and_then(|evidence| evidence.get("cause"))
+                                .and_then(Value::as_str),
+                            Some("invalid_arguments"),
+                            "{result:?}"
+                        );
+                    }
+                }
+            }
+        }
 
         state.restricted_tools.insert("tool_search".to_string());
         let narrowed = host.visible_turn_tools(&mut state);

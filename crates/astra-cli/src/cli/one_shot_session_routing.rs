@@ -6,8 +6,7 @@ use crate::cli::session::session_continuation::{
     portable_resume_descriptor, sanitize_continuation_messages,
 };
 use crate::cli::session::session_restore_client::{
-    fetch_cloud_session_snapshot_with_client, list_cloud_resumable_sessions,
-    restore_session_snapshot_with_client,
+    has_server_auth, list_cloud_resumable_sessions, restore_session_snapshot_with_client,
 };
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -118,9 +117,10 @@ impl OneShotSessionRouting {
     }
 
     /// Resolve continuation once, then keep its prompt messages and durable
-    /// tool-surface state on the same causal path.
+    /// tool-surface state and Team intent on the same causal path.
     pub(crate) fn continuation_turn_inputs(
         &mut self,
+        cli_context: &mut crate::cli::cli_config::cli_context::CliContext,
     ) -> Result<
         (
             Option<Vec<serde_json::Value>>,
@@ -129,10 +129,15 @@ impl OneShotSessionRouting {
         String,
     > {
         Ok(match self.take_continuation()? {
-            Some(continuation) => (
-                Some(continuation.messages),
-                continuation.deferred_tool_activations,
-            ),
+            Some(continuation) => {
+                if cli_context.agent_profile_selection.is_none() {
+                    cli_context.agent_profile_selection = continuation.agent_profile_selection;
+                }
+                (
+                    Some(continuation.messages),
+                    continuation.deferred_tool_activations,
+                )
+            }
             None => (None, Vec::new()),
         })
     }
@@ -209,9 +214,9 @@ async fn load_one_shot_resume_metadata(
         return Ok(OneShotSessionResumeMetadata::default());
     };
 
-    let mut restored = match restore_session_snapshot_with_client(profile, api, session_id).await {
+    let restored = match restore_session_snapshot_with_client(profile, api, session_id).await {
         Ok(restored) => restored,
-        Err(error) if server_session => {
+        Err(error) if server_session || has_server_auth(profile) => {
             return Err(format!(
                 "selected Server session {session_id} could not be restored: {error}"
             ));
@@ -225,44 +230,6 @@ async fn load_one_shot_resume_metadata(
             return Ok(OneShotSessionResumeMetadata::default());
         }
     };
-    if server_session
-        && restored
-            .as_ref()
-            .is_some_and(|snapshot| !snapshot.restored_from_cloud)
-    {
-        // The Server owns both the canonical conversation and turn sequence
-        // for an attached session. Local state can locate that session, but
-        // cannot replace missing Server resume authority.
-        match fetch_cloud_session_snapshot_with_client(profile, api, session_id).await {
-            Ok(Some(remote)) => {
-                if let Some(local) = restored.as_mut() {
-                    // The Server turn clock is authoritative for a networked
-                    // session. Conversation selection remains cursor/root
-                    // based in `continuation`; do not splice remote messages
-                    // into a local snapshot based on turn counts.
-                    local.turn_count = remote.turn_count;
-                    // Conversation-sensitive provider state must come from
-                    // the same server-selected generation. An absent value is
-                    // meaningful; retaining a richer local value would splice
-                    // stale provider state into the remote conversation.
-                    local.model = remote.model.clone();
-                    local.permission_mode = remote.permission_mode.clone();
-                    local.conversation_messages = remote.conversation_messages;
-                    local.resume_bundle = remote.resume_bundle;
-                }
-            }
-            Ok(None) => {
-                return Err(format!(
-                    "selected Server session {session_id} has no authoritative restore bundle"
-                ));
-            }
-            Err(error) => {
-                return Err(format!(
-                    "selected Server session {session_id} could not load its authoritative restore bundle: {error}"
-                ));
-            }
-        }
-    }
 
     match restored {
         Some(restored) => {
@@ -287,7 +254,7 @@ async fn load_one_shot_resume_metadata(
                 resume_bundle: restored.resume_bundle,
             })
         }
-        None if server_session => Err(format!(
+        None if server_session || has_server_auth(profile) => Err(format!(
             "selected Server session {session_id} has no restorable canonical state"
         )),
         None => Ok(OneShotSessionResumeMetadata::default()),
@@ -344,7 +311,9 @@ pub(crate) async fn resolve_one_shot_session_routing(
         return attach_one_shot_resume_metadata(routing, api, profile).await;
     }
 
-    let local_session_id = local_resumable_last_session_id(profile);
+    let local_session_id = (!has_server_auth(profile))
+        .then(|| local_resumable_last_session_id(profile))
+        .flatten();
     let remote_session_id = match list_cloud_resumable_sessions(profile, api).await {
         Ok(sessions) => sessions
             .into_iter()
@@ -715,6 +684,63 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn selected_local_continuation_does_not_restore_stale_team_intent() {
+        let (_sessions, _guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("routing-local-team-{}", uuid::Uuid::new_v4());
+        let local_messages = vec![
+            serde_json::json!({"role": "user", "content": "current local question"}),
+            serde_json::json!({"role": "assistant", "content": "current local answer"}),
+        ];
+        let local_cursor =
+            typed_resume_bundle(&session_id, 3, local_messages.clone(), Vec::new()).cursor;
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            3,
+            &local_messages,
+            &astra_turn_core::conversation_log::SessionStateCompact {
+                source_cursor: Some(local_cursor),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut bundle = typed_resume_bundle(
+            &session_id,
+            1,
+            vec![serde_json::json!({"role": "user", "content": "old remote question"})],
+            Vec::new(),
+        );
+        bundle.projections.provider =
+            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                bundle.cursor.clone(),
+                astra_turn_types::ResumeProviderProjectionV1 {
+                    agent_profile_selection: Some(astra_turn_types::AgentProfileSelection {
+                        team_id: "stale-team".into(),
+                        lead_agent_id: None,
+                    }),
+                    ..Default::default()
+                },
+            ));
+        let mut routing = OneShotSessionRouting {
+            server_session_id: Some(session_id.clone()),
+            history_source_session_id: Some(session_id),
+            resume_metadata: OneShotSessionResumeMetadata {
+                resume_bundle: Some(bundle),
+                ..Default::default()
+            },
+        };
+        let mut context = crate::cli::cli_config::cli_context::CliContext::default();
+        let (messages, _) = routing.continuation_turn_inputs(&mut context).unwrap();
+        assert!(
+            messages
+                .unwrap()
+                .iter()
+                .any(|message| message["content"] == "current local answer")
+        );
+        assert!(context.agent_profile_selection.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn attached_session_uses_server_canonical_authority_across_journal_clock_domains() {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("routing-authority-{}", uuid::Uuid::new_v4());
@@ -761,7 +787,19 @@ mod tests {
         // larger Server event sequence combined with a smaller conversation
         // sequence is not a fork and must never be compared as one clock.
         server_bundle.cursor.journal_event_seq = 100;
-        let routing = OneShotSessionRouting {
+        let selection = astra_turn_types::AgentProfileSelection {
+            team_id: "delivery".into(),
+            lead_agent_id: Some("lead".into()),
+        };
+        server_bundle.projections.provider =
+            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                server_bundle.cursor.clone(),
+                astra_turn_types::ResumeProviderProjectionV1 {
+                    agent_profile_selection: Some(selection.clone()),
+                    ..Default::default()
+                },
+            ));
+        let mut routing = OneShotSessionRouting {
             server_session_id: Some(session_id.clone()),
             history_source_session_id: Some(session_id),
             resume_metadata: OneShotSessionResumeMetadata {
@@ -770,6 +808,15 @@ mod tests {
                 ..Default::default()
             },
         };
+
+        assert_eq!(
+            routing
+                .continuation()
+                .unwrap()
+                .unwrap()
+                .agent_profile_selection,
+            Some(selection)
+        );
 
         let continuation = routing
             .continuation()
@@ -789,6 +836,15 @@ mod tests {
                 .all(|message| message["content"] != "unacknowledged local answer")
         );
         assert_eq!(continuation.resume.cursor.journal_event_seq, 100);
+        let mut context = crate::cli::cli_config::cli_context::CliContext::default();
+        routing.continuation_turn_inputs(&mut context).unwrap();
+        assert_eq!(
+            context
+                .agent_profile_selection
+                .as_ref()
+                .map(|value| value.team_id.as_str()),
+            Some("delivery")
+        );
     }
 
     #[test]
@@ -856,10 +912,30 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn resolve_one_shot_session_routing_keeps_local_continuation_when_cloud_has_no_session() {
+    async fn disabled_resume_skips_existing_session_and_remote_lookup() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let routing = resolve_one_shot_session_routing(
+            &api,
+            None,
+            Some(uuid::Uuid::new_v4().to_string()),
+            false,
+        )
+        .await
+        .expect("new conversation needs no resume lookup");
+        assert!(routing.server_session_id.is_none());
+        assert!(routing.history_source_session_id.is_none());
+        assert!(routing.continuation().unwrap().is_none());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn resolve_one_shot_session_routing_keeps_unauthenticated_local_continuation() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _home_guard = crate::tests::HomeGuard::temp();
+        let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         let session_id = uuid::Uuid::new_v4().to_string();
         write_local_resumable_session_with_checkpoint(&session_id);
 
@@ -867,7 +943,6 @@ mod tests {
         creds.profiles.insert(
             "default".to_string(),
             Profile {
-                access_token: Some("test-token".to_string()),
                 last_session_id: Some(session_id.clone()),
                 ..Default::default()
             },
@@ -875,7 +950,6 @@ mod tests {
         save_credentials(&creds).unwrap();
 
         let server = MockServer::start().await;
-        mock_empty_cloud_resumable_list(&server).await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
         let routing = resolve_one_shot_session_routing(&api, Some("default"), None, true)
@@ -902,6 +976,7 @@ mod tests {
         assert_eq!(continuation.len(), 2);
         assert_eq!(continuation[0]["content"], "previous question");
         assert_eq!(continuation[1]["content"], "previous answer");
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[serial_test::serial]
@@ -910,11 +985,14 @@ mod tests {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
 
+        let session_id = uuid::Uuid::new_v4().to_string();
+        write_local_resumable_session_with_checkpoint(&session_id);
         let mut creds = CredentialsFile::default();
         creds.profiles.insert(
             "default".to_string(),
             Profile {
                 access_token: Some("test-token".to_string()),
+                last_session_id: Some(session_id),
                 ..Default::default()
             },
         );

@@ -307,6 +307,7 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
             .commit_turn(
                 &reservation,
                 CanonicalTurnDeltaV1 {
+                    agent_profile_selection: None,
                     schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
                     completed_turn: 1,
                     journal_event_seq: 1,

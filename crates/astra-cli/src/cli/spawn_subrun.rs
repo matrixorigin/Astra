@@ -5,10 +5,10 @@
 use astra_server_types::{ModelAdmissionRequestV1, ModelAdmissionSlotV1};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use astra_pipeline::{step_protocol::InMemoryIdempotencyCache, step_recorder::StepRecorder};
+use astra_pipeline::step_recorder::StepRecorder;
 use astra_runtime::{
     orchestration::{
         CancellationOrigin, InheritedPermissions, PermissionSummary, PreparedSpawn,
@@ -16,7 +16,6 @@ use astra_runtime::{
         SpawnRunConfig, SpawnRunResult, project_subrun_status_to_spawn,
         spawn_completion_status_from_finish_reason,
     },
-    semantic_dedup::SemanticDedup,
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
     turn::agentic_loop::host::{
         AgenticLoopOutcome, AgenticLoopState, CancellationState, MessagingState, SkillState,
@@ -40,6 +39,39 @@ use crate::edge_tools;
 
 /// Re-export from runtime so all CLI components share one type.
 pub type TokenProvider = astra_runtime::capabilities::TokenProvider;
+
+/// Build the shared skill state used by local child conversations.
+pub(crate) fn build_child_skill_state(
+    request_constraints: astra_runtime::turn::agentic_loop::host::RequestConstraints,
+    resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
+    effective_root: &Path,
+) -> SkillState {
+    SkillState {
+        request_constraints,
+        resolver,
+        quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
+        improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
+        tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(effective_root),
+        session_event_hooks: astra_skills::hooks::load_session_event_hooks(effective_root),
+        ..Default::default()
+    }
+}
+
+/// Restrict the admitted tool surface using an explicit allowlist.
+pub(crate) fn build_restricted_tools(
+    allow_tools: Option<&[String]>,
+    valid_tool_names: &HashSet<String>,
+) -> HashSet<String> {
+    let Some(allow_tools) = allow_tools else {
+        return HashSet::new();
+    };
+    let allowed: HashSet<&str> = allow_tools.iter().map(String::as_str).collect();
+    valid_tool_names
+        .iter()
+        .filter(|name| !allowed.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
 
 fn cancelled_loop_origin(interruption_kind: Option<InterruptionKind>) -> CancellationOrigin {
     if interruption_kind == Some(InterruptionKind::UserCancelled) {
@@ -1593,17 +1625,12 @@ impl CliSpawnAgentExecutor {
         }
 
         // Build restricted tools based on agent type's allowed_tools
-        let restricted_tools: HashSet<String> = if config.allowed_tools.iter().any(|t| t == "*") {
+        let restricted_tools = if config.allowed_tools.iter().any(|t| t == "*") {
             // All tools allowed
             HashSet::new()
         } else {
-            // Only allow specified tools
-            let allowed: HashSet<&str> = config.allowed_tools.iter().map(|s| s.as_str()).collect();
-            valid_tool_names
-                .iter()
-                .filter(|name| !allowed.contains(name.as_str()))
-                .cloned()
-                .collect()
+            // Only allow specified tools.
+            build_restricted_tools(Some(config.allowed_tools.as_slice()), &valid_tool_names)
         };
 
         // Add edit/create to restricted if read_only
@@ -1664,7 +1691,6 @@ impl CliSpawnAgentExecutor {
                 config.initial_turns as usize,
                 explicit_hard_limit,
             );
-        let max_turns = agentic_turn_budget.initial_turns;
 
         let child_thinking = config.thinking.clone();
         let child_model_requirements = config.delegated_model_requirements.clone();
@@ -1675,78 +1701,24 @@ impl CliSpawnAgentExecutor {
         );
 
         let mut state = AgenticLoopState {
-            evaluation_thresholds:
-                astra_runtime::turn::runtime_policy::evaluation_thresholds_from_policy(
-                    &tool_policy_config,
-                ),
-            observation_journal: Default::default(),
-            tool_ledger_receipt: Default::default(),
             messages,
-            run_transcript_capture: None,
-            volatile_pending: Vec::new(),
-            recent_rounds: Vec::new(),
-            tool_results: Vec::new(),
-            session_memory_state: Default::default(),
             current_session_id: server_session_id,
             current_run_id: Some(config.run_id.clone()),
-            current_run_owner_generation: None,
-            provider_canonical_wal_head: None,
-            inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
-            context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
             context_manifest_model_name: effective_model,
             runtime_manifest,
             recursion_depth: config.recursion_depth,
-            final_text: String::new(),
-            current_model_item_id: None,
-            final_text_model_item_id: None,
-            final_text_streamed: false,
-            final_output_ready_notified: false,
-            total_prompt: 0,
-            total_completion: 0,
-            total_cache_read: 0,
-            total_cache_creation: 0,
-            total_tool_calls: 0,
-            last_finish_reason: None,
-            total_observation_tool_calls: 0,
-            has_any_usage: false,
-            qualified_usage: None,
-            last_request_usage: None,
-            max_turns,
-            remaining_turns: max_turns,
-            charged_iterations: 0,
-            agentic_turn_budget,
             budget_is_explicit: config.hard_turn_limit.is_some(),
-            loop_entry: Default::default(),
-            current_round_index: 0,
-            llm_rounds_completed: 0,
-            last_request_message_count: None,
             turn_guard: TurnGuard::with_profile(task_profile),
-            budget_policy: None,
             restricted_tools,
-            step_recorder,
-            idempotency_cache: InMemoryIdempotencyCache::new(),
-            semantic_dedup: SemanticDedup::new(
-                astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
-            ),
-            call_counts: HashMap::new(),
-            max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
-            max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
-            max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
-            stall: Default::default(),
-            telemetry: Default::default(),
-            skills: SkillState {
-                request_constraints: astra_runtime::turn::agentic_loop::host::RequestConstraints {
+            skills: build_child_skill_state(
+                astra_runtime::turn::agentic_loop::host::RequestConstraints {
                     delegated_model_requirements: child_model_requirements,
                     ..Default::default()
                 },
-                resolver: self.skill_resolver.clone(),
-                quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-                tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&effective_root),
-                session_event_hooks: astra_skills::hooks::load_session_event_hooks(&effective_root),
-                ..Default::default()
-            },
+                self.skill_resolver.clone(),
+                &effective_root,
+            ),
             hooks: StopHookState {
                 workspace_root_hint: Some(effective_root.to_string_lossy().into_owned()),
                 ..Default::default()
@@ -1756,7 +1728,6 @@ impl CliSpawnAgentExecutor {
                 progress_emitter: config.progress_emitter,
                 ..Default::default()
             },
-            user_intents: Default::default(),
             cancellation: CancellationState {
                 flag: None,
                 pause_flag: None,
@@ -1764,9 +1735,6 @@ impl CliSpawnAgentExecutor {
                 execution_lease_lost: None,
                 resolved_origin: None,
             },
-            error_recovery: Default::default(),
-            provider_adaptation: Default::default(),
-            run_control: None,
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
                     astra_turn_core::pipeline_config::PipelineConfig::default(),
@@ -1777,55 +1745,25 @@ impl CliSpawnAgentExecutor {
             ),
             message: config.task.clone(),
             user_intent: config.task.clone(),
-            recent_tools: Vec::new(),
-            deferred_tool_activations: Vec::new(),
-            has_prior_assistant_turn: false,
-            turn_intent: None,
             task_profile,
-            last_turn_policy:
-                astra_runtime::turn::agentic_loop::host::TurnInteractionPolicy::default(),
-            api: self.api.clone(),
             api_token: token.clone(),
-            delegation_engine: None,
-            delegations_this_turn: 0,
-            delegation_chain: Vec::new(),
             self_agent_id: "spawn_subrun".to_string(),
-            project_context: None,
-            last_llm_context_manifest_trace: None,
-            rate_limit_cooldown: Default::default(),
-            last_composite_snapshot: None,
-            last_measured_prompt_tokens: None,
-            consecutive_context_window_errors: 0,
-            compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
-            sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
-            budget_wrapup_injected: false,
-            context_compression_triggered: false,
-            canonical_rewrite_state: Default::default(),
-            provider_canonical_wal_base: None,
-            budget_wrapup_ignored_rounds: 0,
-            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
-            skill_produced_output: false,
             thinking: child_thinking,
             permission_context: Some(config.permission_context),
-            applied_permission_mode: None,
-            permission_handler: None,
-            runtime_tool_executor: None,
-            interruption: None,
-            session_facts: Default::default(),
-            memory_extraction_service: None,
             compact_strategy,
-            approval_overrides: None,
-            confidence_trend: Default::default(),
-            last_confidence_diagnosis: None,
-            session_turn: 0,
             canonical_turn_chain_id: Some(config.run_id.clone()),
             root_user_query_event_id: Some(format!("{}:initial-user-query", config.run_id)),
-            turn_event_buffer: None,
-            canonical_turn_started_at: Default::default(),
-            canonical_trace_time_bounds: Default::default(),
-            harness: astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
+            ..AgenticLoopState::fresh(
+                step_recorder,
+                agentic_turn_budget,
+                &resolved_tool_policy,
+                astra_turn_types::InferencePurpose::SubAgent,
+                astra_runtime::turn::runtime_policy::evaluation_thresholds_from_policy(
+                    &tool_policy_config,
+                ),
+                self.api.clone(),
+            )
         };
 
         // Inherit skills from parent: pre-populate discovered skills
@@ -2128,6 +2066,8 @@ mod tests {
 
     fn cli_fanout_test_context() -> SpawnContext {
         SpawnContext {
+            parent_profile_authority: astra_runtime::orchestration::ParentProfileAuthority::Unbound,
+            admitted_agent_profiles: None,
             parent_run_id: "parent-run".into(),
             parent_agent_id: "parent-agent".into(),
             resolved_model_name: Some("parent-model".into()),
@@ -2194,6 +2134,8 @@ mod tests {
             execution_metadata: None,
             is_fork_child: false,
             delegation_chain: Vec::new(),
+            profile_authority: astra_runtime::orchestration::ParentProfileAuthority::Unbound,
+            admitted_agent_profiles: None,
             work_item: None,
         }
     }
@@ -2818,6 +2760,117 @@ mod tests {
             "{revoked_error}"
         );
         revoked_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cli_spawn_handler_reuses_inherited_offering_without_model_access_admit() {
+        let mock = crate::cli::mock_llm::MockLlmServer::start(
+            crate::cli::mock_llm::MockScenario::Complete,
+        )
+        .await
+        .expect("mock child SSE server");
+        let executor = Arc::new(test_executor(&mock.base_url));
+        let transport = Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        let spawner = Arc::new(
+            astra_runtime::orchestration::DynamicAgentSpawner::new(router).with_executor(executor),
+        );
+        let working_dir = std::env::current_dir().expect("test runs from the repository");
+        let context = astra_runtime::orchestration::AgentToolContext {
+            parent_profile_authority: astra_runtime::orchestration::ParentProfileAuthority::Unbound,
+            admitted_agent_profiles: None,
+            delegation_model_admission: None,
+            run_id: "parent-run".into(),
+            agent_id: "parent-agent".into(),
+            delegation_chain: Vec::new(),
+            current_model: Some("parent-model".into()),
+            current_model_selection: Some(astra_turn_types::ModelSelection {
+                offering_id: "offer-parent".into(),
+            }),
+            parent_model_reasoning: None,
+            recursion_depth: 0,
+            is_fork_child: false,
+            working_dir,
+            spawner: spawner.clone(),
+            fanout_admission: spawner.fanout_parent("parent-run"),
+            reply_obligations: Arc::new(Default::default()),
+            inherited_permissions: InheritedPermissions::auto_approve(),
+            enabled_tools: None,
+            active_skills: Vec::new(),
+            live_event_sink: None,
+            client_tool_delivery_tx: None,
+            trace_context: None,
+            execution_metadata: None,
+            execution_deadline: None,
+            workspace_mutation: astra_runtime::orchestration::WorkspaceMutationAuthority::default(),
+            transcript_location:
+                astra_runtime::orchestration::AgentTranscriptLocation::LocalJournal,
+        };
+
+        let launch: Value = serde_json::from_str(
+            &astra_runtime::orchestration::handle_agent_spawn_action(
+                &json!({
+                    "action": "spawn",
+                    "description": "Inherited Offering child",
+                    "prompt": "Return one completed child result.",
+                    "agent_type": "general-purpose"
+                }),
+                Some(&context),
+            )
+            .await,
+        )
+        .expect("public spawn handler must return a JSON launch receipt");
+        assert_eq!(launch["status"], "launched", "{launch}");
+        assert_eq!(
+            launch["prepared_model"],
+            json!({
+                "model_name": "parent-model",
+                "provenance": "inherited_parent_context"
+            }),
+            "launch must retain the inherited prepared model provenance"
+        );
+
+        let agent_id = launch["agent_id"]
+            .as_str()
+            .expect("launch receipt must contain the generated child agent id");
+        let status = spawner
+            .wait_for_agent(agent_id, std::time::Duration::from_secs(5))
+            .await
+            .expect("spawned child must reach a terminal state");
+        assert!(
+            matches!(
+                status,
+                astra_runtime::orchestration::AgentStatus::Completed { .. }
+            ),
+            "child status: {status:?}"
+        );
+
+        let state = spawner
+            .get_agent_state_any(agent_id)
+            .await
+            .expect("completed child state must remain inspectable");
+        let prepared = state
+            .prepared_model
+            .expect("child state must retain the prepared model identity");
+        assert_eq!(prepared.offering_id, "offer-parent");
+        assert_eq!(prepared.model_name, "parent-model");
+        assert_eq!(prepared.provenance, "inherited_parent_context");
+
+        // MockLlmServer records inference bodies only and has no
+        // /model-access/admit route: an unexpected admission request returns
+        // 404 and prevents this child from reaching Completed. Keep the
+        // request count below explicitly scoped to inference.
+        let inference_requests = mock.received_requests();
+        assert_eq!(
+            inference_requests.len(),
+            1,
+            "the child must make one inference request; an unexpected model-access admit would return 404 and prevent completion"
+        );
+        assert_eq!(
+            inference_requests[0]["model_selection"]["offering_id"],
+            "offer-parent"
+        );
     }
 
     #[tokio::test]

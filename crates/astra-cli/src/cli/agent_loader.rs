@@ -43,9 +43,9 @@ struct AgentFrontmatter {
     description: Option<String>,
     /// Agent tier: "orchestrator", "system", or "user" (default).
     tier: Option<String>,
-    /// Allowed tool/skill names. Empty = unrestricted.
-    #[serde(default)]
-    tools: Vec<String>,
+    /// Optional execution-tool allowlist. Absent inherits; an explicit empty
+    /// list denies all tools governed by the allowlist.
+    tools: Option<Vec<String>>,
     /// Optional governed Offering for this agent.
     model_selection: Option<astra_turn_types::ModelSelection>,
     /// Maximum turns for this agent's sub-run.
@@ -119,8 +119,12 @@ pub fn load_and_merge(
         if registry.get(&profile.agent_id).is_some() {
             continue; // built-in wins
         }
-        let _ = registry.register(profile);
-        added += 1;
+        match registry.register(profile) {
+            Ok(()) => added += 1,
+            Err(error) => {
+                eprintln!("  ⚠ skipping custom agent profile: {error}");
+            }
+        }
     }
     added
 }
@@ -165,7 +169,7 @@ fn parse_agent_markdown(path: &Path) -> Result<AgentProfile, String> {
             name: None,
             description: None,
             tier: None,
-            tools: Vec::new(),
+            tools: None,
             model_selection: None,
             max_turns: None,
             can_delegate: None,
@@ -204,12 +208,6 @@ fn parse_agent_markdown(path: &Path) -> Result<AgentProfile, String> {
             serde_json::Value::String(desc.clone()),
         );
     }
-    if let Some(max_turns) = fm.max_turns {
-        metadata.insert(
-            "max_turns".to_string(),
-            serde_json::Value::Number(max_turns.into()),
-        );
-    }
     // Store the source path for diagnostics
     metadata.insert(
         "source_path".to_string(),
@@ -225,7 +223,11 @@ fn parse_agent_markdown(path: &Path) -> Result<AgentProfile, String> {
         } else {
             Some(body.to_string())
         },
-        skill_filter: fm.tools,
+        skill_filter: Vec::new(),
+        allow_tools: fm.tools,
+        read_only: false,
+        initial_turns: None,
+        max_turns: fm.max_turns,
         model_selection: fm.model_selection,
         can_delegate,
         delegate_to: Vec::new(),
@@ -289,7 +291,15 @@ including SQL injection, XSS, and authentication bypasses.
         let p = &profiles[0];
         assert_eq!(p.agent_id, "security-auditor");
         assert_eq!(p.tier, AgentTier::System);
-        assert_eq!(p.skill_filter, vec!["read_file", "grep", "glob"]);
+        assert_eq!(
+            p.allow_tools,
+            Some(vec![
+                "read_file".to_string(),
+                "grep".to_string(),
+                "glob".to_string()
+            ])
+        );
+        assert!(p.skill_filter.is_empty());
         assert_eq!(
             p.model_selection
                 .as_ref()
@@ -303,10 +313,8 @@ including SQL injection, XSS, and authentication bypasses.
                 .unwrap()
                 .contains("security auditor")
         );
-        assert_eq!(
-            p.metadata.get("max_turns").and_then(|v| v.as_u64()),
-            Some(15)
-        );
+        assert_eq!(p.max_turns, Some(15));
+        assert!(!p.read_only);
     }
 
     #[test]
@@ -321,6 +329,18 @@ including SQL injection, XSS, and authentication bypasses.
         assert_eq!(p.name, "My Helper");
         assert_eq!(p.tier, AgentTier::User);
         assert!(!p.can_delegate);
+        assert!(p.allow_tools.is_none());
+    }
+
+    #[test]
+    fn empty_tools_frontmatter_is_explicit_deny_all() {
+        let tmp = TempDir::new().unwrap();
+        let md = "---\ntools: []\n---\nA restricted agent.\n";
+        write_agent_md(tmp.path(), "restricted", md);
+        let profiles = load_agent_profiles(tmp.path());
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].allow_tools, Some(Vec::new()));
+        assert!(profiles[0].skill_filter.is_empty());
     }
 
     #[test]
@@ -384,6 +404,28 @@ including SQL injection, XSS, and authentication bypasses.
         // Built-in coder's name preserved
         assert_eq!(registry.get("coder").unwrap().name, "Built-in Coder");
         assert!(registry.get("analyst").is_some());
+    }
+
+    #[test]
+    fn load_and_merge_counts_only_successful_registrations() {
+        let tmp = TempDir::new().unwrap();
+        write_agent_md(
+            tmp.path(),
+            "invalid",
+            "---\nname: invalid\nmax_turns: 0\n---\nRejected agent.\n",
+        );
+        write_agent_md(
+            tmp.path(),
+            "valid",
+            "---\nname: valid\n---\nAccepted agent.\n",
+        );
+
+        let mut registry = astra_services::coordination::AgentProfileRegistry::new();
+        let added = load_and_merge(tmp.path(), &mut registry);
+
+        assert_eq!(added, 1);
+        assert!(registry.get("invalid").is_none());
+        assert!(registry.get("valid").is_some());
     }
 
     #[test]

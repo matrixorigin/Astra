@@ -1773,21 +1773,26 @@ export type SessionActivity = {
   details: Record<string, unknown>;
 };
 
-/** Nullable lanes retain incomplete evidence; zero is an observed count. */
+/** Known sum and physical attempts that observed it; unknown is not zero. */
+export type ObservedTokenLane = {
+  known_tokens: number | null;
+  observed_attempts: number;
+};
+
 export type SessionRequestUsageSummary = {
   scope: "session_all_runs";
   request_count: number;
-  fresh_input_tokens: number | null;
-  cache_read_tokens: number | null;
-  cache_creation_tokens: number | null;
-  output_tokens: number | null;
+  nonterminal_attempt_count: number;
+  fresh_input_tokens: ObservedTokenLane;
+  cache_read_tokens: ObservedTokenLane;
+  cache_creation_tokens: ObservedTokenLane;
+  output_tokens: ObservedTokenLane;
 };
 
+/** Admission-rate estimate for retained physical attempts, not a provider bill. */
 export type SessionCostSummary = {
   estimated_cost_usd?: number;
-  per_model_cost_usd?: Record<string, number>;
-  priced_turn_count: number;
-  unpriced_turn_count: number;
+  unavailable_reason?: "historical_attempt_coverage_incomplete";
 };
 
 /** `GET /sessions/{id}/audit/summary` — matches the services response. */

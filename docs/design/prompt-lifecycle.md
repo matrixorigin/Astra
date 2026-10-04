@@ -141,6 +141,15 @@ baseline exactly once by durable request identity; only attempts with provider
 usage contribute hit/miss counts. Pre-dispatch attempts and missing-usage
 terminals never fabricate cache statistics.
 
+Planned prompt diagnostics identify owner, session, optional execution run,
+turn, round, attempt, and source. A missing run means a session-only diagnostic;
+it is not a substitute for a known run. Parent and child requests with identical
+coordinates retain separate attribution. Capture and persistence consume the
+same plan, and persistence rejects mismatched identity before acquiring a
+connection. Content hashes remain independent of execution identity: delta
+ancestry may reuse exact content across runs within the same owner/session/source.
+Diagnostic rows remain opt-in and are not a count of physical provider calls.
+
 Append-only canonical state uses the provider-attempt ledger as a write-ahead
 boundary. Before HTTP is authorized, the same transaction that admits the
 exact provider body stores every newly provider-owned canonical append as a

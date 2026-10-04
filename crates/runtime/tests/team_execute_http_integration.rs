@@ -2,10 +2,8 @@
 //!
 //! Injects mock `SubRunExecutor` implementations so delegation runs without a real LLM.
 //!
-//! **CLI parity:** REPL command `/team run review review the latest commit` parses as
-//! team `review` and task `review the latest commit` (see `splitn(2, ' ')` in
-//! `astra-cli/src/cli/slash_team.rs`). The tests below use the same task string against
-//! the built-in parallel `review` team (`InMemoryTeamStore::with_builtins`).
+//! This batch endpoint exercises coordination, not the interactive CLI/TUI
+//! lead journey, which uses ordinary root admission and shared child execution.
 //!
 //! **Failure matrix:** custom `SubRunExecutor` types simulate hard `Err`, mid-run failure
 //! after N successes (sequential + fanout in one test), role-specific failures, HTTP-ish
@@ -203,6 +201,23 @@ async fn post_json(app: Router, path: &str, user: &str, mut payload: Value) -> (
     (status, json)
 }
 
+async fn get_json(app: Router, path: &str, user: &str) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method("GET").uri(path);
+    for (k, v) in auth(user) {
+        builder = builder.header(k, v);
+    }
+    let response = app
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
 /// Build app with team store + delegation engine using the given sub-run executor (mock LLM).
 async fn build_app_with_delegation(
     team_store: Arc<InMemoryTeamStore>,
@@ -221,12 +236,17 @@ async fn build_app_with_delegation(
     let run_store = Arc::new(InMemoryRunStateStore::new());
     let run_engine = Arc::new(RunEngine::new(run_store));
     let tracker = Arc::new(DelegationTracker::new());
-    let delegation = Arc::new(DelegationEngine::with_executor(
-        registry.clone(),
-        run_engine,
-        tracker,
-        executor,
+    let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+        Arc::new(astra_messaging::InProcessTransport::new()),
+        tracker.clone(),
     ));
+    let supervisor = Arc::new(astra_runtime::orchestration::DynamicAgentSpawner::new(
+        router,
+    ));
+    let delegation = Arc::new(
+        DelegationEngine::with_executor(registry.clone(), run_engine, tracker, executor)
+            .for_execution(supervisor),
+    );
 
     let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
@@ -251,7 +271,16 @@ struct ErrorExecutor;
 
 #[async_trait]
 impl SubRunExecutor for ErrorExecutor {
-    async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+    async fn execute(
+        &self,
+        config: SubRunConfig,
+    ) -> Result<
+        (
+            AgentResult,
+            Option<astra_runtime::orchestration::SpawnRunFrontier>,
+        ),
+        String,
+    > {
         Err(format!("agent {} crashed", config.agent_profile.agent_id))
     }
 }
@@ -260,17 +289,29 @@ struct HighTokenExecutor;
 
 #[async_trait]
 impl SubRunExecutor for HighTokenExecutor {
-    async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
-        Ok(AgentResult {
-            agent_id: config.agent_profile.agent_id,
-            run_id: config.run_id,
-            status: astra_core::STATUS_COMPLETED.to_string(),
-            output: Some("done".into()),
-            error: None,
-            prompt_tokens: 500,
-            completion_tokens: 500,
-            tool_calls: 0,
-        })
+    async fn execute(
+        &self,
+        config: SubRunConfig,
+    ) -> Result<
+        (
+            AgentResult,
+            Option<astra_runtime::orchestration::SpawnRunFrontier>,
+        ),
+        String,
+    > {
+        Ok((
+            AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: astra_core::STATUS_COMPLETED.to_string(),
+                output: Some("done".into()),
+                error: None,
+                prompt_tokens: 500,
+                completion_tokens: 500,
+                tool_calls: 0,
+            },
+            None,
+        ))
     }
 }
 
@@ -283,21 +324,33 @@ struct CaptureEnabledToolsExecutor {
 
 #[async_trait]
 impl SubRunExecutor for CaptureEnabledToolsExecutor {
-    async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+    async fn execute(
+        &self,
+        config: SubRunConfig,
+    ) -> Result<
+        (
+            AgentResult,
+            Option<astra_runtime::orchestration::SpawnRunFrontier>,
+        ),
+        String,
+    > {
         self.seen
             .lock()
             .expect("capture mutex is not poisoned")
             .push(config.request_constraints.enabled_tools.clone());
-        Ok(AgentResult {
-            agent_id: config.agent_profile.agent_id,
-            run_id: config.run_id,
-            status: astra_core::STATUS_COMPLETED.to_string(),
-            output: Some("captured".into()),
-            error: None,
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            tool_calls: 0,
-        })
+        Ok((
+            AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: astra_core::STATUS_COMPLETED.to_string(),
+                output: Some("captured".into()),
+                error: None,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                tool_calls: 0,
+            },
+            None,
+        ))
     }
 }
 
@@ -318,7 +371,16 @@ impl FailAfterSuccessExecutor {
 
 #[async_trait]
 impl SubRunExecutor for FailAfterSuccessExecutor {
-    async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+    async fn execute(
+        &self,
+        config: SubRunConfig,
+    ) -> Result<
+        (
+            AgentResult,
+            Option<astra_runtime::orchestration::SpawnRunFrontier>,
+        ),
+        String,
+    > {
         let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         if n > self.fail_after {
             return Err(format!(
@@ -326,16 +388,19 @@ impl SubRunExecutor for FailAfterSuccessExecutor {
                 self.fail_after, config.agent_profile.agent_id
             ));
         }
-        Ok(AgentResult {
-            agent_id: config.agent_profile.agent_id.clone(),
-            run_id: config.run_id.clone(),
-            status: astra_core::STATUS_COMPLETED.to_string(),
-            output: Some(format!("[ok #{n}] {}", config.task)),
-            error: None,
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            tool_calls: 0,
-        })
+        Ok((
+            AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id.clone(),
+                status: astra_core::STATUS_COMPLETED.to_string(),
+                output: Some(format!("[ok #{n}] {}", config.task)),
+                error: None,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                tool_calls: 0,
+            },
+            None,
+        ))
     }
 }
 
@@ -346,23 +411,35 @@ struct ErrWhenAgentIdContains {
 
 #[async_trait]
 impl SubRunExecutor for ErrWhenAgentIdContains {
-    async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+    async fn execute(
+        &self,
+        config: SubRunConfig,
+    ) -> Result<
+        (
+            AgentResult,
+            Option<astra_runtime::orchestration::SpawnRunFrontier>,
+        ),
+        String,
+    > {
         if config.agent_profile.agent_id.contains(self.needle) {
             return Err(format!(
                 "simulated role-specific failure for {}",
                 config.agent_profile.agent_id
             ));
         }
-        Ok(AgentResult {
-            agent_id: config.agent_profile.agent_id.clone(),
-            run_id: config.run_id.clone(),
-            status: astra_core::STATUS_COMPLETED.to_string(),
-            output: Some("stub ok".into()),
-            error: None,
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            tool_calls: 0,
-        })
+        Ok((
+            AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id.clone(),
+                status: astra_core::STATUS_COMPLETED.to_string(),
+                output: Some("stub ok".into()),
+                error: None,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                tool_calls: 0,
+            },
+            None,
+        ))
     }
 }
 
@@ -371,17 +448,29 @@ struct OkButFailedStatusExecutor;
 
 #[async_trait]
 impl SubRunExecutor for OkButFailedStatusExecutor {
-    async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
-        Ok(AgentResult {
-            agent_id: config.agent_profile.agent_id.clone(),
-            run_id: config.run_id.clone(),
-            status: astra_core::STATUS_FAILED.to_string(),
-            output: None,
-            error: Some("provider returned failed status in body".into()),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            tool_calls: 0,
-        })
+    async fn execute(
+        &self,
+        config: SubRunConfig,
+    ) -> Result<
+        (
+            AgentResult,
+            Option<astra_runtime::orchestration::SpawnRunFrontier>,
+        ),
+        String,
+    > {
+        Ok((
+            AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id.clone(),
+                status: astra_core::STATUS_FAILED.to_string(),
+                output: None,
+                error: Some("provider returned failed status in body".into()),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            },
+            None,
+        ))
     }
 }
 
@@ -415,8 +504,7 @@ async fn post_raw_body(
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn http_execute_review_latest_commit_happy_path_matches_cli_team_run() {
-    // Parity: `/team run review review the latest commit` → team=review, task=this string.
+async fn http_execute_builtin_review_batch_happy_path() {
     let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
     let app = build_app_with_delegation(store, Arc::new(StubSubRunExecutor)).await;
 
@@ -435,6 +523,9 @@ async fn http_execute_review_latest_commit_happy_path_matches_cli_team_run() {
     assert_eq!(body["status"], "completed");
     // Each independent reviewer executes once through ordinary fanout.
     assert_eq!(body["agent_count"], 2);
+    assert_eq!(body["usage_scope"], "child_results_only");
+    assert_eq!(body["total_prompt_tokens"], 0);
+    assert_eq!(body["total_completion_tokens"], 0);
     assert!(!body["delegation_id"].as_str().unwrap().is_empty());
 }
 
@@ -543,31 +634,81 @@ async fn http_execute_unknown_team_404() {
 }
 
 #[tokio::test]
-async fn http_execute_validation_failure_400_empty_members() {
-    let store = Arc::new(InMemoryTeamStore::new());
-    let bad = TeamDefinition {
-        team_id: "bad-id".into(),
-        user_id: "test-user".into(),
-        name: "bad-empty".into(),
-        description: "x".into(),
-        coordination: TeamCoordination::Sequential {
-            stop_on_success: false,
-        },
-        members: vec![],
-        context: HashMap::new(),
-        worktree_mode: WorktreeMode::Shared,
-        budget: None,
-        max_parallel: 0,
-        created_at: "2026-01-01T00:00:00Z".into(),
-        updated_at: "2026-01-01T00:00:00Z".into(),
-    };
-    store.save_team(&bad).await.unwrap();
+async fn http_snapshot_get_uses_real_router_and_owner_scope() {
+    let store = Arc::new(InMemoryTeamStore::with_builtins("alice"));
+    let app = build_app_team_only(store);
 
-    let app = build_app_with_delegation(store, Arc::new(StubSubRunExecutor)).await;
+    let (status, created) = post_json(
+        app.clone(),
+        "/teams/review/snapshots",
+        "alice",
+        json!({ "label": "before refactor", "git_commit": "abc123" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let snapshot_id = created["snapshot_id"].as_str().unwrap().to_string();
+
+    let (status, fetched) = get_json(
+        app.clone(),
+        &format!("/teams/snapshots/{snapshot_id}"),
+        "alice",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fetched, created);
+
+    let truncated_id = &snapshot_id[..snapshot_id.len() - 1];
+    let (status, truncated) = get_json(
+        app.clone(),
+        &format!("/teams/snapshots/{truncated_id}"),
+        "alice",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(truncated["detail"].as_str().unwrap().contains("not found"));
+
+    let (status, missing) = get_json(app.clone(), "/teams/snapshots/missing", "alice").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(missing["detail"].as_str().unwrap().contains("not found"));
+
+    let (status, cross_owner) =
+        get_json(app, &format!("/teams/snapshots/{snapshot_id}"), "bob").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        cross_owner["detail"]
+            .as_str()
+            .unwrap()
+            .contains("not found")
+    );
+}
+
+#[tokio::test]
+async fn http_draft_team_persists_but_cannot_execute_until_member_added() {
+    let store = Arc::new(InMemoryTeamStore::new());
+    let executor = Arc::new(FailAfterSuccessExecutor::new(1));
+    let app = build_app_with_delegation(store.clone(), executor.clone()).await;
+    let mut configuration = json!({
+        "name": "draft",
+        "description": "An unfinished roster",
+        "coordination": TeamCoordination::Sequential { stop_on_success: false },
+        "members": [],
+    });
+    let (status, draft) =
+        post_json(app.clone(), "/teams", "test-user", configuration.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        store
+            .load_team("test-user", "draft")
+            .await
+            .unwrap()
+            .unwrap()
+            .members
+            .is_empty()
+    );
 
     let (status, body) = post_json(
-        app,
-        "/teams/bad-empty/execute",
+        app.clone(),
+        "/teams/draft/execute",
         "test-user",
         json!({ "task": "t" }),
     )
@@ -575,6 +716,25 @@ async fn http_execute_validation_failure_400_empty_members() {
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["detail"].as_str().unwrap().contains("validation"));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    configuration["members"] = json!([{
+        "role": "calculator", "agent_id": null, "system_prompt": null,
+        "skills": [], "model_selection": null, "mcp_servers": [],
+    }]);
+    let (status, updated) = post_json(app.clone(), "/teams", "test-user", configuration).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["team_id"], draft["team_id"]);
+    let (status, result) = post_json(
+        app,
+        "/teams/draft/execute",
+        "test-user",
+        json!({"task": "t"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["agent_count"], 1);
+    assert_eq!(result["status"], "completed");
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -597,6 +757,7 @@ async fn http_execute_token_budget_exceeded_body_status() {
             mcp_servers: vec![],
             can_delegate: false,
             max_delegation_depth: 0,
+            ..Default::default()
         }],
         context: HashMap::new(),
         worktree_mode: WorktreeMode::Shared,
@@ -745,6 +906,7 @@ async fn http_pipeline_ok_response_but_agent_status_failed() {
             mcp_servers: vec![],
             can_delegate: false,
             max_delegation_depth: 0,
+            ..Default::default()
         }],
         context: HashMap::new(),
         worktree_mode: WorktreeMode::Shared,

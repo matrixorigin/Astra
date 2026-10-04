@@ -679,6 +679,7 @@ pub(crate) fn root_run_transcript_events(
         return Vec::new();
     }
 
+    let mut evidence_keys = BTreeSet::new();
     messages
         .iter()
         .filter(|message| {
@@ -686,6 +687,17 @@ pub(crate) fn root_run_transcript_events(
                 message.get("role").and_then(serde_json::Value::as_str),
                 Some("system") | None
             )
+        })
+        .filter(|message| {
+            message
+                .get("evidence")
+                .and_then(|value| {
+                    serde_json::from_value::<astra_turn_types::AgentTranscriptEvidence>(
+                        value.clone(),
+                    )
+                    .ok()
+                })
+                .is_none_or(|evidence| evidence_keys.insert(evidence.stable_key()))
         })
         .enumerate()
         .filter_map(|(index, message)| {

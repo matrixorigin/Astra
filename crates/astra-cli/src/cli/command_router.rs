@@ -8,7 +8,8 @@ use crate::cli::auth_flow::{
     parse_auth_tokens, save_refreshed_profile_tokens,
 };
 use crate::cli::cli_config::cli_args::{
-    AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
+    AuditCmd, ChatArgs, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd,
+    SkillCmd, TeamRunArgs, TeamSubcommand,
 };
 use crate::cli::cli_config::cli_utils;
 use crate::cli::cli_config::cli_utils::{
@@ -47,12 +48,9 @@ use crate::cli::stream::streaming_types::{
     StreamResult, format_background_agent_results, stream_result_from_resumable_turn_failure,
 };
 use crate::cli::workspace_inspection::{handle_grep_command, handle_review_command};
-use crate::cli::{
-    agent_loader, delegate_subrun, diff_presenter, journal_diff, journal_digest, journal_tree,
-    theme,
-};
+use crate::cli::{diff_presenter, journal_diff, journal_digest, journal_tree, theme};
 use astra_thin_client::paths;
-use clap::CommandFactory;
+use clap::{CommandFactory, Parser};
 use crossterm::{style::Stylize, terminal};
 use std::io::Read;
 
@@ -132,10 +130,7 @@ async fn fresh_access_token_or_error(
 }
 
 fn repl_bridge_command_requires_access_token(slash_cmd: &str) -> bool {
-    matches!(
-        slash_cmd,
-        "/team" | "/memory" | "/plan" | "/review" | "/grep"
-    )
+    matches!(slash_cmd, "/memory" | "/plan" | "/review" | "/grep")
 }
 
 async fn repl_bridge_access_token(
@@ -183,36 +178,6 @@ async fn delete_session_and_local_history(
         format!("session {session_id} was deleted on the server, but local history cleanup failed: {error}")
     })?;
     Ok(body)
-}
-
-fn maybe_wire_delegation_engine(
-    state: &mut SessionState,
-    api: &astra_thin_client::ThinClient,
-    token: &str,
-) {
-    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let executor = delegate_subrun::CliDelegateSubRunExecutor::new(
-        api.clone(),
-        token.to_string(),
-        state.model.as_deref().map(str::to_string),
-        project_root.clone(),
-        state.perm_manager.inherited_permissions_for_child(true),
-        None,
-    );
-    let mut registry = astra_services::AgentProfileRegistry::new();
-    delegate_subrun::register_default_agents(&mut registry);
-    let _ = agent_loader::load_and_merge(&project_root, &mut registry);
-    let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
-    let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
-    let engine = astra_runtime::server::delegation::engine::DelegationEngine::with_executor(
-        registry,
-        std::sync::Arc::new(astra_runtime::server::run::engine::RunEngine::new(
-            run_store,
-        )),
-        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new()),
-        std::sync::Arc::new(executor),
-    );
-    state.delegation_engine = Some(std::sync::Arc::new(engine));
 }
 
 fn record_stream_persistence_error(sr: &mut StreamResult, detail: impl Into<String>) {
@@ -790,6 +755,56 @@ fn execute_repl_bridge_command<'a>(
     ))
 }
 
+pub(crate) fn parse_team_bridge_command(arg: &str) -> Result<Command, String> {
+    let words = shell_words::split(arg)
+        .map_err(|error| format!("invalid /team command quoting: {error}"))?;
+    let mut argv = Vec::with_capacity(words.len() + 2);
+    argv.push("astra".to_string());
+    argv.push("team".to_string());
+    argv.extend(words);
+    let parsed = Cli::try_parse_from(argv).map_err(|error| error.to_string())?;
+    match parsed.command {
+        Some(command @ Command::Team(_)) => Ok(command),
+        _ => Err("/team requires a Team subcommand".to_string()),
+    }
+}
+
+fn team_run_chat_args(run: &TeamRunArgs, message: String) -> ChatArgs {
+    let mut chat = ChatArgs::one_shot_message(message);
+    chat.json = run.json;
+    chat.no_resume = run.no_resume;
+    chat.stream_events = run.stream_events.clone();
+    chat
+}
+
+#[cfg(test)]
+mod team_run_capture_tests {
+    use super::{parse_team_bridge_command, team_run_chat_args};
+    use crate::cli::cli_config::cli_args::{Command, TeamSubcommand};
+    use std::path::Path;
+
+    #[test]
+    fn team_run_projection_preserves_existing_chat_capture_controls() {
+        let Command::Team(args) = parse_team_bridge_command(
+            "run dev --lead-agent-id lead --json --no-resume --stream-events events.jsonl task",
+        )
+        .expect("Team command") else {
+            panic!("Team command")
+        };
+        let Some(TeamSubcommand::Run(run)) = args.command else {
+            panic!("Run command")
+        };
+
+        let chat = team_run_chat_args(&run, "task".to_string());
+        assert!(chat.json);
+        assert!(chat.no_resume);
+        assert_eq!(
+            chat.stream_events.as_deref(),
+            Some(Path::new("events.jsonl"))
+        );
+    }
+}
+
 async fn execute_repl_bridge_command_impl(
     slash_cmd: &str,
     arg: &str,
@@ -798,6 +813,45 @@ async fn execute_repl_bridge_command_impl(
     api: &astra_thin_client::ThinClient,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
+    if slash_cmd == "/team" {
+        let command = parse_team_bridge_command(arg)?;
+        if let Command::Team(args) = &command
+            && let Some(TeamSubcommand::Run(run)) = args.command.as_ref()
+        {
+            let request = slash_team::resolve_team_run_chat_request(
+                api,
+                profile,
+                &run.team,
+                run.lead_agent_id.as_deref(),
+                &run.task.join(" "),
+            )
+            .await?;
+            let mut selected_context = cli_context.clone();
+            selected_context.agent_profile_selection = Some(request.selection);
+            return execute_cli_command(
+                Some(Command::Chat(team_run_chat_args(run, request.message))),
+                profile.map(ToOwned::to_owned),
+                global_model.map(ToOwned::to_owned),
+                false,
+                None,
+                api,
+                false,
+                &selected_context,
+            )
+            .await;
+        }
+        return execute_cli_command(
+            Some(command),
+            profile.map(ToOwned::to_owned),
+            global_model.map(ToOwned::to_owned),
+            false,
+            None,
+            api,
+            false,
+            cli_context,
+        )
+        .await;
+    }
     try_silent_auth(api, profile).await;
 
     let mut state = initialize_session_state(profile, global_model, cli_context);
@@ -807,17 +861,12 @@ async fn execute_repl_bridge_command_impl(
     }
     maybe_load_project_instructions(&mut state);
 
-    let pipeline_modules = create_pipeline_modules(api, profile);
+    let pipeline_modules = create_pipeline_modules(api, profile).await;
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
     let token = repl_bridge_access_token(slash_cmd, api, profile).await?;
-    if let Some(ref tok) = token {
-        maybe_wire_delegation_engine(&mut state, api, tok);
-    }
-
     match slash_cmd {
-        "/team" => slash_team::handle_team_command(arg, api, profile, &mut state).await,
         "/telemetry" => slash_telemetry::handle_telemetry_command(arg, &state),
         "/memory" => {
             handle_memory_domain_command("/memory", arg, api, &mut state, token.as_deref()).await?
@@ -904,7 +953,8 @@ mod permission_mode_display_tests {
 #[cfg(test)]
 mod token_refresh_error_tests {
     use super::{
-        execute_cli_command, repl_bridge_access_token, repl_bridge_command_requires_access_token,
+        execute_cli_command, execute_repl_bridge_command, repl_bridge_access_token,
+        repl_bridge_command_requires_access_token,
     };
     use crate::cli::cli_config::cli_args::Cli;
     use crate::cli::cli_config::cli_context::CliContext;
@@ -950,7 +1000,7 @@ mod token_refresh_error_tests {
 
     #[test]
     fn repl_bridge_auth_policy_matches_command_capabilities() {
-        for command in ["/team", "/memory", "/plan", "/review", "/grep"] {
+        for command in ["/memory", "/plan", "/review", "/grep"] {
             assert!(
                 repl_bridge_command_requires_access_token(command),
                 "{command} needs cloud auth or delegation wiring and must fail fast"
@@ -1042,6 +1092,136 @@ mod token_refresh_error_tests {
             "gateway auth must advance past local-profile admission: {error}"
         );
         assert!(!error.contains("no profile"), "{error}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn public_team_run_registers_after_canonical_lead_validation() {
+        let _creds = crate::tests::isolate_credentials();
+        let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "team-token");
+        let _registry = EnvVarGuard::remove("ASTRA_EDGE_REGISTRY");
+        let server = MockServer::start().await;
+        let mut team =
+            astra_services::team_persistence::builtin_teams("owner", "2026-10-03T00:00:00Z")
+                .remove(0);
+        team.team_id = "server-team-id".into();
+        team.name = "dev".into();
+        team.members[0].agent_id = Some("lead".into());
+        Mock::given(method("GET"))
+            .and(path("/teams/dev"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&team))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let parsed = Cli::try_parse_from([
+            "astra",
+            "team",
+            "run",
+            "dev",
+            "--lead-agent-id",
+            "lead",
+            "child task",
+        ])
+        .expect("team run arguments");
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("client");
+        let error = execute_cli_command(
+            parsed.command,
+            None,
+            None,
+            false,
+            None,
+            &api,
+            false,
+            &CliContext::default(),
+        )
+        .await
+        .expect_err("Team root turn must fail when Edge registration is unavailable");
+
+        assert!(
+            error.contains("Edge registration failed before chat"),
+            "{error}"
+        );
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 2, "chat and child admission must not start");
+        assert_eq!(requests[0].url.path(), "/teams/dev");
+        assert_eq!(requests[1].url.path(), "/agents/edge");
+
+        let error = execute_repl_bridge_command(
+            "/team",
+            "run dev --lead-agent-id lead \"child task\"",
+            None,
+            None,
+            &api,
+            &CliContext::default(),
+        )
+        .await
+        .expect_err("bridge Team Run must stop when Edge admission fails");
+        assert!(
+            error.contains("Edge registration failed before chat"),
+            "{error}"
+        );
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[2].url.path(), "/teams/dev");
+        assert_eq!(requests[3].url.path(), "/agents/edge");
+
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/teams"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "teams": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut accepted =
+            astra_services::team_persistence::builtin_teams("owner", "2026-10-03T00:00:00Z")
+                .remove(0);
+        accepted.team_id = "server-team-id".into();
+        accepted.name = "draft".into();
+        accepted.description = "description".into();
+        accepted.members.clear();
+        Mock::given(method("POST"))
+            .and(path("/teams"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&accepted))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = execute_repl_bridge_command(
+            "/team",
+            "create draft description",
+            None,
+            None,
+            &api,
+            &CliContext::default(),
+        )
+        .await
+        .expect("Team configuration command");
+
+        assert_eq!(result, crate::cli::exit_code::ExitCode::Success);
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method.as_str(), "GET");
+        assert_eq!(requests[1].method.as_str(), "POST");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() == "/teams")
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != "/agents/edge"),
+            "configuration commands must not perform Edge registration"
+        );
     }
 }
 
@@ -1244,7 +1424,12 @@ async fn execute_cli_command_impl(
             let resolved_model = resolve_one_shot_model(
                 api,
                 &token,
-                None,
+                global_model.as_deref().filter(|_| {
+                    matches!(
+                        cli_context.requested_model_policy,
+                        Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
+                    )
+                }),
                 session_routing.restored_model(),
                 global_model.as_deref(),
             )
@@ -1257,9 +1442,11 @@ async fn execute_cli_command_impl(
                 session_routing.restored_permission_mode(),
                 false,
             )?;
+            let mut continuation_context = cli_context.clone();
             let (mut continuation_messages, deferred_tool_activations) =
-                session_routing.continuation_turn_inputs()?;
-            let _pipeline = create_pipeline_modules(api, profile.as_deref());
+                session_routing.continuation_turn_inputs(&mut continuation_context)?;
+            let cli_context = &continuation_context;
+            let _pipeline = create_pipeline_modules(api, profile.as_deref()).await;
             let mut pm = PermissionManager::with_load_policy(
                 effective_permission_mode,
                 &std::env::current_dir().unwrap_or_default(),
@@ -1506,15 +1693,45 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Team(args)) => {
-            execute_repl_bridge_command(
-                "/team",
+            if let Some(TeamSubcommand::Run(run)) = args.command.as_ref() {
+                let request = slash_team::resolve_team_run_chat_request(
+                    api,
+                    profile.as_deref(),
+                    &run.team,
+                    run.lead_agent_id.as_deref(),
+                    &run.task.join(" "),
+                )
+                .await?;
+                let mut selected_context = cli_context.clone();
+                selected_context.agent_profile_selection = Some(request.selection);
+                return execute_cli_command(
+                    Some(Command::Chat(team_run_chat_args(run, request.message))),
+                    profile,
+                    global_model,
+                    auto_approve,
+                    system_prompt,
+                    api,
+                    no_instructions,
+                    &selected_context,
+                )
+                .await;
+            }
+
+            try_silent_auth(api, profile.as_deref()).await;
+            let mut state =
+                initialize_session_state(profile.as_deref(), global_model.as_deref(), cli_context);
+            fresh_access_token_or_error(api, profile.as_deref()).await?;
+            state.team_store = std::sync::Arc::new(
+                crate::cli::http_team_store::HttpTeamStore::new(api, profile.as_deref()),
+            );
+            slash_team::handle_team_command(
                 &render_team_args(&args),
-                profile.as_deref(),
-                global_model.as_deref(),
                 api,
-                cli_context,
+                profile.as_deref(),
+                &mut state,
             )
-            .await
+            .await?;
+            Ok(ExitCode::Success)
         }
 
         Some(Command::Work(command)) => {
@@ -1678,6 +1895,11 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Chat(args)) => {
+            let mut chat_context = cli_context.clone();
+            if let Some(model) = args.model.as_deref() {
+                chat_context.select_model(Some(model));
+            }
+            let cli_context = &chat_context;
             // Anchor before any token/session/model/spawner await so the
             // process-level deadline covers the complete one-shot lifecycle.
             let one_shot_terminal_deadline = args.max_wall_time_seconds.map(|seconds| {
@@ -1807,7 +2029,14 @@ async fn execute_cli_command_impl(
             let model_future = resolve_one_shot_model(
                 api,
                 &token,
-                args.model.as_deref(),
+                args.model.as_deref().or_else(|| {
+                    global_model.as_deref().filter(|_| {
+                        matches!(
+                            cli_context.requested_model_policy,
+                            Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
+                        )
+                    })
+                }),
                 session_routing.restored_model(),
                 global_model.as_deref(),
             );
@@ -1828,10 +2057,12 @@ async fn execute_cli_command_impl(
                 session_routing.restored_permission_mode(),
                 false,
             )?;
+            let mut continuation_context = cli_context.clone();
             let (mut continuation_messages, deferred_tool_activations) =
-                session_routing.continuation_turn_inputs()?;
+                session_routing.continuation_turn_inputs(&mut continuation_context)?;
+            let cli_context = &continuation_context;
             let is_tty = terminal::size().is_ok();
-            let _pipeline = create_pipeline_modules(api, profile.as_deref());
+            let _pipeline = create_pipeline_modules(api, profile.as_deref()).await;
             let mut pm = {
                 let project_root = std::env::current_dir().unwrap_or_default();
                 PermissionManager::with_load_policy(
@@ -2626,7 +2857,7 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Skill(SkillCmd::List(args))) => {
-            let pipeline_modules = create_pipeline_modules_quiet(api, profile.as_deref());
+            let pipeline_modules = create_pipeline_modules_quiet(api, profile.as_deref()).await;
             let filter = SkillCatalogFilter {
                 query: (!args.query.is_empty()).then(|| args.query.join(" ").to_lowercase()),
                 source: args
@@ -2651,7 +2882,7 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Skill(SkillCmd::Show(args))) => {
-            let pipeline_modules = create_pipeline_modules_quiet(api, profile.as_deref());
+            let pipeline_modules = create_pipeline_modules_quiet(api, profile.as_deref()).await;
             let body = serde_json::to_string(
                 &load_skill_record_from_registry(
                     &pipeline_modules.unified_skill_registry,
@@ -3132,8 +3363,19 @@ pub(crate) async fn run_print_mode(
         }
     }
     let session_id = session_routing.server_session_id.clone();
-    let resolved_model =
-        resolve_one_shot_model(api, &token, None, session_routing.restored_model(), model).await?;
+    let resolved_model = resolve_one_shot_model(
+        api,
+        &token,
+        model.filter(|_| {
+            matches!(
+                cli_context.requested_model_policy,
+                Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
+            )
+        }),
+        session_routing.restored_model(),
+        model,
+    )
+    .await?;
     let effective_model = resolved_model.model;
     let effective_offering_id = resolved_model.offering_id;
     let effective_permission_mode = effective_one_shot_permission_mode(
@@ -3142,9 +3384,11 @@ pub(crate) async fn run_print_mode(
         session_routing.restored_permission_mode(),
         true,
     )?;
+    let mut continuation_context = cli_context.clone();
     let (mut continuation_messages, deferred_tool_activations) =
-        session_routing.continuation_turn_inputs()?;
-    let _pipeline = create_pipeline_modules(api, profile);
+        session_routing.continuation_turn_inputs(&mut continuation_context)?;
+    let cli_context = &continuation_context;
+    let _pipeline = create_pipeline_modules(api, profile).await;
     // Print mode is non-interactive. Restored session mode wins when present;
     // otherwise Auto is the headless fallback.
     // Issue #326 P5b: print mode is headless — strip project

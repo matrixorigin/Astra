@@ -4,6 +4,49 @@ use astra_services::session_journal::{
     BLOCKED_TOOL_RESULT_CLASS, NOOP_OR_CACHED_RESULT_CLASS, ToolCallDisposition, ToolCallRecord,
 };
 
+/// Audit an already settled provider callback. This does not issue execution
+/// authority or synthesize a durable invocation receipt.
+#[must_use]
+pub fn journal_record_edge_tool_result(
+    result: &crate::sse_stream_host::EdgeToolExecResult,
+) -> ToolCallRecord {
+    let args = result.args.to_string();
+    let mut record = journal_record_executed_tool_call(
+        result.tool.clone(),
+        astra_tools::tool_result_status::ToolResultStatusKind::from_status_str(&result.status)
+            .is_failure(),
+        result.duration_ms,
+        u32::try_from(args.len()).unwrap_or(u32::MAX),
+        &result.output,
+        None,
+        None,
+        Some(args),
+    );
+    record.tool_call_id = Some(result.request_id.clone());
+    record.execution_completion = result.execution_completion.clone();
+    let fields = result.tool_result_fields.as_ref();
+    record.disposition = Some(
+        fields
+            .and_then(|fields| fields.get("disposition"))
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or(ToolCallDisposition::Executed),
+    );
+    record.error_kind = fields
+        .and_then(|fields| fields.get("error_kind"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(astra_core::ErrorKind::parse_tag);
+    record.exit_semantics = fields
+        .and_then(|fields| fields.get("exit_semantics"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    record.result_class = fields
+        .and_then(|fields| fields.get("result_class"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    record
+}
+
 #[must_use]
 pub fn journal_record_duplicate_within_turn(
     tool_call_id: String,

@@ -3546,6 +3546,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     let first_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
         user_id: &owner_user_id,
         session_id: &session_id,
+        run_id: Some("first-root-run"),
         turn: 1,
         round: 0,
         attempt: 0,
@@ -3560,7 +3561,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
         &astra_services::PromptRequestPersistInput {
             session_id: session_id.clone(),
             user_id: owner_user_id.clone(),
-            run_id: None,
+            run_id: Some("first-root-run".into()),
             turn: 1,
             round: 0,
             attempt: 0,
@@ -3600,6 +3601,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     let second_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
         user_id: &owner_user_id,
         session_id: &session_id,
+        run_id: Some("second-root-run"),
         turn: 2,
         round: 0,
         attempt: 0,
@@ -3614,7 +3616,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
         &astra_services::PromptRequestPersistInput {
             session_id: session_id.clone(),
             user_id: owner_user_id.clone(),
-            run_id: None,
+            run_id: Some("second-root-run".into()),
             turn: 2,
             round: 0,
             attempt: 0,
@@ -3667,6 +3669,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     let third_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
         user_id: &owner_user_id,
         session_id: &session_id,
+        run_id: None,
         turn: 3,
         round: 0,
         attempt: 0,
@@ -3704,6 +3707,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
         let plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
             user_id: &owner_user_id,
             session_id: &session_id,
+            run_id: None,
             turn,
             round: 0,
             attempt: 0,
@@ -3743,6 +3747,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     let tail_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
         user_id: &owner_user_id,
         session_id: &session_id,
+        run_id: None,
         turn: 101,
         round: 0,
         attempt: 0,
@@ -4772,7 +4777,7 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_audit_usage_counts_physical_attempts_without_repricing_history() {
+async fn session_audit_prices_historical_physical_attempts_without_catalog_repricing() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
@@ -4852,24 +4857,111 @@ async fn session_audit_usage_counts_physical_attempts_without_repricing_history(
     .await
     .expect("insert priced audit event");
 
+    let historical_price_snapshot = r#"{"calculation_version":1,"currency":"USD","unit":"per_token","source":"configured","prompt":0.000002,"completion":0.000008,"cache_read":0.0000005,"cache_write":0.0000015,"configuration_updated_at":"2026-09-30"}"#;
+    let route_ids = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
+    let invocation_ids = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
+    for (route_id, invocation_id, run_id, operation_id) in [
+        (
+            &route_ids[0],
+            &invocation_ids[0],
+            "audit-root-run",
+            "audit_root_request",
+        ),
+        (
+            &route_ids[1],
+            &invocation_ids[1],
+            "audit-child-run",
+            "audit_child_request",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO inference_routes \
+             (route_id, user_id, session_id, scope_kind, run_id, offering_id, \
+              resolved_model_name, upstream_model_name, provider, execution_placement, \
+              access_kind, purpose, price_snapshot_json, created_at) \
+             VALUES (?, ?, ?, 'run', ?, 'audit-offering', ?, ?, 'mock', 'server', \
+                     'self_hosted', 'primary_agent', CAST(? AS JSON), NOW(6))",
+        )
+        .bind(route_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(run_id)
+        .bind(&model_name)
+        .bind(&model_name)
+        .bind(historical_price_snapshot)
+        .execute(&pool)
+        .await
+        .expect("insert historical priced route");
+
+        sqlx::query(
+            "INSERT INTO inference_invocations \
+             (invocation_id, route_id, user_id, session_id, scope_kind, run_id, \
+              admission_token, owner_token, owner_generation, owner_lease_expires_at, \
+              turn_index, round_index, operation_id, logical_attempt, purpose, status, \
+              terminal_fingerprint, usage_status, provider_delivery_state, created_at, terminal_at) \
+             VALUES (?, ?, ?, ?, 'run', ?, ?, ?, 1, DATE_ADD(NOW(6), INTERVAL 60 SECOND), \
+                     1, 0, ?, 0, 'primary_agent', 'succeeded', NULL, \
+                     'provider_exact', 'delivery_authorized', NOW(6), NOW(6))",
+        )
+        .bind(invocation_id)
+        .bind(route_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(run_id)
+        .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .bind("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .bind(operation_id)
+        .execute(&pool)
+        .await
+        .expect("insert historical priced invocation");
+    }
+
     let other_user = Uuid::new_v4().to_string();
     let attempt_ids = [
         Uuid::new_v4().to_string(),
         Uuid::new_v4().to_string(),
         Uuid::new_v4().to_string(),
+        Uuid::new_v4().to_string(),
+        Uuid::new_v4().to_string(),
     ];
-    for (index, owner, status, coverage, counts) in [
+    let foreign_invocation_id = Uuid::new_v4().to_string();
+    for (attempt_id, invocation_id, owner, run_id, attempt_index, status, coverage, counts) in [
         (
-            0,
+            &attempt_ids[0],
+            &invocation_ids[0],
             &user_id,
+            "audit-root-run",
+            0_i64,
             "succeeded",
             "provider_exact",
             [1_000_000, 500_000, 2_000_000, 1_000_000],
         ),
-        (1, &user_id, "failed", "provider_partial", [30_000, 0, 0, 0]),
         (
-            2,
+            &attempt_ids[1],
+            &invocation_ids[1],
+            &user_id,
+            "audit-child-run",
+            0_i64,
+            "failed",
+            "provider_exact",
+            [30_000, 4_000, 100, 20],
+        ),
+        (
+            &attempt_ids[2],
+            &invocation_ids[1],
+            &user_id,
+            "audit-child-run",
+            1_i64,
+            "succeeded",
+            "provider_exact",
+            [10_000, 2_000, 10, 5],
+        ),
+        (
+            &attempt_ids[3],
+            &foreign_invocation_id,
             &other_user,
+            "foreign-run",
+            0_i64,
             "succeeded",
             "provider_exact",
             [99_000_000, 0, 0, 0],
@@ -4877,15 +4969,17 @@ async fn session_audit_usage_counts_physical_attempts_without_repricing_history(
     ] {
         sqlx::query(
             "INSERT INTO inference_provider_attempts \
-             (attempt_id, invocation_id, user_id, session_id, attempt_index, provider, \
+             (attempt_id, invocation_id, user_id, session_id, run_id, attempt_index, provider, \
               admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes, \
               status, usage_status, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) \
-             VALUES (?, ?, ?, ?, 0, 'mock', ?, 'openai_compatible', ?, 1, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, 'mock', ?, 'openai_compatible', ?, 1, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(&attempt_ids[index])
-        .bind(Uuid::new_v4().to_string())
+        .bind(attempt_id)
+        .bind(invocation_id)
         .bind(owner)
         .bind(&session_id)
+        .bind(run_id)
+        .bind(attempt_index)
         .bind("00000000000000000000000000000000")
         .bind("0".repeat(64))
         .bind(status)
@@ -4904,36 +4998,109 @@ async fn session_audit_usage_counts_physical_attempts_without_repricing_history(
         .get_summary(&user_id, &session_id)
         .await
         .expect("get session summary");
-    assert_eq!(summary.request_usage.request_count, 2);
+    assert_eq!(summary.request_usage.request_count, 3);
     assert_eq!(
         summary.request_usage.fresh_input_tokens.known_tokens,
-        Some(1_030_000)
+        Some(1_040_000)
     );
     assert_eq!(
         summary.request_usage.fresh_input_tokens.observed_attempts,
-        2
+        3
     );
     assert_eq!(
         summary.request_usage.output_tokens.known_tokens,
-        Some(500_000)
+        Some(506_000)
     );
-    assert_eq!(summary.request_usage.output_tokens.observed_attempts, 1);
-    assert_eq!(summary.cost.estimated_cost_usd, None);
+    assert_eq!(summary.request_usage.output_tokens.observed_attempts, 3);
     assert_eq!(
-        summary.cost.unavailable_reason,
-        astra_services::session_audit::SessionCostUnavailableReason::HistoricalAttemptCoverageIncomplete
+        summary.request_usage.cache_read_tokens.known_tokens,
+        Some(2_000_110)
+    );
+    assert_eq!(summary.request_usage.cache_read_tokens.observed_attempts, 3);
+    assert_eq!(
+        summary.request_usage.cache_creation_tokens.known_tokens,
+        Some(1_000_025)
+    );
+    assert_eq!(
+        summary
+            .request_usage
+            .cache_creation_tokens
+            .observed_attempts,
+        3
+    );
+    assert!((summary.cost.estimated_cost_usd.unwrap() - 8.6280925).abs() < 1e-10);
+    assert_eq!(summary.cost.unavailable_reason, None);
+
+    sqlx::query("UPDATE infra_llm_models SET pricing = CAST(? AS JSON) WHERE model_id = ?")
+        .bind(
+            r#"{"currency":"USD","unit":"per_token","prompt":0.2,"completion":0.8,"cache_read":0.05,"cache_write":0.15}"#,
+        )
+        .bind(&model_id)
+        .execute(&pool)
+        .await
+        .expect("change current catalog price");
+    let after_catalog_change = audit
+        .get_summary(&user_id, &session_id)
+        .await
+        .expect("get summary after catalog change");
+    assert!((after_catalog_change.cost.estimated_cost_usd.unwrap() - 8.6280925).abs() < 1e-10);
+
+    sqlx::query(
+        "INSERT INTO inference_provider_attempts \
+         (attempt_id, invocation_id, user_id, session_id, run_id, attempt_index, provider, \
+          admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes, \
+          status, usage_status, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) \
+         VALUES (?, ?, ?, ?, ?, 0, 'mock', ?, 'openai_compatible', ?, 1, \
+                 'succeeded', 'provider_exact', 99, 99, 99, 99)",
+    )
+    .bind(&attempt_ids[4])
+    .bind(Uuid::new_v4().to_string())
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind("orphan-run")
+    .bind("00000000000000000000000000000000")
+    .bind("0".repeat(64))
+    .execute(&pool)
+    .await
+    .expect("insert orphan physical attempt");
+    let with_orphan = audit
+        .get_summary(&user_id, &session_id)
+        .await
+        .expect("get summary with orphan attempt");
+    assert_eq!(with_orphan.request_usage.request_count, 4);
+    assert_eq!(with_orphan.cost.estimated_cost_usd, None);
+    assert_eq!(
+        with_orphan.cost.unavailable_reason,
+        Some(
+            astra_services::session_audit::SessionCostUnavailableReason::HistoricalAttemptCoverageIncomplete
+        )
     );
 
     sqlx::query(
-        "DELETE FROM inference_provider_attempts WHERE session_id = ? AND attempt_id IN (?, ?, ?)",
+        "DELETE FROM inference_provider_attempts WHERE session_id = ? AND attempt_id IN (?, ?, ?, ?, ?)",
     )
     .bind(&session_id)
     .bind(&attempt_ids[0])
     .bind(&attempt_ids[1])
     .bind(&attempt_ids[2])
+    .bind(&attempt_ids[3])
+    .bind(&attempt_ids[4])
     .execute(&pool)
     .await
     .expect("delete physical attempts");
+
+    sqlx::query("DELETE FROM inference_invocations WHERE user_id = ? AND session_id = ?")
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .expect("delete audit invocations");
+    sqlx::query("DELETE FROM inference_routes WHERE user_id = ? AND session_id = ?")
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .expect("delete audit routes");
 
     cleanup_agent_sessions_and_events_for_owner(
         &pool,

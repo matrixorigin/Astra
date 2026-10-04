@@ -4231,40 +4231,9 @@ fn sync_incremental_tool_result_state(
     incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
     result: &EdgeToolExecResult,
 ) {
-    let is_failure = tool_result_status_is_failure(&result.status);
-    let error = is_failure.then(|| result.output.clone());
-    let fields = result.tool_result_fields.as_ref();
-    let error_kind = fields
-        .and_then(|fields| fields.get("error_kind"))
-        .and_then(Value::as_str)
-        .and_then(astra_core::ErrorKind::parse_tag);
-    let disposition = fields
-        .and_then(|fields| fields.get("disposition"))
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or(astra_services::session_journal::ToolCallDisposition::Executed);
-    let exit_semantics = fields
-        .and_then(|fields| fields.get("exit_semantics"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    let result_class = fields
-        .and_then(|fields| fields.get("result_class"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    incremental_state.push_tool_record(astra_services::session_journal::ToolCallRecord {
-        tool_call_id: Some(result.request_id.clone()),
-        name: result.tool.clone(),
-        ok: !is_failure,
-        ms: result.duration_ms,
-        error,
-        output_bytes: Some(result.output.len().min(u32::MAX as usize) as u32),
-        result_preview: Some(tool_output_event_text(&result.tool, &result.output)),
-        error_kind,
-        disposition: Some(disposition),
-        exit_semantics,
-        result_class,
-        ..Default::default()
-    });
+    incremental_state.push_tool_record(
+        astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(result),
+    );
     incremental_state.add_tool_used(&result.tool);
 }
 

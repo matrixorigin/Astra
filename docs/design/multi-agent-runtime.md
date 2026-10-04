@@ -73,6 +73,14 @@ these process-local deadline decisions.
 
 ## Agent profile
 
+For a run with admitted profiles, `agent.agent_type` and fanout slot/default
+`agent_type` select an exact profile ID from the frozen run directory. That
+directory replaces the builtin persona list; omitting the selector does not
+implicitly choose a Team member. Tool schemas validate the selector's string
+shape, while the shared child admission owns identity, delegation permission,
+ancestry and depth checks before any child starts. This uses the already-loaded
+snapshot, not a fresh catalog query.
+
 An agent profile may specify:
 
 ```text

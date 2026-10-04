@@ -1,27 +1,12 @@
 //! Multi-agent coordination framework.
 //!
-//! Provides agent profiles with tier-based permissions, coordination patterns
+//! Provides agent profiles with explicit delegation permissions, coordination patterns
 //! for multi-agent task execution, delegation engine for spawning sub-runs,
 //! and result aggregation strategies.
 //!
-//! # Agent Tier Hierarchy
-//!
-//! ```text
-//! ┌──────────────┐    can delegate to
-//! │ ORCHESTRATOR │───────────────────┐
-//! │  (tier 0)    │                   │
-//! └──────┬───────┘                   │
-//!        │ can delegate to           │
-//! ┌──────▼───────┐                   │
-//! │   SYSTEM     │◄──────────────────┘
-//! │  (tier 1)    │
-//! └──────┬───────┘
-//!        │ can delegate to
-//! ┌──────▼───────┐
-//! │    USER      │
-//! │  (tier 2)    │
-//! └──────────────┘
-//! ```
+//! Tiers label profiles and provide construction defaults. Runtime delegation
+//! uses the source's explicit permission, target scope, depth and ancestor
+//! chain; equal-tier agents may collaborate without granting new capabilities.
 //!
 //! # Coordination Patterns
 //!
@@ -162,33 +147,19 @@ pub fn delegation_result_status_is_unfinished(status: &str) -> bool {
 
 // ─── Agent Profile ──────────────────────────────────────────────────────────
 
-/// Agent capability tier determining delegation permissions.
+/// Agent classification used for display and profile-construction defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentTier {
-    /// Top-level orchestrator: can delegate to all tiers.
+    /// Top-level coordinator; defaults to delegation enabled.
     Orchestrator,
-    /// System agent: can delegate to User agents.
+    /// Specialist agent; defaults to delegation enabled.
     System,
-    /// User-facing agent: cannot delegate further.
+    /// User-facing agent; defaults to delegation disabled.
     User,
 }
 
 impl AgentTier {
-    /// Numeric rank (lower = more privileged).
-    pub fn rank(self) -> u8 {
-        match self {
-            Self::Orchestrator => 0,
-            Self::System => 1,
-            Self::User => 2,
-        }
-    }
-
-    /// Whether this tier can delegate to the target tier.
-    pub fn can_delegate_to(self, target: AgentTier) -> bool {
-        self.rank() < target.rank()
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Orchestrator => "orchestrator",
@@ -207,27 +178,45 @@ impl AgentTier {
 }
 
 /// Extended profile for an agent participating in multi-agent coordination.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentProfile {
     /// Unique agent identifier.
     pub agent_id: String,
     /// Human-readable name.
     pub name: String,
-    /// Tier determining delegation permissions.
+    /// Classification; explicit controls below determine delegation authority.
     pub tier: AgentTier,
     /// Optional system prompt override for this agent.
     pub system_prompt: Option<String>,
-    /// Filter limiting which skills/tools this agent can use.
-    /// Empty = unrestricted.
+    /// Filter limiting which skills this agent can use.
+    /// Empty = unrestricted. Tool authorization is carried separately by
+    /// `allow_tools`.
     pub skill_filter: Vec<String>,
+    /// Optional execution-tool allowlist.
+    ///
+    /// `None` inherits the admitted tool surface; `Some(empty)` denies every
+    /// tool governed by this allowlist. This is deliberately separate from
+    /// `skill_filter`, which remains the skill-selection surface.
+    #[serde(default)]
+    pub allow_tools: Option<Vec<String>>,
+    /// Whether this profile is restricted to read-only execution.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Optional initial adaptive turn slice.
+    #[serde(default)]
+    pub initial_turns: Option<u32>,
+    /// Optional hard maximum turn budget.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
     /// Optional product-level Offering selected for this agent.
     /// Absence means the child inherits its parent's admitted Offering.
     pub model_selection: Option<astra_turn_types::ModelSelection>,
     /// Whether this agent can delegate tasks to sub-agents.
     pub can_delegate: bool,
     /// Explicit list of agent IDs this agent may delegate to.
-    /// Empty = any agent at a lower tier.
+    /// Empty = any other agent in the admitted registry. This never grants
+    /// authority over a profile outside that registry.
     pub delegate_to: Vec<String>,
     /// Maximum delegation depth (prevents infinite loops).
     pub max_delegation_depth: u32,
@@ -246,6 +235,10 @@ impl AgentProfile {
             tier,
             system_prompt: None,
             skill_filter: Vec::new(),
+            allow_tools: None,
+            read_only: false,
+            initial_turns: None,
+            max_turns: None,
             model_selection: None,
             can_delegate: tier != AgentTier::User,
             delegate_to: Vec::new(),
@@ -259,12 +252,41 @@ impl AgentProfile {
         }
     }
 
+    /// Validate profile controls that must be safe before runtime admission.
+    ///
+    /// The runtime remains the final authority for effective permissions; this
+    /// check only rejects malformed profile bounds before they become part of
+    /// a registry or Team execution snapshot.
+    pub fn validate_capability_bounds(&self) -> Result<(), String> {
+        if self.agent_id.trim().is_empty() {
+            return Err("agent profile agent_id must not be empty".to_string());
+        }
+        if self.initial_turns == Some(0) {
+            return Err(format!(
+                "agent profile '{}' initial_turns must be positive",
+                self.agent_id
+            ));
+        }
+        if self.max_turns == Some(0) {
+            return Err(format!(
+                "agent profile '{}' max_turns must be positive",
+                self.agent_id
+            ));
+        }
+        if let (Some(initial), Some(maximum)) = (self.initial_turns, self.max_turns)
+            && initial > maximum
+        {
+            return Err(format!(
+                "agent profile '{}' initial_turns cannot exceed max_turns",
+                self.agent_id
+            ));
+        }
+        Ok(())
+    }
+
     /// Check if this agent can delegate to a specific target agent.
     pub fn can_delegate_to_agent(&self, target: &AgentProfile) -> bool {
-        if !self.can_delegate {
-            return false;
-        }
-        if !self.tier.can_delegate_to(target.tier) {
+        if !self.can_delegate || self.agent_id == target.agent_id {
             return false;
         }
         if !self.delegate_to.is_empty() && !self.delegate_to.contains(&target.agent_id) {
@@ -307,7 +329,7 @@ pub enum CoordinationPattern {
     Fork {
         /// Per-child task descriptions.
         tasks: Vec<String>,
-        /// Agent ID to use for all fork children (must be a User-tier agent).
+        /// Admitted agent profile to use for all fork children.
         agent_id: String,
         /// How to aggregate fork results.
         aggregation: AggregationStrategy,
@@ -485,6 +507,7 @@ impl AgentProfileRegistry {
     /// replacement lets an unrelated request change the profile observed by
     /// an already-admitted delegation.
     pub fn register(&mut self, profile: AgentProfile) -> Result<(), String> {
+        profile.validate_capability_bounds()?;
         if self.profiles.contains_key(&profile.agent_id) {
             return Err(format!(
                 "agent profile '{}' is already registered",
@@ -828,25 +851,6 @@ mod tests {
     // ── AgentTier ───
 
     #[test]
-    fn tier_rank_ordering() {
-        assert_eq!(AgentTier::Orchestrator.rank(), 0);
-        assert_eq!(AgentTier::System.rank(), 1);
-        assert_eq!(AgentTier::User.rank(), 2);
-    }
-
-    #[test]
-    fn tier_delegation_rules() {
-        assert!(AgentTier::Orchestrator.can_delegate_to(AgentTier::System));
-        assert!(AgentTier::Orchestrator.can_delegate_to(AgentTier::User));
-        assert!(AgentTier::System.can_delegate_to(AgentTier::User));
-        assert!(!AgentTier::User.can_delegate_to(AgentTier::System));
-        assert!(!AgentTier::User.can_delegate_to(AgentTier::Orchestrator));
-        assert!(!AgentTier::System.can_delegate_to(AgentTier::Orchestrator));
-        // Same tier cannot delegate to itself
-        assert!(!AgentTier::System.can_delegate_to(AgentTier::System));
-    }
-
-    #[test]
     fn tier_as_str_and_from_str() {
         assert_eq!(AgentTier::Orchestrator.as_str(), "orchestrator");
         assert_eq!(AgentTier::from_str_lossy("system"), AgentTier::System);
@@ -864,6 +868,10 @@ mod tests {
         let orch = orchestrator();
         assert!(orch.can_delegate);
         assert_eq!(orch.max_delegation_depth, 3);
+        assert!(orch.allow_tools.is_none());
+        assert!(!orch.read_only);
+        assert!(orch.initial_turns.is_none());
+        assert!(orch.max_turns.is_none());
 
         let sys = system_agent("s1");
         assert!(sys.can_delegate);
@@ -872,6 +880,33 @@ mod tests {
         let usr = user_agent("u1");
         assert!(!usr.can_delegate);
         assert_eq!(usr.max_delegation_depth, 0);
+    }
+
+    #[test]
+    fn profile_registry_preserves_explicit_tool_and_turn_controls() {
+        let mut profile = user_agent("bounded");
+        profile.allow_tools = Some(Vec::new());
+        profile.read_only = true;
+        profile.initial_turns = Some(2);
+        profile.max_turns = Some(5);
+
+        let mut registry = AgentProfileRegistry::new();
+        registry.register(profile).unwrap();
+        let retained = registry.get("bounded").unwrap();
+        assert_eq!(retained.allow_tools, Some(Vec::new()));
+        assert!(retained.read_only);
+        assert_eq!(retained.initial_turns, Some(2));
+        assert_eq!(retained.max_turns, Some(5));
+    }
+
+    #[test]
+    fn profile_registry_rejects_zero_initial_turns() {
+        let mut profile = user_agent("invalid");
+        profile.initial_turns = Some(0);
+
+        let mut registry = AgentProfileRegistry::new();
+        let error = registry.register(profile).unwrap_err();
+        assert!(error.contains("initial_turns must be positive"));
     }
 
     #[test]
@@ -898,6 +933,9 @@ mod tests {
         assert!(orch.can_delegate_to_agent(&sys));
         assert!(orch.can_delegate_to_agent(&usr));
         assert!(sys.can_delegate_to_agent(&usr));
+        assert!(sys.can_delegate_to_agent(&system_agent("s2")));
+        assert!(sys.can_delegate_to_agent(&orch));
+        assert!(!sys.can_delegate_to_agent(&sys));
         assert!(!usr.can_delegate_to_agent(&sys));
         assert!(!usr.can_delegate_to_agent(&orch));
     }
@@ -915,11 +953,12 @@ mod tests {
     }
 
     #[test]
-    fn user_agent_cannot_delegate_even_with_flag() {
+    fn explicit_delegation_permission_is_not_overridden_by_tier() {
         let mut usr = user_agent("u1");
         usr.can_delegate = true; // override flag
         let usr2 = user_agent("u2");
-        // Still can't: same tier
+        assert!(usr.can_delegate_to_agent(&usr2));
+        usr.can_delegate = false;
         assert!(!usr.can_delegate_to_agent(&usr2));
     }
 
@@ -963,7 +1002,12 @@ mod tests {
 
         let sys = system_agent("s1");
         let delegates = reg.find_delegates(&sys);
-        assert_eq!(delegates.len(), 1); // u1 only
+        let mut ids: Vec<_> = delegates
+            .iter()
+            .map(|agent| agent.agent_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["orch-1", "s2", "u1"]);
     }
 
     #[test]
@@ -1060,12 +1104,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_delegation_wrong_tier() {
+    fn validate_delegation_uses_explicit_scope_depth_and_cycle_not_tier() {
         let mut reg = AgentProfileRegistry::new();
-        reg.register(system_agent("s1")).unwrap();
+        let mut source = system_agent("s1");
+        source.delegate_to = vec!["s2".into(), "orch-1".into(), "s1".into()];
+        reg.register(source).unwrap();
+        reg.register(system_agent("s2")).unwrap();
+        reg.register(system_agent("outside-scope")).unwrap();
         reg.register(orchestrator()).unwrap();
 
-        let req = DelegationRequest {
+        let mut req = DelegationRequest {
             session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
@@ -1082,8 +1130,34 @@ mod tests {
             execution_metadata: None,
         };
 
-        let err = reg.validate_delegation(&req, "s1").unwrap_err();
-        assert!(err.contains("cannot delegate"));
+        reg.validate_delegation(&req, "s1").unwrap();
+        for (target, allowed) in [("s2", true), ("s1", false), ("outside-scope", false)] {
+            req.pattern = CoordinationPattern::Fork {
+                agent_id: target.into(),
+                tasks: vec!["bounded task".into()],
+                aggregation: AggregationStrategy::AllResults,
+                timeout_sec: 0,
+            };
+            assert_eq!(reg.validate_delegation(&req, "s1").is_ok(), allowed);
+        }
+        req.pattern = CoordinationPattern::Sequential {
+            agent_ids: vec!["s2".into()],
+            stop_on_success: false,
+            timeout_sec: 0,
+        };
+        req.depth = 1;
+        assert!(
+            reg.validate_delegation(&req, "s1")
+                .unwrap_err()
+                .contains("depth")
+        );
+        req.depth = 0;
+        req.delegation_chain = vec!["s2".into()];
+        assert!(
+            reg.validate_delegation(&req, "s1")
+                .unwrap_err()
+                .contains("circular")
+        );
     }
 
     #[test]

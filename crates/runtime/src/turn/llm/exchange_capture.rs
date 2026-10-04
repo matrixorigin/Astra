@@ -82,19 +82,6 @@ pub(crate) fn build_capture_request_json(
     })
 }
 
-pub(crate) fn build_capture_request_summary_json(
-    messages: &[Value],
-    tools: &[Value],
-    max_output_tokens: Option<usize>,
-) -> Value {
-    json!({
-        "message_count": messages.len(),
-        "tool_count": tools.len(),
-        "max_output_tokens": max_output_tokens,
-        "degraded_summary": true,
-    })
-}
-
 pub(crate) fn build_capture_response_json(outcome: &str, response: Value) -> Value {
     json!({
         "outcome": outcome,

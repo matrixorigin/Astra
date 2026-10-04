@@ -832,7 +832,7 @@ fn work_lifecycle_section(tool_names: &[&str]) -> String {
 
     if can_start {
         body.push_str(
-            "- New Work: `start_work` is genesis; it lists only outcomes executable now, never future/conditional/replacement items. Once bound, never call `start_work` again: change the pinned plan through `propose_work_plan`. Trust IDs, receipts, and `next_action`.\n",
+            "- New Work: `start_work` is genesis; declare every known outcome, including dependent outcomes, with `after_initial_tasks` for explicit prerequisites. Omit only outcomes to be decided, discovered, added, replaced, or cancelled later. Once bound, never call `start_work` again: change the pinned plan through `propose_work_plan`. Trust IDs, receipts, and `next_action`.\n",
         );
         body.push_str(
             "- `activation=start` executes; `activation=defer` only prepares/establishes or honors explicit no-execute, owns no active attempt, and stops without routine decomposition approval.\n",
@@ -858,7 +858,7 @@ fn work_lifecycle_section(tool_names: &[&str]) -> String {
     }
     if can_settle {
         body.push_str(
-            "- Work item: only assigned attempts settle; child waits alone are not Work. Prove expected_result; settle on success, else continue or report blocked/failed. Never broaden/claim delivery.\n",
+            "- Work item: only assigned attempts settle; child waits alone are not Work. Prove expected_result; settle on success, else continue or report blocked/failed. `synthesize_final_response` means the declared graph ended, not that the whole user goal is satisfied; review the goal and revise omissions before further execution. Never broaden/claim delivery.\n",
         );
     }
     body
@@ -1672,8 +1672,10 @@ mod tests {
             "",
         );
         assert!(executable.contains("Trust IDs, receipts, and `next_action`"));
-        assert!(executable.contains("lists only outcomes executable now"));
-        assert!(executable.contains("never future/conditional/replacement items"));
+        assert!(executable.contains("declare every known outcome, including dependent outcomes"));
+        assert!(executable.contains("`after_initial_tasks` for explicit prerequisites"));
+        assert!(!executable.contains("only outcomes executable now"));
+        assert!(executable.contains("not that the whole user goal is satisfied"));
         assert!(executable.contains("propose_work_plan"));
         assert!(executable.contains("status=complete"));
         assert!(executable.contains("without an item"));

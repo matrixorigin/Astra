@@ -250,6 +250,7 @@ struct PrepareChatTurnRequest<'a> {
     current_session_id: Option<&'a str>,
     offering_id: Option<&'a str>,
     model: Option<&'a str>,
+    cli_context: Option<&'a crate::cli::cli_config::cli_context::CliContext>,
     context_window_tokens: u32,
     effective_input_budget_tokens: u64,
     explain: AgenticChatExplainFlags,
@@ -593,6 +594,7 @@ pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
         "plan_subtask_id",
         "is_plan_subtask",
         "requested_model_policy",
+        "agent_profile_selection",
     ] {
         if let Some(value) = source.get(field) {
             request.insert(field.to_string(), value.clone());
@@ -651,8 +653,45 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     }
 
     let git_branch = read_git_branch_abbrev();
+    let requested_model_policy = ctx
+        .cli_context
+        .and_then(|context| context.requested_model_policy.as_ref())
+        .cloned()
+        .unwrap_or(astra_turn_types::RequestedModelPolicy::Inherit);
+    // The resolver already selected this Offering. Preserve the caller's
+    // choice without a second lookup; a resolved default is never Fixed.
+    let requested_model_policy = match (&requested_model_policy, ctx.offering_id) {
+        (
+            astra_turn_types::RequestedModelPolicy::Fixed {
+                selector:
+                    astra_turn_types::ModelSelector::ConfiguredName {
+                        model_name,
+                        source: None,
+                    },
+            },
+            Some(offering_id),
+        ) if ctx.model.is_some_and(|model| {
+            astra_turn_core::thinking_config::resolve_model_thinking_request(model).0 == model_name
+        }) =>
+        {
+            astra_turn_types::RequestedModelPolicy::Fixed {
+                selector: astra_turn_types::ModelSelector::OfferingId {
+                    offering_id: offering_id.to_string(),
+                },
+            }
+        }
+        _ => requested_model_policy,
+    };
+    let profile_selection = ctx
+        .cli_context
+        .and_then(|context| context.agent_profile_selection.as_ref());
+    let profile_default = matches!(
+        requested_model_policy,
+        astra_turn_types::RequestedModelPolicy::Inherit
+    ) && profile_selection
+        .is_some_and(|selection| selection.lead_agent_id.is_some());
     let requested_model = astra_core::model_override::normalize_model_override(ctx.model);
-    let thinking_config = match requested_model {
+    let thinking_config = match requested_model.filter(|_| !profile_default) {
         Some(m) => {
             let (_, cfg) = astra_turn_core::thinking_config::resolve_model_thinking_request(m);
             // Per-turn dampener: the model suffix encodes the user's CEILING
@@ -688,6 +727,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         git_branch,
         thinking: thinking_config.clone(),
     });
+    payload["requested_model_policy"] =
+        serde_json::to_value(requested_model_policy).expect("model policy serializes");
+    if let Some(selection) = profile_selection {
+        payload["agent_profile_selection"] =
+            serde_json::to_value(selection).expect("profile selection serializes");
+    }
 
     // Carry only typed routing metadata across the trust boundary. Full skill
     // instructions remain client-owned and are returned only after the model
@@ -1352,6 +1397,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub auth_profile: Option<&'a str>,
     pub offering_id: Option<&'a str>,
     pub model: Option<&'a str>,
+    pub cli_context: Option<&'a crate::cli::cli_config::cli_context::CliContext>,
     pub context_window_tokens: u32,
     pub effective_input_budget_tokens: u64,
     pub explain: ExplainMode,
@@ -1637,6 +1683,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         auth_profile,
         offering_id,
         model,
+        cli_context,
         context_window_tokens,
         effective_input_budget_tokens,
         explain,
@@ -1738,6 +1785,7 @@ pub(crate) async fn fetch_chat_turn_sse(
                 current_session_id,
                 offering_id,
                 model,
+                cli_context,
                 context_window_tokens,
                 effective_input_budget_tokens,
                 explain: AgenticChatExplainFlags::from_explain_ui_mode(match explain {
@@ -2244,7 +2292,12 @@ mod tests {
         runtime_volatile_texts: &[String],
         message: &str,
         semantic_query_override: Option<&str>,
-        reasoning: Option<(&str, &str, &TurnIntent)>,
+        reasoning: Option<(
+            &str,
+            &str,
+            &TurnIntent,
+            Option<&crate::cli::cli_config::cli_context::CliContext>,
+        )>,
     ) -> (
         Value,
         Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>,
@@ -2276,6 +2329,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let prepared = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            cli_context: reasoning.and_then(|(_, _, _, context)| context),
             messages: &messages,
             runtime_required_texts,
             active_system_skills,
@@ -2283,8 +2337,8 @@ mod tests {
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
-            offering_id: reasoning.map(|(offering, _, _)| offering),
-            model: reasoning.map(|(_, model, _)| model),
+            offering_id: reasoning.map(|(offering, _, _, _)| offering),
+            model: reasoning.map(|(_, model, _, _)| model),
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
@@ -2292,7 +2346,7 @@ mod tests {
             message,
             user_intent: semantic_query_override.unwrap_or(message),
             semantic_query_override,
-            turn_intent: reasoning.map(|(_, _, intent)| intent),
+            turn_intent: reasoning.map(|(_, _, intent, _)| intent),
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
@@ -2348,7 +2402,7 @@ mod tests {
             &[],
             "Explain this.",
             None,
-            Some(("offer-parent", "model-a(thinking:high)", &intent)),
+            Some(("offer-parent", "model-a(thinking:high)", &intent, None)),
         )
         .await;
         let parent = parent.unwrap();
@@ -2378,6 +2432,66 @@ mod tests {
             parent.is_none(),
             "no Offering means no trusted inheritance identity"
         );
+
+        // Exercise the actual preparation + Server projection, not a manually
+        // assembled policy JSON. The same resolved model can be a default or
+        // an explicit choice, including explicitly disabled thinking.
+        for (explicit, expected_thinking) in [
+            (None, ThinkingConfig::ModelDefault),
+            (
+                Some("model-a(thinking:high)"),
+                ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::Medium,
+                },
+            ),
+            (Some("model-a(thinking:off)"), ThinkingConfig::Off),
+        ] {
+            let mut context = crate::cli::cli_config::cli_context::CliContext::default();
+            context.select_model(explicit);
+            context.agent_profile_selection = Some(astra_services::runs::AgentProfileSelection {
+                team_id: "roster".into(),
+                lead_agent_id: Some("lead".into()),
+            });
+            let (payload, _) = prepare_payload_with_reasoning_for_test(
+                vec![json!({"role":"user", "content":"Explain this."})],
+                &[],
+                &[],
+                &[],
+                "Explain this.",
+                None,
+                Some((
+                    "offer-parent",
+                    explicit.unwrap_or("model-a(thinking:high)"),
+                    &intent,
+                    Some(&context),
+                )),
+            )
+            .await;
+            let admitted = server_loop_admission_payload_with_execution_time_budget(
+                &payload,
+                "Explain this.",
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(admitted["model_selection"]["offering_id"], "offer-parent");
+            assert_eq!(
+                admitted["agent_profile_selection"],
+                serde_json::to_value(context.agent_profile_selection.as_ref().unwrap()).unwrap()
+            );
+            assert_eq!(
+                admitted["requested_model_policy"],
+                if explicit.is_some() {
+                    json!({"mode":"fixed", "selector":{"kind":"offering_id", "offering_id":"offer-parent"}})
+                } else {
+                    json!({"mode":"inherit"})
+                }
+            );
+            assert_eq!(
+                admitted["context"]["thinking"],
+                expected_thinking.to_payload_value()
+            );
+        }
     }
 
     #[tokio::test]
@@ -2508,6 +2622,7 @@ mod tests {
             let mut all_selected_skills = Vec::new();
 
             prepare_chat_turn_payload(PrepareChatTurnRequest {
+                cli_context: None,
                 messages: &messages,
                 runtime_required_texts: &required,
                 active_system_skills: &[],
@@ -3224,6 +3339,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            cli_context: None,
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -3398,6 +3514,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            cli_context: None,
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -3540,6 +3657,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            cli_context: None,
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -3661,6 +3779,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            cli_context: None,
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -3750,6 +3869,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            cli_context: None,
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -3865,6 +3985,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            cli_context: None,
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -4010,6 +4131,7 @@ mod tests {
             "Task: review timeout handling\nAssistant summary: Need a fix.\nFollow-up: 修复?";
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            cli_context: None,
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -4170,6 +4292,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            cli_context: None,
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -4294,6 +4417,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            cli_context: None,
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -4414,6 +4538,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            cli_context: None,
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -4517,6 +4642,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            cli_context: None,
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -4628,6 +4754,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            cli_context: None,
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -4732,6 +4859,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            cli_context: None,
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
