@@ -3645,7 +3645,7 @@ fn attach_fanout_to_agent_result(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::orchestration::{SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult};
     use crate::server::delegation::engine::DelegationTracker;
@@ -4592,6 +4592,53 @@ mod tests {
             workspace_mutation: WorkspaceMutationAuthority::default(),
             transcript_location: AgentTranscriptLocation::LocalJournal,
         }
+    }
+
+    pub(crate) async fn assert_restricted_child_handlers(
+        run: &astra_services::runs::DurableRunRecord,
+        inherited_prefix: bool,
+        target: &str,
+    ) {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let mut ctx = test_spawn_context(spawner, Some("Flash"));
+        ctx.run_id = run.run_id.clone();
+        ctx.fanout_admission = ctx.spawner.fanout_parent(&ctx.run_id);
+        ctx.recursion_depth = u8::try_from(run.depth).unwrap();
+        ctx.is_fork_child = inherited_prefix;
+        ctx.parent_profile_authority =
+            crate::server::run::engine::durable_run_profile_authority(run, &run.user_id).unwrap();
+        ctx.admitted_agent_profiles =
+            crate::server::run::engine::durable_run_agent_profiles(run, &run.user_id).unwrap();
+        ctx.trace_context = Some(astra_turn_core::trace_event::TraceContext {
+            session_id: run.session_id.clone(),
+            user_id: run.user_id.clone(),
+            turn_id: "turn".into(),
+            turn_seq: 1,
+            causal_chain_id: "chain".into(),
+            root_event_id: "event".into(),
+        });
+        let spawn = handle_agent_tool(
+            &json!({"action":"spawn", "agent_type":target,
+            "description":"Fresh child", "prompt":"Do the task"}),
+            Some(&ctx),
+        )
+        .await;
+        assert!(
+            spawn.contains("this child execution cannot delegate"),
+            "{spawn}"
+        );
+        let fanout = handle_agent_fanout_tool(&json!({"action":"start", "target_count":1,
+            "slots":[{"id":"fresh", "agent_type":target, "description":"Fresh child", "prompt":"Do the task"}]}), Some(&ctx)).await;
+        assert!(
+            fanout.contains("this child execution cannot delegate"),
+            "{fanout}"
+        );
+        assert!(
+            executor.take_captured_model().is_none(),
+            "rejected children must never execute"
+        );
+        assert!(!ctx.fanout_admission.has_pending_direct_children());
     }
 
     async fn collect_spawn_receipt(receipt: &str, ctx: &AgentToolContext) -> Value {

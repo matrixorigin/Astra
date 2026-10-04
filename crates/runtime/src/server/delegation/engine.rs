@@ -2897,6 +2897,7 @@ impl DelegationEngine {
             &parent_run,
             &request.user_id,
         )?;
+        parent_profile_authority.require_delegation()?;
         let mut execution = self.clone();
         if let Some(snapshot) = admitted_agent_profiles.as_ref() {
             let registry = snapshot.registry(&request.user_id)?;
@@ -2910,7 +2911,7 @@ impl DelegationEngine {
                         .get(profile_id)
                         .ok_or("admitted parent profile is missing")?,
                 ),
-                ParentProfileAuthority::Unbound => {
+                ParentProfileAuthority::Unbound | ParentProfileAuthority::NonDelegating { .. } => {
                     return Err("admitted roster requires parent profile authority".into());
                 }
             };
@@ -3348,6 +3349,7 @@ impl DelegationEngine {
                 Ok((result, frontier))
             };
             spawner.supervise_child(
+                None,
                 &instance_id, parent, execution, settlement, delegated_spawn_projection, Some(cancellation),
             ).await.map(|(receipt, _)| receipt).map_err(|error| error.to_string())
         }.await;
@@ -4284,9 +4286,11 @@ impl DelegationEngine {
         } else {
             Self::delegation_chain_for_child(request, agent_id)?
         };
-        let profile_authority = match parent_profile_authority {
-            ParentProfileAuthority::Unbound => ParentProfileAuthority::Unbound,
-            _ => parent_profile_authority.for_child(agent_id)?,
+        let profile_authority = ParentProfileAuthority::NonDelegating {
+            authority: Box::new(match parent_profile_authority {
+                ParentProfileAuthority::Unbound => ParentProfileAuthority::Unbound,
+                _ => parent_profile_authority.for_child(agent_id)?,
+            }),
         };
         drop(reg);
 
@@ -6656,6 +6660,9 @@ mod tests {
             profile.allow_tools = Some(vec!["read_file".into(), "write_file".into()]);
             profile.skill_filter = vec!["analysis".into()];
             profile.read_only = true;
+            profile.can_delegate = true;
+            profile.max_delegation_depth = 4;
+            profile.delegate_to = vec!["outside".into()];
             profile.initial_turns = Some(2);
             profile.max_turns = Some(5);
             registry.write().await.register(profile.clone()).unwrap();
@@ -6684,6 +6691,14 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+            };
+            let is_fork = matches!(&pattern, CoordinationPattern::Fork { .. });
+            let expected_child_authority = if is_fork {
+                ParentProfileAuthority::NonDelegating {
+                    authority: Box::new(expected_child_authority),
+                }
+            } else {
+                expected_child_authority
             };
             let mut request = fan_out_request(vec!["coder"]);
             request.pattern = pattern;
@@ -6813,6 +6828,16 @@ mod tests {
                     .unwrap(),
                     Some(snapshot.clone())
                 );
+                if is_fork {
+                    for inherited_prefix in [false, true] {
+                        crate::orchestration::agent_tool::tests::assert_restricted_child_handlers(
+                            &child,
+                            inherited_prefix,
+                            "outside",
+                        )
+                        .await;
+                    }
+                }
                 let start = child
                     .events
                     .iter()
@@ -10022,47 +10047,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fork_children_cannot_delegate() {
-        /// Executor that checks can_delegate is false on fork children.
-        struct DelegateCheckExecutor;
-
-        #[async_trait]
-        impl SubRunExecutor for DelegateCheckExecutor {
-            async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
-                let can_del = config.agent_profile.can_delegate;
-                let depth = config.agent_profile.max_delegation_depth;
-                Ok((
-                    AgentResult {
-                        agent_id: config.agent_profile.agent_id,
-                        run_id: config.run_id,
-                        status: "completed".to_string(),
-                        output: Some(format!("can_delegate={can_del},depth={depth}")),
-                        error: None,
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        tool_calls: 0,
-                    },
-                    None,
-                ))
-            }
-        }
-
-        let (reg, engine, tracker) = setup();
-        let de =
-            DelegationEngine::with_executor(reg, engine, tracker, Arc::new(DelegateCheckExecutor));
-
-        let req = fork_request("del-fork-deleg", vec!["task-a"], "writer");
-        let result = execute_with_durable_parent(&de, req, "orch", None)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            result.agent_results[0].output.as_deref(),
-            Some("can_delegate=false,depth=0")
-        );
-    }
-
-    #[tokio::test]
     async fn fork_partial_failure() {
         let executor = Arc::new(FailingExecutor {
             fail_agents: vec!["writer".to_string()],
@@ -11389,6 +11373,7 @@ mod tests {
 
         struct PrefixExecutor {
             model: &'static str,
+            run_engine: Arc<RunEngine>,
             inherited: Arc<std::sync::Mutex<Vec<bool>>>,
         }
         #[async_trait]
@@ -11418,6 +11403,22 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(config.inherited_prefix.is_some());
+                if matches!(
+                    config.profile_authority,
+                    ParentProfileAuthority::NonDelegating { .. }
+                ) {
+                    let child = self
+                        .run_engine
+                        .load_run(&config.user_id, &config.run_id)
+                        .await?
+                        .unwrap();
+                    crate::orchestration::agent_tool::tests::assert_restricted_child_handlers(
+                        &child,
+                        config.inherited_prefix.is_some(),
+                        "coder",
+                    )
+                    .await;
+                }
                 EchoExecutor.execute(config).await
             }
         }
@@ -11428,10 +11429,11 @@ mod tests {
                 let engine = bind_test_engine(
                     &DelegationEngine::with_executor(
                         registry,
-                        run_engine,
+                        run_engine.clone(),
                         tracker,
                         Arc::new(PrefixExecutor {
                             model,
+                            run_engine: run_engine.clone(),
                             inherited: inherited.clone(),
                         }),
                     )

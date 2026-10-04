@@ -14338,6 +14338,7 @@ async fn activation_cancellation_cas_cannot_terminalize_a_rotated_generation() {
 
 #[tokio::test]
 async fn server_subrun_execution_material_is_bound_to_durable_offering_identity() {
+    use crate::orchestration::ParentProfileAuthority;
     let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
     run_engine
         .start_run_ext_with_context(
@@ -14369,7 +14370,9 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
     )
     .with_run_engine(run_engine.clone());
     let mut config = SubRunConfig {
-        profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
+        profile_authority: ParentProfileAuthority::NonDelegating {
+            authority: Box::new(ParentProfileAuthority::Unbound),
+        },
         max_output_tokens: None,
         execution_owner_generation: None,
         execution_owner_generation_sink: None,
@@ -14458,6 +14461,15 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
             .expect_err("a missing durable row cannot become inherited execution material")
             .contains("disappeared before model materialization")
     );
+
+    let admitted_authority = config.profile_authority.clone();
+    config.profile_authority = ParentProfileAuthority::Unbound;
+    let error = executor
+        .ensure_durable_subrun_started(&config, config.admitted_model_execution.as_ref())
+        .await
+        .expect_err("retry cannot remove the admitted delegation restriction");
+    assert!(error.contains("changed its profile authority"));
+    config.profile_authority = admitted_authority;
 
     config.interaction_mode = RequestedTurnInteractionMode::Headless;
     let policy_error = executor
@@ -17150,62 +17162,79 @@ fn lead_model_snapshot(
 }
 
 #[tokio::test]
-async fn prepare_chat_request_admits_lead_default_once_below_explicit_model_policy() {
+async fn http_offering_intent_survives_lead_default_admission() {
     use astra_turn_types::{AutoModelStrategy, ModelSelector, RequestedModelPolicy};
     let models = Arc::new(ActiveTestModelService::default());
     let service = test_service().with_model_service(models.clone());
     assert!(
         service.team_store.is_none(),
-        "frozen profiles must not require a mutable Team read"
+        "frozen admission must not re-read Team configuration"
     );
-    for policy in [
-        None,
-        Some(RequestedModelPolicy::Inherit),
-        Some(RequestedModelPolicy::Fixed {
-            selector: ModelSelector::OfferingId {
-                offering_id: "model-test-model".into(),
-            },
-        }),
-        Some(RequestedModelPolicy::Auto {
-            strategy: AutoModelStrategy::Balanced,
-        }),
+    for (policy, invalid) in [
+        (None, false),
+        (None, true),
+        (Some(RequestedModelPolicy::Inherit), false),
+        (
+            Some(RequestedModelPolicy::Fixed {
+                selector: ModelSelector::OfferingId {
+                    offering_id: "model-test-model".into(),
+                },
+            }),
+            false,
+        ),
+        (
+            Some(RequestedModelPolicy::Auto {
+                strategy: AutoModelStrategy::Balanced,
+            }),
+            false,
+        ),
     ] {
-        let inherits = matches!(policy, None | Some(RequestedModelPolicy::Inherit));
+        let inherits = matches!(policy, Some(RequestedModelPolicy::Inherit));
+        let offering = if inherits || invalid {
+            "unavailable-client"
+        } else {
+            "model-test-model"
+        };
+        let dto: astra_server_types::ChatRequest = serde_json::from_value(json!({
+            "message": "Use the selected Offering.",
+            "model_selection": {"offering_id": offering},
+            "requested_model_policy": policy,
+            "agent_profile_selection": {"team_id": "frozen-team", "lead_agent_id": "lead"},
+            "context": {"thinking": {"mode": "model_default"}}
+        }))
+        .unwrap();
+        let mut request = astra_server_types::chat_request_into_data(dto);
         let snapshot = lead_model_snapshot(
             "u1",
-            Some(if inherits {
+            Some(if inherits || invalid {
                 "model-test-model"
             } else {
                 "unavailable-lead"
             }),
         );
-        let mut request = test_request("Use the admitted profile.");
-        request.agent_profile_selection = Some(astra_services::runs::AgentProfileSelection {
-            team_id: "frozen-team".into(),
-            lead_agent_id: Some("lead".into()),
-        });
         request.admitted_agent_profiles = Some(snapshot.clone());
-        request.requested_model_policy = policy.clone();
-        if inherits {
-            // The ordinary CLI root sends no expected-name assertion. Its
-            // displayed default name is not authority over the lead Offering.
-            request.model = Some("previous-client-default".into());
-        }
-        request.model_selection = Some(ModelSelection {
-            offering_id: if inherits {
-                "unavailable-client-default"
-            } else {
-                "model-test-model"
-            }
-            .into(),
-        });
-        request.context = Some(serde_json::Map::from_iter([(
-            "thinking".into(),
-            json!({"mode":"model_default"}),
-        )]));
         models.offering_requests.lock().unwrap().clear();
-        let prepared = service.prepare_chat_request("u1", request).await.unwrap();
-        assert_eq!(prepared.requested_model_policy, policy);
+        let prepared = service.prepare_chat_request("u1", request).await;
+        if invalid {
+            assert!(
+                prepared.is_err(),
+                "an unavailable explicit Offering must not fall back to the lead"
+            );
+            assert_eq!(
+                *models.offering_requests.lock().unwrap(),
+                vec!["unavailable-client".to_string()]
+            );
+            continue;
+        }
+        let prepared = prepared.unwrap();
+        assert_eq!(
+            prepared.requested_model_policy,
+            Some(policy.unwrap_or_else(|| RequestedModelPolicy::Fixed {
+                selector: ModelSelector::OfferingId {
+                    offering_id: offering.into(),
+                }
+            }))
+        );
         assert!(Arc::ptr_eq(
             prepared.admitted_agent_profiles.as_ref().unwrap(),
             &snapshot

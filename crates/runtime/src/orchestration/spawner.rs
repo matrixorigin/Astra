@@ -1917,6 +1917,12 @@ pub(crate) fn agent_status_to_progress_event(
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ParentProfileAuthority {
+    /// Execution-local restriction retained across durable admission/recovery.
+    /// The enclosed identity authenticates the member but grants no authority
+    /// to admit another child, regardless of prefix availability.
+    NonDelegating {
+        authority: Box<ParentProfileAuthority>,
+    },
     /// No admitted roster is in use. This cannot authorize a roster member.
     Unbound,
     /// Ordinary root admission, without an explicitly selected member lead.
@@ -1932,11 +1938,28 @@ pub enum ParentProfileAuthority {
 }
 
 impl ParentProfileAuthority {
+    pub(crate) fn identity(&self) -> &Self {
+        match self {
+            Self::NonDelegating { authority } => authority,
+            authority => authority,
+        }
+    }
+
+    pub(crate) fn require_delegation(&self) -> Result<(), String> {
+        if matches!(self, Self::NonDelegating { .. }) {
+            return Err("this child execution cannot delegate".into());
+        }
+        Ok(())
+    }
+
     /// Extend the admitted profile lineage without consulting runtime IDs.
     /// Callers still validate the target and delegation scope against their
     /// immutable registry before admitting the child.
     pub(crate) fn for_child(&self, target_profile_id: &str) -> Result<Self, String> {
         let ancestor_profile_ids = match self {
+            Self::NonDelegating { .. } => {
+                return Err("this child execution cannot delegate".into());
+            }
             Self::OrdinaryRoot => Vec::new(),
             Self::AdmittedMember {
                 profile_id,
@@ -6344,9 +6367,14 @@ impl DynamicAgentSpawner {
         context: &SpawnContext,
         input: &SpawnAgentInput,
     ) -> Result<Option<astra_services::coordination::AgentProfile>, SpawnError> {
+        context
+            .parent_profile_authority
+            .require_delegation()
+            .map_err(SpawnError::InvalidInput)?;
         let Some(snapshot) = context.admitted_agent_profiles.as_ref() else {
             return match &context.parent_profile_authority {
-                ParentProfileAuthority::AdmittedMember { .. } => Err(SpawnError::InvalidInput(
+                ParentProfileAuthority::AdmittedMember { .. }
+                | ParentProfileAuthority::NonDelegating { .. } => Err(SpawnError::InvalidInput(
                     "admitted member authority requires its profile snapshot".into(),
                 )),
                 ParentProfileAuthority::Unbound | ParentProfileAuthority::OrdinaryRoot => Ok(None),
@@ -6369,7 +6397,7 @@ impl DynamicAgentSpawner {
             SpawnError::UnknownAgentType(format!("{} is not an admitted profile", input.agent_type))
         })?;
         match &context.parent_profile_authority {
-            ParentProfileAuthority::Unbound => {
+            ParentProfileAuthority::Unbound | ParentProfileAuthority::NonDelegating { .. } => {
                 return Err(SpawnError::InvalidInput(
                     "admitted agent profiles require explicit parent authority".into(),
                 ));
@@ -7006,6 +7034,9 @@ impl DynamicAgentSpawner {
     /// completes before any local terminal publication or receipt is exposed.
     pub(crate) async fn supervise_child<T, F, S, SF, P>(
         &self,
+        held_handles: Option<
+            tokio::sync::RwLockWriteGuard<'_, HashMap<String, tokio::task::AbortHandle>>,
+        >,
         agent_id: &str,
         parent: Arc<FanoutParentAdmission>,
         execution: F,
@@ -7023,7 +7054,12 @@ impl DynamicAgentSpawner {
         let Some(background_tasks) = self.background_tasks.upgrade() else {
             return Err(SpawnError::LifecycleShuttingDown);
         };
-        let mut handles = self.background_abort_handles.write().await;
+        // Dynamic admission transfers the lock held across synchronous launch;
+        // precreated admission acquires it here. Both install one task owner.
+        let mut handles = match held_handles {
+            Some(handles) => handles,
+            None => self.background_abort_handles.write().await,
+        };
         let state = self
             .active_agents
             .read()
@@ -7045,6 +7081,7 @@ impl DynamicAgentSpawner {
             .insert(agent_id.to_string(), Arc::clone(&notify));
         let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
         let spawner = self.clone_for_task();
+        let repair = self.clone_for_task();
         let id = agent_id.to_string();
         let started_at = state.started_at;
         let task = async move {
@@ -7111,23 +7148,32 @@ impl DynamicAgentSpawner {
             })
             .catch_unwind()
             .await;
-            let receipt = match finalized {
-                Ok(result) => result,
-                Err(panic) => (
-                    Err((
-                        format!(
-                            "agent finalization panicked: {}",
-                            panic_payload_message(panic.as_ref())
+            let (receipt, panic_payload) = match finalized {
+                Ok(result) => (result, None),
+                Err(panic) => {
+                    let error = format!(
+                        "agent finalization panicked: {}",
+                        panic_payload_message(panic.as_ref())
+                    );
+                    // Execution has ended, but settlement may not have committed.
+                    // Release local custody without inventing a durable frontier.
+                    repair
+                        .finalize_background_agent(&id, Err((&error, Some("panic"))))
+                        .await;
+                    (
+                        (
+                            Err((error, Some("panic"))),
+                            started_at
+                                .elapsed()
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0),
                         ),
-                        Some("panic"),
-                    )),
-                    started_at
-                        .elapsed()
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0),
-                ),
+                        Some(panic),
+                    )
+                }
             };
             let _ = terminal_tx.send(receipt);
+            drop(panic_payload);
         };
         let admission = self
             .background_task_admission
@@ -7941,36 +7987,17 @@ impl DynamicAgentSpawner {
 
         let description = input.description.clone();
         let messaging_address_text = messaging_address.as_ref().map(|a| a.to_string());
-        self.completion_notifiers
-            .write()
-            .await
-            .insert(agent_id.clone(), Arc::new(tokio::sync::Notify::new()));
-        let Some(background_tasks) = self.background_tasks.upgrade() else {
-            // The root/session owner disappeared while this method was
-            // borrowed through a task-side handle. Converge the reservation
-            // through the canonical cancellation path rather than leaving a
-            // running projection with no host future.
-            let _ = self
-                .cancel_agent_with_origin(
-                    &agent_id,
-                    "agent lifecycle owner disappeared before execution",
-                    CancellationOrigin::Runtime,
-                )
-                .await;
-            return Err(SpawnError::LifecycleShuttingDown);
-        };
         // Install execution ownership atomically with the final active-state
         // check. System cancellation takes the same handles -> active lock
         // order, so it either seizes the pre-handle reservation first (and no
         // executor starts) or observes this handle and aborts the child.
-        let mut handles = self.background_abort_handles.write().await;
-        let child_state = self.active_agents.read().await.get(&agent_id).cloned();
-        let Some(child_state) = child_state else {
+        let handles = self.background_abort_handles.write().await;
+        if !self.active_agents.read().await.contains_key(&agent_id) {
             drop(handles);
             return Err(SpawnError::Race(format!(
                 "agent {agent_id} was cancelled before executor ownership was installed"
             )));
-        };
+        }
         // From this point shutdown must wait for either execution installation
         // or canonical settlement of a synchronous launch failure.
         launch_handoff_owned.store(true, std::sync::atomic::Ordering::Release);
@@ -8014,89 +8041,34 @@ impl DynamicAgentSpawner {
                 return Err(SpawnError::DelegationFailed(error));
             }
         };
-        let spawner = self.clone_for_task();
-        let repair = self.clone_for_task();
-        let child_id = agent_id.clone();
-        let repair_id = agent_id.clone();
-        let spawn_future = async move {
-            let result = AssertUnwindSafe(execution).catch_unwind().await;
-            let finalize = AssertUnwindSafe(async move {
-                match result {
-                    Ok(Ok(result)) => {
-                        spawner
-                            .finalize_background_agent(&child_id, Ok(&result))
-                            .await;
-                    }
-                    failure => {
-                        let (error, finish_reason) = match failure {
-                            Ok(Err(error)) => (error, None),
-                            Err(panic) => (
-                                format!(
-                                    "agent executor panicked: {}",
-                                    panic_payload_message(panic.as_ref())
-                                ),
-                                Some("panic"),
-                            ),
-                            _ => unreachable!(),
-                        };
-                        spawner
-                            .finalize_background_agent(
-                                &child_id,
-                                Err((error.as_str(), finish_reason)),
-                            )
-                            .await;
-                    }
-                }
-            });
-            if let Err(panic) = finalize.catch_unwind().await {
-                let error = format!(
-                    "agent finalization panicked: {}",
-                    panic_payload_message(panic.as_ref())
-                );
-                tracing::error!(agent_id = %repair_id, %error);
-                repair
-                    .finalize_background_agent(&repair_id, Err((error.as_str(), Some("panic"))))
-                    .await;
-            }
-        };
-        let abort_handle = {
-            let admission = self
-                .background_task_admission
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if *admission {
-                // Still under the execution-handle lock: neither completion
-                // nor cancellation can publish before this registration.
-                parent.register_direct_child(&child_state);
-                Some(
-                    background_tasks
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .spawn(spawn_future),
-                )
-            } else {
-                None
-            }
-        };
-        let Some(abort_handle) = abort_handle else {
-            self.finalize_background_agent_with_handles(
-                handles,
+        if let Err(error) = self
+            .supervise_child(
+                Some(handles),
                 &agent_id,
-                AgentStatus::Cancelled {
-                    by_user: false,
-                    reason: "agent lifecycle shut down before execution".into(),
-                },
-                "cancelled",
-                Some("cancelled"),
+                parent,
+                execution,
+                |outcome| std::future::ready(outcome),
+                |result| std::borrow::Cow::Borrowed(result),
                 None,
-                None,
-                Some("agent lifecycle shut down before execution"),
             )
-            .await;
-            return Err(SpawnError::LifecycleShuttingDown);
-        };
-        handles.insert(agent_id.clone(), abort_handle);
-        drop(handles);
+            .await
+        {
+            if matches!(error, SpawnError::LifecycleShuttingDown) {
+                self.cancel_agent_with_origin(
+                    &agent_id,
+                    "agent lifecycle shut down before execution",
+                    CancellationOrigin::Runtime,
+                )
+                .await;
+            } else {
+                self.finalize_background_agent(
+                    &agent_id,
+                    Err((&error.to_string(), Some("launch_failed"))),
+                )
+                .await;
+            }
+            return Err(error);
+        }
 
         Ok(SpawnAgentOutput::Launched {
             agent_id,
@@ -9409,6 +9381,9 @@ impl DynamicAgentSpawner {
                 if let Some(summary) = run_result.permission_summary.clone() {
                     state.permission_summary = summary;
                 }
+            }
+            if run_result.is_none() {
+                state.committed_frontier = None;
             }
             state.status = status;
             state.work_revision = state.work_revision.saturating_add(1);
@@ -23757,6 +23732,76 @@ pub(crate) mod tests {
             spawner.completion_notifiers.read().await.is_empty(),
             "panicked background task must not leave completion notifiers"
         );
+    }
+
+    #[tokio::test]
+    async fn child_supervisor_recovers_settlement_and_projection_panics() {
+        for settlement_panics in [true, false] {
+            let spawner = DynamicAgentSpawner::new(mock_router());
+            let mut child = completed_test_state(0);
+            child.status = AgentStatus::Running {
+                activity: "executing".into(),
+            };
+            child.ended_at = None;
+            child.cancellation_binding_id = Some("owned-invocation".into());
+            child.committed_frontier = Some(SpawnRunFrontier {
+                run_id: child.run_id.clone(),
+                run_generation: 1,
+                last_event_idx: Some(0),
+            });
+            let parent = spawner.fanout_parent(&child.parent_run_id);
+            spawner.adopt_precreated_child(child.clone()).await.unwrap();
+            let (start, ready) = tokio::sync::oneshot::channel();
+            let (receipt, notify) = spawner
+                .supervise_child(
+                    None,
+                    &child.agent_id,
+                    parent.clone(),
+                    async {
+                        ready.await.unwrap();
+                        Ok(())
+                    },
+                    move |outcome| async move {
+                        assert!(!settlement_panics, "injected settlement panic");
+                        outcome
+                    },
+                    |_: &()| -> std::borrow::Cow<'_, SpawnRunResult> {
+                        panic!("injected projection panic")
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(parent.has_pending_direct_children());
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            start.send(()).unwrap();
+            let (outcome, _) = tokio::time::timeout(Duration::from_secs(2), receipt)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(outcome.unwrap_err().0.contains("finalization panicked"));
+            tokio::time::timeout(Duration::from_secs(2), notified)
+                .await
+                .unwrap();
+            assert!(spawner.active_agents.read().await.is_empty());
+            assert!(spawner.background_abort_handles.read().await.is_empty());
+            assert!(spawner.completion_notifiers.read().await.is_empty());
+            let completions = parent.take_completed_direct_children();
+            assert_eq!(completions.len(), 1);
+            assert!(matches!(completions[0].status, AgentStatus::Failed { .. }));
+            assert!(!parent.has_pending_direct_children());
+            assert!(parent.take_completed_direct_children().is_empty());
+            let archived = spawner.get_agent_state_any(&child.agent_id).await.unwrap();
+            assert!(matches!(archived.status, AgentStatus::Failed { .. }));
+            assert!(
+                archived.committed_frontier.is_none(),
+                "admission is not durable settlement evidence"
+            );
+            let _ = spawner.shutdown_and_wait(Duration::from_secs(2)).await;
+            assert_eq!(spawner.background_task_count(), 0);
+        }
     }
 
     #[tokio::test]

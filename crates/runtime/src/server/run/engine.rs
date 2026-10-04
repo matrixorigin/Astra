@@ -715,7 +715,16 @@ pub(crate) fn durable_run_profile_authority(
             .map_err(|_| "durable profile authority is malformed")?,
         None => return Err("durable run is missing profile authority".into()),
     };
-    match (&snapshot, &authority) {
+    if matches!(authority, ParentProfileAuthority::NonDelegating { .. })
+        && (run.depth == 0
+            || matches!(
+                authority.identity(),
+                ParentProfileAuthority::NonDelegating { .. }
+            ))
+    {
+        return Err("invalid non-delegating child authority".into());
+    }
+    match (&snapshot, authority.identity()) {
         (None, ParentProfileAuthority::Unbound) => {}
         (Some(snapshot), ParentProfileAuthority::OrdinaryRoot)
             if run.depth == 0 && snapshot.lead_agent_id.is_none() => {}
@@ -8344,6 +8353,26 @@ mod tests {
             invalid.events[0]["data"]["profile_authority"]["ancestor_profile_ids"] = ancestors;
             assert!(durable_run_profile_authority(&invalid, "user-1").is_err());
         }
+        let restricted = ParentProfileAuthority::NonDelegating {
+            authority: Box::new(child_authority),
+        };
+        let mut recovered = child.clone();
+        recovered.events[0]["data"]["profile_authority"] =
+            serde_json::to_value(&restricted).unwrap();
+        assert_eq!(
+            durable_run_profile_authority(&recovered, "user-1").unwrap(),
+            restricted
+        );
+        assert!(restricted.for_child("another-member").is_err());
+        recovered.depth = 0;
+        assert!(durable_run_profile_authority(&recovered, "user-1").is_err());
+        recovered = child;
+        recovered.events[0]["data"]["profile_authority"] =
+            serde_json::to_value(ParentProfileAuthority::NonDelegating {
+                authority: Box::new(restricted),
+            })
+            .unwrap();
+        assert!(durable_run_profile_authority(&recovered, "user-1").is_err());
     }
 
     #[tokio::test]

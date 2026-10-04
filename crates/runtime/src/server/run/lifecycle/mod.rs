@@ -23043,34 +23043,37 @@ impl ServerSubRunExecutor {
             crate::server::run::engine::durable_run_agent_profiles(&parent, &config.user_id)?;
         let parent_profile_authority =
             crate::server::run::engine::durable_run_profile_authority(&parent, &config.user_id)?;
-        let expected_profile_authority =
-            match (admitted_agent_profiles.as_ref(), &config.profile_authority) {
-                (
-                    Some(snapshot),
-                    crate::orchestration::spawner::ParentProfileAuthority::AdmittedMember {
-                        profile_id,
-                        ..
-                    },
-                ) => {
-                    if !snapshot
-                        .profiles
-                        .iter()
-                        .any(|profile| &profile.agent_id == profile_id)
-                    {
-                        return Err("child profile is absent from the durable parent roster".into());
-                    }
-                    parent_profile_authority.for_child(profile_id)?
+        parent_profile_authority.require_delegation()?;
+        let expected_profile_authority = match (
+            admitted_agent_profiles.as_ref(),
+            config.profile_authority.identity(),
+        ) {
+            (
+                Some(snapshot),
+                crate::orchestration::spawner::ParentProfileAuthority::AdmittedMember {
+                    profile_id,
+                    ..
+                },
+            ) => {
+                if !snapshot
+                    .profiles
+                    .iter()
+                    .any(|profile| &profile.agent_id == profile_id)
+                {
+                    return Err("child profile is absent from the durable parent roster".into());
                 }
-                (None, crate::orchestration::spawner::ParentProfileAuthority::Unbound) => {
-                    crate::orchestration::spawner::ParentProfileAuthority::Unbound
-                }
-                _ => {
-                    return Err(
-                        "child profile authority does not match its durable parent roster".into(),
-                    );
-                }
-            };
-        if config.profile_authority != expected_profile_authority {
+                parent_profile_authority.for_child(profile_id)?
+            }
+            (None, crate::orchestration::spawner::ParentProfileAuthority::Unbound) => {
+                crate::orchestration::spawner::ParentProfileAuthority::Unbound
+            }
+            _ => {
+                return Err(
+                    "child profile authority does not match its durable parent roster".into(),
+                );
+            }
+        };
+        if config.profile_authority.identity() != &expected_profile_authority {
             return Err("child profile ancestry does not match its durable parent".into());
         }
         // Reuse the durable parent already read for admission. Nested children

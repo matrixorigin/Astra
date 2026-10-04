@@ -31,6 +31,10 @@ execution budget. Entry-specific configuration does not define another loop
 lifecycle. Fork context inheritance and recursion restrictions are independent
 of result aggregation: Fork applies its declared aggregation through the same
 result combiner as FanOut.
+Fork children retain a non-delegating restriction in their protected admission
+authority, including after recovery and when no prefix was inherited. Ordinary
+spawn and fanout enforce that authority before admission; a reusable profile
+cannot widen it. Prefix inheritance alone does not impose this Fork restriction.
 Child execution deadlines belong to the request, not a reusable executor.
 FanOut and Fork admit one absolute deadline before model preparation and pass
 it unchanged through queuing into CLI/Server loops, tools and nested children.
@@ -162,6 +166,8 @@ request selects the parent binding; explicit fixed choices and admitted user
 requirements remain authoritative. This normalization precedes shared model
 admission for both single spawn and fanout, so launch receipts and execution
 use the same prepared Offering rather than changing models after launch.
+An HTTP request with an explicit Offering and omitted model policy has fixed
+selection intent; only explicit inheritance can replace it with the lead default.
 
 The user can inspect progress, blockers and artifacts, change requirements,
 pause or cancel, and drill down into member execution without flooding the
@@ -222,6 +228,9 @@ and static slot selection do not have an alternate execution path. Launch
 registers cancellation controls synchronously without starting I/O. The child
 supervisor starts the returned future, and rechecks mutable generation,
 cancellation, and deadline authority at execution boundaries.
+Dynamic and precreated children share that task owner and panic cleanup. A
+settlement or projection panic releases local execution custody and wakes its
+parent without claiming an acknowledged durable terminal frontier.
 A failed preparation or model admission reports a rejected request with an
 explicit non-execution fact. CLI and Server carry that same fact into the
 execution journal; it remains observable as a blocked request and does not

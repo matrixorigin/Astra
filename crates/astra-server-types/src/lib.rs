@@ -2520,6 +2520,17 @@ impl From<ReauthenticationProofRecord> for AuthReauthenticateResponse {
 #[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
+    // An Offering supplied by the HTTP caller is explicit intent even when
+    // the optional policy is omitted. Profile defaults must not replace it.
+    let requested_model_policy = request.requested_model_policy.take().or_else(|| {
+        request.model_selection.as_ref().map(|selection| {
+            astra_turn_types::RequestedModelPolicy::Fixed {
+                selector: astra_turn_types::ModelSelector::OfferingId {
+                    offering_id: selection.offering_id.clone(),
+                },
+            }
+        })
+    });
     let context = merge_plan_subtask_context(
         request.context.take(),
         request.plan_subtask_id.take(),
@@ -2555,7 +2566,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         expected_model_name: request.expected_model_name,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: request.model_selection,
-        requested_model_policy: request.requested_model_policy,
+        requested_model_policy,
         resolved_model_selection: request.resolved_model_selection,
         admitted_model_execution: None,
         capability_descriptors: request.capability_descriptors,
