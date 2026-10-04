@@ -6700,12 +6700,22 @@ mod tests {
         ));
         let mut outcome = outcome_with_tools(&[]);
         outcome.text = "FLASH-SLOT-ALPHA FLASH-SLOT-BETA 2/2".into();
-        let results = evaluate_deterministic_with_session(
-            &case.criteria,
-            &outcome,
-            Some(&mk_session(&adopted)),
-        );
+        outcome.turn_rounds = 4;
+        let session = mk_session(&adopted);
+        let results = evaluate_deterministic_with_session(&case.criteria, &outcome, Some(&session));
         assert!(results.iter().all(|result| result.passed), "{results:?}");
+        for rounds in [0, 5] {
+            outcome.turn_rounds = rounds;
+            let results =
+                evaluate_deterministic_with_session(&case.criteria, &outcome, Some(&session));
+            assert!(
+                results.iter().any(|result| {
+                    matches!(result.criterion, Criterion::TurnRoundsBetween { .. })
+                        && !result.passed
+                }),
+                "invalid or excessive rounds must fail: {results:?}"
+            );
+        }
     }
 
     #[test]

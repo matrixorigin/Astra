@@ -876,12 +876,11 @@ mod tests {
         .await;
         let accepted: Value = serde_json::from_str(&accepted).unwrap();
         assert_eq!(accepted["success"], true);
-        assert!(
-            accepted["instruction"]
-                .as_str()
-                .is_some_and(|text| text.contains("queued, not applied")
-                    && text.contains("propose a final answer"))
-        );
+        assert!(accepted["instruction"].as_str().is_some_and(|text| {
+            text.contains("queued, not applied")
+                && text.contains("agent(action='wait')")
+                && text.contains("runtime completion waiting")
+        }));
         let reply = child_mb
             .try_recv()
             .expect("correlated answer reaches child");
