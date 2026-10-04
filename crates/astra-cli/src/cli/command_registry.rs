@@ -384,11 +384,6 @@ const TEAM_SUBCOMMANDS: &[(&str, &str)] = &[
     ("snapshot", "Save a team snapshot"),
 ];
 
-const MESSAGING_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("help", "Show messaging help"),
-    ("metrics", "Show metrics snapshot"),
-];
-
 const CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[("edit", "Open the runtime configuration editor")];
 
 const HELP_SUBCOMMANDS: &[(&str, &str)] = &[("keys", "Keyboard shortcuts")];
@@ -691,14 +686,6 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_tui_subcommands(TUI_AGENT_SUBCOMMANDS)
     .with_tui_route(TuiCommandRoute::Native)
     .primary(),
-    CommandMeta::new(
-        "/messaging",
-        "Inter-agent messaging: metrics, dlq, status",
-        CommandGroup::Work,
-    )
-    .with_subcommands(MESSAGING_SUBCOMMANDS)
-    .with_arg_hint("[metrics|dlq|status|help]")
-    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/login",
         "Sign in to your Astra account",

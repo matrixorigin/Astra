@@ -6,8 +6,8 @@
 
 use crate::cli::cli_config::cli_args::{
     AgentArgs, AgentSubcommand, BugArgs, BugSubcommand, DebugArgs, DiffArgs, DiffSubcommand,
-    GrepArgs, GrepSubcommand, MemoryArgs, MemorySubcommand, MessagingArgs, PermissionsArgs,
-    PermissionsSubcommand, ReviewArgs, ReviewSubcommand, TeamArgs, TeamSubcommand,
+    GrepArgs, GrepSubcommand, MemoryArgs, MemorySubcommand, PermissionsArgs, PermissionsSubcommand,
+    ReviewArgs, ReviewSubcommand, TeamArgs, TeamSubcommand,
 };
 
 /// Prepend optional system instructions to a user message.
@@ -196,11 +196,6 @@ pub(crate) fn render_agent_args(args: &AgentArgs) -> String {
         Some(AgentSubcommand::Stop(cmd)) => format!("stop {}", cmd.agent_id),
         Some(AgentSubcommand::Logs(cmd)) => format!("logs {}", cmd.agent_id),
     }
-}
-
-/// Render [`MessagingArgs`] back into a stable textual argument list.
-pub(crate) fn render_messaging_args(_args: &MessagingArgs) -> String {
-    String::new()
 }
 
 /// Render [`DiffArgs`] back into a stable textual argument list.

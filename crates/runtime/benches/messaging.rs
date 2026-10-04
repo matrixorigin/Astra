@@ -6,13 +6,10 @@
 //! - Message creation & serialization
 //! - InProcessTransport throughput (direct + broadcast)
 //! - Router registration & lookup
-//! - LatencyTracker record throughput
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::sync::Arc;
-use std::time::Duration;
 
-use astra_runtime::messaging::metrics::LatencyTracker;
 use astra_runtime::messaging::{
     AgentAddress, AgentMailboxRouter, AgentMessage, InProcessTransport, MessagePayload,
     MessageTarget,
@@ -158,33 +155,6 @@ fn bench_inprocess_transport(c: &mut Criterion) {
     group.finish();
 }
 
-// ─── LatencyTracker Throughput ──────────────────────────────────────────────
-
-fn bench_latency_tracker(c: &mut Criterion) {
-    let mut group = c.benchmark_group("latency_tracker");
-
-    group.bench_function("record_1M", |b| {
-        let tracker = LatencyTracker::new();
-        b.iter(|| {
-            for _ in 0..1000 {
-                tracker.record(black_box(Duration::from_micros(42)));
-            }
-        })
-    });
-
-    group.bench_function("snapshot", |b| {
-        let tracker = LatencyTracker::new();
-        for _ in 0..10000 {
-            tracker.record(Duration::from_micros(42));
-        }
-        b.iter(|| {
-            black_box(tracker.snapshot());
-        })
-    });
-
-    group.finish();
-}
-
 // ─── Router Registration ────────────────────────────────────────────────────
 
 fn bench_router(c: &mut Criterion) {
@@ -246,7 +216,6 @@ criterion_group!(
     benches,
     bench_message_creation,
     bench_inprocess_transport,
-    bench_latency_tracker,
     bench_router,
 );
 criterion_main!(benches);

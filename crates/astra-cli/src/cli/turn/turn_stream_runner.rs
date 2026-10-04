@@ -183,7 +183,6 @@ fn build_turn_stream_params<'a>(
         mcp_manager: Some(state.mcp_manager.clone()),
         skill_quality_tracker: &mut state.skill_quality_tracker,
         discovered_skills: Some(&mut state.discovered_skills),
-        messaging_metrics: state.messaging_metrics.clone(),
         agent_spawner: state.agent_spawner.clone(),
         root_agent_id: Some("main"),
         observability_hub: prepared.observability_hub.clone(),

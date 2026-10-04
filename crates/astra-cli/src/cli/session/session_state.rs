@@ -449,9 +449,7 @@ pub(crate) struct SessionState {
     /// Project-level instructions loaded from `.astra/instructions.md`.
     /// Injected into every turn's effective message as `<project_instructions>`.
     pub project_instructions: Option<String>,
-    /// Shared messaging metrics (populated when delegation is active).
-    pub messaging_metrics: Option<std::sync::Arc<astra_messaging::MessagingMetrics>>,
-    /// Dynamic agent spawner for runtime agent creation.
+    /// Session-local recovery and observation projection for child runs.
     pub agent_spawner: Option<std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Session-scoped typed authority for every asynchronous work kind. Model
     /// boundaries consume this registry instead of querying UI projections or
@@ -666,9 +664,7 @@ impl Default for SessionState {
                 astra_services::team_persistence::InMemoryTeamStore::new(),
             ),
             project_instructions: None,
-            // Create shared messaging infrastructure eagerly so /messaging always has data
-            messaging_metrics: Some(std::sync::Arc::new(astra_messaging::MessagingMetrics::new())),
-            agent_spawner: None, // Created lazily when agent spawning is first used
+            agent_spawner: None, // Installed by session projection initialization
             active_work_registry: std::sync::Arc::new(
                 astra_core::work_unit::ActiveWorkRegistry::default(),
             ),

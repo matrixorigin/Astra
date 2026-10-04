@@ -428,7 +428,6 @@ pub(crate) async fn handle_review_command(
         mcp_manager: Some(state.mcp_manager.clone()),
         skill_quality_tracker: &mut state.skill_quality_tracker,
         discovered_skills: None,
-        messaging_metrics: state.messaging_metrics.clone(),
         agent_spawner: state.agent_spawner.clone(),
         root_agent_id: Some("main"),
         observability_hub: state.observability_hub.clone(),

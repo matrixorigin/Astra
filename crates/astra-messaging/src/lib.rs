@@ -7,7 +7,6 @@
 pub mod db_transport;
 pub mod delegation;
 pub mod in_process;
-pub mod metrics;
 pub mod router;
 pub mod transport;
 pub mod types;
@@ -22,10 +21,6 @@ pub use db_transport::{
 };
 pub use delegation::{DelegationLookup, SubRunInfo};
 pub use in_process::{InProcessMetrics, InProcessTransport};
-pub use metrics::{
-    EventDispatcher, LatencySnapshot, LatencyTracker, MessagingEvent, MessagingEventHandler,
-    MessagingMetrics, MetricsSnapshot, StderrEventHandler,
-};
 pub use router::{AgentMailbox, AgentMailboxRouter, PermissionOutcome};
 pub use transport::{MessageStream, MessageTransport};
 pub use types::{

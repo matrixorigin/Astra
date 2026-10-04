@@ -491,8 +491,7 @@ mod tests {
     };
     use clap::Parser;
     use cli::cli_config::cli_args::{
-        AuditCmd, AuditShowArgs, AuditToolsArgs, Command, MessagingArgs, ReplayArgs, SessionCmd,
-        SessionShowArgs,
+        AuditCmd, AuditShowArgs, AuditToolsArgs, Command, ReplayArgs, SessionCmd, SessionShowArgs,
     };
     use cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
@@ -533,23 +532,6 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap(), cli::exit_code::ExitCode::Success);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn execute_cli_messaging_bridge_command() {
-        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let result = execute_cli_command(
-            Some(Command::Messaging(MessagingArgs { command: None })),
-            None,
-            None,
-            false,
-            None,
-            &api,
-            false,
-            &cli::cli_config::cli_context::CliContext::default(),
-        )
-        .await;
-        assert!(result.is_ok());
     }
 
     #[serial_test::serial]

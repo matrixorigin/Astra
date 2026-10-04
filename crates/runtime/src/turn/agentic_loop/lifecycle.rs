@@ -99,9 +99,6 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                     &msg,
                 ));
             }
-            if let Some(ref metrics) = state.messaging.metrics {
-                metrics.messages_received.fetch_add(1, Ordering::Relaxed);
-            }
 
             let mut handled_permission = false;
             if let Some(ref handler) = state.permission_handler

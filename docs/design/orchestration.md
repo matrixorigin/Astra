@@ -336,8 +336,8 @@ remains transient. Replay cannot resend an envelope or create new send authority
 Transport owns consumption acknowledgement, claims, and redelivery. There is no
 application ACK/NACK envelope, sender retry tracker, or in-memory dead-letter
 queue. Immediate routing/transport errors remain visible to the sender. Durable
-transport failure records belong to the transport; `/messaging` exposes observed
-metrics, without a separate application delivery/retry status.
+transport failure records and metrics belong to the transport. The CLI does not
+expose a local messaging counter or a separate application delivery/retry status.
 In-process direct and parent messages share one bounded inbox per canonical
 address. The inbox retains original envelopes and capacity charges until ACK;
 detaching a stream returns unacknowledged deliveries to its head. A second

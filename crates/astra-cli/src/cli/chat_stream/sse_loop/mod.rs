@@ -877,7 +877,6 @@ pub(crate) async fn stream_chat_sse(
             completion_settlement: Default::default(),
         },
         messaging: MessagingState {
-            metrics: p.messaging_metrics.clone(),
             progress_emitter: None,
             ..Default::default()
         },

@@ -1,7 +1,7 @@
 use crate::cli::arg_render::{
     apply_system_prompt, render_agent_args, render_bug_args, render_debug_args, render_diff_args,
-    render_grep_args, render_memory_args, render_messaging_args, render_permissions_args,
-    render_review_args, render_team_args,
+    render_grep_args, render_memory_args, render_permissions_args, render_review_args,
+    render_team_args,
 };
 use crate::cli::auth_flow::{
     clear_profile_auth, do_login, do_memoria_login_with_key, do_register, is_auth_error,
@@ -42,7 +42,6 @@ use crate::cli::skill_catalog::{
 use crate::cli::slash::slash_bug::handle_bug_command;
 use crate::cli::slash::slash_debug::handle_debug_command;
 use crate::cli::slash::slash_memory::handle_memory_domain_command;
-use crate::cli::slash::slash_messaging::handle_messaging_command;
 use crate::cli::slash::{slash_agent, slash_team, slash_telemetry};
 use crate::cli::stream::streaming_types::{
     StreamResult, stream_result_from_resumable_turn_failure,
@@ -855,10 +854,6 @@ async fn execute_repl_bridge_command_impl(
     try_silent_auth(api, profile).await;
 
     let mut state = initialize_session_state(profile, global_model, cli_context);
-    if slash_cmd == "/messaging" {
-        handle_messaging_command(arg, &state);
-        return Ok(ExitCode::Success);
-    }
     // Local journal diagnostics do not consume tools or remote skill catalogs.
     if slash_cmd == "/debug" {
         handle_debug_command(arg, &state);
@@ -904,7 +899,6 @@ async fn execute_repl_bridge_command_impl(
             };
             slash_agent::handle_agent_command(arg, &ctx).await;
         }
-        "/messaging" => handle_messaging_command(arg, &state),
         _ => return Err(format!("unsupported bridged command: {slash_cmd}")),
     }
 
@@ -1830,18 +1824,6 @@ async fn execute_cli_command_impl(
             execute_repl_bridge_command(
                 "/agent",
                 &render_agent_args(&args),
-                profile.as_deref(),
-                global_model.as_deref(),
-                api,
-                cli_context,
-            )
-            .await
-        }
-
-        Some(Command::Messaging(args)) => {
-            execute_repl_bridge_command(
-                "/messaging",
-                &render_messaging_args(&args),
                 profile.as_deref(),
                 global_model.as_deref(),
                 api,

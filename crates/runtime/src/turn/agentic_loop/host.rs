@@ -2306,8 +2306,6 @@ pub struct MessagingState {
     /// Run-owned question obligations shared with the sending tool. These
     /// remain empty for ordinary turns and never trigger a database read.
     pub reply_obligations: Arc<crate::messaging::reply_obligations::ReplyObligations>,
-    /// Unified messaging metrics (optional, shared across agents in a delegation).
-    pub metrics: Option<std::sync::Arc<astra_messaging::metrics::MessagingMetrics>>,
     /// Optional progress emitter for broadcasting turn events to UI/subscribers.
     /// When set, the loop emits `TurnCompleted` events after each turn.
     pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,

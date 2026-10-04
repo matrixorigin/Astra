@@ -230,8 +230,6 @@ pub(crate) enum Command {
     /// Inspect spawned agents
     #[command(alias = "agents")]
     Agent(AgentArgs),
-    /// Inspect inter-agent messaging state
-    Messaging(MessagingArgs),
     /// Dump the `/context` snapshot for a persisted session
     #[command(subcommand)]
     Context(ContextCmd),
@@ -854,19 +852,6 @@ pub(crate) struct AgentIdArgs {
 }
 
 #[derive(Args, Debug)]
-#[command(after_help = "Example:\n  astra messaging")]
-pub(crate) struct MessagingArgs {
-    #[command(subcommand)]
-    pub command: Option<MessagingSubcommand>,
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum MessagingSubcommand {
-    /// Show metrics snapshot
-    Metrics,
-}
-
-#[derive(Args, Debug)]
 #[command(
     after_help = "Examples:\n  astra diff\n  astra diff staged\n  astra diff stat crates/astra-cli/src/main.rs\n  astra diff show HEAD~1",
     override_usage = "astra diff [<PATH>...] | astra diff staged [<PATH>...] | astra diff unstaged [<PATH>...] | astra diff stat [<PATH>...] | astra diff show <REV> [<PATH>...]"
@@ -1485,7 +1470,19 @@ pub(crate) struct ConfigShowPolicyArgs {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Command, ModelCmd, SessionCmd, WorkSubcommand};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn cli_has_no_unbacked_messaging_inspector() {
+        let mut command = Cli::command();
+        assert!(command.find_subcommand("messaging").is_none());
+        assert!(!command.render_long_help().to_string().contains("messaging"));
+        assert!(Cli::try_parse_from(["astra", "help", "messaging"]).is_err());
+        // Preserve ordinary free-text chat parsing rather than reserving a
+        // retired command name in a compatibility rejection path.
+        let cli = Cli::try_parse_from(["astra", "messaging"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Message(words)) if words == ["messaging"]));
+    }
 
     #[test]
     fn session_judge_is_an_explicit_command_with_a_bounded_provider_deadline() {
