@@ -1469,7 +1469,8 @@ fn build_introspect_snapshot_with_tool_admission(
     if !forced.is_empty() {
         alerts.push(format!("advisory_signals: {}", forced.join(", ")));
     }
-    let recent_tool_failures = state.turn_guard.health.recent_errors(10).len();
+    let recent_tool_errors = state.turn_guard.health.recent_errors(10);
+    let recent_tool_failures = recent_tool_errors.len();
     if recent_tool_failures > 0 {
         alerts.push(format!(
             "recent_tool_failures={recent_tool_failures}; tools remain available unless restricted_tools says otherwise"
@@ -1496,6 +1497,44 @@ fn build_introspect_snapshot_with_tool_admission(
             consecutive_failures: cb.consecutive_read_only() as u64,
         })
     };
+
+    let mut execution_errors = recent_tool_errors.into_iter();
+    let mut admission_errors = state
+        .stall
+        .tool_call_records
+        .iter()
+        .rev()
+        .filter(|record| record.effective_disposition() == ToolCallDisposition::Rejected)
+        .take(10)
+        .map(|record| {
+            let (safe_error, _) =
+                astra_text_utils::credential_redaction::redact_credentials_for_display(
+                    record
+                        .error
+                        .as_deref()
+                        .unwrap_or("Tool request rejected before execution"),
+                );
+            let preview: String = safe_error.chars().take(500).collect();
+            astra_turn_core::introspect::ToolErrorEntry {
+                tool: record.name.clone(),
+                signature_hint: record.tool_call_id.clone().unwrap_or_default(),
+                failure_category: Some("admission_rejected".into()),
+                error_preview: Some(preview.clone()),
+                // These records have no wall-clock timestamp and were not dispatched.
+                at_epoch: 0,
+                error_message: preview,
+                file_path: None,
+                file_range: None,
+                turn: state.session_turn,
+                round: record.round.unwrap_or_default(),
+            }
+        });
+    // Neither category may hide the other; retain each source's newest-first order.
+    let tool_errors = (0..10)
+        .flat_map(|_| [execution_errors.next(), admission_errors.next()])
+        .flatten()
+        .take(10)
+        .collect();
 
     let mut snapshot = astra_turn_core::introspect::IntrospectSnapshot {
         runtime_feedback: state
@@ -1525,40 +1564,7 @@ fn build_introspect_snapshot_with_tool_admission(
         stall_state,
         injection_freshness: Vec::new(),
         current_round,
-        tool_errors: state
-            .stall
-            .tool_call_records
-            .iter()
-            .rev()
-            .filter(|record| record.effective_disposition() == ToolCallDisposition::Rejected)
-            .take(10)
-            .map(|record| {
-                let (safe_error, _) =
-                    astra_text_utils::credential_redaction::redact_credentials_for_display(
-                        record
-                            .error
-                            .as_deref()
-                            .unwrap_or("Tool request rejected before execution"),
-                    );
-                let preview: String = safe_error.chars().take(500).collect();
-                astra_turn_core::introspect::ToolErrorEntry {
-                    tool: record.name.clone(),
-                    signature_hint: record.tool_call_id.clone().unwrap_or_default(),
-                    failure_category: Some("admission_rejected".into()),
-                    error_preview: Some(preview.clone()),
-                    // Tool records do not capture wall-clock time. Do not
-                    // invent a timestamp or pretend this was dispatched.
-                    at_epoch: 0,
-                    error_message: preview,
-                    file_path: None,
-                    file_range: None,
-                    turn: state.session_turn,
-                    round: record.round.unwrap_or_default(),
-                }
-            })
-            .chain(state.turn_guard.health.recent_errors(10))
-            .take(10)
-            .collect(),
+        tool_errors,
         circuit_breaker,
     };
 
@@ -13354,6 +13360,78 @@ print(json.dumps({'context': 'user said: ' + msg}))
             astra_turn_core::introspect::render_errors(&snapshot)
                 .contains("parallel topology was not admitted")
         );
+    }
+
+    #[test]
+    fn introspect_error_categories_share_the_bounded_snapshot() {
+        for (rejections, failures, expected_admission, expected_execution) in [
+            (10, 1, 9, 1),
+            (10, 10, 5, 5),
+            (10, 0, 10, 0),
+            (0, 10, 0, 10),
+        ] {
+            let mut state = make_state();
+            for round in 0..rejections {
+                state.stall.tool_call_records.push(ToolCallRecord {
+                    name: "agent".into(),
+                    ok: false,
+                    error: Some("request rejected".into()),
+                    disposition: Some(ToolCallDisposition::Rejected),
+                    round: Some(round),
+                    ..Default::default()
+                });
+            }
+            for epoch in 1..=failures {
+                state.turn_guard.health.record_outcome_with_preview(
+                    &astra_pipeline::ToolHealthIdentity::new(
+                        "bash".into(),
+                        epoch.to_string().as_bytes(),
+                    ),
+                    astra_turn_core::tool::health::ToolOutcome {
+                        success: false,
+                        latency_ms: 100,
+                        result_hash: epoch,
+                        at_epoch: epoch,
+                        failure_category: Some(
+                            astra_turn_core::action_compensation::FailureCategory::Timeout,
+                        ),
+                    },
+                    Some("command deadline exceeded"),
+                );
+            }
+            let snapshot = build_introspect_snapshot(&state, String::new(), None);
+            assert_eq!(snapshot.tool_errors.len(), 10);
+            let admission: Vec<_> = snapshot
+                .tool_errors
+                .iter()
+                .filter(|error| error.failure_category.as_deref() == Some("admission_rejected"))
+                .collect();
+            let execution: Vec<_> = snapshot
+                .tool_errors
+                .iter()
+                .filter(|error| error.tool == "bash")
+                .collect();
+            assert_eq!(admission.len(), expected_admission);
+            assert_eq!(execution.len(), expected_execution);
+            if failures > 0 {
+                assert_eq!(snapshot.tool_errors[0].at_epoch, failures);
+                assert_eq!(
+                    execution[0].error_preview.as_deref(),
+                    Some("command deadline exceeded")
+                );
+            }
+            assert!(
+                execution
+                    .windows(2)
+                    .all(|pair| pair[0].at_epoch > pair[1].at_epoch)
+            );
+            assert!(
+                admission
+                    .windows(2)
+                    .all(|pair| pair[0].round > pair[1].round)
+            );
+            assert!(admission.iter().all(|error| error.at_epoch == 0));
+        }
     }
 
     #[test]

@@ -12121,7 +12121,6 @@ mod tests {
         let workspace = tempdir().unwrap();
         let mut cache = EdgeToolCache::new(8);
         let mut host = fixture.host(workspace.path(), &mut cache, None);
-        host.on_server_tool_surface_admission("bash").unwrap();
         let mut requests = Vec::new();
         let mut settled = Vec::new();
         for (id, args) in [
@@ -12133,6 +12132,7 @@ mod tests {
         ] {
             let mut request = parallel_batch_request("budget", id, "bash", args.clone());
             request.command_timeout_cap_ms = Some(200);
+            host.on_server_tool_surface_admission(&request).unwrap();
             let results = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 host.execute_tools_batch(vec![request.clone()]),
