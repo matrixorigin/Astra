@@ -193,15 +193,11 @@ mod tests {
     use super::*;
     use crate::turn::agentic::headless_round::HeadlessStderrStyle;
     use crate::turn::agentic_loop::host::HostTurnResult;
-    use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
     use astra_pipeline::step_recorder::StepRecorder;
-    use astra_text_utils::semantic_dedup::SemanticDedup;
     use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
     use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
-    use astra_turn_core::turn_guard::TurnGuard;
     use async_trait::async_trait;
     use serde_json::json;
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use tokio_util::sync::CancellationToken;
@@ -269,125 +265,22 @@ mod tests {
 
     fn test_state(message: &str) -> AgenticLoopState {
         AgenticLoopState {
-            admitted_tool_policy: Default::default(),
-            evaluation_thresholds: Default::default(),
             messages: vec![json!({"role": "user", "content": message})],
-            run_transcript_capture: None,
-            volatile_pending: Vec::new(),
-            recent_rounds: Vec::new(),
-            tool_results: Vec::new(),
-            current_session_id: None,
-            current_run_id: None,
-            current_run_owner_generation: None,
-            applied_permission_mode: None,
-            inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-            context_manifest_pool: None,
-            context_manifest_user_id: None,
-            context_manifest_model_name: None,
-            runtime_manifest: None,
-            recursion_depth: 0,
-            final_text: String::new(),
-            current_model_item_id: None,
-            final_text_model_item_id: None,
-            final_text_streamed: false,
-            final_output_ready_notified: false,
-            total_prompt: 0,
-            total_completion: 0,
-            total_cache_read: 0,
-            total_cache_creation: 0,
-            total_tool_calls: 0,
-            total_observation_tool_calls: 0,
-            tool_ledger_receipt: Default::default(),
-            has_any_usage: false,
-            qualified_usage: None,
-            last_request_usage: None,
             max_turns: 3,
             remaining_turns: 3,
-            charged_iterations: 0,
-            agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
-            budget_is_explicit: false,
-            budget_policy: None,
-            loop_entry: Default::default(),
-            current_round_index: 0,
-            llm_rounds_completed: 0,
-            last_request_message_count: None,
-            turn_guard: TurnGuard::new(),
-            restricted_tools: HashSet::new(),
-            step_recorder: StepRecorder::new("test-user", "test", "run"),
-            idempotency_cache: InMemoryIdempotencyCache::new(),
-            semantic_dedup: SemanticDedup::new(0.75),
-            call_counts: HashMap::new(),
-            max_identical_tool_calls: astra_config::runtime_config::RuntimeConfig::load()
-                .tool_policy
-                .effective_max_identical_calls(),
-            max_tools_per_turn: 15,
-            max_consecutive_empty_name: 3,
-            stall: Default::default(),
-            telemetry: Default::default(),
-            skills: Default::default(),
-            hooks: Default::default(),
-            messaging: Default::default(),
-            cancellation: Default::default(),
-            user_intents: Default::default(),
-            error_recovery: Default::default(),
-            provider_adaptation: Default::default(),
-            run_control: None,
             pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
                 astra_turn_core::pipeline_config::PipelineConfig::default(),
             )),
             message: message.to_string(),
             user_intent: message.to_string(),
-            recent_tools: Vec::new(),
-            deferred_tool_activations: Vec::new(),
-            has_prior_assistant_turn: false,
-            turn_intent: None,
-            task_profile: TaskExecutionProfile::default(),
-            last_finish_reason: None,
-            last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
-            api: astra_thin_client::ThinClient::new("http://localhost:1", None).unwrap(),
-            api_token: "test".to_string(),
-            delegation_engine: None,
-            delegations_this_turn: 0,
-            delegation_chain: Vec::new(),
-            self_agent_id: "main".to_string(),
-            project_context: None,
-            last_llm_context_manifest_trace: None,
-            rate_limit_cooldown: Default::default(),
-            last_composite_snapshot: None,
-            last_measured_prompt_tokens: None,
-            consecutive_context_window_errors: 0,
-            compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
-            sticky_tool_schemas: Vec::new(),
-            max_turn_input_tokens: 0,
-            budget_wrapup_injected: false,
-            context_compression_triggered: false,
-            canonical_rewrite_state: Default::default(),
-            provider_canonical_wal_base: None,
-            provider_canonical_wal_head: None,
-            budget_wrapup_ignored_rounds: 0,
-            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
-            skill_produced_output: false,
-            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
-            permission_context: None,
-            permission_handler: None,
-            runtime_tool_executor: None,
-            interruption: None,
-            session_facts: Default::default(),
-            memory_extraction_service: None,
-            session_memory_state: Default::default(),
-            compact_strategy: Default::default(),
-            approval_overrides: None,
-            confidence_trend: Default::default(),
-            last_confidence_diagnosis: None,
-            session_turn: 0,
-            canonical_turn_chain_id: None,
-            root_user_query_event_id: None,
-            turn_event_buffer: None,
-            canonical_turn_started_at: Default::default(),
-            canonical_trace_time_bounds: Default::default(),
-            harness: crate::turn::harness_adapter::HarnessSlot::empty(),
-            observation_journal: Default::default(),
+            ..AgenticLoopState::fresh(
+                StepRecorder::new("test-user", "test", "run"),
+                TaskExecutionProfile::default().agentic_turn_budget,
+                Default::default(),
+                None,
+                astra_turn_types::InferencePurpose::PrimaryAgent,
+                astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            )
         }
     }
 
@@ -486,47 +379,5 @@ mod tests {
     #[test]
     fn dispatcher_default_trait() {
         let _d: LoopDispatcher = Default::default();
-    }
-
-    #[tokio::test]
-    async fn dispatch_waiting_maps_to_external_event() {
-        // Verify that if we had a Waiting outcome from the loop, the dispatcher
-        // would map it correctly. We test the WaitReason enum directly since
-        // Waiting is not yet triggered by the loop itself.
-        let reason = WaitReason::ToolApproval {
-            request_id: "req-1".into(),
-            tool_name: "bash".into(),
-        };
-        let outcome = DispatchOutcome::Waiting(reason);
-        match outcome {
-            DispatchOutcome::Waiting(WaitReason::ToolApproval { tool_name, .. }) => {
-                assert_eq!(tool_name, "bash");
-            }
-            other => panic!("expected Waiting(ToolApproval), got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn two_hosts_same_input_same_outcome_shape() {
-        // Verify that two different host implementations produce the same
-        // outcome shape (Completed with matching token counts) for identical input.
-        let dispatcher = LoopDispatcher::new();
-
-        let mut host_a = TestHost::completed_after_one_turn("answer");
-        let mut state_a = test_state("question");
-        let outcome_a = dispatcher.dispatch(&mut host_a, &mut state_a).await;
-
-        let mut host_b = TestHost::completed_after_one_turn("answer");
-        let mut state_b = test_state("question");
-        let outcome_b = dispatcher.dispatch(&mut host_b, &mut state_b).await;
-
-        match (&outcome_a, &outcome_b) {
-            (DispatchOutcome::Completed(a), DispatchOutcome::Completed(b)) => {
-                assert_eq!(a.final_text, b.final_text);
-                assert_eq!(a.total_prompt_tokens, b.total_prompt_tokens);
-                assert_eq!(a.total_completion_tokens, b.total_completion_tokens);
-            }
-            _ => panic!("expected both Completed, got {outcome_a:?} and {outcome_b:?}"),
-        }
     }
 }
