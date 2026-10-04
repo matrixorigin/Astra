@@ -686,7 +686,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // survive as a guessable health oracle even when the displayed text
         // is redacted later.
         let (redacted_result, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(
+            astra_text_utils::credential_redaction::redact_credentials_for_display(
                 &execution.result_str,
             );
         execution.result_str = redacted_result;

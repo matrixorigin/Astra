@@ -62,7 +62,7 @@ struct SafeOutputCacheEntry {
     secondary_len: Option<u64>,
     secondary_modified: Option<std::time::SystemTime>,
     settled: bool,
-    projection: Arc<astra_tools::credential_redaction::SafeOutputProjection>,
+    projection: Arc<astra_text_utils::credential_redaction::SafeOutputProjection>,
     last_used: u64,
 }
 
@@ -2022,7 +2022,7 @@ fn read_redacted_file(path: &Path) -> Result<String, String> {
 fn read_safe_projection(
     path: &Path,
     settled: bool,
-) -> Result<Arc<astra_tools::credential_redaction::SafeOutputProjection>, String> {
+) -> Result<Arc<astra_text_utils::credential_redaction::SafeOutputProjection>, String> {
     let metadata =
         std::fs::metadata(path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
     let len = metadata.len();
@@ -2059,8 +2059,9 @@ fn read_safe_projection(
     // offset/search page (or another session) pretend that an arbitrary
     // process output owns source bytes.  Source-owned `read_file` remains the
     // only path that issues an edit-capable marker.
-    let safe = astra_tools::credential_redaction::redact_credentials_for_display(raw).0;
-    let projection = Arc::new(astra_tools::credential_redaction::SafeOutputProjection::new(safe));
+    let safe = astra_text_utils::credential_redaction::redact_credentials_for_display(raw).0;
+    let projection =
+        Arc::new(astra_text_utils::credential_redaction::SafeOutputProjection::new(safe));
 
     if projection.total_bytes() <= SAFE_OUTPUT_CACHE_MAX_BYTES
         && let Ok(mut cache) = safe_output_cache().lock()
@@ -2108,7 +2109,7 @@ fn combined_safe_projection(
     stdout_path: &Path,
     stderr_path: &Path,
     settled: bool,
-) -> Result<Arc<astra_tools::credential_redaction::SafeOutputProjection>, String> {
+) -> Result<Arc<astra_text_utils::credential_redaction::SafeOutputProjection>, String> {
     let stdout_metadata = std::fs::metadata(stdout_path).ok();
     let stderr_metadata = std::fs::metadata(stderr_path).ok();
     let stdout_len = stdout_metadata
@@ -2163,7 +2164,7 @@ fn combined_safe_projection(
         format!("{stdout}\n<stderr>\n{stderr}\n</stderr>")
     };
     let projection =
-        Arc::new(astra_tools::credential_redaction::SafeOutputProjection::new(rendered));
+        Arc::new(astra_text_utils::credential_redaction::SafeOutputProjection::new(rendered));
 
     if projection.total_bytes() <= SAFE_OUTPUT_CACHE_MAX_BYTES
         && let Ok(mut cache) = safe_output_cache().lock()
@@ -3026,7 +3027,7 @@ mod tests {
         let path = tmp.path().join("stdout");
         let raw = "prefix AKIAIOSFODNN7EXAMPLE suffix\n";
         std::fs::write(&path, raw).unwrap();
-        let safe = astra_tools::credential_redaction::redact_credentials_for_display(raw).0;
+        let safe = astra_text_utils::credential_redaction::redact_credentials_for_display(raw).0;
         let marker_start = safe.find("[REDACTED:").expect("display marker");
 
         let (before, before_end, total, _) =

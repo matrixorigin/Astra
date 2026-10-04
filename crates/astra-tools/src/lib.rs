@@ -21,7 +21,6 @@ pub mod web_fetch;
 pub mod web_search;
 
 pub mod build_test;
-pub mod credential_redaction;
 // run_script is the programmatic tool-calling / code execution RPC bridge.
 // It uses Unix domain sockets for the script↔host RPC channel. Windows
 // would need named pipes — deferred. Gate the modules so the crate still
@@ -862,8 +861,8 @@ pub fn truncate_output(output: String, max_bytes: usize) -> String {
     // This is the generic tool-output boundary used by search/git helpers.
     // They do not prove ownership of a source file, so they may preserve an
     // existing owner-issued marker but must not mint a new edit capability.
-    let output = credential_redaction::redact_credentials_for_display(&output).0;
-    credential_redaction::truncate_redacted_output(output, max_bytes)
+    let output = astra_text_utils::credential_redaction::redact_credentials_for_display(&output).0;
+    astra_text_utils::credential_redaction::truncate_redacted_output(output, max_bytes)
 }
 
 /// Normalize empty/whitespace-only tool output to a short marker.

@@ -2327,9 +2327,10 @@ fn approval_action_summary(tool_name: &str, args: &Value) -> Option<String> {
     // Keep the serialized display pass as a second boundary for credential
     // syntax embedded in free-form strings.
     let mut safe_args = args.clone();
-    astra_tools::credential_redaction::redact_credentials_in_json(&mut safe_args);
+    astra_text_utils::credential_redaction::redact_credentials_in_json(&mut safe_args);
     let encoded = serde_json::to_string(&safe_args).ok()?;
-    let (redacted, _) = astra_tools::credential_redaction::redact_credentials_for_display(&encoded);
+    let (redacted, _) =
+        astra_text_utils::credential_redaction::redact_credentials_for_display(&encoded);
     let mut summary = format!("{tool_name} arguments: {redacted}");
     if summary.len() > APPROVAL_ACTION_SUMMARY_MAX_BYTES {
         summary.truncate(

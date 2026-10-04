@@ -1,4 +1,4 @@
-//! Shared credential redaction and safe edit-reference support.
+//! Shared credential redaction and safe edit-reference support for text boundaries.
 //!
 //! Tool output is redacted before it reaches the model.  An exact-text editor
 //! still needs a way to address a redacted span without learning the secret,

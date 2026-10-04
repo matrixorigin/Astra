@@ -8288,7 +8288,7 @@ fn redacted_operation_identity(
     let Ok(mut args) = serde_json::from_str::<serde_json::Value>(raw) else {
         return (None, record.args_preview.clone());
     };
-    astra_tools::credential_redaction::redact_credentials_in_json(&mut args);
+    astra_text_utils::credential_redaction::redact_credentials_in_json(&mut args);
     let digest = format!(
         "{:x}",
         Sha256::digest(astra_core::canonical_json_string(&args))

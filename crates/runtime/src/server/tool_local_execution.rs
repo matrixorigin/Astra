@@ -220,7 +220,7 @@ impl<'a> LocalToolExecutionLifecycle<'a> {
         // tool execution, so it is the correct place to issue an edit-capable
         // reference (the later central pass is only a display-only fallback).
         let (redacted_output, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(&result.output);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&result.output);
         result.output = redacted_output;
         normalize_local_tool_result_output(name, &mut result, self.aggregate_output_bytes);
         spawn_memory_recall_feedback_after_success(

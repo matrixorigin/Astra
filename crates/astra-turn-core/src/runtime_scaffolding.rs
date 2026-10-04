@@ -114,9 +114,11 @@ fn sanitize_json_except_assistant_tool_arguments(
         Value::String(_) => {
             let mut leaf = std::mem::replace(value, Value::Null);
             if let Some(key) = object_key {
-                astra_tools::credential_redaction::redact_credentials_in_json_field(&mut leaf, key);
+                astra_text_utils::credential_redaction::redact_credentials_in_json_field(
+                    &mut leaf, key,
+                );
             } else {
-                astra_tools::credential_redaction::redact_credentials_in_json(&mut leaf);
+                astra_text_utils::credential_redaction::redact_credentials_in_json(&mut leaf);
             }
             *value = leaf;
         }
@@ -258,7 +260,7 @@ fn sanitize_embedded_assistant_tool_arguments(message: &mut Value) {
         };
         let safe_arguments = match serde_json::from_str::<Value>(&arguments) {
             Ok(mut parsed) => {
-                astra_tools::credential_redaction::redact_credentials_in_json(&mut parsed);
+                astra_text_utils::credential_redaction::redact_credentials_in_json(&mut parsed);
                 serde_json::to_string(&parsed).unwrap_or_else(|_| {
                     r#"{"_astra_redaction":"arguments_unavailable"}"#.to_string()
                 })

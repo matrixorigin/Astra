@@ -147,8 +147,8 @@ fn truncate_tool_result(tool_name: &str, content: &str, max_chars: usize) -> Str
     // that contract and can split a marker before the final boundary.  Keep
     // marker-bearing results on the shared atomic head/tail path; ordinary
     // outputs retain the richer semantic compression below.
-    if astra_tools::credential_redaction::redaction_marker_status(content).1 {
-        return astra_tools::credential_redaction::truncate_redacted_head_tail_chars(
+    if astra_text_utils::credential_redaction::redaction_marker_status(content).1 {
+        return astra_text_utils::credential_redaction::truncate_redacted_head_tail_chars(
             content, max_chars,
         );
     }
@@ -172,8 +172,8 @@ fn truncate_tool_result(tool_name: &str, content: &str, max_chars: usize) -> Str
 }
 
 fn head_tail_truncate_fallback(tool_name: &str, content: &str, max_chars: usize) -> String {
-    if astra_tools::credential_redaction::redaction_marker_status(content).1 {
-        return astra_tools::credential_redaction::truncate_redacted_head_tail_chars(
+    if astra_text_utils::credential_redaction::redaction_marker_status(content).1 {
+        return astra_text_utils::credential_redaction::truncate_redacted_head_tail_chars(
             content, max_chars,
         );
     }
@@ -616,7 +616,7 @@ mod tests {
             "prefix AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n{}",
             "x".repeat(10_000)
         );
-        let (issued, _) = astra_tools::credential_redaction::redact_credentials_in_text(&raw);
+        let (issued, _) = astra_text_utils::credential_redaction::redact_credentials_in_text(&raw);
         let marker = issued
             .find("[REDACTED:")
             .and_then(|start| {

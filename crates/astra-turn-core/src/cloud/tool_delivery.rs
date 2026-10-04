@@ -173,8 +173,9 @@ fn denied_tool_content(reason: Option<&str>) -> String {
     // message, ledger, or durable run interaction.  In particular, do not
     // mint an edit-capable marker here: this module does not own the source
     // bytes that an edge executor would need to resolve it.
-    let safe_reason = reason
-        .map(|value| astra_tools::credential_redaction::redact_credentials_for_display(value).0);
+    let safe_reason = reason.map(|value| {
+        astra_text_utils::credential_redaction::redact_credentials_for_display(value).0
+    });
     let mut parts = vec!["The user REJECTED this tool call. The tool was NOT executed."];
     let feedback_line;
     if let Some(r) = safe_reason.as_deref().filter(|s| !s.is_empty()) {
@@ -205,7 +206,7 @@ fn llm_safe_tool_content(content: &str, tool_name: &str) -> String {
 /// the callback violated that executor contract.
 fn redact_delivery_entry(entry: &Value, redacted_output: &str) -> Value {
     let mut entry = entry.clone();
-    astra_tools::credential_redaction::redact_credentials_in_json(&mut entry);
+    astra_text_utils::credential_redaction::redact_credentials_in_json(&mut entry);
     let target = if let Some(body) = entry.get_mut("body").and_then(Value::as_object_mut) {
         body
     } else if let Some(object) = entry.as_object_mut() {
@@ -792,19 +793,21 @@ pub async fn wait_tool_result_ledger_for_tool_with_cancel(
                 .and_then(|body| body.get("output"))
                 .and_then(Value::as_str)
         });
-    let (redacted_output, _) = astra_tools::credential_redaction::redact_credentials_for_display(
-        raw_output.unwrap_or(&raw_content),
-    );
+    let (redacted_output, _) =
+        astra_text_utils::credential_redaction::redact_credentials_for_display(
+            raw_output.unwrap_or(&raw_content),
+        );
     let sanitized_effective_entry =
         effective_entry.map(|entry| redact_delivery_entry(entry, &redacted_output));
     let redacted_content = sanitized_effective_entry
         .as_ref()
         .map(tool_content_from_ledger_entry)
         .unwrap_or_else(|| {
-            astra_tools::credential_redaction::redact_credentials_for_display(&raw_content).0
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&raw_content).0
         });
     let content = llm_safe_tool_content(
-        &astra_tools::credential_redaction::redact_credentials_for_display(&redacted_content).0,
+        &astra_text_utils::credential_redaction::redact_credentials_for_display(&redacted_content)
+            .0,
         tool_name,
     );
     out.tool_messages.push(json!({
@@ -867,7 +870,8 @@ pub fn local_tool_execution_delivery(
         .and_then(Value::as_str)
         .unwrap_or("");
     let status = if is_error { "failed" } else { "completed" };
-    let (output, _) = astra_tools::credential_redaction::redact_credentials_for_display(output);
+    let (output, _) =
+        astra_text_utils::credential_redaction::redact_credentials_for_display(output);
     let synthetic = json!({ "body": { "status": status, "output": output } });
     let raw_content = tool_content_from_ledger_entry(&synthetic);
     let content = llm_safe_tool_content(&raw_content, tool_name);

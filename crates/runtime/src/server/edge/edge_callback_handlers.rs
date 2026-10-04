@@ -242,7 +242,7 @@ fn validate_tool_result_request(
         return Err("tool result edge_agent_id is invalid");
     }
     let (_, edge_id_redactions) =
-        astra_tools::credential_redaction::redact_credentials_for_display(&body.edge_agent_id);
+        astra_text_utils::credential_redaction::redact_credentials_for_display(&body.edge_agent_id);
     if edge_id_redactions > 0 {
         return Err("tool result edge_agent_id is invalid");
     }
@@ -285,7 +285,7 @@ pub(crate) async fn post_tool_result_handler(
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
     let safe_edge_id =
-        astra_tools::credential_redaction::redact_credentials_for_display(&edge_id).0;
+        astra_text_utils::credential_redaction::redact_credentials_for_display(&edge_id).0;
     validate_tool_result_request(&body)
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
     // A bearer token authenticates the caller, but does not make the
@@ -341,11 +341,11 @@ pub(crate) async fn post_tool_result_handler(
     // its owning executor before an edit.
     let mut safe_body = body.clone();
     let (safe_output, _) =
-        astra_tools::credential_redaction::redact_credentials_for_display(&safe_body.output);
+        astra_text_utils::credential_redaction::redact_credentials_for_display(&safe_body.output);
     safe_body.output = safe_output;
     if let Some(fields) = safe_body.tool_result_fields.as_mut() {
         for value in fields.values_mut() {
-            astra_tools::credential_redaction::redact_credentials_in_json(value);
+            astra_text_utils::credential_redaction::redact_credentials_in_json(value);
         }
     }
     safe_body.result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
@@ -591,7 +591,7 @@ pub(crate) async fn post_approval_respond_handler(
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
     let safe_edge_id =
-        astra_tools::credential_redaction::redact_credentials_for_display(&edge_id).0;
+        astra_text_utils::credential_redaction::redact_credentials_for_display(&edge_id).0;
     let registry = state.metrics_registry();
     let run_id = body.run_id.trim();
     if run_id.is_empty() {
@@ -617,7 +617,7 @@ pub(crate) async fn post_approval_respond_handler(
     let mut safe_body = body.clone();
     if let Some(reason) = safe_body.reason.as_deref() {
         let (safe_reason, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(reason);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(reason);
         safe_body.reason = Some(safe_reason);
     }
     // The bearer token proves the caller's identity, not that an arbitrary

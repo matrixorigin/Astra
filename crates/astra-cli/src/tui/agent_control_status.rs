@@ -117,7 +117,7 @@ pub(crate) fn compact_delegation_result(status: Option<&str>, payload: Option<&s
     })
     .flatten()
     .map(|value| {
-        astra_tools::credential_redaction::redact_credentials_for_display(value)
+        astra_text_utils::credential_redaction::redact_credentials_for_display(value)
             .0
             .chars()
             .filter(|ch| !ch.is_control())

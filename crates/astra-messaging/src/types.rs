@@ -234,19 +234,25 @@ fn communication_payload_evidence(
             None,
             None,
         ),
-        MessagePayload::Request { request_type, .. } => (
+        MessagePayload::Request { request_type, data } => (
             Kind::Request,
-            Some(bounded_communication_summary(&format!("{request_type:?}"))),
+            Some(bounded_communication_summary(&if data.is_null() {
+                format!("{request_type:?}")
+            } else {
+                format!("{request_type:?} · {}", communication_data_summary(data))
+            })),
             None,
             None,
         ),
         MessagePayload::Response {
             request_id,
             accepted,
-            ..
+            data,
         } => (
             Kind::Response,
-            None,
+            data.as_ref()
+                .filter(|data| !data.is_null())
+                .map(|data| bounded_communication_summary(&communication_data_summary(data))),
             Some(*accepted),
             Some(request_id.clone()),
         ),
@@ -259,12 +265,21 @@ fn communication_payload_evidence(
     }
 }
 
+fn communication_data_summary(data: &serde_json::Value) -> String {
+    let mut safe = data.clone();
+    astra_text_utils::credential_redaction::redact_credentials_in_json(&mut safe);
+    safe.to_string()
+}
+
 fn bounded_communication_summary(value: &str) -> String {
-    let mut summary: String = value
-        .chars()
-        .take(AGENT_COMMUNICATION_SUMMARY_CHARS)
-        .collect();
-    if value.chars().count() > AGENT_COMMUNICATION_SUMMARY_CHARS {
+    let safe = astra_text_utils::credential_redaction::redact_credentials_for_display(value).0;
+    let bytes = safe
+        .char_indices()
+        .nth(AGENT_COMMUNICATION_SUMMARY_CHARS)
+        .map_or(safe.len(), |(index, _)| index);
+    let projection = astra_text_utils::credential_redaction::SafeOutputProjection::new(safe);
+    let (mut summary, next, total, _) = projection.window(0, bytes);
+    if next < total {
         summary.push('…');
     }
     summary
@@ -524,6 +539,10 @@ mod tests {
                 astra_turn_types::AgentCommunicationPayloadKind::Response
             );
             assert_eq!(evidence.response_accepted, Some(accepted));
+            assert_eq!(
+                evidence.summary.as_deref(),
+                Some(r#"{"reason":"permission decision"}"#)
+            );
             assert_eq!(evidence.related_message_id.as_deref(), Some("request-1"));
             assert_eq!(evidence.correlation_id.as_deref(), Some("request-1"));
             let wire = serde_json::to_value(&evidence).unwrap();
@@ -532,6 +551,103 @@ mod tests {
                 serde_json::from_value::<astra_turn_types::AgentCommunicationEvent>(wire).unwrap(),
                 evidence
             );
+        }
+    }
+
+    #[test]
+    fn request_and_response_evidence_preserves_bounded_body() {
+        let observer = AgentAddress::new("receiver-run", "receiver");
+        for data in [
+            serde_json::Value::Null,
+            serde_json::json!({"content": "界".repeat(1_500)}),
+        ] {
+            for payload in [
+                MessagePayload::Request {
+                    request_type: RequestType::Custom("clarification".into()),
+                    data: data.clone(),
+                },
+                MessagePayload::Response {
+                    request_id: "question-id".into(),
+                    accepted: true,
+                    data: Some(data.clone()),
+                },
+                MessagePayload::Response {
+                    request_id: "question-id".into(),
+                    accepted: false,
+                    data: None,
+                },
+            ] {
+                let message = AgentMessage::new(observer.clone(), MessageTarget::Parent, payload)
+                    .with_correlation("question-id");
+                for direction in [
+                    astra_turn_types::AgentCommunicationDirection::Sent,
+                    astra_turn_types::AgentCommunicationDirection::Received,
+                ] {
+                    let event = agent_communication_event(&observer, direction, &message);
+                    assert_eq!(event.message_id, message.id);
+                    assert_eq!(event.correlation_id.as_deref(), Some("question-id"));
+                    let has_body = matches!(&message.payload, MessagePayload::Request { data, .. } if !data.is_null())
+                        || matches!(&message.payload, MessagePayload::Response { data: Some(data), .. } if !data.is_null());
+                    if has_body {
+                        let summary = event.summary.unwrap();
+                        assert!(summary.contains("界"));
+                        assert_eq!(
+                            summary.chars().count(),
+                            AGENT_COMMUNICATION_SUMMARY_CHARS + 1
+                        );
+                        assert!(summary.ends_with('…'));
+                    } else if matches!(message.payload, MessagePayload::Response { .. }) {
+                        assert!(event.summary.is_none());
+                    } else {
+                        assert_eq!(event.summary.as_deref(), Some(r#"Custom("clarification")"#));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn structured_communication_redacts_credentials_before_summary_windows() {
+        let observer = AgentAddress::new("receiver-run", "receiver");
+        for padding in [0, 950, 990] {
+            let data = serde_json::json!({
+                "arguments": {"password": "synthetic-short-secret", "nested": [{"api_key": "synthetic-key"}]},
+                "content": format!("{} Bearer {}", "界".repeat(padding), "a".repeat(64)),
+            });
+            for payload in [
+                MessagePayload::Request {
+                    request_type: RequestType::ToolPermission,
+                    data: data.clone(),
+                },
+                MessagePayload::Response {
+                    request_id: "question-id".into(),
+                    accepted: true,
+                    data: Some(data.clone()),
+                },
+            ] {
+                let message = AgentMessage::new(observer.clone(), MessageTarget::Parent, payload);
+                for direction in [
+                    astra_turn_types::AgentCommunicationDirection::Sent,
+                    astra_turn_types::AgentCommunicationDirection::Received,
+                ] {
+                    let summary = agent_communication_event(&observer, direction, &message)
+                        .summary
+                        .unwrap();
+                    assert!(!summary.contains("synthetic-short-secret"));
+                    assert!(!summary.contains("synthetic-key"));
+                    assert!(!summary.contains(&"a".repeat(12)));
+                    assert!(summary.contains("[REDACTED:"));
+                    assert!(summary.chars().count() <= AGENT_COMMUNICATION_SUMMARY_CHARS + 1);
+                    assert!(
+                        !astra_text_utils::credential_redaction::redaction_marker_status(&summary)
+                            .0,
+                        "display evidence must not issue edit capabilities"
+                    );
+                    for marker in summary.split("[REDACTED:").skip(1) {
+                        assert!(marker.contains(']'), "summary cut a redaction marker");
+                    }
+                }
+            }
         }
     }
 

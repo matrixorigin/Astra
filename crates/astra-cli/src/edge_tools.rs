@@ -3345,7 +3345,7 @@ impl ToolExecutor {
         })
         .to_string();
         let (chunk, end, total_bytes, total_lines) =
-            astra_tools::credential_redaction::redacted_output_window(
+            astra_text_utils::credential_redaction::redacted_output_window(
                 &output,
                 offset as usize,
                 max_bytes,
@@ -3472,7 +3472,7 @@ impl ToolExecutor {
             "hint": "Recovered from the durable session journal; this is a settled historical observation, not a live fanout control handle.",
         }).to_string();
         let (chunk, end, total_bytes, total_lines) =
-            astra_tools::credential_redaction::redacted_output_window(
+            astra_text_utils::credential_redaction::redacted_output_window(
                 &output,
                 offset as usize,
                 max_bytes,
@@ -3641,9 +3641,9 @@ impl ToolExecutor {
         );
         for (turn_num, user, assistant) in shown {
             let user_safe =
-                astra_tools::credential_redaction::redact_credentials_for_display(user).0;
+                astra_text_utils::credential_redaction::redact_credentials_for_display(user).0;
             let assistant_safe =
-                astra_tools::credential_redaction::redact_credentials_for_display(assistant).0;
+                astra_text_utils::credential_redaction::redact_credentials_for_display(assistant).0;
             let user_preview: String = user_safe.chars().take(120).collect();
             let assist_preview: String = assistant_safe.chars().take(200).collect();
             out.push_str(&format!("\n**T{turn_num} User**: {user_preview}"));
@@ -4129,7 +4129,8 @@ impl ToolExecutor {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .replace('\n', " ⏎ ");
-        let preview = astra_tools::credential_redaction::redact_credentials_for_display(&preview).0;
+        let preview =
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&preview).0;
         let preview: String = preview.chars().take(80).collect();
 
         Some(format!(
@@ -4333,7 +4334,7 @@ impl ToolExecutor {
         // recording pipeline is the sole boundary allowed to turn oversized
         // output into a recoverable artifact handle.
         let (output, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
         normalize_empty_output(output, name)
     }
 
@@ -4768,7 +4769,7 @@ impl ToolExecutor {
         // cache insertion: tool_call_end and the Edge→server transport must
         // never become an earlier/raw persistence lane than headless record.
         let (mut output, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
         let embedded_work_observation = embedded_work_unit_observation(&output);
         // Only control-handler output is a producer-owned execution fact;
         // file contents and process stdout cannot certify non-execution.

@@ -44,7 +44,8 @@ const STRUCTURED_WORK_OUTPUT_EVENT_LIMIT_BYTES: usize = 64_000;
 const RELIABLE_STREAM_EVENT_RESERVE: usize = 2;
 
 fn approval_unavailable_tool_output(reason: &str) -> String {
-    let (redacted, _) = astra_tools::credential_redaction::redact_credentials_for_display(reason);
+    let (redacted, _) =
+        astra_text_utils::credential_redaction::redact_credentials_for_display(reason);
     let reason = astra_text_utils::str_preview::truncate_line(&redacted, 240);
     format!(
         "Operation not executed: {reason}. Approval is unavailable in this execution context. Use an operation within the permitted scope, or report this blocker to the parent/user."
@@ -2139,7 +2140,7 @@ impl<'a> CliSseStreamHost<'a> {
         duration_ms: u64,
     ) -> EdgeToolExecResult {
         let (output, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
         let typed_fields = tool_result_fields.as_ref();
         if self.callback_tool_belongs_to_foreground(request_id)
             && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
@@ -2915,11 +2916,11 @@ impl<'a> CliSseStreamHost<'a> {
         // output and extensible fields once before any side channel sees
         // them.
         let (output, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
         let mut tool_result_fields =
             self.tool_result_fields_with_cli_runtime(&req.tool, tool_result_fields);
         for value in tool_result_fields.values_mut() {
-            astra_tools::credential_redaction::redact_credentials_in_json(value);
+            astra_text_utils::credential_redaction::redact_credentials_in_json(value);
         }
 
         if self.callback_tool_belongs_to_foreground(&req.request_id)
@@ -5654,7 +5655,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // callback request before the runtime's durable record pass.  Keep
         // those earlier lanes on the same executor-owned redacted value.
         let (sanitized_output, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
         output = sanitized_output;
         let status = if !allowed || tool_execution_marked_error {
             "failed"

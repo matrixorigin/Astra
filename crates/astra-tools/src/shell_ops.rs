@@ -1536,7 +1536,7 @@ async fn execute_bash_inner(
     // Establish the credential boundary before any user-visible output
     // truncation. A secret that crosses the raw capture limit must not leave a
     // partial value in stdout/stderr for a later pass to miss.
-    result = crate::credential_redaction::redact_credentials_for_display(&result).0;
+    result = astra_text_utils::credential_redaction::redact_credentials_for_display(&result).0;
 
     let mut cap_notes = Vec::new();
     if output.stdout_capped {
@@ -1573,10 +1573,12 @@ async fn execute_bash_inner(
         }
         return attach_scope_settled(
             attach_source_preimage(
-                ToolResult::error(crate::credential_redaction::truncate_redacted_output(
-                    result,
-                    output_limit,
-                ))
+                ToolResult::error(
+                    astra_text_utils::credential_redaction::truncate_redacted_output(
+                        result,
+                        output_limit,
+                    ),
+                )
                 .with_exit_semantics(ExitSemantics::TimedOut)
                 .with_exit_code(output.exit_code),
                 source_preimages,
@@ -1596,10 +1598,12 @@ async fn execute_bash_inner(
         }
         return attach_scope_settled(
             attach_source_preimage(
-                ToolResult::error(crate::credential_redaction::truncate_redacted_output(
-                    result,
-                    output_limit,
-                ))
+                ToolResult::error(
+                    astra_text_utils::credential_redaction::truncate_redacted_output(
+                        result,
+                        output_limit,
+                    ),
+                )
                 .with_exit_semantics(ExitSemantics::Cancelled)
                 .with_exit_code(output.exit_code),
                 source_preimages,
@@ -1621,7 +1625,7 @@ async fn execute_bash_inner(
     if output.exit_code != 0 || result_class.is_tool_error() {
         let exit_code = output.exit_code;
         let output_text =
-            crate::credential_redaction::truncate_redacted_output(result, output_limit);
+            astra_text_utils::credential_redaction::truncate_redacted_output(result, output_limit);
         if exit_semantics.is_tool_error() || result_class.is_tool_error() {
             return attach_scope_settled(
                 attach_source_preimage(
@@ -1682,10 +1686,12 @@ async fn execute_bash_inner(
     } else {
         attach_scope_settled(
             attach_source_preimage(
-                ToolResult::text(crate::credential_redaction::truncate_redacted_output(
-                    result,
-                    output_limit,
-                ))
+                ToolResult::text(
+                    astra_text_utils::credential_redaction::truncate_redacted_output(
+                        result,
+                        output_limit,
+                    ),
+                )
                 .with_exit_semantics(ExitSemantics::Success)
                 .with_result_class(result_class)
                 .with_exit_code(output.exit_code),

@@ -473,7 +473,7 @@ impl ToolExecutor {
                     )
                 };
                 let (safe_outline_text, _) =
-                    astra_tools::credential_redaction::redact_credentials_for_display(
+                    astra_text_utils::credential_redaction::redact_credentials_for_display(
                         &outline_text,
                     );
 
@@ -511,7 +511,7 @@ impl ToolExecutor {
                             };
                         let total_lines = content_for_outline.lines().count();
                         let (safe_content_for_outline, _) =
-                            astra_tools::credential_redaction::redact_credentials_in_text(
+                            astra_text_utils::credential_redaction::redact_credentials_in_text(
                                 &content_for_outline,
                             );
                         self.record_read_cached(&path, true, content_for_outline.clone());
@@ -522,7 +522,7 @@ impl ToolExecutor {
                             if !outline.is_empty() {
                                 let def_count = outline.lines().count();
                                 let (safe_outline, _) =
-                                    astra_tools::credential_redaction::redact_credentials_for_display(
+                                    astra_text_utils::credential_redaction::redact_credentials_for_display(
                                         &outline,
                                     );
                                 return Ok(format!(
@@ -543,7 +543,7 @@ impl ToolExecutor {
                                 .collect::<Vec<_>>()
                                 .join("\n");
                             let (safe_outline, _) =
-                                astra_tools::credential_redaction::redact_credentials_for_display(
+                                astra_text_utils::credential_redaction::redact_credentials_for_display(
                                     &rendered_outline,
                                 );
                             return Ok(format!(
@@ -617,7 +617,7 @@ impl ToolExecutor {
         // partial secret.  Keep `raw_content` for AST parsing, line-range
         // accounting, and the staleness cache.
         let (safe_content, _) =
-            astra_tools::credential_redaction::redact_credentials_in_text(&raw_content);
+            astra_text_utils::credential_redaction::redact_credentials_in_text(&raw_content);
 
         // Outline isolation: return only definition signatures with line numbers
         if has_outline {
@@ -634,8 +634,10 @@ impl ToolExecutor {
                     let def_count = outline.lines().count();
                     return Ok(format!(
                         "# Outline ({total_lines} lines, {def_count} symbols)\n{}",
-                        astra_tools::credential_redaction::redact_credentials_for_display(&outline)
-                            .0
+                        astra_text_utils::credential_redaction::redact_credentials_for_display(
+                            &outline
+                        )
+                        .0
                     ));
                 }
             }
@@ -649,7 +651,7 @@ impl ToolExecutor {
             return Ok(format!(
                 "# Outline ({total_lines} lines total, {} definitions)\n{}",
                 outline.len(),
-                astra_tools::credential_redaction::redact_credentials_for_display(
+                astra_text_utils::credential_redaction::redact_credentials_for_display(
                     &outline
                         .iter()
                         .map(|(line_no, sig)| format!("{line_no}: {sig}"))
@@ -684,7 +686,7 @@ impl ToolExecutor {
                 && raw_content.len() <= AUTO_EXPAND_MAX_BYTES
             {
                 let total_lines = raw_content.lines().count();
-                let expanded_content = astra_tools::credential_redaction::redact_line_window(
+                let expanded_content = astra_text_utils::credential_redaction::redact_line_window(
                     &raw_content,
                     1,
                     total_lines,
@@ -796,7 +798,7 @@ impl ToolExecutor {
             ));
         }
         let actual_start_line = s + 1; // 1-indexed
-        let safe_range = astra_tools::credential_redaction::redact_line_window(
+        let safe_range = astra_text_utils::credential_redaction::redact_line_window(
             &raw_content,
             actual_start_line,
             e,
@@ -1046,7 +1048,7 @@ impl ToolExecutor {
             Some(s) => s,
             None => return Err("Error: missing 'new_str'".to_string().into()),
         };
-        astra_tools::credential_redaction::reject_redaction_markers_in_replacement(new_str)?;
+        astra_text_utils::credential_redaction::reject_redaction_markers_in_replacement(new_str)?;
         if old_str == new_str {
             return Err(FsLeafError::caller_correctable_no_effect(
                 str_replace_fail(
@@ -1079,7 +1081,7 @@ impl ToolExecutor {
                 "Error: File is not valid UTF-8; text edits cannot preserve its bytes".to_owned()
             })?
             .to_owned();
-        let redaction_reference = astra_tools::credential_redaction::resolve_redacted_anchor(
+        let redaction_reference = astra_text_utils::credential_redaction::resolve_redacted_anchor(
             &content,
             old_str,
             replace_all,
@@ -2116,10 +2118,13 @@ impl ToolExecutor {
                 Some(s) => s,
                 None => return Err(format!("Error: edit[{i}] missing 'new_str'").into()),
             };
-            astra_tools::credential_redaction::reject_redaction_markers_in_replacement(new_str)?;
-            let redaction_reference = astra_tools::credential_redaction::resolve_redacted_anchor(
-                &working, old_str, false,
+            astra_text_utils::credential_redaction::reject_redaction_markers_in_replacement(
+                new_str,
             )?;
+            let redaction_reference =
+                astra_text_utils::credential_redaction::resolve_redacted_anchor(
+                    &working, old_str, false,
+                )?;
             let old_str = redaction_reference.as_deref().unwrap_or(old_str);
             if old_str == new_str {
                 return Err(FsLeafError::caller_correctable_no_effect(
@@ -2959,7 +2964,7 @@ fn add_line_numbers_budgeted(
                 // line exceeds the model budget; the shared redacted
                 // truncator drops/keeps the atomic span safely.
                 output.push_str(
-                    &astra_tools::credential_redaction::truncate_redacted_output(
+                    &astra_text_utils::credential_redaction::truncate_redacted_output(
                         rendered, max_chars,
                     ),
                 );
@@ -3440,7 +3445,8 @@ type Handler interface {
         let file_path = dir.path().join("settings.txt");
         let raw = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";
         std::fs::write(&file_path, raw).unwrap();
-        let (redacted, count) = astra_tools::credential_redaction::redact_credentials_in_text(raw);
+        let (redacted, count) =
+            astra_text_utils::credential_redaction::redact_credentials_in_text(raw);
         assert_eq!(count, 1);
         let marker = redacted
             .split_once('=')
@@ -3465,7 +3471,8 @@ type Handler interface {
         let file_path = dir.path().join("settings.txt");
         let raw = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";
         std::fs::write(&file_path, raw).unwrap();
-        let (redacted, count) = astra_tools::credential_redaction::redact_credentials_in_text(raw);
+        let (redacted, count) =
+            astra_text_utils::credential_redaction::redact_credentials_in_text(raw);
         assert_eq!(count, 1);
         let marker = redacted
             .split_once('=')

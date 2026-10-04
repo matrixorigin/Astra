@@ -461,14 +461,16 @@ impl ToolExecutor for DefaultToolExecutor {
         // cannot mint a blind edit capability.
         let result = {
             let (output, _) =
-                crate::credential_redaction::redact_credentials_for_display(&result.output);
+                astra_text_utils::credential_redaction::redact_credentials_for_display(
+                    &result.output,
+                );
             ToolResult { output, ..result }
         };
 
         // Truncate oversized output to prevent context window overflow.
         let result = if result.output.len() > MAX_TOOL_OUTPUT_BYTES {
             ToolResult {
-                output: crate::credential_redaction::truncate_redacted_output(
+                output: astra_text_utils::credential_redaction::truncate_redacted_output(
                     result.output,
                     MAX_TOOL_OUTPUT_BYTES,
                 ),

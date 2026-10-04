@@ -2686,7 +2686,7 @@ mod tests {
         // The HTTP callback uses the astra-tools JSON boundary directly;
         // exercise that same projection before the headless admission check.
         for value in fields.values_mut() {
-            astra_tools::credential_redaction::redact_credentials_in_json(value);
+            astra_text_utils::credential_redaction::redact_credentials_in_json(value);
         }
         let execution = HeadlessResolvedExecution {
             id: "call-local-advertisement".into(),

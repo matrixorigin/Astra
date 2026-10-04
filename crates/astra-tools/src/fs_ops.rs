@@ -664,8 +664,11 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
             Err(e) => return ToolResult::error(format!("Error: Cannot read file: {e}")),
         };
         let total_lines = raw_preview.lines().count();
-        let safe_preview =
-            crate::credential_redaction::redact_line_window(&raw_preview, 1, total_lines);
+        let safe_preview = astra_text_utils::credential_redaction::redact_line_window(
+            &raw_preview,
+            1,
+            total_lines,
+        );
         let safe_lines = safe_preview.lines().collect::<Vec<_>>();
         let head_lines = safe_lines
             .iter()
@@ -733,7 +736,10 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
             && let Some(outline_str) = render_outline(&path, &raw_preview, total_lines)
         {
             preview.push_str(
-                &crate::credential_redaction::redact_credentials_for_display(&outline_str).0,
+                &astra_text_utils::credential_redaction::redact_credentials_for_display(
+                    &outline_str,
+                )
+                .0,
             );
         }
 
@@ -741,7 +747,7 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
         let limit = per_tool_output_limit("read_file");
         let tip = "\n**Tip**: Use `start_line`/`end_line` to read specific sections, or `outline=true` for definitions only.";
         if preview.len() + tip.len() > limit {
-            preview = crate::credential_redaction::truncate_redacted_output(
+            preview = astra_text_utils::credential_redaction::truncate_redacted_output(
                 preview,
                 limit.saturating_sub(tip.len()),
             );
@@ -761,17 +767,18 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
         let rendered = render_outline(&path, &raw_content, total_lines)
             .unwrap_or_else(|| no_definitions_outline_message(total_lines));
         return ToolResult::text(
-            crate::credential_redaction::redact_credentials_for_display(&rendered).0,
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&rendered).0,
         );
     }
 
     if !has_range {
-        let content = crate::credential_redaction::redact_credentials_in_text(&raw_content).0;
+        let content =
+            astra_text_utils::credential_redaction::redact_credentials_in_text(&raw_content).0;
         let numbered = add_line_numbers(&content, 1);
         let limit = per_tool_output_limit("read_file");
         if numbered.len() > limit {
             let mut truncated =
-                crate::credential_redaction::truncate_redacted_output(numbered, limit);
+                astra_text_utils::credential_redaction::truncate_redacted_output(numbered, limit);
             truncated.push_str(&format!(
                 "\n[file has {total_lines} lines — use start_line/end_line or outline=true]"
             ));
@@ -805,8 +812,9 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
         ));
     }
 
-    let slice = crate::credential_redaction::redact_line_window(&raw_content, start + 1, end);
-    let mut result = crate::credential_redaction::truncate_redacted_output(
+    let slice =
+        astra_text_utils::credential_redaction::redact_line_window(&raw_content, start + 1, end);
+    let mut result = astra_text_utils::credential_redaction::truncate_redacted_output(
         add_line_numbers(&slice, start + 1),
         per_tool_output_limit("read_file"),
     );
@@ -1259,7 +1267,7 @@ pub fn prepare_str_replace(
             ));
         }
     };
-    crate::credential_redaction::reject_redaction_markers_in_replacement(new_str)
+    astra_text_utils::credential_redaction::reject_redaction_markers_in_replacement(new_str)
         .map_err(ToolResult::error)?;
     validate_str_replace_anchor("str_replace", old_str).map_err(ToolResult::error)?;
     if old_str == new_str {
@@ -1298,9 +1306,12 @@ pub fn prepare_str_replace(
     // complete non-secret redaction marker is a safe edit reference: resolve
     // it against the raw file at execution time, and fail closed on forged or
     // ambiguous references instead of asking the model to repeat the secret.
-    let redaction_reference =
-        crate::credential_redaction::resolve_redacted_anchor(&content, old_str, replace_all)
-            .map_err(ToolResult::error)?;
+    let redaction_reference = astra_text_utils::credential_redaction::resolve_redacted_anchor(
+        &content,
+        old_str,
+        replace_all,
+    )
+    .map_err(ToolResult::error)?;
     let old_str = redaction_reference.as_deref().unwrap_or(old_str);
     // Resolve opaque anchors before deciding whether this is a no-op.  A
     // marker can differ from the source value while still resolving to the
@@ -1584,12 +1595,13 @@ fn prepare_multi_edit_inner(
                 )));
             }
         };
-        crate::credential_redaction::reject_redaction_markers_in_replacement(new_str)
+        astra_text_utils::credential_redaction::reject_redaction_markers_in_replacement(new_str)
             .map_err(ToolResult::error)?;
         validate_str_replace_anchor(&format!("edit[{i}]"), old_str).map_err(ToolResult::error)?;
-        let redaction_reference =
-            crate::credential_redaction::resolve_redacted_anchor(&working, old_str, false)
-                .map_err(ToolResult::error)?;
+        let redaction_reference = astra_text_utils::credential_redaction::resolve_redacted_anchor(
+            &working, old_str, false,
+        )
+        .map_err(ToolResult::error)?;
         let old_str = redaction_reference.as_deref().unwrap_or(old_str);
         if old_str == new_str {
             return Err(caller_correctable_no_effect(
@@ -3485,7 +3497,8 @@ mod tests {
         let raw = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";
         let path = tmp.path().join("config.env");
         std::fs::write(&path, raw).unwrap();
-        let (redacted, count) = crate::credential_redaction::redact_credentials_in_text(raw);
+        let (redacted, count) =
+            astra_text_utils::credential_redaction::redact_credentials_in_text(raw);
         assert_eq!(count, 1);
         assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"));
 
@@ -3528,7 +3541,8 @@ mod tests {
         let raw = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";
         let path = tmp.path().join("config.env");
         std::fs::write(&path, raw).unwrap();
-        let (redacted, count) = crate::credential_redaction::redact_credentials_in_text(raw);
+        let (redacted, count) =
+            astra_text_utils::credential_redaction::redact_credentials_in_text(raw);
         assert_eq!(count, 1);
         let marker = redacted
             .split_once('=')

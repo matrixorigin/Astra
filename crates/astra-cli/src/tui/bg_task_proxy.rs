@@ -65,7 +65,11 @@ pub(crate) fn safe_output_window(
     max_bytes: usize,
 ) -> (String, u64, u64, u64) {
     let (output, end, total_bytes, total_lines) =
-        astra_tools::credential_redaction::redacted_output_window(raw, offset as usize, max_bytes);
+        astra_text_utils::credential_redaction::redacted_output_window(
+            raw,
+            offset as usize,
+            max_bytes,
+        );
     (output, end as u64, total_bytes as u64, total_lines as u64)
 }
 
@@ -139,7 +143,7 @@ pub(crate) fn local_agent_output_tail(output: Option<String>) -> Option<String> 
             return None;
         }
         Some(
-            astra_tools::credential_redaction::redacted_output_tail_chars(
+            astra_text_utils::credential_redaction::redacted_output_tail_chars(
                 &output,
                 LOCAL_AGENT_OUTPUT_TAIL_CHARS,
             ),

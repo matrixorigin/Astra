@@ -4378,12 +4378,13 @@ impl ToolExecutor {
             };
         }
 
-        result = astra_tools::credential_redaction::redact_credentials_for_display(&result).0;
+        result = astra_text_utils::credential_redaction::redact_credentials_for_display(&result).0;
 
         // Budget-pressure-aware truncation (was hardcoded 20KB)
         let limit = self.scaled_output_limit();
         if result.len() > limit {
-            result = astra_tools::credential_redaction::truncate_redacted_output(result, limit);
+            result =
+                astra_text_utils::credential_redaction::truncate_redacted_output(result, limit);
         }
 
         // For build/test commands, provide structured output with iteration tracking
@@ -5692,12 +5693,14 @@ impl ToolExecutor {
                 }
 
                 result =
-                    astra_tools::credential_redaction::redact_credentials_for_display(&result).0;
+                    astra_text_utils::credential_redaction::redact_credentials_for_display(&result)
+                        .0;
 
                 let limit = self.scaled_output_limit();
                 if result.len() > limit {
-                    result =
-                        astra_tools::credential_redaction::truncate_redacted_output(result, limit);
+                    result = astra_text_utils::credential_redaction::truncate_redacted_output(
+                        result, limit,
+                    );
                 }
 
                 if !out.status.success() {
@@ -5862,10 +5865,12 @@ impl ToolExecutor {
                 // Apply per-tool output limit (centralised in per_tool_output_limit)
                 let limit = self.scaled_output_limit_for("grep");
                 result_text =
-                    astra_tools::credential_redaction::redact_credentials_for_display(&result_text)
-                        .0;
+                    astra_text_utils::credential_redaction::redact_credentials_for_display(
+                        &result_text,
+                    )
+                    .0;
                 if result_text.len() > limit {
-                    result_text = astra_tools::credential_redaction::truncate_redacted_output(
+                    result_text = astra_text_utils::credential_redaction::truncate_redacted_output(
                         result_text,
                         limit,
                     );

@@ -4740,7 +4740,7 @@ pub(super) async fn post_work_branch_interaction_handler(
                     )
                 })?;
             let safe_reason = reason.as_deref().map(|reason| {
-                astra_tools::credential_redaction::redact_credentials_for_display(reason).0
+                astra_text_utils::credential_redaction::redact_credentials_for_display(reason).0
             });
             let decision = match decision {
                 WorkApprovalDecisionV1::Allow => "allow",

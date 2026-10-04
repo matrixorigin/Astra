@@ -7,6 +7,7 @@ publish = false
 description = "Tool execution library shared by the Astra CLI and server"
 
 [dependencies]
+astra-text-utils.workspace = true
 astra-core.workspace = true
 astra-memoria.workspace = true
 astra-prompts.workspace = true

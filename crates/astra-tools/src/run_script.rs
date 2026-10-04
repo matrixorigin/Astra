@@ -290,11 +290,14 @@ pub enum RunScriptError {
 /// same UTF-8-safe head+tail truncation the rest of the module uses,
 /// so multi-byte chars at the split point never panic or mangle.
 fn preview_stream(s: &str) -> String {
-    let (safe, _) = crate::credential_redaction::redact_credentials_for_display(s);
+    let (safe, _) = astra_text_utils::credential_redaction::redact_credentials_for_display(s);
     if safe.len() <= ERROR_STREAM_PREVIEW_BYTES {
         safe
     } else {
-        crate::credential_redaction::truncate_redacted_head_tail(&safe, ERROR_STREAM_PREVIEW_BYTES)
+        astra_text_utils::credential_redaction::truncate_redacted_head_tail(
+            &safe,
+            ERROR_STREAM_PREVIEW_BYTES,
+        )
     }
 }
 
@@ -1258,7 +1261,7 @@ async fn collect_stdout_head_tail(stdout: tokio::process::ChildStdout, max_bytes
                 scan.extend_from_slice(&chunk[..n]);
                 let scan_base = chunk_start.saturating_sub(pem_scan_overlap.len());
                 for (start, end, kind) in
-                    crate::credential_redaction::private_key_header_markers_bytes(&scan)
+                    astra_text_utils::credential_redaction::private_key_header_markers_bytes(&scan)
                 {
                     if pem_headers.len() < MAX_TRACKED_PEM_HEADERS {
                         let absolute = (
@@ -1272,7 +1275,7 @@ async fn collect_stdout_head_tail(stdout: tokio::process::ChildStdout, max_bytes
                     }
                 }
                 for (start, end, kind) in
-                    crate::credential_redaction::private_key_end_markers_bytes(&scan)
+                    astra_text_utils::credential_redaction::private_key_end_markers_bytes(&scan)
                 {
                     if pem_ends.len() < MAX_TRACKED_PEM_HEADERS {
                         let absolute = (
@@ -1347,7 +1350,8 @@ async fn collect_stdout_head_tail(stdout: tokio::process::ChildStdout, max_bytes
             // The block begins in the omitted middle, so the captured tail
             // has no trustworthy context for deciding where key material
             // ends.  Drop it rather than exposing an arbitrary body suffix.
-            let safe_head = crate::credential_redaction::redact_credentials_for_display(head).0;
+            let safe_head =
+                astra_text_utils::credential_redaction::redact_credentials_for_display(head).0;
             (format!("{safe_head}\n\n[REDACTED:PRIVATE_KEY]"), 0)
         } else {
             let tail = complete_tail_lines(&tail_text);
@@ -1356,20 +1360,25 @@ async fn collect_stdout_head_tail(stdout: tokio::process::ChildStdout, max_bytes
             // gets the explicitly conservative partial-input semantics. Do
             // not concatenate first: an orphan END in the tail must not make
             // an unrelated documentation footer in the head disappear.
-            let safe_head = crate::credential_redaction::redact_credentials_for_display(head).0;
+            let safe_head =
+                astra_text_utils::credential_redaction::redact_credentials_for_display(head).0;
             let safe_tail =
-                crate::credential_redaction::redact_credentials_for_display_partial(tail).0;
+                astra_text_utils::credential_redaction::redact_credentials_for_display_partial(
+                    tail,
+                )
+                .0;
             (format!("{safe_head}\n\n{safe_tail}"), 0)
         }
     } else {
         let mut full = String::from_utf8_lossy(&head).into_owned();
         full.push_str(&String::from_utf8_lossy(&tail));
-        crate::credential_redaction::redact_credentials_for_display(&full)
+        astra_text_utils::credential_redaction::redact_credentials_for_display(&full)
     };
     // Redact before the user-visible head/tail budget is selected.  The
     // complete-line boundary above prevents a cross-cap token from becoming
     // an unrecognisable raw suffix.
-    let mut output = crate::credential_redaction::truncate_redacted_head_tail(&safe, max_bytes);
+    let mut output =
+        astra_text_utils::credential_redaction::truncate_redacted_head_tail(&safe, max_bytes);
     if total_bytes > capture_limit {
         output.push_str(&format!(
             "\n\n... [OUTPUT CAPTURE TRUNCATED — {} bytes omitted out of {total_bytes} total] ...",
@@ -1412,9 +1421,11 @@ async fn collect_stderr_with_notice(stderr: tokio::process::ChildStderr) -> Stri
             Err(_) => break,
         }
     }
-    let (safe, _) =
-        crate::credential_redaction::redact_credentials_for_display(&String::from_utf8_lossy(&buf));
-    let mut out = crate::credential_redaction::truncate_redacted_output(safe, STDERR_CAP_BYTES);
+    let (safe, _) = astra_text_utils::credential_redaction::redact_credentials_for_display(
+        &String::from_utf8_lossy(&buf),
+    );
+    let mut out =
+        astra_text_utils::credential_redaction::truncate_redacted_output(safe, STDERR_CAP_BYTES);
     if total > STDERR_CAP_BYTES {
         let omitted = total.saturating_sub(STDERR_CAP_BYTES);
         // Ensure a blank line before the notice — stderr sometimes lacks a

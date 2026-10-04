@@ -277,8 +277,8 @@ pub fn truncate_head_tail(raw: &str, max_bytes: usize) -> String {
 /// the head/tail boundary can turn it into a fragment that no matcher can
 /// recognise later.
 pub(crate) fn redact_then_truncate_rpc_output(raw: &str, max_bytes: usize) -> String {
-    let (safe, _) = crate::credential_redaction::redact_credentials_for_display(raw);
-    crate::credential_redaction::truncate_redacted_head_tail(&safe, max_bytes)
+    let (safe, _) = astra_text_utils::credential_redaction::redact_credentials_for_display(raw);
+    astra_text_utils::credential_redaction::truncate_redacted_head_tail(&safe, max_bytes)
 }
 
 /// Per-invocation RPC server policy. Caller constructs once per script run.

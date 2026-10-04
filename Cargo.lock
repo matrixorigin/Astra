@@ -696,8 +696,11 @@ name = "astra-text-utils"
 version = "0.2.10"
 dependencies = [
  "dirs",
+ "regex",
  "serde",
  "serde_json",
+ "sha2",
+ "uuid",
 ]
 
 [[package]]
@@ -735,6 +738,7 @@ dependencies = [
  "astra-prompts",
  "astra-sandbox",
  "astra-services",
+ "astra-text-utils",
  "astra-turn-types",
  "async-trait",
  "base64",

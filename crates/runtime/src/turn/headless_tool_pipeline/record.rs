@@ -431,10 +431,10 @@ pub(crate) fn safe_tool_arguments_for_record(
     args: &Value,
 ) -> (Option<String>, Option<String>, Option<String>) {
     let mut safe_args = args.clone();
-    astra_tools::credential_redaction::redact_credentials_in_json(&mut safe_args);
+    astra_text_utils::credential_redaction::redact_credentials_in_json(&mut safe_args);
     let args_full = serde_json::to_string(&safe_args).ok();
     let args_preview = make_args_preview(tool_name, &safe_args).map(|preview| {
-        astra_tools::credential_redaction::redact_credentials_for_display(&preview).0
+        astra_text_utils::credential_redaction::redact_credentials_for_display(&preview).0
     });
     let file_path = safe_args
         .get("path")

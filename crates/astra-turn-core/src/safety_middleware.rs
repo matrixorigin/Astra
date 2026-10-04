@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 
 use astra_sandbox::{CommandRisk, analyze_command_risks};
 
-pub use astra_tools::credential_redaction::redact_credentials_for_display as redact_credentials_in_text;
+pub use astra_text_utils::credential_redaction::redact_credentials_for_display as redact_credentials_in_text;
 
 const DESTRUCTIVE_KEYWORDS: &[&str] = &["DROP", "DELETE", "TRUNCATE", "ALTER", "GRANT", "REVOKE"];
 fn is_shell_execution_tool(name: &str) -> bool {
@@ -253,7 +253,8 @@ pub fn sanitize_tool_output_for_llm(output: &str) -> ToolOutputSanitization {
         let stripped_lines = sanitize_json_value_for_llm(&mut value);
         let credential_redactions = redact_json_credentials(&mut value);
         let content = serde_json::to_string(&value).unwrap_or_else(|_| output.to_string());
-        let marker_status = astra_tools::credential_redaction::redaction_marker_status(&content);
+        let marker_status =
+            astra_text_utils::credential_redaction::redaction_marker_status(&content);
         return ToolOutputSanitization {
             content: with_tool_output_safety_note(
                 content,
@@ -268,7 +269,7 @@ pub fn sanitize_tool_output_for_llm(output: &str) -> ToolOutputSanitization {
 
     let (content, stripped_lines) = sanitize_tool_output_plaintext(output);
     let (content, credential_redactions) = redact_credentials_in_text(&content);
-    let marker_status = astra_tools::credential_redaction::redaction_marker_status(&content);
+    let marker_status = astra_text_utils::credential_redaction::redaction_marker_status(&content);
     ToolOutputSanitization {
         content: with_tool_output_safety_note(
             content,
@@ -2624,7 +2625,7 @@ mod tests {
 
     #[test]
     fn sanitize_full_pipeline_explains_preserved_executor_marker() {
-        let issued = astra_tools::credential_redaction::redact_credentials_in_text(
+        let issued = astra_text_utils::credential_redaction::redact_credentials_in_text(
             "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
         )
         .0;
@@ -2644,7 +2645,7 @@ mod tests {
 
     #[test]
     fn sanitize_full_pipeline_is_idempotent_for_already_governed_content() {
-        let issued = astra_tools::credential_redaction::redact_credentials_in_text(
+        let issued = astra_text_utils::credential_redaction::redact_credentials_in_text(
             "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
         )
         .0;
@@ -2656,7 +2657,7 @@ mod tests {
 
     #[test]
     fn sanitize_full_pipeline_collapses_stacked_generated_notes() {
-        let issued = astra_tools::credential_redaction::redact_credentials_in_text(
+        let issued = astra_text_utils::credential_redaction::redact_credentials_in_text(
             "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
         )
         .0;
@@ -2737,7 +2738,7 @@ mod tests {
         // callback boundary.  It must preserve the typed policy enum rather
         // than treating the overloaded `credentials` key as a secret field.
         assert_eq!(
-            astra_tools::credential_redaction::redact_credentials_in_json(&mut encoded),
+            astra_text_utils::credential_redaction::redact_credentials_in_json(&mut encoded),
             0
         );
         assert_eq!(encoded, original);
