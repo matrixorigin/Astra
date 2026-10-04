@@ -64,8 +64,8 @@ const MAX_EDGE_EXECUTION_LIVE_GAP_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
 struct EdgeExecutionReadAhead {
-    /// Complete non-live SSE blocks that must be replayed after the edge call
-    /// settles. Live observations are intentionally not retained here.
+    /// Complete control/data blocks, including ordered live lifecycle facts,
+    /// replayed after the Edge call settles. Replaceable live observations use gaps.
     queued: VecDeque<Vec<u8>>,
     queued_bytes: usize,
     /// A chunk may end in the middle of an SSE block. Keep that fragment until
@@ -184,6 +184,9 @@ impl EdgeExecutionReadAhead {
                     let Ok(live) = agent_live_event_from_sse(&event) else {
                         return false;
                     };
+                    if live.requires_ordered_delivery() {
+                        return false;
+                    }
                     let key = (live.run_id, live.agent_id);
                     let count = gaps.entry(key).or_default();
                     *count = count.saturating_add(1);
@@ -1777,6 +1780,10 @@ struct RecordingSseStreamHost {
     approval_session_ids: Vec<Option<String>>,
     approval_run_ids: Vec<Option<String>>,
     tool_delay: Option<std::time::Duration>,
+    tool_gate: Option<(
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio_util::sync::CancellationToken,
+    )>,
     abort_edge_work_after_approval: bool,
     edge_work_aborted: bool,
     agent_communications: Vec<astra_turn_types::AgentCommunicationEvent>,
@@ -1798,6 +1805,7 @@ impl RecordingSseStreamHost {
             approval_session_ids: Vec::new(),
             approval_run_ids: Vec::new(),
             tool_delay: None,
+            tool_gate: None,
             abort_edge_work_after_approval: false,
             edge_work_aborted: false,
             agent_communications: Vec::new(),
@@ -1880,6 +1888,10 @@ impl SseStreamHost for RecordingSseStreamHost {
         tool: &str,
         args: &Value,
     ) -> EdgeToolExecResult {
+        if let Some((started, release)) = &self.tool_gate {
+            started.notify_one();
+            release.cancelled().await;
+        }
         if let Some(delay) = self.tool_delay {
             tokio::time::sleep(delay).await;
         }
@@ -3907,7 +3919,45 @@ mod tests {
     #[tokio::test]
     async fn edge_execution_drops_recoverable_live_read_ahead_without_transport_abort() {
         let (tx, rx) = test_channel();
-        let mut stream = rx;
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = tokio_util::sync::CancellationToken::new();
+        let mut stream = rx.inspect(|chunk| {
+            if chunk
+                .as_ref()
+                .is_ok_and(|bytes| bytes == b"data: [DONE]\n\n")
+            {
+                release.cancel();
+            }
+        });
+        let ordered = [
+            serde_json::json!({"event_kind": "signal", "signal": {
+                "signal": "run_started", "parent_run_id": "root-run", "depth": 1,
+                "transcript_location": "durable_server"
+            }}),
+            serde_json::json!({"event_kind": "tool_started", "name": "bash",
+                "description": "child tool", "tool_use_id": "child-tool"}),
+            serde_json::json!({"event_kind": "tool_completed", "name": "bash",
+                "description": "child tool", "tool_use_id": "child-tool",
+                "status": "completed", "duration_ms": 1}),
+            serde_json::json!({"event_kind": "signal", "signal": {"signal": "output_settled"}}),
+            serde_json::json!({"event_kind": "agent_terminated", "termination": "completed",
+                "duration_ms": 2}),
+        ]
+        .map(|mut event| {
+            event["type"] = "agent_live_event".into();
+            event["run_id"] = "child-run".into();
+            event["agent_id"] = "child-agent".into();
+            event
+        });
+        let expected: Vec<_> = ordered
+            .iter()
+            .map(|event| agent_live_event_from_sse(event).unwrap())
+            .collect();
+        let lifecycle = ordered
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<Vec<_>>();
+        let bridge_started = started.clone();
         let bridge = tokio::spawn(async move {
             let first = format!(
                 "{}{}",
@@ -3921,15 +3971,18 @@ mod tests {
                 )
             );
             tx.send(Ok(first.into_bytes())).await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            bridge_started.notified().await;
 
             // This is deliberately larger than the historical 1 MiB
             // read-ahead limit. Live child output is reconstructible from the
             // durable child snapshot and must become a typed gap, not a
             // transport failure that cancels the parent fanout.
             let content = "x".repeat(4096);
-            let mut live_burst = String::new();
-            for _ in 0..300 {
+            let mut live_burst = lifecycle[0].clone();
+            for index in 0..300 {
+                if index == 100 || index == 200 {
+                    live_burst.push_str(&lifecycle[index / 100]);
+                }
                 live_burst.push_str(&sse_event(
                     "agent_live_event",
                     &format!(
@@ -3938,6 +3991,7 @@ mod tests {
                     ),
                 ));
             }
+            live_burst.extend(lifecycle[3..].iter().map(String::as_str));
             tx.send(Ok(live_burst.into_bytes())).await.unwrap();
             tx.send(Ok(
                 sse_event("text_delta", ",\"content\":\"done\"").into_bytes()
@@ -3947,8 +4001,8 @@ mod tests {
             tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await.unwrap();
         });
 
-        let mut host =
-            RecordingSseStreamHost::new().with_tool_delay(std::time::Duration::from_millis(200));
+        let mut host = RecordingSseStreamHost::new();
+        host.tool_gate = Some((started, release.clone()));
         let (result, abort) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             consume_sse_stream(&mut stream, &mut host, stream_idle_timeout()),
@@ -3959,11 +4013,72 @@ mod tests {
         assert_eq!(abort, None, "live observation pressure must not abort SSE");
         assert_eq!(result.accum.full_text, "done");
         assert_eq!(result.tool_results.len(), 1);
-        assert_eq!(host.agent_live_events.len(), 0);
+        assert_eq!(
+            serde_json::to_value(&host.agent_live_events).unwrap(),
+            serde_json::to_value(expected).unwrap(),
+            "ordered lifecycle facts must survive Edge read-ahead exactly once and in order"
+        );
         assert_eq!(host.agent_live_gaps.len(), 1);
         assert_eq!(host.agent_live_gaps[0].run_id, "child-run");
         assert_eq!(host.agent_live_gaps[0].agent_id, "child-agent");
         assert_eq!(host.agent_live_gaps[0].dropped_event_count, 300);
+        bridge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordered_live_read_ahead_overflow_cancels_running_edge_tool() {
+        let (tx, mut stream) = test_channel();
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut host = RecordingSseStreamHost::new();
+        host.tool_gate = Some((started.clone(), cancel.clone()));
+        let bridge = tokio::spawn(async move {
+            tx.send(Ok(sse_event(
+                "tool_request",
+                ",\"request_id\":\"tool-1\",\"tool\":\"bash\",\"args\":{}",
+            )
+            .into_bytes()))
+                .await
+                .unwrap();
+            started.notified().await;
+            let output = "x".repeat(4096);
+            let control = sse_event(
+                "agent_live_event",
+                &format!(
+                    ",\"run_id\":\"child-run\",\"agent_id\":\"child-agent\",\
+                \"event_kind\":\"tool_completed\",\"name\":\"bash\",\
+                \"description\":\"child tool\",\"tool_use_id\":\"child-tool\",\
+                \"status\":\"completed\",\"duration_ms\":1,\"output\":{output:?}"
+                ),
+            );
+            tx.send(Ok(control.repeat(300).into_bytes())).await.unwrap();
+        });
+        let (result, abort) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            consume_sse_stream_cancellable(
+                &mut stream,
+                &mut host,
+                stream_idle_timeout(),
+                Some(&cancel),
+                None,
+            ),
+        )
+        .await
+        .expect("ordered control overflow must cancel and settle Edge work");
+        assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
+        assert!(cancel.is_cancelled());
+        assert!(
+            result
+                .accum
+                .error_message
+                .unwrap()
+                .contains("read-ahead exceeded")
+        );
+        assert!(host.agent_live_events.is_empty());
+        assert!(
+            host.agent_live_gaps.is_empty(),
+            "control overflow must not become a gap"
+        );
         bridge.await.unwrap();
     }
 
@@ -4130,6 +4245,23 @@ mod tests {
         assert!(read_ahead.live_gaps.is_empty());
         assert_eq!(read_ahead.live_gap_bytes, 0);
         assert_eq!(read_ahead.queued.len(), 1);
+    }
+
+    #[test]
+    fn mixed_live_control_block_replays_without_partial_gap_accounting() {
+        let block = concat!(
+            "data: {\"type\":\"agent_live_event\",\"run_id\":\"r\",",
+            "\"agent_id\":\"a\",\"event_kind\":\"output_delta\",\"content\":\"x\"}\n",
+            "data: {\"type\":\"agent_live_event\",\"run_id\":\"r\",",
+            "\"agent_id\":\"a\",\"event_kind\":\"signal\",",
+            "\"signal\":{\"signal\":\"output_settled\"}}\n\n"
+        );
+        let mut read_ahead = EdgeExecutionReadAhead::default();
+        read_ahead.push_bytes(block.as_bytes(), true).unwrap();
+        assert!(read_ahead.live_gaps.is_empty());
+        assert_eq!(read_ahead.live_gap_bytes, 0);
+        assert_eq!(read_ahead.pop_front().unwrap(), block.as_bytes());
+        assert!(read_ahead.pop_front().is_none());
     }
 
     /// Adjacent concurrency-safe tool requests may arrive as separate SSE
