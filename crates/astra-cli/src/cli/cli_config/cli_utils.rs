@@ -267,10 +267,14 @@ pub(crate) fn bound_profile_access_token(profile: &Profile) -> Option<&str> {
         .filter(|token| !token.trim().is_empty())
 }
 
+/// Account bound to the CLI identity installed at admission.
+/// Ingestion metadata and the local journal owner are not account identities.
+pub(crate) fn cli_account_id() -> Option<String> {
+    current_cli_profile_identity().and_then(|identity| identity.account_id)
+}
+
 pub(crate) fn cli_user_id() -> String {
-    current_cli_profile_identity()
-        .and_then(|identity| identity.account_id)
-        .unwrap_or_else(astra_services::local_owner_user_id)
+    cli_account_id().unwrap_or_else(astra_services::local_owner_user_id)
 }
 
 /// The two local journal owners attached to the current CLI identity. The

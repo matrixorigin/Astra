@@ -805,6 +805,11 @@ async fn execute_repl_bridge_command_impl(
         handle_messaging_command(arg, &state);
         return Ok(ExitCode::Success);
     }
+    // Local journal diagnostics do not consume tools or remote skill catalogs.
+    if slash_cmd == "/debug" {
+        handle_debug_command(arg, &state);
+        return Ok(ExitCode::Success);
+    }
     maybe_load_project_instructions(&mut state);
 
     let pipeline_modules = create_pipeline_modules(api, profile);
@@ -841,7 +846,6 @@ async fn execute_repl_bridge_command_impl(
         "/allow" => {
             handle_permission_command(arg, &mut state);
         }
-        "/debug" => handle_debug_command(arg, &state),
         "/bug" => handle_bug_command(arg, &state),
         "/agent" => {
             let ctx = slash_agent::AgentCommandContext {

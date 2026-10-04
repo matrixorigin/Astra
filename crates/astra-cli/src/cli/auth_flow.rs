@@ -842,10 +842,11 @@ async fn retire_auth_runtime(state: &mut SessionState) {
     state.unregister_root_mailbox().await;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 struct PreparedAuthTransition {
     owner_changed: bool,
     runtime_needs_initialization: bool,
+    runtime_config: Option<(astra_config::RuntimeConfig, String)>,
 }
 
 async fn prepare_session_auth_transition(
@@ -860,26 +861,49 @@ async fn prepare_session_auth_transition(
     let runtime_needs_initialization =
         state.agent_spawner.is_none() || state.delegation_engine.is_none();
 
-    if owner_changed {
+    let runtime_config = if owner_changed {
+        let prepared = crate::cli::session::session_startup::prepare_session_runtime_config(
+            state,
+            None,
+            Some(account_id),
+        )?;
         // The old session must reach its durable boundary while the old owner
         // scope and credentials are still installed. Only then may local
         // ownerless APIs be rebound to the authenticated account.
         retire_auth_runtime(state).await;
         crate::cli::session::session_cleanup::finalize_session(state).await?;
-        // A model preference may cross accounts; Offering identity and pricing may not.
-        state.model = state.model.as_deref().map(|name| name.to_string().into());
-        state.reset_for_new_session();
-        state.clear_session_id();
-    } else if runtime_needs_initialization {
-        // A same-owner login after `/logout`, or a partially initialized
-        // runtime, is not a session boundary. Retire any incomplete half and
-        // rebuild it after the new credentials have been saved.
-        retire_auth_runtime(state).await;
-    }
+        Some(prepared)
+    } else {
+        if runtime_needs_initialization {
+            // A same-owner login after `/logout`, or a partially initialized
+            // runtime, is not a session boundary. Retire any incomplete half and
+            // rebuild it after the new credentials have been saved.
+            retire_auth_runtime(state).await;
+        }
+        None
+    };
     Ok(PreparedAuthTransition {
         owner_changed,
         runtime_needs_initialization: owner_changed || runtime_needs_initialization,
+        runtime_config,
     })
+}
+
+fn commit_session_auth_transition(
+    prepared: PreparedAuthTransition,
+    account_id: &str,
+    state: &mut SessionState,
+) -> bool {
+    if let Some((config, version)) = prepared.runtime_config {
+        // Publish the new local conversation only after credentials changed.
+        // Model preference may cross accounts; Offering and pricing may not.
+        state.model = state.model.as_deref().map(|name| name.to_string().into());
+        state.reset_for_new_session();
+        state.clear_session_id();
+        state.ingestion_user_id = Some(account_id.to_owned());
+        crate::cli::session::session_startup::apply_session_runtime_config(state, config, version);
+    }
+    prepared.runtime_needs_initialization
 }
 
 async fn initialize_authenticated_runtime(
@@ -895,6 +919,8 @@ async fn initialize_authenticated_runtime(
 /// End the old owner's runtime before browser login can publish new credentials.
 /// Cancellation retains credentials, but starts a fresh local conversation.
 pub(crate) async fn begin_browser_session_login(state: &mut SessionState) -> Result<(), String> {
+    let (config, version) =
+        crate::cli::session::session_startup::prepare_session_runtime_config(state, None, None)?;
     retire_auth_runtime(state).await;
     if state.session_id.is_some() {
         crate::cli::session::session_cleanup::finalize_session(state).await?;
@@ -903,6 +929,7 @@ pub(crate) async fn begin_browser_session_login(state: &mut SessionState) -> Res
     state.reset_for_new_session();
     state.clear_session_id();
     state.model = None;
+    crate::cli::session::session_startup::apply_session_runtime_config(state, config, version);
     Ok(())
 }
 
@@ -927,6 +954,14 @@ pub(crate) async fn finish_browser_session_login(
     let token = crate::cli::session::session_runtime::fresh_access_token(&api, profile)
         .await
         .ok_or("Login completed but no usable session credential is available")?;
+    let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
+    let (config, version) = crate::cli::session::session_startup::prepare_session_runtime_config(
+        state,
+        None,
+        Some(&user_id),
+    )?;
+    state.ingestion_user_id = Some(user_id);
+    crate::cli::session::session_startup::apply_session_runtime_config(state, config, version);
     // A workbench started while signed out skipped startup registration. Publish
     // its stable checkout binding under the new identity before admitting chat.
     crate::cli::edge_lifecycle::register_edge_once(&api, &token)
@@ -975,7 +1010,7 @@ pub(crate) async fn do_login_for_session(
     );
     save_profile_auth_tokens(profile, username, &tokens)?;
     let access_token = tokens.access_token.clone();
-    if transition.runtime_needs_initialization {
+    if commit_session_auth_transition(transition, &tokens.user_id, state) {
         initialize_authenticated_runtime(api, profile, access_token.clone(), state).await;
     }
     Ok(access_token)
@@ -998,7 +1033,7 @@ pub(crate) async fn do_register_for_session(
     );
     save_profile_auth_tokens(profile, username, &tokens)?;
     let access_token = tokens.access_token;
-    if transition.runtime_needs_initialization {
+    if commit_session_auth_transition(transition, &tokens.user_id, state) {
         initialize_authenticated_runtime(api, profile, access_token.clone(), state).await;
     }
     Ok(access_token)
@@ -1074,10 +1109,16 @@ mod tests {
             let api = astra_thin_client::ThinClient::new(&server.uri(), None)
                 .unwrap()
                 .with_bearer_provider(Arc::new(GenerationBearer(generation)));
+            state.runtime_config.memory.retrieval_top_k = 42;
             super::begin_browser_session_login(&mut state)
                 .await
                 .unwrap();
             assert!(state.session_memory_port.is_none());
+            assert_eq!(
+                state.runtime_config.memory.retrieval_top_k,
+                astra_config::RuntimeConfig::load().memory.retrieval_top_k
+            );
+            assert!(state.config_version_id.is_some());
             let _modules = super::rebuild_browser_identity_services(&api, None, &mut state).await;
             let memory = state.session_memory_port.as_ref().unwrap();
             Mock::given(method("POST"))
@@ -1743,6 +1784,8 @@ mod tests {
     #[tokio::test]
     async fn login_account_change_closes_old_owner_session_before_rebinding() {
         let _creds_guard = crate::tests::isolate_credentials();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
         let (_sessions_dir, _journal_guard) = crate::tests::isolated_sessions_dir();
         let _identity_guard =
             crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
@@ -1764,6 +1807,26 @@ mod tests {
         state.set_session_id(session_id);
         state.journal = Some(writer);
         state.turn = 1;
+        state.ingestion_user_id = Some("account-a".into());
+        let hub = std::sync::Arc::new(
+            astra_runtime::observability::ObservabilityHub::with_storage(
+                astra_runtime_env::local_state_root().join("observability"),
+            ),
+        );
+        for (account, max_prompt_tokens) in [
+            ("anonymous", 11111),
+            ("account-a", 11111),
+            ("account-b", 22222),
+        ] {
+            let mut profile = hub.profiles().get_profile(account);
+            profile.preferences.config_overrides.insert(
+                "token_budget.max_prompt_tokens".into(),
+                json!(max_prompt_tokens),
+            );
+            hub.profiles().update_profile(profile);
+        }
+        state.observability_hub = Some(hub);
+        state.runtime_config.token_budget.max_prompt_tokens = 11111;
         state.model = Some(
             crate::cli::session::session_state::SessionModelChoice::Selected(
                 crate::cli::session::session_runtime::ServerModelSelection {
@@ -1793,6 +1856,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(token, "access-b");
+        assert_eq!(state.ingestion_user_id.as_deref(), Some("account-b"));
+        assert_eq!(state.runtime_config.token_budget.max_prompt_tokens, 22222);
         assert_eq!(state.model.as_deref(), Some("model-a(thinking:high)"));
         assert!(state.model.as_ref().unwrap().offering_id().is_none());
         assert!(state.model.as_ref().unwrap().pricing().is_none());
@@ -1810,6 +1875,117 @@ mod tests {
         );
         assert!(state.delegation_engine.is_some());
         assert!(state.agent_spawner.is_some());
+
+        // Preserve actual credentials and disk profiles, but discard process/session state.
+        let fresh_id = format!("cold-profile-{}", uuid::Uuid::new_v4());
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"session_id":fresh_id})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        crate::cli::slash::slash_state::start_fresh_session(&api, None, &token, &mut state)
+            .await
+            .unwrap();
+        let expected = serde_json::to_value(&state.runtime_config).unwrap();
+        let expected_version = state.config_version_id.clone();
+        assert_eq!(state.runtime_config.token_budget.max_prompt_tokens, 22222);
+        assert!(
+            astra_services::session_workspace::read_workspace(&fresh_id)
+                .unwrap()
+                .tuned_config_json
+                .is_none()
+        );
+        let active = astra_turn_core::active_conversation::ActiveConversation::empty(
+            &crate::cli::cli_config::cli_utils::cli_user_id(),
+            &fresh_id,
+        )
+        .unwrap();
+        let commit = active
+            .prepare_commit(
+                1,
+                state.config_version_id.clone(),
+                vec![
+                    json!({"role":"user","content":"question"}),
+                    json!({"role":"assistant","content":"answer"}),
+                ],
+            )
+            .unwrap();
+        state
+            .journal
+            .as_ref()
+            .unwrap()
+            .append(
+                &astra_services::session_journal::JournalEvent::turn(
+                    Some(&fresh_id),
+                    1,
+                    state.model.as_deref(),
+                    "question",
+                    "answer",
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .with_conversation_commit(commit.commit),
+            )
+            .unwrap();
+        state.prepare_for_session_rebind().await;
+        drop(state);
+        crate::cli::cli_config::cli_utils::install_cli_profile_identity("default", None).unwrap();
+        crate::cli::cli_config::cli_utils::configure_cli_profile_identity(
+            None,
+            crate::cli::cli_config::cli_utils::CliProfileIdentityAdmission::RequireBoundAccount,
+        )
+        .unwrap();
+        let mut restarted = crate::cli::session::session_runtime::initialize_session_state(
+            None,
+            None,
+            &crate::cli::cli_config::cli_context::CliContext::default(),
+        );
+        assert_eq!(
+            serde_json::to_value(&restarted.runtime_config).unwrap(),
+            expected
+        );
+        assert_eq!(restarted.ingestion_user_id.as_deref(), Some("account-b"));
+        {
+            let obs = restarted
+                .observability_session
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap();
+            assert_eq!(obs.user_id, "account-b");
+            assert_eq!(obs.profile.user_id, "account-b");
+            assert_eq!(serde_json::to_value(&obs.config).unwrap(), expected);
+        }
+        // Missing ingestion metadata must not change the installed account authority.
+        restarted.ingestion_user_id = None;
+        crate::cli::slash::slash_session::restore_session_into_state(
+            &fresh_id,
+            None,
+            &api,
+            &mut restarted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&restarted.runtime_config).unwrap(),
+            expected
+        );
+        assert_eq!(restarted.config_version_id, expected_version);
+        {
+            let obs = restarted
+                .observability_session
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap();
+            assert_eq!(obs.user_id, "account-b");
+            assert_eq!(obs.profile.user_id, "account-b");
+            assert_eq!(serde_json::to_value(&obs.config).unwrap(), expected);
+        }
+        server.verify().await;
     }
 
     #[serial_test::serial]
@@ -1825,6 +2001,9 @@ mod tests {
         let owner = astra_services::local_owner_scope();
         let mut state = crate::cli::session::session_state::SessionState::default();
         state.set_session_id("same-owner-session");
+        state.runtime_config.memory.retrieval_top_k = 42;
+        state.config_version_id = Some("same-owner-config".into());
+        let saved = serde_json::to_value(&state.runtime_config).unwrap();
         assert!(state.agent_spawner.is_none());
         assert!(state.delegation_engine.is_none());
 
@@ -1846,6 +2025,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(token, "access-new");
+        assert_eq!(serde_json::to_value(&state.runtime_config).unwrap(), saved);
+        assert_eq!(
+            state.config_version_id.as_deref(),
+            Some("same-owner-config")
+        );
         assert_eq!(astra_services::local_owner_scope(), owner);
         assert_eq!(state.session_id.as_deref(), Some("same-owner-session"));
         assert!(state.delegation_engine.is_some());

@@ -32,31 +32,79 @@ pub(crate) struct SessionStartupArtifacts {
 
 // Note: `selector` field was removed — tool surface is now handled by the LLM directly.
 
-pub(crate) struct GoalSteeringChange {
-    pub previous_goal: Option<String>,
-    pub turn: u32,
+/// Select a complete snapshot, or the current process/profile configuration
+/// for a fresh conversation. Preparation must finish before a session rebind.
+pub(crate) fn prepare_session_runtime_config(
+    state: &SessionState,
+    saved: Option<astra_config::RuntimeConfig>,
+    profile_user_id: Option<&str>,
+) -> Result<(astra_config::RuntimeConfig, String), String> {
+    let mut config = saved.unwrap_or_else(|| {
+        let mut config = astra_config::RuntimeConfig::load();
+        if let Some(hub) = &state.observability_hub {
+            let user_id = profile_user_id
+                .map(str::to_owned)
+                .or_else(crate::cli::cli_config::cli_utils::cli_account_id)
+                .unwrap_or_else(|| "anonymous".to_string());
+            let profile = hub.profiles().get_profile(&user_id);
+            profile.preferences.apply_to_config(&mut config);
+        }
+        config
+    });
+    if let Some(format) = state.explain_report_format_override {
+        config.explain.report_format = Some(format);
+    }
+    astra_config::validate_governed_config_candidate(&config)
+        .map_err(|error| format!("runtime configuration is invalid: {}", error.to_json()))?;
+    let toml = toml::to_string_pretty(&config)
+        .map_err(|error| format!("serialize runtime configuration: {error}"))?;
+    let version = astra_config::config_versions::VersionId::from_toml_bytes(toml.as_bytes())
+        .as_str()
+        .to_string();
+    Ok((config, version))
 }
 
-pub(crate) fn steer_observability_goal(
-    _state: &mut SessionState,
-    _goal: &str,
-) -> Option<GoalSteeringChange> {
-    None
+/// Commit the selected configuration and its derived execution/observability data.
+pub(crate) fn apply_session_runtime_config(
+    state: &mut SessionState,
+    config: astra_config::RuntimeConfig,
+    version: String,
+) {
+    let context_window = match &state.model {
+        Some(super::session_state::SessionModelChoice::Selected(selection)) => {
+            selection.context_window
+        }
+        _ => None,
+    };
+    let model = state
+        .model
+        .as_deref()
+        .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).0);
+    state.context_budget =
+        astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
+            &config,
+            model,
+            context_window,
+        );
+    state.runtime_config = config;
+    state.config_version_id = Some(version);
+    state.observability_config_pending = true;
+    sync_pending_observability_config(state);
 }
 
-/// Install the configuration validated at the workspace restore boundary.
-pub(crate) fn apply_pending_runtime_config(state: &mut SessionState) {
+/// Synchronize the observability projection from the execution authority.
+pub(crate) fn sync_pending_observability_config(state: &mut SessionState) {
+    if !state.observability_config_pending {
+        return;
+    }
     let Some(obs) = &state.observability_session else {
         return;
     };
     let Ok(mut guard) = obs.write() else {
         return;
     };
-    let Some(saved) = state.pending_runtime_config.take() else {
-        return;
-    };
-    let current = std::mem::take(&mut guard.config);
-    guard.config = current.merge(saved);
+    guard.config = state.runtime_config.clone();
+    state.observability_config_pending = false;
 }
 
 pub(crate) fn initialize_journal_pub(state: &mut SessionState, session_id: &str) {
@@ -133,9 +181,7 @@ fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
         super::session_side_effects::enqueue_ingestion_pub(state, &start_event);
 
         use astra_config::config_versions::ConfigVersionStore;
-        if state.config_version_id.is_none()
-            && let Some(store) = astra_config::config_versions::LocalFileStore::at_default_root()
-        {
+        if let Some(store) = astra_config::config_versions::LocalFileStore::at_default_root() {
             let meta = astra_config::config_versions::PutMetadata {
                 source_session: Some(session_id.to_string()),
                 parent: None,
@@ -246,9 +292,7 @@ fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
 
     if state.observability_session.is_none() {
         state.observability_session = Some(if let Some(hub) = &state.observability_hub {
-            let user_id = state
-                .ingestion_user_id
-                .clone()
+            let user_id = crate::cli::cli_config::cli_utils::cli_account_id()
                 .unwrap_or_else(|| "anonymous".to_string());
             hub.start_session(&user_id, session_id)
         } else {
@@ -256,8 +300,11 @@ fn initialize_session_artifacts(state: &mut SessionState, session_id: &str) {
                 astra_runtime::observability::ObservabilitySession::new_simple(session_id),
             ))
         });
-        apply_pending_runtime_config(state);
+        // Rebound sessions must project the active configuration again, even
+        // when the previous observability instance already consumed the marker.
+        state.observability_config_pending = true;
     }
+    sync_pending_observability_config(state);
 }
 
 async fn prune_stale_pending_recovery(
@@ -772,8 +819,8 @@ pub(crate) async fn complete_session_startup(
 #[cfg(test)]
 mod tests {
     use super::{
-        CliSessionMemoryMemoriaPort, apply_pending_runtime_config, build_cli_session_memory_port,
-        initialize_journal, prune_stale_pending_recovery,
+        CliSessionMemoryMemoriaPort, build_cli_session_memory_port, initialize_journal,
+        prune_stale_pending_recovery, sync_pending_observability_config,
     };
     use crate::cli::session::session_state::SessionState;
     use astra_runtime::turn::cloud::memoria_compact::MemoriaPort;
@@ -1140,55 +1187,61 @@ mod tests {
 
     #[test]
     fn restored_configuration_waits_for_observability_then_applies_once() {
-        let mut config = astra_config::RuntimeConfig::default();
-        config.memory.retrieval_top_k = 7;
-        let mut state = SessionState {
-            pending_runtime_config: Some(config),
-            ..Default::default()
-        };
-        apply_pending_runtime_config(&mut state);
-        assert!(state.pending_runtime_config.is_some());
-        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability::ObservabilitySession::new_simple("config-restore"),
-        )));
-        apply_pending_runtime_config(&mut state);
-        assert!(state.pending_runtime_config.is_none());
-        assert_eq!(
-            state
-                .observability_session
-                .as_ref()
-                .unwrap()
-                .read()
-                .unwrap()
-                .config
-                .memory
-                .retrieval_top_k,
-            7
-        );
-        apply_pending_runtime_config(&mut state);
-        assert_eq!(
-            state
-                .observability_session
-                .as_ref()
-                .unwrap()
-                .read()
-                .unwrap()
-                .config
-                .memory
-                .retrieval_top_k,
-            7
-        );
+        let defaults = astra_config::RuntimeConfig::default();
+        for saved_top_k in [defaults.memory.retrieval_top_k, 7] {
+            let mut saved = defaults.clone();
+            saved.memory.retrieval_top_k = saved_top_k;
+            let expected = serde_json::to_value(&saved).unwrap();
+            let mut state = SessionState {
+                runtime_config: saved,
+                observability_config_pending: true,
+                ..Default::default()
+            };
+            sync_pending_observability_config(&mut state);
+            assert!(state.observability_config_pending);
+            let mut obs =
+                astra_runtime::observability::ObservabilitySession::new_simple("config-restore");
+            obs.config.memory.retrieval_top_k = 9;
+            obs.config.token_budget.tools_reserve += 1;
+            state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
+            sync_pending_observability_config(&mut state);
+            assert!(!state.observability_config_pending);
+            let obs = state.observability_session.as_ref().unwrap().clone();
+            assert_eq!(
+                serde_json::to_value(&obs.read().unwrap().config).unwrap(),
+                expected
+            );
+            obs.write().unwrap().config.memory.retrieval_top_k = 9;
+            sync_pending_observability_config(&mut state);
+            assert_eq!(obs.read().unwrap().config.memory.retrieval_top_k, 9);
+        }
     }
 
     #[test]
-    fn apply_pending_runtime_config_requeues_when_lock_is_poisoned() {
+    fn sync_pending_observability_config_requeues_when_lock_is_poisoned() {
         let mut state = SessionState::default();
-        state.pending_runtime_config = Some(astra_config::RuntimeConfig::default());
+        state.observability_config_pending = true;
         state.observability_session = Some(poisoned_observability_session("sid-adaptive"));
 
-        apply_pending_runtime_config(&mut state);
+        sync_pending_observability_config(&mut state);
 
-        assert!(state.pending_runtime_config.is_some());
+        assert!(state.observability_config_pending);
+        state.runtime_config.memory.retrieval_top_k = 11;
+        state.observability_session.as_ref().unwrap().clear_poison();
+        sync_pending_observability_config(&mut state);
+        assert!(!state.observability_config_pending);
+        assert_eq!(
+            state
+                .observability_session
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap()
+                .config
+                .memory
+                .retrieval_top_k,
+            11
+        );
     }
 
     #[test]

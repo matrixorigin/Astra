@@ -1017,65 +1017,102 @@ struct LinkedDigestJournals {
     conflicting_round_count: usize,
 }
 
+pub(crate) struct AttachedJournalSource {
+    pub owner: astra_services::OwnerScope,
+    pub path: std::path::PathBuf,
+    pub events: Vec<session_journal::JournalEvent>,
+    non_empty: usize,
+    malformed: usize,
+    available: bool,
+}
+
+pub(crate) fn read_attached_journal_sources(
+    session_id: &str,
+) -> Result<Vec<AttachedJournalSource>, String> {
+    let (local, account) = crate::cli::cli_config::cli_utils::attached_journal_owners()?;
+    read_attached_journal_sources_with_owners(session_id, &local, account.as_ref())
+}
+
+fn read_attached_journal_sources_with_owners(
+    session_id: &str,
+    local: &astra_services::OwnerScope,
+    account: Option<&astra_services::OwnerScope>,
+) -> Result<Vec<AttachedJournalSource>, String> {
+    let mut sources = Vec::new();
+    for owner in std::iter::once(local).chain(account) {
+        let path = session_journal::journal_file_path_for_user(owner.id(), session_id)
+            .map_err(|error| error.to_string())?;
+        let (events, non_empty, malformed, available) =
+            match session_journal::read_journal_source_for_owner(owner, session_id) {
+                Ok((events, lines, malformed)) => (events, lines, malformed, true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (Vec::new(), 0, 0, false)
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+        validate_session_events(&events, session_id)?;
+        if events
+            .iter()
+            .filter_map(|event| event.conversation_commit.as_ref())
+            .any(|commit| {
+                commit.cursor.owner_id != local.id()
+                    && account.is_none_or(|account| commit.cursor.owner_id != account.id())
+            })
+        {
+            return Err("session cursor owner is not attached to the current CLI identity".into());
+        }
+        sources.push(AttachedJournalSource {
+            owner: owner.clone(),
+            path,
+            events,
+            non_empty,
+            malformed,
+            available,
+        });
+    }
+    Ok(sources)
+}
+
 fn read_linked_digest_journals(
     session_id: &str,
     local_owner: &astra_services::OwnerScope,
     account_owner: Option<&astra_services::OwnerScope>,
 ) -> Result<LinkedDigestJournals, String> {
-    let primary_path = session_journal::journal_file_path_for_user(local_owner.id(), session_id)
-        .map_err(|error| error.to_string())?;
-    let (mut events, mut non_empty, mut malformed) =
-        session_journal::read_journal_for_digest_for_user(local_owner.id(), session_id)
-            .map_err(|e| e.to_string())?;
-    validate_session_events(&events, session_id)?;
-    let cursor_owner = events.iter().rev().find_map(|event| {
-        event
-            .conversation_commit
-            .as_ref()
-            .map(|commit| commit.cursor.owner_id.trim())
-            .filter(|owner| !owner.is_empty())
-            .map(ToString::to_string)
-    });
-    if cursor_owner.as_deref().is_some_and(|owner| {
-        owner != local_owner.id() && account_owner.is_none_or(|account| owner != account.id())
-    }) {
-        return Err("session cursor owner is not attached to the current CLI identity".into());
+    let mut sources =
+        read_attached_journal_sources_with_owners(session_id, local_owner, account_owner)?
+            .into_iter();
+    let primary = sources.next().expect("the local source is always present");
+    if !primary.available {
+        return Err(format!(
+            "session journal not found: {}",
+            primary.path.display()
+        ));
     }
-    let primary_path_text = primary_path.to_string_lossy().into_owned();
-    let (owner_events, owner_non_empty, owner_malformed, supplemental_paths) =
-        if let Some(account_owner) = account_owner {
-            let owner_path =
-                session_journal::journal_file_path_for_user(account_owner.id(), session_id)
-                    .map_err(|error| error.to_string())?;
-            if owner_path.exists() {
-                let (owner_events, lines, malformed) =
-                    session_journal::read_journal_for_digest_for_user(
-                        account_owner.id(),
-                        session_id,
-                    )
-                    .map_err(|error| error.to_string())?;
-                validate_session_events(&owner_events, session_id)?;
-                (
-                    owner_events,
-                    lines,
-                    malformed,
-                    vec![owner_path.to_string_lossy().into_owned()],
-                )
-            } else {
-                (Vec::new(), 0, 0, Vec::new())
-            }
-        } else {
-            (Vec::new(), 0, 0, Vec::new())
-        };
-    let conflicting_round_count =
-        merge_attached_events(&mut events, owner_events, contributes_runtime_digest_detail);
-    non_empty = non_empty.saturating_add(owner_non_empty);
-    malformed = malformed.saturating_add(owner_malformed);
+    let mut events = primary.events;
+    session_journal::stabilize_event_order(&mut events);
+    let mut non_empty = primary.non_empty;
+    let mut malformed = primary.malformed;
+    let mut supplemental_paths = Vec::new();
+    let mut supplemental_events = Vec::new();
+    for mut source in sources {
+        session_journal::stabilize_event_order(&mut source.events);
+        non_empty = non_empty.saturating_add(source.non_empty);
+        malformed = malformed.saturating_add(source.malformed);
+        if source.available {
+            supplemental_paths.push(source.path.to_string_lossy().into_owned());
+        }
+        supplemental_events.extend(source.events);
+    }
+    let conflicting_round_count = merge_attached_events(
+        &mut events,
+        supplemental_events,
+        contributes_runtime_digest_detail,
+    );
     Ok(LinkedDigestJournals {
         events,
         non_empty,
         malformed,
-        primary_path: primary_path_text,
+        primary_path: primary.path.to_string_lossy().into_owned(),
         supplemental_paths,
         conflicting_round_count,
     })
@@ -2370,6 +2407,26 @@ mod tests {
                 .unwrap();
         assert_eq!(digest.conflicting_round_count, 0);
         assert_eq!(digest.turns[0].llm_round_details.len(), 1);
+        let primary_path = journal_path_for_test(sid);
+        let root = fs::read_to_string(&primary_path).unwrap();
+        fs::write(
+            &primary_path,
+            format!("{root}{}\n{}\n", round(sid, 10), round(sid, 10)),
+        )
+        .unwrap();
+        let local_only =
+            build_digest_with_owners(sid, DigestFocus::All, &local_owner, None).unwrap();
+        assert_eq!(local_only.conflicting_round_count, 0);
+        assert_eq!(local_only.turns[0].llm_round_details.len(), 1);
+        fs::write(
+            &primary_path,
+            format!("{root}{}\n{}\n", round(sid, 10), round(sid, 11)),
+        )
+        .unwrap();
+        let local_conflict =
+            build_digest_with_owners(sid, DigestFocus::All, &local_owner, None).unwrap();
+        assert_eq!(local_conflict.conflicting_round_count, 1);
+        assert!(local_conflict.turns[0].llm_round_details.is_empty());
     }
 
     #[test]

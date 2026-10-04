@@ -259,7 +259,7 @@ struct TurnSuccessLiveSnapshot {
     observability_session: Option<
         std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     >,
-    pending_runtime_config: Option<astra_config::RuntimeConfig>,
+    observability_config_pending: bool,
     last_turn_interrupted: bool,
     session_persistence_error: Option<String>,
 }
@@ -296,7 +296,7 @@ impl TurnSuccessLiveSnapshot {
             workspace_observation_quarantine: state.workspace_observation_quarantine.clone(),
             last_turn_event: state.last_turn_event.clone(),
             observability_session: state.observability_session.clone(),
-            pending_runtime_config: state.pending_runtime_config.clone(),
+            observability_config_pending: state.observability_config_pending,
             last_turn_interrupted: state.last_turn_interrupted,
             session_persistence_error: state.session_persistence_error.clone(),
         }
@@ -351,7 +351,7 @@ impl TurnSuccessLiveSnapshot {
         state.workspace_observation_quarantine = quarantine_after_rollback;
         state.last_turn_event = self.last_turn_event;
         state.observability_session = self.observability_session;
-        state.pending_runtime_config = self.pending_runtime_config;
+        state.observability_config_pending = self.observability_config_pending;
         state.last_turn_interrupted = self.last_turn_interrupted;
         state.session_persistence_error = self.session_persistence_error;
     }
@@ -1034,7 +1034,7 @@ mod tests {
             observability_hub: Some(std::sync::Arc::new(
                 astra_runtime::observability::ObservabilityHub::new(),
             )),
-            pending_runtime_config: Some(astra_config::RuntimeConfig::default()),
+            observability_config_pending: true,
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("new response");
@@ -1060,7 +1060,7 @@ mod tests {
         assert!(state.csl_manager.is_none());
         assert!(state.observability_session.is_none());
         assert!(state.last_turn_interrupted);
-        assert!(state.pending_runtime_config.is_some());
+        assert!(state.observability_config_pending);
         assert!(
             !crate::cli::session::session_recovery::io::csl_log_path_for(&sid).exists(),
             "post-commit CSL persistence must be skipped when the primary turn commit fails"
@@ -1226,7 +1226,7 @@ mod tests {
             ingestion_user_id: Some("user-1".into()),
             observability_hub: Some(hub.clone()),
             observability_session: Some(pending),
-            pending_runtime_config: Some(astra_config::RuntimeConfig::default()),
+            observability_config_pending: true,
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("done");
@@ -1253,6 +1253,6 @@ mod tests {
         );
         assert!(hub.get_session("pending").is_none());
         assert!(hub.get_session("sess-live").is_some());
-        assert!(state.pending_runtime_config.is_none());
+        assert!(!state.observability_config_pending);
     }
 }

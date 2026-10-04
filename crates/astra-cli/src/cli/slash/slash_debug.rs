@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 /// Interactive debug inspector for session turns.
 ///
 /// Data sources (in priority order):
-/// 1. Heavy checkpoints: `~/.astra/sessions/<id>/step_checkpoints/*-heavy.json`
+/// Each source is scoped to the attached CLI profile or account owner.
+/// 1. Heavy checkpoints: owner-scoped `step_checkpoints/*-heavy.json`
 ///    → full messages array (the actual LLM input/output)
-/// 2. Journal JSONL: `~/.astra/sessions/<id>.jsonl`
+/// 2. Journal JSONL: the same owner's `<id>.jsonl`
 ///    → turn summaries, tool calls, timing, token counts
 ///
 /// **Per-turn view:** journal turn *T* is paired with the *T*-th heavy checkpoint file (sorted by
@@ -32,34 +33,68 @@ pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
             }
         }
     } else {
-        resolve_session_id(arg.trim())
+        match resolve_session_id(arg.trim()) {
+            Ok(id) => id,
+            Err(error) => {
+                eprintln!("  {} {}", theme::icon_err(), error);
+                return;
+            }
+        }
     };
 
-    // Server-owned runs persist their full journal/checkpoints under the
-    // authenticated user, while the legacy CLI mirror uses the process-local
-    // profile owner. Diagnostics must follow the same authenticated owner as
-    // event ingestion or they can report "No data" for a live, observable
-    // session. Never scan unrelated owner partitions.
-    let owner = state
-        .ingestion_user_id
-        .as_deref()
-        .and_then(|user_id| astra_services::OwnerScope::user(user_id).ok())
-        .unwrap_or_else(astra_services::OwnerScope::local_user);
-    let base = session_dir_for_owner(&owner, &session_id);
-    let journal_path = session_journal_path_for_owner(&owner, &session_id);
-
-    // Load data sources.
-    let turns = load_journal_turns(&journal_path);
-    let checkpoints = list_heavy_checkpoints(&base);
-
-    if turns.is_empty() && checkpoints.is_empty() {
+    let sources = match crate::cli::journal_digest::read_attached_journal_sources(&session_id) {
+        Ok(sources) => sources,
+        Err(error) => {
+            eprintln!("  {} {}", theme::icon_err(), error);
+            return;
+        }
+    };
+    let store = astra_services::local_session_artifact_store();
+    let mut found = false;
+    for source in sources {
+        let base = match astra_services::SessionArtifactStore::session_dir_for_owner(
+            &store,
+            &source.owner,
+            &session_id,
+        ) {
+            Ok(base) => base,
+            Err(error) => {
+                eprintln!("  {} {}", theme::icon_err(), error);
+                return;
+            }
+        };
+        let checkpoints = list_heavy_checkpoints(&base);
+        let turns = project_journal_turns(&source.events);
+        if turns.is_empty() && checkpoints.is_empty() {
+            continue;
+        }
+        found = true;
+        eprintln!("\n  Source: {}", source.path.display());
+        if !inspect_debug_source(
+            &session_id,
+            &source.owner,
+            &source.events,
+            &turns,
+            &checkpoints,
+        ) {
+            return;
+        }
+    }
+    if !found {
         eprintln!(
             "{}",
             format!("  No data found for session {session_id}").yellow()
         );
-        return;
     }
+}
 
+fn inspect_debug_source(
+    session_id: &str,
+    owner: &astra_services::OwnerScope,
+    events: &[astra_services::session_journal::JournalEvent],
+    turns: &[TurnSummary],
+    checkpoints: &[PathBuf],
+) -> bool {
     if !turns.is_empty() && !checkpoints.is_empty() && turns.len() != checkpoints.len() {
         eprintln!(
             "  {}",
@@ -73,17 +108,10 @@ pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
     }
 
     // ── Overview ──
-    print_overview(&session_id, &turns, &checkpoints);
+    print_overview(session_id, turns, checkpoints);
 
     // If journal has no turns but checkpoints exist, offer checkpoint-only inspection.
     if turns.is_empty() {
-        if checkpoints.is_empty() {
-            eprintln!(
-                "\n  {}",
-                "No turn data yet. Complete a conversation turn first.".dim()
-            );
-            return;
-        }
         eprintln!(
             "\n  {}",
             "No journal turns (journal may not have been initialized).".dim()
@@ -92,7 +120,7 @@ pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
             "  {} checkpoints available — inspecting latest segment.",
             checkpoints.len().to_string().green()
         );
-        if let Some(view) = build_turn_messages_view(checkpoints.len(), &checkpoints) {
+        if let Some(view) = build_turn_messages_view(checkpoints.len(), checkpoints) {
             let stub = TurnSummary {
                 journal_turn: None,
                 user_input: view
@@ -116,34 +144,37 @@ pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
                 llm_rounds: Vec::new(),
                 interruptions: Vec::new(),
             };
-            inspect_turn(1, &stub, Some(&view), &session_id);
+            inspect_turn(1, &stub, Some(&view), session_id, owner);
         } else {
             eprintln!("  {}", "Failed to load checkpoint data.".yellow());
         }
-        return;
+        return true;
     }
 
     // ── Interactive loop ──
     loop {
         eprint!(
-            "\n  Which turn? [1-{}, bp, ct, cs, q to quit]: ",
+            "\n  Which turn? [1-{}, bp, ct, cs, n for next source, q to quit]: ",
             turns.len().max(1)
         );
         io::stderr().flush().ok();
-        let Some(line) = read_line() else { break };
+        let Some(line) = read_line() else {
+            return false;
+        };
         let line = line.trim().to_lowercase();
         match line.as_str() {
-            "q" | "quit" => break,
+            "q" | "quit" => return false,
+            "n" | "next" => return true,
             "bp" | "breakpoints" => {
-                show_breakpoints(&session_id);
+                show_breakpoints(owner, session_id);
                 continue;
             }
             "cs" | "snapshots" => {
-                show_composite_snapshots(&session_id);
+                show_composite_snapshots(owner, session_id);
                 continue;
             }
             "ct" | "corrections" => {
-                show_correction_timeline(&session_id);
+                show_correction_timeline(events);
                 continue;
             }
             _ => {}
@@ -151,7 +182,7 @@ pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
         let Ok(turn_n) = line.parse::<usize>() else {
             eprintln!(
                 "  {}",
-                "Invalid input — enter a turn number, bp, ct, cs, or q".yellow()
+                "Invalid input — enter a turn number, bp, ct, cs, n, or q".yellow()
             );
             continue;
         };
@@ -160,7 +191,7 @@ pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
             continue;
         }
 
-        let view = build_turn_messages_view(turn_n, &checkpoints);
+        let view = build_turn_messages_view(turn_n, checkpoints);
         if view.is_none() {
             eprintln!(
                 "  {}",
@@ -168,7 +199,7 @@ pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
             );
             continue;
         }
-        inspect_turn(turn_n, &turns[turn_n - 1], view.as_ref(), &session_id);
+        inspect_turn(turn_n, &turns[turn_n - 1], view.as_ref(), session_id, owner);
     }
 }
 
@@ -309,6 +340,7 @@ fn inspect_turn(
     summary: &TurnSummary,
     view: Option<&TurnMessagesView>,
     session_id: &str,
+    owner: &astra_services::OwnerScope,
 ) {
     let journal_tag = summary
         .journal_turn
@@ -373,9 +405,9 @@ fn inspect_turn(
             "2" => show_output(view),
             "3" => show_tools(view, summary),
             "4" => show_injected(view),
-            "5" => dump_turn_json(view, summary, session_id, turn_n, false),
+            "5" => dump_turn_json(view, summary, session_id, owner, turn_n, false),
             "6" => show_summary(summary),
-            "7" => dump_turn_json(view, summary, session_id, turn_n, true),
+            "7" => dump_turn_json(view, summary, session_id, owner, turn_n, true),
             _ => eprintln!("  {}", "Invalid choice".yellow()),
         }
     }
@@ -540,6 +572,7 @@ fn dump_turn_json(
     view: Option<&TurnMessagesView>,
     summary: &TurnSummary,
     session_id: &str,
+    owner: &astra_services::OwnerScope,
     turn_n: usize,
     full_snapshot: bool,
 ) {
@@ -549,7 +582,10 @@ fn dump_turn_json(
     };
     let short = &session_id[..8.min(session_id.len())];
     let suffix = if full_snapshot { "-full" } else { "" };
-    let path = std::env::temp_dir().join(format!("debug-{short}-turn{turn_n}{suffix}.json"));
+    let path = std::env::temp_dir().join(format!(
+        "debug-{short}-{}-turn{turn_n}{suffix}.json",
+        uuid::Uuid::new_v4()
+    ));
     let dump_messages = if full_snapshot { &v.full } else { &v.delta };
     crate::cli::history_work::record_json_history(
         astra_core::history_work::HistoryWorkSite::CliDebugDumpPayloadClone,
@@ -560,6 +596,7 @@ fn dump_turn_json(
         serde_json::json!({
             "schema": "astra-debug-turn-full-v1",
             "session_id": session_id,
+            "owner_id": owner.id(),
             "inspect": {
                 "journal_turn_ordinal": turn_n,
                 "journal_turn_field": summary.journal_turn,
@@ -574,6 +611,7 @@ fn dump_turn_json(
         serde_json::json!({
             "schema": "astra-debug-turn-delta-v1",
             "session_id": session_id,
+            "owner_id": owner.id(),
             "inspect": {
                 "journal_turn_ordinal": turn_n,
                 "journal_turn_field": summary.journal_turn,
@@ -695,43 +733,28 @@ fn show_summary(summary: &TurnSummary) {
 // ── Data loading ─────────────────────────────────────────────────────────────
 
 /// Resolve a (possibly short) session ID to a full UUID by prefix match.
-fn resolve_session_id(input: &str) -> String {
-    let sessions_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
-        .join("sessions");
-    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
-        let matches: Vec<String> = entries
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                // Match directories (session data) by prefix
-                if e.path().is_dir() && name.starts_with(input) {
-                    Some(name)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if matches.len() == 1 {
-            return matches
-                .into_iter()
-                .next()
-                .expect("matches has exactly one item");
+fn resolve_session_id(input: &str) -> Result<String, String> {
+    let (local, account) = crate::cli::cli_config::cli_utils::attached_journal_owners()?;
+    let mut matches = std::collections::BTreeSet::new();
+    for owner in std::iter::once(&local).chain(account.as_ref()) {
+        for id in astra_services::session_journal::list_sessions_for_owner(owner)
+            .map_err(|error| error.to_string())?
+        {
+            if id == input {
+                return Ok(id);
+            }
+            if id.starts_with(input) {
+                matches.insert(id);
+            }
         }
     }
-    input.to_string()
-}
-
-fn session_dir_for_owner(owner: &astra_services::OwnerScope, session_id: &str) -> PathBuf {
-    let store = astra_services::local_session_artifact_store();
-    astra_services::SessionArtifactStore::session_dir_for_owner(&store, owner, session_id)
-        .expect("session id must resolve authenticated owner-bound debug directory")
-}
-
-fn session_journal_path_for_owner(owner: &astra_services::OwnerScope, session_id: &str) -> PathBuf {
-    astra_services::session_journal::journal_file_path_for_owner(owner, session_id)
-        .expect("session id must resolve authenticated owner-bound debug journal")
+    match matches.len() {
+        0 => Ok(input.to_string()), // Full IDs also support checkpoint-only inspection.
+        1 => Ok(matches.into_iter().next().expect("one match")),
+        _ => Err(format!(
+            "session prefix '{input}' is ambiguous among attached journals"
+        )),
+    }
 }
 
 #[derive(Debug)]
@@ -779,151 +802,109 @@ struct InterruptionSummary {
     remaining_turns: u64,
 }
 
+#[cfg(test)]
 fn load_journal_turns(path: &PathBuf) -> Vec<TurnSummary> {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let entries: Vec<serde_json::Value> = content
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let entries = content
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
+        .collect::<Vec<_>>();
+    project_journal_turns(&entries)
+}
+
+fn project_journal_turns(
+    entries: &[astra_services::session_journal::JournalEvent],
+) -> Vec<TurnSummary> {
+    use astra_services::session_journal::JournalEventType;
     let mut turns = Vec::new();
     let mut turn_index_by_id = std::collections::HashMap::new();
-
-    for v in &entries {
-        if v.get("type").and_then(|v| v.as_str()) != Some("turn") {
-            continue;
-        }
-        let tool_calls = v
-            .get("tool_calls")
-            .and_then(|a| a.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|tc| {
-                        Some(ToolCallSummary {
-                            name: tc.get("name")?.as_str()?.to_string(),
-                            ok: tc.get("ok")?.as_bool()?,
-                            input_bytes: tc
-                                .get("input_bytes")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0),
-                            output_bytes: tc
-                                .get("output_bytes")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0),
-                            args_preview: tc
-                                .get("args_preview")
-                                .and_then(|v| v.as_str())
-                                .map(String::from),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let journal_turn = v.get("turn").and_then(|t| t.as_u64()).map(|u| u as u32);
-        let idx = turns.len();
+    for event in entries
+        .iter()
+        .filter(|event| event.event_type == JournalEventType::Turn)
+    {
+        let index = turns.len();
         turns.push(TurnSummary {
-            journal_turn,
-            user_input: v
-                .get("user_input")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            tokens_in: v.get("tokens_in").and_then(|v| v.as_u64()).unwrap_or(0),
-            tokens_out: v.get("tokens_out").and_then(|v| v.as_u64()).unwrap_or(0),
-            duration_ms: v.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0),
-            ttft_ms: v.get("ttft_ms").and_then(|v| v.as_u64()).unwrap_or(0),
-            tool_count: v.get("tool_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-            tools_used: v
-                .get("tools_used")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
+            journal_turn: event.turn,
+            user_input: event.user_input.clone().unwrap_or_default(),
+            tokens_in: event.tokens_in.unwrap_or(0),
+            tokens_out: event.tokens_out.unwrap_or(0),
+            duration_ms: event.duration_ms.unwrap_or(0),
+            ttft_ms: event.ttft_ms.unwrap_or(0),
+            tool_count: event.tool_count.unwrap_or(0) as usize,
+            tools_used: event.tools_used.clone().unwrap_or_default(),
+            tool_calls: event
+                .tool_calls
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|call| ToolCallSummary {
+                    name: call.name.clone(),
+                    ok: call.ok,
+                    input_bytes: u64::from(call.input_bytes.unwrap_or(0)),
+                    output_bytes: u64::from(call.output_bytes.unwrap_or(0)),
+                    args_preview: call.args_preview.clone(),
                 })
-                .unwrap_or_default(),
-            tool_calls,
+                .collect(),
             llm_rounds: Vec::new(),
             interruptions: Vec::new(),
         });
-        if let Some(turn_id) = journal_turn {
-            turn_index_by_id.insert(turn_id, idx);
+        if let Some(turn) = event.turn {
+            turn_index_by_id.insert(turn, index);
         }
     }
-
-    for v in &entries {
-        let Some(turn_id) = v.get("turn").and_then(|t| t.as_u64()).map(|u| u as u32) else {
+    for event in entries {
+        let Some(index) = event.turn.and_then(|turn| turn_index_by_id.get(&turn)) else {
             continue;
         };
-        let Some(&idx) = turn_index_by_id.get(&turn_id) else {
-            continue;
-        };
-        match v.get("type").and_then(|v| v.as_str()) {
-            Some("llm_round") => {
-                let meta = v.get("metadata");
-                turns[idx].llm_rounds.push(LlmRoundSummary {
-                    round: v.get("round").and_then(|v| v.as_u64()).map(|u| u as u32),
-                    agentic_step: v
-                        .get("agentic_step")
-                        .and_then(|v| v.as_u64())
-                        .map(|u| u as u32),
-                    source: meta
-                        .and_then(|m| m.get("source"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    run_id: meta
-                        .and_then(|m| m.get("run_id"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    finish_reason: meta
-                        .and_then(|m| m.get("finish_reason"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    tool_calls_returned: v
-                        .get("tool_calls_returned")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
+        match event.event_type {
+            JournalEventType::LlmRound => {
+                let text = |key| {
+                    event
+                        .metadata
+                        .as_ref()?
+                        .get(key)?
+                        .as_str()
+                        .map(str::to_owned)
+                };
+                turns[*index].llm_rounds.push(LlmRoundSummary {
+                    round: event.round,
+                    agentic_step: event.agentic_step,
+                    source: text("source"),
+                    run_id: text("run_id"),
+                    finish_reason: text("finish_reason"),
+                    tool_calls_returned: u64::from(event.tool_calls_returned.unwrap_or(0)),
                 });
             }
-            Some("interruption_recorded") => {
-                let interruption = v
-                    .get("metadata")
-                    .and_then(|m| m.get("interruption"))
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                turns[idx].interruptions.push(InterruptionSummary {
+            JournalEventType::InterruptionRecorded => {
+                let interruption = event
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("interruption"));
+                let number = |key| {
+                    interruption
+                        .and_then(|value| value.get(key))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                };
+                turns[*index].interruptions.push(InterruptionSummary {
                     kind: interruption
-                        .get("kind")
-                        .and_then(|v| v.as_str())
+                        .and_then(|value| value.get("kind"))
+                        .and_then(serde_json::Value::as_str)
                         .unwrap_or("unknown")
                         .to_string(),
                     resumable: interruption
-                        .get("resumable")
-                        .and_then(|v| v.as_bool())
+                        .and_then(|value| value.get("resumable"))
+                        .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false),
-                    agentic_step: v
-                        .get("agentic_step")
-                        .and_then(|v| v.as_u64())
-                        .map(|u| u as u32),
-                    tool_calls_completed: interruption
-                        .get("tool_calls_completed")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    turns_completed: interruption
-                        .get("turns_completed")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    remaining_turns: interruption
-                        .get("remaining_turns")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
+                    agentic_step: event.agentic_step,
+                    tool_calls_completed: number("tool_calls_completed"),
+                    turns_completed: number("turns_completed"),
+                    remaining_turns: number("remaining_turns"),
                 });
             }
             _ => {}
         }
     }
-
     turns
 }
 
@@ -947,9 +928,8 @@ fn list_heavy_checkpoints(session_dir: &Path) -> Vec<PathBuf> {
 
 // ── Breakpoints ─────────────────────────────────────────────────────────────
 
-fn show_breakpoints(session_id: &str) {
-    let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
-    match astra_pipeline::step_checkpoint::read_breakpoint_index(&user_id, session_id) {
+fn show_breakpoints(owner: &astra_services::OwnerScope, session_id: &str) {
+    match astra_pipeline::step_checkpoint::read_breakpoint_index(owner.id(), session_id) {
         Ok(index) => {
             if index.breakpoints.is_empty() {
                 eprintln!("  {}", "(no breakpoints)".dim());
@@ -972,10 +952,10 @@ fn show_breakpoints(session_id: &str) {
     }
 }
 
-fn show_composite_snapshots(session_id: &str) {
-    let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
+fn show_composite_snapshots(owner: &astra_services::OwnerScope, session_id: &str) {
     let index = match astra_pipeline::step_checkpoint::read_composite_snapshot_index(
-        &user_id, session_id,
+        owner.id(),
+        session_id,
     ) {
         Ok(index) => index,
         Err(error) => {
@@ -1013,15 +993,7 @@ fn show_composite_snapshots(session_id: &str) {
 
 // ── Correction Timeline ─────────────────────────────────────────────────────
 
-fn show_correction_timeline(session_id: &str) {
-    let events = match astra_services::session_journal::read_journal(session_id) {
-        Ok(evts) => evts,
-        Err(e) => {
-            eprintln!("  {} {}", theme::icon_err(), e);
-            return;
-        }
-    };
-
+fn show_correction_timeline(events: &[astra_services::session_journal::JournalEvent]) {
     let verdicts: Vec<_> = events
         .iter()
         .filter(|e| {
@@ -1136,6 +1108,76 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
 
+    #[serial_test::serial]
+    #[test]
+    fn initialized_account_debug_rejects_foreign_sessions_and_cursors() {
+        use astra_services::session_journal::JournalEvent;
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
+        let _credentials = crate::tests::isolate_credentials();
+        let (_directory, _sessions) = crate::tests::isolated_sessions_dir();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("debug-account"),
+        )
+        .unwrap();
+        let state = crate::cli::session::session_runtime::initialize_session_state(
+            None,
+            None,
+            &crate::cli::cli_config::cli_context::CliContext::default(),
+        );
+        assert_eq!(state.ingestion_user_id.as_deref(), Some("debug-account"));
+        let (local, account) =
+            crate::cli::cli_config::cli_utils::attached_journal_owners().unwrap();
+        let account = account.unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let other_session = uuid::Uuid::new_v4().to_string();
+        let unrelated = astra_services::OwnerScope::user("unrelated-account").unwrap();
+        let turn = |session: &str, text: &str| {
+            JournalEvent::turn(Some(session), 1, None, text, "done", 0, 12, 3, 2)
+        };
+        let path =
+            astra_services::session_journal::journal_file_path_for_owner(&local, &session).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A file in an attached partition still cannot claim another session.
+        std::fs::write(
+            path,
+            serde_json::to_vec(&turn(&other_session, "wrong session")).unwrap(),
+        )
+        .unwrap();
+        assert!(crate::cli::journal_digest::read_attached_journal_sources(&session).is_err());
+        let conversation = astra_turn_core::active_conversation::ActiveConversation::empty(
+            unrelated.id(),
+            &session,
+        )
+        .unwrap();
+        let prepared = conversation
+            .prepare_commit(
+                1,
+                None,
+                vec![
+                    json!({"role":"user", "content":"private"}),
+                    json!({"role":"assistant", "content":"done"}),
+                ],
+            )
+            .unwrap();
+        let foreign_cursor = turn(&session, "private").with_conversation_commit(prepared.commit);
+        let local_path =
+            astra_services::session_journal::journal_file_path_for_owner(&local, &session).unwrap();
+        std::fs::remove_file(&local_path).unwrap();
+        let account_path =
+            astra_services::session_journal::journal_file_path_for_owner(&account, &session)
+                .unwrap();
+        std::fs::create_dir_all(account_path.parent().unwrap()).unwrap();
+        std::fs::write(account_path, serde_json::to_vec(&foreign_cursor).unwrap()).unwrap();
+        assert!(
+            crate::cli::journal_digest::read_attached_journal_sources(&session)
+                .err()
+                .unwrap()
+                .contains("not attached")
+        );
+    }
+
     #[test]
     fn truncate_short() {
         assert_eq!(truncate("hello", 10), "hello");
@@ -1215,18 +1257,20 @@ mod tests {
 
     // ── Bug fix: short session ID resolution ─────────────────────────────
 
+    #[serial_test::serial]
     #[test]
     fn resolve_session_id_no_match_returns_input() {
         // No sessions dir match → returns original input
-        let result = resolve_session_id("zzz-nonexistent-prefix");
+        let result = resolve_session_id("zzz-nonexistent-prefix").unwrap();
         assert_eq!(result, "zzz-nonexistent-prefix");
     }
 
+    #[serial_test::serial]
     #[test]
     fn resolve_session_id_exact_uuid_passthrough() {
         // Full UUID that doesn't exist → returns as-is (no crash)
         let fake = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        assert_eq!(resolve_session_id(fake), fake);
+        assert_eq!(resolve_session_id(fake).unwrap(), fake);
     }
 
     // ── Bug fix: load_journal_turns parses real entries ───────────────────

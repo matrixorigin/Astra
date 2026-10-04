@@ -4,9 +4,8 @@
 //!
 //! Key features:
 //! - User preferences (verbosity, language style, explicit tool blocks)
-//! - Scenario strategy selected by the LLM-produced [`TurnIntent`]
+//! - Typed scenario state selected by the LLM-produced [`TurnIntent`]
 //! - Config overrides per user
-//! - A/B experiment enrollment
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -640,117 +639,6 @@ impl TurnIntent {
     }
 }
 
-impl Scenario {
-    /// Get suggested tool labels for this scenario.
-    pub fn suggested_tools(&self) -> Vec<&'static str> {
-        match self {
-            Scenario::CodeReview => vec!["read_file", "grep"],
-            Scenario::Debugging => vec!["bash", "read_file", "grep", "glob"],
-            Scenario::Exploration => vec!["glob", "grep", "read_file", "tool_search"],
-            Scenario::Planning => vec!["read_file", "write_file", "mo_query"],
-            Scenario::Implementation => vec!["str_replace", "write_file", "bash", "read_file"],
-            Scenario::Refactoring => vec!["str_replace", "read_file", "grep", "bash"],
-            Scenario::Testing => vec!["bash", "read_file", "str_replace", "write_file"],
-            Scenario::Documentation => vec!["read_file", "str_replace", "write_file"],
-            Scenario::DevOps => vec!["bash", "read_file", "str_replace", "write_file"],
-            Scenario::Learning => vec!["read_file", "grep", "web_search"],
-            Scenario::QuickAnswer => vec!["read_file", "grep"],
-            Scenario::BenchmarkComparison => Vec::new(),
-        }
-    }
-
-    /// Get strategy adjustments for this scenario.
-    pub fn strategy_hints(&self) -> ScenarioStrategy {
-        match self {
-            Scenario::CodeReview => ScenarioStrategy {
-                max_tools_per_turn: 80,
-                prefer_read_only: true,
-                detail_level: Verbosity::Verbose,
-                memory_top_k: Some(7),
-            },
-            Scenario::Debugging => ScenarioStrategy {
-                max_tools_per_turn: 100,
-                prefer_read_only: false,
-                detail_level: Verbosity::Debug,
-                memory_top_k: Some(8),
-            },
-            Scenario::Exploration => ScenarioStrategy {
-                max_tools_per_turn: 100,
-                prefer_read_only: true,
-                detail_level: Verbosity::Normal,
-                memory_top_k: Some(10),
-            },
-            Scenario::Planning => ScenarioStrategy {
-                max_tools_per_turn: 60,
-                prefer_read_only: true,
-                detail_level: Verbosity::Verbose,
-                memory_top_k: None,
-            },
-            Scenario::Implementation => ScenarioStrategy {
-                max_tools_per_turn: 100,
-                prefer_read_only: false,
-                detail_level: Verbosity::Normal,
-                memory_top_k: None,
-            },
-            Scenario::Refactoring => ScenarioStrategy {
-                max_tools_per_turn: 100,
-                prefer_read_only: false,
-                detail_level: Verbosity::Verbose,
-                memory_top_k: Some(7),
-            },
-            Scenario::Testing => ScenarioStrategy {
-                max_tools_per_turn: 100,
-                prefer_read_only: false,
-                detail_level: Verbosity::Normal,
-                memory_top_k: None,
-            },
-            Scenario::Documentation => ScenarioStrategy {
-                max_tools_per_turn: 60,
-                prefer_read_only: false,
-                detail_level: Verbosity::Verbose,
-                memory_top_k: None,
-            },
-            Scenario::DevOps => ScenarioStrategy {
-                max_tools_per_turn: 80,
-                prefer_read_only: false,
-                detail_level: Verbosity::Normal,
-                memory_top_k: None,
-            },
-            Scenario::Learning => ScenarioStrategy {
-                max_tools_per_turn: 80,
-                prefer_read_only: true,
-                detail_level: Verbosity::Verbose,
-                memory_top_k: Some(10),
-            },
-            // QuickAnswer is intentionally the tightest profile in the set.
-            // The execution cap keeps short factual questions from drifting into
-            // long tool rounds without an explicit escalation.
-            Scenario::QuickAnswer => ScenarioStrategy {
-                max_tools_per_turn: 20,
-                prefer_read_only: true,
-                detail_level: Verbosity::Normal,
-                memory_top_k: Some(5),
-            },
-            Scenario::BenchmarkComparison => ScenarioStrategy {
-                max_tools_per_turn: 80,
-                prefer_read_only: true,
-                detail_level: Verbosity::Verbose,
-                memory_top_k: None,
-            },
-        }
-    }
-}
-
-/// Strategy adjustments for a scenario.
-#[derive(Debug, Clone)]
-pub struct ScenarioStrategy {
-    pub max_tools_per_turn: usize,
-    pub prefer_read_only: bool,
-    pub detail_level: Verbosity,
-    /// Suggested memory retrieval top-k override (None = use default).
-    pub memory_top_k: Option<u32>,
-}
-
 // ─── User Stats ─────────────────────────────────────────────────────────────
 
 /// User session statistics for personalization.
@@ -1079,16 +967,6 @@ mod tests {
     fn test_verbosity_prompt() {
         assert!(Verbosity::Quiet.prompt_instruction().contains("concise"));
         assert!(Verbosity::Debug.prompt_instruction().contains("maximum"));
-    }
-
-    #[test]
-    fn test_scenario_strategy() {
-        let strategy = Scenario::Debugging.strategy_hints();
-        assert_eq!(strategy.detail_level, Verbosity::Debug);
-        assert!(!strategy.prefer_read_only);
-
-        let strategy = Scenario::CodeReview.strategy_hints();
-        assert!(strategy.prefer_read_only);
     }
 
     #[test]

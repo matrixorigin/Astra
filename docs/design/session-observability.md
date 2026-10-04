@@ -63,7 +63,11 @@ source; `LlmRound` tokens are a separate diagnostic observation. The JSON
 `usage_coverage` and round-conflict fields identify unknown buckets and
 excluded contradictions. Root-plus-child observed totals mix sources and are
 never a bill or proof of complete session cost. No journal cursor grants
-access to another owner's file.
+access to another owner's file. The explicit CLI `debug` inspector uses the same
+attached profile/account source authorization. Each source retains its own turns,
+checkpoints, correction timeline and exported owner identity; ingestion metadata
+does not select a storage partition. Debug retains the CLI authentication check
+but does not discover skill catalogs or connect MCP providers.
 
 ## Stuck detection
 

@@ -293,7 +293,7 @@ fn event_type_tiebreak_rank(event_type: &JournalEventType) -> u8 {
     }
 }
 
-fn stabilize_event_order(events: &mut [JournalEvent]) {
+pub fn stabilize_event_order(events: &mut [JournalEvent]) {
     // Fast path: already chronological by file layout, no same-timestamp
     // boundary tiebreak inversion, no leading SessionStart that needs to be
     // lifted.  `read_journal` is in the steady-state hot path — re-sorting
@@ -4628,6 +4628,23 @@ pub fn read_journal_for_digest_for_user(
 fn read_journal_digest_from_path(
     path: &Path,
 ) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
+    let (mut events, lines, malformed) = read_journal_source_from_path(path)?;
+    stabilize_event_order(&mut events);
+    Ok((events, lines, malformed))
+}
+
+/// Raw owner-scoped diagnostic source in physical append order, with non-empty
+/// and malformed line counts. Missing files return NotFound, distinct from empty files.
+pub fn read_journal_source_for_owner(
+    owner: &OwnerScope,
+    session_id: &str,
+) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
+    read_journal_source_from_path(&journal_file_path_for_owner(owner, session_id)?)
+}
+
+fn read_journal_source_from_path(
+    path: &Path,
+) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
     if !path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -4635,7 +4652,7 @@ fn read_journal_digest_from_path(
         ));
     }
     let content = std::fs::read_to_string(path)?;
-    let parsed = parse_journal_text(&content);
+    let parsed = parse_journal_text_in_append_order(&content);
     record_journal_read(
         astra_core::history_work::HistoryWorkSite::SessionJournalDigestRead,
         content.len(),

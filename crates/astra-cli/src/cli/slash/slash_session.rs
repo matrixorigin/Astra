@@ -31,7 +31,6 @@ use crate::cli::{
     stream::stream_render,
     theme,
 };
-use astra_runtime::prompts;
 use crossterm::style::Stylize;
 
 /// `/home/foo/bar` → `~/bar` when under the user home dir (readability).
@@ -4841,50 +4840,53 @@ mod export_tests {
 
 // ═══════════════════════════════════════════════════════════ Resume ═══════
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct PreparedWorkspaceRestore {
     workspace: Option<session_workspace::WorkspaceMetadata>,
     session_persistence_error: Option<String>,
     discovered_skills: std::collections::HashSet<String>,
-    pending_runtime_config: Option<astra_config::RuntimeConfig>,
+    runtime_config: astra_config::RuntimeConfig,
+    config_version_id: String,
 }
 
 fn prepared_workspace_restore_from_workspace(
-    ws: session_workspace::WorkspaceMetadata,
+    ws: Option<session_workspace::WorkspaceMetadata>,
+    state: &SessionState,
 ) -> Result<PreparedWorkspaceRestore, String> {
-    let pending_runtime_config = ws
-        .tuned_config_json
-        .as_deref()
+    let saved = ws
+        .as_ref()
+        .and_then(|workspace| workspace.tuned_config_json.as_deref())
         .map(|json| {
-            let saved: astra_config::RuntimeConfig = serde_json::from_str(json)
-                .map_err(|error| format!("saved runtime configuration is invalid: {error}"))?;
-            astra_config::validate_governed_config_candidate(&saved).map_err(|error| {
-                format!(
-                    "saved runtime configuration is invalid: {}",
-                    error.to_json()
-                )
-            })?;
-            Ok::<_, String>(saved)
+            serde_json::from_str::<astra_config::RuntimeConfig>(json)
+                .map_err(|error| format!("saved runtime configuration is invalid: {error}"))
         })
         .transpose()?;
+    let (runtime_config, config_version_id) =
+        session_startup::prepare_session_runtime_config(state, saved, None)
+            .map_err(|error| format!("saved {error}"))?;
     Ok(PreparedWorkspaceRestore {
-        session_persistence_error: ws.last_persistence_error.clone(),
-        discovered_skills: ws.discovered_skills.iter().cloned().collect(),
-        pending_runtime_config,
-        workspace: Some(ws),
+        session_persistence_error: ws.as_ref().and_then(|ws| ws.last_persistence_error.clone()),
+        discovered_skills: ws
+            .as_ref()
+            .map(|ws| ws.discovered_skills.iter().cloned().collect())
+            .unwrap_or_default(),
+        runtime_config,
+        config_version_id,
+        workspace: ws,
     })
 }
 
 fn load_prepared_workspace_restore(
     restored: &RestoredSession,
+    state: &SessionState,
 ) -> Result<PreparedWorkspaceRestore, String> {
     if let Some(workspace) = restored.workspace.clone() {
-        return prepared_workspace_restore_from_workspace(workspace);
+        return prepared_workspace_restore_from_workspace(Some(workspace), state);
     }
     match session_workspace::read_workspace(&restored.session_id) {
-        Ok(ws) => prepared_workspace_restore_from_workspace(ws),
+        Ok(ws) => prepared_workspace_restore_from_workspace(Some(ws), state),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(PreparedWorkspaceRestore::default())
+            prepared_workspace_restore_from_workspace(None, state)
         }
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
             let backup = session_workspace::backup_invalid_workspace_file(&restored.session_id)
@@ -4906,7 +4908,7 @@ fn load_prepared_workspace_restore(
             workspace.last_persistence_error = Some(format!(
                 "workspace metadata unreadable during resume; rebuilt from journal/checkpoint ({e})"
             ));
-            prepared_workspace_restore_from_workspace(workspace)
+            prepared_workspace_restore_from_workspace(Some(workspace), state)
         }
         Err(e) => Err(format!(
             "read workspace state for session {}: {e}",
@@ -4918,8 +4920,11 @@ fn load_prepared_workspace_restore(
 fn apply_prepared_workspace_restore(state: &mut SessionState, prepared: &PreparedWorkspaceRestore) {
     state.session_persistence_error = prepared.session_persistence_error.clone();
     state.discovered_skills = prepared.discovered_skills.clone();
-    state.pending_runtime_config = prepared.pending_runtime_config.clone();
-    session_startup::apply_pending_runtime_config(state);
+    session_startup::apply_session_runtime_config(
+        state,
+        prepared.runtime_config.clone(),
+        prepared.config_version_id.clone(),
+    );
 }
 
 fn persist_resumed_workspace_metadata(
@@ -5251,7 +5256,7 @@ async fn apply_restored_session(
     let total_cache_creation_tokens = restored
         .total_cache_creation_tokens
         .max(local_state.total_cache_creation_tokens);
-    let prepared_workspace = load_prepared_workspace_restore(&restored)?;
+    let prepared_workspace = load_prepared_workspace_restore(&restored, state)?;
     let prepared_history = prepare_session_history(&restored.session_id).await?;
     let use_typed_continuation = match (
         prepared_history.resume.as_ref(),
@@ -5515,6 +5520,8 @@ async fn apply_restored_session(
     if let Some(mode) = restored_permission_mode {
         state.perm_manager.set_mode(mode);
     }
+    state.model =
+        normalize_model_override(restored.model.as_deref()).map(|model| model.to_string().into());
     apply_prepared_workspace_restore(state, &prepared_workspace);
 
     if let Some(step_restored) = step_restored {
@@ -5560,20 +5567,6 @@ async fn apply_restored_session(
             0,
         );
         eprintln!("  {} Restored step checkpoint from cloud", "☁".magenta());
-    }
-
-    match normalize_model_override(restored.model.as_deref()) {
-        Some(m) => {
-            state.model = Some((m.to_string()).into());
-            let base = astra_turn_core::thinking_config::resolve_model_thinking(m).0;
-            state.context_budget =
-                prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(base));
-        }
-        None => {
-            state.model = None;
-            state.context_budget =
-                prompts::ContextBudget::from_runtime_config(&state.runtime_config, None);
-        }
     }
 
     if use_typed_continuation {
@@ -6983,7 +6976,7 @@ mod resume_tests {
                     .as_deref(),
                 Some(invalid)
             );
-            assert!(state.pending_runtime_config.is_none());
+            assert!(!state.observability_config_pending);
         }
     }
 
@@ -7606,8 +7599,283 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn switch_session_into_state_restores_workspace_scoped_state() {
+    async fn resume_restores_full_configuration_including_explicit_defaults() {
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _top_k = EnvGuard::set("ASTRA_RETRIEVAL_TOP_K", "7");
+        assert_eq!(
+            astra_config::RuntimeConfig::load().memory.retrieval_top_k,
+            7
+        );
+        let session_id = format!("resume-default-config-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 2);
+        let mut saved = astra_config::RuntimeConfig::default();
+        saved.memory.max_memory_tokens = 1300;
+        saved.compression.preserve_recent_turns = 7;
+        assert_eq!(saved.memory.retrieval_top_k, 5);
+        let saved_json = serde_json::to_string(&saved).unwrap();
+        session_workspace::update_existing_workspace_config(
+            &session_id,
+            |workspace| {
+                workspace.tuned_config_json = Some(saved_json.clone());
+                Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue(()))
+            },
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        state.set_session_id("current-session");
+        state.config_version_id = Some("stale-config-version".into());
+        let hub = std::sync::Arc::new(astra_runtime::observability::ObservabilityHub::new());
+        let mut profile = hub.profiles().get_profile("anonymous");
+        profile.preferences.config_overrides.insert(
+            "token_budget.max_prompt_tokens".into(),
+            serde_json::json!(12345),
+        );
+        hub.profiles().update_profile(profile);
+        state.observability_hub = Some(hub);
+        switch_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .unwrap();
+        assert!(!state.observability_config_pending);
+        assert_eq!(
+            serde_json::to_value(&state.runtime_config).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        assert_eq!(state.context_budget.keep_recent_turns, 7);
+        assert_eq!(state.context_budget.memory_budget_chars, 5200);
+        let expected_version = astra_config::config_versions::VersionId::from_toml_bytes(
+            toml::to_string_pretty(&saved).unwrap().as_bytes(),
+        );
+        assert_eq!(
+            state.config_version_id.as_deref(),
+            Some(expected_version.as_str())
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/memory/search"))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"query": "restored config", "top_k": 5}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let memory_api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        crate::cli::slash::slash_memory::handle_memory_domain_command(
+            "/memory",
+            "search restored config",
+            &memory_api,
+            &mut state,
+            Some("fixture-token"),
+        )
+        .await
+        .unwrap();
+        server.verify().await;
+        assert_eq!(
+            serde_json::to_value(
+                &state
+                    .observability_session
+                    .as_ref()
+                    .unwrap()
+                    .read()
+                    .unwrap()
+                    .config
+            )
+            .unwrap(),
+            serde_json::to_value(&saved).unwrap(),
+        );
+        // A replacement observability instance must also use the restored config.
+        state.observability_session = None;
+        crate::cli::session::session_startup::initialize_journal_pub(&mut state, &session_id);
+        assert_eq!(
+            serde_json::to_value(
+                &state
+                    .observability_session
+                    .as_ref()
+                    .unwrap()
+                    .read()
+                    .unwrap()
+                    .config
+            )
+            .unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        state.set_explain_report_format_override(
+            astra_config::runtime_config::ExplainReportFormat::Text,
+        );
+        switch_session_into_state(&session_id, None, &api, &mut state)
+            .await
+            .unwrap();
+        saved.explain.report_format = Some(astra_config::runtime_config::ExplainReportFormat::Text);
+        assert_eq!(
+            serde_json::to_value(&state.runtime_config).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        assert_eq!(
+            state.config_version_id.as_deref(),
+            Some(
+                astra_config::config_versions::VersionId::from_toml_bytes(
+                    toml::to_string_pretty(&saved).unwrap().as_bytes()
+                )
+                .as_str()
+            )
+        );
+
+        // A rejected new-session admission must leave A's selected configuration intact.
+        let fresh_server = MockServer::start().await;
+        let fresh_api = astra_thin_client::ThinClient::new(&fresh_server.uri(), None).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&fresh_server)
+            .await;
+        let previous_version = state.config_version_id.clone();
+        crate::cli::slash::slash_state::start_fresh_session(
+            &fresh_api,
+            None,
+            "fixture-token",
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+        fresh_server.verify().await;
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(
+            serde_json::to_value(&state.runtime_config).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        assert_eq!(state.config_version_id, previous_version);
+        assert_eq!(state.context_budget.keep_recent_turns, 7);
+        assert_eq!(state.context_budget.memory_budget_chars, 5200);
+        fresh_server.reset().await;
+
+        let fresh_id = format!("fresh-config-{}", uuid::Uuid::new_v4());
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"session_id":fresh_id})),
+            )
+            .expect(1)
+            .mount(&fresh_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/memory/search"))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"query":"fresh config","top_k":7}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(2)
+            .mount(&fresh_server)
+            .await;
+        let mut fresh_config = astra_config::RuntimeConfig::load();
+        fresh_config.token_budget.max_prompt_tokens = 12345;
+        fresh_config.explain.report_format =
+            Some(astra_config::runtime_config::ExplainReportFormat::Text);
+        let fresh_version = astra_config::config_versions::VersionId::from_toml_bytes(
+            toml::to_string_pretty(&fresh_config).unwrap().as_bytes(),
+        );
+        state.model = Some(
+            crate::cli::session::session_state::SessionModelChoice::Selected(
+                crate::cli::session::session_runtime::ServerModelSelection {
+                    name: "gpt-5".into(),
+                    context_window: Some(77777),
+                    offering_id: "selected-offering".into(),
+                    pricing: None,
+                },
+            ),
+        );
+        crate::cli::slash::slash_state::start_fresh_session(
+            &fresh_api,
+            None,
+            "fixture-token",
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.context_budget.model_limit, 77777);
+        assert!(
+            session_workspace::read_workspace(&fresh_id)
+                .unwrap()
+                .tuned_config_json
+                .is_none()
+        );
+        let events = session_journal::read_journal(&fresh_id).unwrap();
+        assert!(events.iter().any(|event| event.event_type
+            == session_journal::JournalEventType::ConfigChange
+            && event.metadata.as_ref().unwrap()["config_version"]["to"] == fresh_version.as_str()));
+        for phase in 0..2 {
+            if phase == 1 {
+                write_local_resumable_session(&fresh_id, 1);
+                switch_session_into_state(&fresh_id, None, &api, &mut state)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                serde_json::to_value(&state.runtime_config).unwrap(),
+                serde_json::to_value(&fresh_config).unwrap()
+            );
+            assert_eq!(
+                state.config_version_id.as_deref(),
+                Some(fresh_version.as_str())
+            );
+            assert_eq!(
+                state.context_budget.keep_recent_turns,
+                fresh_config.compression.preserve_recent_turns as usize
+            );
+            assert_eq!(
+                state.context_budget.memory_budget_chars,
+                fresh_config.memory.max_memory_tokens as usize * 4
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    &state
+                        .observability_session
+                        .as_ref()
+                        .unwrap()
+                        .read()
+                        .unwrap()
+                        .config
+                )
+                .unwrap(),
+                serde_json::to_value(&fresh_config).unwrap()
+            );
+            crate::cli::slash::slash_memory::handle_memory_domain_command(
+                "/memory",
+                "search fresh config",
+                &fresh_api,
+                &mut state,
+                Some("fixture-token"),
+            )
+            .await
+            .unwrap();
+        }
+        fresh_server.verify().await;
+        assert_eq!(
+            session_workspace::read_workspace(&session_id)
+                .unwrap()
+                .tuned_config_json
+                .as_deref(),
+            Some(saved_json.as_str())
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn switch_session_into_state_restores_workspace_scoped_state() {
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let mut process_config = astra_config::RuntimeConfig::load();
         let session_id = format!("switch-restore-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 2);
 
@@ -7624,6 +7892,17 @@ mod resume_tests {
             ..Default::default()
         };
         state.set_session_id("current-session");
+        state.runtime_config.memory.retrieval_top_k = 42;
+        state.config_version_id = Some("stale-config-version".into());
+        let hub = std::sync::Arc::new(astra_runtime::observability::ObservabilityHub::new());
+        let mut profile = hub.profiles().get_profile("anonymous");
+        profile.preferences.config_overrides.insert(
+            "token_budget.max_prompt_tokens".into(),
+            serde_json::json!(12345),
+        );
+        hub.profiles().update_profile(profile);
+        state.observability_hub = Some(hub);
+        process_config.token_budget.max_prompt_tokens = 12345;
 
         switch_session_into_state(&session_id, None, &api, &mut state)
             .await
@@ -7640,7 +7919,15 @@ mod resume_tests {
             state.session_persistence_error.as_deref(),
             Some("failed to append turn event")
         );
-        assert!(state.pending_runtime_config.is_none());
+        assert!(!state.observability_config_pending);
+        assert_eq!(
+            serde_json::to_value(&state.runtime_config).unwrap(),
+            serde_json::to_value(&process_config).unwrap()
+        );
+        assert_ne!(
+            state.config_version_id.as_deref(),
+            Some("stale-config-version")
+        );
         assert!(
             state.journal.is_some(),
             "switch should initialize a journal"

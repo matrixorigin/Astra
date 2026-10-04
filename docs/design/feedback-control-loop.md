@@ -25,6 +25,11 @@ The feedback control loop turns user feedback, trace facts, eval results, and op
 
 Runtime pressure and tool-health hints use the existing feedback lane and their observed sources. The retired synthetic diagnostic executor did not invoke a Skill; its fenced-output protocol, cooldowns and unobserved postconditions are removed. Manual evidence-driven diagnostic skills remain available. Retired adaptive tuner, boost/widen markers and timing configuration do not change tool admission or runtime budgets; hard restrictions and explicit tuned configuration retain their existing owners. The unused verification strictness, memory-pressure and context-window adjustment sections, experiment enrollment projections and their mutation/display surfaces are retired together; runtime settings expose execution controls rather than placeholder adaptive behavior.
 
+Typed scenario state is retained for execution intent and observation. The
+unconsumed scenario tool/strategy suggestion tables and empty CLI goal-steering
+wrapper are retired; explicit tool admission, resource limits, and shared
+runtime policy evidence retain their existing owners.
+
 ## Feedback record
 
 A feedback record should include:

@@ -37,7 +37,7 @@ pub(crate) fn handle_telemetry_command(arg: &str, state: &SessionState) {
         "" => show_summary(hub, session, state),
         "turns" => show_turn_timings(session),
         "drift" => show_drift_analysis(session, state),
-        "profile" => show_user_profile(hub, state),
+        "profile" => show_user_profile(hub),
         "context" => show_context_trace(session, sub_arg),
         "context-detail" => show_context_detail(session, sub_arg),
         "session" => show_session_analysis(session),
@@ -323,12 +323,10 @@ fn show_drift_analysis(
     eprintln!();
 }
 
-fn show_user_profile(
-    hub: &std::sync::Arc<astra_runtime::observability::ObservabilityHub>,
-    state: &SessionState,
-) {
-    let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
-    let profile = hub.profiles().get_profile(user_id);
+fn show_user_profile(hub: &std::sync::Arc<astra_runtime::observability::ObservabilityHub>) {
+    let user_id = crate::cli::cli_config::cli_utils::cli_account_id()
+        .unwrap_or_else(|| "anonymous".to_string());
+    let profile = hub.profiles().get_profile(&user_id);
 
     eprintln!(
         "\n{}",
