@@ -340,6 +340,10 @@ async fn fixture() -> (
 #[tokio::test]
 async fn auto_choice_is_durable_idempotent_and_restored_after_policy_change() {
     let (catalog, engine, mut first, mut state) = fixture().await;
+    // Repinning must replace the previous model's limits, not retain them.
+    state.max_identical_tool_calls = 71;
+    state.max_tools_per_turn = 73;
+    state.max_consecutive_empty_name = 79;
     crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut first, &mut state, 0)
         .await
         .unwrap();
@@ -359,6 +363,18 @@ async fn auto_choice_is_durable_idempotent_and_restored_after_policy_change() {
     assert_eq!(
         state.runtime_manifest.as_ref().unwrap()["model_resolution"]["model"],
         "economy"
+    );
+    let policy = astra_config::RuntimeConfig::cached()
+        .tool_policy
+        .resolve_for_model(state.context_manifest_model_name.as_deref());
+    assert_eq!(
+        state.max_identical_tool_calls,
+        policy.max_identical_tool_calls
+    );
+    assert_eq!(state.max_tools_per_turn, policy.max_tools_per_turn);
+    assert_eq!(
+        state.max_consecutive_empty_name,
+        policy.max_consecutive_empty_name
     );
     let saved = engine
         .load_run_event_by_idempotency_key(

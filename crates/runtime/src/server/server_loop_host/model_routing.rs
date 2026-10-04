@@ -456,7 +456,7 @@ impl ServerAgenticLoopHost {
             executor.set_agent_model_execution(&execution);
         }
         let tool_policy = astra_config::RuntimeConfig::cached()
-            .tool_selection
+            .tool_policy
             .resolve_for_model(Some(&execution.model_name));
         state.max_identical_tool_calls = tool_policy.max_identical_tool_calls;
         state.max_tools_per_turn = tool_policy.max_tools_per_turn;

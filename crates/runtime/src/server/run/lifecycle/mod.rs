@@ -13064,7 +13064,7 @@ impl AgenticRunLifecycleService {
             .expect("generation controls validated during request admission")
             .thinking;
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
+            .tool_policy
             .resolve_for_model(request.model.as_deref());
         AgenticLoopState {
             messages: facts.messages,
@@ -24749,7 +24749,7 @@ impl ServerSubRunExecutor {
         // Sub-agent / delegation path: model comes from the agent profile
         // override, not a request field.
         let runtime_config = astra_config::RuntimeConfig::load();
-        let resolved_tool_policy = runtime_config.tool_selection.resolve_for_model(child_model_name.as_deref());
+        let resolved_tool_policy = runtime_config.tool_policy.resolve_for_model(child_model_name.as_deref());
         let mut effective_inherited_permissions = self.inherited_permissions.clone();
         if config.agent_profile.read_only
             || execution_bindings.as_ref().is_some_and(|snapshot| {

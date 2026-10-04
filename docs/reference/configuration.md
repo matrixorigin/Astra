@@ -139,6 +139,13 @@ Scoped credentials drive login, refresh, memory proxy, explicit tools, recall, e
 
 ### Runtime tuning (optional)
 
+`tool_policy` owns workflow guard limits and model profiles for root runs,
+children, skill runs and automatic model changes. The duplicate `tool_selection`
+configuration section is retired. The default per-round tool limit is 100;
+built-in Opus, Sonnet-4, Haiku and GPT-5 profiles use 128, 100, 48 and 128.
+Explicit `tool_policy.model_profiles` take precedence over built-in profiles.
+
+
 Runtime configuration exposes controls consumed by execution: compression,
 retrieval, tool policy and tracing. The retired `verification`,
 `memory_pressure`, `context_window` and `token_budget` sections are not supported.

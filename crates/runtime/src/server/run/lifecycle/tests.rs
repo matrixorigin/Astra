@@ -25973,6 +25973,53 @@ fn build_initial_state_binds_root_observer_to_request_agent() {
 }
 
 #[test]
+#[serial_test::serial]
+fn build_initial_state_uses_the_displayed_tool_execution_policy() {
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(root.path().join("config")).unwrap();
+    std::fs::write(
+        root.path().join("config/runtime.toml"),
+        r#"
+        [[tool_policy.model_profiles]]
+        model_match = "custom-workflow-policy-regression"
+        max_identical_tool_calls = 7
+        max_tools_per_turn = 9
+        max_consecutive_empty_name = 4
+    "#,
+    )
+    .unwrap();
+    let _root = EnvVarGuard::set("ASTRA_LOCAL_STATE_ROOT", root.path().to_str().unwrap());
+    let svc = test_service();
+    for (model, expected) in [
+        (None, (3, 100, 3)),
+        (Some("claude-opus-4-7"), (4, 128, 3)),
+        (Some("claude-haiku-4-5"), (2, 48, 2)),
+        (Some("custom-workflow-policy-regression"), (7, 9, 4)),
+    ] {
+        let mut request = test_request("inspect the workspace");
+        request.model = model.map(str::to_owned);
+        let state = svc.build_initial_state(
+            "test-user",
+            &request,
+            "policy-session",
+            "policy-run",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            (
+                state.max_identical_tool_calls,
+                state.max_tools_per_turn,
+                state.max_consecutive_empty_name
+            ),
+            expected,
+            "model {model:?} must use the canonical workflow policy",
+        );
+    }
+}
+
+#[test]
 fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     let svc = test_service();
     let request = test_request("current authorization, not a new user turn");

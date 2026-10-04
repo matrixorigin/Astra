@@ -7001,6 +7001,7 @@ mod resume_tests {
         for invalid in [
             r#"{"verification":{"strictness":0.8}}"#,
             r#"{"token_budget":{"max_turn_input_tokens":16000}}"#,
+            r#"{"tool_selection":{"max_tools_per_turn":15}}"#,
             r#"{"compression":{"compression_threshold":1.1}}"#,
         ] {
             let session_id = format!("resume-invalid-config-{}", uuid::Uuid::new_v4());

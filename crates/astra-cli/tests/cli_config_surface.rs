@@ -294,6 +294,7 @@ fn retired_controls_are_absent_and_rejected_at_configuration_entrypoints() {
         "memory_pressure",
         "context_window",
         "token_budget",
+        "tool_selection",
     ] {
         assert!(serialized.get(section).is_none());
         assert!(
@@ -315,6 +316,7 @@ fn retired_controls_are_absent_and_rejected_at_configuration_entrypoints() {
         "context_window.compression_threshold_min",
         "token_budget.max_turn_input_tokens",
         "token_budget.tools_reserve",
+        "tool_selection.max_tools_per_turn",
     ] {
         assert!(apply_edit(config.clone(), path, serde_json::json!(0.8)).is_err());
         let mut candidate = config.clone();

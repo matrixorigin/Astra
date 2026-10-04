@@ -999,7 +999,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         // Resolve per-model workflow-guard policy before `effective_model` is
         // consumed by `.with_model(...)` below.
         let runtime_config = astra_config::RuntimeConfig::load();
-        let resolved_tool_policy = runtime_config.tool_selection.resolve_for_model(effective_model.as_deref());
+        let resolved_tool_policy = runtime_config.tool_policy.resolve_for_model(effective_model.as_deref());
 
         // Build the host for the sub-run.
         let mut builder = ServerAgenticLoopHostBuilder::new(
@@ -1349,14 +1349,24 @@ mod tests {
         const SECRET: &str = "FIRST_FORK_ONLY_FILE_EVIDENCE";
         const TASK: &str = "Explain the supplied facts without making changes.";
         let workspace = tempfile::TempDir::new().unwrap();
-        std::fs::write(workspace.path().join("facts.txt"), SECRET).unwrap();
+        // Exceed the retired selection policy's 15-call cap through actual execution.
+        let reads: Vec<_> = (0..16)
+            .map(|index| {
+                let path = format!("facts-{index}.txt");
+                std::fs::write(workspace.path().join(&path), format!("{SECRET}-{index}")).unwrap();
+                let id = if index == 0 {
+                    "first-fork-read".to_string()
+                } else {
+                    format!("first-fork-read-{index}")
+                };
+                json!({"id":id,"type":"function","function":{"name":"read_file",
+                "arguments":json!({"path":path}).to_string()}})
+            })
+            .collect();
         let allowed_tools = vec!["read_file".to_string()];
         let read = ProviderResponse::OpenAi(json!({
             "id":"fork-first-read","model":"genesis-wire-model",
-            "choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{
-                "id":"first-fork-read","type":"function","function":{"name":"read_file",
-                    "arguments":json!({"path":"facts.txt"}).to_string()}
-            }]},"finish_reason":"tool_calls"}],
+            "choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":reads},"finish_reason":"tool_calls"}],
             "usage":{"prompt_tokens":17,"completion_tokens":5,"total_tokens":22}
         }));
         let gateway = ProviderGateway::start(vec![ProviderScript::new(
@@ -1520,20 +1530,19 @@ mod tests {
         let requests = gateway.requests.lock().await;
         assert_eq!(requests.len(), 3);
         let first_followup = requests[1].body["messages"].as_array().unwrap();
-        assert!(
-            first_followup
-                .iter()
-                .any(|message| message["role"] == "tool"
-                    && message["tool_call_id"] == "first-fork-read"
-                    && message["content"]
-                        .as_str()
-                        .is_some_and(|content| content.contains(SECRET))),
-            "first fork must consume the actual read result: {:?}",
-            first_followup
-                .iter()
-                .filter(|message| message["role"] == "tool")
-                .collect::<Vec<_>>()
-        );
+        for call in &reads {
+            assert!(
+                first_followup.iter().any(|message| {
+                    message["role"] == "tool"
+                        && message["tool_call_id"] == call["id"]
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains(SECRET))
+                }),
+                "every admitted read must reach the next provider request: {}",
+                call["id"]
+            );
+        }
         assert!(first_followup.iter().any(|message| {
             message["role"] == "assistant"
                 && message["tool_calls"]

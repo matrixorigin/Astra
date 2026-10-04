@@ -5715,7 +5715,7 @@ pub fn make_test_loop_state() -> AgenticLoopState {
 
 /// **Test-only.** Like [`make_test_loop_state`], but resolves workflow-guard
 /// thresholds (`max_identical_tool_calls`, `max_tools_per_turn`) through
-/// [`astra_config::runtime_config::ToolSelectionConfig::resolve_for_model`], so a
+/// [`astra_config::runtime_config::ToolPolicyConfig::resolve_for_model`], so a
 /// request carrying a specific model id sees that model's profile.
 #[doc(hidden)]
 pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {

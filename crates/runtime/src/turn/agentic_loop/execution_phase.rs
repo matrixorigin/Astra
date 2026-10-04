@@ -9768,7 +9768,7 @@ pub(crate) const PARALLEL_BATCHING_FORCE_MARKER: &str = "## ⤴ Parallel Batchin
 /// Trailing single-tool-round streak length at which the soft prompt nudge
 /// (=6) escalates into typed advisory evidence.
 /// Default for the threshold; the actual value used at runtime flows through
-/// `ToolSelectionConfig::effective_parallel_batching_force_streak` (and
+/// `ToolPolicyConfig::effective_parallel_batching_force_streak` (and
 /// per-model overrides via `ModelPolicyProfile`).
 /// Must match `effective_parallel_batching_force_streak`'s zero-default.
 #[cfg(test)]
@@ -9855,7 +9855,7 @@ fn build_circuit_breaker_signal(
 
 pub(crate) const CACHE_WASTE_MARKER: &str = "## ⤴ Repeated Cached Tool Calls Detected";
 /// Default cache-waste midloop threshold. Used in tests; production code
-/// reads from `ToolSelectionConfig::effective_cache_waste_midloop_threshold()`.
+/// reads from `ToolPolicyConfig::effective_cache_waste_midloop_threshold()`.
 #[cfg(test)]
 pub(crate) const CACHE_WASTE_MIDLOOP_THRESHOLD: usize = 3;
 

@@ -44701,7 +44701,7 @@ mod tests {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.semantic_dedup = astra_text_utils::semantic_dedup::SemanticDedup::new(0.75);
         state.max_identical_tool_calls = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
+            .tool_policy
             .effective_max_identical_calls();
         state.max_tools_per_turn = 15;
         state.max_consecutive_empty_name = 3;
