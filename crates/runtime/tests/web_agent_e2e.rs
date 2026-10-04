@@ -2190,7 +2190,8 @@ async fn web_agent_parallel_direct_spawns_with_invalid_assessment_fail_closed() 
             )
         })
         .collect();
-    let (app,gateway,inference)=build_native_test_app(vec![ProviderScript::new("parent actual execution", |request| primary_request_for(request,"Use two independent child agents and combine their findings.") && delegation_assessment(&request.body).is_none(),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("select-agent", "tool_search", json!({"query": "select:agent"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":calls},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Continuing without unauthorized parallel children.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))]),ProviderScript::new("canonical delegation assessment", |request| request.path=="/v1/chat/completions" && delegation_assessment(&request.body).is_some(),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"invalid assessment"},"finish_reason":"stop"}],"usage":{"prompt_tokens":32,"completion_tokens":8,"total_tokens":40}}))])]).await;
+    let invalid_assessment = json!({"choices":[{"index":0,"message":{"role":"assistant","content":"invalid assessment"},"finish_reason":"stop"}],"usage":{"prompt_tokens":32,"completion_tokens":8,"total_tokens":40}});
+    let (app,gateway,inference)=build_native_test_app(vec![ProviderScript::new("parent actual execution", |request| primary_request_for(request,"Use two independent child agents and combine their findings.") && delegation_assessment(&request.body).is_none(),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("select-agent", "tool_search", json!({"query": "select:agent"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":calls},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Continuing without unauthorized parallel children.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))]),ProviderScript::new("canonical delegation assessment", |request| request.path=="/v1/chat/completions" && delegation_assessment(&request.body).is_some(),(0..2).map(|_| ProviderResponse::OpenAi(invalid_assessment.clone())).collect())]).await;
     let events = chat_stream_collect(&app, json!({
         "message": "Use two independent child agents and combine their findings.","execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "context": {
@@ -2205,7 +2206,10 @@ async fn web_agent_parallel_direct_spawns_with_invalid_assessment_fail_closed() 
             .and_then(|result| serde_json::from_str::<Value>(result).ok())
             .expect("direct spawn must return a structured rejection");
         assert_eq!(result["status"], "failed");
-        assert_eq!(result["error_kind"], "delegation_model_scope_unresolved");
+        assert_eq!(
+            result["error_kind"],
+            "delegation_model_assessment_unavailable"
+        );
         assert_eq!(result["advisory"]["executed"], false);
     }
     assert!(find_event_type(&events, "agent_spawned").is_empty());
@@ -2220,8 +2224,17 @@ async fn web_agent_parallel_direct_spawns_with_invalid_assessment_fail_closed() 
 
     gateway.assert_complete();
     inference.assert_quiescent();
-    assert_eq!(gateway.requests.lock().await.len(), 4);
-    assert_eq!(inference.attempt_count(), 4);
+    let requests = gateway.requests.lock().await;
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| delegation_assessment(&request.body).is_some())
+            .count(),
+        2,
+        "the whole spawn batch shares one assessment and one bounded repair"
+    );
+    assert_eq!(inference.attempt_count(), 5);
 }
 
 #[tokio::test]
@@ -2474,6 +2487,7 @@ async fn discovery_only_child_keeps_native_tool_and_first_request_budget() {
     ]).await;
     let response = chat_stream_start(&app, json!({
         "message":ROOT,
+        "allow_skills":[],
         "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "workspace_binding":{"kind":"edge_workspace","display_name":"test workspace","root":"/workspace/astra",
             "source":{"kind":"edge_path","path":"/workspace/astra"},"authority":"read_write"},
