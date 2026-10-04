@@ -5717,8 +5717,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
-    // Load runtime config once per round for all mid-loop guards below.
-    let tool_cfg = &astra_config::runtime_config::RuntimeConfig::load().tool_policy;
+    // Resolve from this execution's selected policy without round-local I/O.
+    let tool_cfg = &state.admitted_tool_policy;
     let resolved_tool_policy =
         tool_cfg.resolve_for_model(state.context_manifest_model_name.as_deref());
     let parallel_batching_force_threshold =
@@ -26291,54 +26291,38 @@ mod tests {
     /// should_emit_parallel_batching_advisory(_, threshold)`. A regression that
     /// re-routes the guard back to `effective_parallel_batching_force_streak`
     /// (model-blind) would silently break this.
-    #[test]
-    fn parallel_batching_force_uses_resolved_per_model_threshold() {
-        // Configure a user profile well above the global default and nudge
-        // threshold, so a default-length streak should NOT fire under this
-        // profile but WOULD fire under the global default.
-        let mut cfg = astra_config::runtime_config::ToolPolicyConfig::default();
-        cfg.model_profiles
-            .push(astra_config::runtime_config::ModelPolicyProfile {
-                model_match: "haiku".to_string(),
-                parallel_batching_force_streak: 11,
-                ..Default::default()
+    #[tokio::test]
+    async fn parallel_batching_force_uses_resolved_per_model_threshold() {
+        for (streak, should_emit) in [(8, false), (11, true)] {
+            let mut state = make_state();
+            state.message = "explore the codebase".into();
+            state.user_intent = state.message.clone();
+            state.context_manifest_model_name = Some("claude-haiku-4-5".into());
+            state.admitted_tool_policy.model_profiles =
+                vec![astra_config::runtime_config::ModelPolicyProfile {
+                    model_match: "haiku".into(),
+                    parallel_batching_force_streak: 11,
+                    ..Default::default()
+                }];
+            for _ in 0..streak {
+                push_single_tool_round(&mut state);
+            }
+            let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))]);
+            execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
+                .await
+                .unwrap();
+            let delivered = host.executed_volatile[0].iter().any(|entry| {
+                entry.kind == VolatileKind::BehaviorAdvisory
+                    && entry.payload["schema"] == "runtime_advisory.v1"
+                    && entry.payload["evidence"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(PARALLEL_BATCHING_FORCE_MARKER))
             });
-        let policy = cfg.resolve_for_model(Some("us.anthropic.claude-haiku-4-5-20251001-v1:0"));
-        assert_eq!(policy.parallel_batching_force_streak, 11);
-
-        let global_default = cfg.effective_parallel_batching_force_streak() as usize;
-        assert!(global_default < policy.parallel_batching_force_streak as usize);
-
-        // Build a state with a streak equal to the global default.
-        let mut state = make_state();
-        state.message = "explore the codebase".into();
-        state.user_intent = state.message.clone();
-        for _ in 0..global_default {
-            push_single_tool_round(&mut state);
+            assert_eq!(
+                delivered, should_emit,
+                "streak={streak} must use the admitted model policy"
+            );
         }
-
-        // Resolved per-model threshold (=11) must suppress the advisory…
-        assert!(
-            !should_emit_parallel_batching_advisory(
-                &state,
-                policy.parallel_batching_force_streak as usize
-            ),
-            "streak={global_default} must NOT fire under per-model force=11"
-        );
-
-        // …whereas the model-blind global path would fire. This is the
-        // actual regression target: if someone re-routes the guard back to
-        // `effective_parallel_batching_force_streak`, the second assertion
-        // would still pass but the first would change behavior — pinning
-        // both makes the wiring explicit.
-        assert!(
-            should_emit_parallel_batching_advisory(
-                &state,
-                cfg.effective_parallel_batching_force_streak() as usize
-            ),
-            "streak={global_default} SHOULD fire at the global default — sanity check that \
-             the test exercises the right axis"
-        );
     }
 
     /// Per-profile clamp invariant: a user that sets

@@ -744,6 +744,7 @@ pub(crate) async fn stream_chat_sse(
                 .unwrap_or_default(),
         );
     let mut state = AgenticLoopState {
+        admitted_tool_policy: tool_policy_config.clone(),
         evaluation_thresholds:
             astra_runtime::turn::runtime_policy::evaluation_thresholds_from_policy(
                 tool_policy_config,

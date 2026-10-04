@@ -25990,6 +25990,7 @@ fn build_initial_state_uses_the_displayed_tool_execution_policy() {
     .unwrap();
     let _root = EnvVarGuard::set("ASTRA_LOCAL_STATE_ROOT", root.path().to_str().unwrap());
     let svc = test_service();
+    let mut selected_state = None;
     for (model, expected) in [
         (None, (3, 100, 3)),
         (Some("claude-opus-4-7"), (4, 128, 3)),
@@ -26016,7 +26017,45 @@ fn build_initial_state_uses_the_displayed_tool_execution_policy() {
             expected,
             "model {model:?} must use the canonical workflow policy",
         );
+        selected_state = Some(state);
     }
+    std::fs::write(
+        root.path().join("config/runtime.toml"),
+        r#"
+        [[tool_policy.model_profiles]]
+        model_match = "custom-workflow-policy-regression"
+        max_identical_tool_calls = 11
+        max_tools_per_turn = 13
+        max_consecutive_empty_name = 6
+    "#,
+    )
+    .unwrap();
+    let old = selected_state.unwrap();
+    assert_eq!(
+        old.admitted_tool_policy
+            .resolve_for_model(Some("custom-workflow-policy-regression"))
+            .max_tools_per_turn,
+        9
+    );
+    let mut request = test_request("new execution");
+    request.model = Some("custom-workflow-policy-regression".into());
+    let new = svc.build_initial_state(
+        "test-user",
+        &request,
+        "new-policy-session",
+        "new-policy-run",
+        None,
+        None,
+        None,
+    );
+    assert_eq!(
+        (
+            new.max_identical_tool_calls,
+            new.max_tools_per_turn,
+            new.max_consecutive_empty_name
+        ),
+        (11, 13, 6)
+    );
 }
 
 #[test]
@@ -26054,6 +26093,8 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
                 user_intent_digest: "original-digest".into(),
             },
         };
+    facts.admitted_tool_policy.max_tools_per_turn = 41;
+    facts.admitted_tool_policy.search_fanout_eval_threshold = 99;
     facts.original.evaluation_thresholds.search_fanout = 37;
     facts.original.session_turn = 7;
     facts.original.canonical_turn_chain_id = Some("original-chain".to_string());
@@ -26171,6 +26212,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     assert_eq!(state.evaluation_thresholds.search_fanout, 37);
     assert_eq!(state.messages, messages);
     assert_eq!(state.message, "original task");
+    assert_eq!(state.max_tools_per_turn, 41);
     assert_eq!(state.user_intent, "original structured intent");
     assert_eq!(
         state

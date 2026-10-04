@@ -4740,6 +4740,7 @@ struct PreparedAgentBindingLoopContext {
 /// Validated execution facts supplied to the shared loop assembler.
 /// This is not a serialized checkpoint and must not acquire a Default fallback.
 struct LoopExecutionFacts {
+    admitted_tool_policy: astra_config::runtime_config::ToolPolicyConfig,
     original: crate::turn::agentic_loop::host::OriginalLoopExecutionFacts,
     messages: Vec<Value>,
     tool_ledger_receipt: crate::turn::agentic_loop::host::ToolLedgerReceiptAccumulator,
@@ -13015,6 +13016,7 @@ impl AgenticRunLifecycleService {
                 provider_adaptation: Default::default(),
                 skill_produced_output: false,
             },
+            admitted_tool_policy: admitted_runtime_config.tool_policy,
             stall: Default::default(),
             user_intents: Default::default(),
             hooks: StopHookState {
@@ -13063,10 +13065,8 @@ impl AgenticRunLifecycleService {
         let thinking_config = Self::root_generation_controls(request)
             .expect("generation controls validated during request admission")
             .thinking;
-        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_policy
-            .resolve_for_model(request.model.as_deref());
         AgenticLoopState {
+            evaluation_thresholds: facts.original.evaluation_thresholds,
             messages: facts.messages,
             volatile_pending: facts.original.pending_context,
             current_session_id: Some(session_id.to_string()),
@@ -13180,9 +13180,9 @@ impl AgenticRunLifecycleService {
             ..AgenticLoopState::fresh(
                 facts.step_recorder,
                 facts.original.agentic_turn_budget,
-                &resolved_tool_policy,
+                facts.admitted_tool_policy,
+                request.model.as_deref(),
                 astra_turn_types::InferencePurpose::PrimaryAgent,
-                facts.original.evaluation_thresholds,
                 astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             )
         }
@@ -24748,8 +24748,7 @@ impl ServerSubRunExecutor {
 
         // Sub-agent / delegation path: model comes from the agent profile
         // override, not a request field.
-        let runtime_config = astra_config::RuntimeConfig::load();
-        let resolved_tool_policy = runtime_config.tool_policy.resolve_for_model(child_model_name.as_deref());
+        let admitted_tool_policy = astra_config::RuntimeConfig::load().tool_policy;
         let mut effective_inherited_permissions = self.inherited_permissions.clone();
         if config.agent_profile.read_only
             || execution_bindings.as_ref().is_some_and(|snapshot| {
@@ -24851,9 +24850,9 @@ impl ServerSubRunExecutor {
                     &config.run_id,
                 ),
                 agentic_turn_budget,
-                &resolved_tool_policy,
+                admitted_tool_policy,
+                child_model_name.as_deref(),
                 astra_turn_types::InferencePurpose::SubAgent,
-                crate::turn::runtime_policy::evaluation_thresholds_from_policy(&runtime_config.tool_policy),
                 astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             )
         };

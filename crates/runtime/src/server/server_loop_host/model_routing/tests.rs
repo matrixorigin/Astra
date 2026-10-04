@@ -340,6 +340,16 @@ async fn fixture() -> (
 #[tokio::test]
 async fn auto_choice_is_durable_idempotent_and_restored_after_policy_change() {
     let (catalog, engine, mut first, mut state) = fixture().await;
+    state.admitted_tool_policy.model_profiles.push(
+        astra_config::runtime_config::ModelPolicyProfile {
+            model_match: "economy".into(),
+            max_identical_tool_calls: 7,
+            max_tools_per_turn: 9,
+            max_consecutive_empty_name: 4,
+            ..Default::default()
+        },
+    );
+    state.evaluation_thresholds.search_fanout = 37;
     // Repinning must replace the previous model's limits, not retain them.
     state.max_identical_tool_calls = 71;
     state.max_tools_per_turn = 73;
@@ -364,18 +374,15 @@ async fn auto_choice_is_durable_idempotent_and_restored_after_policy_change() {
         state.runtime_manifest.as_ref().unwrap()["model_resolution"]["model"],
         "economy"
     );
-    let policy = astra_config::RuntimeConfig::cached()
-        .tool_policy
-        .resolve_for_model(state.context_manifest_model_name.as_deref());
     assert_eq!(
-        state.max_identical_tool_calls,
-        policy.max_identical_tool_calls
+        (
+            state.max_identical_tool_calls,
+            state.max_tools_per_turn,
+            state.max_consecutive_empty_name
+        ),
+        (7, 9, 4)
     );
-    assert_eq!(state.max_tools_per_turn, policy.max_tools_per_turn);
-    assert_eq!(
-        state.max_consecutive_empty_name,
-        policy.max_consecutive_empty_name
-    );
+    assert_eq!(state.evaluation_thresholds.search_fanout, 37);
     let saved = engine
         .load_run_event_by_idempotency_key(
             "router-user",

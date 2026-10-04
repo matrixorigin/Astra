@@ -269,6 +269,7 @@ mod tests {
 
     fn test_state(message: &str) -> AgenticLoopState {
         AgenticLoopState {
+            admitted_tool_policy: Default::default(),
             evaluation_thresholds: Default::default(),
             messages: vec![json!({"role": "user", "content": message})],
             run_transcript_capture: None,

@@ -996,10 +996,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             parent_recursion_depth,
         );
 
-        // Resolve per-model workflow-guard policy before `effective_model` is
-        // consumed by `.with_model(...)` below.
-        let runtime_config = astra_config::RuntimeConfig::load();
-        let resolved_tool_policy = runtime_config.tool_policy.resolve_for_model(effective_model.as_deref());
+        // Select the policy once for this skill execution.
+        let admitted_tool_policy = astra_config::RuntimeConfig::load().tool_policy;
 
         // Build the host for the sub-run.
         let mut builder = ServerAgenticLoopHostBuilder::new(
@@ -1185,9 +1183,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             ..AgenticLoopState::fresh(
                 step_recorder,
                 agentic_turn_budget,
-                &resolved_tool_policy,
+                admitted_tool_policy,
+                effective_model.as_deref(),
                 astra_turn_types::InferencePurpose::SubAgent,
-                crate::turn::runtime_policy::evaluation_thresholds_from_policy(&runtime_config.tool_policy),
                 astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             )
         };

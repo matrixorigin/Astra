@@ -144,6 +144,10 @@ children, skill runs and automatic model changes. The duplicate `tool_selection`
 configuration section is retired. The default per-round tool limit is 100;
 built-in Opus, Sonnet-4, Haiku and GPT-5 profiles use 128, 100, 48 and 128.
 Explicit `tool_policy.model_profiles` take precedence over built-in profiles.
+Each execution selects its tool policy once. Subsequent rounds and automatic
+model changes use that selected policy; edits apply to newly admitted executions.
+Child and skill executions select their own policy. This does not change the
+process-level selection of their Server execution-round ceilings.
 
 
 Runtime configuration exposes controls consumed by execution: compression,

@@ -3468,6 +3468,8 @@ impl ToolLedgerReceiptAccumulator {
 }
 
 pub struct AgenticLoopState {
+    /// Selected once for this execution; model changes resolve against this input.
+    pub admitted_tool_policy: astra_config::runtime_config::ToolPolicyConfig,
     /// Fixed for this execution, including cooperative owner handoff.
     pub evaluation_thresholds: astra_turn_core::evaluation::EvaluationThresholds,
     // ── Message context ──
@@ -3970,12 +3972,16 @@ impl AgenticLoopState {
     pub fn fresh(
         step_recorder: StepRecorder,
         agentic_turn_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
-        policy: &astra_config::runtime_config::EffectiveToolPolicy,
+        admitted_tool_policy: astra_config::runtime_config::ToolPolicyConfig,
+        model: Option<&str>,
         inference_purpose: astra_turn_types::InferencePurpose,
-        evaluation_thresholds: astra_turn_core::evaluation::EvaluationThresholds,
         api: astra_thin_client::ThinClient,
     ) -> Self {
+        let policy = admitted_tool_policy.resolve_for_model(model);
+        let evaluation_thresholds =
+            crate::turn::runtime_policy::evaluation_thresholds_from_policy(&admitted_tool_policy);
         Self {
+            admitted_tool_policy,
             evaluation_thresholds,
             messages: Vec::new(),
             run_transcript_capture: None,
@@ -5719,9 +5725,7 @@ pub fn make_test_loop_state() -> AgenticLoopState {
 /// request carrying a specific model id sees that model's profile.
 #[doc(hidden)]
 pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
-    let policy = astra_config::runtime_config::RuntimeConfig::load()
-        .tool_policy
-        .resolve_for_model(model);
+    let policy = astra_config::runtime_config::RuntimeConfig::load().tool_policy;
     AgenticLoopState {
         max_turns: 10,
         remaining_turns: 10,
@@ -5734,9 +5738,9 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         ..AgenticLoopState::fresh(
             StepRecorder::new("test-user", "test-session", "test-task"),
             TaskExecutionProfile::default().agentic_turn_budget,
-            &policy,
+            policy,
+            model,
             astra_turn_types::InferencePurpose::PrimaryAgent,
-            Default::default(),
             astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
         )
     }
