@@ -12345,8 +12345,11 @@ fn build_durable_event_pressure_batch(
         .iter()
         .map(durable_run_event_estimated_bytes)
         .sum::<usize>();
-    let budgeted_events =
-        enforce_durable_run_event_batch_budget_with_budget(durable_candidates, budget);
+    let budgeted_events = enforce_durable_run_event_batch_budget_with_budget(
+        durable_candidates,
+        budget,
+        |_, summary| summary,
+    );
     let budgeted_bytes = budgeted_events
         .iter()
         .map(durable_run_event_estimated_bytes)
@@ -14975,28 +14978,34 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
         )
         .await
         .expect("pause child before settlement");
+    let mut host_events = vec![
+        json!({
+            "type": "tool_call_end",
+            "call_id": "edge-child-call",
+            "status": "completed",
+            "transport": "edge_ledger",
+            "_astra_durable_event_committed": true,
+        }),
+        json!({
+            "type": "agent_communication",
+            "schema_version": "astra.agent_communication.v1",
+            "direction": "received", "message_id": "answer-1",
+            "observed_by": {"run_id": "paused-child", "agent_id": "child"},
+            "from": {"run_id": "session-1", "agent_id": "root"},
+            "to": {"kind": "direct", "address": {"run_id": "paused-child", "agent_id": "child"}},
+            "payload_kind": "response", "related_message_id": "question-1",
+            "correlation_id": "question-1", "response_accepted": true,
+            "timestamp_ms": 1,
+        }),
+    ];
+    host_events.extend(
+        (0..=MAX_DURABLE_RUN_EVENT_BATCH_ROWS)
+            .map(|index| explain_turn_fact("paused-child", &format!("paused-fact-{index}"))),
+    );
     let terminals = durable_subrun_host_terminal_events(
-        vec![
-            json!({
-                "type": "tool_call_end",
-                "call_id": "edge-child-call",
-                "status": "completed",
-                "transport": "edge_ledger",
-                "_astra_durable_event_committed": true,
-            }),
-            json!({
-                "type": "agent_communication",
-                "schema_version": "astra.agent_communication.v1",
-                "direction": "received", "message_id": "answer-1",
-                "observed_by": {"run_id": "paused-child", "agent_id": "child"},
-                "from": {"run_id": "session-1", "agent_id": "root"},
-                "to": {"kind": "direct", "address": {"run_id": "paused-child", "agent_id": "child"}},
-                "payload_kind": "response", "related_message_id": "question-1",
-                "correlation_id": "question-1", "response_accepted": true,
-                "timestamp_ms": 1,
-            }),
-        ],
+        host_events,
         Some(authority.owner_generation),
+        "paused-child",
     );
     let mut progress = terminals[1].clone();
     progress["payload_kind"] = json!("progress");
@@ -15004,6 +15013,7 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
         durable_subrun_host_terminal_events(
             vec![progress, json!({"type": "agent_communication"})],
             Some(authority.owner_generation),
+            "child-run",
         )
         .is_empty()
     );
@@ -15056,6 +15066,42 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
     assert_eq!(communication[0]["related_message_id"], "question-1");
     assert_eq!(communication[0]["observed_by"]["run_id"], "paused-child");
     assert_eq!(communication[0]["from"]["run_id"], "session-1");
+    let public = crate::server::run::handlers::transform_stream_run_events_for_client(
+        "paused-child",
+        durable.events.clone(),
+    );
+    assert!(
+        public
+            .iter()
+            .filter(|event| matches!(
+                event["type"].as_str(),
+                Some("explain_analyze" | "stream_gap")
+            ))
+            .all(|event| event.get("idempotency_key").is_none())
+    );
+    let facts = public
+        .iter()
+        .filter_map(|event| astra_turn_types::decode_explain_analyze_wire(event).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(facts.len(), MAX_DURABLE_RUN_EVENT_BATCH_ROWS - 3);
+    assert!(facts.iter().all(|fact| fact.run_id == "paused-child"));
+    assert_eq!(
+        facts
+            .iter()
+            .map(|fact| &fact.event_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        facts.len()
+    );
+    let gaps = public
+        .iter()
+        .filter(|event| event["type"] == "stream_gap")
+        .collect::<Vec<_>>();
+    assert_eq!(gaps.len(), 1, "settlement retry must not duplicate the gap");
+    assert_eq!(gaps[0]["explain_analyze_recovered"], false);
+    assert_eq!(gaps[0]["dropped_event_count"], 4);
+    assert_eq!(gaps[0]["run_id"], "paused-child");
+    assert_eq!(gaps[0]["repair"], "refresh_run_snapshot");
     assert!(
         ServerSubRunExecutor::persist_durable_subrun_tool_terminals(
             &run_engine,
@@ -15119,6 +15165,7 @@ async fn delegated_subrun_waiting_settlement_orders_tool_terminal_before_partial
             "transport": "edge_ledger",
         })],
         Some(authority.owner_generation),
+        "child-run",
     );
     assert_eq!(
         ServerSubRunExecutor::persist_durable_subrun_tool_terminals(
@@ -15204,6 +15251,7 @@ async fn delegated_subrun_retries_active_event_index_cas_loss_without_dropping_t
             "transport": "edge_ledger",
         })],
         Some(authority.owner_generation),
+        "child-run",
     );
 
     assert_eq!(
@@ -15283,6 +15331,7 @@ async fn delegated_subrun_cancel_wins_generation_fenced_terminal_append() {
             "transport": "edge_ledger",
         })],
         Some(authority.owner_generation),
+        "child-run",
     );
 
     assert_eq!(
@@ -20014,7 +20063,8 @@ fn explain_recovery_gap_survives_terminal_batch_compaction() {
         "repair": "refresh_run_snapshot"});
     events.push(gap.clone());
     events.push(json!({"type": "run_finished", "status": "completed"}));
-    let retained = enforce_durable_run_event_batch_budget_with_budget(events, budget);
+    let retained =
+        enforce_durable_run_event_batch_budget_with_budget(events, budget, |_, summary| summary);
     assert!(retained.len() <= budget.row_budget);
     assert!(
         retained.contains(&gap),
@@ -22027,6 +22077,7 @@ fn delegated_subrun_keeps_tool_terminals_for_atomic_settlement() {
             json!({"type": "agent_progress", "status": "working"}),
         ],
         Some(7),
+        "child-run",
     );
 
     assert_eq!(durable.len(), 1);
@@ -22048,10 +22099,85 @@ fn delegated_subrun_keeps_tool_terminals_for_atomic_settlement() {
             json!({"type":"tool_call_end","call_id":"child-call-1","status":"completed"}),
         ],
         Some(7),
+        "child-run",
     );
     assert_eq!(
         reordered[1]["idempotency_key"], durable[0]["idempotency_key"],
         "terminal identity must not depend on retained subset position"
+    );
+
+    let fact = explain_turn_fact("child-run", "finished");
+    let mut started = fact.clone();
+    started["event_id"] = json!("started");
+    started["transition"] = json!("started");
+    started["elapsed_ms"] = json!(0);
+    for field in ["start_elapsed_ms", "duration_ms", "outcome"] {
+        started.as_object_mut().unwrap().remove(field);
+    }
+    let explain = durable_subrun_host_terminal_events(
+        vec![fact.clone(), started.clone()],
+        Some(7),
+        "child-run",
+    );
+    assert_eq!(explain.len(), 2);
+    assert_eq!(explain[0]["idempotency_key"], "subrun-explain:7:finished");
+    assert_eq!(explain[1]["idempotency_key"], "subrun-explain:7:started");
+    let reversed =
+        durable_subrun_host_terminal_events(vec![started, fact.clone()], Some(7), "child-run");
+    assert_eq!(reversed[0], explain[1]);
+    assert_eq!(reversed[1], explain[0]);
+    let public =
+        crate::server::run::handlers::transform_stream_run_events_for_client("child-run", explain);
+    let decoded = astra_turn_types::decode_explain_analyze_wire(&public[0]).unwrap();
+    assert_eq!(decoded.run_id, "child-run");
+    assert_eq!(decoded.event_id, "finished");
+    assert!(astra_turn_types::decode_explain_analyze_wire(&public[1]).is_ok());
+    assert!(public[0].get("idempotency_key").is_none());
+    assert!(durable_subrun_host_terminal_events(vec![fact], Some(7), "other-child").is_empty());
+
+    let facts = (0..=MAX_DURABLE_RUN_EVENT_BATCH_ROWS)
+        .map(|index| explain_turn_fact("child-run", &format!("finished-{index}")))
+        .collect::<Vec<_>>();
+    let budgeted = durable_subrun_host_terminal_events(facts.clone(), Some(7), "child-run");
+    assert_eq!(budgeted.len(), MAX_DURABLE_RUN_EVENT_BATCH_ROWS);
+    let gap = budgeted
+        .iter()
+        .find(|event| durable_event_type(event) == Some("stream_gap"))
+        .unwrap();
+    assert_eq!(gap["data"]["dropped_event_count"], 2);
+    assert_eq!(gap["data"]["explain_analyze_recovered"], false);
+    assert_eq!(
+        durable_subrun_host_terminal_events(facts.clone(), Some(7), "child-run"),
+        budgeted,
+    );
+    let mut changed = facts.clone();
+    changed[0]["event_id"] = json!("different-fact");
+    let other = durable_subrun_host_terminal_events(changed, Some(7), "child-run");
+    let other_gap = other
+        .iter()
+        .find(|event| durable_event_type(event) == Some("stream_gap"))
+        .unwrap();
+    assert_ne!(gap["idempotency_key"], other_gap["idempotency_key"]);
+    assert!(
+        durable_subrun_host_terminal_events(facts, None, "child-run")
+            .iter()
+            .all(|event| event.get("idempotency_key").is_none())
+    );
+    let public =
+        crate::server::run::handlers::transform_stream_run_events_for_client("child-run", budgeted);
+    assert_eq!(
+        public
+            .iter()
+            .filter(|event| event["type"] == "stream_gap")
+            .count(),
+        1
+    );
+    assert_eq!(
+        public
+            .iter()
+            .filter(|event| astra_turn_types::decode_explain_analyze_wire(event).is_ok())
+            .count(),
+        MAX_DURABLE_RUN_EVENT_BATCH_ROWS - 1
     );
 }
 
@@ -22065,6 +22191,7 @@ fn delegated_subrun_same_call_id_conflicting_terminal_fails_exact_reconciliation
             "result": "first outcome",
         })],
         Some(11),
+        "child-run",
     );
     let conflicting = durable_subrun_host_terminal_events(
         vec![json!({
@@ -22074,6 +22201,7 @@ fn delegated_subrun_same_call_id_conflicting_terminal_fails_exact_reconciliation
             "result": "different outcome",
         })],
         Some(11),
+        "child-run",
     );
 
     assert_eq!(
@@ -22083,6 +22211,16 @@ fn delegated_subrun_same_call_id_conflicting_terminal_fails_exact_reconciliation
     let error = durable_subrun_terminal_events_match(&committed, &conflicting)
         .expect_err("conflicting payload under one terminal identity must fail closed");
     assert!(error.contains("conflicting durable facts"), "{error}");
+    let fact = explain_turn_fact("child-run", "same-fact");
+    let committed = durable_subrun_host_terminal_events(vec![fact.clone()], Some(11), "child-run");
+    let mut changed = fact;
+    changed["outcome"] = json!("failed");
+    let conflicting = durable_subrun_host_terminal_events(vec![changed], Some(11), "child-run");
+    assert_eq!(
+        committed[0]["idempotency_key"],
+        conflicting[0]["idempotency_key"]
+    );
+    assert!(durable_subrun_terminal_events_match(&committed, &conflicting).is_err());
 }
 
 #[tokio::test]
@@ -27817,6 +27955,14 @@ fn explain_test_executor(
     executor
 }
 
+fn explain_turn_fact(run_id: &str, event_id: &str) -> Value {
+    json!({"type":"explain_analyze", "schema_version":1,
+        "event_id":event_id, "run_id":run_id, "turn_id":"turn-1", "node_id":"turn",
+        "producer_id":"server", "clock_domain_id":"clock", "kind":"turn",
+        "label":"User turn", "transition":"finished", "elapsed_ms":10,
+        "start_elapsed_ms":0, "duration_ms":10, "outcome":"completed"})
+}
+
 #[tokio::test]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn db_explain_publication_is_discoverable_and_readable() {
@@ -27858,11 +28004,7 @@ async fn db_explain_publication_is_discoverable_and_readable() {
         .unwrap()
         .unwrap()
         .run_generation;
-    let event = json!({"type":"explain_analyze", "schema_version":1,
-        "event_id":"finished", "run_id":run, "turn_id":"turn-1", "node_id":"turn",
-        "producer_id":"server", "clock_domain_id":"clock", "kind":"turn",
-        "label":"User turn", "transition":"finished", "elapsed_ms":10,
-        "start_elapsed_ms":0, "duration_ms":10, "outcome":"completed"});
+    let event = explain_turn_fact(&run, "finished");
     let artifact = crate::server::explain_analyze_artifact::persist_snapshot(
         Some(&pool),
         user,
@@ -29075,7 +29217,11 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
         "transport chunks must stay live-only before DB persistence"
     );
 
-    let budgeted = enforce_durable_run_event_batch_budget_with_budget(durable_candidates, budget);
+    let budgeted = enforce_durable_run_event_batch_budget_with_budget(
+        durable_candidates,
+        budget,
+        |_, summary| summary,
+    );
     assert_eq!(budgeted.len(), budget.row_budget);
     assert!(
         budgeted

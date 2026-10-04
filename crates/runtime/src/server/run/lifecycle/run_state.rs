@@ -464,6 +464,8 @@ pub fn streaming_event_for_persistence(event: &Value) -> bool {
 
 fn durable_agent_communication(event: &Value) -> bool {
     event
+        .get("data")
+        .unwrap_or(event)
         .get("payload_kind")
         .cloned()
         .and_then(|kind| {
@@ -556,12 +558,14 @@ pub fn enforce_durable_run_event_batch_budget(events: Vec<Value>) -> Vec<Value> 
     enforce_durable_run_event_batch_budget_with_budget(
         events,
         DurableRunEventBatchBudget::default(),
+        |_, summary| summary,
     )
 }
 
 pub fn enforce_durable_run_event_batch_budget_with_budget(
     events: Vec<Value>,
     budget: DurableRunEventBatchBudget,
+    map_compaction: impl FnOnce(&[Value], Value) -> Value,
 ) -> Vec<Value> {
     let budget = DurableRunEventBatchBudget::new(budget.row_budget, budget.byte_budget);
     if events.is_empty() {
@@ -581,6 +585,8 @@ pub fn enforce_durable_run_event_batch_budget_with_budget(
         .iter()
         .map(|event| {
             streaming_final_event_for_replay(event)
+                || (durable_event_type(event) == Some("agent_communication")
+                    && durable_agent_communication(event))
                 || matches!(
                     durable_event_type(event),
                     Some("tool_call_end" | "stream_gap")
@@ -650,6 +656,7 @@ pub fn enforce_durable_run_event_batch_budget_with_budget(
         }
     });
 
+    let summary = map_compaction(&events, summary);
     let mut out = Vec::with_capacity(events.len() - dropped_count + 1);
     let mut summary_inserted = false;
     for (idx, event) in events.into_iter().enumerate() {
@@ -917,6 +924,7 @@ mod tests {
         let budgeted = enforce_durable_run_event_batch_budget_with_budget(
             events,
             DurableRunEventBatchBudget::default(),
+            |_, summary| summary,
         );
 
         assert_eq!(budgeted.len(), MAX_DURABLE_RUN_EVENT_BATCH_ROWS);
@@ -951,6 +959,7 @@ mod tests {
         let budgeted = enforce_durable_run_event_batch_budget_with_budget(
             events,
             DurableRunEventBatchBudget::default(),
+            |_, summary| summary,
         );
 
         assert_eq!(budgeted.len(), MAX_DURABLE_RUN_EVENT_BATCH_ROWS);
@@ -985,17 +994,24 @@ mod tests {
     }
 
     #[test]
-    fn durable_run_event_batch_budget_never_compacts_tool_terminals() {
+    fn durable_run_event_batch_budget_never_compacts_tool_terminals_or_messages() {
         let terminal_count = 40;
         let mut events = (0..terminal_count)
             .map(|idx| json!({"type": "tool_call_end", "call_id": format!("call-{idx}")}))
             .collect::<Vec<_>>();
+        let messages = [
+            json!({"type":"agent_communication", "payload_kind":"request"}),
+            json!({"event_type":"agent_communication", "data":{"payload_kind":"response"}}),
+        ];
+        events.extend(messages.iter().cloned());
+        events.push(json!({"type":"agent_communication", "payload_kind":"progress"}));
         events.extend((0..40).map(|idx| json!({"type": "agent_progress", "seq": idx})));
         events.push(json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}));
 
         let budgeted = enforce_durable_run_event_batch_budget_with_budget(
             events,
             DurableRunEventBatchBudget::new(16, MAX_DURABLE_RUN_EVENT_BATCH_BYTES),
+            |_, summary| summary,
         );
 
         assert_eq!(
@@ -1011,6 +1027,27 @@ mod tests {
                 .iter()
                 .any(|event| durable_event_type(event) == Some("run_finished"))
         );
+        assert!(messages.iter().all(|message| budgeted.contains(message)));
+        assert_eq!(
+            budgeted
+                .iter()
+                .filter(|event| durable_event_type(event) == Some("agent_communication"))
+                .count(),
+            messages.len(),
+            "transient progress must not consume the protected message budget"
+        );
+        let terminals = budgeted
+            .into_iter()
+            .filter(|event| durable_event_type(event) == Some("tool_call_end"))
+            .collect::<Vec<_>>();
+        for count in [1, terminal_count] {
+            let retained = enforce_durable_run_event_batch_budget_with_budget(
+                terminals.iter().take(count).cloned().collect(),
+                DurableRunEventBatchBudget::new(16, MIN_DURABLE_RUN_EVENT_BATCH_BYTES),
+                |_, _| panic!("no dropped facts means no compaction work"),
+            );
+            assert_eq!(retained.len(), count);
+        }
     }
 
     #[test]
@@ -1025,6 +1062,7 @@ mod tests {
         let budgeted = enforce_durable_run_event_batch_budget_with_budget(
             events,
             DurableRunEventBatchBudget::default(),
+            |_, summary| summary,
         );
 
         assert_eq!(budgeted.len(), 3);
@@ -1054,6 +1092,7 @@ mod tests {
         let budgeted = enforce_durable_run_event_batch_budget_with_budget(
             events,
             DurableRunEventBatchBudget::new(row_budget, MAX_DURABLE_RUN_EVENT_BATCH_BYTES),
+            |_, summary| summary,
         );
 
         assert_eq!(budgeted.len(), row_budget);

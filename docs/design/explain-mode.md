@@ -449,9 +449,11 @@ recovery. The canonical tool schema and catalog advertise the explicit selector:
 
 Readable discovery fetches the snapshot once and shares validation and the typed
 graph reducer with the canonical handle reader. Raw pages use UTF-8-safe byte
-windows. Byte-window completion is
-separate from capture completeness: partial facts, gaps, truncated coverage and
-unknown usage stay incomplete even after the final byte. Missing, corrupt,
+windows. Child typed facts replay through their own durable run projection;
+compaction emits an unrecovered gap. These facts do not resolve the root's
+`ChildRunIntervals` coverage gap across independent clock domains.
+Byte-window completion is separate from capture completeness: partial facts,
+gaps, truncated coverage and unknown usage stay incomplete even after the final byte. Missing, corrupt,
 expired, mismatched or unavailable selected reports never fall back to older
 reports. Only physical absence may invoke exact completed-run recovery.
 

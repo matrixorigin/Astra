@@ -21671,8 +21671,9 @@ fn server_subrun_waiting_for<'a>(
 fn durable_subrun_host_terminal_events(
     events: Vec<Value>,
     execution_owner_generation: Option<u64>,
+    run_id: &str,
 ) -> Vec<Value> {
-    events
+    let retained = events
         .into_iter()
         .filter_map(|mut event| {
             let (prefix, identity) = match durable_event_type(&event) {
@@ -21700,6 +21701,15 @@ fn durable_subrun_host_terminal_events(
                         .stable_key(),
                     )
                 }
+                Some("explain_analyze") => {
+                    let fact = astra_turn_types::decode_explain_analyze_wire(&event).ok()?;
+                    if fact.run_id != run_id {
+                        return None;
+                    }
+                    let identity = fact.event_id.clone();
+                    event = json!({"event_type":"explain_analyze", "data":fact});
+                    ("subrun-explain", identity)
+                }
                 _ => return None,
             };
             if let Some(object) = event.as_object_mut() {
@@ -21715,7 +21725,32 @@ fn durable_subrun_host_terminal_events(
             }
             Some(event)
         })
-        .collect()
+        .collect();
+    let budget = DurableRunEventBatchBudget::default();
+    enforce_durable_run_event_batch_budget_with_budget(retained, budget, |original, mut summary| {
+        summary["event_type"] = json!("stream_gap");
+        summary["data"]["run_id"] = json!(run_id);
+        summary["data"]["dropped_event_count"] = summary["data"]["dropped_events"].clone();
+        summary["data"]["repair"] = json!("refresh_run_snapshot");
+        summary["data"]["explain_analyze_recovered"] = json!(false);
+        if let Some(generation) = execution_owner_generation {
+            let mut digest = Sha256::new();
+            digest.update(b"astra.subrun-compaction.v1\0");
+            digest.update((budget.row_budget as u64).to_be_bytes());
+            digest.update((budget.byte_budget as u64).to_be_bytes());
+            digest.update((original.len() as u64).to_be_bytes());
+            for event in original {
+                let encoded = astra_core::canonical_json_string(event);
+                digest.update((encoded.len() as u64).to_be_bytes());
+                digest.update(encoded.as_bytes());
+            }
+            summary["idempotency_key"] = json!(format!(
+                "subrun-compaction:{generation}:{:x}",
+                digest.finalize()
+            ));
+        }
+        summary
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25118,6 +25153,7 @@ impl ServerSubRunExecutor {
         let retained_tool_terminals = durable_subrun_host_terminal_events(
             retained_host_events,
             execution_owner_generation,
+            &config.run_id,
         );
         // The thin client owns presentation on the currently attached Edge
         // callback lane, but it does not own durable replay. Commit semantic

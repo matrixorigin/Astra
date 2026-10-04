@@ -19862,14 +19862,15 @@ impl RunStateStore for DatabaseRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
-        if events
+        let keys = events
             .iter()
-            .any(|event| extract_optional_string(event, "idempotency_key").is_none())
-        {
-            return Err(
-                "generation-fenced append requires an idempotency key on every event".to_string(),
-            );
-        }
+            .map(|event| {
+                extract_optional_string(event, "idempotency_key").ok_or_else(|| {
+                    "generation-fenced append requires an idempotency key on every event"
+                        .to_string()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
             .map_err(|source| {
@@ -19899,77 +19900,42 @@ impl RunStateStore for DatabaseRunStateStore {
             return Ok(false);
         }
 
+        let existing_events = self
+            .load_run_control_events_by_keys_tx(
+                &mut tx,
+                user_id,
+                run_id,
+                &keys,
+                "generation_fenced_append_load_idempotency",
+            )
+            .await?
+            .into_iter()
+            .map(|event| (event.idempotency_key, event.payload))
+            .collect::<HashMap<_, _>>();
         let mut events_to_commit = Vec::with_capacity(events.len());
-        for event in events {
-            if let Some(key) = extract_optional_string(event, "idempotency_key") {
-                let existing = sqlx::query(
-                    "SELECT payload_json FROM agent_run_events
-                     WHERE user_id = ? AND run_id = ? AND idempotency_key = ? LIMIT 1",
-                )
-                .bind(user_id)
-                .bind(run_id)
-                .bind(&key)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|source| {
-                    db_error("generation_fenced_append_load_idempotency", run_id, source)
-                        .to_string()
-                })?;
-                if let Some(row) = existing {
-                    let payload_json: String = row.try_get("payload_json").map_err(|source| {
+        let mut staged_keys = HashMap::with_capacity(events.len());
+        for (event, key) in events.iter().zip(keys) {
+            let previous = existing_events
+                .get(&key)
+                .or_else(|| staged_keys.get(&key).map(|&index| &events_to_commit[index]));
+            if let Some(previous) = previous {
+                if !run_events_have_same_immutable_payload(previous, event) {
+                    tx.rollback().await.map_err(|source| {
                         db_error(
-                            "generation_fenced_append_decode_idempotency",
+                            "generation_fenced_append_rollback_immutable_conflict",
                             run_id,
                             source,
                         )
                         .to_string()
                     })?;
-                    let existing: serde_json::Value =
-                        serde_json::from_str(&payload_json).map_err(|source| {
-                            DatabaseRunStateStoreError::Json {
-                                operation: "generation_fenced_append_decode_payload",
-                                entity: run_id.to_string(),
-                                source,
-                            }
-                            .to_string()
-                        })?;
-                    if !run_events_have_same_immutable_payload(&existing, event) {
-                        tx.rollback().await.map_err(|source| {
-                            db_error(
-                                "generation_fenced_append_rollback_immutable_conflict",
-                                run_id,
-                                source,
-                            )
-                            .to_string()
-                        })?;
-                        connection.release();
-                        return Err(format!(
-                            "immutable run event conflict for idempotency key {key}"
-                        ));
-                    }
-                    continue;
+                    connection.release();
+                    return Err(format!(
+                        "immutable run event conflict for idempotency key {key}"
+                    ));
                 }
-                if let Some(staged) = events_to_commit.iter().find(|staged| {
-                    extract_optional_string(staged, "idempotency_key").as_deref()
-                        == Some(key.as_str())
-                }) {
-                    if !run_events_have_same_immutable_payload(staged, event) {
-                        tx.rollback().await.map_err(|source| {
-                            db_error(
-                                "generation_fenced_append_rollback_staged_conflict",
-                                run_id,
-                                source,
-                            )
-                            .to_string()
-                        })?;
-                        connection.release();
-                        return Err(format!(
-                            "immutable run event conflict for idempotency key {key}"
-                        ));
-                    }
-                    continue;
-                }
+                continue;
             }
+            staged_keys.insert(key, events_to_commit.len());
             events_to_commit.push(event.clone());
         }
         if events_to_commit.is_empty() {
@@ -20048,6 +20014,27 @@ impl RunStateStore for DatabaseRunStateStore {
         if let Err(source) = tx.commit().await {
             drop(connection);
             let commit_error = db_error("generation_fenced_append_commit", run_id, source);
+            let keys = event_rows
+                .iter()
+                .map(|event| {
+                    event
+                        .idempotency_key
+                        .clone()
+                        .expect("generation-fenced events validated idempotency keys")
+                })
+                .collect::<Vec<_>>();
+            let durable_hashes = self
+                .load_run_control_events_by_keys(
+                    user_id,
+                    run_id,
+                    &keys,
+                    "generation_fenced_append_reconcile_commit",
+                )
+                .await
+                .map_err(|error| format!("{commit_error}; {error}"))?
+                .into_iter()
+                .map(|event| (event.idempotency_key, event.event_hash))
+                .collect::<HashMap<_, _>>();
             let mut exact = 0usize;
             let mut missing = 0usize;
             for event in &event_rows {
@@ -20055,27 +20042,8 @@ impl RunStateStore for DatabaseRunStateStore {
                     .idempotency_key
                     .as_deref()
                     .expect("generation-fenced events validated idempotency keys");
-                let durable_hash: Option<String> = sqlx::query_scalar(
-                    "SELECT event_hash FROM agent_run_events
-                     WHERE user_id = ? AND run_id = ? AND idempotency_key = ? LIMIT 1",
-                )
-                .bind(user_id)
-                .bind(run_id)
-                .bind(idempotency_key)
-                .fetch_optional(self.pool.get())
-                .await
-                .map_err(|reconcile_source| {
-                    format!(
-                        "{commit_error}; {}",
-                        db_error(
-                            "generation_fenced_append_reconcile_commit",
-                            run_id,
-                            reconcile_source,
-                        )
-                    )
-                })?;
-                match durable_hash {
-                    Some(hash) if hash == event.event_hash => exact += 1,
+                match durable_hashes.get(idempotency_key) {
+                    Some(hash) if hash == &event.event_hash => exact += 1,
                     Some(_) => {
                         return Err(format!(
                             "{commit_error}; immutable run event conflict for idempotency key {}",
