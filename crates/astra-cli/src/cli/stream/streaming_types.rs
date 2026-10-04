@@ -815,9 +815,6 @@ pub(crate) struct StreamResult {
     /// This is the durable fact source for active-run guidance; `final_messages`
     /// is only a prompt projection fallback.
     pub(crate) applied_user_intents: Vec<AppliedStreamUserIntent>,
-    /// Results from background-spawned agents collected after the agentic
-    /// loop ended. Each entry is (agent_id, result_text).
-    pub(crate) background_agent_results: Vec<(String, String)>,
 }
 
 impl StreamResult {
@@ -857,22 +854,6 @@ impl StreamResult {
         event.tool_outcomes = Some(outcomes);
     }
 
-    /// Merge terminal background-agent outputs into the user-facing aggregate
-    /// response used by one-shot CLI and server surfaces.
-    ///
-    /// Interactive turns reconcile the same facts through the root mailbox on
-    /// a later model step. One-shot surfaces have no later step, so leaving the
-    /// drain results only in an internal field would make completed work
-    /// invisible to text consumers.
-    pub(crate) fn integrate_background_agent_results(&mut self) -> Option<String> {
-        let section = format_background_agent_results(&self.background_agent_results)?;
-        if !self.full_text.is_empty() {
-            self.full_text.push_str("\n\n");
-        }
-        self.full_text.push_str(&section);
-        Some(section)
-    }
-
     /// User input that should represent this committed turn in durable history.
     ///
     /// The runtime can apply user guidance while a turn is executing.
@@ -897,21 +878,6 @@ impl StreamResult {
         }
         latest_user_input_from_messages(primary_line, &self.final_messages)
     }
-}
-
-pub(crate) fn format_background_agent_results(results: &[(String, String)]) -> Option<String> {
-    if results.is_empty() {
-        return None;
-    }
-
-    let mut section = String::from("## Background agent results");
-    for (agent_id, result) in results {
-        section.push_str("\n\n### Agent `");
-        section.push_str(agent_id);
-        section.push_str("`\n\n");
-        section.push_str(result.trim());
-    }
-    Some(section)
 }
 
 fn effective_user_input_from_applied_user_intents(
@@ -1638,7 +1604,6 @@ impl Default for StreamResult {
             deferred_tool_activations: Vec::new(),
             run_transcript_messages: Vec::new(),
             applied_user_intents: Vec::new(),
-            background_agent_results: Vec::new(),
         }
     }
 }

@@ -1,20 +1,13 @@
-//! Three surfaces exercised here, all driven by the same motivation:
+//! Two surfaces exercised here, all driven by the same motivation:
 //! operators and scripts must be able to override runtime config without
-//! writing a TOML file on disk, and the `/config` slash view must reflect
-//! the actual budget a turn will see.
+//! writing a TOML file on disk.
 //!
 //! A. `--settings <JSON-or-path>` CLI flag:
 //!    * inline JSON  →  partial overlay onto the resolved RuntimeConfig
 //!    * path-to-file →  read + parse + same overlay semantics
 //!    * malformed    →  surfaces a structured parse error, not a panic
 //!
-//! B. `/config` must show the *effective* `max_turn_input_tokens` that a
-//!    given model will actually see, not only the raw config number.
-//!    Matters because the budget refactor made the effective value model-
-//!    dependent (Sonnet 4.6 gets 800k; 128k-window models get 102k).
-//!    Users should not have to run a code audit to discover that.
-//!
-//! C. `/config edit` — interactive TUI edit flow. Follows the reference agent's
+//! B. `/config edit` — interactive TUI edit flow. Follows the reference agent's
 //!    Config.tsx model: flat list of { id, label, type, value, onChange }
 //!    items, filtered by a search query, dispatched to per-type editors
 //!    (bool toggle / enum select / number input). Per-source snapshot
@@ -28,8 +21,8 @@
 //!    The rendering / keystroke handling is thin glue over these.
 
 use astra_config::config_overlay::{
-    SettingKind, apply_edit, apply_settings_json, build_settings_catalog,
-    effective_budget_for_model, filter_settings, parse_settings_source,
+    RuntimeConfigLayer, SettingKind, apply_edit, build_settings_catalog, filter_settings,
+    parse_settings_source,
 };
 use astra_config::runtime_config::RuntimeConfig;
 
@@ -43,13 +36,13 @@ fn settings_inline_json_partial_overlay() {
     let base = RuntimeConfig::default();
     let original_compression_threshold = base.compression.compression_threshold;
 
-    let json = r#"{"token_budget":{"max_turn_input_tokens":500000}}"#;
-    let overlaid = apply_settings_json(base, json).expect("valid inline JSON");
+    let json = r#"{"memory":{"retrieval_top_k":12}}"#;
+    let overlaid = RuntimeConfigLayer::from_json(json)
+        .unwrap()
+        .apply_to(&base)
+        .expect("valid inline JSON");
 
-    assert_eq!(
-        overlaid.token_budget.max_turn_input_tokens, 500_000,
-        "overlay must apply"
-    );
+    assert_eq!(overlaid.memory.retrieval_top_k, 12, "overlay must apply");
     assert_eq!(
         overlaid.compression.compression_threshold, original_compression_threshold,
         "untouched fields must retain their pre-overlay value"
@@ -62,23 +55,21 @@ fn settings_file_path_reads_and_applies() {
     // recognise it as a file (not as a JSON literal) and return the
     // parsed content.
     let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(
-        tmp.path(),
-        r#"{"token_budget":{"max_turn_input_tokens":123456}}"#,
-    )
-    .unwrap();
+    std::fs::write(tmp.path(), r#"{"memory":{"retrieval_top_k":9}}"#).unwrap();
 
     let raw = parse_settings_source(&tmp.path().to_string_lossy())
         .expect("path-form --settings must read the file");
     let base = RuntimeConfig::default();
-    let overlaid = apply_settings_json(base, &raw).expect("file JSON must apply");
-    assert_eq!(overlaid.token_budget.max_turn_input_tokens, 123456);
+    let overlaid = RuntimeConfigLayer::from_json(&raw)
+        .unwrap()
+        .apply_to(&base)
+        .expect("file JSON must apply");
+    assert_eq!(overlaid.memory.retrieval_top_k, 9);
 }
 
 #[test]
 fn settings_malformed_json_is_structured_error() {
-    let base = RuntimeConfig::default();
-    let err = apply_settings_json(base, "{not valid json").expect_err("must fail");
+    let err = RuntimeConfigLayer::from_json("{not valid json").expect_err("must fail");
     let msg = err.to_string();
     assert!(
         msg.contains("JSON") || msg.contains("parse") || msg.contains("expected"),
@@ -90,43 +81,12 @@ fn settings_malformed_json_is_structured_error() {
 fn parse_settings_source_treats_leading_brace_as_inline() {
     // An operator passing `--settings '{"k":1}'` must NOT have the string
     // misinterpreted as a file path. Heuristic: leading `{` = inline.
-    let raw = parse_settings_source(r#"{"token_budget":{"max_turn_input_tokens":42}}"#)
+    let raw = parse_settings_source(r#"{"memory":{"retrieval_top_k":42}}"#)
         .expect("inline JSON accepted as-is");
     assert!(raw.starts_with('{'));
 }
 
-// ─── B. effective-budget display ─────────────────────────────────────────
-
-#[test]
-fn effective_budget_for_sonnet_4_6_respects_config_cap() {
-    // A 1M-window provider can accept a very large prompt, but the agent's
-    // per-turn working budget is intentionally capped by config by default.
-    let config = RuntimeConfig::default();
-    let shown = effective_budget_for_model(&config, Some("claude-sonnet-4-6"));
-    assert_eq!(
-        shown, config.token_budget.max_turn_input_tokens as u64,
-        "Sonnet 4.6 effective budget should respect the configured cap"
-    );
-}
-
-#[test]
-fn effective_budget_for_unknown_model_falls_back_to_config_value() {
-    let config = RuntimeConfig::default();
-    let shown = effective_budget_for_model(&config, Some("no-such-model-42"));
-    assert_eq!(
-        shown, config.token_budget.max_turn_input_tokens as u64,
-        "unknown model must show the configured fallback"
-    );
-}
-
-#[test]
-fn effective_budget_without_model_returns_configured_default() {
-    let config = RuntimeConfig::default();
-    let shown = effective_budget_for_model(&config, None);
-    assert_eq!(shown, config.token_budget.max_turn_input_tokens as u64);
-}
-
-// ─── C. /config edit pure-model layer ────────────────────────────────────
+// ─── B. /config edit pure-model layer ────────────────────────────────────
 
 #[test]
 fn catalog_includes_knobs_that_motivated_this_refactor() {
@@ -137,10 +97,12 @@ fn catalog_includes_knobs_that_motivated_this_refactor() {
     let items = build_settings_catalog(&config);
     let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
 
+    assert!(
+        !ids.iter().any(|id| id.starts_with("runtime_limits.")),
+        "local editing must not promise control of Server execution rounds"
+    );
+
     for required in [
-        "token_budget.max_turn_input_tokens",
-        "token_budget.system_prompt_reserve",
-        "token_budget.tools_reserve",
         "trace.llm_exchanges",
         "compression.compression_threshold",
         "compression.preserve_recent_turns",
@@ -169,13 +131,12 @@ fn catalog_items_carry_kind_matching_their_concrete_type() {
 
     let budget = items
         .iter()
-        .find(|i| i.id == "token_budget.max_turn_input_tokens")
+        .find(|i| i.id == "memory.retrieval_top_k")
         .expect("must be present");
     match &budget.kind {
-        SettingKind::Number { min, .. } => assert!(
-            *min >= 1000.0,
-            "budget lower bound must not allow values so small the turn cannot run"
-        ),
+        SettingKind::Number { min, .. } => {
+            assert!(*min >= 1.0, "retrieval must select at least one result")
+        }
         other => panic!("budget knob should be Number, got {other:?}"),
     }
 }
@@ -214,11 +175,10 @@ fn filter_settings_matches_on_id_or_label() {
     let config = RuntimeConfig::default();
     let items = build_settings_catalog(&config);
 
-    let hits = filter_settings(&items, "budget");
+    let hits = filter_settings(&items, "memory");
     assert!(
-        hits.iter()
-            .any(|i| i.id == "token_budget.max_turn_input_tokens"),
-        "search for `budget` must surface the main budget knob"
+        hits.iter().any(|i| i.id == "memory.retrieval_top_k"),
+        "search for `memory` must surface the memory budget knob"
     );
     let none = filter_settings(&items, "surely-not-in-any-key-or-label-at-all");
     assert!(
@@ -260,13 +220,9 @@ fn apply_edit_roundtrip_bool_knob() {
 #[test]
 fn apply_edit_roundtrip_number_knob() {
     let config = RuntimeConfig::default();
-    let updated = apply_edit(
-        config,
-        "token_budget.max_turn_input_tokens",
-        serde_json::json!(750_000),
-    )
-    .expect("number edit must succeed");
-    assert_eq!(updated.token_budget.max_turn_input_tokens, 750_000);
+    let updated = apply_edit(config, "memory.retrieval_top_k", serde_json::json!(12))
+        .expect("number edit must succeed");
+    assert_eq!(updated.memory.retrieval_top_k, 12);
 }
 
 #[test]
@@ -333,7 +289,12 @@ fn retired_controls_are_absent_and_rejected_at_configuration_entrypoints() {
     let config = RuntimeConfig::default();
     let serialized = serde_json::to_value(&config).unwrap();
     let catalog = build_settings_catalog(&config);
-    for section in ["verification", "memory_pressure", "context_window"] {
+    for section in [
+        "verification",
+        "memory_pressure",
+        "context_window",
+        "token_budget",
+    ] {
         assert!(serialized.get(section).is_none());
         assert!(
             !catalog
@@ -342,7 +303,7 @@ fn retired_controls_are_absent_and_rejected_at_configuration_entrypoints() {
         );
         let overlay = serde_json::json!({section: {}}).to_string();
         assert!(
-            apply_settings_json(config.clone(), &overlay)
+            RuntimeConfigLayer::from_json(&overlay)
                 .unwrap_err()
                 .to_string()
                 .contains("unknown field")
@@ -352,6 +313,8 @@ fn retired_controls_are_absent_and_rejected_at_configuration_entrypoints() {
         "verification.strictness",
         "memory_pressure.adaptive",
         "context_window.compression_threshold_min",
+        "token_budget.max_turn_input_tokens",
+        "token_budget.tools_reserve",
     ] {
         assert!(apply_edit(config.clone(), path, serde_json::json!(0.8)).is_err());
         let mut candidate = config.clone();

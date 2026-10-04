@@ -45,7 +45,7 @@ use crate::cli::slash::slash_memory::handle_memory_domain_command;
 use crate::cli::slash::slash_messaging::handle_messaging_command;
 use crate::cli::slash::{slash_agent, slash_team, slash_telemetry};
 use crate::cli::stream::streaming_types::{
-    StreamResult, format_background_agent_results, stream_result_from_resumable_turn_failure,
+    StreamResult, stream_result_from_resumable_turn_failure,
 };
 use crate::cli::workspace_inspection::{handle_grep_command, handle_review_command};
 use crate::cli::{diff_presenter, journal_diff, journal_digest, journal_tree, theme};
@@ -871,6 +871,7 @@ async fn execute_repl_bridge_command_impl(
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
     let token = repl_bridge_access_token(slash_cmd, api, profile).await?;
+
     match slash_cmd {
         "/telemetry" => slash_telemetry::handle_telemetry_command(arg, &state),
         "/memory" => {
@@ -1466,9 +1467,7 @@ async fn execute_cli_command_impl(
                 offering_id: effective_offering_id.as_deref(),
                 provider: None,
                 explain: ExplainMode::Off,
-                explain_report_format: astra_config::runtime_config::RuntimeConfig::load()
-                    .explain
-                    .effective_report_format(),
+                runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::load()),
                 render_md: terminal::size().is_ok(),
                 verbose_mode: true,
                 render_policy: crate::cli::stream::stream_render::RenderPolicy::Stream,
@@ -2089,31 +2088,6 @@ async fn execute_cli_command_impl(
                 crate::cli::stream::stream_render::RenderPolicy::Stream
             };
 
-            // One-shot chat uses the same local agent spawner wiring as the
-            // REPL so agent(action='spawn', ...) has the same behavior.
-            let root_agent_id = format!("root-{}", uuid::Uuid::new_v4());
-            let spawner_future = super::agent_runtime::build_one_shot_spawner(
-                api,
-                token.clone(),
-                astra_runtime::skills::default_unified_registry().clone(),
-                session_id.clone(),
-                effective_model.clone(),
-            );
-            let one_shot_spawner = if let Some(deadline) = one_shot_terminal_deadline {
-                tokio::time::timeout_at(deadline, spawner_future)
-                    .await
-                    .map_err(|_| "request wall deadline expired during agent setup".to_string())?
-            } else {
-                spawner_future.await
-            };
-
-            // Keep a clone of the Arc so we can drain background
-            // spawned children before process exit — otherwise
-            // background tasks (the default background-agent mode) get
-            // aborted when main returns, which silently drops any
-            // ForkCacheEvent / child telemetry they would have
-            // emitted on their first response.
-            let spawner_handle_for_drain = one_shot_spawner.clone();
             let (stream_event_tx, stream_event_writer) = if let Some(path) =
                 args.stream_events.as_deref()
             {
@@ -2144,16 +2118,14 @@ async fn execute_cli_command_impl(
                 offering_id: effective_offering_id.as_deref(),
                 provider: None,
                 explain: explain_mode,
-                explain_report_format: astra_config::runtime_config::RuntimeConfig::load()
-                    .explain
-                    .effective_report_format(),
+                runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::load()),
                 render_md,
                 verbose_mode: !quiet,
                 render_policy,
                 cli_context: Some(cli_context),
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                agent_spawner: Some(one_shot_spawner),
-                root_agent_id: Some(&root_agent_id),
+                agent_spawner: None,
+                root_agent_id: None,
                 bg_task_commands: None,
                 bg_task_list_cache: None,
                 bash_detach_slot: None,
@@ -2330,38 +2302,7 @@ async fn execute_cli_command_impl(
                 }
             };
 
-            // Drain any background-spawned child agents before
-            // returning. Without this, background tasks (the
-            // default background-agent mode) are aborted when main
-            // returns, which silently drops any ForkCacheEvent /
-            // child output they would have emitted. Deadline is
-            // bounded so a misbehaving child can't hang the CLI;
-            // tasks exceeding it are aborted with a log warning.
-            //
-            // We drain BEFORE writing result to stdout so the
-            // [fork-cache] stderr lines (if any) appear before the
-            // JSON/text result — operators grepping stderr don't
-            // see the order swap.
-            let mut terminal_settlement_error = None;
-            let background_agent_results = if wall_deadline_reached
-                && spawner_handle_for_drain.background_task_count() > 0
-            {
-                terminal_settlement_error = Some(
-                    "request wall deadline reached with background agents still active".to_string(),
-                );
-                Vec::new()
-            } else if wall_deadline_reached {
-                // No task owns a background execution resource, so there is
-                // nothing to drain and no unbounded cancellation tail.
-                Vec::new()
-            } else {
-                spawner_handle_for_drain
-                    .shutdown_and_wait(std::time::Duration::from_secs(30))
-                    .await
-            };
-
-            // Child progress shares the root stream. Close and flush it only
-            // after every terminal child event has had a chance to arrive.
+            // Flush the completed Server stream before publishing the result.
             drop(chat_ctx);
             settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline).await?;
 
@@ -2372,8 +2313,6 @@ async fn execute_cli_command_impl(
                 }
                 Err(e) => {
                     if let Some(mut sr) = stream_result_from_resumable_turn_failure(&e) {
-                        sr.background_agent_results = background_agent_results.clone();
-                        let background_agent_section = sr.integrate_background_agent_results();
                         let exit_code = finalize_one_shot_stream_result_with_request_lease(
                             profile.as_deref(),
                             effective_model.as_deref(),
@@ -2391,18 +2330,6 @@ async fn execute_cli_command_impl(
                                     "context_ms".to_string(),
                                     serde_json::json!(sr.context_ms),
                                 );
-                                obj.insert(
-                                    "background_agent_results".to_string(),
-                                    serde_json::json!(
-                                        sr.background_agent_results
-                                            .iter()
-                                            .map(|(id, text)| serde_json::json!({
-                                                "agent_id": id,
-                                                "result": text
-                                            }))
-                                            .collect::<Vec<_>>()
-                                    ),
-                                );
                             }
                             write_headless_stdout_line(
                                 &serde_json::to_string_pretty(&json_output).unwrap_or_default(),
@@ -2411,20 +2338,11 @@ async fn execute_cli_command_impl(
                         }
                         if quiet {
                             write_headless_stdout_line(&sr.full_text)?;
-                        } else if let Some(section) = background_agent_section {
-                            write_headless_stdout_line(&format!("\n\n{section}"))?;
                         }
                         print_one_shot_completion_warning(&sr, exit_code, args.json);
                         return Ok(exit_code);
                     }
-                    let mut error = e.error;
-                    if let Some(section) =
-                        format_background_agent_results(&background_agent_results)
-                    {
-                        error.push_str("\n\n");
-                        error.push_str(&section);
-                    }
-                    return Err(error);
+                    return Err(e.error);
                 }
             };
             if wall_deadline_reached {
@@ -2433,14 +2351,9 @@ async fn execute_cli_command_impl(
                         "request wall deadline ended without root execution settlement".to_string(),
                     );
                 }
-                if let Some(error) = terminal_settlement_error {
-                    return Err(error);
-                }
                 apply_wall_deadline_interruption(&mut sr, wall_deadline_server_terminal_settled);
                 retain_wall_deadline_partial_canonical_messages(&mut sr, &message);
             }
-            sr.background_agent_results = background_agent_results;
-            let background_agent_section = sr.integrate_background_agent_results();
 
             let exit_code = finalize_one_shot_stream_result_with_request_lease(
                 profile.as_deref(),
@@ -2458,17 +2371,6 @@ async fn execute_cli_command_impl(
                 if let Some(obj) = json_output.as_object_mut() {
                     obj.insert("ttft_ms".to_string(), serde_json::json!(sr.ttft_ms));
                     obj.insert("context_ms".to_string(), serde_json::json!(sr.context_ms));
-                    obj.insert(
-                        "background_agent_results".to_string(),
-                        serde_json::json!(
-                            sr.background_agent_results
-                                .iter()
-                                .map(
-                                    |(id, text)| serde_json::json!({"agent_id": id, "result": text})
-                                )
-                                .collect::<Vec<_>>()
-                        ),
-                    );
                 }
                 write_headless_stdout_line(
                     &serde_json::to_string_pretty(&json_output).unwrap_or_default(),
@@ -2477,10 +2379,6 @@ async fn execute_cli_command_impl(
             } else if quiet {
                 // Quiet mode: just print the text without formatting
                 write_headless_stdout_line(&sr.full_text)?;
-            } else if let Some(section) = background_agent_section {
-                // The primary assistant response was already streamed. Surface
-                // only the newly reconciled child section here.
-                write_headless_stdout_line(&format!("\n\n{section}"))?;
             }
             // Normal mode output is already handled by stream_chat_sse
 
@@ -3434,9 +3332,7 @@ pub(crate) async fn run_print_mode(
         offering_id: effective_offering_id.as_deref(),
         provider: None,
         explain: ExplainMode::Off,
-        explain_report_format: astra_config::runtime_config::RuntimeConfig::load()
-            .explain
-            .effective_report_format(),
+        runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::load()),
         render_md: false,
         verbose_mode: false,
         render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
@@ -5084,7 +4980,6 @@ mod one_shot_persistence_tests {
             deferred_tool_activations: Vec::new(),
             run_transcript_messages: Vec::new(),
             applied_user_intents: Vec::new(),
-            background_agent_results: Vec::new(),
         };
 
         let settlement = persist_headless_session_state(
@@ -5220,7 +5115,6 @@ mod one_shot_persistence_tests {
             deferred_tool_activations: Vec::new(),
             run_transcript_messages: Vec::new(),
             applied_user_intents: Vec::new(),
-            background_agent_results: Vec::new(),
         };
 
         let exit_code = finalize_one_shot_stream_result_with_request_lease(

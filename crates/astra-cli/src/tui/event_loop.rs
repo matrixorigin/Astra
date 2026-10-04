@@ -2350,12 +2350,10 @@ fn is_initial_session_binding(previous: Option<&str>, next: Option<&str>) -> boo
 
 async fn rebuild_local_agent_runtime_after_session_rebind(
     state: &mut crate::cli::session::session_state::SessionState,
-    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Option<super::local_agent_snapshot::LocalAgentSnapshot> {
     state.prepare_for_session_rebind().await;
     let previous_spawner = state.agent_spawner.take();
-    state.delegation_engine = None;
 
     let retired_snapshot = if let Some(spawner) = previous_spawner {
         retire_local_agent_spawner(spawner.clone()).await;
@@ -2364,14 +2362,14 @@ async fn rebuild_local_agent_runtime_after_session_rebind(
         None
     };
 
-    let Some(token) = crate::cli::session::session_runtime::current_access_token(profile) else {
+    if crate::cli::session::session_runtime::current_access_token(profile).is_none() {
         tracing::warn!(
             session_id = state.session_id.as_deref().unwrap_or(""),
             "local agent runtime is unavailable after session rebind because no access token is available"
         );
         return retired_snapshot;
-    };
-    crate::cli::agent_runtime::initialize_multi_agent_runtime(state, api, token, profile).await;
+    }
+    crate::cli::agent_runtime::initialize_agent_projection(state);
     retired_snapshot
 }
 
@@ -4826,7 +4824,6 @@ fn dispatch_agent_control(
 ) {
     let ViewActionBackends {
         agent_spawner: spawner,
-        delegation_engine,
         api,
         profile,
         agent_workbench_tx: outcome_tx,
@@ -4845,14 +4842,7 @@ fn dispatch_agent_control(
     tokio::spawn(async move {
         let result = tokio::time::timeout(
             AGENT_CONTROL_TIMEOUT,
-            execute_agent_control(
-                target,
-                action,
-                spawner,
-                delegation_engine,
-                &api,
-                profile.as_deref(),
-            ),
+            execute_agent_control(target, action, spawner, &api, profile.as_deref()),
         )
         .await;
         let outcome = match result {
@@ -4895,7 +4885,6 @@ async fn execute_agent_control(
     target: crate::tui::agent_run_projection::AgentControlTarget,
     action: astra_thin_client::SessionRunAction,
     spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
-    delegation_engine: Option<Arc<astra_runtime::server::delegation::engine::DelegationEngine>>,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Result<AgentControlExecution, String> {
@@ -4915,19 +4904,6 @@ async fn execute_agent_control(
                 Ok(AgentControlExecution::Applied(None))
             } else {
                 Err("the local runtime no longer owns an active agent with this identity".into())
-            }
-        }
-        crate::tui::agent_run_projection::AgentControlTarget::LocalDelegatedRun { run_id } => {
-            if action != astra_thin_client::SessionRunAction::Cancel {
-                return Err("this local delegated run can only be cancelled".into());
-            }
-            let Some(engine) = delegation_engine else {
-                return Err("the local delegation runtime is unavailable".into());
-            };
-            if engine.cancel_sub_run(&run_id).await {
-                Ok(AgentControlExecution::Applied(None))
-            } else {
-                Err("the local delegated run is no longer active or controllable".into())
             }
         }
         crate::tui::agent_run_projection::AgentControlTarget::DurableRun { run_id } => {
@@ -5159,7 +5135,6 @@ fn stage_cycled_permission_mode_for_active_turn(
 #[derive(Clone)]
 struct ViewActionBackends {
     agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
-    delegation_engine: Option<Arc<astra_runtime::server::delegation::engine::DelegationEngine>>,
     api: astra_thin_client::ThinClient,
     profile: Option<String>,
     session_id: Option<String>,
@@ -5186,7 +5161,14 @@ async fn dispatch_projection_actions(
     viewport_width: u16,
     terminal_height: u16,
 ) {
-    while let Some(action) = bottom_pane.take_projection_action() {
+    let session_binding_action = (!chat_widget.session_id().is_empty())
+        .then(|| bottom_pane.bind_open_agent_transcript_session(chat_widget.session_id()))
+        .flatten();
+    let mut session_binding_action = session_binding_action.into_iter();
+    while let Some(action) = session_binding_action
+        .next()
+        .or_else(|| bottom_pane.take_projection_action())
+    {
         dispatch_bottom_pane_view_action(
             action,
             background_registry,
@@ -7206,12 +7188,7 @@ pub(crate) async fn run_tui_session(
                 )
                 .await;
             }
-            if tokio::time::timeout(Duration::from_millis(750), state.unregister_root_mailbox())
-                .await
-                .is_err()
-            {
-                tracing::warn!("root mailbox unregister exceeded TUI init-failure budget");
-            }
+
             if let Some(task) = edge_heartbeat_task.take() {
                 task.abort();
                 let _ = task.await;
@@ -8137,7 +8114,6 @@ pub(crate) async fn run_tui_session(
                                     terminal_size.map(|size| size.height).unwrap_or(0),
                                     ViewActionBackends {
                                         agent_spawner: state.agent_spawner.clone(),
-                                        delegation_engine: state.delegation_engine.clone(),
                                         api: api.clone(),
                                         profile: profile.map(str::to_string),
                                         session_id: state.session_id.clone(),
@@ -8622,9 +8598,6 @@ pub(crate) async fn run_tui_session(
                                                     .unwrap_or(0),
                                                 ViewActionBackends {
                                                     agent_spawner: state.agent_spawner.clone(),
-                                                    delegation_engine: state
-                                                        .delegation_engine
-                                                        .clone(),
                                                     api: api.clone(),
                                                     profile: profile.map(str::to_string),
                                                     session_id: transcript_session_id(
@@ -8965,8 +8938,6 @@ pub(crate) async fn run_tui_session(
                                     );
                                     let turn_result = {
                                         let agent_spawner_for_cancel = state.agent_spawner.clone();
-                                        let delegation_engine_for_control =
-                                            state.delegation_engine.clone();
                                         let active_turn_local_run_control =
                                             state.active_turn_local_run_control.clone();
                                         let preinstalled_run_control =
@@ -9284,10 +9255,9 @@ pub(crate) async fn run_tui_session(
                                                                         terminal_size.map(|size| size.height).unwrap_or(0),
                                                                         ViewActionBackends {
                                                                             agent_spawner: agent_spawner_for_cancel.clone(),
-                                                                            delegation_engine: delegation_engine_for_control.clone(),
                                                                             api: api.clone(),
                                                                             profile: profile.map(str::to_string),
-                                                                            session_id: background_registry_turn_session_id.clone(),
+                                                                            session_id: (!chat_widget.session_id().is_empty()).then(|| chat_widget.session_id().to_owned()),
                                                                             file_writer: Some(file_writer.clone()),
                                                                             agent_workbench_tx: agent_workbench_tx.clone(),
                                                                         },
@@ -9739,10 +9709,9 @@ pub(crate) async fn run_tui_session(
                                                                             &mut server_agent_projection_sequence,
                                                                             ViewActionBackends {
                                                                                 agent_spawner: agent_spawner_for_cancel.clone(),
-                                                                                delegation_engine: delegation_engine_for_control.clone(),
                                                                                 api: api.clone(),
                                                                                 profile: profile.map(str::to_string),
-                                                                                session_id: background_registry_turn_session_id.clone(),
+                                                                                session_id: (!chat_widget.session_id().is_empty()).then(|| chat_widget.session_id().to_owned()),
                                                                                 file_writer: Some(file_writer.clone()),
                                                                                 agent_workbench_tx: agent_workbench_tx.clone(),
                                                                             },
@@ -10447,10 +10416,9 @@ pub(crate) async fn run_tui_session(
                                                         &mut server_agent_projection_sequence,
                                                         ViewActionBackends {
                                                             agent_spawner: agent_spawner_for_cancel.clone(),
-                                                            delegation_engine: delegation_engine_for_control.clone(),
                                                             api: api.clone(),
                                                             profile: profile.map(str::to_string),
-                                                            session_id: background_registry_turn_session_id.clone(),
+                                                            session_id: (!chat_widget.session_id().is_empty()).then(|| chat_widget.session_id().to_owned()),
                                                             file_writer: Some(file_writer.clone()),
                                                             agent_workbench_tx: agent_workbench_tx.clone(),
                                                         },
@@ -10958,7 +10926,6 @@ pub(crate) async fn run_tui_session(
                                     &mut server_agent_projection_sequence,
                                     ViewActionBackends {
                                         agent_spawner: state.agent_spawner.clone(),
-                                        delegation_engine: state.delegation_engine.clone(),
                                         api: api.clone(),
                                         profile: profile.map(str::to_string),
                                         session_id: state.session_id.clone(),
@@ -11154,28 +11121,12 @@ pub(crate) async fn run_tui_session(
                                             crate::tui::config_edit_router::finalize_async(
                                                 *disposition,
                                                 toml_body.clone(),
+                                                &mut state,
                                             )
                                             .await;
                                         let msg = match result {
                                             Ok(outcome) => {
-                                                if let Some(save) = outcome.save.as_ref() {
-                                                    let prev = state.config_version_id.clone();
-                                                    if let (Some(ref j), Some(ref sid)) = (
-                                                        state.journal.as_ref(),
-                                                        state.session_id.as_ref(),
-                                                    ) {
-                                                        let ev = astra_services::session_journal::JournalEvent::config_version_change(
-                                                            Some(sid.as_str()),
-                                                            state.turn,
-                                                            prev.as_deref(),
-                                                            &save.new_version_id,
-                                                            save.source,
-                                                        );
-                                                        let _ = j.append(&ev);
-                                                    }
-                                                    state.config_version_id =
-                                                        Some(save.new_version_id.clone());
-                                                    state.reload_runtime_config();
+                                                if outcome.save.is_some() {
                                                     sync_explain_presentation(
                                                         &mut chat_widget,
                                                         &state,
@@ -11799,7 +11750,6 @@ pub(crate) async fn run_tui_session(
                     &mut server_agent_projection_sequence,
                     ViewActionBackends {
                         agent_spawner: state.agent_spawner.clone(),
-                        delegation_engine: state.delegation_engine.clone(),
                         api: api.clone(),
                         profile: profile.map(str::to_string),
                         session_id: state.session_id.clone(),
@@ -11932,7 +11882,6 @@ pub(crate) async fn run_tui_session(
                             && let Some(retired_snapshot) =
                                 rebuild_local_agent_runtime_after_session_rebind(
                                     &mut state,
-                                    api,
                                     profile,
                                 )
                                 .await
@@ -11991,7 +11940,6 @@ pub(crate) async fn run_tui_session(
                                 None,
                                 ViewActionBackends {
                                     agent_spawner: state.agent_spawner.clone(),
-                                    delegation_engine: state.delegation_engine.clone(),
                                     api: api.clone(),
                                     profile: profile.map(str::to_string),
                                     session_id: state.session_id.clone(),
@@ -12010,7 +11958,6 @@ pub(crate) async fn run_tui_session(
                                 &mut server_agent_projection_sequence,
                                 ViewActionBackends {
                                     agent_spawner: state.agent_spawner.clone(),
-                                    delegation_engine: state.delegation_engine.clone(),
                                     api: api.clone(),
                                     profile: profile.map(str::to_string),
                                     session_id: state.session_id.clone(),
@@ -12295,12 +12242,7 @@ pub(crate) async fn run_tui_session(
         )
         .await;
     }
-    if tokio::time::timeout(Duration::from_millis(750), state.unregister_root_mailbox())
-        .await
-        .is_err()
-    {
-        tracing::warn!("root mailbox unregister exceeded TUI shutdown budget");
-    }
+
     if let Some(task) = edge_heartbeat_task.take() {
         task.abort();
         let _ = task.await;
@@ -18942,7 +18884,6 @@ mod tests {
             24,
             ViewActionBackends {
                 agent_spawner: None,
-                delegation_engine: None,
                 api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
                     .expect("test thin client"),
                 profile: None,
@@ -19008,7 +18949,6 @@ mod tests {
             24,
             ViewActionBackends {
                 agent_spawner: None,
-                delegation_engine: None,
                 api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
                     .expect("test thin client"),
                 profile: None,

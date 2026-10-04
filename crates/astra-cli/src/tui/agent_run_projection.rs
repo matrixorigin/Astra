@@ -73,18 +73,8 @@ pub(crate) enum AgentProjectionSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentControlTarget {
-    LocalAgent {
-        agent_id: String,
-    },
-    /// A local child owned by the delegation engine rather than the dynamic
-    /// agent spawner. It has a canonical local transcript and supports a
-    /// cooperative cancel request, but no fake pause/resume control.
-    LocalDelegatedRun {
-        run_id: String,
-    },
-    DurableRun {
-        run_id: String,
-    },
+    LocalAgent { agent_id: String },
+    DurableRun { run_id: String },
 }
 
 /// Authoritative read path for a run transcript.

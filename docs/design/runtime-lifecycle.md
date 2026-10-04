@@ -176,6 +176,11 @@ unknown. Effect-owner domain is independent of this scope. Read-only references
 create no mutation obligation. All judgment carriers share this semantic
 contract; the existing typed receipt checks still own completion evidence.
 
+The same distinction applies to delegated agents and fanout children: inferred
+read-only task intent does not create an execution permission ceiling. Children
+retain explicit parent permissions, read-only agent profiles, and physical
+workspace authority; those restrictions remain effective regardless of intent.
+
 Mutation classification concerns requested task-resource effects, not runtime
 checkpoint, audit, trace, usage or scheduling writes. Explicit Astra Work
 tracking, board and graph changes remain obligations of the Work lifecycle and

@@ -3279,7 +3279,7 @@ fn terminally_relevant_unresolved_tool_outcomes(
         .collect()
 }
 
-/// A launch receipt, running snapshot, or queued answer is not a failed child.
+/// A launch receipt, nonterminal child observation, or queued answer is not a failed child.
 /// It stops blocking completion only after the same child has a producer-owned
 /// successful terminal result that the parent model actually observed.
 ///
@@ -3292,6 +3292,9 @@ pub(crate) fn observed_direct_child_for_nonterminal_receipt<'a>(
     state: &'a AgenticLoopState,
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> Option<&'a serde_json::Value> {
+    use astra_turn_core::orchestration::agent_result_wire::{
+        AgentToolResultStatusKind, DecodedAgentToolResult, decode_agent_tool_result,
+    };
     if record.name != "agent"
         || !record.ok
         || record.disposition
@@ -3314,10 +3317,19 @@ pub(crate) fn observed_direct_child_for_nonterminal_receipt<'a>(
             if action == Some("get_result") && args["agent_id"] != agent_id {
                 return None;
             }
-            if !matches!(
-                (action, result["status"].as_str()),
-                (Some("spawn"), Some("launched")) | (Some("get_result"), Some("still_running"))
-            ) {
+            let pending_receipt = match action {
+                Some("spawn") => result["status"] == "launched",
+                Some("get_result") => matches!(
+                    decode_agent_tool_result(&result),
+                    Some(DecodedAgentToolResult::ChildResult(
+                        AgentToolResultStatusKind::StillRunning
+                            | AgentToolResultStatusKind::Waiting
+                            | AgentToolResultStatusKind::Paused
+                    ))
+                ),
+                _ => false,
+            };
+            if !pending_receipt {
                 return None;
             }
             agent_id
@@ -3374,22 +3386,23 @@ pub(crate) fn nonterminal_child_receipt_superseded(
     state: &AgenticLoopState,
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
-    if record.name == "agent_fanout" && fanout_start_receipt_superseded(state, record) {
+    if record.name == "agent_fanout" && fanout_nonterminal_receipt_superseded(state, record) {
         return true;
     }
     observed_direct_child_for_nonterminal_receipt(state, record).is_some()
 }
 
-/// A fanout start is deliberately non-terminal: it only acknowledges that the
-/// group was accepted.  Once a later `get_results` call returns the same group
-/// as a complete, issue-free result, that earlier control receipt is settled by
-/// the group result.  Correlating by the producer-owned group id keeps the
-/// generic outcome ledger from treating the start and collection actions as
-/// unrelated failed operations.
-pub(crate) fn fanout_start_receipt_superseded(
+/// Settle launch receipts and nonterminal observations only from complete delivery
+/// of the canonical group: either observed child completions or a successful
+/// full-group read. Historical observations remain unchanged in the journal.
+pub(crate) fn fanout_nonterminal_receipt_superseded(
     state: &AgenticLoopState,
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
+    use astra_turn_core::orchestration::agent_result_wire::{
+        AgentToolResultStatusKind, DecodedAgentToolResult, agent_tool_structured_result_class,
+        decode_agent_tool_result,
+    };
     if !record.ok
         || record.disposition
             != Some(astra_services::session_journal::ToolCallDisposition::Executed)
@@ -3402,10 +3415,7 @@ pub(crate) fn fanout_start_receipt_superseded(
     else {
         return false;
     };
-    if args["action"].as_str() != Some("start") {
-        return false;
-    }
-    let Some(start_result) = record
+    let Some(mut start_result) = record
         .runtime_model_result_full
         .as_deref()
         .or(record.result_full.as_deref())
@@ -3413,6 +3423,107 @@ pub(crate) fn fanout_start_receipt_superseded(
     else {
         return false;
     };
+    match args["action"].as_str() {
+        Some("start") => {}
+        Some("get_results") => {
+            let query = &start_result;
+            let Some(group_id) = args["group_id"].as_str().filter(|id| !id.is_empty()) else {
+                return false;
+            };
+            // Pending counts include still-running slots. Only terminal failures
+            // disqualify a running observation from later successful settlement.
+            if query["group_id"] != group_id
+                || state.current_run_id.is_none()
+                || query["fanout"]["parent_run_id"].as_str() != state.current_run_id.as_deref()
+                || [
+                    "failed",
+                    "interrupted",
+                    "timed_out",
+                    "cancelled_by_user",
+                    "cancelled_by_runtime",
+                    "spawn_rejected",
+                ]
+                .iter()
+                .any(|field| query[*field].as_u64().unwrap_or(0) > 0)
+            {
+                return false;
+            }
+            let Some(results) = query["results"].as_array().filter(|rows| !rows.is_empty()) else {
+                return false;
+            };
+            // Child reads precede the refreshed group summary. A child can
+            // finish between them, leaving a genuine running observation in
+            // a now-terminal aggregate. The later complete-delivery proof
+            // settles that observation; it does not rewrite the receipt.
+            let mut pending_observation = false;
+            for item in results {
+                match decode_agent_tool_result(&item["result"]) {
+                    Some(DecodedAgentToolResult::ChildResult(
+                        AgentToolResultStatusKind::StillRunning
+                        | AgentToolResultStatusKind::Waiting
+                        | AgentToolResultStatusKind::Paused,
+                    )) => pending_observation = true,
+                    _ if agent_tool_structured_result_class(&item["result"]) == Some("success") => {
+                    }
+                    _ => return false,
+                }
+            }
+            if !matches!(
+                (query["status"].as_str(), query["active"].as_u64()),
+                (Some("incomplete"), Some(1..))
+            ) && !(query["status"] == "completed_with_issues"
+                && query["active"].as_u64() == Some(0)
+                && pending_observation)
+            {
+                return false;
+            }
+            let Some(start) = state.stall.tool_call_records.iter().find_map(|candidate| {
+                if candidate.name != "agent_fanout"
+                    || !candidate.ok
+                    || candidate.disposition
+                        != Some(astra_services::session_journal::ToolCallDisposition::Executed)
+                {
+                    return None;
+                }
+                let args: serde_json::Value =
+                    serde_json::from_str(candidate.authoritative_args_full()?).ok()?;
+                if args["action"] != "start" {
+                    return None;
+                }
+                let start: serde_json::Value = serde_json::from_str(
+                    candidate
+                        .runtime_model_result_full
+                        .as_deref()
+                        .or(candidate.result_full.as_deref())?,
+                )
+                .ok()?;
+                (start["group_id"] == group_id
+                    && start["fanout"]["parent_run_id"].as_str() == state.current_run_id.as_deref())
+                .then_some(start)
+            }) else {
+                return false;
+            };
+            let Some(agents) = start["agents"].as_array() else {
+                return false;
+            };
+            if query["target_count"] != start["target_count"]
+                || results.iter().any(|item| {
+                    !agents.iter().any(|agent| {
+                        item["agent_id"].as_str().is_some_and(|id| !id.is_empty())
+                            && item["agent_id"] == agent["agent_id"]
+                            && item["slot_index"].is_u64()
+                            && item["slot_index"] == agent["slot_index"]
+                            && (item["run_id"].is_null() || item["run_id"] == agent["run_id"])
+                            && item["result"]["agent_id"] == agent["agent_id"]
+                    })
+                })
+            {
+                return false;
+            }
+            start_result = start;
+        }
+        _ => return false,
+    }
     if start_result["status"].as_str() != Some("started") {
         return false;
     }
@@ -11119,7 +11230,14 @@ mod tests {
             ok: true,
             disposition: Some(ToolCallDisposition::Executed),
             args_full: Some(r#"{"action":"get_result","agent_id":"child@run"}"#.into()),
-            result_full: Some(r#"{"status":"still_running","agent_id":"child@run"}"#.into()),
+            result_full: Some(
+                astra_turn_core::orchestration::agent_result_wire::render_wait_for_agent_status(
+                    "child@run",
+                    &crate::orchestration::AgentStatus::Running {
+                        activity: "working".into(),
+                    },
+                ),
+            ),
             ..Default::default()
         };
         state.push_volatile_payload(
@@ -11165,8 +11283,15 @@ mod tests {
             &rejected_call
         ));
         let mut terminal_failure = record.clone();
-        terminal_failure.result_full =
-            Some(r#"{"status":"interrupted","agent_id":"child@run"}"#.into());
+        terminal_failure.result_full = Some(
+            astra_turn_core::orchestration::agent_result_wire::render_wait_for_agent_status(
+                "child@run",
+                &crate::orchestration::AgentStatus::Interrupted {
+                    partial_result: "unfinished".into(),
+                    finish_reason: "deadline".into(),
+                },
+            ),
+        );
         assert!(!nonterminal_child_receipt_superseded(
             &state,
             &terminal_failure

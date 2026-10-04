@@ -8,10 +8,6 @@ mod agentic_loop_turn;
 mod agentic_sse_loop;
 mod server_admission_host;
 
-pub(crate) use agentic_loop_turn::{
-    server_loop_admission_payload_with_execution_time_budget, turn_policy_from_payload_edge_tools,
-};
-
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -146,26 +142,6 @@ fn restored_compaction_effectiveness(
             astra_runtime::turn::compaction_replay::CompactionEffectivenessTracker::from_json_lossy,
         )
         .unwrap_or_default()
-}
-
-async fn finalize_root_mailbox(
-    slot: Option<&mut Option<astra_messaging::router::AgentMailbox>>,
-    mailbox: &mut Option<astra_messaging::router::AgentMailbox>,
-) {
-    if let Some(slot) = slot {
-        *slot = mailbox.take();
-        return;
-    }
-
-    if let Some(mailbox) = mailbox.take() {
-        let addr = mailbox.address.clone();
-        if let Err(e) = mailbox.retire().await {
-            eprintln!(
-                "astra: failed to retire mailbox for run_id={} agent_id={}: {e}",
-                addr.run_id, addr.agent_id
-            );
-        }
-    }
 }
 
 type RootPermissionContextHandle = astra_runtime::orchestration::PermissionSyncHandle;
@@ -337,9 +313,9 @@ pub(crate) async fn stream_chat_sse(
     let model_for_policy = p.model;
     let runtime_manifest =
         runtime_manifest_for_model("cli_turn_selection", "cli_edge", model_for_policy);
-    let tool_policy_config = astra_config::runtime_config::RuntimeConfig::load().tool_policy;
+    let tool_policy_config = &p.runtime_config.tool_policy;
     let resolved_tool_policy = tool_policy_config.resolve_for_model(model_for_policy);
-    let circuit_breaker_config = circuit_breaker_config_from_tool_policy(&tool_policy_config);
+    let circuit_breaker_config = circuit_breaker_config_from_tool_policy(tool_policy_config);
 
     // Paint an immediate spinner so the user sees feedback during init (executor, schemas,
     // skill discovery, etc.) before the per-turn prep spinner takes over.
@@ -417,15 +393,8 @@ pub(crate) async fn stream_chat_sse(
         // user-visible turn currently in progress.
         ex.journal_turn_index
             .store(current_session_turn, std::sync::atomic::Ordering::Release);
-        // Wire `agent(action='spawn'|'get_result')` context when a spawner is available.
-        // The run_id MUST match what state.current_run_id uses so that
-        // on_turn_completed captures the parent prefix under the same
-        // key the spawner resolves against. Previously this was
-        // p.session_id.unwrap_or("ephemeral") — a mismatch that made
-        // on_turn_completed early-return (current_run_id = None) and
-        // the spawner look up "ephemeral" in the prefix store, finding
-        // nothing. Generating a stable UUID here and threading it into
-        // both sites closes the gap.
+        // The local context serves recovered fanout task queries. New child
+        // execution remains owned by Server control-plane admission.
         if let Some(ref spawner) = p.agent_spawner {
             let spawn_ctx = edge_tools::agent_spawning::AgentActionContext {
                 fanout_admission: spawner.attach_fanout_parent(&parent_turn_run_id).await,
@@ -485,15 +454,6 @@ pub(crate) async fn stream_chat_sse(
     if let Some(feedback) = p.latest_turn_quality_feedback {
         executor.set_latest_turn_quality_feedback(Some(feedback.clone()));
     }
-    let root_send_message_context = p.agent_spawner.as_ref().map(|spawner| {
-        edge_tools::agent_messaging::SendMessageRuntimeContext {
-            agent_id: root_agent_id.to_string(),
-            run_id: parent_turn_run_id.clone(),
-            router: spawner.mailbox_router(),
-            reply_obligations: Arc::new(Default::default()),
-        }
-    });
-
     // --add-dir: expand sandbox to include additional directories
     if let Some(cli_context) = p.cli_context {
         for dir in &cli_context.add_dirs {
@@ -572,7 +532,8 @@ pub(crate) async fn stream_chat_sse(
     if let Some(ref mgr) = p.mcp_manager {
         executor.install_mcp_bundle(mgr.clone(), mcp_runtime_schemas);
     }
-    let registry = ToolRegistry::new_runtime_surface(all_schemas.clone());
+    let registry =
+        ToolRegistry::new_with_tool_surface(all_schemas.clone(), &p.runtime_config.tool_surface);
     let always_load_schema_tokens = registry.total_always_load_token_cost() as u64;
     // Full runtime inventory is used only for static allow/deny policy
     // calculations. The headless validator's admitted tool set is populated
@@ -632,42 +593,6 @@ pub(crate) async fn stream_chat_sse(
     initial_restricted.extend(p.resume_restricted_tools.iter().cloned());
 
     let current_session_id = p.session_id.map(|s| s.to_string());
-    let existing_root_mailbox = if let Some(slot) = p.root_mailbox_slot.as_deref_mut() {
-        slot.take()
-    } else {
-        None
-    };
-    let root_mailbox = if let Some(mailbox) = existing_root_mailbox {
-        Some(mailbox)
-    } else if let Some(ref root_ctx) = root_send_message_context {
-        let run_id = current_session_id
-            .clone()
-            .unwrap_or_else(|| "ephemeral".to_string());
-        root_ctx
-            .router
-            .register(
-                astra_messaging::types::AgentAddress::new(run_id, &root_ctx.agent_id),
-                None,
-            )
-            .await
-            .map(Some)
-            .map_err(|error| crate::TurnFailure {
-                error: format!("cannot attach session mailbox: {error}"),
-                partial: Default::default(),
-            })?
-    } else {
-        None
-    };
-    if let (Some(spawner), Some(mailbox)) = (p.agent_spawner.as_ref(), root_mailbox.as_ref()) {
-        spawner
-            .mailbox_router()
-            .record_parent_delivery_alias(
-                &parent_turn_run_id,
-                &mailbox.address,
-                &mailbox.address.agent_id,
-            )
-            .await;
-    }
     let task_profile = infer_task_execution_profile(p.message);
     let circuit_breaker_config = circuit_breaker_config.for_task_profile(task_profile);
 
@@ -678,21 +603,11 @@ pub(crate) async fn stream_chat_sse(
         TurnGuard::with_health_and_profile(health, task_profile)
     };
 
-    let runtime_ceiling = {
-        let cfg = astra_config::RuntimeConfig::cached();
-        cfg.runtime_limits
-            .resolve_turn_ceiling(p.is_plan_subtask)
-            .map_err(|error| crate::TurnFailure {
-                error,
-                partial: crate::PartialTurnData {
-                    session_id: p.session_id.map(str::to_string),
-                    ..Default::default()
-                },
-            })?
-    };
+    // The Server owns all model rounds within this admission. Local adapter
+    // bookkeeping must not interpret CLI configuration as a remote round limit.
     let agentic_turn_budget = astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
         task_profile,
-        runtime_ceiling,
+        None,
         None,
     );
     let max_turns = agentic_turn_budget.initial_turns;
@@ -708,27 +623,15 @@ pub(crate) async fn stream_chat_sse(
         None => std::mem::take(&mut local_discovered_skills),
     };
 
-    // Capture the child permission envelope before perm_manager is moved into the host.
-    let child_permissions = p.perm_manager.inherited_permissions_for_child(true);
-    let parent_cancel_token = p.cancel_token.clone();
+    // Retain the root permission context before perm_manager is moved into the host.
     let root_permission_context = root_permission_context_handle(p.perm_manager);
 
     // Snapshot approval overrides for checkpoint persistence.
     let initial_approval_overrides = p.perm_manager.export_session_overrides();
 
-    // Bug B step 3: share the spawner's prefix_store with the
-    // CLI host so on_turn_completed can write captured parent
-    // prefixes into the same map the DelegationEngine + spawner
-    // read from. Without shared state, a capture fires but lands
-    // in a different store than resolvers look at — delegate
-    // children always see None.
-    let prefix_store_for_host = p
-        .agent_spawner
-        .as_ref()
-        .and_then(|s| s.prefix_store().cloned());
-
     // ─── Build host + state ──────────────────────────────────────────────
     let mut host = CliServerAdmissionHost {
+        runtime_config: p.runtime_config.clone(),
         api: p.api,
         token: p.token.to_string(),
         auth_profile: p.auth_profile,
@@ -771,13 +674,11 @@ pub(crate) async fn stream_chat_sse(
         approval_request_tx: p.approval_request_tx,
         ask_user_request_tx: p.ask_user_request_tx,
         plan_review_request_tx: p.plan_review_request_tx,
-        root_send_message_context,
         agent_spawner: p.agent_spawner.clone(),
         chat_turn_index: current_session_turn,
         tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(
             resolved_tool_policy.max_identical_tool_calls,
         ),
-        prefix_store: prefix_store_for_host,
         append_system_prompt: p.append_system_prompt.take(),
         execution_time_budget: p.execution_time_budget.take(),
         incremental_state: p.incremental_state.take(),
@@ -801,31 +702,6 @@ pub(crate) async fn stream_chat_sse(
     // dispatch. The resolver observes later registry convergence in place.
     let skill_resolver =
         crate::cli::agent_runtime::bind_skill_resolver(Arc::clone(&p.unified_skill_registry));
-
-    // Build skill executor — fork sub-runs inherit the resolver for nesting.
-    let skill_executor: Option<Arc<dyn astra_skills::SkillExecutor>> = {
-        let mut subrun_exec = crate::cli::skill_subrun::CliSkillSubRunExecutor::new(
-            p.api.clone(),
-            p.token.to_string(),
-            p.model.map(|m| m.to_string()),
-            project_root.clone(),
-            child_permissions,
-            parent_cancel_token,
-        )
-        .with_skill_resolver(skill_resolver.clone())
-        .with_parent_run_id(parent_turn_run_id.clone());
-        if let Some(session_id) = p.session_id {
-            subrun_exec = subrun_exec.with_active_session_id(session_id.to_string());
-        }
-        let subrun_exec = Arc::new(subrun_exec);
-        let isolated = Arc::new(astra_skills::executor::IsolatedSkillExecutor::new(
-            subrun_exec,
-        ));
-        let router = Arc::new(astra_skills::executor::SkillExecutionRouter::new(Some(
-            isolated,
-        )));
-        Some(router as Arc<dyn astra_skills::SkillExecutor>)
-    };
 
     // Pre-compute project-level cross-session context (knowledge backflow P2).
     // Cached per-process via OnceLock since git_root is constant for a session.
@@ -870,7 +746,7 @@ pub(crate) async fn stream_chat_sse(
     let mut state = AgenticLoopState {
         evaluation_thresholds:
             astra_runtime::turn::runtime_policy::evaluation_thresholds_from_policy(
-                &tool_policy_config,
+                tool_policy_config,
             ),
         observation_journal: Default::default(),
         tool_ledger_receipt: Default::default(),
@@ -976,7 +852,8 @@ pub(crate) async fn stream_chat_sse(
         skills: SkillState {
             registry_for_activation: Some(Arc::clone(&p.unified_skill_registry)),
             resolver: skill_resolver,
-            executor: skill_executor,
+            // Fork-skill dispatch belongs to the Server-owned execution.
+            executor: None,
             quality_tracker: p.skill_quality_tracker.clone(),
             quality_tracker_baseline: p.skill_quality_tracker.clone(),
             improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
@@ -1000,7 +877,6 @@ pub(crate) async fn stream_chat_sse(
             completion_settlement: Default::default(),
         },
         messaging: MessagingState {
-            mailbox: root_mailbox,
             metrics: p.messaging_metrics.clone(),
             progress_emitter: None,
             ..Default::default()
@@ -1049,7 +925,7 @@ pub(crate) async fn stream_chat_sse(
         last_turn_policy: astra_runtime::turn::agentic_loop::host::TurnInteractionPolicy::default(),
         api: p.api.clone(),
         api_token: p.token.to_string(),
-        delegation_engine: p.delegation_engine,
+        delegation_engine: None,
         delegations_this_turn: 0,
         delegation_chain: Vec::new(),
         self_agent_id: "tui_session".to_string(),
@@ -1232,7 +1108,6 @@ pub(crate) async fn stream_chat_sse(
         if let Some(slot) = &mut p.deferred_tool_activations {
             **slot = state.deferred_tool_activations.clone();
         }
-        finalize_root_mailbox(p.root_mailbox_slot, &mut state.messaging.mailbox).await;
         if let Some(shared) = p.discovered_skills {
             *shared = state.skills.execution.discovered.clone();
         }
@@ -1323,7 +1198,6 @@ pub(crate) async fn stream_chat_sse(
     if let Some(shared) = p.discovered_skills {
         *shared = state.skills.execution.discovered.clone();
     }
-    finalize_root_mailbox(p.root_mailbox_slot, &mut state.messaging.mailbox).await;
 
     let usage_attribution = UsageAttribution::from_explain_analyze_events(
         &state.telemetry.explain_analyze_events,
@@ -1336,7 +1210,7 @@ pub(crate) async fn stream_chat_sse(
 
     eprint_stream_loop_sidecars(StreamLoopSidecarEprint {
         explain: p.explain,
-        explain_report_format: p.explain_report_format,
+        explain_report_format: p.runtime_config.explain.effective_report_format(),
         quiet: p.render_policy.is_silent(),
         explain_analyze_events: &state.telemetry.explain_analyze_events,
         explain_analyze_degraded: state.telemetry.explain_analyze_degraded,

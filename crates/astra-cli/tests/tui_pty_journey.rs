@@ -229,6 +229,28 @@ impl PtyAstra {
         }
     }
 
+    fn wait_for_absent(&mut self, needle: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.current_screen().contains(needle) {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().expect("poll Astra child") {
+                panic!(
+                    "Astra exited before clearing {needle:?} ({status})\n{}",
+                    self.screen_diagnostic()
+                );
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for {needle:?} to clear\n{}",
+                self.screen_diagnostic()
+            );
+            self.receive(remaining.min(Duration::from_millis(100)));
+        }
+    }
+
     fn receive(&mut self, timeout: Duration) {
         match self.output_rx.recv_timeout(timeout) {
             Ok(chunk) => {
@@ -365,6 +387,44 @@ fn required_live_env(name: &str) -> String {
         .unwrap_or_else(|| panic!("ignored live PTY journey requires {name}"))
 }
 
+fn selected_task_slot(screen: &str) -> Option<String> {
+    screen.lines().find_map(|line| {
+        let numbered = line.trim_start().strip_prefix('›')?.trim_start();
+        let (ordinal, _) = numbered.split_once('.')?;
+        ordinal.parse::<usize>().ok()?;
+        numbered
+            .split_once("slot ")
+            .map(|(_, slot)| slot.split(" · ").next().unwrap().trim().to_string())
+    })
+}
+
+fn select_task_slot(astra: &mut PtyAstra, target: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let before = selected_task_slot(&astra.current_screen());
+        if before.as_deref() == Some(target) {
+            return;
+        }
+        astra.write(b"\x1b[B");
+        loop {
+            astra.receive(Duration::from_millis(50));
+            if selected_task_slot(&astra.current_screen()) != before {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "task selection did not move toward {target}\n{}",
+                astra.current_screen()
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "could not select task slot {target}\n{}",
+            astra.current_screen()
+        );
+    }
+}
+
 fn seed_trusted_workspace(home: &std::path::Path) {
     let workspace = home
         .canonicalize()
@@ -484,7 +544,8 @@ async fn ctrl_o_round_trip_preserves_composer_draft_in_a_real_pty() {
     astra.wait_for(draft, UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x0f]); // Ctrl+O
-    astra.wait_for("Main conversation · Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Main conversation", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
     astra.wait_for("filter:", Duration::from_secs(2));
 
     astra.write(&[0x0f]); // Ctrl+O
@@ -542,7 +603,8 @@ async fn ctrl_o_opens_during_an_active_turn_and_receives_live_completion() {
     astra.wait_for("Sending", UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x0f]); // Ctrl+O while the HTTP turn is still pending.
-    astra.wait_for("Main conversation · Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Main conversation", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
     astra.wait_for("successfully.", Duration::from_secs(10));
 
     astra.write(&[0x0f]);
@@ -576,7 +638,8 @@ async fn ctrl_o_replays_tool_history_after_a_real_tool_turn() {
     assert_committed_mock_write(&mock, home.path());
 
     astra.write(&[0x0f]); // Ctrl+O after the compact view observed the tool.
-    astra.wait_for("Main conversation · Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Main conversation", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
     astra.wait_for("Edited mock-output-astra-cli.txt", UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x0f]);
@@ -605,7 +668,8 @@ async fn ctrl_o_round_trip_preserves_a_live_tool_approval() {
     astra.wait_for("Approval · Write File", Duration::from_secs(10));
 
     astra.write(&[0x0f]); // Ctrl+O while approval owns the bottom pane.
-    astra.wait_for("Main conversation · Transcript", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Main conversation", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("· Transcript", UI_TRANSITION_TIMEOUT);
     astra.wait_for("write_file", UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x0f]);
@@ -1310,4 +1374,176 @@ async fn live_team_delivers_dependent_work_items_and_reworks_after_client_restar
         None,
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_g_reopens_a_child_transcript_after_completion() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration(
+        astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
+    )
+    .await
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+    astra.wait_for("Message Astra", Duration::from_secs(15));
+    astra.paste_and_submit(
+        "delegate_one_child_and_keep_it_observable",
+        UI_TRANSITION_TIMEOUT,
+    );
+    astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x07]);
+    astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Mock child review", UI_TRANSITION_TIMEOUT);
+    astra.write(b"1\r");
+    astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x0f]);
+    astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
+    mock.release_held_response();
+    astra.write(&[0x0f]);
+    astra.wait_for("Agent completed", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x07]);
+    astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
+    astra.write(b"1\r");
+    astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
+    assert_eq!(
+        mock.received_requests().len(),
+        1,
+        "Server owns child execution"
+    );
+    assert!(mock.tool_results().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fanout_partial_refresh_preserves_slot_selection() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration(
+        astra_cli::cli::mock_llm::MockScenario::FanoutThenComplete,
+    )
+    .await
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+    astra.wait_for("Message Astra", Duration::from_secs(15));
+    astra.write(b"launch_three_reviews_as_one_group\r");
+    astra.wait_for("Three mock reviews are running", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x07]);
+    astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
+    for slot in 1..=3 {
+        astra.wait_for(&format!("Mock review {slot}"), UI_TRANSITION_TIMEOUT);
+    }
+    select_task_slot(&mut astra, "2: Mock review 2", UI_TRANSITION_TIMEOUT);
+    let selected = selected_task_slot(&astra.current_screen()).unwrap();
+    mock.publish_partial_fanout_results();
+    astra.write(b"r");
+    astra.wait_for("2 done", UI_TRANSITION_TIMEOUT);
+    assert_eq!(
+        selected_task_slot(&astra.current_screen()).as_ref(),
+        Some(&selected)
+    );
+    let screen = astra.current_screen();
+    for slot in 1..=3 {
+        assert_eq!(
+            screen
+                .matches(&format!("slot {slot}: Mock review {slot}"))
+                .count(),
+            1
+        );
+    }
+    astra.write(b"\x1b");
+    astra.wait_for_absent("Conversations", UI_TRANSITION_TIMEOUT);
+    mock.release_held_response();
+    astra.wait_for("Parent reconciled one", UI_TRANSITION_TIMEOUT);
+    assert_eq!(
+        mock.received_requests().len(),
+        1,
+        "no client reconciliation admission"
+    );
+    assert!(mock.tool_results().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_fanout_slot_cause_is_visible_in_its_transcript() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration(
+        astra_cli::cli::mock_llm::MockScenario::FanoutPartialThenComplete,
+    )
+    .await
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+    astra.wait_for("Message Astra", Duration::from_secs(15));
+    astra.write(b"review_with_one_failed_slot\r");
+    astra.wait_for("Three mock reviews are running", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x07]);
+    astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Mock review 2", UI_TRANSITION_TIMEOUT);
+    select_task_slot(&mut astra, "2: Mock review 2", UI_TRANSITION_TIMEOUT);
+    mock.publish_partial_fanout_results();
+    astra.write(b"r");
+    astra.wait_for("1 failed", UI_TRANSITION_TIMEOUT);
+    mock.release_held_response();
+    astra.write(b"\r");
+    astra.wait_for(
+        "fanout_child_2_failed_with_distinct_cause",
+        UI_TRANSITION_TIMEOUT,
+    );
+    astra.write(&[0x0f]);
+    astra.wait_for("Parent reconciled 2 completed", UI_TRANSITION_TIMEOUT);
+    assert_eq!(mock.received_requests().len(), 1);
+    assert!(mock.tool_results().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_child_cancel_keeps_sibling_transcript_queryable() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration(
+        astra_cli::cli::mock_llm::MockScenario::FanoutThenComplete,
+    )
+    .await
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+    astra.wait_for("Message Astra", Duration::from_secs(15));
+    astra.write(b"inspect_and_cancel_one_child\r");
+    astra.wait_for("Three mock reviews are running", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x07]);
+    astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Mock review 1", UI_TRANSITION_TIMEOUT);
+    select_task_slot(&mut astra, "1: Mock review 1", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
+    astra.wait_for("fanout_child_1_evidence_visible", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x07]);
+    astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
+    select_task_slot(&mut astra, "3: Mock review 3", UI_TRANSITION_TIMEOUT);
+    astra.write(b"r");
+    astra.wait_for("stop available", UI_TRANSITION_TIMEOUT);
+    astra.write(b"x");
+    let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    while mock.cancelled_runs().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "cancel not received: {}",
+            astra.screen_diagnostic()
+        );
+        astra.receive(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(mock.cancelled_runs(), ["mock-run-fanout-child-2"]);
+    astra.write(b"\x1b");
+    astra.wait_for_absent("Conversations", UI_TRANSITION_TIMEOUT);
+    mock.release_held_response();
+    astra.write(&[0x0f]);
+    astra.wait_for("including cancellation", UI_TRANSITION_TIMEOUT);
+    astra.write(&[0x07]);
+    astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
+    select_task_slot(&mut astra, "1: Mock review 1", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
+    astra.wait_for("fanout_child_1_evidence_visible", UI_TRANSITION_TIMEOUT);
+    assert_eq!(mock.received_requests().len(), 1);
+    assert!(mock.tool_results().is_empty());
 }

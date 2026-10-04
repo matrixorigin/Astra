@@ -1,20 +1,15 @@
 //! Config overlay + edit surface.
 //!
-//! Three responsibilities, one module — they all operate on
-//! [`RuntimeConfig`] and share the same merge-if-non-default semantics:
+//! Two responsibilities, one module — they all operate on
+//! [`RuntimeConfig`] and preserve explicitly supplied values:
 //!
-//! 1. `apply_settings_json` — partial JSON overlay onto a base config.
+//! 1. `RuntimeConfigLayer` — validated JSON/TOML fields over a base config.
 //!    Backs the `--settings <JSON-or-path>` CLI flag. Partial means any
 //!    field omitted from the JSON keeps its base value; this matches
 //!    operator intent when the flag is used as a one-shot override
-//!    ("just raise the token budget for this one invocation").
+//!    ("just adjust memory retrieval for this one invocation").
 //!
-//! 2. `effective_budget_for_model` — resolves the model-aware input-
-//!    token budget for `/config` display. Bridges `RuntimeLimits`'
-//!    knowledge of model context windows with the operator's view of
-//!    the config so the reported number matches reality.
-//!
-//! 3. `build_settings_catalog` + `filter_settings` + `apply_edit` —
+//! 2. `build_settings_catalog` + `filter_settings` + `apply_edit` —
 //!    the pure-model layer behind an interactive `/config edit` UI.
 //!    Catalog mirrors the reference implementation's Config.tsx model:
 //!    flat list of { id, label, kind, value } items, each pointing at a
@@ -24,9 +19,6 @@
 
 use crate::runtime_config::{
     ExplainReportFormat, RuntimeConfig, TraceCategory, TraceLevel, TraceProfile, TraceSink,
-};
-use astra_core::runtime_limits::{
-    MODEL_CONTEXT_INPUT_BUDGET_RATIO, RuntimeLimits, context_window_for_model,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -38,6 +30,8 @@ use std::path::Path;
 pub enum OverlayError {
     #[error("invalid JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid TOML: {0}")]
+    Toml(#[from] toml::de::Error),
     #[error("cannot read --settings file {path}: {source}")]
     FileRead {
         path: String,
@@ -82,43 +76,104 @@ pub fn parse_settings_source(raw: &str) -> Result<String, OverlayError> {
     }
 }
 
-/// Apply a JSON overlay onto `base`. The JSON is deserialized as a
-/// [`RuntimeConfig`] (omitted fields default; unknown top-level fields are rejected), then merged via
-/// `RuntimeConfig::merge` which only copies non-default fields. Net
-/// effect: anything the operator omitted stays as-is; anything they set
-/// wins. The one caveat — setting a field *to its default* looks like
-/// "not set" to merge — is acceptable for `--settings`, whose typical
-/// use is raising or lowering away from defaults.
-pub fn apply_settings_json(base: RuntimeConfig, json: &str) -> Result<RuntimeConfig, OverlayError> {
-    let overlay: RuntimeConfig = serde_json::from_str(json)?;
-    Ok(base.merge(overlay))
-}
+/// A validated configuration layer that retains which fields were supplied.
+/// Complete session snapshots are RuntimeConfig values, not layers.
+#[derive(Debug, Clone)]
+pub struct RuntimeConfigLayer(Value);
 
-// ─── B. effective budget ─────────────────────────────────────────────────
-
-/// Resolve the input-token budget a turn will actually see for the
-/// given model. Falls back to `config.token_budget.max_turn_input_tokens`
-/// when the model is unknown or unspecified.
-///
-/// Mirrors [`RuntimeLimits::effective_max_turn_input_tokens`] but reads
-/// the configured per-turn cap from `RuntimeConfig` rather than the global
-/// env-tuned singleton, because `/config` operates on a specific
-/// loaded config, not on `RuntimeLimits::global()`.
-pub fn effective_budget_for_model(config: &RuntimeConfig, model: Option<&str>) -> u64 {
-    let configured = config.token_budget.max_turn_input_tokens as u64;
-    let model_budget = model
-        .and_then(context_window_for_model)
-        .map(|window| (window as f64 * MODEL_CONTEXT_INPUT_BUDGET_RATIO) as u64);
-
-    match (model_budget, configured) {
-        (Some(budget), 0) => budget,
-        (Some(budget), cap) => budget.min(cap),
-        (None, 0) => RuntimeLimits::global().max_turn_input_tokens,
-        (None, cap) => cap,
+impl Default for RuntimeConfigLayer {
+    fn default() -> Self {
+        Self(serde_json::json!({}))
     }
 }
 
-// ─── C. settings catalog + apply_edit ───────────────────────────────────
+impl RuntimeConfigLayer {
+    pub fn from_json(json: &str) -> Result<Self, OverlayError> {
+        // Typed parsing also rejects duplicate declared fields before Value
+        // parsing could collapse them.
+        serde_json::from_str::<RuntimeConfig>(json)?;
+        let fields: serde_json::Map<String, Value> = serde_json::from_str(json)?;
+        Ok(Self(Value::Object(fields)))
+    }
+
+    pub fn from_toml(source: &str) -> Result<Self, OverlayError> {
+        let config: RuntimeConfig = toml::from_str(source)?;
+        let mut value: toml::Value = toml::from_str(source)?;
+        // TOML supports non-finite floats, JSON does not. Preserve the existing
+        // trace normalization before conversion instead of turning them into null.
+        if let Some(rate) = value
+            .get_mut("trace")
+            .and_then(|trace| trace.get_mut("sampling_rate"))
+        {
+            *rate = toml::Value::Float(config.trace.normalize().sampling_rate);
+        }
+        Self::from_value(serde_json::to_value(value)?)
+    }
+
+    fn from_value(value: Value) -> Result<Self, OverlayError> {
+        if !value.is_object() {
+            return Err(OverlayError::InvalidInvariant(
+                "configuration layer must be an object".into(),
+            ));
+        }
+        // Validate the layer by itself, including complete routing policy pairs.
+        // Keep its original fields rather than the deserializer's default values.
+        serde_json::from_value::<RuntimeConfig>(value.clone())?;
+        Ok(Self(value))
+    }
+
+    pub fn apply_to(&self, base: &RuntimeConfig) -> Result<RuntimeConfig, OverlayError> {
+        let mut value = serde_json::to_value(base)?;
+        merge_config_fields(&mut value, &self.0);
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Apply explicit CLI trace selections after settings, without overriding
+    /// lower-layer trace fields absent from both settings and the flags.
+    pub fn with_trace_cli_overrides(
+        mut self,
+        profile: Option<&str>,
+        level: Option<&str>,
+        categories: Option<&str>,
+    ) -> Result<Self, OverlayError> {
+        if profile.is_none() && level.is_none() && categories.is_none() {
+            return Ok(self);
+        }
+        let trace = self
+            .apply_to(&RuntimeConfig::default())?
+            .trace
+            .with_cli_overrides(profile, level, categories)
+            .map_err(OverlayError::InvalidInvariant)?;
+        let trace = serde_json::to_value(trace)?;
+        let patch = if matches!(profile, Some("production" | "dev")) {
+            trace
+        } else {
+            let mut patch = serde_json::json!({"profile": trace["profile"]});
+            if level.is_some() {
+                patch["min_level"] = trace["min_level"].clone();
+            }
+            if categories.is_some() {
+                patch["enabled_categories"] = trace["enabled_categories"].clone();
+            }
+            patch
+        };
+        merge_config_fields(&mut self.0, &serde_json::json!({"trace": patch}));
+        Self::from_value(self.0)
+    }
+}
+
+fn merge_config_fields(base: &mut Value, layer: &Value) {
+    match (base, layer) {
+        (Value::Object(base), Value::Object(layer)) => {
+            for (key, value) in layer {
+                merge_config_fields(base.entry(key.clone()).or_insert(Value::Null), value);
+            }
+        }
+        (base, layer) => *base = layer.clone(),
+    }
+}
+
+// ─── B. settings catalog + apply_edit ───────────────────────────────────
 
 /// What kind of editor the UI should spawn for this knob.
 #[derive(Debug, Clone, PartialEq)]
@@ -162,37 +217,6 @@ impl SettingItem {
 /// test will refuse to pass until both sides exist.
 pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
     vec![
-        // ── Token budget ──
-        SettingItem {
-            id: "token_budget.max_turn_input_tokens".to_string(),
-            label: "Max turn input tokens".to_string(),
-            kind: SettingKind::Number {
-                min: 8_000.0,
-                max: 2_000_000.0,
-                allow_fraction: false,
-            },
-            value: Value::from(config.token_budget.max_turn_input_tokens),
-        },
-        SettingItem {
-            id: "token_budget.system_prompt_reserve".to_string(),
-            label: "System prompt reserve tokens".to_string(),
-            kind: SettingKind::Number {
-                min: 500.0,
-                max: 32_000.0,
-                allow_fraction: false,
-            },
-            value: Value::from(config.token_budget.system_prompt_reserve),
-        },
-        SettingItem {
-            id: "token_budget.tools_reserve".to_string(),
-            label: "Tools reserve tokens".to_string(),
-            kind: SettingKind::Number {
-                min: 1_000.0,
-                max: 64_000.0,
-                allow_fraction: false,
-            },
-            value: Value::from(config.token_budget.tools_reserve),
-        },
         // ── Compression pipeline ──
         SettingItem {
             id: "compression.compression_threshold".to_string(),
@@ -281,27 +305,6 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
                     .trace
                     .category_enabled(TraceCategory::HarnessSnapshots),
             ),
-        },
-        // ── Runtime limits (per-turn agentic budget) ──
-        SettingItem {
-            id: "runtime_limits.max_turns".to_string(),
-            label: "Max tool calls per user message (0 = inherit env / built-in 150)".to_string(),
-            kind: SettingKind::Number {
-                min: 0.0,
-                max: 2000.0,
-                allow_fraction: false,
-            },
-            value: Value::from(config.runtime_limits.max_turns),
-        },
-        SettingItem {
-            id: "runtime_limits.plan_subtask_max_turns".to_string(),
-            label: "Max tool calls per plan subtask (0 = fall back to max_turns)".to_string(),
-            kind: SettingKind::Number {
-                min: 0.0,
-                max: 2000.0,
-                allow_fraction: false,
-            },
-            value: Value::from(config.runtime_limits.plan_subtask_max_turns),
         },
         // ── Explain Analyze ──
         SettingItem {
@@ -440,21 +443,6 @@ pub fn apply_edit(
     }
 
     match id {
-        "token_budget.max_turn_input_tokens" => {
-            let n = as_u32(&new_value, id)?;
-            ensure_range(n as f64, 8_000.0, 2_000_000.0, id)?;
-            config.token_budget.max_turn_input_tokens = n;
-        }
-        "token_budget.system_prompt_reserve" => {
-            let n = as_u32(&new_value, id)?;
-            ensure_range(n as f64, 500.0, 32_000.0, id)?;
-            config.token_budget.system_prompt_reserve = n;
-        }
-        "token_budget.tools_reserve" => {
-            let n = as_u32(&new_value, id)?;
-            ensure_range(n as f64, 1_000.0, 64_000.0, id)?;
-            config.token_budget.tools_reserve = n;
-        }
         "compression.compression_threshold" => {
             let n = as_f64(&new_value, id)?;
             ensure_range(n, 0.0, 1.0, id)?;
@@ -647,16 +635,6 @@ pub fn apply_edit(
             mark_trace_custom(&mut config);
             return Ok(config);
         }
-        "runtime_limits.max_turns" => {
-            let n = as_u32(&new_value, id)?;
-            ensure_range(n as f64, 0.0, 2000.0, id)?;
-            config.runtime_limits.max_turns = n;
-        }
-        "runtime_limits.plan_subtask_max_turns" => {
-            let n = as_u32(&new_value, id)?;
-            ensure_range(n as f64, 0.0, 2000.0, id)?;
-            config.runtime_limits.plan_subtask_max_turns = n;
-        }
         "explain.live_rows" => {
             let n = as_u32(&new_value, id)?;
             ensure_range(n as f64, 1.0, 5.0, id)?;
@@ -800,5 +778,82 @@ mod tests {
                 .enabled_categories
                 .contains(&TraceCategory::LlmExchanges)
         );
+    }
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_layers_are_rejected_before_they_can_override_configuration() {
+        for source in [
+            "[]",
+            "null",
+            "1",
+            r#""config""#,
+            r#"{"memory":{"retrieval_top_k":5},"memory":{"retrieval_top_k":7}}"#,
+            r#"{"memory":{"retrieval_top_k":null}}"#,
+            r#"{"memory":{"retrieval_top_k":"5"}}"#,
+            r#"{"model_routing":{"revision":"incomplete"}}"#,
+            r#"{"safety":{"trust_mode":"unsafe"}}"#,
+        ] {
+            assert!(RuntimeConfigLayer::from_json(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn toml_trace_normalization_does_not_expand_profile_presets() {
+        for rate in ["nan", "inf", "-inf"] {
+            let source = format!("[trace]\nprofile = 'dev'\nsampling_rate = {rate}\n");
+            let selected = RuntimeConfigLayer::from_toml(&source)
+                .unwrap()
+                .apply_to(&RuntimeConfig::default())
+                .unwrap();
+            assert_eq!(selected.trace.sampling_rate, 1.0);
+            assert_eq!(selected.trace.profile, TraceProfile::Dev);
+            assert_eq!(
+                selected.trace.enabled_categories,
+                RuntimeConfig::default().trace.enabled_categories
+            );
+        }
+    }
+
+    #[test]
+    fn trace_flags_override_settings_without_filling_omitted_fields() {
+        let base = RuntimeConfig {
+            trace: crate::runtime_config::SessionTraceConfig::default()
+                .apply_profile(TraceProfile::Dev),
+            ..RuntimeConfig::default()
+        };
+        let layer =
+            RuntimeConfigLayer::from_json(r#"{"runtime_limits":{"max_turns":17}}"#).unwrap();
+        let unchanged = layer
+            .clone()
+            .with_trace_cli_overrides(None, None, None)
+            .unwrap()
+            .apply_to(&base)
+            .unwrap();
+        assert_eq!(unchanged.trace, base.trace);
+        let selected = layer
+            .with_trace_cli_overrides(None, Some("info"), None)
+            .unwrap()
+            .apply_to(&base)
+            .unwrap();
+        assert_eq!(selected.runtime_limits.max_turns, 17);
+        assert_eq!(selected.trace.min_level, TraceLevel::Info);
+        assert_eq!(selected.trace.profile, TraceProfile::Custom);
+        assert_eq!(
+            selected.trace.enabled_categories,
+            base.trace.enabled_categories
+        );
+        assert_eq!(selected.trace.sinks, base.trace.sinks);
+        let cleared =
+            RuntimeConfigLayer::from_json(r#"{"trace":{"enabled_categories":[],"sinks":[]}}"#)
+                .unwrap()
+                .apply_to(&base)
+                .unwrap();
+        assert!(cleared.trace.enabled_categories.is_empty());
+        assert!(cleared.trace.sinks.is_empty());
     }
 }

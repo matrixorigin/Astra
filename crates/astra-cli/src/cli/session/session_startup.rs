@@ -1,6 +1,6 @@
 //! REPL startup/setup orchestration extracted from `run_chat_repl`.
 
-use crate::cli::agent_runtime::initialize_multi_agent_runtime;
+use crate::cli::agent_runtime::initialize_agent_projection;
 use crate::cli::cli_config::cli_utils::{
     SessionResumePreflight, clear_profile_last_session_if_matches_or_warn,
     preflight_remote_resume_session,
@@ -32,25 +32,13 @@ pub(crate) struct SessionStartupArtifacts {
 
 // Note: `selector` field was removed — tool surface is now handled by the LLM directly.
 
-/// Select a complete snapshot, or the current process/profile configuration
+/// Select a complete snapshot, or the current process configuration
 /// for a fresh conversation. Preparation must finish before a session rebind.
 pub(crate) fn prepare_session_runtime_config(
     state: &SessionState,
     saved: Option<astra_config::RuntimeConfig>,
-    profile_user_id: Option<&str>,
 ) -> Result<(astra_config::RuntimeConfig, String), String> {
-    let mut config = saved.unwrap_or_else(|| {
-        let mut config = astra_config::RuntimeConfig::load();
-        if let Some(hub) = &state.observability_hub {
-            let user_id = profile_user_id
-                .map(str::to_owned)
-                .or_else(crate::cli::cli_config::cli_utils::cli_account_id)
-                .unwrap_or_else(|| "anonymous".to_string());
-            let profile = hub.profiles().get_profile(&user_id);
-            profile.preferences.apply_to_config(&mut config);
-        }
-        config
-    });
+    let mut config = saved.unwrap_or_else(astra_config::RuntimeConfig::load);
     if let Some(format) = state.explain_report_format_override {
         config.explain.report_format = Some(format);
     }
@@ -116,7 +104,7 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
     initialize_session_artifacts(state, session_id);
 }
 
-fn record_session_persistence_error(state: &mut SessionState, detail: &str) {
+pub(crate) fn record_session_persistence_error(state: &mut SessionState, detail: &str) {
     match state.session_persistence_error.as_deref() {
         Some(existing) if existing == detail => {}
         Some(existing) => {
@@ -805,8 +793,8 @@ pub(crate) async fn complete_session_startup(
 
     tracer.phase("completions_deferred");
 
-    if let Some(token) = startup_token {
-        initialize_multi_agent_runtime(state, api, token, profile).await;
+    if startup_token.is_some() {
+        initialize_agent_projection(state);
     }
     tracer.phase("multi_agent_runtime");
 
@@ -1206,7 +1194,7 @@ mod tests {
             let mut obs =
                 astra_runtime::observability::ObservabilitySession::new_simple("config-restore");
             obs.config.memory.retrieval_top_k = 9;
-            obs.config.token_budget.tools_reserve += 1;
+            obs.config.memory.max_memory_tokens += 1;
             state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
             sync_pending_observability_config(&mut state);
             assert!(!state.observability_config_pending);

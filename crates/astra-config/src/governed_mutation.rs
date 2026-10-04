@@ -6,24 +6,15 @@ use crate::RuntimeConfig;
 pub enum GovernedConfigPath {
     CompressionThreshold,
     RetrievalTopK,
-    MaxTurnInputTokens,
-    ToolsReserve,
 }
 
 impl GovernedConfigPath {
-    pub const ALL: [Self; 4] = [
-        Self::CompressionThreshold,
-        Self::RetrievalTopK,
-        Self::MaxTurnInputTokens,
-        Self::ToolsReserve,
-    ];
+    pub const ALL: [Self; 2] = [Self::CompressionThreshold, Self::RetrievalTopK];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CompressionThreshold => "compression.compression_threshold",
             Self::RetrievalTopK => "memory.retrieval_top_k",
-            Self::MaxTurnInputTokens => "token_budget.max_turn_input_tokens",
-            Self::ToolsReserve => "token_budget.tools_reserve",
         }
     }
 
@@ -31,8 +22,6 @@ impl GovernedConfigPath {
         match self {
             Self::CompressionThreshold => (0.5, 0.98, false),
             Self::RetrievalTopK => (1.0, 20.0, true),
-            Self::MaxTurnInputTokens => (8_000.0, 200_000.0, true),
-            Self::ToolsReserve => (1_000.0, 40_000.0, true),
         }
     }
 }
@@ -44,8 +33,6 @@ impl TryFrom<&str> for GovernedConfigPath {
         match path {
             "compression.compression_threshold" => Ok(Self::CompressionThreshold),
             "memory.retrieval_top_k" => Ok(Self::RetrievalTopK),
-            "token_budget.max_turn_input_tokens" => Ok(Self::MaxTurnInputTokens),
-            "token_budget.tools_reserve" => Ok(Self::ToolsReserve),
             _ => Err(()),
         }
     }
@@ -221,14 +208,6 @@ pub fn apply_governed_config_mutation(
             let old = candidate.memory.retrieval_top_k;
             (f64::from(old), json!(old), json!(new_number as u32))
         }
-        GovernedConfigPath::MaxTurnInputTokens => {
-            let old = candidate.token_budget.max_turn_input_tokens;
-            (f64::from(old), json!(old), json!(new_number as u32))
-        }
-        GovernedConfigPath::ToolsReserve => {
-            let old = candidate.token_budget.tools_reserve;
-            (f64::from(old), json!(old), json!(new_number as u32))
-        }
     };
     let drift = normalized_config_drift(old_number, new_number);
     if let Some(drift_value) = drift
@@ -250,12 +229,6 @@ pub fn apply_governed_config_mutation(
         GovernedConfigPath::RetrievalTopK => {
             candidate.memory.retrieval_top_k = new_number as u32;
         }
-        GovernedConfigPath::MaxTurnInputTokens => {
-            candidate.token_budget.max_turn_input_tokens = new_number as u32;
-        }
-        GovernedConfigPath::ToolsReserve => {
-            candidate.token_budget.tools_reserve = new_number as u32;
-        }
     }
     validate_governed_config_candidate(&candidate)?;
     *config = candidate;
@@ -276,13 +249,6 @@ mod tests {
         let cases = [
             (GovernedConfigPath::CompressionThreshold, 0.5, 0.98, false),
             (GovernedConfigPath::RetrievalTopK, 1.0, 20.0, true),
-            (
-                GovernedConfigPath::MaxTurnInputTokens,
-                8_000.0,
-                200_000.0,
-                true,
-            ),
-            (GovernedConfigPath::ToolsReserve, 1_000.0, 40_000.0, true),
         ];
         for (path, min, max, integer) in cases {
             for boundary in [min, max] {

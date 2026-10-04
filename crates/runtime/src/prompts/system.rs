@@ -786,7 +786,7 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
     }
     if agent_visible {
         body.push_str(
-"         - Delegation fast path: when the user asks for a child, the first native call is `agent(action=\"spawn\", ...)`. Do not call `tool_search`, `invoke_tool`, `model_catalog` or other discovery tools first. Default `agent_type` is bounded read-only `explore`; use `code-review` for review, `task`/`general-purpose` for mutation/full capabilities. For all user-originated model names, omit `requested_model_policy`: runtime admission resolves the authorized catalog. That field is only for programmatic fixed selectors, never user-name normalization. `model_catalog` serves requested availability/comparison, not a spawn prerequisite. Never select from workspace configuration/credentials or silently substitute unavailable/prohibited models.\n",
+"         - Delegation fast path: when the user asks for a child and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. For absent actions or fields, follow the Tool Availability Protocol; never drop requested constraints. Default `agent_type` is bounded read-only `explore`; use `code-review` for review, `task`/`general-purpose` for mutation/full capabilities. For user model names, omit `requested_model_policy`: runtime admission resolves the authorized catalog; fixed selectors are programmatic. `model_catalog` serves requested availability/comparison, not a spawn prerequisite. Never select from workspace configuration/credentials or silently substitute unavailable/prohibited models.\n",
         );
         body.push_str(
             "         - Launch before tools for the assigned objective: resource/evidence checks belong to the child, not parent preflight. One objective normally needs one child; use fanout for group control, not speculative duplication.\n",
@@ -1722,9 +1722,7 @@ mod tests {
         );
         assert!(agent_surface.contains("Delegation fast path"));
         assert!(agent_surface.contains("the first native call is `agent(action=\"spawn\", ...)`"));
-        assert!(
-            agent_surface.contains("Do not call `tool_search`, `invoke_tool`, `model_catalog`")
-        );
+        assert!(agent_surface.contains("all required arguments fit the visible schema"));
         assert!(agent_surface.contains("not a spawn prerequisite"));
         assert!(agent_surface.contains("silently substitute unavailable/prohibited models"));
         assert!(!agent_surface.contains("settle_work_item"));
@@ -2330,6 +2328,13 @@ mod tests {
 
         let discoverable = tool_conditional_section(&["agent", "tool_search"]);
         assert!(discoverable.contains("ordinary spawn, status, child messages, and results"));
+        assert!(discoverable.contains("all required arguments fit the visible schema"));
+        assert!(
+            discoverable
+                .contains("For absent actions or fields, follow the Tool Availability Protocol")
+        );
+        assert!(discoverable.contains("never drop requested constraints"));
+        assert!(!discoverable.contains("Do not call `tool_search`"));
         assert!(discoverable.contains("the first native call is `agent(action=\"spawn\", ...)`"));
         assert!(discoverable.contains("runtime admission resolves the authorized catalog"));
         assert!(discoverable.contains("model_catalog` serves requested availability/comparison"));

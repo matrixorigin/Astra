@@ -71,8 +71,6 @@ pub enum SandboxExpansionError {
 use crossterm::style::Stylize;
 use serde_json::{Value, json};
 
-#[path = "edge_tools/agent_messaging.rs"]
-pub mod agent_messaging;
 #[path = "edge_tools/agent_spawning.rs"]
 pub mod agent_spawning;
 use astra_tools::build_test;
@@ -1423,8 +1421,6 @@ pub struct ToolExecutor {
     /// bounded snapshot is copied into each child admission context.
     parent_model_reasoning:
         std::sync::Mutex<Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning>>,
-    /// Optional messaging context for the `send_message` tool.
-    pub send_message_context: std::sync::Mutex<Option<agent_messaging::SendMessageRuntimeContext>>,
     /// Optional canonical observability session for introspection.
     /// Provides access to per-turn context assembly traces, timing data,
     /// drift detection, and decision explanations.
@@ -1581,7 +1577,6 @@ impl ToolExecutor {
             delegation_requires_admission: false,
             read_only_execution: false,
             parent_model_reasoning: std::sync::Mutex::new(None),
-            send_message_context: std::sync::Mutex::new(None),
             observability_session: None,
             introspect_snapshot: std::sync::Arc::new(std::sync::RwLock::new(None)),
             active_session_id: std::sync::Mutex::new(None),
@@ -2267,20 +2262,6 @@ impl ToolExecutor {
 
     pub(super) fn mcp_runtime_snapshot(&self, label: &str) -> EdgeMcpRuntimeSnapshot {
         rwlock_read_clone_or_default(&self.mcp_runtime, label)
-    }
-
-    /// Set or clear the messaging context for inter-agent communication.
-    pub fn set_send_message_context(
-        &self,
-        ctx: Option<agent_messaging::SendMessageRuntimeContext>,
-    ) {
-        let mut guard = self.send_message_context.lock().unwrap_or_else(|e| {
-            tracing::error!(
-                "send_message_context lock poisoned; recovering and overwriting stale slot"
-            );
-            e.into_inner()
-        });
-        *guard = ctx;
     }
 
     /// Set the observability session for context analysis tools.
@@ -5319,15 +5300,9 @@ impl ToolExecutor {
                             .await
                         }
                         astra_tools::agent_tool_contract::AgentAction::SendMessage => {
-                            let mailbox_ctx = self
-                                .send_message_context
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .clone();
-                            agent_spawning::handle_agent_send_message_action(
+                            astra_runtime::orchestration::handle_agent_tool(
                                 args,
                                 self.spawn_context.as_ref(),
-                                mailbox_ctx.as_ref(),
                             )
                             .await
                         }
@@ -5710,9 +5685,14 @@ impl ToolExecutor {
         if let Some(session_id) = self.active_session_id()
             && let Some(surface) = crate::cli::self_command::agent_info_surface_alias(dimension)
         {
-            return crate::cli::self_command::render_surface_for_session(&session_id, surface, 20)
-                .await
-                .unwrap_or_else(|error| serde_json::json!({ "error": error }).to_string());
+            return crate::cli::surface::self_surface::render_surface_for_session_with_profile(
+                &session_id,
+                surface,
+                20,
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| serde_json::json!({ "error": error }).to_string());
         }
 
         let self_model = self.build_self_model_snapshot();

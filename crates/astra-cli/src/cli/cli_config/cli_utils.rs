@@ -1329,21 +1329,6 @@ mod tests {
         );
     }
 
-    struct CliOverlayGuard;
-
-    impl CliOverlayGuard {
-        fn install(overlay: astra_config::runtime_config::RuntimeConfig) -> Self {
-            astra_config::runtime_config::set_cli_overlay(Some(overlay));
-            Self
-        }
-    }
-
-    impl Drop for CliOverlayGuard {
-        fn drop(&mut self) {
-            astra_config::runtime_config::set_cli_overlay(None);
-        }
-    }
-
     fn write_resumable_session(session_id: &str) {
         let writer = session_journal::JournalWriter::new(session_id).unwrap();
         writer

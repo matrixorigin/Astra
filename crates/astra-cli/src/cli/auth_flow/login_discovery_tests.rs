@@ -48,7 +48,6 @@ async fn browser_login_completion_requires_registered_checkout_before_runtime_re
                     .unwrap()
                     .contains("local execution registration failed")
             );
-            assert!(state.delegation_engine.is_none());
             assert!(state.agent_spawner.is_none());
         } else {
             assert!(result.is_ok());

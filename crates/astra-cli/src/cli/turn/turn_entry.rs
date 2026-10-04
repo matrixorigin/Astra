@@ -245,7 +245,19 @@ pub(super) async fn ensure_interactive_session_identity(
     if let Some(session_id) = state.session_id.clone() {
         return Ok(session_id);
     }
-    crate::cli::slash::slash_state::bind_initial_session(api, profile, token, state).await
+    let session_id =
+        crate::cli::slash::slash_state::bind_initial_session(api, profile, token, state).await?;
+    // The canonical session is committed before provider admission. Publish
+    // its identity now: the SSE executor already has this binding and may
+    // never emit a changed-identity event (including preflight failures).
+    if let Some(tx) = &state.tui_stream_event_tx {
+        let _ = tx
+            .send(crate::cli::chat_stream::StreamEvent::SessionBound(
+                session_id.clone(),
+            ))
+            .await;
+    }
+    Ok(session_id)
 }
 
 async fn ensure_default_turn_model(
@@ -397,7 +409,7 @@ pub(crate) async fn handle_chat_input_with_ui(
     // it so the next interactive turn (or another surface) can proceed.
     let _execution_lease = acquire_interactive_turn_admission(state)?;
 
-    ensure_multi_agent_runtime_for_turn(state, ctx.api, token, ctx.profile).await;
+    ensure_agent_projection_for_turn(state);
 
     ui.blank_line();
 
@@ -508,7 +520,7 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
 
     let _execution_lease = acquire_interactive_turn_admission(state)?;
 
-    ensure_multi_agent_runtime_for_turn(state, ctx.api, token, ctx.profile).await;
+    ensure_agent_projection_for_turn(state);
     let notification_count = state.pending_bg_notifications.len();
     let notifications = state.pending_bg_notifications.join("\n");
     let runtime_required_texts = vec![format!(
@@ -638,22 +650,11 @@ pub(super) fn acquire_interactive_turn_admission(
     Ok(Some(lease))
 }
 
-async fn ensure_multi_agent_runtime_for_turn(
-    state: &mut SessionState,
-    api: &astra_thin_client::ThinClient,
-    token: &str,
-    profile: Option<&str>,
-) {
+fn ensure_agent_projection_for_turn(state: &mut SessionState) {
     if state.agent_spawner.is_some() {
         return;
     }
-    crate::cli::agent_runtime::initialize_multi_agent_runtime(
-        state,
-        api,
-        token.to_string(),
-        profile,
-    )
-    .await;
+    crate::cli::agent_runtime::initialize_agent_projection(state);
 }
 
 #[cfg(test)]
@@ -662,7 +663,7 @@ mod tests {
     use super::{
         InteractiveTurnOutcome, ShellPassthroughDecision, TurnContext, TurnUsage,
         acquire_interactive_turn_admission, classify_shell_passthrough,
-        ensure_interactive_session_identity, ensure_multi_agent_runtime_for_turn,
+        ensure_agent_projection_for_turn, ensure_interactive_session_identity,
         handle_chat_input_with_ui, interactive_outcome, model_selection_preflight_failure,
     };
     use crate::cli::session::session_state::SessionState;
@@ -801,7 +802,9 @@ mod tests {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let _credentials_guard = crate::tests::isolate_credentials();
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let mut state = SessionState {
+            tui_stream_event_tx: Some(tx),
             // A selected model with no Offering makes the later provider
             // preflight fail deterministically, without spending model tokens.
             model: Some(("mock-model".to_string()).into()),
@@ -843,6 +846,17 @@ mod tests {
         .await
         .expect("the next input must reuse the canonical session after a failed first turn");
 
+        let mut bindings = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let crate::cli::chat_stream::StreamEvent::SessionBound(id) = event {
+                bindings.push(id);
+            }
+        }
+        assert_eq!(
+            bindings,
+            std::slice::from_ref(&session_id),
+            "publish the committed identity even when provider preflight fails; retries do not rebind"
+        );
         server.verify().await;
         let requests = server.received_requests().await.unwrap();
         assert_eq!(
@@ -913,7 +927,11 @@ mod tests {
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let mut state = SessionState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut state = SessionState {
+            tui_stream_event_tx: Some(tx),
+            ..SessionState::default()
+        };
         let ctx = TurnContext {
             api: &api,
             profile: None,
@@ -934,6 +952,10 @@ mod tests {
         .expect_err("session creation must fail before turn admission");
 
         assert!(error.contains("503"), "{error}");
+        assert!(
+            rx.try_recv().is_err(),
+            "failed session creation must not publish an identity"
+        );
         assert_eq!(state.session_id, None);
         assert_eq!(state.turn, 0);
         assert!(state.history.is_empty());
@@ -1194,18 +1216,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn turn_boundary_initializes_multi_agent_runtime_when_startup_did_not() {
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+    #[test]
+    fn turn_boundary_initializes_agent_projection_when_startup_did_not() {
         let mut state = SessionState::default();
         state.set_session_id("turn-session");
 
-        ensure_multi_agent_runtime_for_turn(&mut state, &api, "turn-token", Some("test-profile"))
-            .await;
+        ensure_agent_projection_for_turn(&mut state);
 
         assert!(
             state.agent_spawner.is_some(),
-            "a session-bound turn must have an agent executor binding"
+            "a session-bound turn must have its recovery projection"
         );
     }
 

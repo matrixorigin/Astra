@@ -236,28 +236,12 @@ pub struct TraceSurface {
     pub latest_full_context_trace: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BudgetConfig {
-    pub compression_threshold: f64,
-    pub max_turn_input_tokens: u32,
-}
-
-impl Default for BudgetConfig {
-    fn default() -> Self {
-        Self {
-            compression_threshold: 0.0,
-            max_turn_input_tokens: 0,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct BudgetSurface {
     pub session_id: String,
     pub persistence_error: Option<String>,
     pub budget: Option<BudgetState>,
     pub compression_threshold: f64,
-    pub max_turn_input_tokens: u32,
     pub risk_flags: Vec<String>,
 }
 
@@ -393,7 +377,7 @@ pub trait SelfSurfaceRuntimeSupport: Send + Sync {
     fn constraints(&self) -> SurfaceConstraints {
         SurfaceConstraints::default()
     }
-    fn budget_config(&self, tuned_config_json: Option<&str>) -> Result<BudgetConfig, String>;
+    fn compression_threshold(&self, tuned_config_json: Option<&str>) -> Result<f64, String>;
     fn runtime_checks(&self, tuned_config_json: Option<&str>) -> Vec<SelfSurfaceCheck>;
 }
 
@@ -404,8 +388,8 @@ impl SelfSurfaceRuntimeSupport for NoopSelfSurfaceRuntimeSupport {
         Vec::new()
     }
 
-    fn budget_config(&self, _: Option<&str>) -> Result<BudgetConfig, String> {
-        Ok(BudgetConfig::default())
+    fn compression_threshold(&self, _: Option<&str>) -> Result<f64, String> {
+        Ok(0.0)
     }
 
     fn runtime_checks(&self, _: Option<&str>) -> Vec<SelfSurfaceCheck> {
@@ -852,7 +836,7 @@ fn build_budget_surface(
     artifacts: &SessionArtifacts,
     runtime_support: &dyn SelfSurfaceRuntimeSupport,
 ) -> Result<BudgetSurface, String> {
-    let budget_config = runtime_support.budget_config(
+    let compression_threshold = runtime_support.compression_threshold(
         artifacts
             .workspace
             .as_ref()
@@ -862,8 +846,7 @@ fn build_budget_surface(
         session_id: artifacts.session_id.clone(),
         persistence_error: snapshot.run.persistence_error.clone(),
         budget: snapshot.run.budget.clone(),
-        compression_threshold: budget_config.compression_threshold,
-        max_turn_input_tokens: budget_config.max_turn_input_tokens,
+        compression_threshold,
         risk_flags: snapshot.run.risk_flags.clone(),
     })
 }
@@ -1920,11 +1903,8 @@ mod tests {
             ]
         }
 
-        fn budget_config(&self, _: Option<&str>) -> Result<BudgetConfig, String> {
-            Ok(BudgetConfig {
-                compression_threshold: 0.7,
-                max_turn_input_tokens: 120000,
-            })
+        fn compression_threshold(&self, _: Option<&str>) -> Result<f64, String> {
+            Ok(0.7)
         }
 
         fn runtime_checks(&self, _: Option<&str>) -> Vec<SelfSurfaceCheck> {

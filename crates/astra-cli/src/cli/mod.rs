@@ -4,7 +4,6 @@
 //! that were previously in `main.rs`, following standard Rust module conventions.
 
 // ── Module declarations ──
-pub mod agent_loader;
 pub mod agent_runtime;
 pub mod app_server;
 pub mod arg_render;
@@ -19,7 +18,6 @@ pub mod command_usage;
 pub mod config_manager;
 pub mod context_dump;
 pub mod context_references;
-pub mod delegate_subrun;
 pub mod diagnostic_log;
 pub mod diff_presenter;
 pub mod edge_lifecycle;
@@ -47,9 +45,7 @@ pub mod self_command;
 pub mod session;
 pub(crate) mod session_judge;
 pub mod skill_catalog;
-pub mod skill_subrun;
 pub mod slash;
-pub mod spawn_subrun;
 pub mod sse_utils;
 pub mod startup_trace;
 pub mod stream;

@@ -43,16 +43,14 @@ criteria:
     min: 1
     max: 1
     min_distinct_child_runs: 1
-  - type: journal_tool_json
-    name: agent_fanout
-    document: result
-    path: /provenance/all_slots_delivered
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+  - type: session_child_result_adopted
+    expected_result: child-approval-ok
+  - type: journal_turn_evaluation_success
     equals: true
-  - type: journal_tool_json
-    name: agent_fanout
-    document: result
-    path: /work_unit_observation/status
-    equals: completed
   - type: text_equals
     expected: child-approval-ok
   - type: turn_rounds_between

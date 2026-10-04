@@ -32,10 +32,6 @@ pub enum HistoryWorkSite {
     CliContextDumpJournalHistoryMaterialization,
     CliContextDumpSerialization,
     CliDisplayHistoryProjectionClone,
-    CliForkChildHistoryMaterialization,
-    CliForkFrozenToolSchemaClone,
-    CliForkPrefixSerialization,
-    CliForkToolSchemaSerialization,
     CliMemoryInferenceRequestClone,
     CliPostCommitQueue,
     CliPromptContinuationSanitization,
@@ -53,7 +49,6 @@ pub enum HistoryWorkSite {
     CliSessionRestoreHydration,
     CliSessionRestoreCanonicalHistoryClone,
     CliSessionRestoreJournalHistoryClone,
-    CliSubrunPromptPayloadClone,
     CliTurnRetryHistoryClone,
     CliTurnUserInputProjection,
     CslMaterializedStateClone,
@@ -151,7 +146,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 131;
+    const COUNT: usize = 126;
 
     /// Current instrumented sites; retired producers do not retain zero-only entries.
     pub const ALL: [Self; Self::COUNT] = [
@@ -170,10 +165,6 @@ impl HistoryWorkSite {
         Self::CliContextDumpJournalHistoryMaterialization,
         Self::CliContextDumpSerialization,
         Self::CliDisplayHistoryProjectionClone,
-        Self::CliForkChildHistoryMaterialization,
-        Self::CliForkFrozenToolSchemaClone,
-        Self::CliForkPrefixSerialization,
-        Self::CliForkToolSchemaSerialization,
         Self::CliMemoryInferenceRequestClone,
         Self::CliPostCommitQueue,
         Self::CliPromptContinuationSanitization,
@@ -191,7 +182,6 @@ impl HistoryWorkSite {
         Self::CliSessionRestoreHydration,
         Self::CliSessionRestoreCanonicalHistoryClone,
         Self::CliSessionRestoreJournalHistoryClone,
-        Self::CliSubrunPromptPayloadClone,
         Self::CliTurnRetryHistoryClone,
         Self::CliTurnUserInputProjection,
         Self::CslMaterializedStateClone,
@@ -309,10 +299,6 @@ impl HistoryWorkSite {
             }
             Self::CliContextDumpSerialization => "cli_context_dump_serialization",
             Self::CliDisplayHistoryProjectionClone => "cli_display_history_projection_clone",
-            Self::CliForkChildHistoryMaterialization => "cli_fork_child_history_materialization",
-            Self::CliForkFrozenToolSchemaClone => "cli_fork_frozen_tool_schema_clone",
-            Self::CliForkPrefixSerialization => "cli_fork_prefix_serialization",
-            Self::CliForkToolSchemaSerialization => "cli_fork_tool_schema_serialization",
             Self::CliMemoryInferenceRequestClone => "cli_memory_inference_request_clone",
             Self::CliPostCommitQueue => "cli_post_commit_queue",
             Self::CliPromptContinuationSanitization => "cli_prompt_continuation_sanitization",
@@ -334,7 +320,6 @@ impl HistoryWorkSite {
             Self::CliSessionRestoreJournalHistoryClone => {
                 "cli_session_restore_journal_history_clone"
             }
-            Self::CliSubrunPromptPayloadClone => "cli_subrun_prompt_payload_clone",
             Self::CliTurnRetryHistoryClone => "cli_turn_retry_history_clone",
             Self::CliTurnUserInputProjection => "cli_turn_user_input_projection",
             Self::CslMaterializedStateClone => "csl_materialized_state_clone",
@@ -459,13 +444,6 @@ impl HistoryWorkSite {
             | Self::CliContextDumpSerialization => "cli.context_dump",
             Self::CliDisplayHistoryProjectionClone | Self::CliSessionRestoreHydration => {
                 "cli.session_continuation"
-            }
-            Self::CliForkChildHistoryMaterialization => "cli.spawn_subrun",
-            Self::CliForkFrozenToolSchemaClone | Self::CliSubrunPromptPayloadClone => {
-                "cli.skill_subrun"
-            }
-            Self::CliForkPrefixSerialization | Self::CliForkToolSchemaSerialization => {
-                "cli.chat_stream.fork_capture"
             }
             Self::CliMemoryInferenceRequestClone => "cli.session.memory_inference",
             Self::CliPromptContinuationSanitization => "cli.chat_stream.load_turn_messages",
@@ -620,10 +598,6 @@ impl HistoryWorkSite {
             | Self::ForkPrefixReconstruction
             | Self::ServerForkToolSchemaClone
             | Self::ServerForkPrefixSerialization
-            | Self::CliForkChildHistoryMaterialization
-            | Self::CliForkFrozenToolSchemaClone
-            | Self::CliForkPrefixSerialization
-            | Self::CliForkToolSchemaSerialization
             | Self::CliSessionRestoreCanonicalHistoryClone
             | Self::CliSessionRestoreJournalHistoryClone
             | Self::DelegationParentMessagesClone => 5,
@@ -638,7 +612,6 @@ impl HistoryWorkSite {
             | Self::CliPromptContinuationSanitization
             | Self::CliPromptNormalizationClone
             | Self::CliPromptPayloadClone
-            | Self::CliSubrunPromptPayloadClone
             | Self::EphemeralPipelineInputMaterialization
             | Self::ServerCompactionFixedContextClone
             | Self::ServerToolPolicySchemaClone

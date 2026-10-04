@@ -1295,6 +1295,16 @@ macro_rules! heap_schema_vec {
     }};
 }
 
+fn delegation_agent_type_schema() -> Value {
+    let selection = "With an admitted directory, use its exact profile ID. Otherwise omitted/explore/code-review are read-only (no shell); choose task/general-purpose for shell or mutation, within parent permissions.";
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "description": selection,
+        "x-astra-discovery-summary": "Exact directory ID; else explore=no shell(default), task requests shell.",
+    })
+}
+
 fn requested_model_policy_schema() -> Value {
     json!({
         "description": "Requested model behavior, distinct from the resolved Offering. For a model name coming from the human request, omit this field—including exact names and harmless spelling variants—so one candidate-aware admission can resolve it against the authorized catalog. Use a fixed selector only when the caller already has an exact authorized Offering ID; never put a display name in offering_id, normalize a human name into a fixed selector, or guess an Offering ID. Unresolved or unavailable requirements block new child execution. Explicit inherit cannot override a hard user requirement. Auto cost-priority and balanced requests are preserved, but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable.",
@@ -1815,7 +1825,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "properties": {
                         "action": {"type": "string", "enum": ["config","sleep","history_page","history_search","history_around"]},
                         "path": {"type": "string", "description": "Config path for action=config."},
-                        "value": {"type": "string", "description": "Config value"},
+                        "value": {"type": "number", "description": "Numeric config value. Count paths require an integer; compression threshold accepts a fractional number."},
                         "force": {"type": "boolean", "description": "Override config drift/mutation governor for action=config."},
                         "duration_ms": {"type": "integer", "description": "Sleep ms, max 300000"},
                         "reason": {"type": "string", "description": "Reason (sleep)"},
@@ -1979,7 +1989,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "description": {"type": "string", "description": "Short operation description when required by the selected action."},
                         "prompt": {"type": "string", "description": "Full self-contained child task brief for spawn. Include the constraints, conditional mappings, and expected output needed to finish; only a choice the child must ask about may be left unresolved. Non-empty and required with description."},
-                        "agent_type": {"type": "string", "minLength": 1, "description": "Exact non-empty admitted profile/directory ID when this run has a profile directory; do not omit it or substitute a builtin persona. Without an admitted directory, omit for the bounded read-only default or choose a builtin persona only when mutation or the full surface is required."},
+                        "agent_type": delegation_agent_type_schema(),
                         "requested_model_policy": requested_model_policy_schema(),
                         "reasoning": fanout_reasoning_schema(),
                         "name": {"type": "string", "description": "Action label when accepted by the selected action."},
@@ -2071,7 +2081,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                     "id": {"type": "string", "description": "Optional stable caller-facing label for this slot. Returned in start/results/fanout projections. Not the runtime agent_id."},
                                     "description": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS, "description": "Short UI summary for this slot."},
                                     "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Concise child task brief. The child inherits current provider bindings and can use only its exposed tools; never paste file contents, diffs, or prior tool output here."},
-                                    "agent_type": {"type": "string", "minLength": 1, "description": "Exact non-empty admitted profile/directory ID when this run has a profile directory; do not omit it or substitute a builtin persona. Without an admitted directory, omit for the bounded read-only default or choose a builtin persona only when mutation or the full surface is required."},
+                                    "agent_type": delegation_agent_type_schema(),
                                     "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
                                     "max_output_tokens": {"type": "integer", "minimum": 1},
                                     "complexity": {"type": "string", "enum": ["light","normal","deep"]},
@@ -2088,7 +2098,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "description": "Shared runtime configuration inherited by every slot. Slot-level overrides take precedence.",
                             "additionalProperties": false,
                             "properties": {
-                                "agent_type": {"type": "string", "minLength": 1, "description": "Exact non-empty admitted profile/directory ID when this run has a profile directory; do not omit it or substitute a builtin persona. Without an admitted directory, omit for the bounded read-only default or choose a builtin persona only when mutation or the full surface is required."},
+                                "agent_type": delegation_agent_type_schema(),
                                 "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
                                 "max_output_tokens": {"type": "integer", "minimum": 1},
                                 "complexity": {"type": "string", "enum": ["light","normal","deep"]},
@@ -4024,6 +4034,29 @@ mod tests {
         assert!(props.contains_key("path"));
         assert!(!props.contains_key("key"));
         assert!(!props.contains_key("tool"));
+    }
+
+    #[test]
+    fn session_config_schema_accepts_numeric_values_and_rejects_other_types() {
+        for (path, value) in [
+            ("compression.compression_threshold", json!(0.81)),
+            ("memory.retrieval_top_k", json!(6)),
+        ] {
+            validate_tool_arguments(
+                "session",
+                &json!({"action":"config", "path":path, "value":value}),
+            )
+            .unwrap();
+        }
+        for value in [json!("6"), json!(true), Value::Null, json!({}), json!([])] {
+            assert!(
+                validate_tool_arguments(
+                    "session",
+                    &json!({"action":"config", "path":"memory.retrieval_top_k", "value":value})
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

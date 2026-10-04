@@ -160,7 +160,6 @@ impl AgentRow {
         let run_id = match target {
             AgentControlTarget::DurableRun { run_id } => run_id.as_str(),
             AgentControlTarget::LocalAgent { .. } => self.run_id.as_deref()?,
-            AgentControlTarget::LocalDelegatedRun { .. } => return None,
         };
         Some((target, run_id))
     }

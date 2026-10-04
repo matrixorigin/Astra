@@ -424,7 +424,12 @@ fn compact_select_parameters(params: &Value) -> Value {
         .as_object()
         .and_then(crate::schemas::action_contract_description);
     let mut compact = params.clone();
-    strip_schema_descriptions(&mut compact);
+    // The tool-level summary is already returned beside parameters. Nested
+    // producers may use the same annotation for load-bearing parameter choices.
+    if let Some(object) = compact.as_object_mut() {
+        object.remove("x-astra-discovery-summary");
+    }
+    compact_parameter_descriptions(&mut compact, false);
     // Keep the load-bearing conditional fields after removing internal
     // producer annotations.  This stays a single compact description rather
     // than reintroducing the full schema prose or a provider-specific union.
@@ -436,38 +441,46 @@ fn compact_select_parameters(params: &Value) -> Value {
     compact
 }
 
-fn strip_schema_descriptions(value: &mut Value) {
+/// Compact a canonical parameter schema, retaining producer-owned guidance.
+/// Consumes the summary annotation instead of storing it twice. Resident schemas
+/// retain other internal annotations; selected schemas remove them for the model.
+pub fn compact_parameter_descriptions(value: &mut Value, retain_internal_metadata: bool) {
     match value {
         Value::Object(map) => {
             map.remove("description");
-            map.retain(|key, _| !key.starts_with("x-astra-"));
+            if let Some(Value::String(summary)) = map.remove("x-astra-discovery-summary") {
+                map.insert("description".to_string(), Value::String(summary));
+            }
+            if !retain_internal_metadata {
+                map.retain(|key, _| !key.starts_with("x-astra-"));
+            }
             for (key, child) in map {
                 if is_schema_map_key(key) {
-                    strip_schema_map_descriptions(child);
+                    compact_schema_map_descriptions(child, retain_internal_metadata);
                 } else {
-                    strip_schema_descriptions(child);
+                    compact_parameter_descriptions(child, retain_internal_metadata);
                 }
             }
         }
         Value::Array(values) => {
             for child in values {
-                strip_schema_descriptions(child);
+                compact_parameter_descriptions(child, retain_internal_metadata);
             }
         }
         _ => {}
     }
 }
 
-fn strip_schema_map_descriptions(value: &mut Value) {
+fn compact_schema_map_descriptions(value: &mut Value, retain_internal_metadata: bool) {
     match value {
         Value::Object(map) => {
             for child in map.values_mut() {
-                strip_schema_descriptions(child);
+                compact_parameter_descriptions(child, retain_internal_metadata);
             }
         }
         Value::Array(values) => {
             for child in values {
-                strip_schema_descriptions(child);
+                compact_parameter_descriptions(child, retain_internal_metadata);
             }
         }
         _ => {}
@@ -1122,7 +1135,16 @@ mod tests {
                 "parameters": {
                     "type": "object",
                     "x-astra-discovery-summary": "start needs action+scope; observe needs work_id",
-                    "properties": {"action": {"type": "string"}}
+                    "properties": {
+                        "action": {"type": "string"},
+                        "description": {
+                            "type": "string",
+                            "description": "Long catalog prose must not survive.",
+                            "x-astra-discovery-summary": "Choose an authorized scope.",
+                            "x-astra-internal-note": "not model-visible"
+                        },
+                        "other": {"type": "string", "description": "Discard prose", "x-astra-discovery-summary": false}
+                    }
                 }
             }
         })];
@@ -1133,6 +1155,19 @@ mod tests {
             selected["matches"][0]["description"],
             "start needs action+scope; observe needs work_id"
         );
+        let parameters = &selected["matches"][0]["parameters"];
+        assert!(parameters.get("description").is_none());
+        assert_eq!(parameters["properties"]["description"]["type"], "string");
+        assert_eq!(
+            parameters["properties"]["description"]["description"],
+            "Choose an authorized scope."
+        );
+        assert!(
+            parameters["properties"]["other"]
+                .get("description")
+                .is_none()
+        );
+        assert!(!parameters.to_string().contains("x-astra-"));
         assert!(
             selected["matches"][0]["parameters"]
                 .get("x-astra-discovery-summary")
@@ -1193,6 +1228,28 @@ mod tests {
             let selected = tool_search(&schemas, &json!({"query": query}));
             let parsed: Value = serde_json::from_str(&selected).unwrap();
             assert_eq!(parsed["selection_status"], "ok", "{query}: {parsed}");
+            for selected in parsed["matches"].as_array().unwrap() {
+                let parameters = &selected["parameters"]["properties"];
+                let profiles = if selected["name"] == "agent" {
+                    vec![&parameters["agent_type"]]
+                } else {
+                    vec![
+                        &parameters["defaults"]["properties"]["agent_type"],
+                        &parameters["slots"]["items"]["properties"]["agent_type"],
+                    ]
+                };
+                for profile in profiles {
+                    let description = profile["description"].as_str().unwrap();
+                    for constraint in [
+                        "Exact directory ID",
+                        "explore=no shell(default)",
+                        "task requests shell",
+                    ] {
+                        assert!(description.contains(constraint), "{query}: {description}");
+                    }
+                    assert!(profile.get("x-astra-discovery-summary").is_none());
+                }
+            }
             assert!(
                 selected.len() <= super::MAX_SELECTION_RESULT_BYTES,
                 "{query} exceeds the source-bounded presentation: {} bytes",

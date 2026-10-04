@@ -1431,15 +1431,6 @@ pub(crate) fn initialize_session_state(
     if let Some(ref hub) = state.observability_hub {
         let user_id = account_id.as_deref().unwrap_or("anonymous");
         state.observability_session = Some(hub.start_session(user_id, "pending"));
-        // Resolve the existing profile preferences into the execution authority
-        // once, before deriving budgets or publishing observability projections.
-        if let Some(obs) = &state.observability_session {
-            let guard = obs.read().unwrap_or_else(|error| error.into_inner());
-            guard
-                .profile
-                .preferences
-                .apply_to_config(&mut state.runtime_config);
-        }
         state.context_budget =
             astra_runtime::prompts::ContextBudget::from_runtime_config(&state.runtime_config, None);
         state.observability_config_pending = true;
@@ -3786,7 +3777,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn initialized_profile_configuration_survives_fresh_session_rebind() {
+    async fn initialized_profile_identity_survives_fresh_session_rebind() {
         let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
             "default", None,
         )
@@ -3798,17 +3789,25 @@ mod tests {
             tmp.path().join("observability"),
         );
         let mut profile = hub.profiles().get_profile("anonymous");
-        profile.preferences.config_overrides.insert(
-            "token_budget.max_prompt_tokens".into(),
-            serde_json::json!(12345),
-        );
+        profile.stats.total_queries = 12345;
         hub.profiles().update_profile(profile);
         let mut state = initialize_session_state(
             None,
             None,
             &crate::cli::cli_config::cli_context::CliContext::default(),
         );
-        assert_eq!(state.runtime_config.token_budget.max_prompt_tokens, 12345);
+        assert_eq!(
+            state
+                .observability_session
+                .as_ref()
+                .unwrap()
+                .read()
+                .unwrap()
+                .profile
+                .stats
+                .total_queries,
+            12345
+        );
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/sessions"))
@@ -3829,7 +3828,6 @@ mod tests {
         .await
         .unwrap();
         server.verify().await;
-        assert_eq!(state.runtime_config.token_budget.max_prompt_tokens, 12345);
         assert_eq!(
             state
                 .observability_session
@@ -3837,12 +3835,12 @@ mod tests {
                 .unwrap()
                 .read()
                 .unwrap()
-                .config
-                .token_budget
-                .max_prompt_tokens,
+                .profile
+                .stats
+                .total_queries,
             12345
         );
-        // A bound account without preferences must not inherit anonymous's values.
+        // A bound account must not inherit anonymous profile statistics.
         let _account = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
             "default",
             Some("unconfigured-account"),
@@ -3865,6 +3863,7 @@ mod tests {
             .unwrap();
         assert_eq!(obs.user_id, "unconfigured-account");
         assert_eq!(obs.profile.user_id, "unconfigured-account");
+        assert_eq!(obs.profile.stats.total_queries, 0);
     }
 
     #[serial_test::serial]

@@ -140,22 +140,48 @@ Scoped credentials drive login, refresh, memory proxy, explicit tools, recall, e
 ### Runtime tuning (optional)
 
 Runtime configuration exposes controls consumed by execution: compression,
-retrieval, token budgets, tool policy and tracing. The retired `verification`,
-`memory_pressure` and `context_window` sections are not supported. Model context
+retrieval, tool policy and tracing. The retired `verification`,
+`memory_pressure`, `context_window` and `token_budget` sections are not supported.
+Execution input budgets belong to RuntimeLimits (`ASTRA_MAX_TURN_INPUT_TOKENS`)
+and the admitted model context window; self budget views report observed budget
+state instead of an inactive configuration cap. Model context
 window metadata and tool verification contracts retain their existing owners.
 
 Unknown top-level runtime fields are rejected by the configuration parser.
+User and project files, environment values and CLI settings apply in that order.
+The configuration editor saves user defaults under `ASTRA_LOCAL_STATE_ROOT/config/runtime.toml`
+when that root is set, otherwise under `~/.astra/config/runtime.toml`; local versions
+live in the adjacent `versions` directory. Saving defaults retains invocation CLI settings
+and any complete configuration snapshot belonging to the current session. The current
+session version identifies its effective configuration, not the saved defaults file.
+Server execution-round limits are configured on the Server; the CLI `/config`
+editor does not expose controls for the remote Server’s `runtime_limits`.
+File and JSON layers retain only explicitly supplied fields: missing fields preserve
+lower layers, while defaults, `false`, zero and empty arrays replace them. JSON `null`
+clears optional values and is rejected for non-optional fields. When a layer supplies a model-routing policy, it must declare it completely. CLI trace flags take precedence
+over `--settings`; level/category flags preserve unspecified trace fields, while
+production/dev profile flags select their complete presets. Compression presets and
+trace normalization still run after configuration selection. Non-finite environment
+compression thresholds are rejected with a warning and preserve the configured value;
+an invalid environment value cannot discard explicit CLI settings.
 `--settings` reports the parse error. A saved session configuration is a complete snapshot, not an overlay: restoring
 it replaces the execution configuration before deriving context budgets and the observability projection,
 including values equal to built-in defaults. The configuration version identifies the effective
 snapshot; an explicit `/explain --format` choice for the current CLI session retains precedence.
-Starting a new conversation with `/clear` selects the current process and profile configuration,
+Starting a new conversation with `/clear` selects the current process configuration,
 rather than inheriting a restored session snapshot. Explicit CLI Explain preferences and the
 selected model remain in effect; budgets, configuration version and observability are derived again.
 Cold startup, new conversations, no-snapshot recovery and telemetry select profile identity from the
 account identity installed at entry, not ingestion metadata. An account without stored
 preferences uses its own default profile; only a CLI without an installed account identity uses
 anonymous preferences.
+`astra self mutate preview/apply` uses the process configuration when no complete
+session snapshot exists. Applying one setting preserves the other snapshot values.
+A snapshot is cleared only when the complete result equals the process baseline.
+Profile identity, preferences and statistics do not override runtime configuration.
+Preview reports failed configuration checks without writing. Apply rejects an
+invalid candidate before changing the snapshot, revision or journal. A valid
+candidate may repair an existing invalid configuration.
 Authentication changes select preferences for the verified target account after credentials are saved;
 re-authenticating the same account without resetting its conversation retains that session configuration.
 A saved snapshot must parse and satisfy the current invariants before resume changes the active session; invalid

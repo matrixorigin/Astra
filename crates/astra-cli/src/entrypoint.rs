@@ -55,60 +55,6 @@ use cli::project_instructions::{
 
 // ════════════════════════════════════════════════════════════════ main ════
 
-fn apply_trace_cli_overlay(
-    overlay: &mut astra_config::runtime_config::RuntimeConfig,
-    trace_profile: Option<&str>,
-    trace_level: Option<&str>,
-    trace_cat: Option<&str>,
-) -> Result<bool, String> {
-    if trace_profile.is_none() && trace_level.is_none() && trace_cat.is_none() {
-        return Ok(false);
-    }
-    overlay.trace =
-        overlay
-            .trace
-            .clone()
-            .with_cli_overrides(trace_profile, trace_level, trace_cat)?;
-    Ok(true)
-}
-
-#[cfg(test)]
-mod trace_overlay_tests {
-    use super::apply_trace_cli_overlay;
-
-    #[test]
-    fn apply_trace_cli_overlay_preserves_existing_overlay_fields() {
-        let mut overlay = astra_config::runtime_config::RuntimeConfig::default();
-        overlay.runtime_limits.max_turns = 17;
-
-        let changed = apply_trace_cli_overlay(&mut overlay, Some("dev"), None, None)
-            .expect("trace overlay should parse");
-
-        assert!(changed);
-        assert_eq!(overlay.runtime_limits.max_turns, 17);
-        assert_eq!(
-            overlay.trace.enabled_categories,
-            astra_config::runtime_config::TraceCategory::individual_categories().to_vec()
-        );
-    }
-
-    #[test]
-    fn apply_trace_cli_overlay_is_noop_without_trace_flags() {
-        let mut overlay = astra_config::runtime_config::RuntimeConfig::default();
-        overlay.runtime_limits.max_turns = 23;
-
-        let changed =
-            apply_trace_cli_overlay(&mut overlay, None, None, None).expect("no-op should succeed");
-
-        assert!(!changed);
-        assert_eq!(overlay.runtime_limits.max_turns, 23);
-        assert_eq!(
-            overlay.trace,
-            astra_config::runtime_config::SessionTraceConfig::default()
-        );
-    }
-}
-
 fn validate_native_directory_source(
     before: Option<std::ffi::OsString>,
     after: Option<std::ffi::OsString>,
@@ -219,58 +165,29 @@ async fn run_async() -> i32 {
         }
     }
     cli::diagnostic_log::init_cli_observability(&cli);
-    let mut cli_overlay = astra_config::runtime_config::RuntimeConfig::default();
-    let mut has_cli_overlay = false;
-    // Accumulate CLI-driven config overrides into a local overlay. The
-    // overlay is NOT installed yet — it will be installed via
-    // set_cli_overlay immediately before the first RuntimeConfig::load()
-    // call. Keeping accumulation and installation close together prevents
-    // a footgun window: any code placed between here and the load() call
-    // would see stale config if the overlay were installed early.
-    //
-    // parse_settings_source handles inline JSON vs. filesystem path;
-    // apply_settings_json parses the JSON into a RuntimeConfig (all fields
-    // default) that `load()` will then merge with non-default-wins
-    // semantics. Malformed input aborts with a clear message instead of
-    // silently dropping the flag.
+    let mut cli_overlay = astra_config::config_overlay::RuntimeConfigLayer::default();
     if let Some(raw) = cli.settings.as_deref() {
-        match astra_config::config_overlay::parse_settings_source(raw) {
-            Ok(json) => match astra_config::config_overlay::apply_settings_json(
-                astra_config::runtime_config::RuntimeConfig::default(),
-                &json,
-            ) {
-                Ok(overlay) => {
-                    cli_overlay = overlay;
-                    has_cli_overlay = true;
-                }
-                Err(err) => {
-                    eprintln!(
-                        "{}",
-                        format!("Error: --settings JSON is invalid: {err}").red()
-                    );
-                    return 2;
-                }
-            },
-            Err(err) => {
-                eprintln!("{}", format!("Error: --settings: {err}").red());
+        match astra_config::config_overlay::parse_settings_source(raw)
+            .and_then(|json| astra_config::config_overlay::RuntimeConfigLayer::from_json(&json))
+        {
+            Ok(layer) => cli_overlay = layer,
+            Err(error) => {
+                eprintln!("{}", format!("Error: --settings: {error}").red());
                 return 2;
             }
         }
     }
-    match apply_trace_cli_overlay(
-        &mut cli_overlay,
+    cli_overlay = match cli_overlay.with_trace_cli_overrides(
         cli.trace_profile.as_deref(),
         cli.trace_level.as_deref(),
         cli.trace_cat.as_deref(),
     ) {
-        Ok(changed) => {
-            has_cli_overlay |= changed;
-        }
-        Err(err) => {
-            eprintln!("{}", format!("Error: {err}").red());
+        Ok(layer) => layer,
+        Err(error) => {
+            eprintln!("{}", format!("Error: {error}").red());
             return 2;
         }
-    }
+    };
     // Apply safety.trust_mode from runtime config to the global guard.
     // Defaults to Strict — users must explicitly opt in via
     // `~/.astra/config/runtime.toml` [safety] trust_mode = "trusted".
@@ -278,9 +195,7 @@ async fn run_async() -> i32 {
     // Install CLI overlay immediately before the first RuntimeConfig::load()
     // to minimise the window where future code could call load()/cached()
     // without the overlay.
-    if has_cli_overlay {
-        astra_config::runtime_config::set_cli_overlay(Some(cli_overlay));
-    }
+    astra_config::runtime_config::set_cli_overlay(Some(cli_overlay));
     astra_runtime::apply_safety_config_from_runtime_config(
         &astra_config::runtime_config::RuntimeConfig::load(),
     );

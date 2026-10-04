@@ -838,8 +838,6 @@ async fn retire_auth_runtime(state: &mut SessionState) {
             .shutdown_and_wait_with_reason(AUTH_RUNTIME_SHUTDOWN_WAIT, AUTH_RUNTIME_REPLACED_REASON)
             .await;
     }
-    state.delegation_engine = None;
-    state.unregister_root_mailbox().await;
 }
 
 #[derive(Debug)]
@@ -858,15 +856,11 @@ async fn prepare_session_auth_transition(
     let profile_name = profile_name(profile, &credentials);
     let target_owner = cli_profile_owner_scope(&profile_name, Some(account_id))?;
     let owner_changed = target_owner != astra_services::local_owner_scope();
-    let runtime_needs_initialization =
-        state.agent_spawner.is_none() || state.delegation_engine.is_none();
+    let runtime_needs_initialization = state.agent_spawner.is_none();
 
     let runtime_config = if owner_changed {
-        let prepared = crate::cli::session::session_startup::prepare_session_runtime_config(
-            state,
-            None,
-            Some(account_id),
-        )?;
+        let prepared =
+            crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
         // The old session must reach its durable boundary while the old owner
         // scope and credentials are still installed. Only then may local
         // ownerless APIs be rebound to the authenticated account.
@@ -906,21 +900,11 @@ fn commit_session_auth_transition(
     prepared.runtime_needs_initialization
 }
 
-async fn initialize_authenticated_runtime(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    access_token: String,
-    state: &mut SessionState,
-) {
-    crate::cli::agent_runtime::initialize_multi_agent_runtime(state, api, access_token, profile)
-        .await;
-}
-
 /// End the old owner's runtime before browser login can publish new credentials.
 /// Cancellation retains credentials, but starts a fresh local conversation.
 pub(crate) async fn begin_browser_session_login(state: &mut SessionState) -> Result<(), String> {
     let (config, version) =
-        crate::cli::session::session_startup::prepare_session_runtime_config(state, None, None)?;
+        crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
     retire_auth_runtime(state).await;
     if state.session_id.is_some() {
         crate::cli::session::session_cleanup::finalize_session(state).await?;
@@ -955,11 +939,8 @@ pub(crate) async fn finish_browser_session_login(
         .await
         .ok_or("Login completed but no usable session credential is available")?;
     let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
-    let (config, version) = crate::cli::session::session_startup::prepare_session_runtime_config(
-        state,
-        None,
-        Some(&user_id),
-    )?;
+    let (config, version) =
+        crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
     state.ingestion_user_id = Some(user_id);
     crate::cli::session::session_startup::apply_session_runtime_config(state, config, version);
     // A workbench started while signed out skipped startup registration. Publish
@@ -971,7 +952,7 @@ pub(crate) async fn finish_browser_session_login(
                 .to_string()
         })?;
     let modules = rebuild_browser_identity_services(&api, profile, state).await;
-    initialize_authenticated_runtime(&api, profile, token.clone(), state).await;
+    crate::cli::agent_runtime::initialize_agent_projection(state);
     Ok((api, token, modules))
 }
 
@@ -1012,7 +993,7 @@ pub(crate) async fn do_login_for_session(
     save_profile_auth_tokens(profile, username, &tokens)?;
     let access_token = tokens.access_token.clone();
     if commit_session_auth_transition(transition, &tokens.user_id, state) {
-        initialize_authenticated_runtime(api, profile, access_token.clone(), state).await;
+        crate::cli::agent_runtime::initialize_agent_projection(state);
     }
     Ok(access_token)
 }
@@ -1035,7 +1016,7 @@ pub(crate) async fn do_register_for_session(
     save_profile_auth_tokens(profile, username, &tokens)?;
     let access_token = tokens.access_token;
     if commit_session_auth_transition(transition, &tokens.user_id, state) {
-        initialize_authenticated_runtime(api, profile, access_token.clone(), state).await;
+        crate::cli::agent_runtime::initialize_agent_projection(state);
     }
     Ok(access_token)
 }
@@ -1815,20 +1796,17 @@ mod tests {
                 astra_runtime_env::local_state_root().join("observability"),
             ),
         );
-        for (account, max_prompt_tokens) in [
+        for (account, total_queries) in [
             ("anonymous", 11111),
             ("account-a", 11111),
             ("account-b", 22222),
         ] {
             let mut profile = hub.profiles().get_profile(account);
-            profile.preferences.config_overrides.insert(
-                "token_budget.max_prompt_tokens".into(),
-                json!(max_prompt_tokens),
-            );
+            profile.stats.total_queries = total_queries;
             hub.profiles().update_profile(profile);
         }
         state.observability_hub = Some(hub);
-        state.runtime_config.token_budget.max_prompt_tokens = 11111;
+        state.runtime_config.memory.retrieval_top_k = 42;
         state.model = Some(
             crate::cli::session::session_state::SessionModelChoice::Selected(
                 crate::cli::session::session_runtime::ServerModelSelection {
@@ -1859,7 +1837,10 @@ mod tests {
 
         assert_eq!(token, "access-b");
         assert_eq!(state.ingestion_user_id.as_deref(), Some("account-b"));
-        assert_eq!(state.runtime_config.token_budget.max_prompt_tokens, 22222);
+        assert_eq!(
+            serde_json::to_value(&state.runtime_config).unwrap(),
+            serde_json::to_value(astra_config::RuntimeConfig::load()).unwrap()
+        );
         assert_eq!(state.model.as_deref(), Some("model-a(thinking:high)"));
         assert!(state.model.as_ref().unwrap().offering_id().is_none());
         assert!(state.model.as_ref().unwrap().pricing().is_none());
@@ -1875,7 +1856,6 @@ mod tests {
             load_credentials().profiles["default"].account_id.as_deref(),
             Some("account-b")
         );
-        assert!(state.delegation_engine.is_some());
         assert!(state.agent_spawner.is_some());
 
         // Preserve actual credentials and disk profiles, but discard process/session state.
@@ -1891,7 +1871,10 @@ mod tests {
             .unwrap();
         let expected = serde_json::to_value(&state.runtime_config).unwrap();
         let expected_version = state.config_version_id.clone();
-        assert_eq!(state.runtime_config.token_budget.max_prompt_tokens, 22222);
+        assert_eq!(
+            serde_json::to_value(&state.runtime_config).unwrap(),
+            serde_json::to_value(astra_config::RuntimeConfig::load()).unwrap()
+        );
         assert!(
             astra_services::session_workspace::read_workspace(&fresh_id)
                 .unwrap()
@@ -1987,6 +1970,7 @@ mod tests {
                 .unwrap();
             assert_eq!(obs.user_id, "account-b");
             assert_eq!(obs.profile.user_id, "account-b");
+            assert_eq!(obs.profile.stats.total_queries, 22222);
             assert_eq!(serde_json::to_value(&obs.config).unwrap(), expected);
         }
         // Missing ingestion metadata must not change the installed account authority.
@@ -2013,6 +1997,7 @@ mod tests {
                 .unwrap();
             assert_eq!(obs.user_id, "account-b");
             assert_eq!(obs.profile.user_id, "account-b");
+            assert_eq!(obs.profile.stats.total_queries, 22222);
             assert_eq!(serde_json::to_value(&obs.config).unwrap(), expected);
         }
         server.verify().await;
@@ -2035,7 +2020,6 @@ mod tests {
         state.config_version_id = Some("same-owner-config".into());
         let saved = serde_json::to_value(&state.runtime_config).unwrap();
         assert!(state.agent_spawner.is_none());
-        assert!(state.delegation_engine.is_none());
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2062,7 +2046,6 @@ mod tests {
         );
         assert_eq!(astra_services::local_owner_scope(), owner);
         assert_eq!(state.session_id.as_deref(), Some("same-owner-session"));
-        assert!(state.delegation_engine.is_some());
         assert!(state.agent_spawner.is_some());
     }
 

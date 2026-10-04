@@ -26,7 +26,7 @@ fn sample_payload() -> ConfigVersionPayload {
     ConfigVersionPayload {
         version_id: "cfg_abcdef0123456789".to_string(),
         user_id: "user_test".to_string(),
-        toml_body: "[token_budget]\nmax_turn_input_tokens = 500000\n".to_string(),
+        toml_body: "[memory]\nretrieval_top_k = 7\n".to_string(),
         first_seen_session: Some("sess_xyz".to_string()),
     }
 }

@@ -2553,6 +2553,8 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
         .to_string();
     let final_reply = "One parent synthesis disclosed all three failed child causes.";
     let fixture_model = format!("mock-{}", ctx.suffix);
+    let releases =
+        ReleaseProviderGatesOnDrop(vec![std::sync::Arc::new(tokio::sync::Notify::new())]);
     let root_model = fixture_model.clone();
     let child_model = fixture_model.clone();
     ctx.install_native_provider(auth,vec![
@@ -2574,29 +2576,68 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
                             "defaults": {"agent_type": "general-purpose"}
                         }),
                     ),
-                    native_invoke_response(
-                        "online-failed-fanout-wait", "agent", json!({"action": "wait", "timeout_ms": 10000}),
+                    gated_native_delta(
+                        json!({"tool_calls":[{"index":0,"id":"online-failed-fanout-wait","type":"function","function":{"name":"invoke_tool","arguments":json!({"name":"agent","arguments":{"action":"wait","timeout_ms":10000}}).to_string()}}]}),
+                        "tool_calls", releases.0[0].clone(),
                     ), native_text_response(final_reply)]),
         native_child_script(child_model.clone(),"Run three reviews and preserve every failure cause.","Inspect storage.",ProviderResponse::Json {status:StatusCode::BAD_REQUEST,body:json!({"error":{"message":"private failed child marker"}})}),
 native_child_script(child_model.clone(),"Run three reviews and preserve every failure cause.","Inspect runtime.",ProviderResponse::Json {status:StatusCode::BAD_REQUEST,body:json!({"error":{"message":"private failed child marker"}})}),
 native_child_script(child_model.clone(),"Run three reviews and preserve every failure cause.","Inspect journey.",ProviderResponse::Json {status:StatusCode::BAD_REQUEST,body:json!({"error":{"message":"private failed child marker"}})}),
         ProviderScript::new("actual canonical delegation assessment",move |request|request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && delegation_assessment(&request.body).is_some(),vec![native_text_response("{\"disposition\":\"not_applicable\"}")])
     ]).await;
-    let (status, raw_sse) = stream_chat_full(
-        app,
-        auth,
-        json!({
-            "message": "Run three reviews and preserve every failure cause.",
-        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
-            "session_id": &session_id,
-            "model_selection": seeded_model_selection(ctx),
-            "context": {
-
-            }
-        }),
+    let payload = json!({
+        "message": "Run three reviews and preserve every failure cause.",
+        "execution_policy": {"turn_intent":"fixed_default","skill_auto_route":"disabled"},
+        "session_id": &session_id,
+        "model_selection": seeded_model_selection(ctx),
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let response = tokio::time::timeout_at(
+        deadline,
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/chat/stream")
+                .header("authorization", auth.as_str())
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        ),
     )
-    .await;
-    assert_eq!(status, StatusCode::OK, "chat/stream: {raw_sse}");
+    .await
+    .expect("bounded stream admission")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    // Independent child failures can arrive across provider rounds. Hold the
+    // third response until all real terminals arrive so this finite script
+    // tests one synthesis over the whole group, not scheduler timing. An
+    // agent wait is an input observation, not an all-children completion fence.
+    loop {
+        let chunk = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .expect("bounded child failure delivery")
+            .expect("live stream before child failures")
+            .unwrap();
+        bytes.extend_from_slice(&chunk);
+        if parse_sse_events(&String::from_utf8_lossy(&bytes))
+            .iter()
+            .filter(|event| event["type"] == "agent_failed")
+            .count()
+            == 3
+        {
+            break;
+        }
+    }
+    releases.0[0].notify_one();
+    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .expect("bounded parent synthesis")
+    {
+        bytes.extend_from_slice(&chunk.unwrap());
+    }
+    let raw_sse = String::from_utf8(bytes).unwrap();
     assert_native_delegation_judgment(
         ctx,
         "Run three reviews and preserve every failure cause.",

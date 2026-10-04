@@ -26,6 +26,11 @@ level unless its production discovery and activation path demonstrates it.
 
 A tool is a callable schema. Tool visibility and execution are decided by the capability system.
 
+`session(action=config)` accepts a JSON numeric `value`. Retrieval counts
+require integers; compression thresholds accept fractional numbers. The
+shared governor owns supported paths, ranges and drift limits; schemas and executor
+admission must agree with that contract. Numeric strings are rejected.
+
 Resident tools expose a small stable `tools[]` contract. `tool_search` selects
 deferred invocation contracts into canonical conversation evidence; it does not
 inject their schemas into later `tools[]` requests. Invoke selected tools through
@@ -125,6 +130,10 @@ Skill discovery should be progressive:
 - capability-aware filtering;
 - deterministic ordering;
 - clear diagnostics for unavailable skill dependencies.
+
+CLI admissions keep fork-skill dispatch on the Server-owned execution. The CLI
+retains skill discovery and inline tool callbacks; it does not construct a second
+fork-skill executor or invocation ledger.
 
 ## Observability
 

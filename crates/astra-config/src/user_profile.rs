@@ -5,7 +5,6 @@
 //! Key features:
 //! - User preferences (verbosity, language style, explicit tool blocks)
 //! - Typed scenario state selected by the LLM-produced [`TurnIntent`]
-//! - Config overrides per user
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -16,7 +15,6 @@ use astra_turn_types::{ObjectiveRelation, UserFeedback};
 use serde::{Deserialize, Serialize};
 
 use crate::lock_ext::RwLockExt;
-use crate::runtime_config::RuntimeConfig;
 
 // ─── User Profile ───────────────────────────────────────────────────────────
 
@@ -101,10 +99,6 @@ pub struct UserPreferences {
     /// Response length preference.
     pub response_length: ResponseLength,
 
-    /// Runtime config overrides.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub config_overrides: HashMap<String, serde_json::Value>,
-
     /// Custom prompt additions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_prompt_suffix: Option<String>,
@@ -117,44 +111,17 @@ impl Default for UserPreferences {
             blocked_tools: Vec::new(),
             language_style: LanguageStyle::default(),
             response_length: ResponseLength::Medium,
-            config_overrides: HashMap::new(),
             custom_prompt_suffix: None,
         }
     }
 }
 
 impl UserPreferences {
-    /// Apply config overrides to a RuntimeConfig.
-    pub fn apply_to_config(&self, config: &mut RuntimeConfig) {
-        for (key, value) in &self.config_overrides {
-            apply_preference_override(config, key, value);
-        }
-    }
-
     /// Check if a tool is blocked.
     pub fn is_blocked_tool(&self, tool_name: &str) -> bool {
         self.blocked_tools
             .iter()
             .any(|t| t == tool_name || tool_name.starts_with(t))
-    }
-}
-
-/// Apply a single config override based on key path.
-fn apply_preference_override(config: &mut RuntimeConfig, key: &str, value: &serde_json::Value) {
-    match key {
-        "token_budget.max_prompt_tokens" => {
-            if let Some(v) = value.as_u64() {
-                config.token_budget.max_prompt_tokens = v as u32;
-            }
-        }
-        "token_budget.system_prompt_reserve" => {
-            if let Some(v) = value.as_u64() {
-                config.token_budget.system_prompt_reserve = v as u32;
-            }
-        }
-        _ => {
-            // Unknown key - log or ignore
-        }
     }
 }
 

@@ -1112,9 +1112,11 @@ fn unresolved_tool_outcome_failure_counts(
             .iter()
             .map(|record| {
                 let mut fact = ToolEvaluationFact::from_record(record);
-                if record.name == "agent"
-                    && record.ok
-                    && fact.effective_result_class.as_deref() == Some(RESULT_CLASS_AGENT_INCOMPLETE)
+                if matches!(
+                    (record.name.as_str(), fact.effective_result_class.as_deref()),
+                    ("agent", Some(RESULT_CLASS_AGENT_INCOMPLETE))
+                        | ("agent_fanout", Some(RESULT_CLASS_FANOUT_INCOMPLETE))
+                ) && record.ok
                     && record
                         .execution_completion
                         .as_ref()

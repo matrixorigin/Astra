@@ -3690,8 +3690,9 @@ impl ChatWidget {
                     slot_index,
                     slot_label: slot_label.to_string(),
                 };
+            let run_key = self.agent_runs.key_for_live_event(&agent_id, &run_id);
             let state_accepted = self.agent_runs.ensure(
-                agent_id.clone(),
+                run_key.clone(),
                 slot_label.to_string(),
                 if requested_description.is_some() {
                     AgentRunLabelKind::TaskDescription
@@ -3701,8 +3702,8 @@ impl ChatWidget {
                 AgentRunState::observed(state),
             );
             self.agent_runs
-                .set_fanout_membership(&agent_id, Some(membership));
-            let Some(projection) = self.agent_runs.get_mut(&agent_id) else {
+                .set_fanout_membership(&run_key, Some(membership));
+            let Some(projection) = self.agent_runs.get_mut(&run_key) else {
                 continue;
             };
             projection.set_runtime_metadata(
@@ -8261,6 +8262,49 @@ mod tests {
                 && row.transcript_target.is_none()
                 && row.available_actions.is_empty()
         }));
+    }
+
+    #[test]
+    fn fanout_receipt_after_server_projection_keeps_one_row_per_run() {
+        use crate::tui::server_agent_observer::ServerAgentTruthState;
+        use astra_thin_client::SessionRunLifecycleStatus;
+        let mut widget = fresh();
+        let runs = vec![
+            server_run_node("run-one", SessionRunLifecycleStatus::Running, 2),
+            server_run_node("run-two", SessionRunLifecycleStatus::Completed, 3),
+        ];
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            ServerAgentTruthState::Confirmed,
+            runs,
+            false,
+        ));
+        let receipt = serde_json::json!({"group_id":"group", "target_count":2,
+        "fanout":{"parent_run_id":"root-run"}, "transcript_location":"durable_server",
+        "agents":[
+            {"agent_id":"reviewer", "run_id":"run-one", "slot_index":0, "status":"launched"},
+            {"agent_id":"reviewer", "run_id":"run-two", "slot_index":1, "status":"launched"}
+        ]})
+        .to_string();
+        widget.on_agent_fanout_launch_receipt(&receipt);
+        widget.on_agent_fanout_launch_receipt(&receipt);
+        let rows = widget.agent_monitor_snapshot(5);
+        assert_eq!(
+            rows.len(),
+            2,
+            "late receipt must enrich existing runs, including reused agent profiles"
+        );
+        for (index, run_id) in ["run-one", "run-two"].iter().enumerate() {
+            let row = rows
+                .iter()
+                .find(|row| row.run_id.as_deref() == Some(*run_id))
+                .unwrap();
+            assert_eq!(row.fanout.as_ref().unwrap().slot_index, index);
+            assert_eq!(row.fanout.as_ref().unwrap().group_id, "group");
+        }
+        assert_eq!(
+            widget.agent_run_cell("run-two").unwrap().status,
+            TaskStatus::Completed
+        );
     }
 
     #[test]

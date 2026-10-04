@@ -441,12 +441,6 @@ pub(crate) struct SessionState {
     /// Skills surfaced by `discover_skills` during this CLI session.
     pub discovered_skills: std::collections::HashSet<String>,
     pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
-    /// Delegation engine for multi-agent coordination.
-    /// Constructed at REPL startup with a real `CliDelegateSubRunExecutor` when
-    /// the user is authenticated. Falls back to stub creation during plan execution
-    /// if not already initialized.
-    pub delegation_engine:
-        Option<std::sync::Arc<astra_runtime::server::delegation::engine::DelegationEngine>>,
     /// Team coordination registry for multi-agent team patterns.
     pub team_registry: slash_team::TeamRegistry,
     /// Shared team persistence service (in-memory or API-backed).
@@ -463,12 +457,8 @@ pub(crate) struct SessionState {
     /// boundaries consume this registry instead of querying UI projections or
     /// one producer-specific cache.
     pub active_work_registry: std::sync::Arc<astra_core::work_unit::ActiveWorkRegistry>,
-    /// Persistent top-level mailbox so spawned agents can reply across turns.
-    pub root_mailbox: Option<astra_messaging::router::AgentMailbox>,
-    /// Replies received while the REPL is idle at the prompt. Flushed only at safe redraw points.
 
     // ── Drift tracking ──
-
     /// Resume guidance message from a previously interrupted checkpoint.
     /// One-shot: consumed and cleared after the first turn that uses it.
     pub resume_guidance: Option<String>,
@@ -671,7 +661,6 @@ impl Default for SessionState {
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),
             )),
-            delegation_engine: None,
             team_registry: slash_team::TeamRegistry::new(),
             team_store: std::sync::Arc::new(
                 astra_services::team_persistence::InMemoryTeamStore::new(),
@@ -683,7 +672,6 @@ impl Default for SessionState {
             active_work_registry: std::sync::Arc::new(
                 astra_core::work_unit::ActiveWorkRegistry::default(),
             ),
-            root_mailbox: None,
             resume_guidance: None,
             resume_restricted_tools: Vec::new(),
             drift_original_query: None,
@@ -748,17 +736,6 @@ impl SessionState {
         self.runtime_config.explain.report_format = Some(format);
     }
 
-    /// Reload file-backed configuration while retaining an explicit session
-    /// format choice. This is used after a successful `/config` save; callers
-    /// that only inspect configuration should not reload at all.
-    pub(crate) fn reload_runtime_config(&mut self) {
-        let format_override = self.explain_report_format_override;
-        self.runtime_config = astra_config::runtime_config::RuntimeConfig::load();
-        if let Some(format) = format_override {
-            self.runtime_config.explain.report_format = Some(format);
-        }
-    }
-
     fn advance_session_attachment(&mut self) {
         self.session_attachment_epoch = self
             .session_attachment_epoch
@@ -819,8 +796,7 @@ impl SessionState {
     /// install process/profile settings, while restore installs its snapshot.
     ///
     /// Call `prepare_for_session_rebind().await` before using this at a
-    /// session boundary; this synchronous reset does not tear down the
-    /// asynchronously registered root mailbox.
+    /// session boundary to clear the asynchronously shared background-task view.
     pub fn reset_for_new_session(&mut self) {
         self.cli_context.agent_profile_selection = None;
         self.advance_session_attachment();
@@ -875,34 +851,17 @@ impl SessionState {
     /// Stronger than `reset_for_new_session()`: resume must also drop the
     /// current session binding and any workspace-derived skills and configuration
     /// so the next restore cannot inherit stale values from the previous
-    /// session. Call `prepare_for_session_rebind().await` first so any
-    /// root mailbox tied to the old session is unregistered before the
-    /// next session binds.
+    /// session. Call `prepare_for_session_rebind().await` first to clear
+    /// the previous session's background-task view.
     pub fn reset_for_session_restore(&mut self) {
         self.reset_for_new_session();
         self.clear_session_id();
         self.discovered_skills.clear();
     }
 
-    /// Tear down session-bound routing before this REPL is rebound to a
-    /// different session id.
+    /// Clear the shared background-task projection before rebinding the session.
     pub async fn prepare_for_session_rebind(&mut self) {
-        self.unregister_root_mailbox().await;
         self.bg_task_list_cache.write().await.clear();
-    }
-
-    /// Unregister and drop the root mailbox so a subsequent turn can
-    /// re-register without agent_id collision.
-    pub async fn unregister_root_mailbox(&mut self) {
-        if let Some(mailbox) = self.root_mailbox.take() {
-            let addr = mailbox.address.clone();
-            if let Err(e) = mailbox.retire().await {
-                eprintln!(
-                    "astra: failed to retire root mailbox run_id={} agent_id={}: {e}",
-                    addr.run_id, addr.agent_id
-                );
-            }
-        }
     }
 
     /// Single source of truth for "is the CLI session currently in
@@ -937,7 +896,6 @@ pub(crate) fn apply_initial_explain_mode(
 mod default_tests {
     use super::{ContinuationAnchor, ExplainMode, SessionState, apply_initial_explain_mode};
     use crate::cli::permission_manager::PermissionManager;
-    use astra_config::runtime_config::ExplainReportFormat;
 
     #[test]
     fn explain_slash_parser_is_explicit_and_idempotent() {
@@ -1015,23 +973,6 @@ mod default_tests {
 
         apply_initial_explain_mode(&mut state, None);
         assert_eq!(state.explain, ExplainMode::On);
-    }
-
-    #[test]
-    fn explicit_report_format_override_survives_runtime_config_reload() {
-        let mut state = SessionState::default();
-        state.set_explain_report_format_override(ExplainReportFormat::Text);
-
-        state.reload_runtime_config();
-
-        assert_eq!(
-            state.explain_report_format_override,
-            Some(ExplainReportFormat::Text)
-        );
-        assert_eq!(
-            state.runtime_config.explain.effective_report_format(),
-            ExplainReportFormat::Text
-        );
     }
 
     #[test]
@@ -1311,28 +1252,13 @@ mod default_tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_session_rebind_unregisters_root_mailbox() {
-        let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
-        let tracker = std::sync::Arc::new(
-            astra_runtime::server::delegation::engine::DelegationTracker::new(),
-        );
-        let router =
-            std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
-        let root_addr = astra_messaging::AgentAddress::new("old-session", "main");
-
+    async fn prepare_for_session_rebind_clears_background_task_projection() {
         let mut state = SessionState::default();
-        state.root_mailbox = Some(router.register(root_addr.clone(), None).await.unwrap());
         *state.bg_task_list_cache.write().await =
             "<background_tasks count=\"1\"><task id=\"old\" /></background_tasks>".into();
 
         state.prepare_for_session_rebind().await;
-
-        assert!(state.root_mailbox.is_none());
         assert!(state.bg_task_list_cache.read().await.is_empty());
-        router
-            .register(root_addr, None)
-            .await
-            .expect("old root mailbox address should be reusable after unregister");
     }
 }
 

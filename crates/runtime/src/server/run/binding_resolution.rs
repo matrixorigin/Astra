@@ -79,11 +79,9 @@ pub(crate) fn execution_bindings_from_metadata(
     execution_bindings_from_metadata_with_authority(metadata, server_workspace, None)
 }
 
-/// Reconstruct a child binding from the parent's durable metadata while
-/// enforcing the child's typed workspace boundary.  A read-only child must
-/// never inherit a read-write workspace authority merely because its parent
-/// had one; doing so widens provider policy and turns harmless inspection
-/// commands into explicit approval requests.
+/// Reconstruct a child binding from the parent's durable metadata, applying
+/// an explicit child execution ceiling when supplied. Task mutation intent
+/// is not authorization and must not supply this override.
 pub(crate) fn execution_bindings_from_metadata_with_authority(
     metadata: Option<&Value>,
     server_workspace: &Path,

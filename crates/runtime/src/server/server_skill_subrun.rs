@@ -1,7 +1,7 @@
 //! Server-side skill fork (sub-run) executor.
 //!
 //! Enables skills with `execution_context: Fork` to run in isolated sub-agent
-//! loops on the server, matching the CLI's `CliSkillSubRunExecutor` behavior.
+//! loops owned by the Server, including for CLI-originated admissions.
 //!
 //! Each sub-run creates a fresh [`ServerAgenticLoopHost`] +
 //! [`AgenticLoopState`] pair and runs [`run_agentic_loop_with_host`] to
@@ -1857,13 +1857,8 @@ mod tests {
         );
     }
 
-    /// Server-side symmetric to `cli_skill_subrun_rejects_when_recursion_depth_limit_reached`:
-    /// the fork sub-run executor must refuse to spawn once the agent recursion
-    /// cap is reached. Without this guard, a fork-context skill could recurse
-    /// into itself indefinitely. The CLI has had this test; the server did not
-    /// — so this closes an asymmetric coverage gap where a misbehaving
-    /// resolver on the server path could recurse without a fast-fail at the
-    /// depth boundary.
+    /// Fork-skill execution must reject excessive recursion before model or
+    /// tool admission, preventing a resolver from recursively spawning itself.
     #[tokio::test]
     async fn server_skill_subrun_rejects_when_recursion_depth_limit_reached() {
         let executor = ServerSkillSubRunExecutor::new(

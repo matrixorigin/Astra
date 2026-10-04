@@ -160,6 +160,7 @@ impl ToolExecutor {
                         path,
                         value.clone(),
                         &observed_config,
+                        &astra_config::RuntimeConfig::load(),
                         force,
                         ceiling,
                     ) {

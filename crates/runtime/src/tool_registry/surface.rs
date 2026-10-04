@@ -598,7 +598,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
         .then(|| properties.get("tasks")?.get("description").cloned())
         .flatten();
     for property in properties.values_mut() {
-        strip_resident_property_descriptions(property);
+        astra_tools::tool_search::compact_parameter_descriptions(property, true);
     }
     if let Some(description) = task_outcome_description {
         properties
@@ -641,28 +641,6 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
         }),
     );
     schema
-}
-
-/// Remove prose that is useful in the canonical catalog but expensive in the
-/// cacheable resident prefix. This deliberately preserves every structural
-/// keyword (types, enums, bounds, defaults, required fields, and Astra
-/// extension metadata). Callers retain semantically essential descriptions;
-/// structural validation alone cannot preserve an argument's meaning.
-fn strip_resident_property_descriptions(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            object.remove("description");
-            for child in object.values_mut() {
-                strip_resident_property_descriptions(child);
-            }
-        }
-        Value::Array(values) => {
-            for child in values {
-                strip_resident_property_descriptions(child);
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
 }
 
 fn builtin_tool_is_internal(name: &str) -> bool {

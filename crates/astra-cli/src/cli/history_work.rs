@@ -122,20 +122,6 @@ pub(crate) fn record_text_payload<'a>(
     record_operation(site, bytes, row_count.try_into().unwrap_or(u64::MAX), 0);
 }
 
-pub(crate) fn record_fork_tool_schema_serialization(
-    site: HistoryWorkSite,
-    entries: &[astra_turn_core::fork_prefix::ToolSchemaEntry],
-) {
-    let Some(bytes) = measure_when(instrumentation_enabled(), || {
-        entries.iter().fold(0_u64, |bytes, entry| {
-            bytes.saturating_add(entry.canonical_bytes.len().try_into().unwrap_or(u64::MAX))
-        })
-    }) else {
-        return;
-    };
-    record_operation(site, bytes, entries.len().try_into().unwrap_or(u64::MAX), 0);
-}
-
 pub(crate) fn reserve_json_history_queue(
     site: HistoryWorkSite,
     messages: &[Value],

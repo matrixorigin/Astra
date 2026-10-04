@@ -18658,79 +18658,221 @@ fn build_runtime_turn_evaluation_event_respects_settled_status_and_preserves_too
 }
 
 #[tokio::test]
-async fn completed_direct_child_supersedes_launch_receipt_in_final_evaluation() {
+async fn completed_child_supersedes_nonterminal_receipts_in_final_evaluation() {
     use astra_turn_types::task_resolution::{EdgeDispatchCompletionRef, ToolExecutionEvidenceRef};
 
-    let svc = test_service();
-    let request = test_request("delegate one check");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
-    );
-    let completion = ToolExecutionEvidenceRef::EdgeDispatch(EdgeDispatchCompletionRef {
-        identity: astra_turn_types::ToolInvocationIdentity::new(
+    for (tool, mixed_time, pending_status) in [
+        ("agent", false, None),
+        ("agent_fanout", false, None),
+        ("agent_fanout", true, None),
+        ("agent", false, Some("waiting")),
+        ("agent", false, Some("paused")),
+        ("agent_fanout", false, Some("waiting")),
+        ("agent_fanout", true, Some("waiting")),
+        ("agent_fanout", false, Some("paused")),
+        ("agent_fanout", true, Some("paused")),
+    ] {
+        let svc = test_service();
+        let request = test_request("delegate one check");
+        let mut state = svc.build_initial_state(
             "test-user",
+            &request,
             "session-1",
             "run-1",
-            "chain-1",
-            "spawn-call",
-        )
-        .unwrap(),
-        edge_agent_id: "edge-1".into(),
-        result_hash: "sha256:test".into(),
-    });
-    state.stall.tool_call_records.push(ToolCallRecord {
-        name: "agent".into(),
+            None,
+            None,
+            None,
+        );
+        let completion = ToolExecutionEvidenceRef::EdgeDispatch(EdgeDispatchCompletionRef {
+            identity: astra_turn_types::ToolInvocationIdentity::new(
+                "test-user",
+                "session-1",
+                "run-1",
+                "chain-1",
+                "spawn-call",
+            )
+            .unwrap(),
+            edge_agent_id: "edge-1".into(),
+            result_hash: "sha256:test".into(),
+        });
+        state.stall.tool_call_records.push(ToolCallRecord {
+        name: tool.into(),
         ok: true,
         disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
         execution_completion: Some(completion),
-        args_full: Some(r#"{"action":"spawn","description":"check","prompt":"check"}"#.into()),
-        result_full: Some(r#"{"status":"launched","agent_id":"child@run"}"#.into()),
+        args_full: Some(if tool == "agent" {
+            r#"{"action":"spawn","description":"check","prompt":"check"}"#
+        } else {
+            r#"{"action":"get_results","group_id":"group-1","slot_index":0}"#
+        }.into()),
+        result_full: Some(if tool == "agent" {
+            r#"{"status":"launched","agent_id":"child@run"}"#
+        } else {
+            r#"{"status":"incomplete","group_id":"group-1","target_count":1,"active":1,"failed":0,"incomplete_results":1,"fanout":{"active":1,"parent_run_id":"run-1"},"results":[{"agent_id":"child@run","slot_index":0,"run_id":null,"result":{"result_family":"child_result","status":"still_running","agent_id":"child@run"}}]}"#
+        }.into()),
         ..Default::default()
     });
-    let evaluate = |state: &AgenticLoopState| {
-        build_runtime_turn_evaluation_event("session-1", "server_runtime", state, STATUS_COMPLETED)
+        if let Some(pending_status) = pending_status {
+            use astra_turn_core::orchestration::{agent_result_wire, types::AgentStatus};
+            let status = match pending_status {
+                "waiting" => AgentStatus::Waiting {
+                    reason: "executor recovery".into(),
+                },
+                "paused" => AgentStatus::Paused {
+                    reason: "awaiting authorization".into(),
+                },
+                _ => unreachable!(),
+            };
+            let rendered = agent_result_wire::render_wait_for_agent_status("child@run", &status);
+            let record = state.stall.tool_call_records.last_mut().unwrap();
+            if tool == "agent" {
+                record.args_full = Some(
+                    serde_json::json!({
+                        "action":"get_result", "agent_id":"child@run"
+                    })
+                    .to_string(),
+                );
+                record.result_full = Some(rendered);
+            } else {
+                let mut result: serde_json::Value =
+                    serde_json::from_str(record.result_full.as_ref().unwrap()).unwrap();
+                result["results"][0]["result"] = serde_json::from_str(&rendered).unwrap();
+                record.result_full = Some(result.to_string());
+            }
+        }
+        if mixed_time {
+            let record = state.stall.tool_call_records.last_mut().unwrap();
+            let mut result: serde_json::Value =
+                serde_json::from_str(record.result_full.as_ref().unwrap()).unwrap();
+            result["status"] = serde_json::json!("completed_with_issues");
+            result["active"] = serde_json::json!(0);
+            result["fanout"]["active"] = serde_json::json!(0);
+            record.result_full = Some(result.to_string());
+        }
+        if tool == "agent_fanout" {
+            state.stall.tool_call_records.insert(0, ToolCallRecord {
+            name: tool.into(),
+            ok: true,
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+            args_full: Some(r#"{"action":"start","target_count":1}"#.into()),
+            result_full: Some(r#"{"status":"started","group_id":"group-1","target_count":1,"agents":[{"agent_id":"child@run","run_id":"child-run","slot_index":0}],"fanout":{"parent_run_id":"run-1"}}"#.into()),
+            ..Default::default()
+        });
+        }
+        let evaluate = |state: &AgenticLoopState| {
+            build_runtime_turn_evaluation_event(
+                "session-1",
+                "server_runtime",
+                state,
+                STATUS_COMPLETED,
+            )
             .metadata
             .unwrap()
-    };
-    assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
-    state.push_volatile_payload(
-        crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
-        serde_json::json!({
-            "schema": "direct_child_completion.v1",
-            "parent_run_id": "run-1",
-            "observed_by_provider": true,
-            "children": [{"agent_id":"child@run","status":"completed"}]
-        }),
-    );
-    assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
-    state.volatile_pending.last_mut().unwrap().payload["children"][0]["result"] =
-        serde_json::json!("check complete");
-    let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
-    host.direct_child_owner = Some(
-        crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
-            "run-1",
-            "child@run",
-        ),
-    );
-    crate::turn::agentic_loop::execution_phase::fence_direct_child_finalization(
-        &mut host, &mut state,
-    )
-    .await;
-    assert!(
-        state.volatile_pending.is_empty(),
-        "terminal context was retired"
-    );
-    let settled = evaluate(&state);
-    assert_eq!(settled["tool_evaluation_success"], true);
-    assert_eq!(settled["success"], true);
-    state.current_run_id = Some("other-run".into());
-    assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+        };
+        assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+        state.push_volatile_payload(
+            crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+            serde_json::json!({
+                "schema": "direct_child_completion.v1",
+                "parent_run_id": "run-1",
+                "observed_by_provider": true,
+                "children": [{"agent_id":"child@run","run_id":"child-run","status":"completed"}]
+            }),
+        );
+        assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+        state.volatile_pending.last_mut().unwrap().payload["children"][0]["result"] =
+            serde_json::json!("check complete");
+        state.volatile_pending.last_mut().unwrap().payload["children"][0]["result_bytes"] =
+            serde_json::json!(14);
+        if tool == "agent_fanout" {
+            use crate::turn::agentic_loop::execution_phase::nonterminal_child_receipt_superseded;
+            let receipt = state.stall.tool_call_records.last().unwrap().clone();
+            assert!(nonterminal_child_receipt_superseded(&state, &receipt));
+            for (pointer, replacement) in [
+                ("/group_id", serde_json::json!("other-group")),
+                ("/fanout/parent_run_id", serde_json::json!("other-parent")),
+                ("/target_count", serde_json::json!(2)),
+                ("/active", serde_json::json!(if mixed_time { 1 } else { 0 })),
+                ("/failed", serde_json::json!(1)),
+                (
+                    "/results/0/result/result_family",
+                    serde_json::json!("unknown"),
+                ),
+                ("/results/0/result/agent_id", serde_json::Value::Null),
+                ("/results/0/agent_id", serde_json::json!("other-agent")),
+                ("/results/0/run_id", serde_json::json!("other-run")),
+                ("/results/0/slot_index", serde_json::json!(1)),
+                ("/results/0/result/status", serde_json::json!("failed")),
+                (
+                    "/results/0/result",
+                    serde_json::json!({"status":"completed","result":""}),
+                ),
+            ] {
+                let mut result: serde_json::Value =
+                    serde_json::from_str(receipt.result_full.as_ref().unwrap()).unwrap();
+                *result.pointer_mut(pointer).unwrap() = replacement;
+                let mut invalid = receipt.clone();
+                invalid.result_full = Some(result.to_string());
+                assert!(
+                    !nonterminal_child_receipt_superseded(&state, &invalid),
+                    "{pointer}"
+                );
+            }
+            if mixed_time {
+                let mut result: serde_json::Value =
+                    serde_json::from_str(receipt.result_full.as_ref().unwrap()).unwrap();
+                result["results"][0]["result"] = serde_json::json!({
+                    "result_family":"child_result", "status":"completed",
+                    "agent_id":"child@run", "result":"check complete"
+                });
+                let mut no_running_observation = receipt.clone();
+                no_running_observation.result_full = Some(result.to_string());
+                assert!(!nonterminal_child_receipt_superseded(
+                    &state,
+                    &no_running_observation
+                ));
+            }
+            let start = state.stall.tool_call_records.remove(0);
+            assert!(!nonterminal_child_receipt_superseded(&state, &receipt));
+            state.stall.tool_call_records.insert(0, start);
+            for (field, invalid) in [
+                ("observed_by_provider", serde_json::json!(false)),
+                ("parent_run_id", serde_json::json!("other-parent")),
+            ] {
+                let payload = &mut state.volatile_pending.last_mut().unwrap().payload;
+                let original = payload[field].clone();
+                payload[field] = invalid;
+                assert!(
+                    !nonterminal_child_receipt_superseded(&state, &receipt),
+                    "{field}"
+                );
+                state.volatile_pending.last_mut().unwrap().payload[field] = original;
+            }
+        }
+        let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(vec![]);
+        host.direct_child_owner = Some(
+            crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+                "run-1",
+                "child@run",
+            ),
+        );
+        crate::turn::agentic_loop::execution_phase::fence_direct_child_finalization(
+            &mut host, &mut state,
+        )
+        .await;
+        assert!(
+            state.volatile_pending.is_empty(),
+            "terminal context was retired"
+        );
+        let settled = evaluate(&state);
+        assert_eq!(
+            settled["tool_evaluation_success"], true,
+            "{tool} {pending_status:?} mixed={mixed_time}"
+        );
+        assert_eq!(settled["success"], true);
+        state.current_run_id = Some("other-run".into());
+        assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+    }
 }
 
 #[tokio::test]

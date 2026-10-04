@@ -127,12 +127,12 @@ Delegated agents do not inherit unlimited authority. Capabilities are bounded
 by the delegation request, parent authorization, provider availability, and
 runtime policy. A wildcard `read_only` delegation inherits the parent's tool
 scope. `read_only` is workspace authority, not a second tool-name allowlist:
-the child's read-only execution binding rejects tools that declare a writable
-workspace requirement while discovery, coordination, and other
-parent-authorized capabilities remain subject to their own provider/runtime
-admission and enabled-tool constraints. Shell commands and external services
-are not made side-effect-free by this tool projection; they require their own
-execution and effect boundaries. When the parent
+Edge tool visibility and dispatch both require the registered tool's read-only
+execution capability. Shell execution is excluded even when a proposed command
+appears observational. Discovery, coordination, and separately routed services
+remain subject to their own provider/runtime admission and enabled-tool
+constraints. Tool selection must disclose profile defaults and their execution
+limits before a parent delegates work. When the parent
 has an explicit enabled-capability set, a child allowlist may include registered
 core tools or capabilities explicitly enabled by the parent; unknown names are
 rejected before dispatch. Dynamic capabilities must be present in that explicit
@@ -142,8 +142,8 @@ execution binding and authorization.
 Before launch, preparation binds each slot's model selection to its parent,
 Offering, reasoning, and slot identity. It grants no reusable inference
 authorization; each inference revalidates current authorization. Invalid
-preparation rejects the batch before any child starts. Provider and CLI batching
-rules and the catalog-read contract belong to
+preparation rejects the batch before any child starts. Server batching rules
+and the catalog-read contract belong to
 [orchestration model selection](orchestration.md#model-selection).
 
 ## Result integration
@@ -188,6 +188,10 @@ live or its owner receipt survives. Spawn/replay and stop actions still require
 the exact parent run. Historical reads use the owner's cache and do not emit a
 new parent collection event; a reused bare group ID is rejected when multiple
 owners remain visible, and evicted receipts are not made permanent.
+An explicit slot read may report all slots delivered only when it covers every
+successful slot and returns the complete byte window. A suffix, truncated page,
+or slot subset cannot make that claim. This does not change historical observation
+mode, parent ownership, or pagination accounting.
 When a later durable child state corrects a terminal result, it refines the same
 parent-owned group receipt (live or evicted) and invalidates the rendered result;
 ordinary executor callbacks cannot overturn that durable terminal truth. Auto-ID

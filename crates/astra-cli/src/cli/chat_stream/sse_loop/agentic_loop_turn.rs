@@ -241,6 +241,7 @@ pub(crate) struct PrepareTurnTelemetry<'a> {
 }
 
 struct PrepareChatTurnRequest<'a> {
+    tool_surface_config: &'a astra_config::runtime_config::ToolSurfaceConfig,
     messages: &'a [Value],
     runtime_required_texts: &'a [String],
     active_system_skills: &'a [String],
@@ -1017,7 +1018,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     }
     let tool_surface = tool_registry::surface::ToolSurface::build_excluding_visible(
         eligible_surface_schemas,
-        &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
+        ctx.tool_surface_config,
         &eligible_provider_schemas,
         &final_visible_tool_names,
     );
@@ -1392,6 +1393,7 @@ fn inject_runtime_turn_overrides(
 // ─── Fetch: payload → POST → consume_turn_sse ─────────────────────────────────
 
 pub(crate) struct ChatTurnSseFetchRequest<'a> {
+    pub tool_surface_config: &'a astra_config::runtime_config::ToolSurfaceConfig,
     pub api: &'a astra_thin_client::ThinClient,
     pub token: &'a str,
     pub auth_profile: Option<&'a str>,
@@ -1678,6 +1680,7 @@ pub(crate) async fn fetch_chat_turn_sse(
     ctx: ChatTurnSseFetchRequest<'_>,
 ) -> Result<TurnResult, String> {
     let ChatTurnSseFetchRequest {
+        tool_surface_config,
         api,
         token,
         auth_profile,
@@ -1776,6 +1779,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             stream_json_emitter: stream_json_emitter.as_ref(),
             execution_time_budget_clock: execution_time_budget,
             prepare: PrepareChatTurnRequest {
+                tool_surface_config,
                 messages,
                 runtime_required_texts,
                 active_system_skills,
@@ -2330,6 +2334,7 @@ mod tests {
 
         let prepared = prepare_chat_turn_payload(PrepareChatTurnRequest {
             cli_context: reasoning.and_then(|(_, _, _, context)| context),
+            tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts,
             active_system_skills,
@@ -2623,6 +2628,7 @@ mod tests {
 
             prepare_chat_turn_payload(PrepareChatTurnRequest {
                 cli_context: None,
+                tool_surface_config: &Default::default(),
                 messages: &messages,
                 runtime_required_texts: &required,
                 active_system_skills: &[],
@@ -3340,6 +3346,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             cli_context: None,
+            tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -3515,6 +3522,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             cli_context: None,
+            tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -3658,6 +3666,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             cli_context: None,
+            tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -3780,6 +3789,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             cli_context: None,
+            tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -3870,6 +3880,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             cli_context: None,
+            tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -3986,6 +3997,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             cli_context: None,
+            tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -4132,6 +4144,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             cli_context: None,
+            tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -4293,6 +4306,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             cli_context: None,
+            tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -4418,6 +4432,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             cli_context: None,
+            tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -4539,6 +4554,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             cli_context: None,
+            tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -4643,6 +4659,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             cli_context: None,
+            tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -4755,6 +4772,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             cli_context: None,
+            tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],
@@ -4860,6 +4878,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             cli_context: None,
+            tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
             active_system_skills: &[],

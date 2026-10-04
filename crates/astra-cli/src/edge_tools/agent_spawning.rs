@@ -25,32 +25,6 @@ pub async fn handle_agent_list_action(args: &Value, ctx: Option<&AgentActionCont
     astra_runtime::orchestration::handle_agent_list_action(args, ctx).await
 }
 
-/// Handle `agent(action='send_message')` using the same mailbox contract as
-/// the server tool surface.
-pub async fn handle_agent_send_message_action(
-    args: &Value,
-    ctx: Option<&AgentActionContext>,
-    mailbox_ctx: Option<&super::agent_messaging::SendMessageRuntimeContext>,
-) -> String {
-    if let Some(ctx) = ctx {
-        return astra_runtime::orchestration::handle_agent_tool(args, Some(ctx)).await;
-    }
-    let Some(mailbox_ctx) = mailbox_ctx else {
-        return astra_runtime::orchestration::render_agent_runtime_binding_error(
-            "agent",
-            "send_message",
-        );
-    };
-    astra_runtime::orchestration::handle_agent_send_message_with_router(
-        args,
-        mailbox_ctx.router.as_ref(),
-        &mailbox_ctx.run_id,
-        &mailbox_ctx.agent_id,
-        mailbox_ctx.reply_obligations.as_ref(),
-    )
-    .await
-}
-
 /// Handle `agent_fanout(...)` using the shared runtime contract.
 pub async fn handle_agent_fanout_tool(args: &Value, ctx: Option<&AgentActionContext>) -> String {
     astra_runtime::orchestration::handle_agent_fanout_tool(args, ctx).await

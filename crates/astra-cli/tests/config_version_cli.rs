@@ -16,14 +16,9 @@
 //!     would run under right now (hash of the effective
 //!     `RuntimeConfig::load()` result).
 //!
-//! This test file drives the rendering/formatting helpers directly,
-//! because the subcommand entry points are `fn(…) -> Result<(), String>`
-//! that write to stdout — impossible to capture from a unit test
-//! without rerouting. The presentation helpers (`format_version_list`,
-//! `format_version_diff`, `resolve_prefix`) are pure `(store, args) ->
-//! String` shapes that each return the exact bytes the CLI would
-//! print, so the test contract locks the content, not the println
-//! machinery.
+//! Rendering helpers cover version lookup and formatting. The subprocess test
+//! drives the real CLI entrypoint to verify file, environment, settings and
+//! trace-flag precedence through the effective configuration hash.
 
 use astra_config::config_version_cli::{
     ResolveError, format_current, format_version_diff, format_version_list, format_version_show,
@@ -37,7 +32,7 @@ fn tmp_store_with_versions(n_changes: usize) -> (tempfile::TempDir, LocalFileSto
     let store = LocalFileStore::new(dir.path().to_path_buf());
     for i in 0..n_changes {
         let mut cfg = RuntimeConfig::default();
-        cfg.token_budget.max_turn_input_tokens = 100_000 + (i as u32) * 10_000;
+        cfg.memory.max_memory_tokens = 100_000 + (i as u32) * 10_000;
         let meta = PutMetadata {
             source_session: Some(format!("sess_{i}")),
             parent: None,
@@ -105,11 +100,11 @@ fn show_prints_the_exact_toml_bytes_of_a_version() {
     let id = entries[0].id.clone();
     let out = format_version_show(&store, id.as_str()).expect("show ok");
     assert!(
-        out.contains("[token_budget]"),
-        "show must include the token_budget section: {out}"
+        out.contains("[memory]"),
+        "show must include the memory section: {out}"
     );
     assert!(
-        out.contains("max_turn_input_tokens"),
+        out.contains("max_memory_tokens"),
         "show must include field names: {out}"
     );
 }
@@ -122,7 +117,7 @@ fn show_accepts_short_prefix_when_unique() {
     // Use the first 8 chars past `cfg_` — a realistic human prefix.
     let prefix = &id[..8.min(id.len())];
     let out = format_version_show(&store, prefix).expect("short prefix resolves");
-    assert!(out.contains("token_budget"), "short prefix must resolve");
+    assert!(out.contains("memory"), "short prefix must resolve");
 }
 
 #[test]
@@ -153,7 +148,7 @@ fn diff_shows_changed_field_between_two_versions() {
     assert!(out.contains(older.as_str()) && out.contains(newer.as_str()));
     // The changed field must appear with its old and new values.
     assert!(
-        lower.contains("max_turn_input_tokens"),
+        lower.contains("max_memory_tokens"),
         "diff must name the changed field: {out}"
     );
     assert!(
@@ -209,8 +204,8 @@ fn resolve_prefix_errors_on_ambiguous_prefix() {
     // as the ambiguous needle.
     let mut a = RuntimeConfig::default();
     let mut b = RuntimeConfig::default();
-    a.token_budget.max_turn_input_tokens = 1;
-    b.token_budget.max_turn_input_tokens = 2;
+    a.memory.max_memory_tokens = 1;
+    b.memory.max_memory_tokens = 2;
     store.put(&a, PutMetadata::default()).unwrap();
     store.put(&b, PutMetadata::default()).unwrap();
     let err = resolve_prefix(&store, "cfg_").unwrap_err();
@@ -233,4 +228,167 @@ fn current_reports_the_hash_of_the_default_runtime_config() {
         out.trim().len() >= "cfg_".len() + 16,
         "id must be full length (cfg_ + 16 hex): {out:?}"
     );
+}
+
+#[tokio::test]
+async fn configuration_layers_preserve_explicit_values_at_the_cli_entrypoint() {
+    use astra_config::config_versions::VersionId;
+    use astra_config::runtime_config::{
+        TraceCategory, TraceLevel, TraceProfile, TraceSink, TrustModeSerde,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let local = root.path().join("local");
+    std::fs::create_dir_all(local.join("config")).unwrap();
+    std::fs::create_dir_all(root.path().join(".astra/config")).unwrap();
+    std::fs::write(
+        local.join("config/runtime.toml"),
+        r#"
+        [memory]
+        retrieval_top_k = 8
+        max_memory_tokens = 8192
+        include_repository_memories = false
+        [compression]
+        preserve_tool_calls = false
+        [trace]
+        profile = "custom"
+        min_level = "debug"
+        enabled_categories = ["budget"]
+        sinks = ["stderr"]
+        sampling_rate = 0.5
+        [safety]
+        trust_mode = "trusted"
+    "#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(".astra/config/runtime.toml"),
+        r#"
+        [memory]
+        retrieval_top_k = 5
+        include_repository_memories = true
+        [compression]
+        preserve_tool_calls = true
+        [trace]
+        min_level = "info"
+    "#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("settings.json"),
+        r#"{"memory":{"retrieval_top_k":5}}"#,
+    )
+    .unwrap();
+    let mut base = RuntimeConfig::default();
+    base.memory.max_memory_tokens = 8192;
+    base.trace.profile = TraceProfile::Custom;
+    base.trace.min_level = TraceLevel::Info;
+    base.trace.enabled_categories = vec![TraceCategory::Budget];
+    base.trace.sinks = vec![TraceSink::Stderr];
+    base.trace.sampling_rate = 0.5;
+    base.safety.trust_mode = Some(TrustModeSerde::Trusted);
+
+    let retrieval_env = [("ASTRA_RETRIEVAL_TOP_K", "7")];
+    let invalid_threshold_env = [
+        ("ASTRA_RETRIEVAL_TOP_K", "7"),
+        ("ASTRA_COMPRESSION_THRESHOLD", "NaN"),
+    ];
+    for (env, args, top_k, trace, trust) in [
+        (
+            &[][..],
+            vec![],
+            5,
+            base.trace.clone(),
+            Some(TrustModeSerde::Trusted),
+        ),
+        (
+            retrieval_env.as_slice(),
+            vec!["--settings", "{}"],
+            7,
+            base.trace.clone(),
+            Some(TrustModeSerde::Trusted),
+        ),
+        (
+            retrieval_env.as_slice(),
+            vec!["--settings", r#"{"memory":{"retrieval_top_k":5}}"#],
+            5,
+            base.trace.clone(),
+            Some(TrustModeSerde::Trusted),
+        ),
+        (
+            retrieval_env.as_slice(),
+            vec!["--settings", "settings.json"],
+            5,
+            base.trace.clone(),
+            Some(TrustModeSerde::Trusted),
+        ),
+        (
+            retrieval_env.as_slice(),
+            vec![
+                "--settings",
+                r#"{"trace":{"profile":"dev","min_level":"debug"}}"#,
+                "--trace-profile",
+                "production",
+            ],
+            7,
+            Default::default(),
+            Some(TrustModeSerde::Trusted),
+        ),
+        (
+            retrieval_env.as_slice(),
+            vec!["--trace-level", "debug"],
+            7,
+            astra_config::runtime_config::SessionTraceConfig {
+                min_level: TraceLevel::Debug,
+                ..base.trace.clone()
+            },
+            Some(TrustModeSerde::Trusted),
+        ),
+        (
+            retrieval_env.as_slice(),
+            vec!["--settings", r#"{"safety":{"trust_mode":null}}"#],
+            7,
+            base.trace.clone(),
+            None,
+        ),
+        (
+            invalid_threshold_env.as_slice(),
+            vec!["--settings", r#"{"safety":{"trust_mode":"strict"}}"#],
+            7,
+            base.trace.clone(),
+            Some(TrustModeSerde::Strict),
+        ),
+    ] {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"));
+        command
+            .env_clear()
+            .env("HOME", root.path())
+            .env("ASTRA_LOCAL_STATE_ROOT", &local)
+            .current_dir(root.path())
+            .args(&args)
+            .args(["config", "version", "current"])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        command.envs(env.iter().copied());
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
+            .await
+            .expect("local configuration command must finish without network or input")
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut expected = base.clone();
+        expected.memory.retrieval_top_k = top_k;
+        expected.trace = trace;
+        expected.safety.trust_mode = trust;
+        let expected =
+            VersionId::from_toml_bytes(toml::to_string_pretty(&expected).unwrap().as_bytes());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            expected.as_str(),
+            "args={args:?}"
+        );
+    }
 }

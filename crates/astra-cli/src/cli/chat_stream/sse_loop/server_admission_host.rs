@@ -298,6 +298,7 @@ impl Drop for SandboxPolicyGuard<'_> {
 /// Holds all CLI-specific dependencies; the runtime loop calls `execute_turn()`
 /// which delegates to the existing `fetch_chat_turn_sse` pipeline.
 pub(crate) struct CliServerAdmissionHost<'a> {
+    pub runtime_config: Arc<astra_config::RuntimeConfig>,
     pub api: &'a astra_thin_client::ThinClient,
     pub token: String,
     pub auth_profile: Option<&'a str>,
@@ -373,9 +374,6 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// stays separate so plan markdown does not have to be smuggled
     /// through the question/option layout `ask_user` expects.
     pub plan_review_request_tx: Option<crate::cli::chat_stream::PlanReviewRequestTx>,
-    /// Root-level messaging context used when the current turn has no mailbox.
-    pub root_send_message_context:
-        Option<crate::edge_tools::agent_messaging::SendMessageRuntimeContext>,
     /// Shared dynamic-agent runtime for this session. It may be constructed
     /// before the server has allocated the session id, so the host late-binds it
     /// when the first streamed snapshot names the canonical session.
@@ -389,17 +387,6 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// Original-deadline-backed source for a fresh request-local wall budget.
     /// This stays typed and out of all static prompt/cache-prefix fields.
     pub execution_time_budget: Option<crate::cli::chat_stream::ExecutionTimeBudgetClock>,
-    /// Optional fork-prefix store. When wired, this host calls
-    /// `capture_parent_prefix` in its
-    /// `on_turn_completed` hook, feeding the store that the
-    /// DynamicAgentSpawner and DelegationEngine share. Without
-    /// this, a captured parent prefix never exists and children
-    /// always resolve to None — which was the exact observation
-    /// during live MiniMax verification (spawn succeeded,
-    /// delegate succeeded, but fork-cache events never fired
-    /// because no parent capture happened).
-    pub prefix_store:
-        Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
     /// Incremental turn state for surviving interruptions.
     /// Written during streaming; snapped on force-exit to recover partial data.
     pub incremental_state: Option<Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>>,
@@ -1154,8 +1141,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         // callback failures must stop this physical stream and cancel its
         // durable run without being misreported as a user cancellation or
         // cancelling other work that shares the caller token.
-        let stream_cancel_token =
-            crate::cli::skill_subrun::child_cancellation_scope(state.cancellation.token.as_ref());
+        let stream_cancel_token = child_cancellation_scope(state.cancellation.token.as_ref());
         let persistent_restricted_tools = state.restricted_tools.clone();
         let interaction_scoped_restrictions =
             interaction_scoped_tool_restrictions(interaction_mode);
@@ -1196,36 +1182,12 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         if let Some(context) = self.executor.spawn_context.as_ref() {
             state.messaging.reply_obligations = Arc::clone(&context.reply_obligations);
         }
-        let send_message_context = state
-            .messaging
-            .mailbox
-            .as_ref()
-            .map(
-                |mailbox| crate::edge_tools::agent_messaging::SendMessageRuntimeContext {
-                    agent_id: mailbox.address.agent_id.clone(),
-                    run_id: state
-                        .current_run_id
-                        .clone()
-                        .unwrap_or_else(|| mailbox.address.run_id.clone()),
-                    router: mailbox.router(),
-                    reply_obligations: Arc::clone(&state.messaging.reply_obligations),
-                },
-            )
-            .or_else(|| self.root_send_message_context.clone())
-            .map(|mut context| {
-                if let Some(run_id) = state.current_run_id.clone() {
-                    context.run_id = run_id;
-                }
-                context.reply_obligations = Arc::clone(&state.messaging.reply_obligations);
-                context
-            });
-        self.executor.set_send_message_context(send_message_context);
-
         let append_system_prompt = self.append_system_prompt.as_deref();
 
         macro_rules! fetch_turn_sse {
             () => {
                 fetch_chat_turn_sse(ChatTurnSseFetchRequest {
+                    tool_surface_config: &self.runtime_config.tool_surface,
                     api: self.api,
                     token: self.token.as_str(),
                     auth_profile: self.auth_profile,
@@ -2203,75 +2165,6 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             inc.set_tool_calls_count(state.total_tool_calls);
             inc.replace_tools_used(tools_used);
         }
-
-        // Bug B step 3: capture the parent turn's cacheable prefix
-        // so subsequent agent-spawn / delegate calls can inherit it
-        // for prompt-cache reuse. No-op unless:
-        //   - the `prefix_store` Arc was plumbed in by the host
-        //   - ingest populated the expected state fields
-        let Some(store) = self.prefix_store.as_ref() else {
-            return;
-        };
-        let parent_run_id = match state.current_run_id.as_deref() {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => return,
-        };
-        let model_selector = self.model.unwrap_or("");
-        let model_id = model_selector.to_string();
-        let provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
-        let raw_provider = provider.raw_provider_name().to_owned();
-        let capture_thinking =
-            astra_turn_core::thinking_config::resolve_model_thinking_request(model_selector).1;
-        // Canonical prefix bytes: JSON-serialize the messages as-is.
-        // This is the format `fork_reconstruct::reconstruct_messages`
-        // expects on the consuming end. System prompts and tool
-        // schemas are captured separately; for step 3 we ship a
-        // minimal-but-correct subset — the messages array is what
-        // downstream prepending into child state cares about.
-        let Ok(canonical_prefix_bytes) = serde_json::to_vec(&state.messages) else {
-            return;
-        };
-        crate::cli::history_work::record_existing_buffer(
-            astra_core::history_work::HistoryWorkSite::CliForkPrefixSerialization,
-            &canonical_prefix_bytes,
-            state.messages.len(),
-        );
-        let captured_at_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // G1 payload fill: `all_schemas` is exactly the tool list the
-        // CLI advertised to the LLM this turn, so it's the honest
-        // source for `tool_schemas`. `system_blocks` stays empty here
-        // because the CLI doesn't assemble the final system prompt
-        // locally — the server-side bridge does that. A future PR on
-        // the server host (G2) will populate system_blocks where the
-        // real bytes exist.
-        let tool_schemas =
-            astra_turn_core::fork_prefix::build_tool_schema_entries(&self.all_schemas);
-        crate::cli::history_work::record_fork_tool_schema_serialization(
-            astra_core::history_work::HistoryWorkSite::CliForkToolSchemaSerialization,
-            &tool_schemas,
-        );
-        let req = astra_turn_core::fork_capture::CaptureRequest {
-            parent_run_id,
-            parent_turn_seq: self.chat_turn_index,
-            provider,
-            model_id,
-            thinking: astra_turn_core::thinking_config::fork_capture_thinking_slice(
-                &capture_thinking,
-                &raw_provider,
-                model_selector,
-            ),
-            system_blocks: vec![],
-            tool_schemas,
-            beta_headers: vec![],
-            canonical_prefix_bytes,
-            cache_mode: astra_turn_core::fork_prefix::CacheMode::Write,
-            captured_at_secs,
-            microcompact_fired_in_turn: false,
-        };
-        let _ = astra_turn_core::fork_capture::capture_parent_prefix(req, store.as_ref());
     }
 }
 
@@ -2298,20 +2191,60 @@ fn request_allowlist_restriction_names(
         .collect()
 }
 
+/// Isolate one Server stream from its caller's cancellation domain.
+///
+/// Parent cancellation propagates into the child, while a child-local control
+/// failure (for example an exhausted edge callback retry) cannot cancel its
+/// parent or any sibling that happens to share the same parent token.
+fn child_cancellation_scope(
+    parent: Option<&std::sync::Arc<tokio_util::sync::CancellationToken>>,
+) -> std::sync::Arc<tokio_util::sync::CancellationToken> {
+    std::sync::Arc::new(parent.map(|token| token.child_token()).unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::{
         SandboxPolicyGuard, TERMINAL_STREAM_DRAIN_TIMEOUT, accumulated_control_duration_ms,
-        authoritative_provider_surface_report, derive_turn_interaction_mode,
-        emit_final_output_ready, emit_ordered_control_event_with_backpressure,
-        is_pre_admission_rejection, permission_mode_change_audit_event,
-        reconcile_terminal_stream_projection, record_remote_applied_user_intents,
-        recovered_agent_fanout_completion_event, request_allowlist_restriction_names,
-        retain_ordered_stream_event_in_queue, server_terminal_requires_unverified,
-        stream_event_requires_ordered_delivery, user_intent_stream_event,
+        authoritative_provider_surface_report, child_cancellation_scope,
+        derive_turn_interaction_mode, emit_final_output_ready,
+        emit_ordered_control_event_with_backpressure, is_pre_admission_rejection,
+        permission_mode_change_audit_event, reconcile_terminal_stream_projection,
+        record_remote_applied_user_intents, recovered_agent_fanout_completion_event,
+        request_allowlist_restriction_names, retain_ordered_stream_event_in_queue,
+        server_terminal_requires_unverified, stream_event_requires_ordered_delivery,
+        user_intent_stream_event,
     };
+
+    #[test]
+    fn child_cancellation_scope_is_one_way_and_sibling_isolated() {
+        let parent = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+        let children = (0..1_024)
+            .map(|_| child_cancellation_scope(Some(&parent)))
+            .collect::<Vec<_>>();
+        let first = &children[0];
+
+        first.cancel();
+
+        assert!(first.is_cancelled());
+        assert!(!parent.is_cancelled(), "a child must not cancel its parent");
+        assert!(
+            children[1..].iter().all(|child| !child.is_cancelled()),
+            "a callback failure in one child must not cancel any sibling"
+        );
+
+        parent.cancel();
+        assert!(
+            children.iter().all(|child| child.is_cancelled()),
+            "parent cancellation must reach every child"
+        );
+        assert!(
+            child_cancellation_scope(Some(&parent)).is_cancelled(),
+            "a child created after parent cancellation starts cancelled"
+        );
+    }
 
     #[test]
     fn authoritative_runtime_surface_replaces_the_edge_preflight_subset() {

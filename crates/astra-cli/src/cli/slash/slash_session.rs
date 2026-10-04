@@ -3486,10 +3486,6 @@ fn handle_session_adaptive(_arg: &str, state: &SessionState) {
 
             eprintln!("  {} Config snapshot:", "▸".magenta(),);
             eprintln!(
-                "      token_budget.max_turn_input_tokens = {}",
-                guard.config.token_budget.max_turn_input_tokens
-            );
-            eprintln!(
                 "      memory.retrieval_top_k             = {}",
                 guard.config.memory.retrieval_top_k
             );
@@ -4861,7 +4857,7 @@ fn prepared_workspace_restore_from_workspace(
         })
         .transpose()?;
     let (runtime_config, config_version_id) =
-        session_startup::prepare_session_runtime_config(state, saved, None)
+        session_startup::prepare_session_runtime_config(state, saved)
             .map_err(|error| format!("saved {error}"))?;
     Ok(PreparedWorkspaceRestore {
         session_persistence_error: ws.as_ref().and_then(|ws| ws.last_persistence_error.clone()),
@@ -6733,7 +6729,7 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn apply_restored_session_rebinds_root_mailbox_and_replaces_live_session_overrides() {
+    async fn apply_restored_session_replaces_live_session_overrides() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-overrides-{}", uuid::Uuid::new_v4());
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
@@ -6760,19 +6756,8 @@ mod resume_tests {
             last_status: "active".into(),
             ..Default::default()
         };
-        let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
-        let tracker = std::sync::Arc::new(
-            astra_runtime::server::delegation::engine::DelegationTracker::new(),
-        );
-        let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
-            transport.clone(),
-            tracker,
-        ));
-        let live_root_addr = astra_messaging::AgentAddress::new("live-session", "main");
-
         let mut state = SessionState::default();
         state.set_session_id("live-session");
-        state.root_mailbox = Some(router.register(live_root_addr.clone(), None).await.unwrap());
         state.perm_manager.record_approval("bash", None, false);
 
         apply_restored_session(None, &api, &mut state, restored)
@@ -6791,11 +6776,6 @@ mod resume_tests {
             restored_session_overrides.check(&restored_read_file),
             Some(true)
         );
-        assert!(state.root_mailbox.is_none());
-        router
-            .register(live_root_addr, None)
-            .await
-            .expect("resume should unregister the prior root mailbox");
     }
 
     #[serial_test::serial]
@@ -7020,6 +7000,7 @@ mod resume_tests {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         for invalid in [
             r#"{"verification":{"strictness":0.8}}"#,
+            r#"{"token_budget":{"max_turn_input_tokens":16000}}"#,
             r#"{"compression":{"compression_threshold":1.1}}"#,
         ] {
             let session_id = format!("resume-invalid-config-{}", uuid::Uuid::new_v4());
@@ -7744,12 +7725,6 @@ mod resume_tests {
         state.set_session_id("current-session");
         state.config_version_id = Some("stale-config-version".into());
         let hub = std::sync::Arc::new(astra_runtime::observability::ObservabilityHub::new());
-        let mut profile = hub.profiles().get_profile("anonymous");
-        profile.preferences.config_overrides.insert(
-            "token_budget.max_prompt_tokens".into(),
-            serde_json::json!(12345),
-        );
-        hub.profiles().update_profile(profile);
         state.observability_hub = Some(hub);
         switch_session_into_state(&session_id, None, &api, &mut state)
             .await
@@ -7888,7 +7863,6 @@ mod resume_tests {
             .mount(&fresh_server)
             .await;
         let mut fresh_config = astra_config::RuntimeConfig::load();
-        fresh_config.token_budget.max_prompt_tokens = 12345;
         fresh_config.explain.report_format =
             Some(astra_config::runtime_config::ExplainReportFormat::Text);
         let fresh_version = astra_config::config_versions::VersionId::from_toml_bytes(
@@ -7987,7 +7961,7 @@ mod resume_tests {
         )
         .unwrap();
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let mut process_config = astra_config::RuntimeConfig::load();
+        let process_config = astra_config::RuntimeConfig::load();
         let _creds_guard = crate::tests::isolate_credentials();
         let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         let session_id = format!("switch-restore-{}", uuid::Uuid::new_v4());
@@ -8009,14 +7983,7 @@ mod resume_tests {
         state.runtime_config.memory.retrieval_top_k = 42;
         state.config_version_id = Some("stale-config-version".into());
         let hub = std::sync::Arc::new(astra_runtime::observability::ObservabilityHub::new());
-        let mut profile = hub.profiles().get_profile("anonymous");
-        profile.preferences.config_overrides.insert(
-            "token_budget.max_prompt_tokens".into(),
-            serde_json::json!(12345),
-        );
-        hub.profiles().update_profile(profile);
         state.observability_hub = Some(hub);
-        process_config.token_budget.max_prompt_tokens = 12345;
 
         switch_session_into_state(&session_id, None, &api, &mut state)
             .await

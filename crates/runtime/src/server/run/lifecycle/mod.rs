@@ -21986,7 +21986,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         _parent_selection: Option<&ModelSelection>,
     ) -> Result<Vec<Box<dyn PreparedSpawn>>, String> {
         if inputs.iter().any(|input| input.isolated) {
-            return Err("this Server execution boundary does not support isolated Git workspaces; select a CLI execution boundary".into());
+            return Err("agent execution does not support isolated Git workspaces".into());
         }
         let parent = self
             .runtime_context_for_parent_run(&context.parent_run_id)
@@ -24561,8 +24561,8 @@ impl ServerSubRunExecutor {
         } else {
             crate::orchestration::workspace_mutation_from_context(&config.context)
         };
-        let execution_bindings = if child_workspace_mutation
-            == astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
+        let execution_bindings = if self.inherited_permissions.read_only_execution
+            || config.agent_profile.read_only
         {
             execution_bindings_from_metadata_with_authority(
                 config.execution_metadata.as_ref(),
@@ -24751,8 +24751,7 @@ impl ServerSubRunExecutor {
         let runtime_config = astra_config::RuntimeConfig::load();
         let resolved_tool_policy = runtime_config.tool_selection.resolve_for_model(child_model_name.as_deref());
         let mut effective_inherited_permissions = self.inherited_permissions.clone();
-        if config.agent_profile.read_only || child_workspace_mutation
-            == astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
+        if config.agent_profile.read_only
             || execution_bindings.as_ref().is_some_and(|snapshot| {
                 snapshot.workspace.authority == astra_runtime_env::WorkspaceAuthority::ReadOnly
             })

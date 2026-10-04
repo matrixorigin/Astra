@@ -75,21 +75,18 @@ fn hint_mentions_navigation_search_and_save() {
 #[test]
 fn typing_a_letter_filters_the_list_to_matching_ids_or_labels() {
     let mut v = make_view();
-    // Default catalog has 16+ items; searching "budget" should whittle
-    // it down (token_budget.* items all match, plus any label hits).
-    for c in "budget".chars() {
+    // Search filters the catalog by both IDs and display labels.
+    for c in "memory".chars() {
         v.handle_key(ch(c));
     }
     let visible = v.visible_ids();
     assert!(
         !visible.is_empty(),
-        "search for `budget` should match something"
+        "search for `memory` should match something"
     );
     assert!(
-        visible
-            .iter()
-            .all(|id| id.contains("budget") || id.contains("_tokens")),
-        "all matches should touch budget-ish ids, got {visible:?}"
+        visible.iter().all(|id| id.contains("memory")),
+        "all matches should select memory settings, got {visible:?}"
     );
     // And backspace clears the filter character by character.
     v.handle_key(key(KeyCode::Backspace));
@@ -144,7 +141,7 @@ fn enter_on_bool_item_opens_bool_editor() {
 #[test]
 fn enter_on_number_item_opens_number_editor() {
     let mut v = make_view();
-    v.select_by_id("token_budget.max_turn_input_tokens");
+    v.select_by_id("memory.retrieval_top_k");
     v.handle_key(key(KeyCode::Enter));
     assert!(v.has_inner_editor());
     assert_eq!(v.inner_editor_kind(), Some("number"));
@@ -440,25 +437,20 @@ fn bool_editor_space_still_toggles_for_muscle_memory() {
 #[test]
 fn number_edit_round_trips_and_marks_dirty() {
     let mut v = make_view();
-    v.select_by_id("token_budget.max_turn_input_tokens");
+    v.select_by_id("memory.retrieval_top_k");
     v.handle_key(key(KeyCode::Enter)); // open number editor
-    // Replace initial value with 750000
+    // Replace initial value with 12
     // (the number editor pre-fills with current; we wipe and retype)
     for _ in 0..10 {
         v.handle_key(key(KeyCode::Backspace));
     }
-    for c in "750000".chars() {
+    for c in "12".chars() {
         v.handle_key(ch(c));
     }
     v.handle_key(key(KeyCode::Enter));
     assert!(!v.has_inner_editor());
     assert!(v.is_dirty());
-    assert_eq!(
-        v.working_config_for_test()
-            .token_budget
-            .max_turn_input_tokens,
-        750_000
-    );
+    assert_eq!(v.working_config_for_test().memory.retrieval_top_k, 12);
 }
 
 #[test]
@@ -621,7 +613,7 @@ fn render_fits_height_budget_at_reasonable_width() {
         }
     }
     assert!(
-        text.contains("budget")
+        text.contains("memory")
             || text.contains("compression")
             || text.contains("memory")
             || text.contains("Search"),

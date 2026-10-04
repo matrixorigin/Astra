@@ -155,11 +155,13 @@ impl LocalFileStore {
         Self { root }
     }
 
-    /// Default store location: `~/.astra/config/versions/`.
-    /// Returns `None` if the home dir is unresolvable, so callers
-    /// can fall back gracefully (e.g., test / containerised env).
+    /// Store versions beside the user runtime configuration, respecting
+    /// `ASTRA_LOCAL_STATE_ROOT`. Returns `None` when neither root is available.
     pub fn at_default_root() -> Option<Self> {
-        dirs::home_dir().map(|h| Self::new(h.join(".astra/config/versions")))
+        crate::runtime_config::user_runtime_config_path().and_then(|path| {
+            path.parent()
+                .map(|parent| Self::new(parent.join("versions")))
+        })
     }
 
     fn blob_path(&self, id: &VersionId) -> PathBuf {

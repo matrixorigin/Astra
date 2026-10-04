@@ -6637,13 +6637,8 @@ impl DynamicAgentSpawner {
         // capacity, registering a mailbox, or touching Git. A read-only
         // execution ceiling is immutable; approval and the child profile
         // cannot turn worktree provisioning back on.
-        let workspace_mutation = if agent_def.read_only {
-            astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
-        } else {
-            context.workspace_mutation
-        };
-        let read_only_execution = context.inherited_permissions.read_only_execution
-            || workspace_mutation == astra_config::user_profile::WorkspaceMutationIntent::ReadOnly;
+        let read_only_execution =
+            context.inherited_permissions.read_only_execution || agent_def.read_only;
         if input.isolated && read_only_execution {
             return Err(SpawnError::InvalidInput(
                 "isolated spawn requires a writable workspace; read-only execution cannot provision a worktree"
@@ -7334,8 +7329,8 @@ impl DynamicAgentSpawner {
         } else {
             context.workspace_mutation
         };
-        let read_only_execution = context.inherited_permissions.read_only_execution
-            || workspace_mutation == astra_config::user_profile::WorkspaceMutationIntent::ReadOnly;
+        let read_only_execution =
+            context.inherited_permissions.read_only_execution || agent_def.read_only;
 
         // 2. Generate IDs
         let agent_name = input
@@ -7922,8 +7917,7 @@ impl DynamicAgentSpawner {
             hard_turn_limit,
             execution_deadline,
             allowed_tools: effective_allowed_tools,
-            read_only: workspace_mutation
-                == astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            read_only: read_only_execution,
             workspace_mutation,
             working_dir: context.working_dir.clone(),
             isolated: input.isolated,
@@ -13282,6 +13276,101 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn fanout_result_preserves_running_read_when_summary_becomes_terminal() {
+        use crate::orchestration::{
+            AgentToolContext, AgentTranscriptLocation, InheritedPermissions,
+            WorkspaceMutationAuthority, handle_agent_fanout_tool,
+        };
+        let executor = BlockingExecutorFactory::new();
+        let spawner =
+            Arc::new(DynamicAgentSpawner::new(mock_router()).with_executor(executor.clone()));
+        let ctx = AgentToolContext {
+            parent_profile_authority: ParentProfileAuthority::Unbound,
+            admitted_agent_profiles: None,
+            fanout_admission: spawner.fanout_parent("mixed-parent"),
+            reply_obligations: Arc::new(Default::default()),
+            delegation_model_admission: None,
+            run_id: "mixed-parent".into(),
+            agent_id: "root-agent".into(),
+            delegation_chain: Vec::new(),
+            current_model: None,
+            current_model_selection: None,
+            parent_model_reasoning: None,
+            recursion_depth: 0,
+            is_fork_child: false,
+            working_dir: PathBuf::from("."),
+            spawner: spawner.clone(),
+            inherited_permissions: InheritedPermissions::auto_approve(),
+            enabled_tools: None,
+            active_skills: Vec::new(),
+            live_event_sink: None,
+            client_tool_delivery_tx: None,
+            trace_context: None,
+            execution_metadata: None,
+            execution_deadline: None,
+            workspace_mutation: WorkspaceMutationAuthority::default(),
+            transcript_location: AgentTranscriptLocation::DurableServer,
+        };
+        let start: serde_json::Value = serde_json::from_str(
+            &handle_agent_fanout_tool(
+                &json!({"action":"start","group_id":"mixed-group","target_count":1,
+                    "slots":[{"description":"review", "prompt":"review"}]}),
+                Some(&ctx),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(start["status"], "started", "{start}");
+        let agent_id = start["agents"][0]["agent_id"].as_str().unwrap();
+        tokio::task::yield_now().await;
+        let args = json!({"action":"get_results","group_id":"mixed-group"});
+        let query = handle_agent_fanout_tool(&args, Some(&ctx));
+        tokio::pin!(query);
+        assert!(futures_util::poll!(&mut query).is_pending());
+        let groups = spawner.fanout_groups.write().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        // The child read has timed out and captured Running. Block its inner
+        // group lookup, then queue the real finalizer behind that lookup.
+        assert!(futures_util::poll!(&mut query).is_pending());
+        let result = SpawnRunResult {
+            agent_id: agent_id.into(),
+            run_id: start["agents"][0]["run_id"].as_str().unwrap().into(),
+            committed_frontier: None,
+            status: "completed".into(),
+            finish_reason: "normal".into(),
+            cancellation_origin: CancellationOrigin::Unverified,
+            output: Some("review complete".into()),
+            error: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+            turns_completed: 0,
+            permission_summary: None,
+            permission_requests: 0,
+            permission_requests_approved: 0,
+            tools_blocked: 0,
+        };
+        let finalize = spawner.finalize_background_agent(agent_id, Ok(&result));
+        tokio::pin!(finalize);
+        assert!(futures_util::poll!(&mut finalize).is_pending());
+        drop(groups);
+        // FIFO locking lets the old child lookup finish, while the renderer's
+        // refreshed summary waits behind the terminal write.
+        assert!(futures_util::poll!(&mut query).is_pending());
+        assert!(finalize.await);
+        let rendered: serde_json::Value = serde_json::from_str(&query.await).unwrap();
+        assert_eq!(rendered["status"], "completed_with_issues", "{rendered}");
+        assert_eq!(rendered["active"], 0);
+        assert_eq!(rendered["completed"], 1);
+        assert_eq!(rendered["failed"], 0);
+        assert_eq!(rendered["results"][0]["result"]["status"], "still_running");
+        assert_eq!(rendered["results"][0]["agent_id"], agent_id);
+        assert_eq!(rendered["provenance"]["all_slots_delivered"], false);
+        executor.unblock();
+        spawner.shutdown_and_wait(Duration::from_secs(1)).await;
+    }
+
     #[tokio::test]
     async fn cold_next_turn_result_discovers_durable_group_once_then_hits_owner_cache() {
         use crate::orchestration::{
@@ -15427,6 +15516,7 @@ pub(crate) mod tests {
 
     struct CapturingDepthExecutor {
         captured_depth: std::sync::Mutex<Option<u8>>,
+        captured_read_only: std::sync::Mutex<Option<(bool, bool)>>,
         captured_workspace_mutation:
             std::sync::Mutex<Option<astra_config::user_profile::WorkspaceMutationIntent>>,
     }
@@ -15572,6 +15662,7 @@ pub(crate) mod tests {
         fn new() -> Self {
             Self {
                 captured_depth: std::sync::Mutex::new(None),
+                captured_read_only: std::sync::Mutex::new(None),
                 captured_workspace_mutation: std::sync::Mutex::new(None),
             }
         }
@@ -16149,6 +16240,10 @@ pub(crate) mod tests {
 
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             *self.captured_depth.lock().unwrap() = Some(config.recursion_depth);
+            *self.captured_read_only.lock().unwrap() = Some((
+                config.read_only,
+                config.inherited_permissions.read_only_execution,
+            ));
             *self.captured_workspace_mutation.lock().unwrap() = Some(config.workspace_mutation);
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
@@ -16640,34 +16735,48 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_threads_parent_workspace_mutation_to_capable_child() {
-        let executor = Arc::new(CapturingDepthExecutor::new());
-        let spawner = DynamicAgentSpawner::new(mock_router()).with_executor(executor.clone());
-        let mut context = make_bg_context();
-        context.recursion_depth = 0;
-        context.workspace_mutation =
-            astra_config::user_profile::WorkspaceMutationIntent::MustMutate;
-        let input = SpawnAgentInput {
-            description: "Implement the admitted change".into(),
-            prompt: "Apply and verify the change".into(),
-            agent_type: "task".into(),
-            ..Default::default()
-        };
-
-        let result = spawner.spawn(input, &context).await.unwrap();
-        let SpawnAgentOutput::Launched { agent_id, .. } = result;
-        let status = spawner
-            .wait_for_agent(&agent_id, Duration::from_secs(2))
-            .await;
-        assert!(
-            matches!(status, Some(AgentStatus::Completed { .. })),
-            "{status:?}"
-        );
-        assert_eq!(
-            *executor.captured_workspace_mutation.lock().unwrap(),
-            Some(astra_config::user_profile::WorkspaceMutationIntent::MustMutate),
-            "a mutation-capable child must inherit the root completion/effect boundary"
-        );
+    async fn spawn_preserves_task_intent_without_granting_execution_authority() {
+        use astra_config::user_profile::WorkspaceMutationIntent::{MustMutate, ReadOnly};
+        for (agent_type, intent, inherited_read_only, expected_read_only) in [
+            ("task", MustMutate, false, false),
+            ("task", ReadOnly, false, false),
+            ("task", MustMutate, true, true),
+            ("task", ReadOnly, true, true),
+            ("explore", MustMutate, false, true),
+        ] {
+            let executor = Arc::new(CapturingDepthExecutor::new());
+            let spawner = DynamicAgentSpawner::new(mock_router()).with_executor(executor.clone());
+            let mut context = make_bg_context();
+            context.workspace_mutation = intent;
+            context.inherited_permissions.read_only_execution = inherited_read_only;
+            let input = SpawnAgentInput {
+                agent_type: agent_type.into(),
+                ..make_bg_input()
+            };
+            let SpawnAgentOutput::Launched { agent_id, .. } =
+                spawner.spawn(input, &context).await.unwrap();
+            let status = spawner
+                .wait_for_agent(&agent_id, Duration::from_secs(2))
+                .await;
+            assert!(
+                matches!(status, Some(AgentStatus::Completed { .. })),
+                "{status:?}"
+            );
+            assert_eq!(
+                *executor.captured_read_only.lock().unwrap(),
+                Some((expected_read_only, expected_read_only)),
+                "agent={agent_type}, intent={intent:?}, inherited={inherited_read_only}"
+            );
+            assert_eq!(
+                *executor.captured_workspace_mutation.lock().unwrap(),
+                Some(if agent_type == "explore" {
+                    ReadOnly
+                } else {
+                    intent
+                }),
+                "task semantics must still reach completion accounting"
+            );
+        }
     }
 
     #[tokio::test]
@@ -23868,6 +23977,15 @@ pub(crate) mod tests {
             assert!(parent.has_pending_direct_children());
             let archived = spawner.get_agent_state_any(&child.agent_id).await.unwrap();
             assert!(matches!(archived.status, AgentStatus::Waiting { .. }));
+            let observation: serde_json::Value = serde_json::from_str(
+                &astra_turn_core::orchestration::agent_result_wire::render_wait_for_agent_status(
+                    &child.agent_id,
+                    &archived.status,
+                ),
+            )
+            .unwrap();
+            assert_eq!(observation["result_family"], "child_result");
+            assert_eq!(observation["status"], "waiting");
             assert!(archived.ended_at.is_none());
             assert_eq!(
                 archived.cancellation_binding_id,

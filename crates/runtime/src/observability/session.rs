@@ -69,10 +69,7 @@ impl ObservabilitySession {
         let profile = manager.get_profile(&user_id);
 
         // Load config from defaults + file hierarchy + env vars
-        let mut config = RuntimeConfig::load();
-
-        // Apply user preferences
-        profile.preferences.apply_to_config(&mut config);
+        let config = RuntimeConfig::load();
 
         Self {
             user_id,

@@ -1,3 +1,5 @@
+use crate::cli::cli_config::cli_args::{SelfCmd, SelfMutateCmd, SelfMutateConfigArgs};
+use crate::cli::self_command::execute_self_command;
 use crate::edge_tools::ToolExecutor;
 use astra_services::{session_journal::JournalDirGuard, session_workspace};
 use serde_json::{Value, json};
@@ -40,12 +42,13 @@ fn executor_with_persisted_session() -> (
 }
 
 #[tokio::test]
-async fn adjust_config_applies_bounded_change() {
+async fn session_config_applies_bounded_numeric_change() {
     let (exe, session) = executor_with_session();
     let out = exe
         .execute(
-            "adjust_config",
+            "session",
             &json!({
+                "action": "config",
                 "path": "memory.retrieval_top_k",
                 "value": 6
             }),
@@ -62,8 +65,9 @@ async fn adjust_config_respects_drift_ceiling_without_force() {
     let (exe, _session) = executor_with_session();
     let out = exe
         .execute(
-            "adjust_config",
+            "session",
             &json!({
+                "action": "config",
                 "path": "memory.retrieval_top_k",
                 "value": 20
             }),
@@ -75,43 +79,43 @@ async fn adjust_config_respects_drift_ceiling_without_force() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn adjust_config_rejects_retired_verification_control() {
+async fn adjust_config_rejects_retired_controls() {
     let (_tmp, _guard, exe, session, session_id) = executor_with_persisted_session();
-    let baseline = session
-        .read()
-        .unwrap()
-        .config
-        .compression
-        .compression_threshold;
+    let baseline = serde_json::to_value(&session.read().unwrap().config).unwrap();
+    let workspace_before =
+        serde_json::to_value(session_workspace::read_workspace(&session_id).unwrap()).unwrap();
+    let journal_path = astra_services::session_journal::journal_file_path(&session_id);
+    assert!(!journal_path.exists());
 
-    let rejected: Value = serde_json::from_str(
-        &exe.execute(
-            "adjust_config",
-            &json!({
-                "path": "verification.strictness",
-                "value": 0.95,
-                "force": true
-            }),
+    for path in [
+        "verification.strictness",
+        "token_budget.max_turn_input_tokens",
+        "token_budget.tools_reserve",
+    ] {
+        let rejected: Value = serde_json::from_str(
+            &exe.execute(
+                "session",
+                &json!({
+                    "action": "config",
+                    "path": path,
+                    "value": 0.95,
+                    "force": true
+                }),
+            )
+            .await,
         )
-        .await,
-    )
-    .unwrap();
-    assert_eq!(rejected["error"], "Unsupported config path");
-    assert_eq!(
-        session
-            .read()
-            .unwrap()
-            .config
-            .compression
-            .compression_threshold,
-        baseline
-    );
-    assert_eq!(
-        session_workspace::read_workspace(&session_id)
-            .unwrap()
-            .config_mutation_revision,
-        0
-    );
+        .unwrap();
+        assert_eq!(rejected["error"], "Unsupported config path");
+        assert_eq!(
+            serde_json::to_value(&session.read().unwrap().config).unwrap(),
+            baseline
+        );
+        assert_eq!(
+            serde_json::to_value(session_workspace::read_workspace(&session_id).unwrap()).unwrap(),
+            workspace_before
+        );
+        assert!(!journal_path.exists());
+    }
 }
 
 #[tokio::test]
@@ -120,8 +124,9 @@ async fn self_mod_persists_config() {
 
     let adjust_out = exe
         .execute(
-            "adjust_config",
+            "session",
             &json!({
+                "action": "config",
                 "path": "memory.retrieval_top_k",
                 "value": 6
             }),
@@ -167,8 +172,8 @@ async fn durable_config_failure_does_not_change_observability_or_rollback_state(
 
     let failed: Value = serde_json::from_str(
         &exe.execute(
-            "adjust_config",
-            &json!({"path": "memory.retrieval_top_k", "value": changed, "force": true}),
+            "session",
+            &json!({"action": "config", "path": "memory.retrieval_top_k", "value": changed, "force": true}),
         )
         .await,
     )
@@ -188,8 +193,8 @@ async fn durable_config_failure_does_not_change_observability_or_rollback_state(
     std::fs::remove_dir(&lock_path).unwrap();
     let applied: Value = serde_json::from_str(
         &exe.execute(
-            "adjust_config",
-            &json!({"path": "memory.retrieval_top_k", "value": changed, "force": true}),
+            "session",
+            &json!({"action": "config", "path": "memory.retrieval_top_k", "value": changed, "force": true}),
         )
         .await,
     )
@@ -204,17 +209,21 @@ async fn governed_config_validates_against_latest_durable_authority() {
     let (_tmp, _guard, exe, session, session_id) = executor_with_persisted_session();
     let observed = session.read().unwrap().config.memory.retrieval_top_k;
     assert_ne!(observed, 20);
-    crate::cli::self_command::persist_config_override(
-        &session_id,
-        "memory.retrieval_top_k",
-        json!(20),
+    execute_self_command(
+        &SelfCmd::Mutate(SelfMutateCmd::Apply(SelfMutateConfigArgs {
+            session_id: Some(session_id.clone()),
+            path: "memory.retrieval_top_k".into(),
+            value: "20".into(),
+        })),
+        None,
     )
+    .await
     .unwrap();
 
     let rejected: Value = serde_json::from_str(
         &exe.execute(
-            "adjust_config",
-            &json!({"path": "memory.retrieval_top_k", "value": observed}),
+            "session",
+            &json!({"action": "config", "path": "memory.retrieval_top_k", "value": observed}),
         )
         .await,
     )
@@ -247,8 +256,8 @@ async fn projection_failure_preserves_durable_receipt_and_rollback_handle() {
 
     let applied: Value = serde_json::from_str(
         &exe.execute(
-            "adjust_config",
-            &json!({"path": "memory.retrieval_top_k", "value": changed, "force": true}),
+            "session",
+            &json!({"action": "config", "path": "memory.retrieval_top_k", "value": changed, "force": true}),
         )
         .await,
     )
@@ -300,8 +309,8 @@ async fn post_rename_sync_unknown_projects_readback_and_records_exact_owner() {
 
     let unknown: Value = serde_json::from_str(
         &exe.execute(
-            "adjust_config",
-            &json!({"path": "memory.retrieval_top_k", "value": changed, "force": true}),
+            "session",
+            &json!({"action": "config", "path": "memory.retrieval_top_k", "value": changed, "force": true}),
         )
         .await,
     )
@@ -346,31 +355,25 @@ async fn cli_rollback_rejects_aba_writer_without_overwriting_authority() {
         .unwrap();
     let applied: Value = serde_json::from_str(
         &exe.execute(
-            "adjust_config",
-            &json!({"path": "memory.retrieval_top_k", "value": first, "force": true}),
+            "session",
+            &json!({"action": "config", "path": "memory.retrieval_top_k", "value": first, "force": true}),
         )
         .await,
     )
     .unwrap();
     assert_eq!(applied["status"], "completed");
-    crate::cli::self_command::persist_config_override(
-        &session_id,
-        "memory.retrieval_top_k",
-        json!(first),
-    )
-    .unwrap();
-    crate::cli::self_command::persist_config_override(
-        &session_id,
-        "memory.retrieval_top_k",
-        json!(second),
-    )
-    .unwrap();
-    crate::cli::self_command::persist_config_override(
-        &session_id,
-        "memory.retrieval_top_k",
-        json!(first),
-    )
-    .unwrap();
+    for value in [first, second, first] {
+        execute_self_command(
+            &SelfCmd::Mutate(SelfMutateCmd::Apply(SelfMutateConfigArgs {
+                session_id: Some(session_id.clone()),
+                path: "memory.retrieval_top_k".into(),
+                value: value.to_string(),
+            })),
+            None,
+        )
+        .await
+        .unwrap();
+    }
 
     let rollback: Value = serde_json::from_str(
         &exe.execute("rollback_session_state", &json!({"scope": "current_turn"}))

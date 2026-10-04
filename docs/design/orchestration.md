@@ -25,7 +25,7 @@ requires an explicitly wired executor; a stub is a test fixture, not a default
 execution mode.
 
 Child results and failures remain in the canonical lifecycle and journal.
-CLI delegate, dynamic-agent and skill children use the runtime's common fresh
+Server delegate, dynamic-agent and skill children use the runtime's common fresh
 loop state, then install their exact identity, authority, context, transport and
 execution budget. Entry-specific configuration does not define another loop
 lifecycle. Fork context inheritance and recursion restrictions are independent
@@ -37,7 +37,7 @@ spawn and fanout enforce that authority before admission; a reusable profile
 cannot widen it. Prefix inheritance alone does not impose this Fork restriction.
 Child execution deadlines belong to the request, not a reusable executor.
 FanOut and Fork admit one absolute deadline before model preparation and pass
-it unchanged through queuing into CLI/Server loops, tools and nested children.
+it unchanged through queuing into Server loops, tools and nested children.
 Sequential retains its explicit per-stage timeout policy; a zero timeout adds
 no deadline. Invalid deadline ranges fail before child admission.
 The scheduler does not parse task output into a second findings store or copy
@@ -239,12 +239,16 @@ execution journal; it remains observable as a blocked request and does not
 create an unfinished child obligation. Failure after launch, partially started
 fanout, and unknown outcomes retain their execution and settlement obligations.
 
-An isolated child workspace belongs to the explicitly selected CLI workspace
-boundary, which provisions tracked sources through Git and retains cleanup
-ownership until its workers actually finish. Unsupported boundaries, missing
-HEAD, and Git failures reject isolation explicitly. Cleanup failure leaves the
-child unsettled and observable; an abort request or observer timeout does not
-prove that the local worker stopped or that its workspace was removed.
+CLI agent and fanout requests execute through the Server control plane, including
+one-shot chat and app-server. The CLI does not launch a second local agent run or
+append local child results after the Server stream terminates. These agent
+entrypoints reject isolated Git workspaces; they do not provision a local
+worktree implicitly. Native Team execution uses this same root-turn and child
+execution boundary.
+Interactive CLI state retains local recovery projections for historical child
+and fanout queries. It does not install a root delegation engine, capture a
+parent prefix for local children, or register a root agent mailbox.
+
 Use `agent_fanout.start` when the parent needs a fixed group with all-slot
 preflight and group-level control. Preflight prevents launching a group with
 an invalid slot, but provider or child execution can still fail after launch.
@@ -417,24 +421,23 @@ and requires no parent-run lookup or additional persistence.
 User-authored delegation requirements retain their default or hard strength in
 the frozen invocation. An explicit slot choice may override a default but not a
 hard requirement; applicable hard requirements are resolved before defaults,
-independent of extraction order. A CLI child without a trusted task binder
-rejects new nested delegation when it inherits unresolved or constrained
-descendant requirements rather than silently dropping them.
+independent of extraction order.
 `max_output_tokens` is exposed by the resident `agent.spawn` schema and is a
-ceiling for the first child model round, including its retries. CLI carries it as validated `context.max_output_tokens`; internal
-delegation carries the same typed cap. Catalog output limits remain separate.
+ceiling for the first child model round, including its retries. Shared child
+admission carries this typed cap. Catalog output limits remain separate.
 Final request assembly cannot enlarge that cap or replace an exact reasoning
 control through route defaults, convergence, or settlement heuristics.
 
 Server fanout prepares every slot before launching any child and admits distinct
-non-inherited Offerings in one bounded user-scoped batch. CLI uses one
-`/model-access/admit` request for model or reasoning selections that require
-Server validation. Each response binds the selected display name, context
-window, reasoning, and output ceiling to its requested slot; it conveys no
-reusable authorization token. An inherited-only batch reuses the parent's exact
-Offering and model snapshot without a catalog lookup. Mixed batches require
+non-inherited Offerings in one bounded user-scoped batch. An inherited-only
+batch reuses the parent's exact Offering and model snapshot without a catalog
+lookup. Mixed batches require
 the exact parent Offering identity for inherited slots and fail before remote
 I/O if it is missing. Preparation failure never authorizes a partial launch.
+
+CLI root model or reasoning selections use `/model-access/admit` when Server
+validation is required. Its response binds the selected model and limits;
+it conveys no reusable authorization token.
 
 ## Failure handling
 
@@ -444,6 +447,12 @@ I/O if it is missing. Preparation failure never authorizes a partial launch.
   not a failed child. It stops blocking final reconciliation only after the
   same child's successful producer-owned terminal result has been observed by
   the parent; final quality evaluation consumes the same typed proof.
+  Nonterminal `still_running`, `waiting`, and `paused` query observations follow
+  the same rule after that child's successful result is observed. This does not
+  authorize resuming a paused child or treating an unresolved wait as success.
+  Fanout launch and nonterminal result-query receipts follow the same rule for
+  the complete canonical group. An early slot query does not require another
+  query after all group results have been observed at the completion barrier.
   Failed or unobserved terminal results still block completion. When the
   parent has no independent work, it proposes a final answer; the existing
   completion barrier waits for direct children and resumes synthesis with

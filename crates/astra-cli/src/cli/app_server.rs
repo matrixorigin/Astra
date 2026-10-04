@@ -20,7 +20,7 @@ use crate::cli::session::session_continuation::{
     SessionContinuation, load_session_continuation_for_recovery,
 };
 use crate::cli::session::session_runtime;
-use crate::cli::stream::streaming_types::{StreamResult, format_background_agent_results};
+use crate::cli::stream::streaming_types::StreamResult;
 use crate::{ExplainMode, cli::chat_stream::BasicCliChatContext};
 
 #[derive(Clone, Debug, Default)]
@@ -541,15 +541,6 @@ async fn run_turn(
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let explain_mode = explain_mode_from_params(&params)?;
     let unified_skill_registry = astra_runtime::skills::default_unified_registry();
-    let agent_spawner = crate::cli::agent_runtime::build_one_shot_spawner(
-        &ctx.api,
-        token.clone(),
-        unified_skill_registry.clone(),
-        Some(thread_id.clone()),
-        model.clone(),
-    )
-    .await;
-    let spawner_for_drain = agent_spawner.clone();
     let chat_ctx = BasicCliChatContext {
         mcp_manager: None,
         api: &ctx.api,
@@ -559,16 +550,14 @@ async fn run_turn(
         model: model.as_deref(),
         provider: None,
         explain: explain_mode,
-        explain_report_format: astra_config::runtime_config::RuntimeConfig::load()
-            .explain
-            .effective_report_format(),
+        runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::load()),
         render_md: false,
         verbose_mode: false,
         render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: Some(&cli_context),
         unified_skill_registry,
-        agent_spawner: Some(agent_spawner),
-        root_agent_id: Some("gateway-root"),
+        agent_spawner: None,
+        root_agent_id: None,
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
@@ -612,9 +601,6 @@ async fn run_turn(
         turn_options,
     )
     .await;
-    let background_agent_results = spawner_for_drain
-        .shutdown_and_wait(std::time::Duration::from_secs(30))
-        .await;
     drop(chat_ctx);
     drop(approval_tx);
     join_or_abort_app_server_task(event_task, Duration::from_millis(250)).await;
@@ -623,11 +609,7 @@ async fn run_turn(
     let mut sr = match result {
         Ok(sr) => sr,
         Err(err) => {
-            let mut error = err.error;
-            if let Some(section) = format_background_agent_results(&background_agent_results) {
-                error.push_str("\n\n");
-                error.push_str(&section);
-            }
+            let error = err.error;
             write_notification(&writer, "error", serde_json::json!({"message": error})).await?;
             write_notification(
                 &writer,
@@ -638,8 +620,6 @@ async fn run_turn(
             return Ok(());
         }
     };
-    sr.background_agent_results = background_agent_results;
-    sr.integrate_background_agent_results();
     let next_thread_id = match persist_app_server_turn(
         ctx.auth_profile.as_deref(),
         model.as_deref(),

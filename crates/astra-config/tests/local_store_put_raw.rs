@@ -21,7 +21,7 @@ fn put_raw_toml_preserves_cloud_bytes() {
     // Cloud gave us this exact byte sequence; the pull path must NOT
     // reformat (a new toml::to_string_pretty round-trip can reorder
     // tables and change the hash).
-    let body = "version = \"1.0\"\n\n[token_budget]\nmax_turn_input_tokens = 500000\n";
+    let body = "version = \"1.0\"\n\n[memory]\nmax_memory_tokens = 500000\n";
     let id = VersionId::from_toml_bytes(body.as_bytes());
     store
         .put_raw_toml(&id, body, PutMetadata::default())

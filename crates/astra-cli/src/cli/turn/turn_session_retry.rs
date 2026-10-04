@@ -34,7 +34,6 @@ pub(crate) async fn prepare_session_not_found_retry(
         let _ = hub.end_session(old_sid);
     }
     state.clear_session_id();
-    state.unregister_root_mailbox().await;
     state.observability_session = None;
 }
 
@@ -77,7 +76,6 @@ mod tests {
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());
         assert!(state.observability_session.is_none());
-        assert!(state.root_mailbox.is_none());
     }
 
     #[serial_test::serial]

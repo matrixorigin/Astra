@@ -1,5 +1,5 @@
 use super::resolve_journal_target_session;
-use crate::cli::agent_runtime::initialize_multi_agent_runtime;
+use crate::cli::agent_runtime::initialize_agent_projection;
 use crate::cli::command_registry;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::stream_render::{
@@ -188,17 +188,13 @@ fn quiet_dispatch_captures_text_without_output() {
     assert_eq!(result.full_text, "hello world");
 }
 
-#[tokio::test]
-async fn initialize_multi_agent_runtime_wires_spawner_and_engine() {
-    let api =
-        astra_thin_client::ThinClient::new("http://127.0.0.1:8000", None).expect("test API URL");
+#[test]
+fn initialize_agent_projection_does_not_install_a_local_executor() {
     let mut state = SessionState::default();
 
-    initialize_multi_agent_runtime(&mut state, &api, "fake-token".to_string(), None).await;
-
-    assert!(state.delegation_engine.is_some());
+    initialize_agent_projection(&mut state);
     let spawner = state.agent_spawner.expect("agent spawner should be wired");
-    assert!(spawner.has_executor());
+    assert!(!spawner.has_executor());
 }
 
 #[test]

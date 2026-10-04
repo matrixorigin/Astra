@@ -382,7 +382,6 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         deferred_tool_activations,
         run_transcript_messages,
         applied_user_intents,
-        background_agent_results: Vec::new(),
     }
 }
 #[cfg(test)]

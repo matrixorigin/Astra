@@ -1457,8 +1457,20 @@ fn legacy_event_identity(value: &serde_json::Value) -> Option<String> {
         .and_then(|value| value.as_u64())
         .map(|value| value.to_string())
         .unwrap_or_default();
+    // Concurrent children can share a timestamp and producer. Their recorded
+    // execution identity distinguishes facts; other attributes remain subject
+    // to the full-payload conflict check.
+    let child_run = if matches!(event_type, "agent_spawned" | "agent_terminated") {
+        object
+            .get("metadata")
+            .and_then(|metadata| metadata.get("run_id"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+    } else {
+        ""
+    };
     Some(format!(
-        "legacy:{event_type}|{ts}|{session_id}|{producer_run}|{turn}|{agentic_step}"
+        "legacy:{event_type}|{ts}|{session_id}|{producer_run}|{turn}|{agentic_step}|{child_run}"
     ))
 }
 
@@ -2564,6 +2576,92 @@ mod tests {
         assert_eq!(capture.events.len(), 1);
         assert_eq!(capture.skipped_lines, 1);
         assert!(capture.has_integrity_errors());
+    }
+
+    #[test]
+    fn concurrent_child_lifecycle_identity_survives_owner_merge() {
+        use astra_services::session_journal::JournalEvent as StoredEvent;
+
+        let dir = tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(dir.path());
+        let owners = [
+            astra_services::OwnerScope::user("child-mirror-a").unwrap(),
+            astra_services::OwnerScope::user("child-mirror-b").unwrap(),
+        ];
+        let session = "concurrent-children";
+        let paths = owners.each_ref().map(|owner| {
+            let path = astra_services::session_journal::journal_file_path_for_owner(owner, session)
+                .unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            path
+        });
+        for terminated in [false, true] {
+            for producer in [None, Some("parent-run")] {
+                let event = |run: &str| {
+                    let mut event = if terminated {
+                        StoredEvent::agent_terminated(
+                            Some(session),
+                            run,
+                            run,
+                            "explore",
+                            "completed",
+                            None,
+                            Some(1),
+                            0,
+                            1,
+                            1,
+                            1,
+                            None,
+                        )
+                    } else {
+                        StoredEvent::agent_spawned(
+                            Some(session),
+                            run,
+                            run,
+                            "parent-run",
+                            "explore",
+                            "inspect",
+                            None,
+                            false,
+                            None,
+                        )
+                    }
+                    .with_producer_scope(producer);
+                    event.ts = "2026-10-04T09:21:38.776256+00:00".into();
+                    serde_json::to_value(event).unwrap()
+                };
+                let first = event("child-a");
+                let second = event("child-b");
+                std::fs::write(&paths[0], format!("{first}\n{second}\n{first}")).unwrap();
+                std::fs::write(&paths[1], format!("{second}\n{first}")).unwrap();
+                for capture in [
+                    load_session_from_path(session, &paths[0]).unwrap(),
+                    load_session_for_owners(session, &owners).unwrap(),
+                ] {
+                    assert_eq!(capture.events.len(), 2);
+                    assert!(!capture.has_integrity_errors());
+                }
+                // Subject attributes remain payload, not additional identities.
+                for field in [
+                    "agent_id",
+                    "parent_run_id",
+                    "description",
+                    "fanout_slot",
+                    "status",
+                ] {
+                    let mut conflict = first.clone();
+                    conflict["metadata"][field] = serde_json::json!("changed");
+                    std::fs::write(&paths[1], conflict.to_string()).unwrap();
+                    let merged = load_session_for_owners(session, &owners).unwrap();
+                    assert!(merged.has_integrity_errors(), "{field}");
+                    std::fs::write(&paths[0], format!("{first}\n{second}\n{conflict}")).unwrap();
+                    let local = load_session_from_path(session, &paths[0]).unwrap();
+                    assert_eq!(local.events.len(), 2);
+                    assert!(local.has_integrity_errors(), "{field}");
+                    std::fs::write(&paths[0], format!("{first}\n{second}")).unwrap();
+                }
+            }
+        }
     }
 
     #[test]

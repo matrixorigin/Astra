@@ -4,8 +4,6 @@ use crate::cli::chat_stream::{
 };
 use crate::cli::permission_manager::PermissionManager;
 use crate::cli::session::session_state::ExplainMode;
-use crate::edge_tools;
-use astra_runtime::tool_registry;
 use astra_services::session_journal::{self, JournalEventType, ProcessJournalDirGuard};
 use axum::{Json, Router, routing::post};
 
@@ -175,7 +173,7 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
-        explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
+        runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::default()),
         render_md: false,
         verbose_mode: false,
         render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
@@ -311,7 +309,6 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let request_lease =
@@ -335,7 +332,7 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
-        explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
+        runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::default()),
         render_md: false,
         history: &[],
         perm_manager: &mut pm,
@@ -354,7 +351,6 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
         plan_subtask_id: None,
-        delegation_engine: None,
         cancel_token: None,
         execution_time_budget: None,
         run_control: None,
@@ -374,7 +370,6 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         messaging_metrics: None,
         agent_spawner: None,
         root_agent_id: None,
-        root_mailbox_slot: None,
         observability_hub: None,
         observability_session: None,
         file_journal: None,
@@ -493,7 +488,6 @@ async fn stream_chat_sse_simple_text_response() {
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let result = stream_chat_sse(ChatTurnParams {
@@ -512,7 +506,7 @@ async fn stream_chat_sse_simple_text_response() {
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
-        explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
+        runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::default()),
         render_md: false,
         history: &[],
         perm_manager: &mut pm,
@@ -531,7 +525,6 @@ async fn stream_chat_sse_simple_text_response() {
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
         plan_subtask_id: None,
-        delegation_engine: None,
         cancel_token: None,
         execution_time_budget: None,
         run_control: None,
@@ -551,7 +544,6 @@ async fn stream_chat_sse_simple_text_response() {
         messaging_metrics: None,
         agent_spawner: None,
         root_agent_id: None,
-        root_mailbox_slot: None,
         observability_hub: None,
         observability_session: None,
         file_journal: None,
@@ -610,7 +602,6 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
@@ -630,7 +621,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
-        explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
+        runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::default()),
         render_md: false,
         history: &[],
         perm_manager: &mut pm,
@@ -649,7 +640,6 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
         plan_subtask_id: None,
-        delegation_engine: None,
         cancel_token: None,
         execution_time_budget: None,
         run_control: None,
@@ -669,7 +659,6 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         messaging_metrics: None,
         agent_spawner: None,
         root_agent_id: None,
-        root_mailbox_slot: None,
         observability_hub: None,
         observability_session: None,
         file_journal: None,
@@ -706,129 +695,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
 }
 
 #[tokio::test]
-async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
-    let app = Router::new().route(
-        "/chat/stream",
-        post(|| async { (TEST_SSE_HEADERS, sse_text_response("Hello!", "sess-001")) }),
-    );
-    let base = spawn_mock(app).await;
-    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
-    let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
-    let tracker =
-        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
-    let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
-    let spawner = std::sync::Arc::new(astra_runtime::orchestration::DynamicAgentSpawner::new(
-        router.clone(),
-    ));
-    let mut root_mailbox = Some(
-        router
-            .register(
-                astra_messaging::AgentAddress::new("persisted-run", "main"),
-                None,
-            )
-            .await
-            .unwrap(),
-    );
-
-    for session_id in [None, Some("sess-override")] {
-        let mut pm = PermissionManager::new(true);
-        let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-        let result = stream_chat_sse(ChatTurnParams {
-            api: &api,
-            token: "fake-token",
-            auth_profile: None,
-            message: "hi",
-            user_intent: "hi",
-            input_runtime_required_texts: &[],
-            input_active_system_skills: &[],
-            input_runtime_volatile_texts: &[],
-            input_work_unit_observations: &[],
-            semantic_query_override: None,
-            session_id,
-            offering_id: None,
-            model: Some("test-model"),
-            provider: None,
-            explain: ExplainMode::Off,
-            explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
-            render_md: false,
-            history: &[],
-            perm_manager: &mut pm,
-            verbose_mode: false,
-            render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
-            cli_context: None,
-            recent_tools: &[],
-            deferred_tool_activations: None,
-            resume_restricted_tools: &[],
-            tool_health_entries: &[],
-            workspace_observation_quarantine: None,
-            session_lessons: &[],
-            memory_selection_reports: &[],
-
-            latest_turn_quality_feedback: None,
-            unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
-            is_plan_subtask: false,
-            plan_subtask_id: None,
-            delegation_engine: None,
-            cancel_token: None,
-            execution_time_budget: None,
-            run_control: None,
-            incremental_state: None,
-            request_session_execution_lease: None,
-            plan_assemble_line_release: None,
-            stream_event_tx: None,
-            explain_analyze_terminal_degraded: None,
-            stream_json_emitter: None,
-            agent_live_event_sink: None,
-            approval_request_tx: None,
-            ask_user_request_tx: None,
-            plan_review_request_tx: None,
-            mcp_manager: None,
-            skill_quality_tracker: &mut skill_qt,
-            discovered_skills: None,
-            messaging_metrics: None,
-            agent_spawner: Some(spawner.clone()),
-            root_agent_id: Some("main"),
-            root_mailbox_slot: Some(&mut root_mailbox),
-            observability_hub: None,
-            observability_session: None,
-            file_journal: None,
-            file_state: None,
-            database_snapshot_journal: None,
-
-            git_worktree_journal: None,
-            session_state_journal: None,
-            bg_task_commands: None,
-            bg_task_list_cache: None,
-            bash_detach_slot: None,
-            turn_index: DEFAULT_TURN_INDEX,
-            pipeline_state: None,
-            compaction_state: None,
-            consecutive_context_window_errors: 0,
-            idempotency_cache: None,
-            pre_loaded_messages: None,
-            append_system_prompt: None,
-            #[cfg(feature = "harness")]
-            harness_sink: None,
-            #[cfg(feature = "harness")]
-            harness_trace: None,
-            #[cfg(feature = "harness")]
-            benchmark_profile: None,
-        })
-        .await
-        .unwrap();
-        assert_eq!(result.full_text, "Hello!");
-        assert_eq!(
-            root_mailbox
-                .as_ref()
-                .map(|mailbox| mailbox.address.run_id.as_str()),
-            Some("persisted-run")
-        );
-    }
-}
-
-#[tokio::test]
-async fn stream_chat_sse_does_not_delegate_server_continuation_to_cli_spawner() {
+async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
     let admissions = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let admissions_for_route = admissions.clone();
     let app = Router::new().route(
@@ -854,14 +721,6 @@ async fn stream_chat_sse_does_not_delegate_server_continuation_to_cli_spawner() 
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let unified_skill_registry = astra_runtime::skills::empty_unified_registry().clone();
-    let spawner = crate::cli::agent_runtime::build_one_shot_spawner(
-        &api,
-        "fake-token".to_string(),
-        unified_skill_registry.clone(),
-        None,
-        Some("mock-model".to_string()),
-    )
-    .await;
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
@@ -883,7 +742,13 @@ async fn stream_chat_sse_does_not_delegate_server_continuation_to_cli_spawner() 
             model: Some("mock-model"),
             provider: None,
             explain: ExplainMode::Off,
-            explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
+            runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig {
+                runtime_limits: astra_config::runtime_config::RuntimeLimitsConfig {
+                    max_turns: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
             render_md: false,
             history: &[],
             perm_manager: &mut pm,
@@ -902,7 +767,6 @@ async fn stream_chat_sse_does_not_delegate_server_continuation_to_cli_spawner() 
             unified_skill_registry: &unified_skill_registry,
             is_plan_subtask: false,
             plan_subtask_id: None,
-            delegation_engine: None,
             cancel_token: None,
             execution_time_budget: None,
             run_control: None,
@@ -920,9 +784,8 @@ async fn stream_chat_sse_does_not_delegate_server_continuation_to_cli_spawner() 
             skill_quality_tracker: &mut skill_qt,
             discovered_skills: None,
             messaging_metrics: None,
-            agent_spawner: Some(spawner),
-            root_agent_id: Some("main"),
-            root_mailbox_slot: None,
+            agent_spawner: None,
+            root_agent_id: None,
             observability_hub: None,
             observability_session: None,
             file_journal: None,
@@ -960,117 +823,7 @@ async fn stream_chat_sse_does_not_delegate_server_continuation_to_cli_spawner() 
     assert_eq!(
         admissions.load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "a configured CLI spawner must not create another model admission"
-    );
-}
-
-#[tokio::test]
-async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
-    let app = Router::new().route(
-        "/chat/stream",
-        post(|| async { (TEST_SSE_HEADERS, sse_text_response("Hello!", "sess-001")) }),
-    );
-    let base = spawn_mock(app).await;
-    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
-    let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
-    let tracker =
-        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
-    let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
-    let spawner = std::sync::Arc::new(astra_runtime::orchestration::DynamicAgentSpawner::new(
-        router.clone(),
-    ));
-    let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-
-    let result = stream_chat_sse(ChatTurnParams {
-        api: &api,
-        token: "fake-token",
-        auth_profile: None,
-        message: "hi",
-        user_intent: "hi",
-        input_runtime_required_texts: &[],
-        input_active_system_skills: &[],
-        input_runtime_volatile_texts: &[],
-        input_work_unit_observations: &[],
-        semantic_query_override: None,
-        session_id: None,
-        offering_id: None,
-        model: Some("test-model"),
-        provider: None,
-        explain: ExplainMode::Off,
-        explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
-        render_md: false,
-        history: &[],
-        perm_manager: &mut pm,
-        verbose_mode: false,
-        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
-        cli_context: None,
-        recent_tools: &[],
-        deferred_tool_activations: None,
-        resume_restricted_tools: &[],
-        tool_health_entries: &[],
-        workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
-
-        latest_turn_quality_feedback: None,
-        unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
-        is_plan_subtask: false,
-        plan_subtask_id: None,
-        delegation_engine: None,
-        cancel_token: None,
-        execution_time_budget: None,
-        run_control: None,
-        incremental_state: None,
-        request_session_execution_lease: None,
-        plan_assemble_line_release: None,
-        stream_event_tx: None,
-        explain_analyze_terminal_degraded: None,
-        stream_json_emitter: None,
-        agent_live_event_sink: None,
-        approval_request_tx: None,
-        ask_user_request_tx: None,
-        plan_review_request_tx: None,
-        mcp_manager: None,
-        skill_quality_tracker: &mut skill_qt,
-        discovered_skills: None,
-        messaging_metrics: None,
-        agent_spawner: Some(spawner),
-        root_agent_id: Some("bg-root"),
-        root_mailbox_slot: None,
-        observability_hub: None,
-        observability_session: None,
-        file_journal: None,
-        file_state: None,
-        database_snapshot_journal: None,
-
-        git_worktree_journal: None,
-        session_state_journal: None,
-        bg_task_commands: None,
-        bg_task_list_cache: None,
-        bash_detach_slot: None,
-        turn_index: DEFAULT_TURN_INDEX,
-        pipeline_state: None,
-        compaction_state: None,
-        consecutive_context_window_errors: 0,
-        idempotency_cache: None,
-        pre_loaded_messages: None,
-        append_system_prompt: None,
-        #[cfg(feature = "harness")]
-        harness_sink: None,
-        #[cfg(feature = "harness")]
-        harness_trace: None,
-        #[cfg(feature = "harness")]
-        benchmark_profile: None,
-    })
-    .await
-    .unwrap();
-
-    assert_eq!(result.full_text, "Hello!");
-    assert!(
-        !router.is_run_registered("persisted-run").await,
-        "ephemeral root mailbox should be unregistered after the turn"
+        "one Server-owned turn must use one admission"
     );
 }
 
@@ -1087,7 +840,6 @@ async fn stream_chat_sse_api_error_propagated() {
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let result = stream_chat_sse(ChatTurnParams {
@@ -1106,7 +858,7 @@ async fn stream_chat_sse_api_error_propagated() {
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
-        explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
+        runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::default()),
         render_md: false,
         history: &[],
         perm_manager: &mut pm,
@@ -1125,7 +877,6 @@ async fn stream_chat_sse_api_error_propagated() {
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
         plan_subtask_id: None,
-        delegation_engine: None,
         cancel_token: None,
         execution_time_budget: None,
         run_control: None,
@@ -1145,7 +896,6 @@ async fn stream_chat_sse_api_error_propagated() {
         messaging_metrics: None,
         agent_spawner: None,
         root_agent_id: None,
-        root_mailbox_slot: None,
         observability_hub: None,
         observability_session: None,
         file_journal: None,
@@ -1205,7 +955,6 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
         );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true); // auto-approve
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let result = stream_chat_sse(ChatTurnParams {
@@ -1224,7 +973,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
-        explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
+        runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::default()),
         render_md: false,
         history: &[],
         perm_manager: &mut pm,
@@ -1243,7 +992,6 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
         plan_subtask_id: None,
-        delegation_engine: None,
         cancel_token: None,
         execution_time_budget: None,
         run_control: None,
@@ -1263,7 +1011,6 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
         messaging_metrics: None,
         agent_spawner: None,
         root_agent_id: None,
-        root_mailbox_slot: None,
         observability_hub: None,
         observability_session: None,
         file_journal: None,
@@ -1377,7 +1124,6 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let result = stream_chat_sse(ChatTurnParams {
@@ -1396,7 +1142,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
-        explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
+        runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::default()),
         render_md: false,
         history: &[],
         perm_manager: &mut pm,
@@ -1415,7 +1161,6 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
         plan_subtask_id: None,
-        delegation_engine: None,
         cancel_token: None,
         execution_time_budget: None,
         run_control: None,
@@ -1435,7 +1180,6 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         messaging_metrics: None,
         agent_spawner: None,
         root_agent_id: None,
-        root_mailbox_slot: None,
         observability_hub: None,
         observability_session: None,
         file_journal: None,
@@ -1551,9 +1295,10 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+    let mut config = astra_config::RuntimeConfig::default();
+    config.tool_surface.pinned_tools = vec!["glob".into(), "-read_file".into()];
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
@@ -1570,7 +1315,7 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
-        explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
+        runtime_config: std::sync::Arc::new(config),
         render_md: false,
         history: &[],
         perm_manager: &mut pm,
@@ -1589,7 +1334,6 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
         plan_subtask_id: None,
-        delegation_engine: None,
         cancel_token: None,
         execution_time_budget: None,
         run_control: None,
@@ -1609,7 +1353,6 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         messaging_metrics: None,
         agent_spawner: None,
         root_agent_id: None,
-        root_mailbox_slot: None,
         observability_hub: None,
         observability_session: None,
         file_journal: None,
@@ -1648,6 +1391,20 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
     assert_eq!(payloads.len(), 1, "one user action is one Server admission");
     let payload = &payloads[0];
     assert_eq!(payload["message"], "review local changes");
+    let tools: Vec<_> = payload["context"]["edge_tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|schema| schema["function"]["name"].as_str())
+        .collect();
+    assert!(
+        tools.contains(&"glob"),
+        "selected session pins must reach the wire: {tools:?}"
+    );
+    assert!(
+        !tools.contains(&"read_file"),
+        "session removal must override process defaults: {tools:?}"
+    );
     for client_owned in [
         "messages",
         "tool_results",
@@ -1711,7 +1468,6 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
     let failure = stream_chat_sse(ChatTurnParams {
@@ -1730,7 +1486,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         model: Some("test-model"),
         provider: None,
         explain: ExplainMode::Off,
-        explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
+        runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::default()),
         render_md: false,
         history: &[],
         perm_manager: &mut pm,
@@ -1749,7 +1505,6 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
         is_plan_subtask: false,
         plan_subtask_id: None,
-        delegation_engine: None,
         cancel_token: None,
         execution_time_budget: None,
         run_control: None,
@@ -1769,7 +1524,6 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         messaging_metrics: None,
         agent_spawner: None,
         root_agent_id: None,
-        root_mailbox_slot: None,
         observability_hub: None,
         observability_session: None,
         file_journal: None,
@@ -1915,7 +1669,7 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
             model: Some("test-model"),
             provider: None,
             explain: ExplainMode::Off,
-            explain_report_format: astra_config::runtime_config::ExplainReportFormat::default(),
+            runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::default()),
             render_md: false,
             verbose_mode: false,
             render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,

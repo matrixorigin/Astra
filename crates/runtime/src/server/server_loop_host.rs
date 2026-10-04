@@ -34,6 +34,7 @@ use crate::server::tool_admission::{
     ToolAdmissionContext, has_explicit_runtime_executor_provider,
     resolve_tool_admission_for_binding_with_context,
 };
+use crate::server::tool_binding_projection::edge_tool_allowed_by_workspace_authority;
 use crate::server::tool_route_runtime::ToolRouteObserver;
 use crate::server::tool_route_selection::{
     ToolExecutionClass, ToolExecutionRouteKind, edge_bound_route_is_offline_for_binding,
@@ -96,17 +97,6 @@ use astra_turn_core::rate_limit_cooldown::{
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
-
-fn edge_tool_allowed_by_workspace_authority(
-    authority: WorkspaceAuthority,
-    tool_name: &str,
-    registry: &astra_runtime_env::ToolRegistry,
-) -> bool {
-    authority != WorkspaceAuthority::ReadOnly
-        || registry
-            .get(tool_name)
-            .is_some_and(astra_runtime_env::ToolSpec::is_read_only_execution_capability)
-}
 
 /// A committed lifecycle event must not wait forever on an attached SSE
 /// observer.  The event is retained before this bounded live delivery and can
@@ -32780,9 +32770,21 @@ mod tests {
             .with_execution_binding_snapshot(cli_edge_ledger_snapshot())
             .build();
 
-        for (label, host) in [("root", root), ("child", child)] {
+        let read_only_child = test_host_builder("u-cli-read-only-child", "s-cli-read-only-child")
+            .with_execution_binding_snapshot(read_only_edge_ledger_snapshot())
+            .build();
+
+        for (label, host, shell_allowed) in [
+            ("root", root, true),
+            ("child", child, true),
+            ("read-only child", read_only_child, false),
+        ] {
             let names = schema_names(&host.tool_schemas);
-            assert!(names.contains("bash"), "{label} lost process execution");
+            assert_eq!(
+                names.contains("bash"),
+                shell_allowed,
+                "{label} shell surface"
+            );
             assert!(
                 names.contains("read_file"),
                 "{label} lost repository read execution"

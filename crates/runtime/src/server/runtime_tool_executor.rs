@@ -15300,25 +15300,48 @@ esac
         )
         .unwrap();
         let (mut exec, _workspace) = test_executor();
-        exec.set_observability_session(Arc::new(std::sync::RwLock::new(
+        let session = Arc::new(std::sync::RwLock::new(
             crate::observability::ObservabilitySession::new_simple("test-session"),
-        )));
+        ));
+        exec.set_observability_session(session.clone());
         let store = Arc::new(RecordingResultArtifactStore::default());
         let exec = exec.with_test_session_artifact_store(store.clone());
         let top_k = astra_config::RuntimeConfig::load().memory.retrieval_top_k;
         let changed = if top_k == 20 { 19 } else { top_k + 1 };
 
-        let result = crate::server::tool_session_runtime::execute_with_executor(
-            &exec,
-            &json!({
-                "action": "config",
-                "path": "memory.retrieval_top_k",
-                "value": changed,
-                "force": true,
-            }),
-        )
-        .await;
+        for value in [json!(6.5), json!(21)] {
+            let rejected = exec
+                .execute_with_metadata(
+                    "session",
+                    &json!({
+                        "action": "config",
+                        "path": "memory.retrieval_top_k",
+                        "value": value,
+                        "force": true,
+                    }),
+                )
+                .await;
+            assert!(rejected.is_error, "{rejected:?}");
+            assert_eq!(session.read().unwrap().config.memory.retrieval_top_k, top_k);
+            assert!(store.seen.lock().unwrap().is_none());
+        }
+
+        let result = exec
+            .execute_with_metadata(
+                "session",
+                &json!({
+                    "action": "config",
+                    "path": "memory.retrieval_top_k",
+                    "value": changed,
+                    "force": true,
+                }),
+            )
+            .await;
         assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            session.read().unwrap().config.memory.retrieval_top_k,
+            changed
+        );
         assert_eq!(
             store.seen.lock().unwrap().as_ref().unwrap().artifact_kind,
             astra_services::session_workspace::WORKSPACE_METADATA_ARTIFACT_KIND

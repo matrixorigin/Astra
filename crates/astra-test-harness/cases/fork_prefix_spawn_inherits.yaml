@@ -1,10 +1,10 @@
 name: fork_prefix_spawn_inherits
 description: |
-  **What**: Spawn a child agent with inherit_prefix and verify the full capture-resolve-probe cycle via the CLI path.
-  **Tests**: Fork-prefix pipeline for canonical agent spawn — parent captures prefix on turn_completed, child resolves via InMemoryPrefixStore.
-  **Why**: Regression for the CLI-exercisable fork-prefix path (distinct from server-side DelegationEngine), ensuring prefix inheritance works end-to-end.
-  **Pass means**: The child resolved the parent's prefix, produced the expected reply, and the parent surfaced it in the final answer.
-  **Fail means**: Prefix capture missed turn_completed, InMemoryPrefixStore lookup failed, or canonical agent spawn dispatch is broken.
+  **What**: Request required parent-prefix inheritance through the CLI's Server-owned agent admission.
+  **Tests**: The Server captures and resolves the parent prefix before launching the child; the CLI records canonical execution facts.
+  **Why**: A required inherited prefix must work without a second CLI-local execution or prefix store.
+  **Pass means**: One child launches with required inheritance, reaches a matching terminal result, and the parent adopts its exact reply.
+  **Fail means**: Required-prefix admission rejects, child execution fails, or the parent reports an unadopted result.
 prompt: |
   Use the `agent` tool with:
     action: "spawn"

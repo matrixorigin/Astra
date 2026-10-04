@@ -2273,8 +2273,13 @@ async fn render_agent_fanout_results(
         .await
         .unwrap_or(group);
     let summary = updated.summary();
-    let all_slots_delivered =
-        read_options.slot_index.is_none() && complete_deliverables == summary.target_count;
+    // An explicit slot read can cover the entire group too. Such a read
+    // must not claim full delivery for a partial byte window or slot subset.
+    let all_slots_delivered = complete_deliverables == summary.target_count
+        && (read_options.slot_index.is_none()
+            || results
+                .iter()
+                .all(|item| item.get("result_truncated") == Some(&Value::Bool(false))));
     let incomplete_slot_count = summary.target_count.saturating_sub(complete_deliverables);
     let work_status = if summary.active == 0 && incomplete_result_count > 0 {
         WorkUnitStatus::CompletedWithIssues
@@ -5972,7 +5977,7 @@ pub(crate) mod tests {
         );
         assert_eq!(value["delivery"], "parent_owned_concurrent");
 
-        use crate::turn::agentic_loop::execution_phase::fanout_start_receipt_superseded;
+        use crate::turn::agentic_loop::execution_phase::fanout_nonterminal_receipt_superseded;
         use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
         let mut state = crate::turn::agentic_loop::host::tests::make_state();
         state.current_run_id = Some(ctx.run_id.clone());
@@ -5984,7 +5989,7 @@ pub(crate) mod tests {
             result_full: Some(value.to_string()),
             ..Default::default()
         };
-        assert!(!fanout_start_receipt_superseded(&state, &started));
+        assert!(!fanout_nonterminal_receipt_superseded(&state, &started));
 
         let result = handle_agent_fanout_tool(
             &json!({"action": "get_results", "group_id": "review-structured"}),
@@ -6007,19 +6012,19 @@ pub(crate) mod tests {
             result_full: Some(result.to_string()),
             ..Default::default()
         });
-        assert!(fanout_start_receipt_superseded(&state, &started));
+        assert!(fanout_nonterminal_receipt_superseded(&state, &started));
         let window = handle_agent_fanout_tool(
             &json!({"action":"get_results","group_id":"review-structured","slot_index":0}),
             Some(&ctx),
         )
         .await;
         state.stall.tool_call_records[0].result_full = Some(window);
-        assert!(!fanout_start_receipt_superseded(&state, &started));
+        assert!(fanout_nonterminal_receipt_superseded(&state, &started));
         state.stall.tool_call_records[0].result_full = Some(result.to_string());
         let mut wrong_identity = result.clone();
         wrong_identity["results"][0]["run_id"] = json!("unrelated-run");
         state.stall.tool_call_records[0].result_full = Some(wrong_identity.to_string());
-        assert!(!fanout_start_receipt_superseded(&state, &started));
+        assert!(!fanout_nonterminal_receipt_superseded(&state, &started));
         state.stall.tool_call_records.clear();
         let completion = crate::orchestration::spawner::DirectChildCompletion {
             agent_id: result["results"][0]["agent_id"].as_str().unwrap().into(),
@@ -6041,15 +6046,15 @@ pub(crate) mod tests {
                 "children": [completion],
             }),
         );
-        assert!(!fanout_start_receipt_superseded(&state, &started));
+        assert!(!fanout_nonterminal_receipt_superseded(&state, &started));
         state.lease_volatile_pending().unwrap();
         state.commit_volatile_attempt_lease();
-        assert!(fanout_start_receipt_superseded(&state, &started));
+        assert!(fanout_nonterminal_receipt_superseded(&state, &started));
         state.lease_volatile_pending().unwrap();
         state.commit_volatile_attempt_lease();
-        assert!(fanout_start_receipt_superseded(&state, &started));
+        assert!(fanout_nonterminal_receipt_superseded(&state, &started));
         state.volatile_pending[0].payload["children"][0]["run_id"] = json!("unrelated-run");
-        assert!(!fanout_start_receipt_superseded(&state, &started));
+        assert!(!fanout_nonterminal_receipt_superseded(&state, &started));
     }
 
     #[tokio::test]
@@ -7134,6 +7139,47 @@ pub(crate) mod tests {
             .expect("an unaligned caller offset must advance, never rewind");
         assert_eq!(inside_scalar.start, 4);
         assert!(inside_scalar.end > inside_scalar.start);
+    }
+
+    #[tokio::test]
+    async fn fanout_slot_read_claims_delivery_only_for_complete_group_coverage() {
+        use astra_turn_core::orchestration::agent_result_wire::agent_fanout_results_delivered;
+        for target_count in [1, 2] {
+            let spawner = test_spawner(Arc::new(FixedOutputExecutor {
+                output: "complete".into(),
+            }));
+            let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+            let start = handle_agent_fanout_tool(
+                &json!({
+                    "action": "start", "group_id": "coverage", "target_count": target_count,
+                    "slots": (0..target_count).map(|_| json!({
+                        "description": "Observe evidence", "prompt": "Return evidence"
+                    })).collect::<Vec<_>>()
+                }),
+                Some(&ctx),
+            )
+            .await;
+            let collected = collect_fanout_start(&start, &ctx).await;
+            assert_eq!(collected["status"], "completed");
+            for (offset, max_bytes, complete_window) in
+                [(0, 32, true), (0, 4, false), (4, 32, false)]
+            {
+                let result = handle_agent_fanout_tool(
+                    &json!({"action": "get_results", "group_id": "coverage",
+                        "slot_index": 0, "offset": offset, "max_bytes": max_bytes}),
+                    Some(&ctx),
+                )
+                .await;
+                let value: Value = serde_json::from_str(&result).unwrap();
+                let expected = target_count == 1 && complete_window;
+                assert_eq!(
+                    value["provenance"]["all_slots_delivered"], expected,
+                    "{value}"
+                );
+                assert_eq!(agent_fanout_results_delivered(&value), expected, "{value}");
+                assert_eq!(value["work_unit_observation"]["mode"], "historical");
+            }
+        }
     }
 
     #[tokio::test]

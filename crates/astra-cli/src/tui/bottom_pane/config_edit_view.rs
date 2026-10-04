@@ -1076,13 +1076,10 @@ enum SavePromptOutcome {
     BackToEdit,
 }
 
-/// Resolve scope labels. User path uses the conventional `~/.astra/...`
-/// because home is stable across shell cwds; project path is resolved
-/// against the CURRENT working directory so the user sees the real
-/// filename, not the `./` sugar that hid the actual destination.
+/// Show the same resolved paths used by configuration loading and saving.
 fn user_path_label() -> String {
-    dirs::home_dir()
-        .map(|h| h.join(".astra/config/runtime.toml").display().to_string())
+    astra_config::runtime_config::user_runtime_config_path()
+        .map(|path| path.display().to_string())
         .unwrap_or_else(|| "~/.astra/config/runtime.toml".to_string())
 }
 

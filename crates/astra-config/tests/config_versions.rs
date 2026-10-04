@@ -64,7 +64,7 @@ fn different_content_produces_different_id() {
     let (_dir, store) = tmp_store();
     let a = RuntimeConfig::default();
     let mut b = RuntimeConfig::default();
-    b.token_budget.max_turn_input_tokens = a.token_budget.max_turn_input_tokens + 1;
+    b.memory.max_memory_tokens = a.memory.max_memory_tokens + 1;
 
     let id_a = store.put(&a, PutMetadata::default()).unwrap();
     let id_b = store.put(&b, PutMetadata::default()).unwrap();
@@ -148,11 +148,11 @@ fn custom_root_places_blobs_under_that_root() {
 fn get_by_id_returns_the_toml_bytes_that_were_put() {
     let (_dir, store) = tmp_store();
     let mut cfg = RuntimeConfig::default();
-    cfg.token_budget.max_turn_input_tokens = 500_000;
+    cfg.memory.max_memory_tokens = 500_000;
     let id = store.put(&cfg, PutMetadata::default()).unwrap();
     let toml = store.get_toml(&id).expect("roundtrip").expect("found");
     assert!(
-        toml.contains("max_turn_input_tokens"),
+        toml.contains("max_memory_tokens"),
         "TOML must carry the field name: {toml}"
     );
     assert!(
@@ -162,8 +162,8 @@ fn get_by_id_returns_the_toml_bytes_that_were_put() {
     // And reparses to the same config.
     let parsed: RuntimeConfig = toml::from_str(&toml).expect("reparse");
     assert_eq!(
-        parsed.token_budget.max_turn_input_tokens,
-        cfg.token_budget.max_turn_input_tokens
+        parsed.memory.max_memory_tokens,
+        cfg.memory.max_memory_tokens
     );
 }
 
@@ -183,9 +183,9 @@ fn list_returns_versions_in_newest_first_order() {
     let mut a = RuntimeConfig::default();
     let mut b = RuntimeConfig::default();
     let mut c = RuntimeConfig::default();
-    a.token_budget.max_turn_input_tokens = 100_000;
-    b.token_budget.max_turn_input_tokens = 200_000;
-    c.token_budget.max_turn_input_tokens = 300_000;
+    a.memory.max_memory_tokens = 100_000;
+    b.memory.max_memory_tokens = 200_000;
+    c.memory.max_memory_tokens = 300_000;
 
     let id_a = store.put(&a, PutMetadata::default()).unwrap();
     // Sleep 2ms so timestamps truly differ; file mtime granularity on
@@ -284,7 +284,7 @@ fn put_waits_for_exclusive_index_lock_before_appending() {
     let handle = std::thread::spawn(move || {
         let store = LocalFileStore::new(root);
         let mut cfg = RuntimeConfig::default();
-        cfg.token_budget.max_turn_input_tokens += 42;
+        cfg.memory.max_memory_tokens += 42;
         started_tx.send(()).expect("send started");
         let result = store.put(&cfg, PutMetadata::default());
         tx.send(result).expect("send result");

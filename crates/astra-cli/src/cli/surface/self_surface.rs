@@ -4,7 +4,7 @@ use crate::cli::self_command::{
 use astra_config::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::ConstraintSet;
 use astra_services::self_surface::{
-    BudgetConfig, LoadedSelfSurfaceArtifacts, LocalSelfSurfaceService, PersistentSelfSnapshot,
+    LoadedSelfSurfaceArtifacts, LocalSelfSurfaceService, PersistentSelfSnapshot,
     SelfSurfaceArtifactLoader, SelfSurfaceCheck, SelfSurfaceDimension, SelfSurfaceResponse,
     SelfSurfaceRuntimeSupport, SelfSurfaceService, SurfaceConstraints,
 };
@@ -45,12 +45,9 @@ impl SelfSurfaceRuntimeSupport for CliSelfSurfaceRuntimeSupport {
         }
     }
 
-    fn budget_config(&self, tuned_config_json: Option<&str>) -> Result<BudgetConfig, String> {
+    fn compression_threshold(&self, tuned_config_json: Option<&str>) -> Result<f64, String> {
         let config = runtime_config_from_json(tuned_config_json)?;
-        Ok(BudgetConfig {
-            compression_threshold: config.compression.compression_threshold,
-            max_turn_input_tokens: config.token_budget.max_turn_input_tokens,
-        })
+        Ok(config.compression.compression_threshold)
     }
 
     fn runtime_checks(&self, tuned_config_json: Option<&str>) -> Vec<SelfSurfaceCheck> {
@@ -63,14 +60,6 @@ impl SelfSurfaceRuntimeSupport for CliSelfSurfaceRuntimeSupport {
             })
             .collect()
     }
-}
-
-pub(crate) async fn render_surface_for_session(
-    session_id: &str,
-    surface: &str,
-    journal_limit: usize,
-) -> Result<String, String> {
-    render_surface_for_session_with_profile(session_id, surface, journal_limit, None).await
 }
 
 pub(crate) async fn render_surface_for_session_with_profile(

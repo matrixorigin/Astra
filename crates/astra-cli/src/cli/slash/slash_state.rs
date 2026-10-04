@@ -47,7 +47,7 @@ pub(crate) async fn bind_initial_session(
         return Err("initial session identity requires a pristine sessionless runtime".to_string());
     }
     let (config, version) =
-        crate::cli::session::session_startup::prepare_session_runtime_config(state, None, None)?;
+        crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
     let session_id = create_server_session_identity(api, token).await?;
     state.set_session_id(session_id.clone());
     crate::cli::session::session_startup::apply_session_runtime_config(state, config, version);
@@ -62,7 +62,7 @@ pub(crate) async fn start_fresh_session(
     state: &mut SessionState,
 ) -> Result<String, String> {
     let (config, version) =
-        crate::cli::session::session_startup::prepare_session_runtime_config(state, None, None)?;
+        crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
     let session_id = create_server_session_identity(api, token).await?;
     state.prepare_for_session_rebind().await;
     state.reset_for_new_session();

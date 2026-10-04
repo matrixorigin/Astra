@@ -538,10 +538,8 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Prefer this over model-name heuristics when the resolved provider is known.
     pub(crate) provider: Option<&'a str>,
     pub(crate) explain: ExplainMode,
-    /// Per-turn snapshot of the local derived Explain Analyze format. It is
-    /// frozen before streaming so a mid-turn config edit cannot rewrite the
-    /// artifact representation after the fact.
-    pub(crate) explain_report_format: astra_config::runtime_config::ExplainReportFormat,
+    /// Configuration selected by the entrypoint and frozen for this execution.
+    pub(crate) runtime_config: Arc<astra_config::RuntimeConfig>,
     pub(crate) render_md: bool,
     pub(crate) history: &'a [(String, String)],
     pub(crate) perm_manager: &'a mut PermissionManager,
@@ -573,9 +571,6 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) is_plan_subtask: bool,
     /// Sent on `/chat/stream` JSON so cloud can classify the turn like local `is_plan_subtask`.
     pub(crate) plan_subtask_id: Option<&'a str>,
-    /// Optional delegation engine for multi-agent coordination with verification gates.
-    pub(crate) delegation_engine:
-        Option<Arc<astra_runtime::server::delegation::engine::DelegationEngine>>,
     /// Optional cancellation token for interrupting SSE streaming mid-flight.
     pub(crate) cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     /// Original-deadline-backed wall-clock budget source. Each physical Server
@@ -639,8 +634,6 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Optional logical root agent ID for this top-level turn when agent spawning is enabled.
     pub(crate) root_agent_id: Option<&'a str>,
-    /// Optional persistent top-level mailbox slot for cross-turn reply handling.
-    pub(crate) root_mailbox_slot: Option<&'a mut Option<astra_messaging::router::AgentMailbox>>,
     /// Optional observability hub for profiles, traces, and feedback signals.
     pub(crate) observability_hub: Option<Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Optional observability session for per-session tracking.
@@ -729,19 +722,15 @@ pub(crate) struct BasicCliChatContext<'a> {
     pub model: Option<&'a str>,
     pub provider: Option<&'a str>,
     pub explain: ExplainMode,
-    pub explain_report_format: astra_config::runtime_config::ExplainReportFormat,
+    pub runtime_config: Arc<astra_config::RuntimeConfig>,
     pub render_md: bool,
     pub verbose_mode: bool,
     pub render_policy: crate::cli::stream::stream_render::RenderPolicy,
     pub cli_context: Option<&'a CliContext>,
 
     pub unified_skill_registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
-    /// Optional agent spawner so `astra chat -m` (non-REPL one-shot)
-    /// can trigger `agent(action='spawn', ...)` just like the interactive
-    /// REPL does. When `None`, agent spawning returns "not available" —
-    /// the previous behavior before the fix. Callers that want the
-    /// fix set this via `initialize_multi_agent_runtime`-equivalent
-    /// bootstrap before constructing the context.
+    /// Optional local recovery projection for historical agent and fanout queries.
+    /// Server admission owns new child execution on every CLI surface.
     pub agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Optional logical root agent id when `agent_spawner` is set.
     /// Passed through to `sse_loop::mod` for `AgentActionContext`
@@ -799,7 +788,7 @@ impl<'a> ChatTurnParams<'a> {
             model: ctx.model,
             provider: ctx.provider,
             explain: ctx.explain,
-            explain_report_format: ctx.explain_report_format,
+            runtime_config: ctx.runtime_config.clone(),
             render_md: ctx.render_md,
             history: &[],
             perm_manager,
@@ -818,7 +807,6 @@ impl<'a> ChatTurnParams<'a> {
             unified_skill_registry: ctx.unified_skill_registry,
             is_plan_subtask: false,
             plan_subtask_id: None,
-            delegation_engine: None,
             cancel_token: None,
             execution_time_budget: None,
             run_control: None,
@@ -838,7 +826,6 @@ impl<'a> ChatTurnParams<'a> {
             messaging_metrics: None,
             agent_spawner: ctx.agent_spawner.clone(),
             root_agent_id: ctx.root_agent_id,
-            root_mailbox_slot: None,
             observability_hub: None,
             observability_session: None,
             file_journal: None,

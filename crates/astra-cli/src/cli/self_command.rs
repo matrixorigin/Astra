@@ -100,7 +100,7 @@ pub(crate) async fn execute_self_command(
 ) -> Result<String, String> {
     match cmd {
         SelfCmd::Snapshot(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "snapshot",
                 20,
@@ -133,7 +133,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Profile(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "profile",
                 20,
@@ -142,7 +142,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Goal(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "goal",
                 20,
@@ -151,7 +151,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Trace(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "trace",
                 20,
@@ -160,7 +160,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Budget(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "budget",
                 20,
@@ -169,7 +169,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Signals(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "signals",
                 20,
@@ -178,7 +178,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Health(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "health",
                 20,
@@ -187,7 +187,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Journal(SelfJournalArgs { session_id, limit }) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(session_id.as_deref(), profile).await?,
                 "journal",
                 *limit,
@@ -196,7 +196,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Verify(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "verify",
                 20,
@@ -213,48 +213,6 @@ pub(crate) async fn execute_self_command(
             to_json(&persist_config_mutation(&session_id, args)?)
         }
     }
-}
-
-pub(crate) async fn render_surface_for_session(
-    session_id: &str,
-    surface: &str,
-    journal_limit: usize,
-) -> Result<String, String> {
-    render_surface_for_session_with_profile(session_id, surface, journal_limit, None).await
-}
-
-pub(crate) async fn render_surface_for_session_with_profile(
-    session_id: &str,
-    surface: &str,
-    journal_limit: usize,
-    profile: Option<&str>,
-) -> Result<String, String> {
-    self_surface::render_surface_for_session_with_profile(
-        session_id,
-        surface,
-        journal_limit,
-        profile,
-    )
-    .await
-}
-
-pub(crate) async fn render_reflect_surface_for_session(
-    session_id: &str,
-    journal_limit: usize,
-    topic: Option<&str>,
-    facet: Option<&str>,
-    question: Option<&str>,
-) -> Result<String, String> {
-    let request = ReflectRequest::from_observation_params(
-        topic,
-        facet,
-        None,
-        None,
-        i32::try_from(journal_limit).unwrap_or(i32::MAX),
-        question.unwrap_or(""),
-    );
-    let bounded_limit = usize::try_from(request.last_n).unwrap_or(20);
-    render_reflect_surface_for_session_with_profile(session_id, bounded_limit, request, None).await
 }
 
 pub(crate) async fn try_render_reflect_surface_for_session_with_profile(
@@ -990,8 +948,10 @@ fn preview_config_mutation_value(
 ) -> Result<MutatePreviewResponse, String> {
     let workspace = session_workspace::read_workspace(session_id)
         .map_err(|e| format!("workspace metadata missing for session {session_id}: {e}"))?;
-    let base_config = effective_runtime_config(Some(&workspace))?;
-    prepare_config_mutation(session_id, path, new_value, &base_config).map(|(preview, _)| preview)
+    let baseline = RuntimeConfig::load();
+    let base_config = effective_runtime_config(Some(&workspace), &baseline)?;
+    prepare_config_mutation(session_id, path, new_value, &base_config, &baseline)
+        .map(|(preview, _)| preview)
 }
 
 fn prepare_config_mutation(
@@ -999,6 +959,7 @@ fn prepare_config_mutation(
     path: &str,
     new_value: serde_json::Value,
     base_config: &RuntimeConfig,
+    baseline: &RuntimeConfig,
 ) -> Result<(MutatePreviewResponse, RuntimeConfig), String> {
     let base_json = serde_json::to_value(base_config).map_err(|e| e.to_string())?;
     let mut value = base_json.clone();
@@ -1008,7 +969,7 @@ fn prepare_config_mutation(
         .map_err(|e| format!("mutation produced invalid RuntimeConfig at '{}': {e}", path))?;
     let candidate_json = serde_json::to_string(&candidate_config).map_err(|e| e.to_string())?;
     let candidate_checks = verify_runtime_config(Some(&candidate_json));
-    let baseline_json = serde_json::to_value(RuntimeConfig::load()).map_err(|e| e.to_string())?;
+    let baseline_json = serde_json::to_value(baseline).map_err(|e| e.to_string())?;
     Ok((
         MutatePreviewResponse {
             session_id: session_id.to_string(),
@@ -1029,6 +990,7 @@ pub(crate) fn prepare_governed_config_mutation(
     path: &str,
     new_value: serde_json::Value,
     base_config: &RuntimeConfig,
+    baseline: &RuntimeConfig,
     force: bool,
     drift_ceiling: f64,
 ) -> Result<(MutatePreviewResponse, RuntimeConfig, Option<f64>), serde_json::Value> {
@@ -1051,7 +1013,7 @@ pub(crate) fn prepare_governed_config_mutation(
     let base_value = serde_json::to_value(base_config).map_err(
         |error| serde_json::json!({"error": "invalid_config_mutation", "detail": error.to_string()}),
     )?;
-    let baseline = serde_json::to_value(RuntimeConfig::load()).map_err(
+    let baseline = serde_json::to_value(baseline).map_err(
         |error| serde_json::json!({"error": "invalid_config_mutation", "detail": error.to_string()}),
     )?;
     let preview = MutatePreviewResponse {
@@ -1085,16 +1047,30 @@ fn persist_config_mutation_value(
     path: &str,
     new_value: serde_json::Value,
 ) -> Result<MutateApplyResponse, String> {
+    let baseline = RuntimeConfig::load();
     let outcome = session_workspace::update_existing_workspace_config(
         session_id,
         |workspace| {
-            let base_config = effective_runtime_config(Some(workspace))
+            let base_config = effective_runtime_config(Some(workspace), &baseline)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-            let (preview, candidate_config) =
-                prepare_config_mutation(session_id, path, new_value.clone(), &base_config)
-                    .map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
-                    })?;
+            let (preview, candidate_config) = prepare_config_mutation(
+                session_id,
+                path,
+                new_value.clone(),
+                &base_config,
+                &baseline,
+            )
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            if !preview.valid {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    serde_json::json!({
+                        "error": "invalid_runtime_config",
+                        "checks": preview.checks,
+                    })
+                    .to_string(),
+                ));
+            }
             let candidate_json =
                 serde_json::to_string(&candidate_config).map_err(std::io::Error::other)?;
             workspace.tuned_config_json = if preview.would_clear_override {
@@ -1129,7 +1105,7 @@ fn persist_config_mutation_value(
         } => (
             value.0,
             revision,
-            effective_runtime_config(Some(&workspace))?,
+            effective_runtime_config(Some(&workspace), &baseline)?,
             postcommit,
         ),
         session_workspace::WorkspaceConfigMutationOutcome::Rejected(()) => {
@@ -1151,14 +1127,6 @@ fn persist_config_mutation_value(
     })
 }
 
-pub(crate) fn persist_config_override(
-    session_id: &str,
-    path: &str,
-    new_value: serde_json::Value,
-) -> Result<MutateApplyResponse, String> {
-    persist_config_mutation_value(session_id, path, new_value)
-}
-
 pub(crate) fn persist_governed_config_override(
     session_id: &str,
     path: &str,
@@ -1166,16 +1134,18 @@ pub(crate) fn persist_governed_config_override(
     force: bool,
     drift_ceiling: f64,
 ) -> Result<(MutateApplyResponse, Option<f64>), GovernedConfigMutationError> {
+    let baseline = RuntimeConfig::load();
     let outcome = session_workspace::update_existing_workspace_config(
         session_id,
         |workspace| {
-            let base_config = effective_runtime_config(Some(workspace))
+            let base_config = effective_runtime_config(Some(workspace), &baseline)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
             let prepared = prepare_governed_config_mutation(
                 session_id,
                 path,
                 new_value.clone(),
                 &base_config,
+                &baseline,
                 force,
                 drift_ceiling,
             );
@@ -1230,7 +1200,7 @@ pub(crate) fn persist_governed_config_override(
                 .map(|workspace| workspace.config_mutation_revision);
             let observed_config = observed
                 .as_deref()
-                .and_then(|workspace| effective_runtime_config(Some(workspace)).ok());
+                .and_then(|workspace| effective_runtime_config(Some(workspace), &baseline).ok());
             let retry_revision = session_workspace::exact_workspace_config_owner_revision(
                 revision,
                 &value.4,
@@ -1564,10 +1534,11 @@ fn restored_recent_turn_previews(
 
 fn effective_runtime_config(
     workspace: Option<&WorkspaceMetadata>,
+    baseline: &RuntimeConfig,
 ) -> Result<RuntimeConfig, String> {
     match workspace.and_then(|ws| ws.tuned_config_json.as_deref()) {
         Some(json) => serde_json::from_str(json).map_err(|e| e.to_string()),
-        None => Ok(RuntimeConfig::load()),
+        None => Ok(baseline.clone()),
     }
 }
 
@@ -1914,8 +1885,7 @@ mod tests {
     use super::{
         EventPreview, SourcePolicy, analysis_view_recent_event_previews, build_reflect_response,
         cli_provider_visible_tool_names, event_preview_has_adverse_signal, event_preview_summary,
-        execute_self_command, persist_config_override,
-        render_reflect_surface_for_session_with_profile, resolve_session_id,
+        execute_self_command, render_reflect_surface_for_session_with_profile, resolve_session_id,
         restored_recent_turn_previews, session_agent_delivery_summary, verify_runtime_config,
     };
     use crate::cli::cli_config::cli_args::{
@@ -2129,9 +2099,9 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn config_override_preserves_background_task_projection() {
+    async fn config_override_preserves_background_task_projection() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-config-preserves-background";
@@ -2153,16 +2123,102 @@ mod tests {
             .retrieval_top_k;
         let replacement = if current == 5 { 6 } else { 5 };
 
-        persist_config_override(
-            session_id,
-            "memory.retrieval_top_k",
-            serde_json::json!(replacement),
+        execute_self_command(
+            &SelfCmd::Mutate(SelfMutateCmd::Apply(SelfMutateConfigArgs {
+                session_id: Some(session_id.into()),
+                path: "memory.retrieval_top_k".into(),
+                value: replacement.to_string(),
+            })),
+            None,
         )
+        .await
         .unwrap();
 
         let persisted = session_workspace::read_workspace(session_id).unwrap();
         assert_eq!(persisted.background_shell_tasks.len(), 1);
         assert!(persisted.tuned_config_json.is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mutate_apply_rejects_invalid_candidate_without_persistence() {
+        let temp = tempfile::tempdir().unwrap();
+        let _journals = JournalDirGuard::new(temp.path().join("sessions"));
+        let _root = EnvGuard::set("ASTRA_LOCAL_STATE_ROOT", temp.path().to_str().unwrap());
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        let session_id = "self-invalid-config";
+        session_workspace::write_workspace(&WorkspaceMetadata::new(session_id, "gpt-5")).unwrap();
+        let writer = session_journal::JournalWriter::new(session_id).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(session_id),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        let workspace = session_workspace::workspace_file_path(session_id).unwrap();
+        let journal = session_journal::journal_file_path(session_id);
+        let workspace_before = std::fs::read(&workspace).unwrap();
+        let journal_before = std::fs::read(&journal).unwrap();
+        let args = || SelfMutateConfigArgs {
+            session_id: Some(session_id.into()),
+            path: "compression.compression_threshold".into(),
+            value: "1.2".into(),
+        };
+        let preview = execute_self_command(&SelfCmd::Mutate(SelfMutateCmd::Preview(args())), None)
+            .await
+            .unwrap();
+        let preview: serde_json::Value = serde_json::from_str(&preview).unwrap();
+        assert_eq!(preview["valid"], false);
+        assert!(
+            preview["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["name"] == "compression_bounds" && check["ok"] == false)
+        );
+        assert_eq!(std::fs::read(&workspace).unwrap(), workspace_before);
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+        let error = execute_self_command(&SelfCmd::Mutate(SelfMutateCmd::Apply(args())), None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("compression_bounds"), "{error}");
+        assert_eq!(std::fs::read(workspace).unwrap(), workspace_before);
+        assert_eq!(std::fs::read(journal).unwrap(), journal_before);
+
+        let mut invalid = astra_config::RuntimeConfig::load();
+        invalid.compression.compression_threshold = 1.2;
+        session_workspace::update_existing_workspace_config(
+            session_id,
+            |workspace| {
+                workspace.tuned_config_json = Some(serde_json::to_string(&invalid).unwrap());
+                Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue(()))
+            },
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        let seeded = session_workspace::read_workspace(session_id).unwrap();
+        let saved: astra_config::RuntimeConfig =
+            serde_json::from_str(seeded.tuned_config_json.as_deref().unwrap()).unwrap();
+        assert_eq!(saved.compression.compression_threshold, 1.2);
+        let mut repair = args();
+        repair.value = "0.8".into();
+        execute_self_command(&SelfCmd::Mutate(SelfMutateCmd::Apply(repair)), None)
+            .await
+            .unwrap();
+        let repaired = session_workspace::read_workspace(session_id).unwrap();
+        assert_eq!(
+            repaired.config_mutation_revision,
+            seeded.config_mutation_revision + 1
+        );
+        let config = repaired
+            .tuned_config_json
+            .as_deref()
+            .map(|json| serde_json::from_str::<astra_config::RuntimeConfig>(json).unwrap())
+            .unwrap_or_else(astra_config::RuntimeConfig::load);
+        assert_eq!(config.compression.compression_threshold, 0.8);
     }
 
     #[tokio::test]
@@ -2280,18 +2336,6 @@ mod tests {
             ))
             .mount(server)
             .await;
-    }
-
-    #[test]
-    fn verify_runtime_config_flags_invalid_bounds() {
-        let checks =
-            verify_runtime_config(Some(r#"{"compression":{"compression_threshold":1.2}}"#));
-
-        assert!(
-            checks
-                .iter()
-                .any(|check| { check.name == "compression_bounds" && !check.ok })
-        );
     }
 
     #[test]

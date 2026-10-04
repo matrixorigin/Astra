@@ -301,13 +301,12 @@ pub use sandbox::{
     UnconfiguredSandboxService,
 };
 pub use self_surface::{
-    AcceptanceSurface, BudgetConfig, BudgetState, BudgetSurface, CapabilitySurface,
-    EnvironmentSurface, EventPreview, EvolutionRecord, EvolutionSurface, GoalSurface,
-    HealthSurface, JournalSurface, LocalSelfSurfaceService, NoopSelfSurfaceRuntimeSupport,
-    PersistentSelfSnapshot, ProfileSurface, RunSurface, RunTotals, SelfSurfaceCheck,
-    SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceRuntimeSupport, SelfSurfaceService,
-    SignalsSurface, StepRecord, SurfaceConstraints, ToolCallView, ToolFailureView, ToolHealthView,
-    TraceSurface, VerificationSurface,
+    AcceptanceSurface, BudgetState, BudgetSurface, CapabilitySurface, EnvironmentSurface,
+    EventPreview, EvolutionRecord, EvolutionSurface, GoalSurface, HealthSurface, JournalSurface,
+    LocalSelfSurfaceService, NoopSelfSurfaceRuntimeSupport, PersistentSelfSnapshot, ProfileSurface,
+    RunSurface, RunTotals, SelfSurfaceCheck, SelfSurfaceDimension, SelfSurfaceResponse,
+    SelfSurfaceRuntimeSupport, SelfSurfaceService, SignalsSurface, StepRecord, SurfaceConstraints,
+    ToolCallView, ToolFailureView, ToolHealthView, TraceSurface, VerificationSurface,
 };
 pub use service_error::{ServiceError, ServiceErrorKind, ServiceResult};
 pub use session_artifact_store::{

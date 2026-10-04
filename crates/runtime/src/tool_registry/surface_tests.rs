@@ -61,20 +61,33 @@ fn schema_name_set() -> std::collections::BTreeSet<String> {
     names(&catalog_schemas()).into_iter().collect()
 }
 
-fn assert_no_resident_property_descriptions(value: &Value, path: &str) {
+fn assert_only_producer_parameter_descriptions(value: &Value, canonical: &Value, path: &str) {
     match value {
         Value::Object(object) => {
-            assert!(
-                !object.contains_key("description"),
-                "resident property {path} must not carry catalog prose"
-            );
+            if let Some(description) = object.get("description").and_then(Value::as_str) {
+                assert_eq!(
+                    canonical
+                        .get("x-astra-discovery-summary")
+                        .and_then(Value::as_str),
+                    Some(description),
+                    "resident property {path} must only carry producer-owned guidance"
+                );
+            }
             for (key, child) in object {
-                assert_no_resident_property_descriptions(child, &format!("{path}.{key}"));
+                assert_only_producer_parameter_descriptions(
+                    child,
+                    &canonical[key],
+                    &format!("{path}.{key}"),
+                );
             }
         }
         Value::Array(values) => {
             for (index, child) in values.iter().enumerate() {
-                assert_no_resident_property_descriptions(child, &format!("{path}[{index}]"));
+                assert_only_producer_parameter_descriptions(
+                    child,
+                    &canonical[index],
+                    &format!("{path}[{index}]"),
+                );
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
@@ -522,6 +535,16 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
 
     let agent = find(&resident, "agent");
     let agent_params = &agent["function"]["parameters"];
+    let profile = agent_params["properties"]["agent_type"]["description"]
+        .as_str()
+        .unwrap();
+    for constraint in [
+        "Exact directory ID",
+        "explore=no shell(default)",
+        "task requests shell",
+    ] {
+        assert!(profile.contains(constraint), "{profile}");
+    }
     assert!(
         agent["function"]["description"]
             .as_str()
@@ -886,10 +909,15 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
 
 #[test]
 fn resident_schemas_keep_structure_but_drop_catalog_prose() {
-    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    let canonical = catalog_schemas();
+    let surface = ToolSurface::build(canonical.clone(), &ToolSurfaceConfig::default(), &[]);
     for schema in surface.always_load_schemas() {
         let name = tool_schema_name(&schema).expect("resident schema name");
         let function = schema["function"].as_object().expect("function object");
+        let canonical_parameters = &canonical
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some(name))
+            .unwrap()["function"]["parameters"]["properties"];
         assert_eq!(
             function["parameters"]["additionalProperties"], false,
             "resident schema {name} must be an exact closed provider contract"
@@ -913,7 +941,11 @@ fn resident_schemas_keep_structure_but_drop_catalog_prose() {
                     .unwrap()
                     .remove("description");
             }
-            assert_no_resident_property_descriptions(&compact_property, &format!("{name}.{field}"));
+            assert_only_producer_parameter_descriptions(
+                &compact_property,
+                &canonical_parameters[field],
+                &format!("{name}.{field}"),
+            );
         }
     }
 
