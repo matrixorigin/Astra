@@ -9235,14 +9235,6 @@ impl AgenticRunLifecycleService {
             self.validate_runtime_process_authorization_executor(request)
                 .await?;
         }
-        if !request.has_agent_binding_runtime() && request.runtime_skill_binding.is_none() {
-            let skill_policy = request_constraints.skill_surfacing_policy();
-            if skill_policy.requires_catalog_validation() {
-                let bundle = build_server_skill_resolver(self.skill_service.clone(), user_id).await;
-                apply_normalized_skill_allowlist(bundle.resolver, &request_constraints)
-                    .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
-            }
-        }
         Ok(request_constraints)
     }
 
@@ -16321,6 +16313,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let work_runtime_binding = self
             .validate_work_runtime_binding(&user_id, &session_id, &request)
             .await?;
+        let runtime_capabilities = self
+            .prepare_runtime_capabilities(&user_id, &request, &request_constraints)
+            .await?;
         self.bind_execution_selection(
             &user_id,
             &session_id,
@@ -16337,9 +16332,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 agent_binding_mode,
                 edge_context.has_tools(),
             );
-        let runtime_capabilities = self
-            .prepare_runtime_capabilities(&user_id, &request, &request_constraints)
-            .await?;
         let mut edge_profile =
             Self::edge_profile_with_skill_listing(&edge_context, &request_constraints);
         Self::apply_agent_binding_prompt_context(
@@ -17178,6 +17170,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let work_runtime_binding = self
             .validate_work_runtime_binding(&user_id, &session_id, &request)
             .await?;
+        let runtime_capabilities = self
+            .prepare_runtime_capabilities(&user_id, &request, &request_constraints)
+            .await?;
         self.bind_execution_selection(
             &user_id,
             &session_id,
@@ -17194,9 +17189,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 agent_binding_mode,
                 edge_context.has_tools(),
             );
-        let runtime_capabilities = self
-            .prepare_runtime_capabilities(&user_id, &request, &request_constraints)
-            .await?;
         let mut edge_profile =
             Self::edge_profile_with_skill_listing(&edge_context, &request_constraints);
         Self::apply_agent_binding_prompt_context(

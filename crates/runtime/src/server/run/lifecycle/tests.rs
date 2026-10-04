@@ -16438,6 +16438,22 @@ async fn native_edge_without_durable_coordinator_fails_closed_but_edge_ledger_is
         transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
         status: Some(astra_services::runs::ExecutorStatusRequest::Online),
     });
+    let mut invalid_skills = request.clone();
+    invalid_skills.allow_skills = Some(vec!["__missing_skill__".into()]);
+    for streaming in [false, true] {
+        let rejected = if streaming {
+            err(service
+                .stream_chat("owner-1".into(), invalid_skills.clone())
+                .await)
+        } else {
+            err(service
+                .create_run("owner-1".into(), invalid_skills.clone())
+                .await)
+        };
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+        assert!(rejected.1.0.detail.contains("allow_skills"));
+        assert!(service.runs.read().await.is_empty());
+    }
     let denied = service
         .bind_execution_selection("owner-1", "session-no-coordinator", &mut request, None)
         .await
@@ -18270,22 +18286,6 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
         "unrestricted request validation must not discover the full skill catalog"
     );
 
-    let mut validation_request = prepared_test_request("hello");
-    validation_request.allow_skills = Some(vec!["remote-db".to_string()]);
-    svc.validate_request_constraints("test-user", &validation_request)
-        .await
-        .expect("known skill allowlist should be validated against the catalog");
-    assert_eq!(
-        skill_service
-            .list_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "non-empty skill allowlist should perform exactly one catalog discovery"
-    );
-
-    skill_service
-        .list_calls
-        .store(0, std::sync::atomic::Ordering::SeqCst);
     let default_constraints = AgenticRunLifecycleService::try_request_constraints(&default_request)
         .expect("default request constraints");
     let default_capabilities = svc
@@ -18345,14 +18345,15 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
         "unfiltered server catalog should be available for conditional activation"
     );
 
-    let mut filtered_request = test_request("hello");
+    let mut filtered_request = prepared_test_request("hello");
     filtered_request.allow_skills = Some(vec!["remote-db".to_string()]);
     skill_service
         .list_calls
         .store(0, std::sync::atomic::Ordering::SeqCst);
-    let filtered_constraints =
-        AgenticRunLifecycleService::try_request_constraints(&filtered_request)
-            .expect("filtered request constraints");
+    let filtered_constraints = svc
+        .validate_request_constraints("test-user", &filtered_request)
+        .await
+        .expect("filtered request constraints");
     let filtered_capabilities = svc
         .prepare_runtime_capabilities("test-user", &filtered_request, &filtered_constraints)
         .await
@@ -18428,20 +18429,6 @@ async fn build_initial_state_includes_database_skill_provider_when_wired() {
         0,
         "build_initial_state should only use list_skills/get_skill on this mock"
     );
-}
-
-#[tokio::test]
-async fn create_run_rejects_unknown_request_skill_allowlist() {
-    let svc = test_service();
-    let mut request = test_request("hello");
-    request.allow_skills = Some(vec!["__missing_skill__".into()]);
-
-    let err = svc
-        .create_run("user-1".into(), request)
-        .await
-        .expect_err("unknown allow_skills entry should be rejected");
-    assert_eq!(err.0, StatusCode::BAD_REQUEST);
-    assert!(err.1.0.detail.contains("allow_skills"));
 }
 
 #[test]
