@@ -966,7 +966,7 @@ async fn reconcile_agent_result_with_durable_authority(
     let durable = match run_engine.load_run(user_id, &result.run_id).await {
         Ok(Some(durable)) => durable,
         Ok(None) => {
-            result.status = STATUS_FAILED.to_string();
+            result.status = STATUS_WAITING.to_string();
             result.output = None;
             result.error = Some(format!(
                 "{persistence_detail}; durable run {} is missing",
@@ -975,7 +975,7 @@ async fn reconcile_agent_result_with_durable_authority(
             return (result, None);
         }
         Err(load_error) => {
-            result.status = STATUS_FAILED.to_string();
+            result.status = STATUS_WAITING.to_string();
             result.output = None;
             result.error = Some(format!(
                 "{persistence_detail}; failed to load durable winner for run {}: {load_error}",
@@ -7375,6 +7375,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lost_child_receipt_preserves_unknown_durable_outcome() {
+        use crate::server::run::lifecycle::tests::FaultInjectedRunStateStore;
+
+        for read_fails in [false, true] {
+            for receipt_closed in [false, true] {
+                let (registry, _, tracker) = setup();
+                let store = FaultInjectedRunStateStore::new(&[], &[]);
+                let store = if read_fails {
+                    store.with_failed_load_run_call(1)
+                } else {
+                    store
+                };
+                let engine = Arc::new(RunEngine::new(Arc::new(store)));
+                let de = bind_test_engine(&DelegationEngine::with_executor(
+                    registry,
+                    engine,
+                    tracker,
+                    Arc::new(EchoExecutor),
+                ));
+                let parent = de.spawner.as_ref().unwrap().fanout_parent("parent");
+                let (sender, receipt) = tokio::sync::oneshot::channel();
+                if receipt_closed {
+                    drop(sender);
+                } else {
+                    sender
+                        .send((Err(("settlement panicked".into(), Some("panic"))), 0))
+                        .unwrap();
+                }
+                let result = de
+                    .collect_supervised_subrun(
+                        "worker".into(),
+                        "unknown-child".into(),
+                        Ok(receipt),
+                        parent,
+                        "u",
+                        "s",
+                    )
+                    .await;
+                assert_eq!(result.status, STATUS_WAITING);
+                assert!(result.is_unfinished());
+                assert!(result.output.is_none());
+                assert!(result.error.as_deref().unwrap().contains(if read_fails {
+                    "failed to load durable winner"
+                } else {
+                    "is missing"
+                }));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn fan_out_executes_with_custom_executor() {
         let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
 
@@ -10890,7 +10941,8 @@ mod tests {
         )
         .await
         .0;
-        assert_eq!(result.status, STATUS_FAILED);
+        assert_eq!(result.status, STATUS_WAITING);
+        assert!(result.is_unfinished());
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while transport.retained_inbox_count().await != 2 {

@@ -230,7 +230,9 @@ supervisor starts the returned future, and rechecks mutable generation,
 cancellation, and deadline authority at execution boundaries.
 Dynamic and precreated children share that task owner and panic cleanup. A
 settlement or projection panic releases local execution custody and wakes its
-parent without claiming an acknowledged durable terminal frontier.
+parent with a Waiting projection that retains its direct-child obligation.
+Only durable reconciliation may publish the winning terminal result; missing
+or unreadable durable state also remains unfinished.
 A failed preparation or model admission reports a rejected request with an
 explicit non-execution fact. CLI and Server carry that same fact into the
 execution journal; it remains observable as a blocked request and does not

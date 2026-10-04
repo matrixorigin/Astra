@@ -25790,4 +25790,4 @@ impl ServerSubRunExecutor {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -3611,6 +3611,14 @@ impl DynamicAgentSpawner {
                 state.metrics.tool_calls = run.total_tool_calls;
                 state.metrics.prompt_tokens = run.total_prompt_tokens;
                 state.metrics.completion_tokens = run.total_completion_tokens;
+                if state.status.is_terminal()
+                    && let Some(address) = state.messaging_address.take()
+                {
+                    // A locally yielded child retained its mailbox while the
+                    // durable outcome was unknown. The router owns retirement
+                    // eagerly and fences it to this exact lifetime.
+                    drop(self.mailbox_router.retire_terminal(address.lifetime()));
+                }
                 changed.push(state.clone());
             }
         }
@@ -7156,9 +7164,22 @@ impl DynamicAgentSpawner {
                         panic_payload_message(panic.as_ref())
                     );
                     // Execution has ended, but settlement may not have committed.
-                    // Release local custody without inventing a durable frontier.
+                    // Release local custody, retaining the parent's obligation
+                    // until durable reconciliation observes the actual winner.
+                    let handles = repair.background_abort_handles.write().await;
                     repair
-                        .finalize_background_agent(&id, Err((&error, Some("panic"))))
+                        .finalize_background_agent_with_handles(
+                            handles,
+                            &id,
+                            AgentStatus::Waiting {
+                                reason: "durable settlement reconciliation pending".into(),
+                            },
+                            "waiting",
+                            Some("panic"),
+                            None,
+                            None,
+                            Some(&error),
+                        )
                         .await;
                     (
                         (
@@ -23736,8 +23757,17 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn child_supervisor_recovers_settlement_and_projection_panics() {
-        for settlement_panics in [true, false] {
-            let spawner = DynamicAgentSpawner::new(mock_router());
+        for (settlement_panics, committed_before_panic, cancelled) in [
+            (true, false, false),
+            (false, false, true),
+            (false, true, false),
+        ] {
+            let transport = Arc::new(crate::messaging::InProcessTransport::new());
+            let router = Arc::new(AgentMailboxRouter::new(
+                transport.clone(),
+                Arc::new(DelegationTracker::new()),
+            ));
+            let spawner = DynamicAgentSpawner::new(router.clone());
             let mut child = completed_test_state(0);
             child.status = AgentStatus::Running {
                 activity: "executing".into(),
@@ -23749,6 +23779,28 @@ pub(crate) mod tests {
                 run_generation: 1,
                 last_event_idx: Some(0),
             });
+            let mut durable = durable_run(
+                &child.run_id,
+                1,
+                if cancelled {
+                    astra_core::STATUS_WAITING
+                } else {
+                    astra_core::STATUS_RUNNING
+                },
+            );
+            durable.parent_run_id = Some(child.parent_run_id.clone());
+            durable.run_generation = 1;
+            durable.last_event_idx = 0;
+            bind_durable_child_identity(&mut durable, child.agent_id.clone());
+            let mailbox = router
+                .register(
+                    AgentAddress::new(child.run_id.clone(), child.agent_id.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+            child.messaging_address = Some(mailbox.registration());
+            drop(mailbox);
             let parent = spawner.fanout_parent(&child.parent_run_id);
             spawner.adopt_precreated_child(child.clone()).await.unwrap();
             let (start, ready) = tokio::sync::oneshot::channel();
@@ -23776,6 +23828,30 @@ pub(crate) mod tests {
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            let mut winner = durable.clone();
+            winner.last_event_idx = 1;
+            winner.status = if cancelled {
+                astra_core::STATUS_CANCELLED
+            } else {
+                astra_core::STATUS_COMPLETED
+            }
+            .into();
+            winner.events.push(json!({
+                "event_type": "text_done", "data": { "full_text": "durable winner" }
+            }));
+            winner.events.push(json!({
+                "event_type": "run_finished",
+                "data": { "cancelled": cancelled, "cancellation_origin": "user" }
+            }));
+            spawner
+                .set_durable_agent_reconciler(Arc::new(StaticDurableReconciler {
+                    runs: vec![if committed_before_panic {
+                        winner.clone()
+                    } else {
+                        durable
+                    }],
+                }))
+                .await;
             start.send(()).unwrap();
             let (outcome, _) = tokio::time::timeout(Duration::from_secs(2), receipt)
                 .await
@@ -23788,16 +23864,69 @@ pub(crate) mod tests {
             assert!(spawner.active_agents.read().await.is_empty());
             assert!(spawner.background_abort_handles.read().await.is_empty());
             assert!(spawner.completion_notifiers.read().await.is_empty());
+            assert!(parent.take_completed_direct_children().is_empty());
+            assert!(parent.has_pending_direct_children());
+            let archived = spawner.get_agent_state_any(&child.agent_id).await.unwrap();
+            assert!(matches!(archived.status, AgentStatus::Waiting { .. }));
+            assert!(archived.ended_at.is_none());
+            assert_eq!(
+                archived.cancellation_binding_id,
+                child.cancellation_binding_id
+            );
+            assert!(archived.committed_frontier.is_none());
+            assert!(archived.messaging_address.is_some());
+            assert_eq!(transport.retained_inbox_count().await, 1);
+            assert!(router.registered_address(&child.run_id).await.is_some());
+            if !committed_before_panic {
+                spawner.reconcile_durable_agent_runs().await.unwrap();
+                assert!(parent.take_completed_direct_children().is_empty());
+                assert!(parent.has_pending_direct_children());
+                let wait = spawner.wait_for_direct_children(&parent);
+                tokio::pin!(wait);
+                assert!(futures_util::poll!(&mut wait).is_pending());
+                spawner
+                    .set_durable_agent_reconciler(Arc::new(StaticDurableReconciler {
+                        runs: vec![winner],
+                    }))
+                    .await;
+            }
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                spawner.wait_for_direct_children(&parent),
+            )
+            .await
+            .unwrap();
             let completions = parent.take_completed_direct_children();
             assert_eq!(completions.len(), 1);
-            assert!(matches!(completions[0].status, AgentStatus::Failed { .. }));
+            if cancelled {
+                assert!(matches!(
+                    completions[0].status,
+                    AgentStatus::Cancelled { by_user: true, .. }
+                ));
+            } else {
+                assert!(
+                    matches!(&completions[0].status, AgentStatus::Completed { result, .. } if result == "durable winner")
+                );
+            }
+            spawner.reconcile_durable_agent_runs().await.unwrap();
             assert!(!parent.has_pending_direct_children());
             assert!(parent.take_completed_direct_children().is_empty());
-            let archived = spawner.get_agent_state_any(&child.agent_id).await.unwrap();
-            assert!(matches!(archived.status, AgentStatus::Failed { .. }));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while transport.retained_inbox_count().await != 0
+                    || router.registered_address(&child.run_id).await.is_some()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("durable winner must retire the retained mailbox");
             assert!(
-                archived.committed_frontier.is_none(),
-                "admission is not durable settlement evidence"
+                spawner
+                    .get_agent_state_any(&child.agent_id)
+                    .await
+                    .unwrap()
+                    .messaging_address
+                    .is_none()
             );
             let _ = spawner.shutdown_and_wait(Duration::from_secs(2)).await;
             assert_eq!(spawner.background_task_count(), 0);

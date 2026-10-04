@@ -9068,7 +9068,7 @@ struct FaultInjectedEventAppend {
     events: Vec<Value>,
 }
 
-struct FaultInjectedRunStateStore {
+pub(crate) struct FaultInjectedRunStateStore {
     inner: InMemoryRunStateStore,
     fail_status_calls: HashSet<usize>,
     fail_status_run_ids: HashSet<String>,
@@ -9103,7 +9103,7 @@ struct FaultInjectedRunStateStore {
 }
 
 impl FaultInjectedRunStateStore {
-    fn new(fail_status_calls: &[usize], fail_append_calls: &[usize]) -> Self {
+    pub(crate) fn new(fail_status_calls: &[usize], fail_append_calls: &[usize]) -> Self {
         Self {
             inner: InMemoryRunStateStore::new(),
             fail_status_calls: fail_status_calls.iter().copied().collect(),
@@ -9149,7 +9149,7 @@ impl FaultInjectedRunStateStore {
         self
     }
 
-    fn with_failed_load_run_call(mut self, call: usize) -> Self {
+    pub(crate) fn with_failed_load_run_call(mut self, call: usize) -> Self {
         self.fail_load_run_calls.insert(call);
         self
     }
