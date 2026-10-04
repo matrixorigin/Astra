@@ -135,6 +135,13 @@ user prohibition such as “do not use `glm-5.2`” is not a positive model choi
 the runtime must keep it unresolved and block the child rather than silently
 inheriting DeepSeek Flash or substituting another model.
 
+`flash_versioned_model_with_independent_parent_task` requires a catalog with a
+unique Qwen 3.7 identity (`qwen3.7-max`). It checks the actual child model,
+result adoption, and the independent parent's answer. Run it separately from
+GLM-only deployments. `flash_rejected_delegation_preserves_parent_tools` checks
+that an unavailable child model is still rejected, followed by a successful
+parent catalog query rather than a forced text-only turn.
+
 `flash_missing_child_model_fail_closed` uses an unavailable fixed identity and
 requires one attempted spawn to receive the typed admission rejection. It does
 not accept an omitted child or a parent-only explanation as evidence. The

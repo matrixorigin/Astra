@@ -264,6 +264,27 @@ fn all_requested_calls_rejected_non_retryable(
         })
 }
 
+fn is_non_retryable_delegation_rejection(record: &ToolCallRecord) -> bool {
+    record.disposition == Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+        && record
+            .runtime_model_result_full
+            .as_deref()
+            .or(record.result_full.as_deref())
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .is_some_and(|result| {
+                result.get("retryable").and_then(Value::as_bool) == Some(false)
+                    && matches!(
+                        result.get("error_kind").and_then(Value::as_str),
+                        Some(
+                            "invalid_delegation_model_scope"
+                                | "delegation_model_scope_unresolved"
+                                | "delegation_model_assessment_unavailable"
+                                | "delegation_model_unavailable"
+                        )
+                    )
+            })
+}
+
 /// Reconcile the terminal tool batch without overriding a typed action that
 /// Work or completion recovery has already authorized from those same facts.
 pub(crate) fn settle_non_retryable_tool_rejections(
@@ -280,6 +301,12 @@ pub(crate) fn settle_non_retryable_tool_rejections(
         // owns an unfinished child or correlated reply. The request remains
         // rejected, but existing communication authority must survive.
         || (pending_run_dependency && !active_work_attempt)
+        // A frozen model-admission failure blocks delegation, not independent
+        // parent work. Rejected calls still enter the existing stall signature
+        // and budget-renewal path below; retryability never grants execution.
+        || (!active_work_attempt
+            && state.stall.tool_call_records[round_records_start..]
+                .iter().all(is_non_retryable_delegation_rejection))
         || !all_requested_calls_rejected_non_retryable(
             requested,
             &state.stall.tool_call_records[round_records_start..],
@@ -2231,9 +2258,21 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             turn_result.edge_tool_round.extend(delivered.results);
         }
 
+        // Rejection is still a model attempt. Omitting this lane produces an
+        // empty signature and lets repeated frozen refusals renew the budget.
+        let attempted_logical_calls = admitted_logical_calls
+            .iter()
+            .chain(
+                admission
+                    .rejected
+                    .iter()
+                    .map(|call| call.invocation.logical_target_call()),
+            )
+            .cloned()
+            .collect::<Vec<_>>();
         agentic_round_stall_preflight(
             turn_index,
-            &admitted_logical_calls,
+            &attempted_logical_calls,
             &turn_result.edge_tool_round,
             &mut state.stall.turn_sigs,
             &mut state.stall.turn_tool_names,
@@ -3648,8 +3687,22 @@ mod tests {
             false,
             false,
         );
-        assert!(state.hooks.completion_settlement.text_only);
+        assert!(!state.hooks.completion_settlement.text_only);
         assert!(!state.hooks.completion_settlement.work_settlement_only);
+        assert!(!state.budget_wrapup_injected);
+        assert!(state.hooks.completion_settlement.wrapup_origin.is_none());
+
+        // A durable Work executor must still settle its owned assignment.
+        settle_non_retryable_tool_rejections(
+            &mut state,
+            std::slice::from_ref(&call),
+            0,
+            false,
+            true,
+            false,
+        );
+        assert!(state.hooks.completion_settlement.work_settlement_only);
+        assert!(!state.hooks.completion_settlement.text_only);
     }
 
     fn publish_test_feedback(

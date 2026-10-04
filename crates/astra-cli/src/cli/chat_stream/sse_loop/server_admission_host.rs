@@ -606,9 +606,13 @@ impl CliServerAdmissionHost<'_> {
 }
 
 fn stream_event_requires_ordered_delivery(event: &crate::cli::chat_stream::StreamEvent) -> bool {
+    if let crate::cli::chat_stream::StreamEvent::AgentLive(event) = event {
+        return event.requires_ordered_delivery();
+    }
     matches!(
         event,
         crate::cli::chat_stream::StreamEvent::SessionBound(_)
+            | crate::cli::chat_stream::StreamEvent::AgentLiveGap(_)
             | crate::cli::chat_stream::StreamEvent::RunBound(_)
             | crate::cli::chat_stream::StreamEvent::ToolStarted { .. }
             | crate::cli::chat_stream::StreamEvent::ToolCompleted { .. }
@@ -2719,6 +2723,22 @@ mod tests {
                 server_terminal: None,
             },
         ]);
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveTermination,
+        };
+        // Exercise retention, not just draining a manually populated queue.
+        retain_ordered_stream_event_in_queue(
+            &mut pending,
+            StreamEvent::AgentLive(AgentLiveEvent {
+                run_id: "child-run".into(),
+                agent_id: "child".into(),
+                kind: AgentLiveEventKind::AgentTerminated {
+                    termination: AgentLiveTermination::Completed,
+                    duration_ms: 10,
+                    reason: None,
+                },
+            }),
+        );
         let consumer = tokio::spawn(async move {
             let mut received = Vec::new();
             while let Some(event) = rx.recv().await {
@@ -2746,7 +2766,9 @@ mod tests {
         assert!(matches!(received[0], StreamEvent::StatusLine(_)));
         assert!(matches!(received[1], StreamEvent::ToolStarted { .. }));
         assert!(matches!(received[2], StreamEvent::ToolCompleted { .. }));
-        assert!(matches!(received[3], StreamEvent::AssistantOutputSettled));
+        assert!(matches!(&received[3], StreamEvent::AgentLive(event)
+            if matches!(event.kind, AgentLiveEventKind::AgentTerminated { .. })));
+        assert!(matches!(received[4], StreamEvent::AssistantOutputSettled));
     }
 
     #[tokio::test]

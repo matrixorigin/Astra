@@ -6788,9 +6788,7 @@ impl ServerAgenticLoopHost {
         astra_turn_types::DelegationIntentRequirements,
         Option<astra_services::delegation_model_requirement::DelegationScopeBinding>,
     ) {
-        use astra_services::delegation_model_requirement::{
-            DelegationRequirementDisposition, delegation_model_candidates,
-        };
+        use astra_services::delegation_model_requirement::delegation_model_candidates;
         use astra_turn_types::DelegationIntentRequirements;
 
         let origin = delegation_requirement_source(source);
@@ -6902,23 +6900,6 @@ impl ServerAgenticLoopHost {
                 }
             };
         *summary = Some(extracted.summary.clone());
-        match extracted.response.disposition {
-            DelegationRequirementDisposition::NotApplicable => {
-                return (
-                    DelegationIntentRequirements::Unconstrained { source: origin },
-                    None,
-                );
-            }
-            DelegationRequirementDisposition::Unresolved => {
-                return (
-                    unresolved(
-                        "The requested model or reasoning could not be interpreted; clarify the task and model.",
-                    ),
-                    None,
-                );
-            }
-            DelegationRequirementDisposition::Resolved => {}
-        }
         let assessed = match astra_services::delegation_model_requirement::materialize_delegation_intent_requirements(
             &extracted, origin.clone(),
         ) {
@@ -40964,6 +40945,115 @@ mod tests {
             assert_eq!(*reads.lock().unwrap(), expected_calls);
             assert_eq!(requests.lock().unwrap().len(), expected_calls);
         }
+    }
+
+    #[tokio::test]
+    async fn unresolved_delegation_preserves_reason_and_reuses_frozen_rejection() {
+        let reads = Arc::new(std::sync::Mutex::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reason = "The requested variant is unavailable; specify an available variant.";
+        let mut host = test_host_builder("user", "session")
+            .with_model_service(Some(Arc::new(DelegationCatalogSpy {
+                reads: reads.clone(),
+            })))
+            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                    json!({"disposition":"unresolved","reason":reason}).to_string(),
+                ])),
+                requests: requests.clone(),
+            }) as Box<dyn SummaryLlmClient>])
+            .build();
+        let mut state = create_test_state();
+        state.context_manifest_user_id = Some("user".into());
+        state.current_session_id = Some("session".into());
+        state.current_run_id = Some("root-run".into());
+        state.canonical_turn_chain_id = Some("chain".into());
+        state.current_run_owner_generation = Some(1);
+        state.user_intent =
+            "Delegate review to Model-A-Pro; independently inspect the catalog.".into();
+        for id in ["first-spawn", "repeated-spawn"] {
+            let call = json!({"id":id,"type":"function","function":{
+                "name":"agent","arguments":json!({"action":"spawn","description":"Review",
+                "prompt":"Review the proposal"}).to_string()
+            }});
+            use crate::turn::agentic_loop::{
+                execution_phase::TurnExecutionPhase, lifecycle::TurnIterationPrep,
+            };
+            let phase = TurnExecutionPhase {
+                llm_wall_start: Instant::now(),
+                turn_result: HostTurnResult {
+                    accum: astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum {
+                        tool_calls: vec![call],
+                        has_tool_calls: true,
+                        ..Default::default()
+                    },
+                    ttft_ms: None,
+                    edge_tool_round: Vec::new(),
+                    error_kind: None,
+                },
+            };
+            crate::turn::agentic_loop::tool_phase::execute_tool_phase(
+                &mut host,
+                &mut state,
+                usize::from(id == "repeated-spawn"),
+                TurnIterationPrep {
+                    quiet: true,
+                    turn_start_time: Instant::now(),
+                },
+                phase,
+            )
+            .await
+            .expect("rejected model request is a terminal tool receipt");
+            let record = state
+                .stall
+                .tool_call_records
+                .last()
+                .expect("rejected tool record");
+            let result: Value =
+                serde_json::from_str(record.result_full.as_deref().unwrap()).unwrap();
+            assert_eq!(result["error_kind"], "delegation_model_scope_unresolved");
+            assert_eq!(result["error"], reason);
+            assert_eq!(result["retryable"], false);
+            assert_eq!(result["advisory"]["executed"], false);
+            assert!(!record.was_executed());
+            assert!(!state.hooks.completion_settlement.text_only);
+            assert!(
+                !state.stall.turn_sigs.last().unwrap().is_empty(),
+                "rejected attempts count toward stall detection"
+            );
+        }
+        assert_eq!(
+            *reads.lock().unwrap(),
+            1,
+            "reuse the authorized catalog snapshot"
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "never pay to reinterpret the same intent"
+        );
+        assert_eq!(state.stall.turn_sigs[0], state.stall.turn_sigs[1]);
+        state.agentic_turn_budget =
+            astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
+                state.task_profile,
+                None,
+                None,
+            );
+        assert!(state.agentic_turn_budget.extension_turns > 1);
+        state.max_turns = state.agentic_turn_budget.initial_turns;
+        let old_limit = state.max_turns;
+        state.remaining_turns = 0;
+        let error =
+            crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 2)
+                .await
+            .err()
+            .expect("repeated refusals exhaust the execution budget");
+        assert!(error.to_string().contains("Turn budget exhausted"));
+        assert_eq!(
+            state.max_turns, old_limit,
+            "rejected repetition cannot renew execution indefinitely"
+        );
     }
 
     #[tokio::test]

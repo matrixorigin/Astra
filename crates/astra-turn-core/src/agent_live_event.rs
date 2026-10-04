@@ -12,6 +12,28 @@ pub struct AgentLiveEvent {
     pub kind: AgentLiveEventKind,
 }
 
+impl AgentLiveEvent {
+    /// Preserve lifecycle and control facts under backpressure. Output and
+    /// replaceable progress observations can use the bounded sampled lane.
+    pub fn requires_ordered_delivery(&self) -> bool {
+        match &self.kind {
+            AgentLiveEventKind::ToolStarted { .. }
+            | AgentLiveEventKind::ToolCompleted { .. }
+            | AgentLiveEventKind::AgentTerminated { .. } => true,
+            AgentLiveEventKind::Signal(signal) => !matches!(
+                signal,
+                AgentLiveSignal::WaitingForModel
+                    | AgentLiveSignal::ModelResponding
+                    | AgentLiveSignal::ToolProgress { .. }
+                    | AgentLiveSignal::TranscriptCommitted { .. }
+            ),
+            AgentLiveEventKind::OutputDelta { .. }
+            | AgentLiveEventKind::ThinkingDelta { .. }
+            | AgentLiveEventKind::Status { .. } => false,
+        }
+    }
+}
+
 /// A bounded transport lane dropped one or more live events for this durable
 /// agent execution. This is not agent output and must never be reconstructed
 /// into transcript text; consumers use it to mark their projection incomplete

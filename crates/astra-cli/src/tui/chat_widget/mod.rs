@@ -9305,19 +9305,19 @@ mod tests {
         w.handle_event(AppEvent::wire(agent_control_completed(
             "spawn",
             "broken-reviewer",
-            "failed",
-            10,
-            Some(r#"{"error":"spawn failed"}"#),
+            "rejected",
+            0,
+            Some(r#"{"status":"failed","error_kind":"delegation_model_scope_unresolved","retryable":false,"advisory":{"executed":false},"error":"model scope is ambiguous"}"#),
             "spawn-broken",
             None,
         )));
         w.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "broken-reviewer".into(),
-            status: "failed".into(),
-            duration_ms: 10,
+            status: "rejected".into(),
+            duration_ms: 0,
             output_summary: None,
-            output: Some(r#"{"error":"spawn failed"}"#.into()),
+            output: Some(r#"{"status":"failed","error_kind":"delegation_model_scope_unresolved","retryable":false,"advisory":{"executed":false},"error":"model scope is ambiguous"}"#.into()),
             tool_use_id: "spawn-broken".into(),
             parent_tool_use_id: None,
         }));

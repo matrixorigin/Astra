@@ -6,8 +6,7 @@ use tokio_util::sync::CancellationToken;
 use super::app_event::TuiAppEvent;
 use crate::cli::chat_stream::StreamEvent;
 use astra_turn_core::agent_live_event::{
-    AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveGap, AgentLiveSendError,
-    SharedAgentLiveEventSink,
+    AgentLiveEvent, AgentLiveEventSink, AgentLiveGap, AgentLiveSendError, SharedAgentLiveEventSink,
 };
 
 const TUI_APP_EVENT_CHANNEL_CAPACITY: usize = 2048;
@@ -195,7 +194,7 @@ impl AgentLiveEventSink for BoundedAgentLiveSink {
         if self.tx.is_closed() {
             return Err(AgentLiveSendError::Closed);
         }
-        let normal_permit = if is_high_priority_live_event(&event) {
+        let normal_permit = if event.requires_ordered_delivery() {
             None
         } else {
             match self.normal_permits.clone().try_acquire_owned() {
@@ -248,24 +247,6 @@ impl BoundedAgentLiveSink {
             agent_id: event.agent_id.clone(),
             dropped_event_count: 1,
         });
-    }
-}
-
-fn is_high_priority_live_event(event: &AgentLiveEvent) -> bool {
-    match &event.kind {
-        AgentLiveEventKind::ToolStarted { .. }
-        | AgentLiveEventKind::ToolCompleted { .. }
-        | AgentLiveEventKind::AgentTerminated { .. } => true,
-        AgentLiveEventKind::Signal(signal) => !matches!(
-            signal,
-            astra_turn_core::agent_live_event::AgentLiveSignal::WaitingForModel
-                | astra_turn_core::agent_live_event::AgentLiveSignal::ModelResponding
-                | astra_turn_core::agent_live_event::AgentLiveSignal::ToolProgress { .. }
-                | astra_turn_core::agent_live_event::AgentLiveSignal::TranscriptCommitted { .. }
-        ),
-        AgentLiveEventKind::OutputDelta { .. }
-        | AgentLiveEventKind::ThinkingDelta { .. }
-        | AgentLiveEventKind::Status { .. } => false,
     }
 }
 

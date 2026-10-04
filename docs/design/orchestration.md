@@ -378,7 +378,9 @@ Per-agent model override is an orchestration decision, but it must still respect
 When a user names a delegated model in natural language, one candidate-aware
 judgment resolves the request against the current authorized Chat catalog.
 It must preserve the requested family, version, variant, namespace and source;
-an unavailable or ambiguous model stops the child before execution. Runtime
+an unavailable or ambiguous model stops the child before execution. A family
+plus version can identify a unique model in that snapshot when the user omitted
+a variant; multiple matching variants or sources require clarification. Runtime
 checks exact quoted text, candidate membership, canonical IDs/names, scope,
 authorization and capability, but does not run a second lexical parser over
 model aliases. Semantic alias interpretation can still be wrong; its accuracy
@@ -394,7 +396,11 @@ catalog snapshot; semantic accuracy is evaluated separately. An invalid or
 uncertain judgment cannot silently choose a nearby model, relax a hard
 requirement, or authorize Auto. A tool's proposed selector is matching context,
 never user authority. This interpretation adds no separate catalog query or
-database write.
+database write. The validated ambiguity reason is returned to the caller, while
+Explain retains only its bounded structured summary. A non-retryable delegation
+rejection blocks that operation, not independent parent work. Frozen admission
+results, stall limits and turn budgets prevent repeated paid interpretation;
+active Work attempts retain their existing typed settlement boundary.
 
 A model-only request does not imply a reasoning level. The same judgment must
 distinguish a request to *use* a reasoning control from a phrase the child is

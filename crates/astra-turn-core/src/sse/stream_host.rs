@@ -507,12 +507,12 @@ pub trait SseStreamHost: Send {
     /// This lane carries the exact agent identity and content boundaries across
     /// CLI, Server Only, and Edge+Server execution; hosts must not reconstruct
     /// it from parent tool-card text.
-    fn on_agent_live_event(&mut self, _event: AgentLiveEvent) {}
+    async fn on_agent_live_event(&mut self, _event: AgentLiveEvent) {}
 
     /// Called when the transport had to drop coalescible agent live activity.
     /// Hosts must treat the corresponding transcript/projection as incomplete
     /// until it has been reconciled from durable state.
-    fn on_agent_live_gap(&mut self, _gap: AgentLiveGap) {}
+    async fn on_agent_live_gap(&mut self, _gap: AgentLiveGap) {}
 
     /// Reconcile the Server's exact wire-schema admission before an Edge
     /// executor applies its local binding, argument, permission and sandbox
@@ -1104,7 +1104,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 }
             };
             for gap in live_gaps {
-                host.on_agent_live_gap(gap);
+                host.on_agent_live_gap(gap).await;
             }
         }
         if abort.is_some() {
@@ -1343,7 +1343,7 @@ async fn process_sse_event_block<H: SseStreamHost>(
                 }
             }
             Some("agent_live_event") => match agent_live_event_from_sse(event) {
-                Ok(event) => host.on_agent_live_event(event),
+                Ok(event) => host.on_agent_live_event(event).await,
                 Err(error) => tracing::warn!(
                     target: "astra_turn_core::sse",
                     %error,
@@ -1351,7 +1351,7 @@ async fn process_sse_event_block<H: SseStreamHost>(
                 ),
             },
             Some("agent_live_gap") => match agent_live_gap_from_sse(event) {
-                Ok(gap) => host.on_agent_live_gap(gap),
+                Ok(gap) => host.on_agent_live_gap(gap).await,
                 Err(error) => tracing::warn!(
                     target: "astra_turn_core::sse",
                     %error,
@@ -1866,11 +1866,11 @@ impl SseStreamHost for RecordingSseStreamHost {
         self.agent_communications.push(event);
     }
 
-    fn on_agent_live_event(&mut self, event: AgentLiveEvent) {
+    async fn on_agent_live_event(&mut self, event: AgentLiveEvent) {
         self.agent_live_events.push(event);
     }
 
-    fn on_agent_live_gap(&mut self, gap: AgentLiveGap) {
+    async fn on_agent_live_gap(&mut self, gap: AgentLiveGap) {
         self.agent_live_gaps.push(gap);
     }
 

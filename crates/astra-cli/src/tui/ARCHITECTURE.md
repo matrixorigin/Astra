@@ -236,7 +236,7 @@ not an interactive fallback dispatcher.
 | `Ctrl+D` | Composer empty | Quit |
 | `Ctrl+L` | Any | Force full redraw |
 | `Ctrl+O` | Global, including active turns | Toggle the root conversation workspace; it remains live while the run streams |
-| `Ctrl+G` | Compact chat or conversation workspace | Open the run navigator; Enter/Right switches to the selected root or agent transcript, Left/Esc returns |
+| `Ctrl+G` | Compact chat or conversation workspace | Open active/uncertain runs and their ancestors; H toggles completed history; Enter/Right switches to the selected root or agent transcript, Left/Esc returns |
 | `Ctrl+E` | Transcript / activity | Toggle all expandable reasoning and tool details; in composer it remains line-end |
 | `Alt+E` | Composer | Open the external editor |
 | `Ctrl+R` | Idle, composer empty | Pull last user message back into composer for editing / retry |

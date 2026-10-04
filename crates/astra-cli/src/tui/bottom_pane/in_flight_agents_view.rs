@@ -167,6 +167,8 @@ impl AgentRow {
 
 pub(crate) struct InFlightAgentsView {
     rows: Vec<AgentRow>,
+    hidden_terminal_rows: Vec<(usize, AgentRow)>,
+    show_history: bool,
     show_root_conversation: bool,
     server_truth_state: crate::tui::server_agent_observer::ServerAgentTruthState,
     durable_snapshot_truncated: bool,
@@ -184,29 +186,41 @@ impl InFlightAgentsView {
     const ROOT_SELECTION: usize = usize::MAX;
 
     pub fn new(snapshot: impl Into<AgentMonitorSnapshot>) -> Self {
-        let snapshot = snapshot.into();
-        let AgentMonitorSnapshot {
-            rows,
-            show_root_conversation,
-            server_truth_state,
-            durable_snapshot_truncated,
-        } = snapshot;
-        let (live_count, failed_count, uncertain_count) = count_rows(&rows);
-        Self {
-            rows,
-            show_root_conversation,
-            server_truth_state,
-            durable_snapshot_truncated,
-            live_count,
-            failed_count,
-            uncertain_count,
-            selected: if show_root_conversation {
-                Self::ROOT_SELECTION
-            } else {
-                0
-            },
+        let mut view = Self {
+            rows: Vec::new(),
+            hidden_terminal_rows: Vec::new(),
+            show_history: false,
+            show_root_conversation: false,
+            server_truth_state: ServerAgentTruthState::Unbound,
+            durable_snapshot_truncated: false,
+            live_count: 0,
+            failed_count: 0,
+            uncertain_count: 0,
+            selected: Self::ROOT_SELECTION,
             completed: false,
             pending_action: None,
+        };
+        view.replace_snapshot(snapshot.into());
+        view
+    }
+
+    fn toggle_history(&mut self) {
+        let selected_id = self.rows.get(self.selected).map(|row| row.agent_id.clone());
+        self.show_history = !self.show_history;
+        let mut rows = std::mem::take(&mut self.rows);
+        for (index, row) in self.hidden_terminal_rows.drain(..) {
+            rows.insert(index, row);
+        }
+        self.replace_snapshot(AgentMonitorSnapshot {
+            rows,
+            show_root_conversation: self.show_root_conversation,
+            server_truth_state: self.server_truth_state,
+            durable_snapshot_truncated: self.durable_snapshot_truncated,
+        });
+        if let Some(index) =
+            selected_id.and_then(|id| self.rows.iter().position(|row| row.agent_id == id))
+        {
+            self.selected = index;
         }
     }
 
@@ -219,6 +233,47 @@ impl InFlightAgentsView {
         } = snapshot;
         let preserve_root_selection = self.selected == Self::ROOT_SELECTION;
         let selected_id = self.rows.get(self.selected).map(|row| row.agent_id.clone());
+        // Keep terminal ancestors of live/uncertain descendants so filtering
+        // history never severs the visible run tree. This is presentation only.
+        let by_run: std::collections::HashMap<_, _> = rows
+            .iter()
+            .filter_map(|row| row.run_id.as_deref().map(|id| (id, row)))
+            .collect();
+        let mut ancestors = std::collections::HashSet::new();
+        let mut active_groups = std::collections::HashSet::new();
+        for row in rows.iter().filter(|row| {
+            !row.state.status.is_terminal()
+                || matches!(
+                    row.state.confidence,
+                    AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
+                )
+        }) {
+            if let Some(group) = &row.fanout {
+                active_groups.insert((row.parent_run_id.clone(), group.group_id.clone()));
+            }
+            let mut parent = row.parent_run_id.as_deref();
+            while let Some(id) = parent {
+                if !ancestors.insert(id.to_string()) {
+                    break;
+                }
+                parent = by_run.get(id).and_then(|row| row.parent_run_id.as_deref());
+            }
+        }
+        let (rows, hidden): (Vec<_>, Vec<_>) =
+            rows.into_iter().enumerate().partition(|(_, row)| {
+                self.show_history
+                    || !row.state.status.is_terminal()
+                    || matches!(
+                        row.state.confidence,
+                        AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
+                    )
+                    || row.run_id.as_ref().is_some_and(|id| ancestors.contains(id))
+                    || row.fanout.as_ref().is_some_and(|group| {
+                        active_groups.contains(&(row.parent_run_id.clone(), group.group_id.clone()))
+                    })
+            });
+        self.hidden_terminal_rows = hidden;
+        let rows: Vec<_> = rows.into_iter().map(|(_, row)| row).collect();
         let (live_count, failed_count, uncertain_count) = count_rows(&rows);
         self.selected = if preserve_root_selection && show_root_conversation {
             Self::ROOT_SELECTION
@@ -230,7 +285,6 @@ impl InFlightAgentsView {
                 } else {
                     0
                 })
-                .min(rows.len().saturating_sub(1))
         };
         self.rows = rows;
         self.show_root_conversation = show_root_conversation;
@@ -503,7 +557,10 @@ fn agent_list_entries(rows: &[AgentRow], show_root_conversation: bool) -> Vec<Ag
             .filter_map(|(member_idx, row)| {
                 row.fanout
                     .as_ref()
-                    .is_some_and(|member| member.group_id == fanout.group_id)
+                    .is_some_and(|member| {
+                        member.group_id == fanout.group_id
+                            && row.parent_run_id == rows[idx].parent_run_id
+                    })
                     .then_some(member_idx)
             })
             .collect::<Vec<_>>();
@@ -869,6 +926,7 @@ impl BottomPaneView for InFlightAgentsView {
 
     fn handle_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Char('h') | KeyCode::Char('H') => self.toggle_history(),
             KeyCode::Up | KeyCode::Char('k') => self.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),
             KeyCode::PageUp => self.move_page_up(),
@@ -941,7 +999,11 @@ impl BottomPaneView for InFlightAgentsView {
             } else {
                 "←/Esc close"
             };
-            return Some(hint.into());
+            return Some(if self.hidden_terminal_rows.is_empty() {
+                hint.into()
+            } else {
+                format!("H history · {hint}")
+            });
         }
         let mut hints = vec!["↑↓ move", "Enter/→ transcript"];
         let selected = self.rows.get(self.selected);
@@ -971,6 +1033,13 @@ impl BottomPaneView for InFlightAgentsView {
         }
         if self.server_truth_state != ServerAgentTruthState::Unbound {
             hints.push("R refresh");
+        }
+        if self.show_history || !self.hidden_terminal_rows.is_empty() {
+            hints.push(if self.show_history {
+                "H active only"
+            } else {
+                "H history"
+            });
         }
         hints.push("←/Esc close");
         Some(hints.join(" · "))
@@ -1395,6 +1464,75 @@ mod tests {
         buffer_to_string(&draw_widget(ViewWidget(view), width, height))
     }
 
+    #[test]
+    fn history_toggle_preserves_order_transcripts_and_live_lineage_across_refresh() {
+        let mut snapshot = rows(4);
+        snapshot[0].state = AgentRunState::observed(AgentRunStatus::Completed);
+        snapshot[1].state = AgentRunState::observed(AgentRunStatus::Completed);
+        snapshot[1].parent_run_id = snapshot[0].run_id.clone();
+        snapshot[2].parent_run_id = snapshot[0].run_id.clone();
+        let mut view = InFlightAgentsView::new(snapshot.clone());
+        assert_eq!(
+            view.rows.len(),
+            3,
+            "keep the live child and its terminal ancestor"
+        );
+        assert_eq!(view.hidden_terminal_rows[0].1.agent_id, "agent-1");
+        assert!(view.hint_keys().unwrap().contains("H history"));
+        view.selected = 1;
+        view.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(
+            view.rows
+                .iter()
+                .map(|r| r.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            ["agent-0", "agent-1", "agent-2", "agent-3"],
+            "restore DFS order before the next refresh"
+        );
+        assert_eq!(view.rows[view.selected].agent_id, "agent-2");
+        view.refresh_agent_monitor(snapshot.clone().into());
+        assert_eq!(view.rows.len(), 4, "refresh respects the history selection");
+        view.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(view.rows.len(), 3);
+        snapshot[2].state = AgentRunState::observed(AgentRunStatus::Completed);
+        snapshot[3].state = AgentRunState::observed(AgentRunStatus::Completed);
+        view.refresh_agent_monitor(snapshot.into());
+        assert!(
+            view.rows.is_empty(),
+            "no completed rows linger in the active view"
+        );
+        assert!(view.hint_keys().unwrap().contains("H history"));
+        view.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(view.rows.len(), 4);
+        view.selected = 1;
+        view.handle_key(key(KeyCode::Enter));
+        assert!(
+            view.take_action_request().is_some(),
+            "completed transcript remains accessible"
+        );
+    }
+
+    #[test]
+    fn reused_fanout_id_does_not_reveal_or_merge_another_parents_history() {
+        let mut snapshot = rows(2);
+        snapshot[0].state = AgentRunState::observed(AgentRunStatus::Completed);
+        snapshot[0].parent_run_id = Some("old-parent".into());
+        for row in &mut snapshot {
+            row.fanout = Some(fanout("reused-group", 1, 0));
+        }
+        let mut view = InFlightAgentsView::new(snapshot);
+        assert_eq!(view.rows.len(), 1);
+        assert_eq!(view.rows[0].agent_id, "agent-1");
+        view.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(
+            agent_list_entries(&view.rows, false)
+                .iter()
+                .filter(|entry| matches!(entry, AgentListEntry::FanoutHeader(_)))
+                .count(),
+            2
+        );
+    }
+
     /// Empty agent list: must not panic, must not select anything.
     #[test]
     fn empty_list_is_inert() {
@@ -1816,6 +1954,7 @@ mod tests {
         rows[1].state = AgentRunState::observed(AgentRunStatus::Failed);
         rows[2].state = AgentRunState::observed(AgentRunStatus::Cancelled);
         let mut v = InFlightAgentsView::new(rows);
+        v.handle_key(key(KeyCode::Char('h')));
         for _ in 0..3 {
             v.handle_key(key(KeyCode::Char('x')));
             v.handle_key(key(KeyCode::Down));
@@ -1981,6 +2120,7 @@ mod tests {
     #[test]
     fn refresh_agent_monitor_recomputes_counts_and_preserves_selection() {
         let mut v = InFlightAgentsView::new(rows(3));
+        v.handle_key(key(KeyCode::Char('h')));
         v.handle_key(key(KeyCode::Down));
         assert_eq!(v.rows[v.selected].agent_id, "agent-1");
 
@@ -2298,7 +2438,9 @@ mod tests {
         rows[1].state = AgentRunState::observed(AgentRunStatus::Completed);
         rows[2].state = AgentRunState::observed(AgentRunStatus::Failed);
         rows[3].state = AgentRunState::observed(AgentRunStatus::Cancelled);
-        let out = render(&InFlightAgentsView::new(rows), 80, 6);
+        let mut view = InFlightAgentsView::new(rows);
+        view.handle_key(key(KeyCode::Char('h')));
+        let out = render(&view, 80, 6);
         assert!(out.contains("stopping"), "{out}");
         assert!(out.contains("done"), "{out}");
         assert!(out.contains("failed"), "{out}");
