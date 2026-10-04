@@ -70,69 +70,7 @@ fn non_tty_output_failure(
     }
 }
 
-/// Map `ToolPolicyConfig` (from `astra-config`) to `BreakerConfig` (from
-/// `astra-turn-core`).
-///
-/// Lives in the CLI because `astra-config` and `astra-turn-core` are sibling
-/// crates with no dependency edge between them; adding `impl From<…> for
-/// BreakerConfig` in either crate would introduce an unwanted dependency.
-/// The CLI is the natural composition layer that already depends on both.
-/// If a second caller appears, promote this to a dedicated adapter crate
-/// rather than coupling the two base crates.
-fn circuit_breaker_config_from_tool_policy(
-    config: &astra_config::runtime_config::ToolPolicyConfig,
-) -> astra_turn_core::loop_circuit_breaker::BreakerConfig {
-    // Resolve each threshold and warn when a user-supplied value was clamped
-    // to its floor so operators can diagnose unexpected behaviour.
-    macro_rules! resolve_and_warn {
-        ($raw:expr, $effective:expr, $name:literal) => {{
-            let raw = $raw;
-            let effective = $effective;
-            if raw > 0 && effective != raw {
-                tracing::warn!(
-                    config_field = $name,
-                    user_value = raw,
-                    applied_value = effective,
-                    "circuit breaker config value below floor — clamped to minimum"
-                );
-            }
-            effective as usize
-        }};
-    }
-
-    astra_turn_core::loop_circuit_breaker::BreakerConfig {
-        stall_threshold: resolve_and_warn!(
-            config.circuit_breaker_stall_threshold,
-            config.effective_circuit_breaker_stall_threshold(),
-            "circuit_breaker_stall_threshold"
-        ),
-        repetition_threshold: resolve_and_warn!(
-            config.circuit_breaker_repetition_threshold,
-            config.effective_circuit_breaker_repetition_threshold(),
-            "circuit_breaker_repetition_threshold"
-        ),
-        read_only_stall_threshold: resolve_and_warn!(
-            config.circuit_breaker_read_only_stall_threshold,
-            config.effective_circuit_breaker_read_only_stall_threshold(),
-            "circuit_breaker_read_only_stall_threshold"
-        ),
-        max_introspect_emissions: resolve_and_warn!(
-            config.circuit_breaker_max_introspect_emissions,
-            config.effective_circuit_breaker_max_introspect_emissions(),
-            "circuit_breaker_max_introspect_emissions"
-        ),
-        half_open_patience: resolve_and_warn!(
-            config.circuit_breaker_half_open_patience,
-            config.effective_circuit_breaker_half_open_patience(),
-            "circuit_breaker_half_open_patience"
-        ),
-        absolute_max_rounds: resolve_and_warn!(
-            config.circuit_breaker_absolute_max_rounds,
-            config.effective_circuit_breaker_absolute_max_rounds(),
-            "circuit_breaker_absolute_max_rounds"
-        ),
-    }
-}
+use astra_runtime::turn::runtime_policy::circuit_breaker_config_from_tool_policy;
 
 fn restored_compaction_effectiveness(
     compaction_state: Option<&serde_json::Value>,

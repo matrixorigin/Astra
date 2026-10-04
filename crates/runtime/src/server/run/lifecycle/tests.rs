@@ -25980,6 +25980,9 @@ fn build_initial_state_uses_the_displayed_tool_execution_policy() {
     std::fs::write(
         root.path().join("config/runtime.toml"),
         r#"
+        [tool_policy]
+        circuit_breaker_absolute_max_rounds = 20
+        circuit_breaker_read_only_stall_threshold = 17
         [[tool_policy.model_profiles]]
         model_match = "custom-workflow-policy-regression"
         max_identical_tool_calls = 7
@@ -26022,6 +26025,9 @@ fn build_initial_state_uses_the_displayed_tool_execution_policy() {
     std::fs::write(
         root.path().join("config/runtime.toml"),
         r#"
+        [tool_policy]
+        circuit_breaker_absolute_max_rounds = 30
+        circuit_breaker_read_only_stall_threshold = 19
         [[tool_policy.model_profiles]]
         model_match = "custom-workflow-policy-regression"
         max_identical_tool_calls = 11
@@ -26030,7 +26036,7 @@ fn build_initial_state_uses_the_displayed_tool_execution_policy() {
     "#,
     )
     .unwrap();
-    let old = selected_state.unwrap();
+    let mut old = selected_state.unwrap();
     assert_eq!(
         old.admitted_tool_policy
             .resolve_for_model(Some("custom-workflow-policy-regression"))
@@ -26039,7 +26045,7 @@ fn build_initial_state_uses_the_displayed_tool_execution_policy() {
     );
     let mut request = test_request("new execution");
     request.model = Some("custom-workflow-policy-regression".into());
-    let new = svc.build_initial_state(
+    let mut new = svc.build_initial_state(
         "test-user",
         &request,
         "new-policy-session",
@@ -26056,6 +26062,31 @@ fn build_initial_state_uses_the_displayed_tool_execution_policy() {
         ),
         (11, 13, 6)
     );
+    use astra_turn_core::loop_circuit_breaker::{BreakerAction, RoundSignal};
+    for (state, limit, read_only_threshold) in [(&mut old, 20, 17), (&mut new, 30, 19)] {
+        assert_eq!(
+            state.stall.circuit_breaker.read_only_threshold(),
+            read_only_threshold
+        );
+        for round in 1..=limit {
+            let action = state.stall.circuit_breaker.observe(RoundSignal {
+                tool_signatures: Default::default(),
+                produced_mutation: true,
+                tool_count: 1,
+            });
+            if round == limit {
+                assert_eq!(
+                    action,
+                    BreakerAction::HardRoundLimitReached {
+                        rounds: limit,
+                        limit
+                    }
+                );
+            } else {
+                assert_eq!(action, BreakerAction::Continue);
+            }
+        }
+    }
 }
 
 #[test]
@@ -26093,6 +26124,26 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
                 user_intent_digest: "original-digest".into(),
             },
         };
+    use astra_turn_core::loop_circuit_breaker::{
+        BreakerAction, BreakerConfig, LoopCircuitBreaker, RoundSignal,
+    };
+    facts.stall.circuit_breaker = LoopCircuitBreaker::new(BreakerConfig {
+        absolute_max_rounds: 20,
+        ..Default::default()
+    });
+    for _ in 0..19 {
+        assert_eq!(
+            facts.stall.circuit_breaker.observe(RoundSignal {
+                tool_signatures: Default::default(),
+                produced_mutation: true,
+                tool_count: 1,
+            }),
+            BreakerAction::Continue
+        );
+    }
+    facts
+        .admitted_tool_policy
+        .circuit_breaker_absolute_max_rounds = 99;
     facts.admitted_tool_policy.max_tools_per_turn = 41;
     facts.admitted_tool_policy.search_fanout_eval_threshold = 99;
     facts.original.evaluation_thresholds.search_fanout = 37;
@@ -26198,7 +26249,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
         &PreparedRuntimeCapabilities::default(),
         Some(3),
     );
-    let state = svc.assemble_loop_state(
+    let mut state = svc.assemble_loop_state(
         "test-user",
         &request,
         "same-session",
@@ -26317,6 +26368,17 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     }
     assert!(state.budget_wrapup_injected);
     assert_eq!(state.budget_wrapup_ignored_rounds, 1);
+    assert_eq!(
+        state.stall.circuit_breaker.observe(RoundSignal {
+            tool_signatures: Default::default(),
+            produced_mutation: true,
+            tool_count: 1,
+        }),
+        BreakerAction::HardRoundLimitReached {
+            rounds: 20,
+            limit: 20
+        }
+    );
 }
 
 #[test]

@@ -146,6 +146,9 @@ built-in Opus, Sonnet-4, Haiku and GPT-5 profiles use 128, 100, 48 and 128.
 Explicit `tool_policy.model_profiles` take precedence over built-in profiles.
 Each execution selects its tool policy once. Subsequent rounds and automatic
 model changes use that selected policy; edits apply to newly admitted executions.
+The execution circuit breaker uses the same admitted policy, including its
+resolved default thresholds and absolute round limit. Reassembling an active
+execution preserves its existing breaker observations.
 Child and skill executions select their own policy. This does not change the
 process-level selection of their Server execution-round ceilings.
 

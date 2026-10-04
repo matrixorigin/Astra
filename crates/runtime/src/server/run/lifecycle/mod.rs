@@ -13016,8 +13016,15 @@ impl AgenticRunLifecycleService {
                 provider_adaptation: Default::default(),
                 skill_produced_output: false,
             },
+            stall: crate::turn::agentic_loop::host::StallTrackingState {
+                circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
+                    crate::turn::runtime_policy::circuit_breaker_config_from_tool_policy(
+                        &admitted_runtime_config.tool_policy,
+                    ),
+                ),
+                ..Default::default()
+            },
             admitted_tool_policy: admitted_runtime_config.tool_policy,
-            stall: Default::default(),
             user_intents: Default::default(),
             hooks: StopHookState {
                 stop_hooks: hook_sets.stop_hooks,
