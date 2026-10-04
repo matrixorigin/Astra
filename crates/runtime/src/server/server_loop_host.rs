@@ -6000,7 +6000,7 @@ fn append_tool_schemas_unique(surface: &mut Vec<Value>, candidates: Vec<Value>) 
         .iter()
         .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
         .collect();
-    for schema in candidates.iter().cloned() {
+    for schema in candidates {
         let Some(name) = tool_schema_name(&schema) else {
             continue;
         };
