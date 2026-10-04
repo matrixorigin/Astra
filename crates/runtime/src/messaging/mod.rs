@@ -18,8 +18,7 @@ pub mod reply_obligations;
 // Re-export key types for convenience.
 pub use astra_messaging::{
     AgentAddress, AgentMailbox, AgentMailboxRouter, AgentMessage, AgentSignal, CleanupScheduler,
-    DatabaseTransport, DbTransportMetrics, DelegationLookup, InProcessMetrics, InProcessTransport,
-    MailboxError, MessagePayload, MessageStream, MessageTarget, MessageTransport,
-    PermissionOutcome, RequestType, SubRunInfo,
+    DatabaseTransport, DelegationLookup, InProcessTransport, MailboxError, MessagePayload,
+    MessageStream, MessageTarget, MessageTransport, PermissionOutcome, RequestType, SubRunInfo,
 };
 pub use astra_messaging::{db_transport, in_process, router, transport, types};

@@ -122,22 +122,6 @@ const CLEANUP_ORPHAN_BROADCAST_DELIVERY_SQL: &str = "DELETE FROM agent_message_b
          ORDER BY message_id ASC, consumer_id ASC
          LIMIT ?";
 
-// ─── Metrics ────────────────────────────────────────────────────────────────
-
-/// Observable counters for the database transport.
-#[derive(Debug, Default)]
-pub struct TransportMetrics {
-    pub messages_sent: std::sync::atomic::AtomicU64,
-    pub messages_received: std::sync::atomic::AtomicU64,
-    pub messages_dropped: std::sync::atomic::AtomicU64,
-    pub poll_errors: std::sync::atomic::AtomicU64,
-    pub send_errors: std::sync::atomic::AtomicU64,
-    pub poll_cycles: std::sync::atomic::AtomicU64,
-    pub idle_poll_cycles: std::sync::atomic::AtomicU64,
-    pub directory_lease_lost: std::sync::atomic::AtomicU64,
-    pub directory_lease_renewal_errors: std::sync::atomic::AtomicU64,
-}
-
 // ─── Schema ─────────────────────────────────────────────────────────────────
 
 /// Create the message transport tables if they don't exist.
@@ -347,8 +331,6 @@ pub struct DatabaseTransport {
     shutdown_rx: watch::Receiver<bool>,
     /// Active poll task abort handles — aborted on shutdown for clean drain.
     poll_abort_handles: Arc<std::sync::Mutex<HashMap<String, PollTaskControl>>>,
-    /// Observable metrics.
-    metrics: Arc<TransportMetrics>,
     /// Lazily started maintenance task for reclaiming stale claims and pruning
     /// expired rows.
     cleanup_scheduler: Mutex<Option<CleanupScheduler>>,
@@ -383,7 +365,6 @@ impl DatabaseTransport {
             shutdown_tx,
             shutdown_rx,
             poll_abort_handles: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            metrics: Arc::new(TransportMetrics::default()),
             cleanup_scheduler: Mutex::new(None),
         }
     }
@@ -442,11 +423,6 @@ impl DatabaseTransport {
     /// Number of currently registered agents (local process only).
     pub async fn agent_count(&self) -> usize {
         self.registrations.read().await.len()
-    }
-
-    /// Get a reference to the transport's metrics counters.
-    pub fn metrics(&self) -> &Arc<TransportMetrics> {
-        &self.metrics
     }
 
     fn is_shutdown(&self) -> bool {
@@ -939,7 +915,6 @@ impl MessageTransport for DatabaseTransport {
                 self.max_delivery_attempts,
                 tx,
                 self.shutdown_rx.clone(),
-                Arc::clone(&self.metrics),
                 consumer_id.clone(),
                 subscription_id.clone(),
                 Arc::clone(&self.poll_abort_handles),
@@ -1032,31 +1007,14 @@ impl MessageTransport for DatabaseTransport {
         if self.is_shutdown() {
             return Err(MailboxError::Transport("transport is shut down".into()));
         }
-        match &msg.to {
-            super::types::MessageTarget::Direct { .. } => {}
-            _ => {
-                return Err(MailboxError::Transport(
-                    "send() requires Direct target".into(),
-                ));
-            }
-        }
-        match self.insert_message(&msg, false).await {
-            Ok(()) => {
-                self.metrics
-                    .messages_sent
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let MessageTarget::Direct { address } = &msg.to {
-                    self.wake_local_consumer(&format!("{}@{}", address.agent_id, address.run_id));
-                }
-                Ok(())
-            }
-            Err(e) => {
-                self.metrics
-                    .send_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Err(e)
-            }
-        }
+        let MessageTarget::Direct { address } = &msg.to else {
+            return Err(MailboxError::Transport(
+                "send() requires Direct target".into(),
+            ));
+        };
+        self.insert_message(&msg, false).await?;
+        self.wake_local_consumer(&format!("{}@{}", address.agent_id, address.run_id));
+        Ok(())
     }
 
     async fn broadcast(
@@ -1076,21 +1034,9 @@ impl MessageTransport for DatabaseTransport {
             };
             m
         };
-        match self.insert_message(&stored_msg, true).await {
-            Ok(()) => {
-                self.metrics
-                    .messages_sent
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.wake_local_broadcast_consumers(delegation_id).await;
-                Ok(())
-            }
-            Err(e) => {
-                self.metrics
-                    .send_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Err(e)
-            }
-        }
+        self.insert_message(&stored_msg, true).await?;
+        self.wake_local_broadcast_consumers(delegation_id).await;
+        Ok(())
     }
 
     async fn health_check(&self) -> Result<(), MailboxError> {
@@ -1181,7 +1127,6 @@ async fn poll_loop(
     max_delivery_attempts: u32,
     tx: mpsc::Sender<DatabaseDelivery>,
     mut shutdown_rx: watch::Receiver<bool>,
-    metrics: Arc<TransportMetrics>,
     consumer_id: String,
     subscription_id: String,
     poll_abort_handles: Arc<std::sync::Mutex<HashMap<String, PollTaskControl>>>,
@@ -1213,9 +1158,6 @@ async fn poll_loop(
 
         let mut had_error = false;
         let mut had_activity = false;
-        metrics
-            .poll_cycles
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         if let Some(delegation_id) = delegation_id.as_deref()
             && tokio::time::Instant::now() >= next_directory_renewal
@@ -1239,9 +1181,6 @@ async fn poll_loop(
                     next_directory_renewal = tokio::time::Instant::now() + DIRECTORY_RENEW_INTERVAL;
                 }
                 Ok(_) => {
-                    metrics
-                        .directory_lease_lost
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(
                         target: "astra_runtime::messaging::db_transport",
                         %delegation_id,
@@ -1253,12 +1192,6 @@ async fn poll_loop(
                 }
                 Err(error) => {
                     had_error = true;
-                    metrics
-                        .directory_lease_renewal_errors
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    metrics
-                        .poll_errors
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(
                         target: "astra_runtime::messaging::db_transport",
                         %delegation_id,
@@ -1295,9 +1228,6 @@ async fn poll_loop(
             Ok(row) => row.is_some(),
             Err(error) => {
                 had_error = true;
-                metrics
-                    .poll_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(target: "astra_runtime::messaging::db_transport",
                     "  ⚠ messaging: direct pending probe error for {}@{}: {:?}",
                     addr.agent_id, addr.run_id, error
@@ -1348,9 +1278,6 @@ async fn poll_loop(
                             let message_id: Option<String> = row.try_get("message_id").ok();
                             if message_id.is_none() {
                                 had_error = true;
-                                metrics
-                                    .poll_errors
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if let Err(e) = release_direct_claimed_batch_for_consumer_in_pool(
                                     &pool,
                                     &consumer_id,
@@ -1376,9 +1303,6 @@ async fn poll_loop(
                             let json: String = match row.try_get("payload_json") {
                                 Ok(j) => j,
                                 Err(_) => {
-                                    metrics
-                                        .messages_dropped
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     match mark_direct_failed_by_identity(
                                         &pool,
                                         message_id.as_deref(),
@@ -1390,9 +1314,6 @@ async fn poll_loop(
                                         Ok(()) => {}
                                         Err(e) => {
                                             had_error = true;
-                                            metrics
-                                                .poll_errors
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                                 "  ⚠ messaging: failed to dead-letter undecodable direct row (message_id: {}) for {}@{}: {:?}",
                                                 message_id.as_deref().unwrap_or("<unavailable>"),
@@ -1416,9 +1337,6 @@ async fn poll_loop(
                                         .await
                                         .is_err()
                                     {
-                                        metrics
-                                            .poll_errors
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         if let Err(e) = release_claimed_for_consumer_in_pool(
                                             &pool,
                                             &consumer_id,
@@ -1434,14 +1352,8 @@ async fn poll_loop(
                                         }
                                         break 'poll;
                                     }
-                                    metrics
-                                        .messages_received
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                                 Ok(_) | Err(_) => {
-                                    metrics
-                                        .messages_dropped
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     match mark_direct_failed_by_identity(
                                         &pool,
                                         message_id.as_deref(),
@@ -1453,9 +1365,6 @@ async fn poll_loop(
                                         Ok(()) => {}
                                         Err(e) => {
                                             had_error = true;
-                                            metrics
-                                                .poll_errors
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                                 "  ⚠ messaging: failed to dead-letter direct row (message_id: {}) for {}@{}: {:?}",
                                                 message_id.as_deref().unwrap_or("<unavailable>"),
@@ -1470,9 +1379,6 @@ async fn poll_loop(
                         }
                     } else {
                         had_error = true;
-                        metrics
-                            .poll_errors
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if let Err(e) = release_direct_claimed_batch_for_consumer_in_pool(
                             &pool,
                             &consumer_id,
@@ -1501,9 +1407,6 @@ async fn poll_loop(
                 }
                 Err(e) => {
                     had_error = true;
-                    metrics
-                        .poll_errors
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(target: "astra_runtime::messaging::db_transport",
                         "  ⚠ messaging: direct claim error for {}@{}: {:?}",
                         addr.agent_id, addr.run_id, e
@@ -1538,9 +1441,6 @@ async fn poll_loop(
                     let message_id: Option<String> = row.try_get("message_id").ok();
                     if message_id.is_none() {
                         had_error = true;
-                        metrics
-                            .poll_errors
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!(target: "astra_runtime::messaging::db_transport",
                             "  ⚠ messaging: broadcast row missing message_id for delegation {}",
                             did
@@ -1551,16 +1451,10 @@ async fn poll_loop(
                     let json: String = match row.try_get("payload_json") {
                         Ok(j) => j,
                         Err(_) => {
-                            metrics
-                                .messages_dropped
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             match mark_broadcast_failed_by_identity(&pool, &message_id, did).await {
                                 Ok(()) => {}
                                 Err(e) => {
                                     had_error = true;
-                                    metrics
-                                        .poll_errors
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                         "  ⚠ messaging: failed to dead-letter undecodable broadcast message {} for delegation {}: {:?}",
                                         message_id, did, e
@@ -1588,9 +1482,6 @@ async fn poll_loop(
                                 Ok(false) => continue,
                                 Err(e) => {
                                     had_error = true;
-                                    metrics
-                                        .poll_errors
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                         "  ⚠ messaging: failed to reserve broadcast delivery {} for {} in delegation {}: {:?}",
                                         message_id, consumer_id, did, e
@@ -1621,21 +1512,12 @@ async fn poll_loop(
                                 }
                                 break 'poll;
                             }
-                            metrics
-                                .messages_received
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                         Ok(_) | Err(_) => {
-                            metrics
-                                .messages_dropped
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             match mark_broadcast_failed_by_identity(&pool, &message_id, did).await {
                                 Ok(()) => {}
                                 Err(e) => {
                                     had_error = true;
-                                    metrics
-                                        .poll_errors
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                         "  ⚠ messaging: failed to dead-letter broadcast message {} for delegation {}: {:?}",
                                         message_id, did, e
@@ -1647,9 +1529,6 @@ async fn poll_loop(
                 }
             } else {
                 had_error = true;
-                metrics
-                    .poll_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(target: "astra_runtime::messaging::db_transport",
                     "  ⚠ messaging: broadcast poll error for delegation {}: {:?}",
                     did,
@@ -1678,9 +1557,6 @@ async fn poll_loop(
                 interval
             } else {
                 consecutive_idle_cycles = consecutive_idle_cycles.saturating_add(1);
-                metrics
-                    .idle_poll_cycles
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 idle_poll_interval(interval, consecutive_idle_cycles, &consumer_id)
             }
         };
@@ -3001,10 +2877,10 @@ mod tests {
             loop {
                 if transport.agent_count().await == 0
                     && transport
-                        .metrics()
-                        .directory_lease_lost
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        == 1
+                        .poll_abort_handles
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_empty()
                 {
                     break;
                 }
@@ -3211,16 +3087,6 @@ mod tests {
                 "remaining_delivery_rows": count_delivery_rows(&pool).await,
             })
         );
-    }
-
-    #[test]
-    fn transport_metrics_default() {
-        let m = TransportMetrics::default();
-        assert_eq!(
-            m.messages_sent.load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
-        assert_eq!(m.poll_errors.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

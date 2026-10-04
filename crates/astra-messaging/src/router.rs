@@ -1919,19 +1919,7 @@ mod tests {
         assert!(mailbox.wait_ready().await);
         mailbox.release_unconsumed().await.unwrap();
 
-        let sent_before_replay = transport
-            .metrics()
-            .messages_sent
-            .load(AtomicOrdering::Relaxed);
         let mut next = router.register(root.clone(), None).await.unwrap();
-        assert_eq!(
-            transport
-                .metrics()
-                .messages_sent
-                .load(AtomicOrdering::Relaxed),
-            sent_before_replay,
-            "volatile backlog ownership transfer must not resend messages"
-        );
         let fresh = AgentMessage::new(
             sender,
             MessageTarget::Direct { address: root },

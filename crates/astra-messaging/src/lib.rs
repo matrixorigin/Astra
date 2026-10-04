@@ -16,11 +16,9 @@ pub use astra_turn_types::{
     AGENT_COMMUNICATION_SCHEMA_VERSION, AgentCommunicationDirection, AgentCommunicationEvent,
     AgentCommunicationParty, AgentCommunicationTarget,
 };
-pub use db_transport::{
-    CleanupScheduler, DatabaseTransport, TransportMetrics as DbTransportMetrics,
-};
+pub use db_transport::{CleanupScheduler, DatabaseTransport};
 pub use delegation::{DelegationLookup, SubRunInfo};
-pub use in_process::{InProcessMetrics, InProcessTransport};
+pub use in_process::InProcessTransport;
 pub use router::{AgentMailbox, AgentMailboxRouter, PermissionOutcome};
 pub use transport::{MessageStream, MessageTransport};
 pub use types::{

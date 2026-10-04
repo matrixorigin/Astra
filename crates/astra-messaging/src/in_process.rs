@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -44,17 +44,6 @@ impl Write for ByteCounter {
 struct DirectEnvelope {
     message: Arc<AgentMessage>,
     charged_bytes: usize,
-}
-
-// ─── Metrics ────────────────────────────────────────────────────────────────
-
-/// Observable counters for the in-process transport.
-#[derive(Debug, Default)]
-pub struct InProcessMetrics {
-    pub messages_sent: AtomicU64,
-    pub messages_received: AtomicU64,
-    pub messages_dropped: AtomicU64,
-    pub broadcast_lag_events: AtomicU64,
 }
 
 // ─── InProcessTransport ─────────────────────────────────────────────────────
@@ -103,8 +92,6 @@ pub struct InProcessTransport {
     is_shutdown: AtomicBool,
     /// Total retained direct-message charge, including unacknowledged deliveries.
     total_direct_bytes: Arc<AtomicUsize>,
-    /// Observable metrics.
-    metrics: Arc<InProcessMetrics>,
 }
 
 impl InProcessTransport {
@@ -115,7 +102,6 @@ impl InProcessTransport {
             memberships: RwLock::new(HashMap::new()),
             is_shutdown: AtomicBool::new(false),
             total_direct_bytes: Arc::new(AtomicUsize::new(0)),
-            metrics: Arc::new(InProcessMetrics::default()),
         }
     }
 
@@ -150,11 +136,6 @@ impl InProcessTransport {
         self.inboxes.read().await.len()
     }
 
-    /// Get a reference to the transport's metrics counters.
-    pub fn metrics(&self) -> &Arc<InProcessMetrics> {
-        &self.metrics
-    }
-
     async fn enqueue(&self, msg: Arc<AgentMessage>) -> Result<(), MailboxError> {
         if self.is_shutdown.load(Ordering::Relaxed) {
             return Err(MailboxError::DeliveryRejected(
@@ -174,9 +155,6 @@ impl InProcessTransport {
             .map_err(|error| MailboxError::DeliveryRejected(format!("message size: {error}")))?;
         let charge = counter.0.saturating_add(DIRECT_ENVELOPE_OVERHEAD);
         if charge > MAX_DIRECT_MESSAGE_BYTES {
-            self.metrics
-                .messages_dropped
-                .fetch_add(1, Ordering::Relaxed);
             return Err(MailboxError::DeliveryRejected(
                 "direct message too large".into(),
             ));
@@ -189,9 +167,6 @@ impl InProcessTransport {
         if state.outstanding >= DIRECT_INBOX_CAPACITY
             || state.outstanding_bytes.saturating_add(charge) > MAX_DIRECT_INBOX_BYTES
         {
-            self.metrics
-                .messages_dropped
-                .fetch_add(1, Ordering::Relaxed);
             return Err(MailboxError::DeliveryRejected(
                 "direct inbox full (backpressure)".into(),
             ));
@@ -204,9 +179,6 @@ impl InProcessTransport {
             })
             .is_err()
         {
-            self.metrics
-                .messages_dropped
-                .fetch_add(1, Ordering::Relaxed);
             return Err(MailboxError::DeliveryRejected(
                 "direct transport byte capacity reached".into(),
             ));
@@ -217,7 +189,6 @@ impl InProcessTransport {
         });
         state.outstanding += 1;
         state.outstanding_bytes += charge;
-        self.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
         inbox.ready.notify_one();
         Ok(())
     }
@@ -327,7 +298,6 @@ impl MessageTransport for InProcessTransport {
         if state.last_owner.as_ref() != Some(subscription) || state.subscription.is_some() {
             return Ok(());
         }
-        let abandoned = state.outstanding;
         let abandoned_bytes = state.outstanding_bytes;
         state.retired = true;
         state.pending.clear();
@@ -337,9 +307,6 @@ impl MessageTransport for InProcessTransport {
         inboxes.remove(subscription.address());
         self.total_direct_bytes
             .fetch_sub(abandoned_bytes, Ordering::AcqRel);
-        self.metrics
-            .messages_dropped
-            .fetch_add(abandoned as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -410,7 +377,6 @@ impl MessageTransport for InProcessTransport {
             delivered: VecDeque::new(),
             detached: false,
             broadcast: broadcast_rx,
-            metrics: Arc::clone(&self.metrics),
             total_direct_bytes: Arc::clone(&self.total_direct_bytes),
         }))
     }
@@ -463,27 +429,16 @@ impl MessageTransport for InProcessTransport {
 
         let broadcasts = self.broadcasts.read().await;
         let Some(tx) = broadcasts.get(delegation_id) else {
-            self.metrics
-                .messages_dropped
-                .fetch_add(1, Ordering::Relaxed);
             return Err(MailboxError::Transport(format!(
                 "broadcast group not found: {delegation_id}"
             )));
         };
 
         match tx.send(msg) {
-            Ok(_) => {
-                self.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(_) => {
-                self.metrics
-                    .messages_dropped
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(MailboxError::Transport(format!(
-                    "broadcast group '{delegation_id}' has no subscribers"
-                )))
-            }
+            Ok(_) => Ok(()),
+            Err(_) => Err(MailboxError::Transport(format!(
+                "broadcast group '{delegation_id}' has no subscribers"
+            ))),
         }
     }
 
@@ -517,7 +472,6 @@ struct InProcessStream {
     delivered: VecDeque<DirectEnvelope>,
     detached: bool,
     broadcast: Option<broadcast::Receiver<Arc<AgentMessage>>>,
-    metrics: Arc<InProcessMetrics>,
     total_direct_bytes: Arc<AtomicUsize>,
 }
 
@@ -552,9 +506,6 @@ impl InProcessStream {
         }?;
         let message = Arc::clone(&envelope.message);
         self.delivered.push_back(envelope);
-        self.metrics
-            .messages_received
-            .fetch_add(1, Ordering::Relaxed);
         Some(message)
     }
 }
@@ -594,7 +545,6 @@ impl MessageStream for InProcessStream {
                 } => match result {
                     Ok(message) => return Some(message),
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        self.metrics.broadcast_lag_events.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(target: "astra_messaging", n, "broadcast receiver lagged");
                     }
                     Err(broadcast::error::RecvError::Closed) => self.broadcast = None,
@@ -1202,57 +1152,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_track_send_count() {
+    async fn full_inbox_rejects_additional_messages() {
         let transport = InProcessTransport::new();
         let a = addr("r1", "a");
         let b = addr("r2", "b");
 
         let _a_subscription = transport.register(a.clone(), None).await.unwrap();
         let _b_subscription = transport.register(b.clone(), None).await.unwrap();
+        // Subscribe retains deliveries within the bounded inbox.
         let _stream = transport.subscribe(&_b_subscription).await.unwrap();
 
-        for i in 0..3 {
-            let msg = text_msg(a.clone(), b.clone(), &format!("m{i}"));
-            transport.send(msg).await.unwrap();
-        }
-
-        assert_eq!(transport.metrics().messages_sent.load(Ordering::Relaxed), 3);
-    }
-
-    #[tokio::test]
-    async fn metrics_track_dropped_on_backpressure() {
-        let transport = InProcessTransport::new();
-        let a = addr("r1", "a");
-        let b = addr("r2", "b");
-
-        let _a_subscription = transport.register(a.clone(), None).await.unwrap();
-        let _b_subscription = transport.register(b.clone(), None).await.unwrap();
-        // Subscribe creates a bounded channel (cap 4096).
-        let _stream = transport.subscribe(&_b_subscription).await.unwrap();
-
-        // Fill the channel beyond capacity.
+        // Fill the inbox beyond capacity.
         let mut sent = 0u64;
         let mut dropped = 0u64;
         for i in 0..5000 {
             let msg = text_msg(a.clone(), b.clone(), &format!("flood-{i}"));
             match transport.send(msg).await {
                 Ok(()) => sent += 1,
-                Err(_) => dropped += 1,
+                Err(MailboxError::DeliveryRejected(_)) => dropped += 1,
+                Err(error) => panic!("unexpected send failure: {error}"),
             }
         }
 
-        assert_eq!(
-            transport.metrics().messages_sent.load(Ordering::Relaxed),
-            sent
-        );
-        assert_eq!(
-            transport.metrics().messages_dropped.load(Ordering::Relaxed),
-            dropped
-        );
-        assert!(
-            dropped > 0,
-            "should have dropped some messages due to backpressure"
-        );
+        assert_eq!(sent, DIRECT_INBOX_CAPACITY as u64);
+        assert_eq!(dropped, 5000 - sent);
     }
 
     #[tokio::test]
@@ -1276,10 +1199,6 @@ mod tests {
             }
             other => panic!("expected transport error, got {other:?}"),
         }
-        assert_eq!(
-            transport.metrics().messages_dropped.load(Ordering::Relaxed),
-            1
-        );
     }
 
     #[tokio::test]
@@ -1310,10 +1229,6 @@ mod tests {
             }
             other => panic!("expected transport error, got {other:?}"),
         }
-        assert_eq!(
-            transport.metrics().messages_dropped.load(Ordering::Relaxed),
-            1
-        );
     }
 
     #[tokio::test]
