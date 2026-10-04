@@ -106,6 +106,15 @@ pass. Both final answers must be exactly `42`. Report all physical calls,
 auxiliary judgments, token/cache coverage, tool attempts, and elapsed phases,
 not just whether the answer is right. Use repeated runs for latency claims.
 
+`flash_child_compact_json` adds a non-arithmetic, compact JSON contract for
+both the actual GLM child result and the parent's answer. Together with the
+integer-only cases, it checks whether requested formats survive shared persona
+and summary guidance without runtime output rewriting. Keep failed samples;
+one later pass does not demonstrate reliable format compliance. The fanout
+case also reports a soft primary-round bound of four: automatic delivery should
+avoid re-fetching sufficient observed results, while inspection, missing or
+truncated output, pagination and recovery remain valid reasons to read results.
+
 `flash_semantic_model_reference_glm` isolates candidate-aware semantic
 selection from live websites. The user says `5.2glm` without tool syntax;
 the case requires the authorized `glm-5.2` child to make a real provider call

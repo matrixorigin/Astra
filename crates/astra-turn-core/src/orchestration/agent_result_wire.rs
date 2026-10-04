@@ -766,7 +766,9 @@ fn render_child_agent_result(mut body: Value) -> String {
     body.to_string()
 }
 
-pub const PENDING_CHILD_RUNTIME_WAIT_GUIDANCE: &str = "This observation is not a terminal result. Continue only work needed for the user's request. For a pending direct child owned by this run, proposing a final answer lets the runtime wait and resume when continuation is available. Otherwise inspect the child's status or waiting reason. Do not busy-poll or use shell sleep solely to wait.";
+pub const CHILD_OUTCOME_GUIDANCE: &str = "Continue relevant independent work while children run. After an accepted launch, when none remains, use agent(action='wait') for current-run input; a proposed final answer also enters runtime completion waiting. Terminal child outcomes are delivered automatically. Do not re-fetch an already observed, sufficient terminal result. get_result/get_results remain available for inspection, missing or truncated output, pagination, and recovery. Do not busy-poll or use shell sleep. A wait timeout does not cancel children or authorize completion.";
+
+pub const PENDING_CHILD_RUNTIME_WAIT_GUIDANCE: &str = "This observation is not a terminal result. Continue only work needed for the user's request. For a pending direct child owned by this run, use agent(action='wait') for input, or propose a final answer so the runtime waits and resumes when continuation is available. Otherwise inspect the child's status or waiting reason. Do not busy-poll or use shell sleep solely to wait.";
 
 pub fn render_wait_timeout_outcome(
     agent_id: &str,

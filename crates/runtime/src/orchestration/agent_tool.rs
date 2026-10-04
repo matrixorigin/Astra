@@ -30,8 +30,8 @@ use astra_tools::agent_tool_contract::{
     has_malformed_tool_args,
 };
 use astra_turn_core::orchestration::agent_result_wire::{
-    AGENT_RESULT_CLASS_SUCCESS, DecodedAgentToolResult, agent_tool_result_needs_recovery,
-    agent_tool_structured_result_class, decode_agent_tool_result,
+    AGENT_RESULT_CLASS_SUCCESS, CHILD_OUTCOME_GUIDANCE, DecodedAgentToolResult,
+    agent_tool_result_needs_recovery, agent_tool_structured_result_class, decode_agent_tool_result,
     fanout_slot_status_is_recoverable_issue, render_agent_tool_admission_error,
     render_agent_tool_admission_error_with_kind, render_agent_tool_error,
     render_unknown_agent_result, render_wait_for_agent_status, render_wait_timeout_outcome,
@@ -84,7 +84,6 @@ static NEXT_FANOUT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 /// caller-supplied agent_id — that value already appears in the
 /// structured `agent_id` JSON field, where serde escapes it safely.
 const UNKNOWN_AGENT_ID_ERROR: &str = "Unknown agent_id. Use the exact runtime-generated agent_id returned by the earlier spawn result. The optional spawn `name` is only for send_message addressing and cannot be used with get_result.";
-const CHILD_OUTCOME_GUIDANCE: &str = "Continue relevant independent work while children run. When none remains, use agent(action='wait') for input, or propose a final answer for runtime completion waiting. get_result is for inspection or output windows, not polling. A wait timeout does not cancel children.";
 
 /// Keep preparation owned by the tool call while still polling the large
 /// spawner future from a fresh Tokio scheduler frame. Dropping the handler
@@ -1187,7 +1186,7 @@ const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
 ];
 const FANOUT_STOP_SLOT_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id", "slot_index"];
 const FANOUT_STOP_GROUP_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id"];
-const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}]}. Put concise work instructions in each slots[i].prompt. If this run has an admitted profile directory, set agent_type on each slot or in defaults to the exact non-empty profile/directory ID from that directory; do not omit it or substitute explore, code-review, task, or general-purpose. If no admitted profile directory is present, omit agent_type for the bounded read-only default, or choose a builtin persona only when mutation or the full surface is required. With an admitted profile directory, an omitted model policy uses that exact profile's model default; if it has no default, it inherits the parent Offering. Explicit Inherit requests the parent Offering, while an explicit authorized Offering ID or reasoning control remains authoritative; for any model name coming from the user, omit requested_model_policy and let one candidate-aware admission resolve it. Auto strategies are preserved as requests but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable. Reasoning is a separate control. Every slot is resolved and admitted atomically before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout starts all admitted children concurrently and returns launch receipts immediately; the parent continues independent work and uses `agent_fanout(action='get_results', group_id=...)` when it needs results. Do not pass run_in_background.";
+const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}]}. Put concise work instructions in each slots[i].prompt. If this run has an admitted profile directory, set agent_type on each slot or in defaults to the exact non-empty profile/directory ID from that directory; do not omit it or substitute explore, code-review, task, or general-purpose. If no admitted profile directory is present, omit agent_type for the bounded read-only default, or choose a builtin persona only when mutation or the full surface is required. With an admitted profile directory, an omitted model policy uses that exact profile's model default; if it has no default, it inherits the parent Offering. Explicit Inherit requests the parent Offering, while an explicit authorized Offering ID or reasoning control remains authoritative; for any model name coming from the user, omit requested_model_policy and let one candidate-aware admission resolve it. Auto strategies are preserved as requests but currently fail closed before any child starts because comparable task-level cost, quality, and completion-time evidence is unavailable. Reasoning is a separate control. Every slot is resolved and admitted atomically before any child starts. Children can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout starts all admitted children concurrently and returns launch receipts immediately; the parent continues independent work and follows the launch receipt for waiting and automatic result delivery. Do not pass run_in_background.";
 const FANOUT_GET_RESULTS_SHAPE: &str = "Use one JSON object: {\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}. For large results, use {\"action\":\"get_results\",\"group_id\":\"returned-group-id\",\"slot_index\":0,\"offset\":0,\"max_bytes\":8192}.";
 const FANOUT_STOP_SLOT_SHAPE: &str = "Use one JSON object: {\"action\":\"stop_slot\",\"group_id\":\"returned-group-id\",\"slot_index\":0}.";
 const FANOUT_STOP_GROUP_SHAPE: &str =
@@ -1868,14 +1867,14 @@ async fn handle_agent_fanout_start_action_with_deadline(
                 .map(fanout_group_summary_to_json)
                 .unwrap_or(Value::Null),
             "delivery": "parent_owned_concurrent",
-            "instruction": "Fanout children are running concurrently. Continue independent parent work; do not claim child completion yet. Use agent_fanout(action='get_results', group_id=...) when their results are needed. Live progress remains available through the active work view.",
+            "instruction": format!("Fanout children are running concurrently; do not claim child completion yet. {CHILD_OUTCOME_GUIDANCE}"),
         });
         if terminal_causes.has_stopped_slots() {
             let obj = resp.as_object_mut().unwrap();
             terminal_causes.insert_json_fields(obj);
             obj.insert(
                 "instruction".into(),
-                json!("Some fanout slots already stopped before the group fully launched. Do not retry or spawn replacements. Use agent_fanout(action='get_results', group_id=...) to collect completed or partial results when ready."),
+                json!(format!("Some fanout slots already stopped before the group fully launched. Preserve their individual outcomes; do not retry or spawn replacements. {CHILD_OUTCOME_GUIDANCE}")),
             );
         }
         // If any slot failed to spawn synchronously, inject anti-respawn
@@ -1888,7 +1887,7 @@ async fn handle_agent_fanout_start_action_with_deadline(
         if any_spawn_failed && !terminal_causes.has_stopped_slots() {
             resp.as_object_mut().unwrap().insert(
                 "instruction".into(),
-                json!("Some agents failed to spawn. Do NOT retry or spawn replacements. Use agent_fanout(action='get_results', group_id=...) to collect partial results when ready."),
+                json!(format!("Some agents failed to spawn. Preserve their individual outcomes; do NOT retry or spawn replacements. {CHILD_OUTCOME_GUIDANCE}")),
             );
         }
         return resp.to_string();
@@ -5972,7 +5971,7 @@ pub(crate) mod tests {
         assert!(
             value["instruction"]
                 .as_str()
-                .is_some_and(|instruction| instruction.contains("get_results")),
+                .is_some_and(|instruction| instruction.contains(CHILD_OUTCOME_GUIDANCE)),
             "{value}"
         );
         assert_eq!(value["delivery"], "parent_owned_concurrent");

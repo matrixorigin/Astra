@@ -17,6 +17,9 @@ timeout_seconds: 240
 criteria:
   - type: exit_code
     code: 0
+  - type: turn_rounds_between
+    min: 2
+    max: 4
   - type: journal_tool_call_count
     name: agent_fanout
     min: 1

@@ -249,7 +249,7 @@ fn parent_coordination_addendum(agent_prompt: &str) -> String {
          The runtime owns your run identity and parent routing; use `to=\"parent\"` for the typed parent target. \
          Stay within the delegated task boundary. If you need an answer from your parent, use `agent(action=\"send_message\", to=\"parent\", message_type=\"question\", ...)`; `ask_user` addresses the human, not your parent. Use parent messages only when you are blocked, need a decision, discover information that materially changes the parent plan, or have a concise milestone worth acting on. \
          A parent question is control flow, never terminal output. After sending one through agent(action=\"send_message\", to=\"parent\", message_type=\"question\", ...), wait for the correlated answer and do not finish the run until the delegated brief is complete. \
-         Routine tool-by-tool progress does not need reporting. Complete the entire delegated brief before returning: every explicit operation, condition, and requested output is required. Do not return an intermediate calculation, partial checklist, plan, or first step as the terminal result. Before finishing, verify that the result answers the full brief; if something remains incomplete, state exactly what remains and why. Return only the answer, evidence, or decision the parent needs; keep a one-shot result to one line when that is sufficient. Do not paste file contents, diffs, or large logs into the result—store detailed artifacts where the task requires them and summarize the relevant evidence. Your terminal result is delivered to the parent automatically.",
+         Routine tool-by-tool progress does not need reporting. Complete the entire delegated brief before returning: every explicit operation, condition, and requested output is required. Do not return an intermediate calculation, partial checklist, plan, or first step as the terminal result. Before finishing, verify that the result answers the full brief; if something remains incomplete, state exactly what remains and why. Return only the answer, evidence, or decision the parent needs. Honor the brief's requested output format exactly; persona and summary defaults must not add explanation or formatting. Otherwise keep a one-shot result to one line when sufficient. Do not paste file contents, diffs, or large logs into the result—store detailed artifacts where the task requires them and summarize the relevant evidence. Your terminal result is delivered to the parent automatically.",
         agent_prompt,
     )
 }
@@ -11691,6 +11691,10 @@ pub(crate) mod tests {
         assert!(first.contains("wait for the correlated answer"));
         assert!(first.contains("`ask_user` addresses the human"));
         assert!(first.contains("Return only the answer, evidence, or decision"));
+        assert!(first.contains("Honor the brief's requested output format exactly"));
+        assert!(
+            first.contains("persona and summary defaults must not add explanation or formatting")
+        );
         assert!(first.contains("Complete the entire delegated brief"));
         assert!(first.contains("Do not return an intermediate calculation"));
         assert!(first.contains("Do not paste file contents, diffs, or large logs"));

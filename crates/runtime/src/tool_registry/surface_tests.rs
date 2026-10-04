@@ -471,6 +471,11 @@ fn resident_settlement_schema_accepts_typed_direct_input_and_rejects_stale_shape
 fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
     let resident = surface.always_load_schemas();
+    let agent_description = find(&resident, "agent")["function"]["description"]
+        .as_str()
+        .expect("resident agent description");
+    assert!(agent_description.contains("agent(wait) yields for automatic results"));
+    assert!(agent_description.contains("no re-fetch if sufficient"));
     let full = catalog_schemas();
     fn find<'a>(schemas: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
         schemas
@@ -549,7 +554,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
         agent["function"]["description"]
             .as_str()
             .unwrap()
-            .contains("Runtime binds the user's model requirement")
+            .contains("runtime binds requested models")
     );
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "agent", &json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"}), agent,
