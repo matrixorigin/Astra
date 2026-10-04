@@ -5986,10 +5986,6 @@ mod tests {
         }
     }
 
-    fn test_executor() -> ToolExecutor {
-        ToolExecutor::new(std::env::temp_dir())
-    }
-
     fn assert_preparation_rejected(outcome: super::super::ToolExecutionOutcome) {
         assert!(outcome.is_error);
         let fields = outcome.tool_result_fields.expect("preflight facts");
@@ -7193,7 +7189,8 @@ mod tests {
 
     #[test]
     fn bash_missing_command_returns_error() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         let result = executor.bash(&serde_json::json!({}));
         assert!(result.contains("Error"), "got: {result}");
         assert!(
@@ -7205,7 +7202,8 @@ mod tests {
 
     #[test]
     fn bash_blank_command_returns_model_argument_error() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         let result = executor.bash(&serde_json::json!({"command": " \n\t "}));
         assert!(result.contains("Error"), "got: {result}");
         assert!(
@@ -7217,14 +7215,16 @@ mod tests {
 
     #[test]
     fn bash_echo_returns_output() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         let result = executor.bash(&serde_json::json!({"command": "echo hello"}));
         assert!(result.trim().contains("hello"), "got: {result}");
     }
 
     #[test]
     fn bash_rejects_background_task_pseudo_tool_call() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         let result =
             executor.bash(&serde_json::json!({"command": "task_output(task_id='bg-shell-1')"}));
         assert!(result.contains("background-task tool"), "got: {result}");
@@ -7245,7 +7245,8 @@ mod tests {
     /// to defeat.
     #[test]
     fn bash_rejects_background_task_output_dir_disk_read() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         for command in [
             "tail -20 /tmp/astra/bg_tasks/default/bg-shell-1.stderr",
             "cat /tmp/astra/bg_tasks/default/bg-shell-1.stdout",
@@ -7374,7 +7375,8 @@ mod tests {
 
     #[test]
     fn server_command_cap_preserves_adaptive_timeout_when_omitted() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         for (args, expected) in [
             (
                 serde_json::json!({
@@ -7423,7 +7425,8 @@ mod tests {
 
     #[test]
     fn bash_preparation_preserves_git_command_semantics() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         for command in [
             "git diff HEAD~5..HEAD",
             "git log HEAD~3..HEAD; exit 23",
@@ -7557,7 +7560,8 @@ mod tests {
         // wait for the backgrounded child to finish"; the absolute drain
         // timeout is not the point.
         let _guard = set_test_bash_pipe_read_timeout_ms(50);
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         let start = std::time::Instant::now();
         // This command starts a long-running background process and exits immediately.
         // Without the fix, wait_with_output() would block until sleep finishes (60s).
@@ -7618,7 +7622,8 @@ mod tests {
 
     #[test]
     fn joined_background_work_does_not_report_reaping() {
-        let outcome = test_executor().bash_outcome_with_cancel(
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = test_executor_in(dir.path()).bash_outcome_with_cancel(
             &serde_json::json!({"command": "sleep 0.02 & wait; echo done"}),
             astra_tools::tool_engine::ToolInvocationMetadata::default(),
             None,
@@ -7659,14 +7664,16 @@ mod tests {
 
     #[test]
     fn bash_failed_command_returns_output() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         let result = executor.bash(&serde_json::json!({"command": "echo err >&2 && false"}));
         assert!(result.contains("err"), "got: {result}");
     }
 
     #[test]
     fn powershell_missing_command_returns_error() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         let result = executor.powershell(&serde_json::json!({}));
         assert!(result.contains("Error"), "got: {result}");
         assert!(
@@ -7696,7 +7703,8 @@ mod tests {
         let Some(_) = find_powershell_program() else {
             return;
         };
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         let result = executor.powershell(&serde_json::json!({
             "command": "Write-Output hello"
         }));
@@ -7705,7 +7713,8 @@ mod tests {
 
     #[test]
     fn grep_missing_pattern_returns_error() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         let result = executor.grep(&serde_json::json!({}));
         assert!(result.contains("Error"), "got: {result}");
     }
@@ -10135,7 +10144,8 @@ mod tests {
 
     #[test]
     fn bash_grep_no_match_not_error() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         let result = executor.bash(
             &serde_json::json!({"command": "grep -r 'ZZZZZ_IMPOSSIBLE_PATTERN_99999' /dev/null"}),
         );
@@ -10148,7 +10158,8 @@ mod tests {
 
     #[test]
     fn bash_false_command_is_domain_negative_not_error() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         let result = executor.bash(&serde_json::json!({"command": "false"}));
         assert!(
             !result.to_lowercase().starts_with("error"),
@@ -10162,7 +10173,8 @@ mod tests {
 
     #[test]
     fn edge_bash_pipeline_preserves_upstream_failure_status() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         let output = executor
             .run_shell_output("bash -c 'exit 7' | tail -1", 5.0)
             .expect("pipeline should execute");
@@ -10189,7 +10201,8 @@ mod tests {
 
     #[test]
     fn bash_blocks_name_based_process_kill_commands() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         let result = executor.bash(&serde_json::json!({"command": "pkill -f http.server"}));
         assert!(
             result.contains("not allowed in this shared environment"),

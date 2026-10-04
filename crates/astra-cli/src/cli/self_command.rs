@@ -2322,8 +2322,10 @@ mod tests {
         assert!(error.contains("no session journal or workspace matches"));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn snapshot_aggregates_workspace_and_journal_state() {
+        let _api_url = EnvGuard::set("ASTRA_API_URL", "");
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-snapshot-session";
@@ -2439,8 +2441,10 @@ mod tests {
         assert_eq!(value["acceptance"]["ok"], true);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn snapshot_surfaces_persistence_error_field() {
+        let _api_url = EnvGuard::set("ASTRA_API_URL", "");
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-snapshot-persistence";
@@ -2520,8 +2524,10 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn health_surface_exposes_risk_flags_and_acceptance() {
+        let _api_url = EnvGuard::set("ASTRA_API_URL", "");
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-health-session";
@@ -2631,8 +2637,10 @@ mod tests {
         assert_eq!(value["acceptance_ok"], true);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn verify_surface_reports_acceptance_gaps() {
+        let _api_url = EnvGuard::set("ASTRA_API_URL", "");
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-verify-session";

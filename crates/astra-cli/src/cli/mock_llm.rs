@@ -1274,7 +1274,9 @@ mod tests {
         let server = super::MockLlmServer::start(MockScenario::ToolThenComplete)
             .await
             .unwrap();
-        let client = reqwest::Client::new();
+        let client = astra_core::net::client_builder_for_target(&server.base_url)
+            .build()
+            .unwrap();
         let mut response = client
             .post(format!("{}/chat/stream", server.base_url))
             .json(&serde_json::json!({"agent_id": "astra-cli", "message": "launch the review"}))
@@ -1395,7 +1397,9 @@ mod tests {
         let server = super::MockLlmServer::start(MockScenario::ToolThenComplete)
             .await
             .unwrap();
-        let client = reqwest::Client::new();
+        let client = astra_core::net::client_builder_for_target(&server.base_url)
+            .build()
+            .unwrap();
         let mut response = client
             .post(format!("{}/chat/stream", server.base_url))
             .json(&serde_json::json!({"agent_id": "astra-cli", "message": "write the file"}))

@@ -1785,6 +1785,7 @@ mod tests {
     #[tokio::test]
     async fn login_account_change_closes_old_owner_session_before_rebinding() {
         let _creds_guard = crate::tests::isolate_credentials();
+        let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         let _home = crate::test_utils::HomeGuard::temp();
         let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
         let (_sessions_dir, _journal_guard) = crate::tests::isolated_sessions_dir();
@@ -1912,6 +1913,34 @@ mod tests {
                 ],
             )
             .unwrap();
+        assert_eq!(commit.next.cursor().owner_id, "account-b");
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{fresh_id}/resume")))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer access-b",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                astra_services::session_restore::RestoredSession {
+                    session_id: fresh_id.clone(),
+                    turn_count: 1,
+                    restored_from_cloud: true,
+                    resume_bundle: Some(astra_turn_types::ResumeBundleV1 {
+                        schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+                        cursor: commit.next.cursor().clone(),
+                        source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+                        conversation_messages: commit.next.messages().to_vec(),
+                        materialized_conversation_root_hash: None,
+                        degraded_reasons: Vec::new(),
+                        repair_actions: Vec::new(),
+                        projections: Default::default(),
+                    }),
+                    ..Default::default()
+                },
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
         state
             .journal
             .as_ref()

@@ -3216,6 +3216,7 @@ mod tests {
         assert!(history.is_empty());
     }
 
+    #[serial_test::serial]
     #[test]
     fn restore_history_from_journal_roundtrip() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
