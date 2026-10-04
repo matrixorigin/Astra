@@ -28827,7 +28827,7 @@ async fn db_long_running_fanout_survives_observer_restart_and_partial_completion
     for (run_id, agent_id, _) in &children {
         owner
             .run_engine
-            .start_run_ext(
+            .start_run_ext_with_context(
                 run_id,
                 &user_id,
                 &session_id,
@@ -28835,6 +28835,10 @@ async fn db_long_running_fanout_survives_observer_restart_and_partial_completion
                 Some("fanout-it-delegation"),
                 Some(agent_id),
                 None,
+                crate::server::run::engine::RunStartContext {
+                    child_runtime_id: Some((*agent_id).into()),
+                    ..Default::default()
+                },
             )
             .await
             .expect("owner starts fanout child");
