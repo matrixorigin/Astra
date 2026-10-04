@@ -129,17 +129,6 @@ pub(crate) fn resolved_tool_metrics<I>(
     fallback_count: u32,
     fallback_tools: I,
     tool_call_records: &[ToolCallRecord],
-) -> (u32, Vec<String>)
-where
-    I: IntoIterator<Item = String>,
-{
-    resolved_tool_metrics_with_authority(fallback_count, fallback_tools, tool_call_records, false)
-}
-
-fn resolved_tool_metrics_with_authority<I>(
-    fallback_count: u32,
-    fallback_tools: I,
-    tool_call_records: &[ToolCallRecord],
     aggregate_authoritative: bool,
 ) -> (u32, Vec<String>)
 where
@@ -266,11 +255,11 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         run_transcript_messages,
         applied_user_intents,
     } = ctx;
-    let (_, tools_used) = resolved_tool_metrics_with_authority(
+    let (_, tools_used) = resolved_tool_metrics(
         tool_calls_count,
         tools_used,
         &tool_call_records,
-        tool_record_coverage_partial,
+        server_terminal_authoritative || tool_record_coverage_partial,
     );
     let mut interruption = interruption;
     let mut server_terminal_unverified = server_terminal_unverified;
@@ -665,6 +654,7 @@ mod tests {
                 String::new(),
             ],
             &[],
+            false,
         );
 
         assert_eq!(count, 4);
@@ -680,7 +670,7 @@ mod tests {
             tool_record(" read_file", true, Some("contents")),
         ];
 
-        let (count, tools) = resolved_tool_metrics(0, std::iter::empty(), &records);
+        let (count, tools) = resolved_tool_metrics(0, std::iter::empty(), &records, false);
 
         assert_eq!(count, 3);
         assert_eq!(tools, vec!["bash".to_string(), "read_file".to_string()]);
@@ -695,7 +685,9 @@ mod tests {
         ctx.tool_ledger_aggregate = succeeded_aggregate(34);
         ctx.tools_used = HashSet::from(["bash".to_string(), "write_file".to_string()]);
         ctx.server_terminal_authoritative = true;
-        ctx.tool_record_coverage_partial = true;
+        // A complete Server ledger still does not make the edge-only local
+        // records a complete projection of all executed tools.
+        ctx.tool_record_coverage_partial = false;
         ctx.tool_call_records = vec![tool_record("bash", false, Some("first run failed"))];
 
         let result = build_stream_result(ctx);

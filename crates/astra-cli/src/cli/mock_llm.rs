@@ -214,7 +214,7 @@ fn tool_request_for_run(
         "turn_chain_id": turn_chain_id,
         "request_id": call_id,
         "schema_admitted_by_server": true,
-        "execution_timeout_ms": 300_000,
+        "execution_timeout_ms": 300_000, "command_timeout_cap_ms": 30_000,
         "execution_deadline_unix_ms": 4_102_444_800_000_u64,
         "tool": tool,
         "args": args,

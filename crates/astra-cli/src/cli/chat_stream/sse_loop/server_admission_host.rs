@@ -2152,16 +2152,12 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut tools_used = if tool_records.is_empty() {
-                astra_core::canonical_names::normalize_name_list(
-                    state.telemetry.all_tools_used.iter().cloned(),
-                )
-            } else {
-                astra_core::canonical_names::normalize_name_list(
-                    tool_records.iter().map(|record| record.name.clone()),
-                )
-            };
-            tools_used.sort_unstable();
+            let (_, tools_used) = super::agentic_sse_loop::resolved_tool_metrics(
+                state.total_tool_calls,
+                state.telemetry.all_tools_used.iter().cloned(),
+                &tool_records,
+                !state.telemetry.server_summary_run_usage.is_empty(),
+            );
             inc.replace_tool_records(tool_records);
             // Retained records may be filtered (policy/synthetic entries) and
             // may overlap live edge records already counted incrementally.

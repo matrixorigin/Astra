@@ -546,6 +546,7 @@ pub enum ChatTurnEdgePending {
         /// across batching, local queueing, and SSE replay.
         execution_deadline_unix_ms: u64,
         execution_timeout_ms: u64,
+        command_timeout_cap_ms: Option<u64>,
         tool: String,
         args: Value,
     },
@@ -1082,6 +1083,19 @@ fn apply_one_event(
                         Some("Server tool_request omitted absolute execution deadline".to_string());
                     return;
                 };
+                let command_timeout_cap_ms = event
+                    .get("command_timeout_cap_ms")
+                    .and_then(Value::as_u64)
+                    .filter(|cap| *cap > 0 && *cap <= execution_timeout_ms);
+                if (tool == "bash" || event.get("command_timeout_cap_ms").is_some())
+                    && command_timeout_cap_ms.is_none()
+                {
+                    accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                    accum.error_message = Some(
+                        "Server tool_request omitted valid command timeout authority".to_string(),
+                    );
+                    return;
+                }
                 edge_pending.push(ChatTurnEdgePending::ToolRequest {
                     session_id: event
                         .get("session_id")
@@ -1106,6 +1120,7 @@ fn apply_one_event(
                         .unwrap_or(false),
                     execution_deadline_unix_ms,
                     execution_timeout_ms,
+                    command_timeout_cap_ms,
                     tool,
                     args,
                 });
@@ -3564,7 +3579,7 @@ mod tests {
     fn tool_request_enqueues_pending() {
         let mut a = ChatTurnSseAccum::default();
         let mut pending = Vec::new();
-        let block = "data: {\"type\":\"tool_request\",\"request_id\":\"tr-1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":1700000300000,\"tool\":\" bash \",\"args\":{\"command\":\"echo x\"}}\n\n";
+        let block = "data: {\"type\":\"tool_request\",\"request_id\":\"tr-1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":1700000300000,\"tool\":\" bash \",\"args\":{\"command\":\"echo x\"}}\n\n";
         dispatch_chat_turn_sse_event_block(block, &mut a, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
@@ -3645,7 +3660,7 @@ mod tests {
         dispatch_chat_turn_sse_event_block(
             &sse(
                 "tool_request",
-                ",\"request_id\":\"r1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"tool\":\"bash\"",
+                ",\"request_id\":\"r1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"tool\":\"bash\"",
             ),
             &mut a,
             &mut pending,
@@ -3656,6 +3671,59 @@ mod tests {
             a.error_message
                 .as_deref()
                 .is_some_and(|message| message.contains("absolute execution deadline"))
+        );
+    }
+
+    #[test]
+    fn bash_request_requires_command_timeout_authority_separate_from_delivery_budget() {
+        for cap in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(0)),
+            Some(serde_json::json!(-1)),
+            Some(serde_json::json!(1.5)),
+            Some(serde_json::json!("5000")),
+            Some(serde_json::json!(30_001)),
+        ] {
+            let mut event = serde_json::json!({
+                "type": "tool_request", "request_id": "bash-cap",
+                "schema_admitted_by_server": true, "tool": "bash",
+                "args": {"command": "echo verified"}, "execution_timeout_ms": 30_000,
+                "execution_deadline_unix_ms": 1_700_000_300_000u64
+            });
+            if let Some(cap) = cap {
+                event["command_timeout_cap_ms"] = cap;
+            }
+            let mut accum = ChatTurnSseAccum::default();
+            let mut pending = Vec::new();
+            dispatch_chat_turn_sse_event_block(
+                &format!("data: {event}\n\n"),
+                &mut accum,
+                &mut pending,
+            );
+            assert!(
+                pending.is_empty(),
+                "invalid authority cannot enter local execution"
+            );
+            assert_eq!(
+                accum.error_kind,
+                Some(astra_core::ErrorKind::ContractViolation)
+            );
+        }
+        let args = serde_json::json!({"command": "echo verified", "timeout": 90});
+        let event = serde_json::json!({
+            "type": "tool_request", "request_id": "bash-cap", "schema_admitted_by_server": true,
+            "tool": "bash", "args": args, "execution_timeout_ms": 30_000,
+            "execution_deadline_unix_ms": 1_700_000_300_000u64, "command_timeout_cap_ms": 5_000
+        });
+        let mut accum = ChatTurnSseAccum::default();
+        let mut pending = Vec::new();
+        dispatch_chat_turn_sse_event_block(&format!("data: {event}\n\n"), &mut accum, &mut pending);
+        assert!(accum.error_kind.is_none());
+        assert!(
+            matches!(pending.as_slice(), [ChatTurnEdgePending::ToolRequest {
+            command_timeout_cap_ms: Some(5_000), args: actual, ..
+        }] if actual == &args)
         );
     }
 
@@ -4211,7 +4279,7 @@ mod tests {
         dispatch_chat_turn_sse_event_block(
             &sse(
                 "tool_request",
-                ",\"request_id\":\"r1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000,\"tool\":\"bash\"",
+                ",\"request_id\":\"r1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"tool\":\"bash\"",
             ),
             &mut a,
             &mut pending,

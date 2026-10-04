@@ -342,8 +342,8 @@ pub use session_handoff::{
 };
 pub use session_identity::{MAX_PERSISTED_SESSION_ID_BYTES, validate_persisted_session_id};
 pub use skill_auto_route_judge::{
-    SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
-    SkillAutoRouteJudgeError, build_skill_auto_route_prompt, parse_skill_auto_route_response,
+    SkillAutoRouteCandidate, SkillAutoRouteJudgeContext, SkillAutoRouteJudgeError,
+    build_skill_auto_route_prompt, parse_skill_auto_route_response,
     skill_auto_route_judge_messages, skill_auto_route_judgment_request,
 };
 pub use skill_config::{
@@ -376,12 +376,11 @@ pub use sync_outbox::{
     sync_outbox_canonical_payload_hash, sync_outbox_stable_event_id,
 };
 pub use turn_intent_judge::{
-    TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError,
-    WORK_ADMISSION_MAX_OUTPUT_TOKENS, WORK_ADMISSION_MAX_UNITS, WORK_ADMISSION_TARGET_TEXT_CHARS,
-    WorkAdmissionActivation, WorkAdmissionCapability, WorkAdmissionDecision,
-    WorkAdmissionGraphMutation, WorkAdmissionTask, WorkExecutionTopology, build_turn_intent_prompt,
-    parse_turn_intent_response, parse_work_admission_response, turn_intent_judge_messages,
-    work_admission_judge_messages, work_admission_repair_hints,
+    TurnIntentJudgeContext, TurnIntentJudgeError, WORK_ADMISSION_MAX_OUTPUT_TOKENS,
+    WORK_ADMISSION_MAX_UNITS, WORK_ADMISSION_TARGET_TEXT_CHARS, WorkAdmissionActivation,
+    WorkAdmissionCapability, WorkAdmissionDecision, WorkAdmissionGraphMutation, WorkAdmissionTask,
+    WorkExecutionTopology, parse_work_admission_response, work_admission_judge_messages,
+    work_admission_repair_hints,
 };
 pub use verification::{
     VerificationCriterion, VerificationResult, VerificationRunner, VerifierKind,

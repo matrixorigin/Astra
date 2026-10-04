@@ -1053,6 +1053,7 @@ pub(crate) async fn stream_chat_sse(
             state.total_tool_calls,
             state.telemetry.all_tools_used.iter().cloned(),
             &state.stall.tool_call_records,
+            !state.telemetry.server_summary_run_usage.is_empty(),
         );
         let tool_outcomes = astra_services::session_journal::ToolOutcomeSummary::from_records(
             &state.stall.tool_call_records,

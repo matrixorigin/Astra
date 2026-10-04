@@ -9088,6 +9088,7 @@ pub(crate) struct FaultInjectedRunStateStore {
     append_delay: Duration,
     cancellation_discovery_delay: Duration,
     terminal_transition_delay: Duration,
+    terminal_transition_release: Option<Arc<tokio::sync::Semaphore>>,
     terminal_transition_entries: AtomicUsize,
     appended_batches: StdMutex<Vec<Vec<Value>>>,
     guarded_transition_entered: Option<Arc<tokio::sync::Notify>>,
@@ -9124,6 +9125,7 @@ impl FaultInjectedRunStateStore {
             append_delay: Duration::ZERO,
             cancellation_discovery_delay: Duration::ZERO,
             terminal_transition_delay: Duration::ZERO,
+            terminal_transition_release: None,
             terminal_transition_entries: AtomicUsize::new(0),
             appended_batches: StdMutex::new(Vec::new()),
             guarded_transition_entered: None,
@@ -9858,6 +9860,13 @@ impl RunStateStore for FaultInjectedRunStateStore {
         }
         self.terminal_transition_entries
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Some(release) = &self.terminal_transition_release {
+            release
+                .acquire()
+                .await
+                .expect("terminal barrier open")
+                .forget();
+        }
         if !self.terminal_transition_delay.is_zero() {
             tokio::time::sleep(self.terminal_transition_delay).await;
         }
@@ -32792,10 +32801,10 @@ async fn stream_chat_accepts_promptly_while_global_admission_is_busy_and_cancell
 
 #[tokio::test]
 async fn execution_admission_releases_before_slow_terminal_persistence() {
-    let store = Arc::new(
-        FaultInjectedRunStateStore::new(&[], &[])
-            .with_terminal_transition_delay(Duration::from_millis(500)),
-    );
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut store = FaultInjectedRunStateStore::new(&[], &[]);
+    store.terminal_transition_release = Some(release.clone());
+    let store = Arc::new(store);
     let svc = test_service_with_store(store.clone()).with_run_concurrency_limit(1);
 
     let mut first_request = test_request("first execution");
@@ -32815,13 +32824,13 @@ async fn execution_admission_releases_before_slow_terminal_persistence() {
     let mut second_request = test_request("second execution");
     second_request.session_id = Some("admission-second".to_string());
     let _second = tokio::time::timeout(
-        Duration::from_millis(250),
+        Duration::from_secs(2),
         svc.stream_chat("user-2".into(), second_request),
     )
     .await
     .expect("slow terminal persistence must not hold a second stream request")
     .expect("second stream was accepted");
-    tokio::time::timeout(Duration::from_millis(250), async {
+    tokio::time::timeout(Duration::from_secs(2), async {
         while store.terminal_transition_entries() < 2 {
             tokio::task::yield_now().await;
         }
@@ -32829,6 +32838,7 @@ async fn execution_admission_releases_before_slow_terminal_persistence() {
     .await
     .expect("slow terminal persistence must not retain the execution permit");
 
+    release.add_permits(2);
     assert!(
         svc.drain_background_tasks(Duration::from_secs(3)).await,
         "both terminal runs must settle after their delayed persistence"

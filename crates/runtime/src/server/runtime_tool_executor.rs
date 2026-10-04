@@ -4798,6 +4798,7 @@ impl RuntimeToolExecutor {
                                 },
                             ),
                             expected_control_epoch: request.policy.expected_control_epoch,
+                            command_timeout_cap_ms: None,
                             delegation_model_admission: request.policy.delegation_model_admission.as_ref(),
                             task_resolution_authority: request.policy.task_resolution_authority.as_ref(),
                         },

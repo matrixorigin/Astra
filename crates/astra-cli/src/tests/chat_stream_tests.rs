@@ -1085,7 +1085,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
                                     "turn_chain_id": "chain-tx-e2e",
                                     "request_id": "tr-tx-1",
                                     "schema_admitted_by_server": true,
-                                    "execution_timeout_ms": 300_000,
+                                    "execution_timeout_ms": 300_000, "command_timeout_cap_ms": 30_000,
                                     "execution_deadline_unix_ms": 4_102_444_800_000_u64,
                                     "tool": "bash",
                                     "args": {
@@ -1618,7 +1618,7 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
                         "type": "tool_request", "session_id": "sess-mcp",
                         "run_id": "run-sess-mcp", "turn_chain_id": "chain-mcp",
                         "request_id": "mcp-1", "schema_admitted_by_server": true,
-                        "execution_timeout_ms": 300000,
+                        "execution_timeout_ms": 300000, "command_timeout_cap_ms": 30_000,
                         "execution_deadline_unix_ms": 4102444800000u64,
                         "tool": tn, "args": {"message": "hello from test"}
                     });

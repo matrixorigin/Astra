@@ -166,19 +166,23 @@ pub fn restore_session(
         Err(e) => return Err(RestoreError::IoError(e.to_string())),
     };
 
-    // Step 2: Validate protocol version
-    validate_checkpoint_version(&heavy)?;
-
-    // Step 3: Extract resume turn and completed-tool audit history.
-    build_restored_session(user_id, session_id, heavy)
+    let mut restored = restore_checkpoint(session_id, heavy)?;
+    let (completed_results, report) = recover_completed_tool_audit_from_events(user_id, session_id);
+    restored.completed_tool_results = completed_results;
+    restored.cache_restore_report = report;
+    Ok(Some(restored))
 }
 
-/// Shared: build RestoredSession from a validated checkpoint.
-fn build_restored_session(
-    user_id: &str,
+/// Validate and consume the checkpoint once. Each recovery entrypoint owns
+/// its journal completeness policy and adds only non-executable audit results.
+pub(crate) fn restore_checkpoint(
     session_id: &str,
     heavy: HeavyCheckpoint,
-) -> Result<Option<RestoredSession>, RestoreError> {
+) -> Result<RestoredSession, RestoreError> {
+    validate_checkpoint_version(&heavy)?;
+    crate::step_protocol::StepCheckpoint::Light(heavy.light.clone())
+        .validate()
+        .map_err(|error| RestoreError::InvalidCheckpoint(error.to_string()))?;
     if let Some(control) = &heavy.run_execution_control {
         let budget = heavy.run_execution_budget.as_ref().ok_or_else(|| {
             RestoreError::InvalidCheckpoint("execution control has no paired run budget".into())
@@ -217,10 +221,7 @@ fn build_restored_session(
         }
     }
     let resume_turn = extract_resume_turn(&heavy);
-    let (completed_results, cache_restore_report) =
-        recover_completed_tool_audit_from_events(user_id, session_id);
-
-    Ok(Some(RestoredSession {
+    Ok(RestoredSession {
         conversation_cursor: heavy.conversation_cursor,
         messages: heavy.messages,
         budget_remaining_tokens: heavy.budget_remaining_tokens,
@@ -232,15 +233,15 @@ fn build_restored_session(
         deferred_tool_activations: heavy.deferred_tool_activations,
         resume_turn,
         protocol_version: heavy.light.protocol_version,
-        completed_tool_results: completed_results,
+        completed_tool_results: HashMap::new(),
         interruption: heavy.interruption,
         approval_overrides: heavy.approval_overrides,
         consecutive_context_window_errors: heavy.consecutive_context_window_errors,
         compaction_state: heavy.compaction_state,
         pipeline_state: heavy.pipeline_state,
         workspace_observation_quarantine: heavy.workspace_observation_quarantine,
-        cache_restore_report,
-    }))
+        cache_restore_report: CacheRestoreReport::default(),
+    })
 }
 
 /// Require the exact current checkpoint protocol.
@@ -604,7 +605,7 @@ mod tests {
             config_version_id: None,
         });
 
-        let error = build_restored_session(TEST_USER_ID, "session-1", heavy).unwrap_err();
+        let error = restore_checkpoint("session-1", heavy).unwrap_err();
         assert!(
             matches!(error, RestoreError::InvalidCheckpoint(ref detail)
                 if detail.contains("cursor root")),
@@ -626,7 +627,7 @@ mod tests {
                 source_tool_call_id: None,
             });
 
-        let error = build_restored_session(TEST_USER_ID, "session-1", heavy).unwrap_err();
+        let error = restore_checkpoint("session-1", heavy).unwrap_err();
         assert!(
             matches!(error, RestoreError::InvalidCheckpoint(detail) if detail.contains("quarantine"))
         );

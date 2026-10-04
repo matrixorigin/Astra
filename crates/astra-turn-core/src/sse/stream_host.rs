@@ -402,6 +402,9 @@ pub struct ToolBatchRequest {
     pub read_only_execution: bool,
     /// Immutable execution budget issued by the server for this invocation.
     pub execution_timeout_ms: u64,
+    /// Bash command ceiling. The delivery deadline also includes settlement
+    /// grace and must not replace this executor-owned budget.
+    pub command_timeout_cap_ms: Option<u64>,
     /// Immutable absolute server deadline retained until this exact invocation starts.
     pub execution_deadline_unix_ms: u64,
     pub tool: String,
@@ -534,12 +537,7 @@ pub trait SseStreamHost: Send {
 
     /// Execute a tool request that arrived via `tool_request` SSE event.
     /// Returns the execution result (output, status, duration).
-    async fn execute_tool(
-        &mut self,
-        request_id: &str,
-        tool: &str,
-        args: &Value,
-    ) -> EdgeToolExecResult;
+    async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult;
 
     /// Resolve an approval request that arrived via `approval_required` SSE event.
     /// CLI: interactive prompt. Headless: auto-deny or ledger-based.
@@ -599,9 +597,7 @@ pub trait SseStreamHost: Send {
     ) -> Vec<EdgeToolExecResult> {
         let mut results = Vec::with_capacity(requests.len());
         for req in requests {
-            let r = self
-                .execute_tool(&req.request_id, &req.tool, &req.args)
-                .await;
+            let r = self.execute_tool(&req).await;
             results.push(r);
         }
         results
@@ -1539,6 +1535,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 read_only_execution,
                 execution_deadline_unix_ms,
                 execution_timeout_ms,
+                command_timeout_cap_ms,
                 tool,
                 args,
             } => {
@@ -1579,6 +1576,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                     turn_chain_id,
                     request_id,
                     execution_timeout_ms,
+                    command_timeout_cap_ms,
                     execution_deadline_unix_ms,
                     read_only_execution,
                     tool,
@@ -1733,12 +1731,10 @@ impl SseStreamHost for NoopSseStreamHost {
 
     fn on_stream_complete(&mut self) {}
 
-    async fn execute_tool(
-        &mut self,
-        request_id: &str,
-        tool: &str,
-        args: &Value,
-    ) -> EdgeToolExecResult {
+    async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
+        let request_id = request.request_id.as_str();
+        let tool = request.tool.as_str();
+        let args = &request.args;
         EdgeToolExecResult {
             execution_completion: None,
             request_id: request_id.to_string(),
@@ -1882,12 +1878,10 @@ impl SseStreamHost for RecordingSseStreamHost {
         self.agent_live_gaps.push(gap);
     }
 
-    async fn execute_tool(
-        &mut self,
-        request_id: &str,
-        tool: &str,
-        args: &Value,
-    ) -> EdgeToolExecResult {
+    async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
+        let request_id = request.request_id.as_str();
+        let tool = request.tool.as_str();
+        let args = &request.args;
         if let Some((started, release)) = &self.tool_gate {
             started.notify_one();
             release.cancelled().await;
@@ -1946,7 +1940,7 @@ mod tests {
 
     fn sse_event(typ: &str, extra: &str) -> String {
         let admission = if typ == "tool_request" {
-            ",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000"
+            ",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000"
         } else {
             ""
         };
@@ -2033,12 +2027,10 @@ mod tests {
 
             fn on_stream_complete(&mut self) {}
 
-            async fn execute_tool(
-                &mut self,
-                request_id: &str,
-                tool: &str,
-                args: &Value,
-            ) -> EdgeToolExecResult {
+            async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
+                let request_id = request.request_id.as_str();
+                let tool = request.tool.as_str();
+                let args = &request.args;
                 self.token.cancelled().await;
                 self.observed_cancel = true;
                 EdgeToolExecResult {
@@ -2144,12 +2136,10 @@ mod tests {
             async fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
             fn on_stream_complete(&mut self) {}
 
-            async fn execute_tool(
-                &mut self,
-                request_id: &str,
-                tool: &str,
-                args: &Value,
-            ) -> EdgeToolExecResult {
+            async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
+                let request_id = request.request_id.as_str();
+                let tool = request.tool.as_str();
+                let args = &request.args;
                 self.token.cancelled().await;
                 self.settled = true;
                 EdgeToolExecResult {
@@ -2236,12 +2226,10 @@ mod tests {
             async fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
             fn on_stream_complete(&mut self) {}
 
-            async fn execute_tool(
-                &mut self,
-                request_id: &str,
-                tool: &str,
-                args: &Value,
-            ) -> EdgeToolExecResult {
+            async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
+                let request_id = request.request_id.as_str();
+                let tool = request.tool.as_str();
+                let args = &request.args;
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 EdgeToolExecResult {
                     execution_completion: None,
@@ -2328,12 +2316,10 @@ mod tests {
             async fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
             fn on_stream_complete(&mut self) {}
 
-            async fn execute_tool(
-                &mut self,
-                request_id: &str,
-                tool: &str,
-                args: &Value,
-            ) -> EdgeToolExecResult {
+            async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
+                let request_id = request.request_id.as_str();
+                let tool = request.tool.as_str();
+                let args = &request.args;
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 EdgeToolExecResult {
                     execution_completion: None,
@@ -3187,12 +3173,10 @@ mod tests {
                     .push(format!("session:{session_id}"));
             }
 
-            async fn execute_tool(
-                &mut self,
-                request_id: &str,
-                tool: &str,
-                args: &Value,
-            ) -> EdgeToolExecResult {
+            async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
+                let request_id = request.request_id.as_str();
+                let tool = request.tool.as_str();
+                let args = &request.args;
                 self.0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -3295,12 +3279,10 @@ mod tests {
                 ));
             }
 
-            async fn execute_tool(
-                &mut self,
-                request_id: &str,
-                tool: &str,
-                args: &Value,
-            ) -> EdgeToolExecResult {
+            async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
+                let request_id = request.request_id.as_str();
+                let tool = request.tool.as_str();
+                let args = &request.args;
                 EdgeToolExecResult {
                     execution_completion: None,
                     request_id: request_id.to_string(),
@@ -3717,6 +3699,7 @@ mod tests {
             read_only_execution: false,
             execution_deadline_unix_ms: 4_102_444_800_000,
             execution_timeout_ms: 300_000,
+            command_timeout_cap_ms: Some(300_000),
             tool: tool.to_string(),
             args: serde_json::json!({}),
         }
@@ -4279,12 +4262,10 @@ mod tests {
         impl SseStreamHost for BatchHost {
             async fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
             fn on_stream_complete(&mut self) {}
-            async fn execute_tool(
-                &mut self,
-                rid: &str,
-                tool: &str,
-                args: &Value,
-            ) -> EdgeToolExecResult {
+            async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
+                let rid = request.request_id.as_str();
+                let tool = request.tool.as_str();
+                let args = &request.args;
                 EdgeToolExecResult {
                     execution_completion: None,
                     request_id: rid.to_string(),
@@ -4383,7 +4364,7 @@ mod tests {
         // only one \n\n at the end). This simulates them arriving in the
         // same TCP chunk as a single framed event.
         let block = format!(
-            "data: {{\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000,\"request_id\":\"t-bash\",\"tool\":\"bash\",\"args\":{{}}}}\ndata: {{\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000,\"request_id\":\"t-skill\",\"tool\":\"{}\",\"args\":{{}}}}\n\n",
+            "data: {{\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"request_id\":\"t-bash\",\"tool\":\"bash\",\"args\":{{}}}}\ndata: {{\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"request_id\":\"t-skill\",\"tool\":\"{}\",\"args\":{{}}}}\n\n",
             "skill"
         );
         let chunks: Vec<Result<Vec<u8>, String>> = vec![Ok(block.into_bytes())];
@@ -4395,12 +4376,10 @@ mod tests {
         impl SseStreamHost for OrderTrackingHost {
             async fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
             fn on_stream_complete(&mut self) {}
-            async fn execute_tool(
-                &mut self,
-                rid: &str,
-                tool: &str,
-                args: &Value,
-            ) -> EdgeToolExecResult {
+            async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
+                let rid = request.request_id.as_str();
+                let tool = request.tool.as_str();
+                let args = &request.args;
                 self.0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -4462,7 +4441,7 @@ mod tests {
         // trailing \n\n — it stays in the framer buffer and gets flushed
         // as the tail blob after the stream ends.
         let complete = sse_event("text_delta", ",\"content\":\"hi\"");
-        let partial_tool = "data: {\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000,\"request_id\":\"t1\",\"tool\":\"bash\",\"args\":{}}";
+        let partial_tool = "data: {\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"request_id\":\"t1\",\"tool\":\"bash\",\"args\":{}}";
         let chunks: Vec<Result<Vec<u8>, String>> =
             vec![Ok(format!("{complete}{partial_tool}").into_bytes())];
         let mut stream = stream::iter(chunks);
@@ -4600,12 +4579,10 @@ mod tests {
         impl SseStreamHost for TrackingHost {
             async fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
             fn on_stream_complete(&mut self) {}
-            async fn execute_tool(
-                &mut self,
-                request_id: &str,
-                tool: &str,
-                args: &Value,
-            ) -> EdgeToolExecResult {
+            async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
+                let request_id = request.request_id.as_str();
+                let tool = request.tool.as_str();
+                let args = &request.args;
                 self.0
                     .lock()
                     .unwrap()
@@ -4779,12 +4756,10 @@ mod tests {
         impl SseStreamHost for OrderHost {
             async fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
             fn on_stream_complete(&mut self) {}
-            async fn execute_tool(
-                &mut self,
-                rid: &str,
-                tool: &str,
-                args: &Value,
-            ) -> EdgeToolExecResult {
+            async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
+                let rid = request.request_id.as_str();
+                let tool = request.tool.as_str();
+                let args = &request.args;
                 self.0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())

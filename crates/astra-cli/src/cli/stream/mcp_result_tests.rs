@@ -105,6 +105,7 @@ async fn callback_through_pipeline(
             tool: tool.clone(),
             args: args.clone(),
             execution_timeout_ms: 30_000,
+            command_timeout_cap_ms: None,
             execution_deadline_unix_ms: u64::MAX,
         }])
         .await;

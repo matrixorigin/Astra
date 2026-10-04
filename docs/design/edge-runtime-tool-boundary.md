@@ -89,6 +89,12 @@ A Server-issued read-only ceiling belongs to its exact tool request and travels
 through parsing, batching and execution. Stream completion cannot clear that
 ceiling while the request remains pending. Local approval cannot widen it.
 
+Bash command time is carried by the Server's `command_timeout_cap_ms` request
+metadata. The separate delivery deadline includes callback settlement time and
+must not extend the command budget. Missing or invalid command authority rejects
+a Bash request. Model arguments remain unchanged for approval, invocation identity
+and journal evidence; runtime controls are never injected into those arguments.
+
 ### Rename authority
 
 The CLI may modify symbol references only through an active semantic LSP backend

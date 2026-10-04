@@ -84,7 +84,7 @@ use astra_services::runs::{
 };
 use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
 use astra_services::{AdmittedModelExecution, SessionArtifactStore};
-use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeError};
+use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudgeError};
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal, SharedAgentLiveEventSink,
 };
@@ -3106,8 +3106,7 @@ impl SummaryClientWorkAdmissionJudge {
     }
 }
 
-#[async_trait]
-impl SkillAutoRouteJudge for SummaryClientSkillAutoRouteJudge {
+impl SummaryClientSkillAutoRouteJudge {
     async fn judge(
         &self,
         ctx: &astra_services::SkillAutoRouteJudgeContext,
@@ -4062,14 +4061,6 @@ pub struct ServerAgenticLoopHost {
     provider_capabilities: Arc<HashMap<String, HashSet<String>>>,
     /// Shared exact provider allowlist. Missing provider id means unrestricted.
     provider_allowed_tools: Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>>,
-    /// Optional LLM-based turn intent judge. When set, every turn first asks
-    /// the judge to classify the user's message. Judge failure is non-fatal:
-    /// the turn proceeds without explicit semantic intent.
-    turn_intent_judge: Option<Arc<dyn astra_services::TurnIntentJudge>>,
-    /// Optional LLM-based skill auto-route judge. When unset, the host may use
-    /// the configured auxiliary LLM path; failure is non-fatal and leaves
-    /// pre-routing disabled for that turn.
-    skill_auto_route_judge: Option<Arc<dyn SkillAutoRouteJudge>>,
 }
 
 struct ExecutionHandoffContext {
@@ -5919,8 +5910,6 @@ impl ServerAgenticLoopHostBuilder {
             provider_allowed_tools: self
                 .provider_allowed_tools
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashMap::new()))),
-            turn_intent_judge: None,
-            skill_auto_route_judge: None,
         }
     }
 
@@ -11367,20 +11356,6 @@ impl ServerAgenticLoopHost {
         Arc::clone(&self.plan_authoring_active)
     }
 
-    /// Inject an LLM-based turn intent judge.
-    ///
-    /// The judge is consulted at the start of every user turn (see
-    /// [`AgenticLoopHost::judge_turn_intent`]); on judge failure or when this
-    /// setter is not called, the host proceeds without explicit semantic
-    /// intent.
-    pub fn set_turn_intent_judge(&mut self, judge: Arc<dyn astra_services::TurnIntentJudge>) {
-        self.turn_intent_judge = Some(judge);
-    }
-
-    pub fn set_skill_auto_route_judge(&mut self, judge: Arc<dyn SkillAutoRouteJudge>) {
-        self.skill_auto_route_judge = Some(judge);
-    }
-
     async fn resolve_llm_config_for_state(
         &mut self,
         state: &AgenticLoopState,
@@ -15730,14 +15705,12 @@ impl ServerAgenticLoopHost {
                 // the model's `timeout` argument: rewriting that argument
                 // changes explicitness-sensitive tool semantics.
                 if let Some(event) = tool_request_event.as_object_mut() {
-                    event.insert(
-                        "args".to_string(),
-                        Self::with_authoritative_command_timeout_cap(
-                            &tool_name,
-                            &args,
-                            command_timeout_cap_ms,
-                        ),
-                    );
+                    if tool_name == "bash" {
+                        event.insert(
+                            "command_timeout_cap_ms".to_string(),
+                            json!(command_timeout_cap_ms),
+                        );
+                    }
                     if let Some(offer) = admitted_edge_offers.get(&request_id) {
                         // Persist the exact provider descriptor alongside the
                         // replayable Edge request. The public tool name is a
@@ -16318,27 +16291,6 @@ impl ServerAgenticLoopHost {
         u64::try_from(deadline.as_millis())
             .ok()
             .filter(|milliseconds| *milliseconds > 0)
-    }
-
-    /// Bash has adaptive local defaults, so it receives a server-authored
-    /// upper bound rather than a fabricated model timeout. Keeping it
-    /// separate preserves explicitness-sensitive tool semantics while letting
-    /// the Edge choose the shorter local default for timeout-omitting calls.
-    fn with_authoritative_command_timeout_cap(
-        tool_name: &str,
-        args: &Value,
-        timeout_cap_ms: u64,
-    ) -> Value {
-        let mut effective = args.clone();
-        if let Some(map) = effective.as_object_mut()
-            && tool_name == "bash"
-        {
-            map.insert(
-                "_astra_command_timeout_cap_ms".to_string(),
-                Value::from(timeout_cap_ms),
-            );
-        }
-        effective
     }
 
     async fn wait_tool_result_with_dispatch_fallback(
@@ -19671,7 +19623,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     fn owns_semantic_admission_timing(&self) -> bool {
-        self.turn_intent_judge.is_none()
+        true
     }
 
     fn consume_control_plane_turn(
@@ -19752,23 +19704,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
             return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault;
         }
-        if let Some(judge) = self.turn_intent_judge.as_ref() {
-            // The auxiliary judge classifies an outer user turn, not an
-            // inner provider round.  Preserve the session turn across
-            // multi-round tool execution and resumed conversations.
-            let context = crate::turn::agentic::turn_intent::context_for_state(state);
-            let outcome =
-                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::from_optional_intent(
-                    crate::turn::agentic::turn_intent::judge_turn_intent_with_llm_deadline(
-                        judge.as_ref(),
-                        &context,
-                        TURN_INTENT_JUDGE_DEADLINE,
-                    )
-                    .await,
-                );
-            return outcome;
-        }
-
         // Auto may start bounded semantic admission in parallel with the
         // primary request only in the explicit Always policy. The default
         // waits until a typed provider boundary has an immediate admission
@@ -19803,32 +19738,29 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
         let service_ctx = skill_auto_route_service_context(ctx);
 
-        let judged = if let Some(judge) = self.skill_auto_route_judge.as_ref() {
-            judge.judge(&service_ctx).await
-        } else {
-            if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
-                tracing::debug!(
-                    target: "astra::skill_auto_route_judge",
-                    policy = auxiliary_llm_policy_label(),
-                    reason,
-                    "skill auto-route judge skipped by capacity policy"
-                );
+        if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
+            tracing::debug!(
+                target: "astra::skill_auto_route_judge",
+                policy = auxiliary_llm_policy_label(),
+                reason,
+                "skill auto-route judge skipped by capacity policy"
+            );
+            return None;
+        }
+        let request = match astra_services::skill_auto_route_judgment_request(&service_ctx) {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(%error, "invalid skill judgment input; no inference dispatched");
                 return None;
             }
-            let request = match astra_services::skill_auto_route_judgment_request(&service_ctx) {
-                Ok(request) => request,
-                Err(error) => {
-                    tracing::warn!(%error, "invalid skill judgment input; no inference dispatched");
-                    return None;
-                }
-            };
-            let client = self
-                .judgment_summary_client(state, "skill_auto_route", &request)
-                .await
-                .ok()?;
-            let judge = SummaryClientSkillAutoRouteJudge { client };
-            judge.judge(&service_ctx).await
         };
+        let client = self
+            .judgment_summary_client(state, "skill_auto_route", &request)
+            .await
+            .ok()?;
+        let judged = SummaryClientSkillAutoRouteJudge { client }
+            .judge(&service_ctx)
+            .await;
 
         match judged {
             Ok(Some(skill_name)) => {
@@ -24716,26 +24648,6 @@ mod tests {
             host.clamped_edge_execution_timeout_ms("bash", &args),
             Some(60_000)
         );
-        assert_eq!(
-            ServerAgenticLoopHost::with_authoritative_command_timeout_cap("bash", &args, 30_000)
-                .get("_astra_command_timeout_cap_ms")
-                .and_then(Value::as_u64),
-            Some(30_000),
-            "the executor receives a server-authored command cap, not the delivery deadline"
-        );
-        let omitted = json!({"command": "cargo test"});
-        assert_eq!(
-            ServerAgenticLoopHost::with_authoritative_command_timeout_cap("bash", &omitted, 30_000)
-                .get("_astra_command_timeout_cap_ms")
-                .and_then(Value::as_u64),
-            Some(30_000),
-            "Bash must not exceed the server cap when using its Edge-local adaptive default"
-        );
-        assert!(
-            ServerAgenticLoopHost::with_authoritative_command_timeout_cap("bash", &omitted, 30_000)
-                .get("timeout")
-                .is_none()
-        );
     }
 
     #[test]
@@ -24770,13 +24682,6 @@ mod tests {
         assert_eq!(
             host.clamped_edge_execution_timeout_ms("write_file", &write_file),
             Some(125_000)
-        );
-        assert_eq!(
-            ServerAgenticLoopHost::with_authoritative_command_timeout_cap("bash", &bash, 5_000)
-                .get("_astra_command_timeout_cap_ms")
-                .and_then(Value::as_u64),
-            Some(5_000),
-            "the Edge receives a bounded cap and retains its adaptive default"
         );
     }
 
@@ -24947,6 +24852,8 @@ mod tests {
             .find(|event| event["type"] == "tool_request")
             .expect("typed completion action reaches actual Edge admission");
         assert_eq!(request["execution_timeout_ms"], 45_000);
+        assert_eq!(request["command_timeout_cap_ms"], 15_000);
+        assert_eq!(request["args"], bash_args);
     }
 
     #[test]
@@ -52236,135 +52143,14 @@ mod tests {
 
     // ── Turn intent judge wiring ────────────────────────────────────────
     //
-    // Pin the contract that ServerAgenticLoopHost honors an injected LLM
-    // judge and never substitutes natural-language keyword matching when the
-    // judge is absent or fails.
+    // Pin semantic admission through the real provider response boundary;
+    // unavailable judgment cannot authorize an effect or fabricate intent.
     mod turn_intent_judge_wiring {
         use super::*;
-        use astra_config::user_profile::{Scenario, TurnIntent};
+        use astra_services::AdmittedModelExecution;
         use astra_services::runs::{SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy};
-        use astra_services::{
-            AdmittedModelExecution, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
-            SkillAutoRouteJudgeError, TurnIntentJudge, TurnIntentJudgeContext,
-            TurnIntentJudgeError,
-        };
-        use astra_turn_types::ObjectiveRelation;
         use async_trait::async_trait;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
-        struct ScriptedJudge {
-            calls: std::sync::Mutex<Vec<TurnIntentJudgeContext>>,
-            response: std::sync::Mutex<Option<Result<TurnIntent, TurnIntentJudgeError>>>,
-        }
-
-        impl ScriptedJudge {
-            fn ok(intent: TurnIntent) -> Arc<Self> {
-                Arc::new(Self {
-                    calls: std::sync::Mutex::new(Vec::new()),
-                    response: std::sync::Mutex::new(Some(Ok(intent))),
-                })
-            }
-            fn err(error: TurnIntentJudgeError) -> Arc<Self> {
-                Arc::new(Self {
-                    calls: std::sync::Mutex::new(Vec::new()),
-                    response: std::sync::Mutex::new(Some(Err(error))),
-                })
-            }
-            fn calls(&self) -> Vec<TurnIntentJudgeContext> {
-                self.calls.lock().unwrap().clone()
-            }
-        }
-
-        #[async_trait]
-        impl TurnIntentJudge for ScriptedJudge {
-            async fn judge(
-                &self,
-                ctx: &TurnIntentJudgeContext,
-            ) -> Result<TurnIntent, TurnIntentJudgeError> {
-                self.calls.lock().unwrap().push(ctx.clone());
-                self.response
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .expect("ScriptedJudge consumed twice")
-            }
-        }
-
-        struct ScriptedSkillRouteJudge {
-            calls: std::sync::Mutex<Vec<SkillAutoRouteJudgeContext>>,
-            response: std::sync::Mutex<Option<Result<Option<String>, SkillAutoRouteJudgeError>>>,
-        }
-
-        impl ScriptedSkillRouteJudge {
-            fn ok(skill_name: Option<&str>) -> Arc<Self> {
-                Arc::new(Self {
-                    calls: std::sync::Mutex::new(Vec::new()),
-                    response: std::sync::Mutex::new(Some(Ok(skill_name.map(str::to_string)))),
-                })
-            }
-
-            fn err(error: SkillAutoRouteJudgeError) -> Arc<Self> {
-                Arc::new(Self {
-                    calls: std::sync::Mutex::new(Vec::new()),
-                    response: std::sync::Mutex::new(Some(Err(error))),
-                })
-            }
-
-            fn calls(&self) -> Vec<SkillAutoRouteJudgeContext> {
-                self.calls.lock().unwrap().clone()
-            }
-        }
-
-        #[async_trait]
-        impl SkillAutoRouteJudge for ScriptedSkillRouteJudge {
-            async fn judge(
-                &self,
-                ctx: &SkillAutoRouteJudgeContext,
-            ) -> Result<Option<String>, SkillAutoRouteJudgeError> {
-                self.calls.lock().unwrap().push(ctx.clone());
-                self.response
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .expect("ScriptedSkillRouteJudge consumed twice")
-            }
-        }
-
-        fn host_with_judge(judge: Arc<dyn TurnIntentJudge>) -> ServerAgenticLoopHost {
-            let mut host = test_host_builder("u", "s").build();
-            host.set_turn_intent_judge(judge);
-            host
-        }
-
-        fn host_with_turn_intent_policy_and_judge(
-            policy: TurnIntentExecutionPolicy,
-            judge: Arc<dyn TurnIntentJudge>,
-        ) -> ServerAgenticLoopHost {
-            let mut host = test_host_builder("u", "s")
-                .with_turn_intent_policy(policy)
-                .build();
-            host.set_turn_intent_judge(judge);
-            host
-        }
-
-        fn host_with_skill_route_judge(
-            judge: Arc<dyn SkillAutoRouteJudge>,
-        ) -> ServerAgenticLoopHost {
-            let mut host = test_host_builder("u", "s").build();
-            host.set_skill_auto_route_judge(judge);
-            host
-        }
-
-        fn host_with_skill_route_policy_and_judge(
-            policy: SkillAutoRouteExecutionPolicy,
-            judge: Arc<dyn SkillAutoRouteJudge>,
-        ) -> ServerAgenticLoopHost {
-            let mut host = test_host_builder("u", "s")
-                .with_skill_auto_route_policy(policy)
-                .build();
-            host.set_skill_auto_route_judge(judge);
-            host
-        }
 
         #[test]
         fn auxiliary_llm_capacity_policy_parser_is_stable() {
@@ -52458,57 +52244,16 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn judge_turn_intent_invokes_wired_judge_and_returns_its_result() {
-            let llm_intent =
-                TurnIntent::default().with_objective_relation(ObjectiveRelation::Continue);
-            let judge = ScriptedJudge::ok(llm_intent.clone());
-            let mut host = host_with_judge(judge.clone() as Arc<dyn TurnIntentJudge>);
-
-            let mut state = crate::turn::agentic_loop::host::tests::make_state();
-            state.message = "可以了，按你刚才说的方向继续往下走".to_string();
-            state.user_intent = state.message.clone();
-            state.messages = vec![
-                serde_json::json!({"role": "user", "content": "earlier"}),
-                serde_json::json!({"role": "assistant", "content": "ok"}),
-                serde_json::json!({"role": "user", "content": state.message}),
-            ];
-            state.recent_tools = vec!["read_file".to_string()];
-            // The provider may take several inner rounds for one user turn.
-            // The judge receives the outer session-turn identity, not the
-            // provider-round count.
-            state.session_turn = 5;
-            state.llm_rounds_completed = 4;
-
-            let intent = host.judge_turn_intent(&state).await;
-            assert_eq!(
-                intent,
-                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Intent(llm_intent)
-            );
-
-            let calls = judge.calls();
-            assert_eq!(calls.len(), 1, "judge must be called exactly once");
-            let call = &calls[0];
-            assert_eq!(call.message, "可以了，按你刚才说的方向继续往下走");
-            assert_eq!(
-                call.turn_count, 5,
-                "turn count should remain the stable outer session turn"
-            );
-            assert_eq!(call.recent_tools, vec!["read_file".to_string()]);
-            assert!(
-                call.has_prior_assistant_turn,
-                "must surface the prior-assistant signal so the judge can detect follow-ups"
-            );
-        }
-
-        #[tokio::test]
-        async fn fixed_default_turn_intent_policy_skips_even_an_injected_judge() {
-            let judge = ScriptedJudge::ok(
-                TurnIntent::default().with_requested_scenario(Scenario::CodeReview),
-            );
-            let mut host = host_with_turn_intent_policy_and_judge(
-                TurnIntentExecutionPolicy::FixedDefault,
-                judge.clone() as Arc<dyn TurnIntentJudge>,
-            );
+        async fn fixed_default_turn_intent_policy_skips_provider_inference() {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut host = test_host_builder("u", "s")
+                .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
+                .with_test_judgment_clients([Box::new(SequencedSummaryClient {
+                    provenance: astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                    responses: std::sync::Mutex::new(Default::default()),
+                    requests: requests.clone(),
+                }) as Box<dyn SummaryLlmClient>])
+                .build();
             let state = crate::turn::agentic_loop::host::tests::make_state();
 
             assert_eq!(
@@ -52516,18 +52261,22 @@ mod tests {
                 crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault
             );
             assert!(
-                judge.calls().is_empty(),
+                requests.lock().unwrap().is_empty(),
                 "fixed policy must not invoke the intent LLM"
             );
         }
 
         #[tokio::test]
         async fn fixed_default_subrun_keeps_explicit_policy_without_judge() {
-            let judge = ScriptedJudge::ok(TurnIntent::default());
-            let mut host = host_with_turn_intent_policy_and_judge(
-                TurnIntentExecutionPolicy::FixedDefault,
-                judge.clone() as Arc<dyn TurnIntentJudge>,
-            );
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut host = test_host_builder("u", "s")
+                .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
+                .with_test_judgment_clients([Box::new(SequencedSummaryClient {
+                    provenance: astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                    responses: std::sync::Mutex::new(Default::default()),
+                    requests: requests.clone(),
+                }) as Box<dyn SummaryLlmClient>])
+                .build();
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.inference_purpose = astra_turn_types::InferencePurpose::SubAgent;
 
@@ -52535,26 +52284,7 @@ mod tests {
                 host.judge_turn_intent(&state).await,
                 crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault
             );
-            assert!(judge.calls().is_empty());
-        }
-
-        #[tokio::test]
-        async fn historical_work_does_not_suppress_an_explicit_general_intent_judge() {
-            let judge = ScriptedJudge::ok(TurnIntent::default());
-            let mut host = test_host_builder("u-bound-admission", "s-bound-admission")
-                .with_work_planning_bound(true)
-                .build();
-            host.set_turn_intent_judge(judge.clone() as Arc<dyn TurnIntentJudge>);
-            let state = crate::turn::agentic_loop::host::tests::make_state();
-
-            assert!(matches!(
-                host.judge_turn_intent(&state).await,
-                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Intent(_)
-            ));
-            assert!(
-                !judge.calls().is_empty(),
-                "a historical graph must not make an unrelated later user turn inherit stale semantics"
-            );
+            assert!(requests.lock().unwrap().is_empty());
         }
 
         #[test]
@@ -52571,36 +52301,6 @@ mod tests {
             assert!(
                 !fixed.requires_turn_intent_decision(),
                 "FixedDefault is the explicit no-inference policy"
-            );
-
-            let mut injected =
-                test_host_builder("u-injected-admission", "s-injected-admission").build();
-            injected.set_turn_intent_judge(
-                ScriptedJudge::ok(TurnIntent::default()) as Arc<dyn TurnIntentJudge>
-            );
-            assert!(
-                !injected.requires_turn_intent_decision(),
-                "an explicitly injected structured judge owns its own unavailable policy"
-            );
-        }
-
-        #[tokio::test]
-        async fn judge_turn_intent_returns_unavailable_when_judge_errors() {
-            let judge = ScriptedJudge::err(TurnIntentJudgeError::Inference(
-                astra_core::ClassifiedError::new(
-                    astra_core::ErrorKind::Network,
-                    "connection reset",
-                ),
-            ));
-            let mut host = host_with_judge(judge.clone() as Arc<dyn TurnIntentJudge>);
-
-            let mut state = crate::turn::agentic_loop::host::tests::make_state();
-            state.message = "please inspect the current changes".to_string();
-            state.user_intent = state.message.clone();
-
-            assert_eq!(
-                host.judge_turn_intent(&state).await,
-                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
             );
         }
 
@@ -52843,6 +52543,7 @@ mod tests {
                 requests: requests.clone(),
             };
             let mut host = test_host_builder("u-observation", "s-observation")
+                .with_work_planning_bound(true)
                 .with_test_inference_ledger(ledger.clone())
                 .with_test_judgment_clients([
                     Box::new(classification_client)
@@ -52851,7 +52552,9 @@ mod tests {
                 ])
                 .build();
             let mut state = create_durable_execution_test_state("s-observation");
-            state.session_turn = 3;
+            state.session_turn = 5;
+            state.llm_rounds_completed = 4;
+            state.recent_tools = vec!["read_file".into()];
             state.user_intent = "correct it".into();
             state.message =
                 "<project-instructions>context</project-instructions>\n\ncorrect it".into();
@@ -52879,10 +52582,6 @@ mod tests {
             crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
                 .await
                 .unwrap();
-            assert!(
-                host.turn_intent_judge.is_none(),
-                "test must use the built-in production producer"
-            );
             state
                 .messages
                 .push(json!({"role":"assistant","content":"later response"}));
@@ -52931,6 +52630,11 @@ mod tests {
                 context["state"]["context"]["immediate_previous_exchange"]["assistant"],
                 "response B"
             );
+            assert_eq!(context["state"]["context"]["turn"], 5);
+            assert_eq!(
+                context["state"]["context"]["recent_tools"],
+                json!(["read_file"])
+            );
             assert!(
                 context["state"]["context"].get("source").is_none(),
                 "runtime IDs are never model-authored"
@@ -52939,11 +52643,9 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn judge_skill_auto_route_invokes_wired_judge_with_visible_catalog() {
-            let judge = ScriptedSkillRouteJudge::ok(Some("review-changes"));
-            let mut host =
-                host_with_skill_route_judge(judge.clone() as Arc<dyn SkillAutoRouteJudge>);
-            let state = crate::turn::agentic_loop::host::tests::make_state();
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        async fn skill_auto_route_uses_provider_request_and_closed_response() {
+            let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
             let visible_skills = vec![crate::turn::skill_tool::SkillToolInfo {
                 name: "review-changes".into(),
                 description: "Review local changes".into(),
@@ -52951,91 +52653,72 @@ mod tests {
                 aliases: vec!["review".into()],
                 ..Default::default()
             }];
-
-            let decision = host
-                .judge_skill_auto_route(
-                    &state,
-                    crate::turn::agentic_loop::host::SkillAutoRouteJudgeContext {
-                        query: "review current branch",
-                        visible_skills: &visible_skills,
-                    },
-                )
-                .await;
-
-            assert_eq!(
-                decision,
-                Some(crate::turn::agentic_loop::host::SkillAutoRouteDecision {
-                    skill_name: "review-changes".into()
-                })
-            );
-            let calls = judge.calls();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].query, "review current branch");
-            assert_eq!(calls[0].visible_skills.len(), 1);
-            assert_eq!(calls[0].visible_skills[0].name, "review-changes");
-            assert_eq!(calls[0].visible_skills[0].aliases, vec!["review"]);
-        }
-
-        #[tokio::test]
-        async fn disabled_skill_auto_route_policy_skips_even_an_injected_judge() {
-            let judge = ScriptedSkillRouteJudge::ok(Some("review-changes"));
-            let mut host = host_with_skill_route_policy_and_judge(
-                SkillAutoRouteExecutionPolicy::Disabled,
-                judge.clone() as Arc<dyn SkillAutoRouteJudge>,
-            );
-            let state = crate::turn::agentic_loop::host::tests::make_state();
-            let visible_skills = vec![crate::turn::skill_tool::SkillToolInfo {
-                name: "review-changes".into(),
-                description: "Review local changes".into(),
-                ..Default::default()
-            }];
-
-            assert_eq!(
-                host.judge_skill_auto_route(
-                    &state,
-                    crate::turn::agentic_loop::host::SkillAutoRouteJudgeContext {
-                        query: "review current branch",
-                        visible_skills: &visible_skills,
-                    },
-                )
-                .await,
-                None
-            );
-            assert!(
-                judge.calls().is_empty(),
-                "disabled policy must not invoke the skill auto-route LLM"
-            );
-        }
-
-        #[tokio::test]
-        async fn judge_skill_auto_route_returns_none_when_judge_errors() {
-            let judge = ScriptedSkillRouteJudge::err(SkillAutoRouteJudgeError::Inference(
-                astra_core::ClassifiedError::new(
-                    astra_core::ErrorKind::Network,
-                    "connection reset",
+            let accepted =
+                json!({"answers":{"0":{"type":"discrete_noul","decision":"yes"}}}).to_string();
+            for (policy, response, expected_calls, expected_skill) in [
+                (
+                    SkillAutoRouteExecutionPolicy::Auto,
+                    Some(accepted.clone()),
+                    1,
+                    Some("review-changes"),
                 ),
-            ));
-            let mut host =
-                host_with_skill_route_judge(judge.clone() as Arc<dyn SkillAutoRouteJudge>);
-            let state = crate::turn::agentic_loop::host::tests::make_state();
-            let visible_skills = vec![crate::turn::skill_tool::SkillToolInfo {
-                name: "review-changes".into(),
-                description: "Review local changes".into(),
-                ..Default::default()
-            }];
-
-            assert_eq!(
-                host.judge_skill_auto_route(
-                    &state,
-                    crate::turn::agentic_loop::host::SkillAutoRouteJudgeContext {
-                        query: "review current branch",
-                        visible_skills: &visible_skills,
-                    },
+                (
+                    SkillAutoRouteExecutionPolicy::Disabled,
+                    Some(accepted),
+                    0,
+                    None,
+                ),
+                (
+                    SkillAutoRouteExecutionPolicy::Auto,
+                    Some("not JSON".into()),
+                    1,
+                    None,
+                ),
+                // The existing provider fixture returns a classified error when no response exists.
+                (SkillAutoRouteExecutionPolicy::Auto, None, 1, None),
+            ] {
+                let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let mut host = test_host_builder("u", "s")
+                    .with_skill_auto_route_policy(policy)
+                    .with_test_judgment_clients([Box::new(SequencedSummaryClient {
+                        provenance: astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                        responses: std::sync::Mutex::new(response.into_iter().collect()),
+                        requests: requests.clone(),
+                    })
+                        as Box<dyn SummaryLlmClient>])
+                    .build();
+                let state = crate::turn::agentic_loop::host::tests::make_state();
+                let context = crate::turn::agentic_loop::host::SkillAutoRouteJudgeContext {
+                    query: "review current branch",
+                    visible_skills: &visible_skills,
+                };
+                let expected_request = astra_services::skill_auto_route_judgment_request(
+                    &skill_auto_route_service_context(
+                        crate::turn::agentic_loop::host::SkillAutoRouteJudgeContext {
+                            query: context.query,
+                            visible_skills: context.visible_skills,
+                        },
+                    ),
                 )
-                .await,
-                None
-            );
-            assert_eq!(judge.calls().len(), 1);
+                .unwrap();
+                let decision = host.judge_skill_auto_route(&state, context).await;
+                assert_eq!(
+                    decision
+                        .as_ref()
+                        .map(|decision| decision.skill_name.as_str()),
+                    expected_skill
+                );
+                let calls = requests.lock().unwrap();
+                assert_eq!(calls.len(), expected_calls);
+                if expected_calls != 0 {
+                    let sent: astra_turn_types::JudgmentRequest =
+                        serde_json::from_str(calls[0][1]["content"].as_str().unwrap()).unwrap();
+                    assert_eq!(sent, expected_request);
+                    assert_eq!(sent.state["query"], "review current branch");
+                    assert_eq!(sent.state["catalog"][0]["name"], "review-changes");
+                    assert_eq!(sent.state["catalog"][0]["aliases"], json!(["review"]));
+                }
+            }
         }
 
         #[tokio::test]

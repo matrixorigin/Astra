@@ -62,6 +62,7 @@ fn invocation<'a>(run_id: &'a str, call_id: &'a str) -> ToolInvocationMetadata<'
         tool_call_id: Some(call_id),
         admission_source: Some(ToolInvocationAdmissionSource::Policy),
         expected_control_epoch: None,
+        command_timeout_cap_ms: None,
         delegation_model_admission: None,
         task_resolution_authority: None,
     }
@@ -1117,6 +1118,7 @@ async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
                     tool_call_id: Some("terminal-cut-repair-call"),
                     admission_source: Some(ToolInvocationAdmissionSource::Policy),
                     expected_control_epoch: Some(-1),
+                    command_timeout_cap_ms: None,
                     delegation_model_admission: None,
                     task_resolution_authority: None,
                 },
@@ -1191,6 +1193,7 @@ async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
                     tool_call_id: Some("settlement-replay-call"),
                     admission_source: Some(ToolInvocationAdmissionSource::Policy),
                     expected_control_epoch: Some(7),
+                    command_timeout_cap_ms: None,
                     delegation_model_admission: None,
                     task_resolution_authority: None,
                 },

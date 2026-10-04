@@ -1350,11 +1350,6 @@ struct CliSseStreamHost<'a> {
     /// When a `tool_request` arrives with one of these IDs, the local permission
     /// check is skipped — the user has already approved the operation.
     cloud_pre_approved: std::collections::HashSet<String>,
-    /// Server-issued read-only execution ceiling for the request currently
-    /// entering the local executor. The authoritative bit travels on each
-    /// `ToolBatchRequest`; this flag is only the short-lived bridge into the
-    /// existing `execute_tool` implementation.
-    active_read_only_execution: bool,
     /// Per-invocation server-approved deadline token. This is separate from
     /// parent turn cancellation so sibling tool calls cannot cancel each other.
     active_execution_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -1808,7 +1803,6 @@ impl<'a> CliSseStreamHost<'a> {
             skill_resolver: ctx.skill_resolver,
             skills_invoked: std::collections::HashSet::new(),
             cloud_pre_approved: std::collections::HashSet::new(),
-            active_read_only_execution: false,
             active_execution_cancel: None,
             tool_result_identities: std::collections::HashMap::new(),
             active_turn_rollback,
@@ -4282,9 +4276,10 @@ async fn execute_server_budgeted(
         .map(tokio_util::sync::CancellationToken::child_token)
         .unwrap_or_default();
     host.active_execution_cancel = Some(cancellation.clone());
-    host.active_read_only_execution = request.read_only_execution;
     let result = {
-        let execution = host.execute_tool(&request.request_id, &request.tool, args);
+        let mut invocation_request = request.clone();
+        invocation_request.args = args.clone();
+        let execution = host.execute_tool(&invocation_request);
         tokio::pin!(execution);
         tokio::select! {
             result = &mut execution => result,
@@ -4295,7 +4290,6 @@ async fn execute_server_budgeted(
         }
     };
     host.active_execution_cancel = None;
-    host.active_read_only_execution = false;
     result
 }
 
@@ -4846,12 +4840,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         self.sync_incremental_tool_result(result);
     }
 
-    async fn execute_tool(
-        &mut self,
-        request_id: &str,
-        tool: &str,
-        args: &serde_json::Value,
-    ) -> EdgeToolExecResult {
+    async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
+        let request_id = request.request_id.as_str();
+        let tool = request.tool.as_str();
+        let args = &request.args;
         self.sync_permission_manager_session_id();
 
         // Child tool detail already arrives through the canonical AgentLive
@@ -4990,7 +4982,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // the cloud approval gate (approval_required → user approved → tool_request).
         // This eliminates the double-prompt issue where the same operation requires
         // both cloud approval and local approval.
-        let read_only_execution = self.active_read_only_execution;
+        let read_only_execution = request.read_only_execution;
         let cloud_approved = self.cloud_pre_approved.remove(request_id);
 
         let decision = if read_only_execution {
@@ -5421,6 +5413,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         .as_ref()
                         .map(|identity| identity.turn_chain_id.as_str()),
                     tool_call_id: Some(request_id),
+                    command_timeout_cap_ms: request.command_timeout_cap_ms,
                     ..Default::default()
                 };
                 let mut outcome = execute_with_invocation_metadata_responsive(
@@ -6256,6 +6249,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 .map(|(_, req)| {
                     let tool = req.tool.clone();
                     let args = req.args.clone();
+                    let command_timeout_cap_ms = req.command_timeout_cap_ms;
                     let request_id = req.request_id.clone();
                     let run_id = req.run_id.clone();
                     let turn_chain_id = req.turn_chain_id.clone();
@@ -6322,6 +6316,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             run_id: Some(&run_id),
                             turn_chain_id: Some(&turn_chain_id),
                             tool_call_id: Some(&request_id),
+                            command_timeout_cap_ms,
                             ..Default::default()
                         };
                         let exec = catch_tool_execution_panic(
@@ -6544,6 +6539,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         run_id: Some(&req.run_id),
                         turn_chain_id: Some(&req.turn_chain_id),
                         tool_call_id: Some(&req.request_id),
+                        command_timeout_cap_ms: req.command_timeout_cap_ms,
                         ..Default::default()
                     },
                     Some(retry_cancel.clone()),
@@ -8213,6 +8209,7 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
             tool_call_id: tool_call_id_for_blocking.as_deref(),
             admission_source: admission_source_for_blocking,
             expected_control_epoch: None,
+            command_timeout_cap_ms: invocation.command_timeout_cap_ms,
             delegation_model_admission: None,
         };
         executor_for_blocking.execute_blocking_shell_tool(
@@ -8834,7 +8831,7 @@ mod tests {
                 "run_id": "readonly-run", "turn_chain_id": "readonly-chain",
                 "request_id": format!("readonly-write-{read_only}"),
                 "schema_admitted_by_server": true, "read_only_execution": read_only,
-                "execution_timeout_ms": 300000, "execution_deadline_unix_ms": 4102444800000u64,
+                "execution_timeout_ms": 300000, "command_timeout_cap_ms": 30_000, "execution_deadline_unix_ms": 4102444800000u64,
                 "tool": "write_file", "args": {"path": marker, "content": "published"}
             });
             let wire = format!(
@@ -8919,7 +8916,14 @@ mod tests {
                     request_id: "denied-git".to_string(),
                 },
             );
-            let result = host.execute_tool("denied-git", "bash", &args).await;
+            let result = host
+                .execute_tool(&parallel_batch_request(
+                    "direct",
+                    "denied-git",
+                    "bash",
+                    (args).clone(),
+                ))
+                .await;
             assert_eq!(result.status, "failed", "{}", result.output);
             assert!(
                 result.output.contains("Approval is unavailable"),
@@ -12089,10 +12093,47 @@ mod tests {
             request_id: id.to_owned(),
             read_only_execution: false,
             execution_timeout_ms: 30_000,
+            command_timeout_cap_ms: (tool == "bash").then_some(30_000),
             execution_deadline_unix_ms: u64::MAX,
             tool: tool.to_owned(),
             args,
         }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn server_bash_budget_does_not_change_invocation_arguments() {
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let workspace = tempdir().unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        host.on_server_tool_surface_admission("bash").unwrap();
+        let mut requests = Vec::new();
+        let mut settled = Vec::new();
+        for (id, args) in [
+            ("default", serde_json::json!({"command": "sleep 10"})),
+            (
+                "explicit",
+                serde_json::json!({"command": "sleep 10", "timeout": 90}),
+            ),
+        ] {
+            let mut request = parallel_batch_request("budget", id, "bash", args.clone());
+            request.command_timeout_cap_ms = Some(200);
+            let results = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                host.execute_tools_batch(vec![request.clone()]),
+            )
+            .await
+            .expect("command cap ends execution before delivery deadline");
+            assert_eq!(results.len(), 1);
+            let result = &results[0];
+            assert!(result.output.contains("timed out"), "{}", result.output);
+            assert_eq!(result.args, args);
+            assert_eq!(request.args, args);
+            requests.push(request);
+            settled.extend(results);
+        }
+        fixture.assert_settlements(&requests, &settled).await;
     }
 
     fn parallel_recall(owner: &str, id: &str) -> ToolBatchRequest {
@@ -12438,6 +12479,7 @@ mod tests {
                     request_id: "pf-1".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({"path": first.to_string_lossy()}),
@@ -12449,6 +12491,7 @@ mod tests {
                     request_id: "pf-2".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({"path": second.to_string_lossy()}),
@@ -12492,6 +12535,7 @@ mod tests {
                     request_id: request_id.into(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "list_dir".into(),
                     args: serde_json::json!({"path": project}),
@@ -12533,6 +12577,7 @@ mod tests {
                 request_id: "child-synthetic".into(),
                 read_only_execution: false,
                 execution_timeout_ms: 300_000,
+                command_timeout_cap_ms: None,
                 execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "read_file".into(),
                 args: serde_json::json!({"path": first, "transaction_id": 1}),
@@ -12626,6 +12671,7 @@ mod tests {
                 request_id: "expired-1".to_string(),
                 read_only_execution: false,
                 execution_timeout_ms: 300_000,
+                command_timeout_cap_ms: None,
                 execution_deadline_unix_ms: 1,
                 tool: "read_file".to_string(),
                 args: serde_json::json!({"path": target}),
@@ -12700,6 +12746,7 @@ mod tests {
                     request_id: "callback-1".into(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".into(),
                     args: serde_json::json!({"path": "one.txt"}),
@@ -12711,6 +12758,7 @@ mod tests {
                     request_id: "callback-2".into(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".into(),
                     args: serde_json::json!({"path": "two.txt"}),
@@ -12779,7 +12827,7 @@ mod tests {
                 "data: {{\"type\":\"tool_request\",\"session_id\":{first:?},",
                 "\"run_id\":\"run-late-bind\",\"turn_chain_id\":\"chain-late-bind\",",
                 "\"request_id\":\"tool-must-not-run\",",
-                "\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000,\"tool\":\"write_file\",",
+                "\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"tool\":\"write_file\",",
                 "\"args\":{{\"path\":{output:?},\"content\":\"forbidden\"}}}}\n\n",
                 "data: [DONE]\n\n"
             ),
@@ -13517,7 +13565,7 @@ mod tests {
         let mut r = TurnResult::new();
         let mut s = StreamRenderState::new();
         let mut pending = Vec::new();
-        let block = "data: {\"type\":\"tool_request\",\"session_id\":\"test-session\",\"run_id\":\"test-run\",\"turn_chain_id\":\"test-chain\",\"request_id\":\"tr-1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000,\"tool\":\"bash\",\"args\":{\"command\":\"echo x\"}}\n\n";
+        let block = "data: {\"type\":\"tool_request\",\"session_id\":\"test-session\",\"run_id\":\"test-run\",\"turn_chain_id\":\"test-chain\",\"request_id\":\"tr-1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"tool\":\"bash\",\"args\":{\"command\":\"echo x\"}}\n\n";
         dispatch_turn_event_block(block, &mut r, &mut s, RenderPolicy::Silent, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
@@ -14684,9 +14732,30 @@ mod tests {
         );
 
         let args = serde_json::json!({"path": "output.txt", "content": "same bytes\n"});
-        let first = host.execute_tool("write-1", "write_file", &args).await;
-        let second = host.execute_tool("write-2", "write_file", &args).await;
-        let third = host.execute_tool("write-3", "write_file", &args).await;
+        let first = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-1",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
+        let second = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-2",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
+        let third = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-3",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
         assert_eq!(first.status, "completed", "{}", first.output);
         assert_eq!(second.status, "completed", "{}", second.output);
         assert_eq!(third.status, "failed");
@@ -14713,7 +14782,14 @@ mod tests {
                 .output_cache
                 .contains_key("read_file:cached")
         );
-        let next = host.execute_tool("write-4", "write_file", &args).await;
+        let next = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-4",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
         assert_eq!(
             next.status, "completed",
             "new provider round must reopen the call"
@@ -14721,25 +14797,53 @@ mod tests {
         host.on_accepted_sse_event(&round_two)
             .await
             .expect("same feedback replay");
-        let same_round_second = host.execute_tool("write-5", "write_file", &args).await;
+        let same_round_second = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-5",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
         assert_eq!(same_round_second.status, "completed");
         host.on_accepted_sse_event(&round_one)
             .await
             .expect("stale feedback replay");
-        let same_round_third = host.execute_tool("write-6", "write_file", &args).await;
+        let same_round_third = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-6",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
         assert_eq!(same_round_third.status, "failed");
 
         let missing_request = provider_round_feedback_event("session-1", "run-1", 3, None);
         host.on_accepted_sse_event(&missing_request)
             .await
             .expect("request-less feedback remains presentation evidence only");
-        let after_missing = host.execute_tool("write-7", "write_file", &args).await;
+        let after_missing = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-7",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
         assert_eq!(after_missing.status, "failed");
 
         let mismatched =
             provider_round_feedback_event("other-session", "run-1", 3, Some("request-3"));
         assert!(host.on_accepted_sse_event(&mismatched).await.is_err());
-        let after_mismatch = host.execute_tool("write-8", "write_file", &args).await;
+        let after_mismatch = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-8",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
         assert_eq!(after_mismatch.status, "failed");
     }
 
@@ -14842,6 +14946,7 @@ mod tests {
                     request_id: "tr-1".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -14858,6 +14963,7 @@ mod tests {
                     request_id: "tr-2".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -14950,6 +15056,7 @@ mod tests {
                     request_id: "tr-1".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -14966,6 +15073,7 @@ mod tests {
                     request_id: "tr-2".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -15050,6 +15158,7 @@ mod tests {
                     request_id: "tr-1".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -15066,6 +15175,7 @@ mod tests {
                     request_id: "tr-2".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -15081,6 +15191,7 @@ mod tests {
                     request_id: "tr-3".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -15164,6 +15275,7 @@ mod tests {
                 request_id: "tx-boundary-1".to_string(),
                 read_only_execution: false,
                 execution_timeout_ms: 300_000,
+                command_timeout_cap_ms: None,
                 execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "write_file".to_string(),
                 args: serde_json::json!({
@@ -15253,6 +15365,7 @@ mod tests {
                     request_id: "tx-boundary-1".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -15269,6 +15382,7 @@ mod tests {
                     request_id: "tx-boundary-2".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -15367,6 +15481,7 @@ mod tests {
                     request_id: "turn-1".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -15381,6 +15496,7 @@ mod tests {
                     request_id: "turn-2".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: Some(300_000),
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -15498,6 +15614,7 @@ mod tests {
             request_id: request_id.to_string(),
             read_only_execution: false,
             execution_timeout_ms: 300_000,
+            command_timeout_cap_ms: Some(300_000),
             execution_deadline_unix_ms: 4_102_444_800_000,
             tool: tool.to_string(),
             args,
@@ -15847,6 +15964,7 @@ mod tests {
                     request_id: "turn-1".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -15861,6 +15979,7 @@ mod tests {
                     request_id: "turn-2".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: Some(300_000),
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -15874,6 +15993,7 @@ mod tests {
                     request_id: "turn-3".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -15955,11 +16075,12 @@ mod tests {
         );
 
         let first = host
-            .execute_tool(
+            .execute_tool(&parallel_batch_request(
+                "direct",
                 "cache-read-1",
                 "read_file",
-                &serde_json::json!({"path": "cached.txt"}),
-            )
+                (serde_json::json!({"path": "cached.txt"})).clone(),
+            ))
             .await;
         assert!(first.output.contains("v1"), "{}", first.output);
 
@@ -15992,11 +16113,12 @@ mod tests {
         );
 
         let second = host
-            .execute_tool(
+            .execute_tool(&parallel_batch_request(
+                "direct",
                 "cache-read-2",
                 "read_file",
-                &serde_json::json!({"path": "cached.txt"}),
-            )
+                (serde_json::json!({"path": "cached.txt"})).clone(),
+            ))
             .await;
         assert!(second.output.contains("v2"), "{}", second.output);
         assert!(
@@ -16075,6 +16197,7 @@ mod tests {
                 request_id: "cache-read-hit".into(),
                 read_only_execution: false,
                 execution_timeout_ms: 300_000,
+                command_timeout_cap_ms: None,
                 execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "read_file".into(),
                 args: read_args,
@@ -16159,7 +16282,12 @@ mod tests {
 
         let read_args = serde_json::json!({"path": "cached.txt"});
         let initial = host
-            .execute_tool("cache-read-1", "read_file", &read_args)
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "cache-read-1",
+                "read_file",
+                (read_args).clone(),
+            ))
             .await;
         assert!(initial.output.contains("v1"), "{}", initial.output);
         let read_sig = tool_dedup_signature("read_file", &read_args);
@@ -16183,11 +16311,12 @@ mod tests {
         host.tool_cache.call_counts.insert(read_sig.clone(), 2);
 
         let write = host
-            .execute_tool(
+            .execute_tool(&parallel_batch_request(
+                "direct",
                 "cache-write-1",
                 "write_file",
-                &serde_json::json!({"path": "cached.txt", "content": "v2\n"}),
-            )
+                (serde_json::json!({"path": "cached.txt", "content": "v2\n"})).clone(),
+            ))
             .await;
         assert_eq!(write.status, "completed", "{}", write.output);
         assert!(
@@ -16205,7 +16334,12 @@ mod tests {
         );
 
         let reread = host
-            .execute_tool("cache-read-2", "read_file", &read_args)
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "cache-read-2",
+                "read_file",
+                (read_args).clone(),
+            ))
             .await;
         assert!(reread.output.contains("v2"), "{}", reread.output);
         assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
@@ -16254,7 +16388,12 @@ mod tests {
 
         let read_args = serde_json::json!({"path": "cached.txt"});
         let initial = host
-            .execute_tool("cache-read-alpha", "read_file", &read_args)
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "cache-read-alpha",
+                "read_file",
+                (read_args).clone(),
+            ))
             .await;
         assert!(initial.output.contains("alpha"), "{}", initial.output);
         let read_sig = tool_dedup_signature("read_file", &read_args);
@@ -16282,15 +16421,17 @@ mod tests {
         host.tool_cache.call_counts.insert(read_sig.clone(), 2);
 
         let replace = host
-            .execute_tool(
+            .execute_tool(&parallel_batch_request(
+                "direct",
                 "cache-replace-1",
                 "str_replace",
-                &serde_json::json!({
+                (serde_json::json!({
                     "path": "cached.txt",
                     "old_str": "alpha",
                     "new_str": "omega"
-                }),
-            )
+                }))
+                .clone(),
+            ))
             .await;
         assert_eq!(replace.status, "completed", "{}", replace.output);
         assert!(
@@ -16308,7 +16449,12 @@ mod tests {
         );
 
         let reread = host
-            .execute_tool("cache-read-3", "read_file", &read_args)
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "cache-read-3",
+                "read_file",
+                (read_args).clone(),
+            ))
             .await;
         assert!(reread.output.contains("omega"), "{}", reread.output);
         assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
@@ -16369,6 +16515,7 @@ mod tests {
                     request_id: "turn-bash-0".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -16383,6 +16530,7 @@ mod tests {
                     request_id: "turn-bash-1".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: Some(300_000),
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -16396,6 +16544,7 @@ mod tests {
                     request_id: "turn-bash-2".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: Some(300_000),
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -16521,11 +16670,12 @@ mod tests {
             "MCP must execute after discovery: {echo}"
         );
         let result = host
-            .execute_tool(
+            .execute_tool(&parallel_batch_request(
+                "direct",
                 "turn-bash-ro",
                 "bash",
-                &serde_json::json!({"command": "pwd"}),
-            )
+                (serde_json::json!({"command": "pwd"})).clone(),
+            ))
             .await;
 
         assert_ne!(result.status, "failed");
@@ -16607,11 +16757,12 @@ mod tests {
         );
 
         let result = host
-            .execute_tool(
+            .execute_tool(&parallel_batch_request(
+                "direct",
                 "bash-pkill-blocked",
                 "bash",
-                &serde_json::json!({"command": "pkill -f http.server"}),
-            )
+                (serde_json::json!({"command": "pkill -f http.server"})).clone(),
+            ))
             .await;
 
         assert_eq!(result.status, "failed");
@@ -16717,6 +16868,7 @@ mod tests {
                     request_id: "ro-1".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -16731,6 +16883,7 @@ mod tests {
                     request_id: "ro-2".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -16744,6 +16897,7 @@ mod tests {
                     request_id: "ro-3".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -16830,6 +16984,7 @@ mod tests {
                 request_id: "turn-boundary-1".to_string(),
                 read_only_execution: false,
                 execution_timeout_ms: 300_000,
+                command_timeout_cap_ms: None,
                 execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "read_file".to_string(),
                 args: serde_json::json!({
@@ -16916,6 +17071,7 @@ mod tests {
                     request_id: "turn-boundary-1".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -16930,6 +17086,7 @@ mod tests {
                     request_id: "turn-boundary-2".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: Some(300_000),
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -17025,6 +17182,7 @@ mod tests {
                     request_id: "tx-bash-1".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -17041,6 +17199,7 @@ mod tests {
                     request_id: "tx-bash-2".to_string(),
                     read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: Some(300_000),
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -17127,6 +17286,7 @@ mod tests {
                 request_id: "tx-bash-ro".to_string(),
                 read_only_execution: false,
                 execution_timeout_ms: 300_000,
+                command_timeout_cap_ms: Some(300_000),
                 execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "bash".to_string(),
                 args: serde_json::json!({

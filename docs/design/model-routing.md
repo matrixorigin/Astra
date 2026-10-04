@@ -99,7 +99,7 @@ Escalate when:
 
 ## Next-turn observations (stage 2)
 
-The shared `TurnIntentJudge` can emit an optional typed `assessment`. It keeps
+Work-admission judgment can emit an optional typed `assessment`. It keeps
 response satisfaction (satisfied/mixed/dissatisfied/unknown) separate from the
 new request's difficulty (easy/moderate/difficult/unknown) and urgency
 (normal/urgent/unknown). Each dimension has its own categorical confidence;
@@ -110,8 +110,7 @@ The production Work-admission judge emits the same optional assessment in its
 existing request. The shared turn entrypoint captures the source and preceding
 exchange before primary rounds, and the completed admission records observations
 on that source even when the result arrives later. Invalid optional assessments
-are discarded without rejecting a valid Work decision. Full injected turn-intent
-judges use the same assessment contract and runtime binding. Fixed-default,
+are discarded without rejecting a valid Work decision. Fixed-default,
 already-bound Work, and capacity-policy skips do not add a call for observation;
 their missing assessments remain unknown. Native TypeSafe responses preserve the
 optional assessment through answer validation for the admission parser to decode.

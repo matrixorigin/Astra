@@ -683,14 +683,7 @@ impl SessionCapture {
                         .get("turn")
                         .and_then(|value| value.as_u64())
                         .and_then(|turn| turn.try_into().ok()),
-                    run_id: event
-                        .raw
-                        .get("producer_scope")
-                        .and_then(|scope| scope.get("run_id"))
-                        .or_else(|| event.raw.get("run_id"))
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|id| !id.is_empty())
-                        .map(str::to_owned),
+                    run_id: event_run_id(&event.raw).map(str::to_owned),
                     round: record
                         .get("round")
                         .or_else(|| {
@@ -1047,29 +1040,8 @@ fn materialize_persisted_tool_results(
 fn event_invocation_binding(
     raw: &serde_json::Value,
 ) -> Option<(&str, chrono::DateTime<chrono::Utc>)> {
+    let run_id = event_run_id(raw)?;
     let logical = logical_event(raw);
-    let run_id = logical
-        .get("run_id")
-        .and_then(|value| value.as_str())
-        .or_else(|| {
-            raw.get("metadata")
-                .and_then(|metadata| metadata.get("run_id"))
-                .and_then(|value| value.as_str())
-        })
-        .or_else(|| {
-            raw.get("producer_scope")
-                .and_then(|scope| scope.get("run_id"))
-                .and_then(|value| value.as_str())
-        })
-        .or_else(|| raw.get("run_id").and_then(|value| value.as_str()))
-        .or_else(|| {
-            logical
-                .get("payload")
-                .and_then(|payload| payload.get("trace_context"))
-                .and_then(|context| context.get("run_id"))
-                .and_then(|value| value.as_str())
-        })
-        .filter(|value| !value.trim().is_empty())?;
 
     if let Some(ts) = raw.get("ts").and_then(|value| value.as_str()) {
         let timestamp = chrono::DateTime::parse_from_rfc3339(ts)
@@ -1249,13 +1221,33 @@ fn nested_tool_identity(event: &JournalEvent, call_id: &str) -> String {
 }
 
 fn nested_tool_run_id(event: &JournalEvent) -> &str {
-    event
-        .raw
-        .get("producer_scope")
-        .and_then(|scope| scope.get("run_id"))
-        .or_else(|| event.raw.get("run_id"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("legacy-unscoped")
+    event_run_id(&event.raw).unwrap_or("legacy-unscoped")
+}
+
+fn event_run_id(raw: &serde_json::Value) -> Option<&str> {
+    let logical = logical_event(raw);
+    logical
+        .get("run_id")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            raw.get("metadata")
+                .and_then(|metadata| metadata.get("run_id"))
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            raw.get("producer_scope")
+                .and_then(|scope| scope.get("run_id"))
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| raw.get("run_id").and_then(|value| value.as_str()))
+        .or_else(|| {
+            logical
+                .get("payload")
+                .and_then(|payload| payload.get("trace_context"))
+                .and_then(|context| context.get("run_id"))
+                .and_then(|value| value.as_str())
+        })
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// Resolve artifacts only inside the explicitly authorized owner roots.
@@ -1850,7 +1842,7 @@ mod tests {
             "ts": "2026-08-09T00:00:00Z",
             "session_id": session_id,
             "turn": 1,
-            "producer_scope": {"run_id": "run-fanout"},
+            "metadata": {"run_id": "run-fanout"},
             "tool_calls": [{
                 "tool_call_id": "call-fanout",
                 "name": "agent_fanout",
@@ -1861,10 +1853,15 @@ mod tests {
                 "result_artifact": persisted.descriptor,
             }],
         });
-        std::fs::write(&journal, format!("{event}\n")).unwrap();
+        let mut round = event.clone();
+        round["type"] = "llm_round".into();
+        round["producer_scope"] = serde_json::json!({"run_id": "run-fanout"});
+        round.as_object_mut().unwrap().remove("metadata");
+        std::fs::write(&journal, format!("{round}\n{event}\n")).unwrap();
         let capture = load_session_from_path(session_id, &journal).expect("loaded capture");
         let calls = capture.journal_tool_calls();
         assert_eq!(calls.len(), 1, "capture: {capture:?}");
+        assert_eq!(calls[0].run_id.as_deref(), Some("run-fanout"));
         assert_eq!(
             calls[0]
                 .result
@@ -3629,6 +3626,7 @@ mod tests {
                 JournalEvent {
                     event_type: "turn".into(),
                     raw: serde_json::json!({
+                        "metadata": {"run_id": "conflicting-run"},
                         "tool_calls": [{
                             "tool_call_id": "call-1",
                             "name": "start_work",
@@ -3641,6 +3639,7 @@ mod tests {
                 JournalEvent {
                     event_type: "turn".into(),
                     raw: serde_json::json!({
+                        "producer_scope": {"run_id": "conflicting-run"},
                         "tool_calls": [{
                             "tool_call_id": "call-1",
                             "name": "start_work",
@@ -3720,7 +3719,7 @@ mod tests {
                 JournalEvent {
                     event_type: "turn".into(),
                     raw: serde_json::json!({
-                        "producer_scope": {"run_id": "run-1"},
+                        "metadata": {"run_id": "run-1"},
                         "tool_calls": [{
                             "tool_call_id": "call-00",
                             "name": "start_work",

@@ -1,13 +1,11 @@
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::{
-    AvailableToolSurface, CapabilityResolver, EffectiveCapabilitySet, IsolationIntent,
-    PolicyIntent, RunBinding, RuntimeBinding, RuntimeEnvironmentAdvertisement,
-    RuntimeIsolationBackend, RuntimeLaunchDriver, RuntimeSessionManager, RuntimeStatus,
-    ToolRegistry, ToolUnavailableReason, WorkspaceRecord,
+    AvailableToolSurface, EffectiveCapabilitySet, IsolationIntent, PolicyIntent, RunBinding,
+    RuntimeEnvironmentAdvertisement, RuntimeIsolationBackend, RuntimeLaunchDriver,
+    RuntimeSessionManager, ToolUnavailableReason, WorkspaceRecord,
 };
 
 pub const TOOL_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT: &str = "runtime_environment_advertisement";
@@ -61,32 +59,6 @@ impl CompiledRuntimePolicy {
 
     pub fn initial(intent: PolicyIntent) -> Self {
         Self::dynamic(PolicyRevision::INITIAL, intent)
-    }
-
-    pub fn require_runtime(&self, runtime: &RuntimeBinding) -> Result<(), RuntimeError> {
-        if runtime.status != RuntimeStatus::Ready {
-            return Err(RuntimeError::runtime_unavailable(format!(
-                "runtime '{}' is {:?}",
-                runtime.runtime_id, runtime.status
-            )));
-        }
-
-        if isolation_enforceable(self.intent.isolation, runtime.isolation_backend) {
-            return Ok(());
-        }
-
-        Err(RuntimeError::policy_unenforceable(format!(
-            "runtime isolation backend {:?} cannot enforce isolation intent {:?}",
-            runtime.isolation_backend, self.intent.isolation
-        )))
-    }
-
-    pub fn requires_session_recreate_from(&self, previous: &Self) -> bool {
-        self.update_mode == RuntimePolicyUpdateMode::SessionRecreateRequired
-            || previous.update_mode == RuntimePolicyUpdateMode::SessionRecreateRequired
-            || self.intent.isolation != previous.intent.isolation
-            || self.intent.filesystem != previous.intent.filesystem
-            || self.intent.credentials != previous.intent.credentials
     }
 }
 
@@ -685,236 +657,17 @@ pub fn runtime_result_fields_with_policy_evidence(
     fields
 }
 
-pub fn validate_runtime_session_spec(
-    registry: &ToolRegistry,
-    spec: &RuntimeSessionSpec,
-) -> Result<(), RuntimeError> {
-    spec.policy.require_runtime(&spec.binding.runtime)?;
-    for tool_name in &spec.requested_tools {
-        validate_runtime_tool_name(registry, &spec.binding, tool_name)?;
-    }
-    Ok(())
-}
-
-pub fn validate_runtime_tool_invocation(
-    registry: &ToolRegistry,
-    invocation: &RuntimeToolInvocation,
-) -> Result<(), RuntimeError> {
-    validate_runtime_tool_call(
-        registry,
-        &invocation.binding,
-        &invocation.tool_name,
-        &invocation.arguments,
-    )
-}
-
-fn validate_runtime_tool_name(
-    registry: &ToolRegistry,
-    binding: &RunBinding,
-    tool_name: &str,
-) -> Result<(), RuntimeError> {
-    if !binding.policy.allows_tool(tool_name) {
-        return Err(RuntimeError::tool_unavailable(
-            tool_name,
-            ToolUnavailableReason::PolicyDenied(PolicyIntent::disallowed_tool_reason(tool_name)),
-        ));
-    }
-    CapabilityResolver
-        .check_tool_for_surface(
-            registry,
-            tool_name,
-            &binding.capabilities,
-            &binding.tool_surface,
-        )
-        .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))
-}
-
-fn validate_runtime_tool_call(
-    registry: &ToolRegistry,
-    binding: &RunBinding,
-    tool_name: &str,
-    args: &Value,
-) -> Result<(), RuntimeError> {
-    if !binding.policy.allows_tool(tool_name) {
-        return Err(RuntimeError::tool_unavailable(
-            tool_name,
-            ToolUnavailableReason::PolicyDenied(PolicyIntent::disallowed_tool_reason(tool_name)),
-        ));
-    }
-    CapabilityResolver
-        .check_tool_call_for_surface(
-            registry,
-            tool_name,
-            args,
-            &binding.capabilities,
-            &binding.tool_surface,
-        )
-        .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))
-}
-
-#[async_trait]
-pub trait RuntimeEnvironment: Send + Sync {
-    fn runtime_binding(&self) -> RuntimeBinding;
-
-    fn session_manager(&self) -> RuntimeSessionManager {
-        self.runtime_binding().session_manager
-    }
-
-    fn capabilities(&self, binding: &RunBinding) -> EffectiveCapabilitySet {
-        binding.capabilities
-    }
-
-    fn advertised_surface(&self, binding: &RunBinding) -> AvailableToolSurface {
-        binding.tool_surface.clone()
-    }
-
-    async fn prepare_session(
-        &self,
-        spec: RuntimeSessionSpec,
-    ) -> Result<RuntimeSessionHandle, RuntimeError>;
-
-    async fn execute_tool(
-        &self,
-        session: &RuntimeSessionHandle,
-        invocation: RuntimeToolInvocation,
-    ) -> Result<RuntimeToolOutcome, RuntimeError>;
-
-    async fn update_policy(
-        &self,
-        session: &RuntimeSessionHandle,
-        binding: RunBinding,
-        policy: CompiledRuntimePolicy,
-    ) -> Result<RuntimeSessionHandle, RuntimeError>;
-
-    async fn destroy_session(&self, session: RuntimeSessionHandle) -> Result<(), RuntimeError>;
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::Mutex;
 
     use serde_json::json;
 
     use super::*;
     use crate::{
-        ExecutorBinding, PolicyIntent, RuntimeBinding, WorkspaceAuthority, WorkspaceBinding,
+        ExecutorBinding, PolicyIntent, RuntimeBinding, ToolRegistry, WorkspaceAuthority,
+        WorkspaceBinding,
     };
-
-    struct FakeRuntime {
-        runtime: RuntimeBinding,
-        registry: ToolRegistry,
-        live_sessions: Mutex<BTreeSet<String>>,
-        allow_dynamic_policy_update: bool,
-        capacity: usize,
-    }
-
-    impl FakeRuntime {
-        fn new(runtime: RuntimeBinding) -> Self {
-            Self {
-                runtime,
-                registry: ToolRegistry::builtins(),
-                live_sessions: Mutex::new(BTreeSet::new()),
-                allow_dynamic_policy_update: true,
-                capacity: usize::MAX,
-            }
-        }
-
-        fn with_dynamic_policy_updates(mut self, allowed: bool) -> Self {
-            self.allow_dynamic_policy_update = allowed;
-            self
-        }
-
-        fn with_capacity(mut self, capacity: usize) -> Self {
-            self.capacity = capacity;
-            self
-        }
-
-        fn contains_session(&self, session_id: &str) -> bool {
-            self.live_sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(session_id)
-        }
-    }
-
-    #[async_trait]
-    impl RuntimeEnvironment for FakeRuntime {
-        fn runtime_binding(&self) -> RuntimeBinding {
-            self.runtime.clone()
-        }
-
-        async fn prepare_session(
-            &self,
-            mut spec: RuntimeSessionSpec,
-        ) -> Result<RuntimeSessionHandle, RuntimeError> {
-            spec.binding = RunBinding::resolve(
-                spec.binding.workspace.clone(),
-                spec.binding.executor.clone(),
-                self.runtime.clone(),
-                spec.binding.policy.clone(),
-                &self.registry,
-            );
-            validate_runtime_session_spec(&self.registry, &spec)?;
-            let mut live_sessions = self.live_sessions.lock().unwrap_or_else(|e| e.into_inner());
-            if live_sessions.len() >= self.capacity {
-                return Err(RuntimeError::capacity_exhausted(
-                    "runtime capacity exhausted",
-                ));
-            }
-            live_sessions.insert(spec.session_id.clone());
-            Ok(RuntimeSessionHandle::from_spec(&spec))
-        }
-
-        async fn execute_tool(
-            &self,
-            session: &RuntimeSessionHandle,
-            invocation: RuntimeToolInvocation,
-        ) -> Result<RuntimeToolOutcome, RuntimeError> {
-            if !self.contains_session(&session.session_id) {
-                return Err(RuntimeError::runtime_unavailable(
-                    "runtime session is not live",
-                ));
-            }
-            if invocation.policy_revision != session.policy.revision {
-                return Err(RuntimeError::sandbox_recreate_required(
-                    "tool invocation policy revision does not match runtime session",
-                ));
-            }
-            validate_runtime_tool_invocation(&self.registry, &invocation)?;
-            Ok(RuntimeToolOutcome::completed(&invocation, "ok", session))
-        }
-
-        async fn update_policy(
-            &self,
-            session: &RuntimeSessionHandle,
-            binding: RunBinding,
-            policy: CompiledRuntimePolicy,
-        ) -> Result<RuntimeSessionHandle, RuntimeError> {
-            if !self.contains_session(&session.session_id) {
-                return Err(RuntimeError::runtime_unavailable(
-                    "runtime session is not live",
-                ));
-            }
-            policy.require_runtime(&binding.runtime)?;
-            if !self.allow_dynamic_policy_update
-                || policy.requires_session_recreate_from(&session.policy)
-            {
-                return Err(RuntimeError::sandbox_recreate_required(
-                    "policy change requires a fresh runtime session",
-                ));
-            }
-            Ok(session.clone().with_policy(policy, &binding))
-        }
-
-        async fn destroy_session(&self, session: RuntimeSessionHandle) -> Result<(), RuntimeError> {
-            self.live_sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&session.session_id);
-            Ok(())
-        }
-    }
 
     fn gvisor_binding() -> RunBinding {
         let registry = ToolRegistry::builtins();
@@ -1013,197 +766,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepare_session_rejects_policy_runtime_mismatch_before_execution() {
-        // Use strict_orchestrator policy which requires GVisor isolation.
-        // host_process runtime cannot satisfy GVisor.
-        let registry = ToolRegistry::builtins();
-        let binding = RunBinding::resolve(
-            WorkspaceBinding::local_filesystem("/workspace/project", WorkspaceAuthority::ReadWrite),
-            ExecutorBinding::local_cli(),
-            RuntimeBinding::gvisor("gvisor-1"),
-            PolicyIntent::strict_orchestrator(),
-            &registry,
-        );
-        let runtime = FakeRuntime::new(RuntimeBinding::host_process("host-1"));
-        let spec =
-            RuntimeSessionSpec::new("session-1", "run-1", binding).with_requested_tools(["bash"]);
-
-        let err = runtime
-            .prepare_session(spec)
-            .await
-            .expect_err("host process cannot satisfy gVisor policy");
-
-        assert_eq!(err.kind, RuntimeErrorKind::PolicyUnenforceable);
-        assert!(!err.execution_started);
-        assert!(!err.side_effects_maybe);
-    }
-
-    #[tokio::test]
-    async fn prepare_session_rejects_capacity_exhaustion_as_retryable() {
-        let binding = gvisor_binding();
-        let runtime = FakeRuntime::new(RuntimeBinding::gvisor("gvisor-1")).with_capacity(0);
-        let spec = RuntimeSessionSpec::new("session-1", "run-1", binding);
-
-        let err = runtime
-            .prepare_session(spec)
-            .await
-            .expect_err("capacity is exhausted");
-
-        assert_eq!(err.kind, RuntimeErrorKind::RuntimeCapacityExhausted);
-        assert!(err.retryable);
-        assert!(!err.execution_started);
-    }
-
-    #[tokio::test]
-    async fn prepare_session_rejects_requested_tool_outside_policy_allowlist() {
-        let registry = ToolRegistry::builtins();
-        let binding = RunBinding::resolve(
-            WorkspaceBinding::local_filesystem("/workspace/project", WorkspaceAuthority::ReadWrite),
-            ExecutorBinding::local_cli(),
-            RuntimeBinding::gvisor("gvisor-1"),
-            PolicyIntent::local_developer().with_allowed_tools(["read_file"]),
-            &registry,
-        );
-        let runtime = FakeRuntime::new(RuntimeBinding::gvisor("gvisor-1"));
-        let spec =
-            RuntimeSessionSpec::new("session-1", "run-1", binding).with_requested_tools(["bash"]);
-
-        let err = runtime
-            .prepare_session(spec)
-            .await
-            .expect_err("policy-disallowed requested tool must fail before session start");
-
-        assert_eq!(err.kind, RuntimeErrorKind::ToolUnavailable);
-        assert!(!err.execution_started);
-        assert!(!err.side_effects_maybe);
-        assert_eq!(
-            err.tool_reason,
-            Some(ToolUnavailableReason::PolicyDenied(
-                PolicyIntent::disallowed_tool_reason("bash")
-            ))
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_tool_rejects_unavailable_tool_before_execution() {
-        let registry = ToolRegistry::builtins();
-        let binding = RunBinding::cloud_control_plane(&registry);
-        let runtime = FakeRuntime::new(RuntimeBinding::oci_container("orchestrator-runtime"));
-        let spec = RuntimeSessionSpec::new("session-1", "run-1", binding.clone());
-        let session = runtime
-            .prepare_session(spec)
-            .await
-            .expect("prepare session");
-        let invocation = RuntimeToolInvocation::new(
-            "call-1",
-            "bash",
-            json!({"cmd": "pwd"}),
-            binding,
-            session.policy.revision,
-        );
-
-        let err = runtime
-            .execute_tool(&session, invocation)
-            .await
-            .expect_err("cloud control plane has no shell");
-
-        assert_eq!(err.kind, RuntimeErrorKind::ToolUnavailable);
-        assert!(!err.execution_started);
-        assert!(matches!(
-            err.tool_reason,
-            Some(ToolUnavailableReason::ExecutorUnavailable(_))
-                | Some(ToolUnavailableReason::WorkspaceUnavailable(_))
-                | Some(ToolUnavailableReason::RuntimeCapabilityMissing(_))
-        ));
-    }
-
     #[test]
-    fn invocation_validation_rejects_tools_not_selected_by_provider_surface() {
-        let registry = ToolRegistry::builtins();
-        let providers = vec![
-            crate::server_service_provider("server", &registry),
-            crate::control_plane_provider("control", &registry),
-        ];
-        let binding = RunBinding::resolve_with_provider_declarations(
-            WorkspaceBinding::local_filesystem("/workspace/project", WorkspaceAuthority::ReadWrite),
-            ExecutorBinding::local_cli(),
-            RuntimeBinding::host_process("local-host"),
-            PolicyIntent::local_developer(),
-            &registry,
-            &providers,
-        );
-        let invocation = RuntimeToolInvocation::new(
-            "call-1",
-            "bash",
-            json!({"cmd": "pwd"}),
-            binding,
-            PolicyRevision::INITIAL,
-        );
-
-        let err = validate_runtime_tool_invocation(&registry, &invocation)
-            .expect_err("surface-hidden tool must not be executable through capability fallback");
-
-        assert_eq!(err.kind, RuntimeErrorKind::ToolUnavailable);
-        assert_eq!(
-            err.tool_reason,
-            Some(ToolUnavailableReason::ExecutorUnavailable(
-                "tool_not_selected_by_current_provider_surface".to_string()
-            ))
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_tool_rejects_policy_disallowed_tool_before_execution() {
-        let registry = ToolRegistry::builtins();
-        let binding = RunBinding::resolve(
-            WorkspaceBinding::local_filesystem("/workspace/project", WorkspaceAuthority::ReadWrite),
-            ExecutorBinding::local_cli(),
-            RuntimeBinding::gvisor("gvisor-1"),
-            PolicyIntent::local_developer().with_allowed_tools(["read_file"]),
-            &registry,
-        );
-        let runtime = FakeRuntime::new(RuntimeBinding::gvisor("gvisor-1"));
-        let spec = RuntimeSessionSpec::new("session-1", "run-1", binding.clone())
-            .with_requested_tools(["read_file"]);
-        let session = runtime
-            .prepare_session(spec)
-            .await
-            .expect("prepare session");
-        let invocation = RuntimeToolInvocation::new(
-            "call-1",
-            "bash",
-            json!({"cmd": "pwd"}),
-            binding,
-            session.policy.revision,
-        );
-
-        let err = runtime
-            .execute_tool(&session, invocation)
-            .await
-            .expect_err("policy-disallowed invocation must fail before execution");
-
-        assert_eq!(err.kind, RuntimeErrorKind::ToolUnavailable);
-        assert!(!err.execution_started);
-        assert!(!err.side_effects_maybe);
-        assert_eq!(
-            err.tool_reason,
-            Some(ToolUnavailableReason::PolicyDenied(
-                PolicyIntent::disallowed_tool_reason("bash")
-            ))
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_tool_result_carries_runtime_environment_evidence() {
+    fn completed_tool_result_carries_runtime_environment_evidence() {
         let binding = gvisor_binding();
-        let runtime = FakeRuntime::new(RuntimeBinding::gvisor("gvisor-1"));
         let spec = RuntimeSessionSpec::new("session-1", "run-1", binding.clone())
             .with_requested_tools(["bash"]);
-        let session = runtime
-            .prepare_session(spec)
-            .await
-            .expect("prepare session");
+        let session = RuntimeSessionHandle::from_spec(&spec);
         let invocation = RuntimeToolInvocation::new(
             "call-1",
             "bash",
@@ -1212,10 +780,7 @@ mod tests {
             session.policy.revision,
         );
 
-        let outcome = runtime
-            .execute_tool(&session, invocation)
-            .await
-            .expect("execute tool");
+        let outcome = RuntimeToolOutcome::completed(&invocation, "ok", &session);
 
         assert!(!outcome.is_error);
         assert!(outcome.execution_started);
@@ -1284,58 +849,5 @@ mod tests {
             outcome.metadata[TOOL_RESULT_RUNTIME_POLICY_EVIDENCE]["side_effects_maybe"],
             true
         );
-    }
-
-    #[tokio::test]
-    async fn static_policy_update_requires_fresh_session() {
-        let binding = gvisor_binding();
-        let runtime =
-            FakeRuntime::new(RuntimeBinding::gvisor("gvisor-1")).with_dynamic_policy_updates(false);
-        let spec = RuntimeSessionSpec::new("session-1", "run-1", binding.clone());
-        let session = runtime
-            .prepare_session(spec)
-            .await
-            .expect("prepare session");
-        let new_policy =
-            CompiledRuntimePolicy::dynamic(session.policy.revision.next(), binding.policy.clone());
-
-        let err = runtime
-            .update_policy(&session, binding, new_policy)
-            .await
-            .expect_err("runtime cannot update policy in place");
-
-        assert_eq!(err.kind, RuntimeErrorKind::SandboxRecreateRequired);
-        assert!(!err.execution_started);
-    }
-
-    #[tokio::test]
-    async fn destroyed_session_is_runtime_unavailable_before_execution() {
-        let binding = gvisor_binding();
-        let runtime = FakeRuntime::new(RuntimeBinding::gvisor("gvisor-1"));
-        let spec = RuntimeSessionSpec::new("session-1", "run-1", binding.clone());
-        let session = runtime
-            .prepare_session(spec)
-            .await
-            .expect("prepare session");
-        runtime
-            .destroy_session(session.clone())
-            .await
-            .expect("destroy session");
-        let invocation = RuntimeToolInvocation::new(
-            "call-1",
-            "bash",
-            json!({"cmd": "pwd"}),
-            binding,
-            session.policy.revision,
-        );
-
-        let err = runtime
-            .execute_tool(&session, invocation)
-            .await
-            .expect_err("destroyed session cannot execute");
-
-        assert_eq!(err.kind, RuntimeErrorKind::RuntimeUnavailable);
-        assert!(!err.execution_started);
-        assert!(err.retryable);
     }
 }

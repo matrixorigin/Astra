@@ -1395,8 +1395,10 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x07]);
     astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("Mock child review", UI_TRANSITION_TIMEOUT);
-    astra.write(b"1\r");
+    astra.wait_for("1. Mock child review", UI_TRANSITION_TIMEOUT);
+    astra.write(b"1");
+    astra.wait_for("› 1. Mock child review", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
     astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x0f]);
     astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
@@ -1405,7 +1407,11 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     astra.wait_for("Agent completed", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x07]);
     astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
-    astra.write(b"1\r");
+    astra.write(b"h");
+    astra.wait_for("1. Mock child review", UI_TRANSITION_TIMEOUT);
+    astra.write(b"1");
+    astra.wait_for("› 1. Mock child review", UI_TRANSITION_TIMEOUT);
+    astra.write(b"\r");
     astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
     assert_eq!(
         mock.received_requests().len(),
@@ -1541,6 +1547,8 @@ async fn server_child_cancel_keeps_sibling_transcript_queryable() {
     astra.wait_for("including cancellation", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x07]);
     astra.wait_for("Conversations", UI_TRANSITION_TIMEOUT);
+    astra.write(b"h");
+    astra.wait_for("Mock review 1", UI_TRANSITION_TIMEOUT);
     select_task_slot(&mut astra, "1: Mock review 1", UI_TRANSITION_TIMEOUT);
     astra.write(b"\r");
     astra.wait_for("fanout_child_1_evidence_visible", UI_TRANSITION_TIMEOUT);

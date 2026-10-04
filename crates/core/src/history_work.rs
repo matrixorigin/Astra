@@ -75,9 +75,6 @@ pub enum HistoryWorkSite {
     PipelineCheckpointRead,
     PipelineCompositeIndexSerialization,
     PipelineCompositeIndexRead,
-    PipelineRecoveryClone,
-    PipelineRecoverySerialization,
-    PipelineRecoveryHash,
     PipelineEventJournalRead,
     ContextBinding,
     ContextOptimization,
@@ -146,7 +143,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 126;
+    const COUNT: usize = 123;
 
     /// Current instrumented sites; retired producers do not retain zero-only entries.
     pub const ALL: [Self; Self::COUNT] = [
@@ -208,9 +205,6 @@ impl HistoryWorkSite {
         Self::PipelineCheckpointRead,
         Self::PipelineCompositeIndexSerialization,
         Self::PipelineCompositeIndexRead,
-        Self::PipelineRecoveryClone,
-        Self::PipelineRecoverySerialization,
-        Self::PipelineRecoveryHash,
         Self::PipelineEventJournalRead,
         Self::ContextBinding,
         Self::ContextOptimization,
@@ -346,9 +340,6 @@ impl HistoryWorkSite {
             Self::PipelineCheckpointRead => "pipeline_checkpoint_read",
             Self::PipelineCompositeIndexSerialization => "pipeline_composite_index_serialization",
             Self::PipelineCompositeIndexRead => "pipeline_composite_index_read",
-            Self::PipelineRecoveryClone => "pipeline_recovery_clone",
-            Self::PipelineRecoverySerialization => "pipeline_recovery_serialization",
-            Self::PipelineRecoveryHash => "pipeline_recovery_hash",
             Self::PipelineEventJournalRead => "pipeline_event_journal_read",
             Self::ContextBinding => "context_binding",
             Self::ContextOptimization => "context_optimization",
@@ -489,11 +480,7 @@ impl HistoryWorkSite {
             | Self::PipelineCheckpointSerialization
             | Self::PipelineCheckpointRead
             | Self::PipelineCompositeIndexSerialization
-            | Self::PipelineCompositeIndexRead
-            | Self::PipelineRecoveryClone => "pipeline.persistence",
-            Self::PipelineRecoverySerialization | Self::PipelineRecoveryHash => {
-                "pipeline.crash_recovery"
-            }
+            | Self::PipelineCompositeIndexRead => "pipeline.persistence",
             Self::PipelineEventJournalRead => "pipeline.event_store",
             Self::ContextBinding => "turn_core.context_binder",
             Self::ContextOptimization => "turn_core.context_optimizer",

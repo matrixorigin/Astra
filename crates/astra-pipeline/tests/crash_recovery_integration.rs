@@ -19,7 +19,7 @@ use astra_services::session_journal::JournalDirGuard;
 const TEST_USER_ID: &str = "test-user";
 
 /// Helper: write a minimal heavy checkpoint for a session.
-fn write_test_heavy_checkpoint(session_id: &str, step_id: &str, created_at: u64) {
+fn test_heavy_checkpoint(step_id: &str, created_at: u64) -> HeavyCheckpoint {
     let light = LightCheckpoint {
         protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
         cursor: ExecutionCursor::default(),
@@ -31,7 +31,7 @@ fn write_test_heavy_checkpoint(session_id: &str, step_id: &str, created_at: u64)
         created_at,
     };
 
-    let checkpoint = StepCheckpoint::Heavy(Box::new(HeavyCheckpoint {
+    HeavyCheckpoint {
         light,
         conversation_cursor: None,
         messages: vec![],
@@ -53,9 +53,21 @@ fn write_test_heavy_checkpoint(session_id: &str, step_id: &str, created_at: u64)
         compaction_state: None,
         config_version_id: None,
         workspace_observation_quarantine: None,
-    }));
+    }
+}
 
-    write_step_checkpoint(TEST_USER_ID, session_id, 1, &checkpoint).unwrap();
+fn write_test_heavy_checkpoint(session_id: &str, step_id: &str, created_at: u64) {
+    write_heavy_checkpoint(session_id, test_heavy_checkpoint(step_id, created_at));
+}
+
+fn write_heavy_checkpoint(session_id: &str, heavy: HeavyCheckpoint) {
+    write_step_checkpoint(
+        TEST_USER_ID,
+        session_id,
+        1,
+        &StepCheckpoint::Heavy(Box::new(heavy)),
+    )
+    .unwrap();
 }
 
 /// Helper: write tool-call events to the session journal.
@@ -450,4 +462,269 @@ fn skipped_tool_auto_recovers() {
         "skipped tools should auto-recover, got {:?}",
         outcome.map(|o| format!("{:?}", o))
     );
+}
+
+#[test]
+fn recovery_rejects_cursor_outside_the_checkpoint_session_or_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    for (sid, cursor_sid, root) in [
+        ("cr-wrong-session", "foreign-session", None),
+        ("cr-wrong-root", "cr-wrong-root", Some("wrong-root")),
+    ] {
+        let mut heavy = test_heavy_checkpoint("session-turn-3", 1000);
+        heavy.messages = vec![serde_json::json!({"role":"user","content":"resume"})];
+        heavy.conversation_cursor = Some(astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: TEST_USER_ID.into(),
+            session_id: cursor_sid.into(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
+            completed_turn: 3,
+            journal_event_seq: 3,
+            conversation_seq: 3,
+            canonical_root_hash: root
+                .map(str::to_string)
+                .unwrap_or_else(|| astra_turn_types::canonical_conversation_root(&heavy.messages)),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        });
+        write_heavy_checkpoint(sid, heavy);
+        let error = recover_from_crash(TEST_USER_ID, sid).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                astra_pipeline::crash_recovery::RecoveryError::CorruptedCheckpoint(_)
+            ),
+            "{sid}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn recovery_rejects_invalid_execution_cursors() {
+    use astra_pipeline::step_protocol::{SlotState, StepAction};
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    let act = ExecutionCursor {
+        phase: StepAction::Act,
+        ..Default::default()
+    };
+    let wait = ExecutionCursor {
+        phase: StepAction::Wait,
+        ..Default::default()
+    };
+    let mut running = ExecutionCursor::for_act(1);
+    running.slots[0].state = SlotState::Running;
+    for (sid, cursor) in [
+        ("cr-empty-act", act),
+        ("cr-empty-wait", wait),
+        ("cr-running-slot", running),
+    ] {
+        let mut heavy = test_heavy_checkpoint("session-turn-3", 1000);
+        heavy.light.cursor = cursor;
+        write_heavy_checkpoint(sid, heavy);
+        assert!(recover_from_crash(TEST_USER_ID, sid).is_err(), "{sid}");
+        // The ordinary checkpoint projection uses the same validator.
+        assert!(
+            astra_pipeline::step_restore::restore_session(TEST_USER_ID, sid).is_err(),
+            "{sid}"
+        );
+    }
+}
+
+#[test]
+fn recovery_rejects_unpaired_or_foreign_execution_control() {
+    use astra_pipeline::step_protocol::{RunExecutionBudget, RunExecutionControl};
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    for (sid, budget) in [
+        ("cr-missing-budget", None),
+        (
+            "cr-wrong-budget-owner",
+            Some(RunExecutionBudget::V1 {
+                run_id: "foreign-run".into(),
+                producer_owner_generation: 3,
+                charged_iterations: 2,
+                granted_iteration_boundary: 20,
+                remaining_iterations: 18,
+                effective_hard_turn_limit: None,
+            }),
+        ),
+    ] {
+        let mut heavy = test_heavy_checkpoint("session-turn-3", 1000);
+        heavy.run_execution_budget = budget;
+        heavy.run_execution_control = Some(RunExecutionControl::V3 {
+            completion_settlement: Default::default(),
+            hook_obligations: Default::default(),
+            reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
+                run_id: "control-run".into(),
+                producer_owner_generation: 3,
+                pending: Vec::new(),
+            },
+            budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
+        });
+        write_heavy_checkpoint(sid, heavy);
+        assert!(recover_from_crash(TEST_USER_ID, sid).is_err(), "{sid}");
+    }
+}
+
+#[test]
+fn damaged_journal_cannot_be_accepted_as_unknown_tool_effects() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    let sid = "cr-gap-with-pending";
+    write_test_heavy_checkpoint(sid, "session-turn-3", 1000);
+    write_tool_events(
+        sid,
+        &[
+            make_step_event(
+                "start",
+                "step-1",
+                StepEventType::ToolCallStarted,
+                2000,
+                Some(serde_json::json!({"tool_name":"bash","call_id":"pending"})),
+            ),
+            make_step_event(
+                "later",
+                "step-2",
+                StepEventType::StepCompleted,
+                400_000,
+                None,
+            ),
+        ],
+    );
+    assert!(matches!(
+        recover_from_crash(TEST_USER_ID, sid),
+        Err(astra_pipeline::crash_recovery::RecoveryError::JournalGap { .. })
+    ));
+}
+
+#[test]
+fn recovery_retains_completed_output_as_audit_without_cache_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    let sid = "cr-audit-only";
+    write_test_heavy_checkpoint(sid, "session-turn-3", 1000);
+    let key = astra_pipeline::step_protocol::IdempotencyKey::semantic(
+        "read_file",
+        &serde_json::json!({"path":"file"}),
+    );
+    write_tool_events(
+        sid,
+        &[
+            make_step_event(
+                "old",
+                "step-old",
+                StepEventType::ToolCallCompleted,
+                500,
+                Some(serde_json::json!({"tool_name":"read_file","output":"before checkpoint"})),
+            ),
+            make_step_event(
+                "result",
+                "step-1",
+                StepEventType::ToolCallCompleted,
+                2000,
+                Some(
+                    serde_json::json!({"tool_name":"read_file","result":"result field","idempotency_key":key.cache_key()}),
+                ),
+            ),
+            make_step_event(
+                "output",
+                "step-2",
+                StepEventType::ToolCallCompleted,
+                3000,
+                Some(
+                    serde_json::json!({"tool_name":"read_file","output":"output field","idempotency_key":"semantic:freshness=sha256:unverified"}),
+                ),
+            ),
+        ],
+    );
+    let Some(RecoveryOutcome::AutoRecovered { restored }) =
+        recover_from_crash(TEST_USER_ID, sid).unwrap()
+    else {
+        panic!("completed results need no uncertainty confirmation");
+    };
+    assert_eq!(
+        restored.completed_tool_results["read_file"],
+        ["result field", "output field"]
+    );
+    assert_eq!(restored.cache_restore_report.rejected_unverified_entries, 2);
+    assert_eq!(
+        restored.cache_restore_report.rejected_context_bound_entries,
+        1
+    );
+    assert_eq!(restored.cache_restore_report.events_examined, 2);
+    assert_eq!(restored.resume_turn, 3);
+}
+
+#[test]
+fn recovery_does_not_read_another_owner_checkpoint() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    let sid = "cr-owner-scoped";
+    write_test_heavy_checkpoint(sid, "session-turn-3", 1000);
+    assert!(recover_from_crash("foreign-owner", sid).unwrap().is_none());
+    assert!(recover_from_crash(TEST_USER_ID, sid).unwrap().is_some());
+}
+
+#[test]
+fn recovery_rejects_invalid_quarantine_and_checkpoint_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    let mut quarantine = test_heavy_checkpoint("session-turn-3", 1000);
+    quarantine.workspace_observation_quarantine = Some(
+        astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1 {
+            reason: "unsupported_reason".into(),
+            scope: "bound_workspace".into(),
+            source_tool_call_id: None,
+        },
+    );
+    let mut version = test_heavy_checkpoint("session-turn-3", 1000);
+    version.light.protocol_version += 1;
+    for (sid, heavy) in [
+        ("cr-invalid-quarantine", quarantine),
+        ("cr-invalid-version", version),
+    ] {
+        write_heavy_checkpoint(sid, heavy);
+        assert!(recover_from_crash(TEST_USER_ID, sid).is_err(), "{sid}");
+    }
+}
+
+#[test]
+fn recovery_rejects_a_torn_tool_receipt() {
+    use astra_services::{OwnerScope, SessionArtifactStore};
+    use std::io::Write;
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    let sid = "cr-torn-receipt";
+    write_test_heavy_checkpoint(sid, "session-turn-3", 1000);
+    write_tool_events(
+        sid,
+        &[make_step_event(
+            "start",
+            "step-1",
+            StepEventType::ToolCallStarted,
+            2000,
+            Some(serde_json::json!({"tool_name":"bash","call_id":"pending"})),
+        )],
+    );
+    let owner = OwnerScope::user(TEST_USER_ID).unwrap();
+    let path = astra_services::local_session_artifact_store()
+        .session_dir_for_owner(&owner, sid)
+        .unwrap()
+        .join("step_events.jsonl");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(b"{torn receipt")
+        .unwrap();
+    assert!(matches!(
+        recover_from_crash(TEST_USER_ID, sid),
+        Err(astra_pipeline::crash_recovery::RecoveryError::JournalRead(
+            _
+        ))
+    ));
 }

@@ -6780,6 +6780,7 @@ pub(crate) mod tests {
                 tool_call_id: Some(tool_call_id),
                 admission_source: None,
                 expected_control_epoch: None,
+                command_timeout_cap_ms: None,
                 delegation_model_admission: None,
             }
         }
@@ -6968,6 +6969,7 @@ pub(crate) mod tests {
                     tool_call_id: Some("call-external-noop"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    command_timeout_cap_ms: None,
                     delegation_model_admission: None,
                 },
             )

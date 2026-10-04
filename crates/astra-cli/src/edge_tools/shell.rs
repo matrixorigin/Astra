@@ -4245,7 +4245,11 @@ impl ToolExecutor {
         }
     }
 
-    fn prepare_bash_invocation(&self, args: &Value) -> Result<(String, f64), String> {
+    fn prepare_bash_invocation(
+        &self,
+        args: &Value,
+        command_timeout_cap_ms: Option<u64>,
+    ) -> Result<(String, f64), String> {
         let command = match args.get("command").and_then(Value::as_str) {
             Some(c) if !c.trim().is_empty() => c,
             _ => {
@@ -4281,9 +4285,7 @@ impl ToolExecutor {
         // The server may attach a separate authoritative command cap. It
         // is intentionally not the model-visible `timeout` field: execution
         // cannot exceed the policy cap behind a longer edge callback deadline.
-        let server_command_timeout_cap_secs = args
-            .get("_astra_command_timeout_cap_ms")
-            .and_then(Value::as_u64)
+        let server_command_timeout_cap_secs = command_timeout_cap_ms
             .filter(|milliseconds| *milliseconds > 0)
             .map(|milliseconds| milliseconds as f64 / 1_000.0);
         // A model timeout is a request, never authority to exceed the server
@@ -4805,10 +4807,11 @@ impl ToolExecutor {
                 "Error: environment-lifetime background tasks are not authorized by this execution environment; no process was started".to_string(),
             );
         }
-        let (command, _) = match self.prepare_bash_invocation(args) {
-            Ok(value) => value,
-            Err(error) => return bash_preparation_rejection(error),
-        };
+        let (command, _) =
+            match self.prepare_bash_invocation(args, invocation.command_timeout_cap_ms) {
+                Ok(value) => value,
+                Err(error) => return bash_preparation_rejection(error),
+            };
         if args.get("source_artifacts").is_some() {
             return super::ToolExecutionOutcome::error(
                 "Error: source_artifacts cannot be combined with run_in_background; prepare immutable inputs in a foreground call first".to_string(),
@@ -5079,10 +5082,11 @@ impl ToolExecutor {
                 .start_environment_background_task(args, invocation, cancel_token)
                 .await;
         }
-        let (command, timeout_secs) = match self.prepare_bash_invocation(args) {
-            Ok(invocation) => invocation,
-            Err(message) => return bash_preparation_rejection(message),
-        };
+        let (command, timeout_secs) =
+            match self.prepare_bash_invocation(args, invocation.command_timeout_cap_ms) {
+                Ok(invocation) => invocation,
+                Err(message) => return bash_preparation_rejection(message),
+            };
         let source_preimages = match prepare_source_preimages(self, args, invocation, true) {
             Ok(plan) => plan,
             Err(message) => {
@@ -5302,13 +5306,14 @@ impl ToolExecutor {
         let slot = self.bash_detach_slot.as_ref()?.clone();
         let handle = slot.lock().await.take()?;
 
-        let (command, timeout_secs) = match self.prepare_bash_invocation(args) {
-            Ok(invocation) => invocation,
-            Err(message) => {
-                self.restore_bash_detach_handle(slot, handle).await;
-                return Some(bash_preparation_rejection(message));
-            }
-        };
+        let (command, timeout_secs) =
+            match self.prepare_bash_invocation(args, invocation.command_timeout_cap_ms) {
+                Ok(invocation) => invocation,
+                Err(message) => {
+                    self.restore_bash_detach_handle(slot, handle).await;
+                    return Some(bash_preparation_rejection(message));
+                }
+            };
         if astra_tools::workspace_observation::is_explicit_workspace_verification_request(
             "bash", args,
         ) || args
@@ -5479,10 +5484,11 @@ impl ToolExecutor {
             astra_tools::workspace_observation::is_explicit_workspace_verification_request(
                 "bash", args,
             );
-        let (command, timeout_secs) = match self.prepare_bash_invocation(args) {
-            Ok(invocation) => invocation,
-            Err(message) => return bash_preparation_rejection(message),
-        };
+        let (command, timeout_secs) =
+            match self.prepare_bash_invocation(args, invocation.command_timeout_cap_ms) {
+                Ok(invocation) => invocation,
+                Err(message) => return bash_preparation_rejection(message),
+            };
         let source_preimages = match prepare_source_preimages(self, args, invocation, true) {
             Ok(plan) => plan,
             Err(message) => return super::ToolExecutionOutcome::error(format!("Error: {message}")),
@@ -6240,6 +6246,7 @@ mod tests {
                     tool_call_id: Some("call"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    command_timeout_cap_ms: None,
                     delegation_model_admission: None,
                 },
                 None,
@@ -6299,6 +6306,7 @@ mod tests {
                     tool_call_id: Some("wrapper-exit"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    command_timeout_cap_ms: None,
                     delegation_model_admission: None,
                 },
                 None,
@@ -6379,6 +6387,7 @@ mod tests {
                     tool_call_id: Some("timeout"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    command_timeout_cap_ms: None,
                     delegation_model_admission: None,
                 },
                 None,
@@ -6456,6 +6465,7 @@ mod tests {
                     tool_call_id: Some("cancel"),
                     admission_source: None,
                     expected_control_epoch: None,
+                    command_timeout_cap_ms: None,
                     delegation_model_admission: None,
                 },
                 Some(&cancel),
@@ -7382,47 +7392,23 @@ mod tests {
     fn server_command_cap_preserves_adaptive_timeout_when_omitted() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
-        for (args, expected) in [
+        for (args, cap, expected) in [
             (
-                serde_json::json!({
-                    "command": "cargo test",
-                    "timeout": 90.0,
-                    "_astra_command_timeout_cap_ms": 30_000,
-                }),
+                serde_json::json!({"command": "cargo test", "timeout": 90.0}),
+                30_000,
                 30.0,
             ),
             (
-                serde_json::json!({
-                    "command": "cargo test",
-                    "timeout": 10.0,
-                    "_astra_command_timeout_cap_ms": 30_000,
-                }),
+                serde_json::json!({"command": "cargo test", "timeout": 10.0}),
+                30_000,
                 10.0,
             ),
-            (
-                serde_json::json!({
-                    "command": "cargo test",
-                    "_astra_command_timeout_cap_ms": 30_000,
-                }),
-                30.0,
-            ),
-            (
-                serde_json::json!({
-                    "command": "echo hello",
-                    "_astra_command_timeout_cap_ms": 120_000,
-                }),
-                5.0,
-            ),
-            (
-                serde_json::json!({
-                    "command": "sleep 5",
-                    "_astra_command_timeout_cap_ms": 100,
-                }),
-                0.1,
-            ),
+            (serde_json::json!({"command": "cargo test"}), 30_000, 30.0),
+            (serde_json::json!({"command": "echo hello"}), 120_000, 5.0),
+            (serde_json::json!({"command": "sleep 5"}), 100, 0.1),
         ] {
             let (_, timeout) = executor
-                .prepare_bash_invocation(&args)
+                .prepare_bash_invocation(&args, Some(cap))
                 .expect("server budget is a valid internal execution constraint");
             assert_eq!(timeout, expected);
         }
@@ -7438,7 +7424,7 @@ mod tests {
             "git diff HEAD~3..HEAD --stat",
         ] {
             let (prepared, _) = executor
-                .prepare_bash_invocation(&serde_json::json!({"command": command}))
+                .prepare_bash_invocation(&serde_json::json!({"command": command}), None)
                 .expect("Git commands use ordinary Bash preparation");
             assert_eq!(
                 prepared, command,

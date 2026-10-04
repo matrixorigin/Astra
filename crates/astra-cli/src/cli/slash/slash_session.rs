@@ -5347,8 +5347,8 @@ async fn apply_restored_session(
             }
         }
     };
-    // Crash recovery has one current state-machine protocol. Missing crash
-    // state means there is nothing to replay; malformed state fails closed.
+    // Local recovery validates checkpoint and journal facts; it does not
+    // re-execute tools. Missing state needs no restore; malformed state fails closed.
     let step_restored = if !local_checkpoint_is_admissible {
         tracing::warn!(
             session_id = %restored.session_id,
@@ -5361,13 +5361,12 @@ async fn apply_restored_session(
                 restored: cr_restored,
                 ..
             })) => {
-                tracing::info!("crash recovery: auto-recovered via state machine");
+                tracing::info!("crash recovery: restored validated checkpoint");
                 Some(cr_restored)
             }
             Ok(Some(astra_pipeline::crash_recovery::RecoveryOutcome::RequiresUserInput {
                 pending_decisions,
                 restored: cr_restored,
-                mut manager,
                 ..
             })) => {
                 tracing::info!(
@@ -5388,30 +5387,18 @@ async fn apply_restored_session(
                         tool_name.clone().bold()
                     );
 
-                    let reason = match decision {
-                        astra_pipeline::crash_recovery::ToolReplayDecision::RequireUserInput {
-                            reason,
-                        } => reason.clone(),
-                        astra_pipeline::crash_recovery::ToolReplayDecision::InFlightAtCrash {
-                            tool_name: tn,
-                        } => {
-                            format!("Tool '{}' was in-flight when crash occurred", tn)
-                        }
-                        _ => "Unknown".to_string(),
-                    };
-                    eprintln!("      Reason: {}", reason.dim());
+                    eprintln!("      Reason: {}", decision.as_str().dim());
                 }
 
                 eprintln!();
                 eprintln!("  {}", "Options:".bold());
-                eprintln!("    [r] Replay - Re-execute the tool");
-                eprintln!("    [s] Skip - Skip this tool (use cached result if available)");
+                eprintln!(
+                    "    [c] Continue - Accept unknown tool effects and resume the conversation"
+                );
+                eprintln!("        No tool is re-executed or skipped by recovery");
                 eprintln!("    [a] Abort - Abort recovery and fail");
                 eprintln!();
-                eprint!(
-                    "  {} ",
-                    "Choose action for all pending tools (r/s/a):".bold()
-                );
+                eprint!("  {} ", "Choose whether to continue or abort (c/a):".bold());
                 let _ = std::io::stderr().flush();
 
                 let mut input = String::new();
@@ -5421,21 +5408,11 @@ async fn apply_restored_session(
 
                 let choice = input.trim().to_lowercase();
                 match choice.as_str() {
-                    "r" | "replay" | "s" | "skip" => {
-                        let label = if choice.starts_with('r') {
-                            "replay"
-                        } else {
-                            "skip"
-                        };
+                    "c" | "continue" => {
                         eprintln!(
-                            "  {} User chose to {} all pending tools",
-                            "✓".green(),
-                            label
+                            "  {} Continuing with acknowledged unknown tool effects",
+                            "✓".green()
                         );
-                        // force_complete transitions Replaying -> Recovered, bypassing pending checks
-                        if let Err(e) = manager.force_complete() {
-                            return Err(format!("Failed to apply {} decisions: {}", label, e));
-                        }
                         Some(cr_restored)
                     }
                     "a" | "abort" => {

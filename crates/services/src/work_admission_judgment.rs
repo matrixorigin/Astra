@@ -797,17 +797,13 @@ mod tests {
                 .unwrap()
                 .contains(MUTATION_TARGET_SCOPE_POLICY)
         );
-        for messages in [
-            crate::turn_intent_judge::turn_intent_judge_messages(&ctx),
-            work_admission_judge_messages(&ctx),
-        ] {
-            assert!(
-                messages[0]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains(MUTATION_TARGET_SCOPE_POLICY)
-            );
-        }
+        let messages = work_admission_judge_messages(&ctx);
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains(MUTATION_TARGET_SCOPE_POLICY)
+        );
         for (scope, meaning) in [
             ("workspace", "Every required mutation target is inside"),
             ("external", "Every required mutation target is outside"),

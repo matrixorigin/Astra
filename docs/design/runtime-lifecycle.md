@@ -528,6 +528,13 @@ Recovery uses:
 
 Prompt cache artifacts are not recovery correctness inputs.
 
+Local checkpoint recovery validates the checkpoint and its owner-scoped journal;
+it does not replay tools or reconstruct the original Server execution. Unknown
+side effects require explicit acknowledgment before continuing the conversation,
+or the user can abort. This acknowledgment cannot bypass checkpoint or journal
+integrity checks. Ordinary audit recovery can report a bounded or degraded tail;
+crash recovery requires a complete journal window since its checkpoint.
+
 ### Provider chat session lookup
 
 `POST /sessions` accepts authenticated provider requests with a required
