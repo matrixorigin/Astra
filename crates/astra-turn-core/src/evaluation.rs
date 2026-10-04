@@ -1778,6 +1778,7 @@ pub struct ToolEvaluationFact {
     effective_result_class: Option<String>,
     non_failure_outcome: bool,
     is_rejected_attempt: bool,
+    rejection_non_retryable: bool,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub round: Option<u32>,
     pub disposition: astra_services::session_journal::ToolCallDisposition,
@@ -1914,6 +1915,9 @@ impl ToolEvaluationFact {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.rejection_non_retryable && !self.is_rejected_attempt {
+            return Err("non-retryable rejection without rejected attempt");
+        }
         if self.operation_identity_complete && self.operation_identity.is_none() {
             return Err("complete operation evidence without identity");
         }
@@ -1947,6 +1951,16 @@ impl ToolEvaluationFact {
             effective_result_class: effective_tool_result_class(record),
             non_failure_outcome: record_is_non_failure_outcome(record),
             is_rejected_attempt: record_is_rejected_attempt(record),
+            rejection_non_retryable: record_is_rejected_attempt(record)
+                && record
+                    .runtime_model_result_full
+                    .as_deref()
+                    .or(record.result_full.as_deref())
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .and_then(|result| {
+                        result.get("retryable").and_then(serde_json::Value::as_bool)
+                    })
+                    == Some(false),
             round: record.round,
             disposition: record.effective_disposition(),
             ok: record.ok,
@@ -2308,6 +2322,19 @@ pub fn active_rejected_fact_keys(
             fact.outcome_key(index),
         )
     }))
+}
+
+/// Retain explicit non-retryability through policy-window compaction and
+/// recovery. Only an authoritative success for the same operation clears it.
+pub fn has_active_non_retryable_rejection(facts: &[ToolEvaluationFact]) -> bool {
+    !active_rejected_keys(facts.iter().enumerate().map(|(index, fact)| {
+        (
+            fact.is_rejected_attempt && fact.rejection_non_retryable,
+            fact.was_executed() && fact.ok,
+            fact.outcome_key(index),
+        )
+    }))
+    .is_empty()
 }
 
 pub fn count_unresolved_tool_outcome_fact_failures(facts: &[ToolEvaluationFact]) -> usize {

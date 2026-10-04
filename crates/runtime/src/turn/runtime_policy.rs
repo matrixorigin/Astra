@@ -952,7 +952,13 @@ fn evaluate_policy_boundary(
             ),
             observed_at_round: completed_rounds,
             evidence_count: saturating_u32(rejected_requests),
-            recommendation: RuntimePolicyRecommendation::RepairToolRequest,
+            recommendation: if astra_turn_core::evaluation::has_active_non_retryable_rejection(
+                &run_window,
+            ) {
+                RuntimePolicyRecommendation::DiagnoseToolOutcomes
+            } else {
+                RuntimePolicyRecommendation::RepairToolRequest
+            },
         });
     }
     if validation_retries >= thresholds.redundant_validation_retries
@@ -2188,6 +2194,69 @@ mod tests {
                 .iter()
                 .any(|entry| entry.signal == RuntimePolicySignal::UnresolvedToolOutcomes)
         );
+    }
+
+    #[test]
+    fn non_retryable_rejection_guidance_survives_recovery_until_exact_success() {
+        for retryable in [None, Some(true), Some(false)] {
+            let mut state = RuntimePolicyEvaluationState::default();
+            let record = ToolCallRecord {
+                name: "agent".into(),
+                args_full: Some(r#"{"action":"spawn","prompt":"compute a value"}"#.into()),
+                round: Some(1),
+                disposition: Some(ToolCallDisposition::Rejected),
+                result_class: Some("rejected".into()),
+                runtime_model_result_full: Some(
+                    serde_json::json!({"retryable": retryable}).to_string(),
+                ),
+                // The model-bound result, not an older executor payload, owns recovery advice.
+                result_full: Some(r#"{"retryable":true}"#.into()),
+                ..Default::default()
+            };
+            let feedback = evaluate_tool_boundary(
+                &mut state,
+                work_subject("item-1"),
+                std::slice::from_ref(&record),
+                1,
+            )
+            .unwrap()
+            .unwrap();
+            let entry = entries(&feedback)
+                .iter()
+                .find(|entry| entry.signal == RuntimePolicySignal::RejectedToolRequests)
+                .unwrap();
+            assert_eq!(
+                entry.recommendation,
+                if retryable == Some(false) {
+                    RuntimePolicyRecommendation::DiagnoseToolOutcomes
+                } else {
+                    RuntimePolicyRecommendation::RepairToolRequest
+                }
+            );
+            let restored: RuntimePolicyEvaluationState =
+                serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+            let mut facts = restored.record_window.into_iter().collect::<Vec<_>>();
+            let blocked = |facts: &[_]| {
+                astra_turn_core::evaluation::has_active_non_retryable_rejection(facts)
+            };
+            assert_eq!(blocked(&facts), retryable == Some(false));
+            facts.push(
+                astra_turn_core::evaluation::ToolEvaluationFact::from_record(&executed(
+                    "agent",
+                    r#"{"action":"status"}"#,
+                    2,
+                )),
+            );
+            assert_eq!(blocked(&facts), retryable == Some(false));
+            facts.push(
+                astra_turn_core::evaluation::ToolEvaluationFact::from_record(&executed(
+                    "agent",
+                    record.args_full.as_deref().unwrap(),
+                    3,
+                )),
+            );
+            assert!(!blocked(&facts));
+        }
     }
 
     #[test]
