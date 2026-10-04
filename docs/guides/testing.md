@@ -151,6 +151,8 @@ configured real provider. It creates a temporary lead/builder/reviewer Team,
 verifies actual CSV artifacts and child execution identities, checks the
 builder-to-reviewer order, reopens a completed child's transcript, then restarts
 the CLI and requests a revision through ordinary input in the same session.
+Child projections must replay typed Explain terminals; session audit must retain
+physical-attempt usage and either a finite cost estimate or an explicit unknown.
 It uses real model calls and removes its Team after successful validation.
 
 ```bash

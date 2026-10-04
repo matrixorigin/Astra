@@ -785,6 +785,24 @@ async fn assert_live_team_round(
         .await;
         assert!(projection["run_event_high_watermark"].as_i64().unwrap() < 500);
         let events = projection["recent_events"].as_array().unwrap();
+        let facts = events
+            .iter()
+            .filter(|event| event["type"] == "explain_analyze")
+            .map(|event| astra_turn_types::decode_explain_analyze_wire(event).unwrap())
+            .collect::<Vec<_>>();
+        assert!(facts.iter().all(|fact| fact.run_id == child_id));
+        use astra_turn_types::{ExplainAnalyzeNodeKindV1, ExplainAnalyzeTransitionV1};
+        for kind in [
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeNodeKindV1::ProviderAttempt,
+            ExplainAnalyzeNodeKindV1::ToolCall,
+        ] {
+            assert!(
+                facts.iter().any(|fact| fact.kind == kind
+                    && fact.transition == ExplainAnalyzeTransitionV1::Finished),
+                "{profile} must replay its own terminal {kind:?} facts"
+            );
+        }
         let expected: &[(&str, &str)] = if profile == "builder" {
             &[("read_file", "source.csv"), ("write_file", "report.json")]
         } else {
@@ -972,6 +990,44 @@ async fn live_team_delivers_dependent_member_results_and_reworks_after_client_re
         if artifact == "review.json" {
             assert_eq!(value["approved"], true);
         }
+    }
+    let audit: astra_services::session_audit::SessionAuditSummary = serde_json::from_value(
+        live_team_json(
+            &client,
+            &api,
+            reqwest::Method::GET,
+            &format!("/sessions/{session_id}/audit/summary"),
+            None,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(audit.session_id, session_id);
+    assert_eq!(audit.turn_count, 2);
+    let usage = audit.request_usage;
+    assert_eq!(
+        usage.scope,
+        astra_services::session_audit::SessionRequestUsageScope::SessionAllRuns
+    );
+    assert!(
+        usage.request_count >= 6,
+        "both leads and all four children infer"
+    );
+    assert_eq!(usage.nonterminal_attempt_count, 0);
+    for lane in [
+        usage.fresh_input_tokens,
+        usage.cache_read_tokens,
+        usage.cache_creation_tokens,
+        usage.output_tokens,
+    ] {
+        assert!(lane.observed_attempts <= usage.request_count);
+        assert_eq!(lane.known_tokens.is_some(), lane.observed_attempts > 0);
+    }
+    if let Some(amount) = audit.cost.estimated_cost_usd {
+        assert!(amount.is_finite() && amount >= 0.0);
+        assert!(audit.cost.unavailable_reason.is_none());
+    } else {
+        assert!(audit.cost.unavailable_reason.is_some());
     }
     astra.signal(nix::sys::signal::Signal::SIGHUP);
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
