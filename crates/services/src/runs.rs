@@ -11876,6 +11876,29 @@ impl DatabaseRunStateStore {
                ) ranked_terminal WHERE recovery_rank = 1",
         );
         if !recovery_event_run_ids.is_empty() {
+            // Runtime identity is an admission fact, not terminal progress.
+            // Keep every admission so the consumer can reject ambiguity;
+            // ranking to the latest one would hide conflicting identities.
+            // The recovery consumer needs no private profile/model snapshot.
+            builder
+                .push(
+                    " UNION ALL SELECT run_id, event_idx,
+                    CAST(JSON_OBJECT('event_type', 'run_started', 'data',
+                        JSON_OBJECT('child_runtime_id',
+                            JSON_EXTRACT(payload_json, '$.data.child_runtime_id'))) AS CHAR) AS payload_json
+                    FROM agent_run_events WHERE user_id = ",
+                )
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND event_type = 'run_started' AND run_id IN (");
+            {
+                let mut ids = builder.separated(",");
+                for run_id in &recovery_event_run_ids {
+                    ids.push_bind(*run_id);
+                }
+            }
+            builder.push(")");
             builder.push(
                 "
                UNION ALL
@@ -32490,6 +32513,24 @@ mod tests {
         child.ancestor_path = Some(format!("{root_id}/{child_id}"));
         child.depth = 1;
         child.agent_id = Some("reviewer".into());
+        let mut profile = crate::coordination::AgentProfile::new(
+            "reviewer",
+            "Reviewer",
+            crate::coordination::AgentTier::System,
+        );
+        profile.system_prompt = Some("x".repeat(200 * 1024));
+        let snapshot = AgentProfileSnapshot {
+            owner_user_id: user_id.clone(),
+            source_team_id: "recovery-team".into(),
+            lead_agent_id: Some("reviewer".into()),
+            profiles: vec![profile],
+        };
+        snapshot.registry(&user_id).unwrap();
+        child.events = vec![serde_json::json!({
+            "event_type": "run_started",
+            "data": {"child_runtime_id": "reviewer", "run_id": child_id,
+                "admitted_agent_profiles": snapshot}
+        })];
         store.insert_run(child).await.unwrap();
         store
             .append_events_batch(
@@ -32500,7 +32541,7 @@ mod tests {
                         "type": "agent_spawned",
                         "run_id": child_id,
                         "agent_id": "reviewer",
-                        "agent_type": "code-review",
+                        "agent_type": "reviewer",
                         "description": "review storage",
                         "fanout_slot": {"group_id":"review","target_count":1,"slot_index":0,"slot_id":"correctness"}
                     }),
@@ -32572,7 +32613,12 @@ mod tests {
             noise.root_run_id = Some(root_id.clone());
             noise.ancestor_path = Some(format!("{root_id}/{noise_id}"));
             noise.depth = 1;
-            noise.agent_id = Some(format!("noise-{index}"));
+            noise.agent_id = Some("reviewer".into());
+            noise.events = vec![serde_json::json!({
+                "event_type": "run_started",
+                "data": {"child_runtime_id": format!("reviewer-{index}"), "run_id": noise_id,
+                    "admitted_agent_profiles": snapshot}
+            })];
             store.insert_run(noise).await.unwrap();
         }
         sqlx::query(
@@ -32619,8 +32665,15 @@ mod tests {
         assert_eq!(root.events[1]["type"], "fanout_group_cancelled");
         assert_eq!(root.events[1]["data"]["group_id"], "review-b");
         assert_eq!(child.status, STATUS_RUNNING);
-        assert_eq!(child.events.len(), 1);
-        assert_eq!(child.events[0]["data"]["attempt"], 39);
+        assert_eq!(child.events.len(), 2);
+        assert_eq!(
+            child.events[0],
+            serde_json::json!({
+                "event_type": "run_started", "data": {"child_runtime_id": "reviewer"}
+            }),
+            "recovery reads only identity despite the large legal private snapshot"
+        );
+        assert_eq!(child.events[1]["data"]["attempt"], 39);
         assert_eq!(
             active_page.recovery_next_cursor.as_deref(),
             Some(child_id.as_str())
@@ -32634,7 +32687,49 @@ mod tests {
             after_page.recovery_cancellation_run_ids,
             vec![child_id.clone()]
         );
-        assert!(after_page.runs.iter().any(|run| run.run_id == child_id));
+        let after_child = after_page
+            .runs
+            .iter()
+            .find(|run| run.run_id == child_id)
+            .unwrap();
+        assert_eq!(
+            after_child.events[0]["data"]["child_runtime_id"],
+            "reviewer"
+        );
+
+        store
+            .recovery_batch_reads
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let exact_page = store
+            .load_session_agent_recovery_for(
+                &user_id,
+                &session_id,
+                &[child_id.clone(), noise_ids[0].clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .recovery_batch_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "child identities use the existing row and event batches"
+        );
+        for (run_id, runtime_id) in [(&child_id, "reviewer"), (&noise_ids[0], "reviewer-0")] {
+            let run = exact_page
+                .runs
+                .iter()
+                .find(|run| run.run_id == *run_id)
+                .unwrap();
+            assert_eq!(run.agent_id.as_deref(), Some("reviewer"));
+            assert_eq!(run.events[0]["data"]["child_runtime_id"], runtime_id);
+        }
+        let full_child = store.load_run(&user_id, &child_id).await.unwrap().unwrap();
+        assert_eq!(
+            full_child.events[0]["data"]["admitted_agent_profiles"],
+            serde_json::json!(snapshot),
+            "the original admission remains fully persisted"
+        );
         let wrapped_page = store
             .load_session_agent_recovery(&user_id, &session_id, 2)
             .await
@@ -32679,9 +32774,54 @@ mod tests {
             .find(|run| run.run_id == child_id)
             .unwrap();
         assert_eq!(child.status, STATUS_CANCELLED);
-        assert_eq!(child.events.len(), 1);
-        assert_eq!(child.events[0]["event_type"], "run_finished");
-        assert_eq!(child.events[0]["data"]["cancellation_origin"], "user");
+        assert_eq!(child.events.len(), 2);
+        assert_eq!(child.events[0]["data"]["child_runtime_id"], "reviewer");
+        assert_eq!(child.events[1]["event_type"], "run_finished");
+        assert_eq!(child.events[1]["data"]["cancellation_origin"], "user");
+
+        store
+            .append_events_batch(
+                &user_id,
+                &session_id,
+                &child_id,
+                &[
+                    serde_json::json!({
+                        "event_type": "run_started",
+                        "data": {"child_runtime_id": "conflicting-reviewer", "run_id": child_id}
+                    }),
+                    serde_json::json!({
+                        "event_type": "run_started", "data": {"child_runtime_id": 7}
+                    }),
+                    serde_json::json!({"event_type": "run_started", "data": {}}),
+                ],
+            )
+            .await
+            .unwrap();
+        let ambiguous = store
+            .load_session_agent_recovery_for(&user_id, &session_id, std::slice::from_ref(&child_id))
+            .await
+            .unwrap();
+        let child = ambiguous
+            .runs
+            .iter()
+            .find(|run| run.run_id == child_id)
+            .unwrap();
+        let identities = child
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == "run_started")
+            .map(|event| event["data"]["child_runtime_id"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identities,
+            vec![
+                serde_json::json!("reviewer"),
+                serde_json::json!("conflicting-reviewer"),
+                serde_json::json!(7),
+                serde_json::Value::Null
+            ],
+            "the reader preserves duplicate admissions and JSON types for fail-closed recovery"
+        );
 
         for run_id in [&root_id, &child_id].into_iter().chain(noise_ids.iter()) {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
