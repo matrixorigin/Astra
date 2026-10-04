@@ -4730,8 +4730,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             .await;
     }
 
-    fn on_server_tool_surface_admission(&mut self, tool: &str) -> Result<(), String> {
-        self.executor.accept_server_tool_surface_admission(tool)
+    fn on_server_tool_surface_admission(
+        &mut self,
+        request: &ToolBatchRequest,
+    ) -> Result<(), String> {
+        self.tool_result_identities.insert(
+            request.request_id.clone(),
+            ToolResultIdentity::from_batch_request(request),
+        );
+        self.executor
+            .accept_server_tool_surface_admission(&request.tool)
     }
 
     async fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
@@ -4837,7 +4845,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     fn on_tool_result(&mut self, result: &EdgeToolExecResult) {
-        self.sync_incremental_tool_result(result);
+        // The foreground snapshot belongs to one run, not every callback
+        // transported through its stream. Child results retain their own
+        // durable journal and AgentLive publication.
+        if self.callback_tool_belongs_to_foreground(&result.request_id) {
+            self.sync_incremental_tool_result(result);
+        }
     }
 
     async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
@@ -11995,7 +12008,7 @@ mod tests {
             cache: &'a mut EdgeToolCache,
             cancel: Option<&'a tokio_util::sync::CancellationToken>,
         ) -> CliSseStreamHost<'a> {
-            let mut host = CliSseStreamHost::from_edge_ctx(
+            let host = CliSseStreamHost::from_edge_ctx(
                 EdgeSseContext {
                     api: &self.api,
                     token: "tok",
@@ -12021,7 +12034,8 @@ mod tests {
                 80,
                 false,
             );
-            host.on_server_tool_surface_admission("memory")
+            host.executor
+                .accept_server_tool_surface_admission("memory")
                 .expect("existing cloud memory binding accepts server admission");
             host
         }
@@ -12437,6 +12451,8 @@ mod tests {
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(&project));
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let incremental =
+            std::sync::Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
         let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
@@ -12458,7 +12474,7 @@ mod tests {
                 skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                incremental_state: None,
+                incremental_state: Some(incremental.clone()),
                 request_session_execution_lease: None,
             },
             80,
@@ -12500,6 +12516,16 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 2);
+        for result in &results {
+            host.on_tool_result(result);
+        }
+        assert_eq!(incremental.snapshot().tool_call_records.len(), 1);
+        assert_eq!(
+            incremental.snapshot().tool_call_records[0]
+                .tool_call_id
+                .as_deref(),
+            Some("pf-1")
+        );
         assert!(results.iter().all(|result| result.status == "completed"));
         assert!(results[0].output.contains("one"), "{}", results[0].output);
         assert!(results[1].output.contains("two"), "{}", results[1].output);
@@ -12542,6 +12568,7 @@ mod tests {
                 }])
                 .await;
             assert_eq!(results[0].status, "completed");
+            host.on_tool_result(&results[0]);
             if request_id == "serial-child" {
                 let fields = results[0]
                     .tool_result_fields
@@ -12584,6 +12611,8 @@ mod tests {
             }])
             .await;
         assert_eq!(rejected[0].status, "failed");
+        host.on_tool_result(&rejected[0]);
+        assert_eq!(incremental.snapshot().tool_call_records.len(), 2);
         assert!(
             rx.try_recv().is_err(),
             "child synthetic rejection stays out of root UI"
@@ -12968,6 +12997,28 @@ mod tests {
             }),
             ..Default::default()
         });
+        // A rejected server request still has an exact owner before any
+        // execution starts; unknown callbacks must not enter this snapshot.
+        for (id, run) in [("child-rejected", "child-live"), ("tool-1", "run-live")] {
+            let mut request =
+                parallel_batch_request(run, id, "unavailable_tool", serde_json::json!({}));
+            request.run_id = run.into();
+            request.session_id = "sess-live".into();
+            assert!(host.on_server_tool_surface_admission(&request).is_err());
+            host.on_tool_result(&EdgeToolExecResult {
+                execution_completion: None,
+                request_id: id.into(),
+                tool: request.tool,
+                args: request.args,
+                output: "surface rejected".into(),
+                tool_result_fields: None,
+                status: "failed".into(),
+                duration_ms: 0,
+            });
+        }
+        assert_eq!(incremental_state.snapshot().tool_call_records.len(), 1);
+        incremental_state.replace_tool_records(Vec::new());
+        incremental_state.replace_tools_used(Vec::new());
         host.on_tool_result(&EdgeToolExecResult {
             execution_completion: None,
             request_id: "tool-1".to_string(),

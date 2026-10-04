@@ -94,7 +94,9 @@ async fn callback_through_pipeline(
         80,
         false,
     );
-    host.on_server_tool_surface_admission(&tool).unwrap();
+    host.executor
+        .accept_server_tool_surface_admission(&tool)
+        .unwrap();
     let results = host
         .execute_tools_batch(vec![ToolBatchRequest {
             session_id: "mcp-session".into(),

@@ -523,7 +523,10 @@ pub trait SseStreamHost: Send {
     /// Reconcile the Server's exact wire-schema admission before an Edge
     /// executor applies its local binding, argument, permission and sandbox
     /// gates. Hosts without a second local tool surface need no action.
-    fn on_server_tool_surface_admission(&mut self, _tool: &str) -> Result<(), String> {
+    fn on_server_tool_surface_admission(
+        &mut self,
+        _request: &ToolBatchRequest,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -1555,22 +1558,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 if !schema_admitted_by_server {
                     continue;
                 }
-                if let Err(error) = host.on_server_tool_surface_admission(&tool) {
-                    let result = EdgeToolExecResult {
-                        execution_completion: None,
-                        request_id,
-                        tool,
-                        args,
-                        output: error,
-                        tool_result_fields: None,
-                        status: "failed".to_string(),
-                        duration_ms: 0,
-                    };
-                    host.on_tool_result(&result);
-                    tool_results.push(result);
-                    continue;
-                }
-                tool_batch.push(ToolBatchRequest {
+                let request = ToolBatchRequest {
                     session_id,
                     run_id,
                     turn_chain_id,
@@ -1581,7 +1569,23 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                     read_only_execution,
                     tool,
                     args,
-                });
+                };
+                if let Err(error) = host.on_server_tool_surface_admission(&request) {
+                    let result = EdgeToolExecResult {
+                        execution_completion: None,
+                        request_id: request.request_id,
+                        tool: request.tool,
+                        args: request.args,
+                        output: error,
+                        tool_result_fields: None,
+                        status: "failed".to_string(),
+                        duration_ms: 0,
+                    };
+                    host.on_tool_result(&result);
+                    tool_results.push(result);
+                    continue;
+                }
+                tool_batch.push(request);
             }
             ChatTurnEdgePending::ApprovalRequired {
                 session_id,
@@ -3158,7 +3162,11 @@ mod tests {
 
             fn on_stream_complete(&mut self) {}
 
-            fn on_server_tool_surface_admission(&mut self, tool: &str) -> Result<(), String> {
+            fn on_server_tool_surface_admission(
+                &mut self,
+                request: &ToolBatchRequest,
+            ) -> Result<(), String> {
+                let tool = request.tool.as_str();
                 self.0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
