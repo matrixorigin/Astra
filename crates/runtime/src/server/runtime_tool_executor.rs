@@ -8357,36 +8357,15 @@ pub(crate) mod tests {
 
     #[test]
     fn handler_registry_covers_all_server_control_plane_and_runtime_tools() {
-        use crate::server::tool_binding_projection::{
-            is_server_control_plane_tool, is_server_runtime_tool,
-        };
-
         let (exec, _dir) = test_executor_with_agent_context_and_reflect_service();
-        let schema_names = schema_name_set(exec.tool_schemas());
+        let mut schema_names = schema_name_set(exec.tool_schemas());
+        // Agent dispatch carries private execution facts outside ToolEngine.
+        // Its real route is exercised by agent_tools_execute_through_canonical_runtime_dispatch
+        // and admitted_nonbuiltin_profile_reaches_child_executor_through_public_tool_boundary.
+        assert!(schema_names.remove("agent"));
+        assert!(!exec.tool_engine.contains("agent"));
 
-        // 1. Every control_plane tool must have a handler.
-        let missing_control_plane: Vec<_> = schema_names
-            .iter()
-            .filter(|n| is_server_control_plane_tool(n) && !exec.tool_engine.contains(n))
-            .cloned()
-            .collect();
-        assert!(
-            missing_control_plane.is_empty(),
-            "control_plane tools without handlers: {missing_control_plane:?}"
-        );
-
-        // 2. Every runtime tool must have a handler.
-        let missing_runtime: Vec<_> = schema_names
-            .iter()
-            .filter(|n| is_server_runtime_tool(n) && !exec.tool_engine.contains(n))
-            .cloned()
-            .collect();
-        assert!(
-            missing_runtime.is_empty(),
-            "runtime tools without handlers: {missing_runtime:?}"
-        );
-
-        // 3. Every handler must have a corresponding schema (excluding dynamic prefix handlers).
+        // Every handler has a schema unless its capability is unavailable.
         let handler_names: Vec<_> = exec.tool_engine.handler_names().map(String::from).collect();
         let unclassified: Vec<_> = handler_names
             .iter()
@@ -8428,8 +8407,7 @@ pub(crate) mod tests {
             "handlers without corresponding schema: {unclassified:?}"
         );
 
-        // 4. No handler exists without a matching ToolEngine registration
-        //    at the local-transport level (double-check via `contains`).
+        // Every remaining visible schema has a registered local handler.
         let all_handled: Vec<_> = schema_names
             .iter()
             .filter(|n| !exec.tool_engine.contains(n))

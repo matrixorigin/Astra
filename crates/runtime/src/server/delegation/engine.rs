@@ -4892,6 +4892,23 @@ impl DelegationEngine {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+pub(crate) fn bind_test_engine(engine: &DelegationEngine) -> DelegationEngine {
+    if engine.spawner.is_some() {
+        return engine.clone();
+    }
+    let router = engine.mailbox_router.clone().unwrap_or_else(|| {
+        Arc::new(AgentMailboxRouter::new(
+            Arc::new(crate::messaging::InProcessTransport::new()),
+            engine.tracker.clone(),
+        ))
+    });
+    engine
+        .clone()
+        .with_mailbox_router(Arc::clone(&router))
+        .for_execution(Arc::new(DynamicAgentSpawner::new(router)))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use astra_services::coordination::{AgentProfile, AgentTier};
@@ -4914,22 +4931,6 @@ mod tests {
             context: HashMap::new(),
             execution_metadata: None,
         }
-    }
-
-    fn bind_test_engine(engine: &DelegationEngine) -> DelegationEngine {
-        if engine.spawner.is_some() {
-            return engine.clone();
-        }
-        let router = engine.mailbox_router.clone().unwrap_or_else(|| {
-            Arc::new(AgentMailboxRouter::new(
-                Arc::new(crate::messaging::InProcessTransport::new()),
-                engine.tracker.clone(),
-            ))
-        });
-        engine
-            .clone()
-            .with_mailbox_router(Arc::clone(&router))
-            .for_execution(Arc::new(DynamicAgentSpawner::new(router)))
     }
 
     #[test]

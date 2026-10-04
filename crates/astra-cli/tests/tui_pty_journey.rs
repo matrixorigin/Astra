@@ -683,6 +683,40 @@ fn live_tool_json(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+fn assert_live_work_artifacts(workspace: &std::path::Path, version: u64) {
+    let master: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(workspace.join("customer_master.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        master,
+        serde_json::json!({"version":version,"customers":[
+            {"id":"C001","name":if version == 1 {"Alice"} else {"Alice Updated"},"credit_limit":if version == 1 {100} else {150}},
+            {"id":"C002","name":"Bob","credit_limit":200},
+            {"id":"C003","name":"Cara","credit_limit":50}
+        ]})
+    );
+    let exceptions: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(workspace.join("invoice_exceptions.json")).unwrap())
+            .unwrap();
+    let mut expected = vec![
+        serde_json::json!({"invoice_id":"I003","customer_id":"C999","amount":30,"reason":"unknown_customer"}),
+        serde_json::json!({"invoice_id":"I004","customer_id":"C003","amount":70,"reason":"over_credit_limit"}),
+    ];
+    if version == 1 {
+        expected.insert(0,serde_json::json!({"invoice_id":"I001","customer_id":"C001","amount":120,"reason":"over_credit_limit"}));
+    }
+    assert_eq!(
+        exceptions,
+        serde_json::json!({"version":version,"exceptions":expected,"total_amount":if version == 1 {220} else {100}})
+    );
+}
+
+struct LiveTeamRound {
+    root_id: String,
+    graph: serde_json::Value,
+    proposal: Option<serde_json::Value>,
+}
+
 async fn assert_live_team_round(
     astra: &mut PtyAstra,
     client: &reqwest::Client,
@@ -690,7 +724,7 @@ async fn assert_live_team_round(
     session_id: &str,
     team: &serde_json::Value,
     round: usize,
-) -> String {
+) -> LiveTeamRound {
     let deadline = Instant::now() + Duration::from_secs(180);
     let tree = loop {
         astra.receive(Duration::from_millis(25));
@@ -722,7 +756,7 @@ async fn assert_live_team_round(
             Instant::now() < deadline,
             "live Team turn did not settle: {roots:?}"
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
     };
     assert_eq!(tree["truncated"], false);
     let runs = tree["runs"].as_array().expect("durable run tree");
@@ -804,12 +838,15 @@ async fn assert_live_team_round(
             );
         }
         let expected: &[(&str, &str)] = if profile == "builder" {
-            &[("read_file", "source.csv"), ("write_file", "report.json")]
+            &[
+                ("read_file", "customers.csv"),
+                ("write_file", "customer_master.json"),
+            ]
         } else {
             &[
-                ("read_file", "source.csv"),
-                ("read_file", "report.json"),
-                ("write_file", "review.json"),
+                ("read_file", "invoices.csv"),
+                ("read_file", "customer_master.json"),
+                ("write_file", "invoice_exceptions.json"),
             ]
         };
         for (tool, path) in expected {
@@ -865,6 +902,210 @@ async fn assert_live_team_round(
         builder_done < reviewer_started,
         "reviewer consumes a settled builder result"
     );
+    let receipts = |tool: &str| -> Vec<(usize, serde_json::Value)> {
+        root_events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, end)| {
+                if end["type"] != "tool_call_end"
+                    || end["status"] != "completed"
+                    || end["success"] != true
+                {
+                    return None;
+                }
+                if end["tool"] != tool {
+                    return None;
+                }
+                let (start_index, _) = root_events
+                    .iter()
+                    .enumerate()
+                    .find(|(_, event)| {
+                        event["type"] == "tool_call_start"
+                            && event["call_id"] == end["call_id"]
+                            && event["tool"] == tool
+                    })
+                    .expect("Server Work terminal has its exact start");
+                assert!(start_index < index);
+                assert_ne!(end["result_truncated"], serde_json::json!(true));
+                let receipt: serde_json::Value = serde_json::from_str(
+                    end["result"]
+                        .as_str()
+                        .expect("Server Work receipt is JSON text"),
+                )
+                .expect("Work receipt JSON");
+                assert!(receipt.is_object());
+                Some((index, receipt))
+            })
+            .collect()
+    };
+    let starts = receipts("start_work");
+    let proposals = receipts("propose_work_plan");
+    let (assignment_index, assignment) = if round == 1 {
+        assert_eq!(starts.len(), 1);
+        let (index, start) = &starts[0];
+        assert_eq!(start["status"], "started");
+        assert_eq!(start["initial_item_count"], 2);
+        assert!(proposals.is_empty());
+        (*index, start["initial_task"].clone())
+    } else {
+        assert!(starts.is_empty(), "guidance must retain the existing Work");
+        let inspections = receipts("inspect_work_plan");
+        let assignments = receipts("run_next_work_item");
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(assignments.len(), 1);
+        assert!(inspections.iter().any(|(index, _)| *index < proposals[0].0));
+        assert_eq!(proposals[0].1["status"], "accepted");
+        assert!(proposals[0].0 < assignments[0].0);
+        assignments[0].clone()
+    };
+    let settlements = receipts("settle_work_item");
+    assert_eq!(settlements.len(), 2);
+    let assignments = [assignment, settlements[0].1["next_task"].clone()];
+    for key in ["item_id", "attempt_id"] {
+        assert_ne!(assignments[0][key], assignments[1][key]);
+    }
+    for ((_, settlement), assignment) in settlements.iter().zip(&assignments) {
+        assert_eq!(assignment["status"], "assigned");
+        assert_eq!(assignment["execution"], "primary_session");
+        assert_eq!(settlement["status"], "recorded");
+        assert_eq!(settlement["outcome"], "delivered");
+        assert_eq!(settlement["status_scope"], "task_graph_execution");
+        for key in ["item_id", "item_revision", "attempt_id"] {
+            assert!(!assignment[key].is_null());
+            assert_eq!(settlement[key], assignment[key]);
+        }
+    }
+    assert!(settlements[1].1["next_task"].is_null());
+    assert_eq!(settlements[1].1["next_action"], "synthesize_final_response");
+    let builder_started = root_events
+        .iter()
+        .position(|event| {
+            event["type"] == "agent_spawned" && event["run_id"] == member_ids["builder"]
+        })
+        .unwrap();
+    let reviewer_done = root_events
+        .iter()
+        .position(|event| {
+            event["type"] == "agent_completed" && event["run_id"] == member_ids["reviewer"]
+        })
+        .unwrap();
+    assert!(assignment_index < builder_started);
+    assert!(builder_done < settlements[0].0 && settlements[0].0 < reviewer_started);
+    assert!(reviewer_done < settlements[1].0);
+    let spawns: Vec<_> = root_events
+        .iter()
+        .filter(|event| {
+            event["type"] == "tool_call_end"
+                && event["tool"] == "agent"
+                && event["success"] == true
+                && live_tool_json(&event["arguments"])["action"] == "spawn"
+        })
+        .collect();
+    assert_eq!(spawns.len(), 2);
+    for spawn in spawns {
+        assert!(
+            live_tool_json(&spawn["arguments"])
+                .get("work_item")
+                .is_none(),
+            "helpers must not create a parallel Work attempt owner"
+        );
+    }
+    let work_id = settlements[0].1["work_id"].as_str().unwrap();
+    let branch_id = settlements[0].1["branch_id"].as_str().unwrap();
+    let graph: serde_json::Value = client
+        .get(format!(
+            "{api}/v1/works/{work_id}/branches/{branch_id}/task-graph?item_limit=8&dependency_limit=8"
+        ))
+        .header("x-astra-work-api-major", "1")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(graph["schema_version"], 1);
+    assert_eq!(graph["scope"], "declared_work");
+    assert!(graph["next_cursor"].is_null());
+    assert_eq!(graph["basis"]["work_id"], work_id);
+    assert_eq!(graph["basis"]["branch_id"], branch_id);
+    assert_eq!(graph["items"]["total"], 3);
+    let entries = graph["items"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(
+        entries
+            .iter()
+            .any(|item| item["item_id"] == "root" && item["kind"] == "milestone")
+    );
+    let items: Vec<_> = entries
+        .iter()
+        .filter(|item| item["kind"] == "task")
+        .collect();
+    assert_eq!(items.len(), 2);
+    for assignment in &assignments {
+        let item = items
+            .iter()
+            .find(|item| item["item_id"] == assignment["item_id"])
+            .unwrap();
+        assert_eq!(item["revision"], assignment["item_revision"]);
+        assert_eq!(item["kind"], "task");
+        assert_eq!(item["declaration_state"], "active");
+        assert_eq!(item["execution"]["status"], "completed");
+        assert_eq!(item["execution"]["terminal"], true);
+        assert_eq!(item["execution"]["run"]["run_id"], root_id);
+        assert_eq!(
+            item["execution"]["run"]["attempt_id"],
+            assignment["attempt_id"]
+        );
+        assert_eq!(
+            item["execution"]["run"]["graph_revision"],
+            graph["basis"]["graph_revision"]
+        );
+        assert_eq!(item["delivery"]["status"], "delivered");
+    }
+    for (_, settlement) in &settlements {
+        assert_eq!(settlement["work_id"], work_id);
+        assert_eq!(settlement["branch_id"], branch_id);
+    }
+    if let Some((_, start)) = starts.first() {
+        assert_eq!(start["work_id"], work_id);
+        assert_eq!(start["branch_id"], branch_id);
+        assert_eq!(start["graph_revision"], graph["basis"]["graph_revision"]);
+    }
+    if let Some((_, proposal)) = proposals.first() {
+        assert!(!proposal["proposal_id"].as_str().unwrap().is_empty());
+        assert!(!proposal["payload_hash"].as_str().unwrap().is_empty());
+        assert_eq!(
+            proposal["result_graph_revision"],
+            graph["basis"]["graph_revision"]
+        );
+        assert_eq!(
+            proposal["result_branch_revision"],
+            graph["basis"]["branch_revision"]
+        );
+        for key in ["added_items", "dependencies_added", "dependencies_removed"] {
+            assert!(
+                proposal["applied_mutations"][key]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            proposal["applied_mutations"]["revised_items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+    assert_eq!(graph["dependencies"]["total"], 1);
+    let edges = graph["dependencies"]["entries"].as_array().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["predecessor_item_id"], assignments[0]["item_id"]);
+    assert_eq!(edges[0]["successor_item_id"], assignments[1]["item_id"]);
+    assert_eq!(edges[0]["kind"], "dependency");
     let resume = live_team_json(
         client,
         api,
@@ -881,17 +1122,21 @@ async fn assert_live_team_round(
         resume["resume_bundle"]["projections"]["provider"]["payload"]["agent_profile_selection"]["lead_agent_id"],
         "lead"
     );
-    root_id.to_string()
+    LiveTeamRound {
+        root_id: root_id.to_string(),
+        graph,
+        proposal: proposals.first().map(|(_, receipt)| receipt.clone()),
+    }
 }
 
 #[ignore = "opt-in native live Team delivery; requires ASTRA_TUI_LIVE_API_URL, ASTRA_TUI_LIVE_MODEL, and ASTRA_TUI_LIVE_ACCESS_TOKEN"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_team_delivers_dependent_member_results_and_reworks_after_client_restart() {
+async fn live_team_delivers_dependent_work_items_and_reworks_after_client_restart() {
     let _journey = pty_journey_lock().lock().await;
     let api = required_live_env(LIVE_TEAM_API_URL_ENV);
     let model = required_live_env(LIVE_TEAM_MODEL_ENV);
     let token = required_live_env(LIVE_TEAM_ACCESS_TOKEN_ENV);
-    let client = reqwest::Client::builder()
+    let client = astra_core::net::client_builder_for_target(&api)
         .default_headers(reqwest::header::HeaderMap::from_iter([(
             reqwest::header::AUTHORIZATION,
             format!("Bearer {token}").parse().unwrap(),
@@ -904,9 +1149,9 @@ async fn live_team_delivers_dependent_member_results_and_reworks_after_client_re
         serde_json::json!({
             "role":role, "agent_id":role, "skills":[], "mcp_servers":[],
             "system_prompt": if role == "lead" {
-                "Coordinate builder then reviewer using their exact profile identities. Wait for each actual result. Never edit files yourself. Ask reviewer to independently read source CSV and the generated report."
+                "Coordinate the two independently useful Work deliverables using builder then reviewer with their exact profile identities. Start durable Work before exploration. Execute each server-assigned primary task, delegate only its artifact work, and settle delivery after observing its result. Helpers must not receive a work_item assignment. Wait for each actual result. Never edit files yourself. Reviewer independently reads invoices and the generated customer master. Guidance revises the existing Work through inspect and propose; never start a replacement Work."
             } else { "Carry out the delegated file task using actual tools, then report the observed result." },
-            "allow_tools": if role == "lead" { vec!["agent", "tool_search", "introspect", "read_file", "write_file"] }
+            "allow_tools": if role == "lead" { vec!["agent", "tool_search", "introspect", "read_file", "write_file", "start_work", "run_next_work_item", "settle_work_item", "inspect_work_plan", "propose_work_plan"] }
                 else { vec!["read_file", "write_file", "tool_search"] },
             "initial_turns":6, "max_turns": if role == "lead" {24} else {12},
             "can_delegate": role == "lead", "max_delegation_depth": if role == "lead" {1} else {0}
@@ -939,57 +1184,84 @@ async fn live_team_delivers_dependent_member_results_and_reworks_after_client_re
         .unwrap();
 
     std::fs::write(
-        home.path().join("source.csv"),
-        "id,value\na,2\nb,3\na,7\nc,5\n",
+        home.path().join("customers.csv"),
+        "id,name,credit_limit\nC001,Alice,100\nC002,Bob,200\nC001,Alice Updated,150\nC003,Cara,50\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join("invoices.csv"),
+        "invoice_id,customer_id,amount\nI001,C001,120\nI002,C002,80\nI003,C999,30\nI004,C003,70\n",
     )
     .unwrap();
     let mut astra = PtyAstra::spawn_with_config(home.path(), &api, &model, &token, &["--yes"]);
     astra.wait_for("Message Astra", Duration::from_secs(15));
     let task = format!(
-        "/team run {team_name} --lead-agent-id lead \"Deliver a CSV report using builder, then reviewer. Give their tasks the descriptions CSV builder and CSV reviewer. Count all source.csv data rows, including duplicate ids. Builder must read source.csv and write report.json with version=1, count and total (sum of value). After builder completes, reviewer must independently read source.csv and report.json, verify count and total, then write review.json with version=1, approved=true, count and total. Do not invent file results.\""
+        "/team run {team_name} --lead-agent-id lead \"Use durable Work for exactly two independently useful deliverables. A: builder reads customers.csv and writes customer_master.json with version=1 and customers sorted by id, each containing id, name and numeric credit_limit. Keep the first row for each customer id. B depends on completed A: reviewer independently reads invoices.csv and customer_master.json and writes invoice_exceptions.json with version=1, exceptions sorted by invoice_id, and total_amount summing exceptions. Each exception contains invoice_id, customer_id, numeric amount and reason: unknown_customer for missing customer or over_credit_limit for amount strictly above the limit. Do not report ordinary invoices. Give helpers the descriptions CSV builder and CSV reviewer, in that order. Helpers produce artifacts without Work item assignments; you own the primary tasks and settle each observed delivery. Do not invent file results.\""
     );
     astra.paste_and_submit(&task, UI_TRANSITION_TIMEOUT);
     let session_id = wait_for_live_session_id(&mut astra, home.path());
     let first_root = assert_live_team_round(&mut astra, &client, &api, &session_id, &team, 1).await;
-    for artifact in ["report.json", "review.json"] {
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(home.path().join(artifact)).unwrap()).unwrap();
-        assert_eq!(value["version"], 1);
-        assert_eq!(value["count"], 4);
-        assert_eq!(value["total"], 17);
-        if artifact == "review.json" {
-            assert_eq!(value["approved"], true);
-        }
-    }
+    assert_live_work_artifacts(home.path(), 1);
     // Completed children retain their transcripts across conversation switches.
     astra.select_conversation("CSV builder");
     astra.wait_for("CSV builder · Transcript", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("source.csv", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("customers.csv", UI_TRANSITION_TIMEOUT);
     astra.write(&[0x0f]);
     astra.wait_for("Main conversation ·", UI_TRANSITION_TIMEOUT);
     astra.select_conversation("CSV builder");
     astra.wait_for("CSV builder · Transcript", UI_TRANSITION_TIMEOUT);
-    astra.wait_for("source.csv", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("customers.csv", UI_TRANSITION_TIMEOUT);
     astra.signal(nix::sys::signal::Signal::SIGHUP);
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
     let mut astra = PtyAstra::spawn_with_config(home.path(), &api, &model, &token, &["--yes"]);
     astra.wait_for("Message Astra", Duration::from_secs(15));
     astra.paste_and_submit(&format!("/resume {session_id}"), UI_TRANSITION_TIMEOUT);
     astra.wait_for("Resumed", Duration::from_secs(30));
-    astra.paste_and_submit("Change the duplicate rule: keep the last row for each id. Continue with the same builder and reviewer, in that order, and rewrite report.json and review.json with version=2, count and total. Reviewer must independently reread source.csv and the new report. Each member must read its existing output before rewriting it.", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("Change the duplicate rule to keep the last customer row. Inspect and revise the existing two Work items together, keeping their identities and dependency. Use the same builder then reviewer to deliver version=2 of customer_master.json and invoice_exceptions.json with the same schemas. Recompute invoice exceptions against the revised credit limits. Each member must read its existing output before rewriting it. Settle both new primary attempts; do not create another Work.", UI_TRANSITION_TIMEOUT);
     let second_root =
         assert_live_team_round(&mut astra, &client, &api, &session_id, &team, 2).await;
-    assert_ne!(first_root, second_root);
-    for artifact in ["report.json", "review.json"] {
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(home.path().join(artifact)).unwrap()).unwrap();
-        assert_eq!(value["version"], 2);
-        assert_eq!(value["count"], 3);
-        assert_eq!(value["total"], 15);
-        if artifact == "review.json" {
-            assert_eq!(value["approved"], true);
-        }
+    assert_ne!(first_root.root_id, second_root.root_id);
+    for key in ["work_id", "branch_id"] {
+        assert_eq!(
+            first_root.graph["basis"][key],
+            second_root.graph["basis"][key]
+        );
     }
+    for key in ["graph_revision", "branch_revision"] {
+        assert!(
+            second_root.graph["basis"][key].as_i64().unwrap()
+                > first_root.graph["basis"][key].as_i64().unwrap()
+        );
+    }
+    assert!(first_root.proposal.is_none());
+    let revisions = second_root.proposal.as_ref().unwrap()["applied_mutations"]["revised_items"]
+        .as_array()
+        .unwrap();
+    for first in first_root.graph["items"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["kind"] == "task")
+    {
+        let second = second_root.graph["items"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["item_id"] == first["item_id"])
+            .unwrap();
+        let revision = revisions
+            .iter()
+            .find(|revision| revision["item_id"] == first["item_id"])
+            .unwrap();
+        assert_eq!(revision["from_revision"], first["revision"]);
+        assert_eq!(revision["declaration_state"], "active");
+        assert!(second["revision"].as_i64().unwrap() > first["revision"].as_i64().unwrap());
+        assert_ne!(
+            second["execution"]["run"]["attempt_id"],
+            first["execution"]["run"]["attempt_id"]
+        );
+    }
+    assert_live_work_artifacts(home.path(), 2);
     let audit: astra_services::session_audit::SessionAuditSummary = serde_json::from_value(
         live_team_json(
             &client,

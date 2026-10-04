@@ -37,6 +37,26 @@ MCP CLI tests launch the prebuilt `mock_mcp_server` beside their test executable
 `cargo build -p astra-cli --bin mock_mcp_server` using the same target directory,
 target triple, and profile. Test processes do not run nested Cargo builds.
 
+The provider fixtures and live Team PTY client use
+`astra_core::net::client_builder_for_target` so loopback traffic works with or
+without inherited proxies, even when `NO_PROXY` is absent.
+Remote API clients retain environment proxy routing; external provider requests
+retain the provider proxy policy. Do not globally disable proxies to fix a local
+test. Verify both environments in separate processes (including uppercase and
+lowercase proxy variables), using an unreachable proxy for the loopback lane:
+
+```bash
+cargo test -p astra-core --test proxy_routing
+env -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy \
+  -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+  cargo test -p astra-runtime --lib server::provider_test_support::
+env -u NO_PROXY -u no_proxy HTTP_PROXY=http://127.0.0.1:9 \
+  http_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
+  https_proxy=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 \
+  all_proxy=http://127.0.0.1:9 \
+  cargo test -p astra-runtime --lib server::provider_test_support::
+```
+
 Live `astra-test` quality judging invokes `astra session judge --model MODEL
 --message JUDGMENT_REQUEST_JSON`. This is one tool-free `VerificationJudge`
 completion through the existing authenticated Offering and durable inference
@@ -148,16 +168,19 @@ The native Team PTY journey is a separate opt-in live lane. Set
 `ASTRA_TUI_LIVE_API_URL`, `ASTRA_TUI_LIVE_MODEL`, and
 `ASTRA_TUI_LIVE_ACCESS_TOKEN` for an isolated local Server and account with a
 configured real provider. It creates a temporary lead/builder/reviewer Team,
-verifies actual CSV artifacts and child execution identities, checks the
-builder-to-reviewer order, reopens a completed child's transcript, then restarts
-the CLI and requests a revision through ordinary input in the same session.
+checks customer-master and invoice-exception artifacts, child identities, and
+builder-to-reviewer order. Root Work receipts and one task-graph read per round
+must show two dependent primary assignments. It reopens a completed child's
+transcript, restarts the CLI, and requests a duplicate-rule revision through
+ordinary input. Work, branch and task identities remain stable; task revisions
+increase and attempts change after the accepted graph proposal.
 Child projections must replay typed Explain terminals; session audit must retain
 physical-attempt usage and either a finite cost estimate or an explicit unknown.
 It uses real model calls and removes its Team after successful validation.
 
 ```bash
 cargo test -p astra-cli --test tui_pty_journey \
-  live_team_delivers_dependent_member_results_and_reworks_after_client_restart \
+  live_team_delivers_dependent_work_items_and_reworks_after_client_restart \
   -- --ignored --exact
 ```
 

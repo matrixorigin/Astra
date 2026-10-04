@@ -832,7 +832,7 @@ fn work_lifecycle_section(tool_names: &[&str]) -> String {
 
     if can_start {
         body.push_str(
-            "- New Work: `start_work` is genesis; declare every known outcome, including dependent outcomes, with `after_initial_tasks` for explicit prerequisites. Omit only outcomes to be decided, discovered, added, replaced, or cancelled later. Once bound, never call `start_work` again: change the pinned plan through `propose_work_plan`. Trust IDs, receipts, and `next_action`.\n",
+            "- `start_work`: declare all known outcomes and `after_initial_tasks` dependencies; defer undecided changes. Once bound, use `propose_work_plan`, never new genesis. Trust IDs, receipts, and `next_action`.\n",
         );
         body.push_str(
             "- `activation=start` executes; `activation=defer` only prepares/establishes or honors explicit no-execute, owns no active attempt, and stops without routine decomposition approval.\n",
@@ -853,12 +853,12 @@ fn work_lifecycle_section(tool_names: &[&str]) -> String {
     }
     if can_run_next_work_item && can_start {
         body.push_str(
-            "- A bound Work is not genesis or proof of an active task. Change scope through typed inspection/proposal; otherwise execute the returned `initial_task`.\n",
+            "- Bound Work is not an active assignment; execute returned `initial_task` or inspect/propose a revision.\n",
         );
     }
     if can_settle {
         body.push_str(
-            "- Work item: only assigned attempts settle; child waits alone are not Work. Prove expected_result; settle on success, else continue or report blocked/failed. `synthesize_final_response` means the declared graph ended, not that the whole user goal is satisfied; review the goal and revise omissions before further execution. Never broaden/claim delivery.\n",
+            "- Only assigned attempts settle. Child waits are not Work. Prove expected_result, then settle; else continue or report blocked/failed. `synthesize_final_response` ends the graph, not the user goal; revise omissions before more work. Never broaden or claim unproved delivery.\n",
         );
     }
     body
@@ -1672,10 +1672,10 @@ mod tests {
             "",
         );
         assert!(executable.contains("Trust IDs, receipts, and `next_action`"));
-        assert!(executable.contains("declare every known outcome, including dependent outcomes"));
-        assert!(executable.contains("`after_initial_tasks` for explicit prerequisites"));
+        assert!(executable.contains("declare all known outcomes"));
+        assert!(executable.contains("`after_initial_tasks` dependencies"));
         assert!(!executable.contains("only outcomes executable now"));
-        assert!(executable.contains("not that the whole user goal is satisfied"));
+        assert!(executable.contains("not the user goal"));
         assert!(executable.contains("propose_work_plan"));
         assert!(executable.contains("status=complete"));
         assert!(executable.contains("without an item"));
@@ -1685,8 +1685,8 @@ mod tests {
         assert!(executable.contains("owns no active attempt"));
         assert!(executable.contains("run_next_work_item"));
         assert!(executable.contains("`initial_task`"));
-        assert!(executable.contains("Work item: only assigned attempts settle"));
-        assert!(executable.contains("settle on success"));
+        assert!(executable.contains("Only assigned attempts settle"));
+        assert!(executable.contains("Prove expected_result, then settle"));
         assert!(executable.contains("report blocked/failed"));
         assert!(
             DURABLE_WORK_ATTEMPT_FRAME_INSTRUCTION
@@ -1770,9 +1770,17 @@ mod tests {
             ],
             "",
         );
-        assert!(bound_work_surface.contains("never call `start_work` again"));
-        assert!(bound_work_surface.contains("change the pinned plan through `propose_work_plan`"));
-        assert!(bound_work_surface.contains("typed inspection/proposal"));
+        assert!(
+            bound_work_surface.contains("Once bound, use `propose_work_plan`, never new genesis")
+        );
+        assert!(
+            bound_work_surface
+                .contains("execute returned `initial_task` or inspect/propose a revision")
+        );
+        assert!(
+            bound_work_surface
+                .contains("inspect the pinned plan and propose the smallest typed change")
+        );
 
         let no_settle = build_main_system_prompt(&["start_work"], "");
         assert!(!no_settle.contains("`settle_work_item`"));

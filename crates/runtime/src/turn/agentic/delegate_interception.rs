@@ -1573,7 +1573,7 @@ mod tests {
         assert!(lines[1].1.contains("Final merged answer"));
     }
 
-    fn make_partition_engine(
+    async fn make_partition_engine(
         root_agent_id: &str,
         agent_ids: &[&str],
     ) -> crate::server::delegation::engine::DelegationEngine {
@@ -1596,17 +1596,22 @@ mod tests {
             ));
         }
         let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
-        DelegationEngine::with_executor(
+        let run_engine = RunEngine::new(run_store);
+        run_engine
+            .start_run("run-1", "system", "sess-1")
+            .await
+            .unwrap();
+        crate::server::delegation::engine::bind_test_engine(&DelegationEngine::with_executor(
             Arc::new(tokio::sync::RwLock::new(registry)),
-            Arc::new(RunEngine::new(run_store)),
+            Arc::new(run_engine),
             Arc::new(DelegationTracker::new()),
             Arc::new(StubSubRunExecutor),
-        )
+        ))
     }
 
     #[tokio::test]
     async fn partition_separates_delegate_from_regular_calls() {
-        let engine = make_partition_engine("main", &["coder"]);
+        let engine = make_partition_engine("main", &["coder"]).await;
         let tool_calls = vec![
             json!({
                 "id": "call_delegate",
@@ -1629,8 +1634,8 @@ mod tests {
         let (delegation_results, remaining) = partition_and_execute_delegations(
             &tool_calls,
             &engine,
-            "test-run",
-            "test-session",
+            "run-1",
+            "sess-1",
             0,
             "main",
             None,
@@ -1648,13 +1653,20 @@ mod tests {
         assert_eq!(delegation_results.len(), 1);
         assert_eq!(remaining.len(), 1);
         assert_eq!(delegation_results[0].call_id, "call_delegate");
-        assert!(delegation_results[0].summary.contains("Delegation"));
+        assert!(
+            delegation_results[0]
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.succeeded),
+            "{:?}",
+            delegation_results[0]
+        );
         assert_eq!(remaining[0]["id"], "call_bash");
     }
 
     #[tokio::test]
     async fn partition_handles_all_delegate_calls() {
-        let engine = make_partition_engine("main", &["coder", "reviewer"]);
+        let engine = make_partition_engine("main", &["coder", "reviewer"]).await;
         let tool_calls = vec![
             json!({
                 "id": "d1",
@@ -1686,12 +1698,19 @@ mod tests {
         .await;
 
         assert_eq!(delegation_results.len(), 2);
+        assert!(
+            delegation_results.iter().all(|result| result
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.succeeded)),
+            "{delegation_results:?}"
+        );
         assert!(remaining.is_empty());
     }
 
     #[tokio::test]
     async fn partition_handles_invalid_delegation_args_gracefully() {
-        let engine = make_partition_engine("main", &[]);
+        let engine = make_partition_engine("main", &[]).await;
         let tool_calls = vec![json!({
             "id": "bad_call",
             "function": {"name": "delegate", "arguments": "not valid json!!!"}
@@ -1727,7 +1746,7 @@ mod tests {
 
     #[tokio::test]
     async fn partition_preserves_target_error_with_exact_source_identity() {
-        let engine = make_partition_engine("main", &[]);
+        let engine = make_partition_engine("main", &[]).await;
         let tool_calls = vec![json!({
             "id": "missing_target",
             "function": {"name": "delegate", "arguments": "{\"task\": \"code\", \"agents\": [\"coder\"]}"}
@@ -1765,7 +1784,7 @@ mod tests {
 
     #[tokio::test]
     async fn partition_rejects_retired_root_agent_alias() {
-        let engine = make_partition_engine("main", &["coder"]);
+        let engine = make_partition_engine("main", &["coder"]).await;
         let tool_calls = vec![json!({
             "id": "retired_source",
             "function": {"name": "delegate", "arguments": "{\"task\": \"code\", \"agents\": [\"coder\"]}"}
@@ -1852,7 +1871,7 @@ mod tests {
     async fn intercept_delegations_uses_exact_root_agent_identity() {
         let mut host = MockHost::new(Vec::new()).with_valid_tools(&["delegate"]);
         let mut state = make_state();
-        state.delegation_engine = Some(Arc::new(make_partition_engine("main", &["coder"])));
+        state.delegation_engine = Some(Arc::new(make_partition_engine("main", &["coder"]).await));
 
         let turn_result = HostTurnResult {
             accum: astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum {

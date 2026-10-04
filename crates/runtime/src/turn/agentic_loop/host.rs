@@ -10438,11 +10438,13 @@ pub(crate) mod tests {
             .start_run(parent_run_id, "system", session_id)
             .await
             .expect("test delegation parent should persist");
-        Arc::new(DelegationEngine::with_executor(
-            Arc::new(tokio::sync::RwLock::new(registry)),
-            run_engine,
-            Arc::new(DelegationTracker::new()),
-            Arc::new(StubSubRunExecutor),
+        Arc::new(crate::server::delegation::engine::bind_test_engine(
+            &DelegationEngine::with_executor(
+                Arc::new(tokio::sync::RwLock::new(registry)),
+                run_engine,
+                Arc::new(DelegationTracker::new()),
+                Arc::new(StubSubRunExecutor),
+            ),
         ))
     }
 

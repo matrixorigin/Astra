@@ -6,13 +6,11 @@
 //!
 //! # Proxy invariant
 //!
-//! [`astra_core::net::apply_env_proxy`] is the **only** place in the codebase
-//! that honours `HTTPS_PROXY` / `ALL_PROXY` env vars. It is called from the
-//! LLM client here and from `validate_connectivity` in `astra-services`
-//! (both reach external provider endpoints). All other `reqwest` clients
-//! (durable bridge, skill HTTP, server tool executor, summary client, …)
-//! must call `.no_proxy()` — their traffic is local/intranet and should
-//! not be routed through a user's LLM proxy.
+//! External providers use [`astra_core::net::apply_env_proxy`]. Internal-only
+//! traffic uses [`astra_core::net::build_internal_http_client`]; clients that
+//! can target local or remote servers use
+//! [`astra_core::net::client_builder_for_target`], preserving remote proxies
+//! while bypassing them for loopback. See [`astra_core::net`] for the policy.
 //!
 //! Re-exported as [`apply_env_proxy`] for in-crate call sites.
 
@@ -10760,7 +10758,9 @@ mod tests {
             "choices":[{"index":0,"message":{"role":"assistant","tool_calls":response_calls},"finish_reason":"tool_calls"}],
             "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}
         }))])]).await;
-        let response = reqwest::Client::new()
+        let response = astra_core::net::client_builder_for_target(&gateway.base_url)
+            .build()
+            .unwrap()
             .post(format!("{}/v1/chat/completions", gateway.base_url))
             .json(&json!({"stream":true}))
             .send()

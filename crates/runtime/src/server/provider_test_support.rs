@@ -801,7 +801,9 @@ mod tests {
                 }],
             )])
             .await;
-            let client = reqwest::Client::new();
+            let client = astra_core::net::client_builder_for_target(&gateway.base_url)
+                .build()
+                .unwrap();
             client
                 .post(format!("{}/v1/chat/completions", gateway.base_url))
                 .json(&json!({}))
@@ -859,7 +861,9 @@ mod response_bounds_tests {
             ),
         ])
         .await;
-        let client = reqwest::Client::new();
+        let client = astra_core::net::client_builder_for_target(&gateway.base_url)
+            .build()
+            .unwrap();
         let url = format!("{}/v1/chat/completions", gateway.base_url);
         for _ in 0..5 {
             assert_eq!(
@@ -949,7 +953,9 @@ mod response_bounds_tests {
             )])
             .await;
             for index in 0..attempts {
-                let result = reqwest::Client::new()
+                let result = astra_core::net::client_builder_for_target(&gateway.base_url)
+                    .build()
+                    .unwrap()
                     .post(format!("{}/v1/chat/completions", gateway.base_url))
                     .json(&json!({"model":"bounded-fixture","stream":false}))
                     .send()

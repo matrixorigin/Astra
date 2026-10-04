@@ -5530,8 +5530,8 @@ async fn apply_restored_session(
         state.cli_context.requested_model_policy,
         Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
     ) {
-        state.model =
-            normalize_model_override(restored.model.as_deref()).map(|model| model.to_string().into());
+        state.model = normalize_model_override(restored.model.as_deref())
+            .map(|model| model.to_string().into());
     }
     apply_prepared_workspace_restore(state, &prepared_workspace);
 

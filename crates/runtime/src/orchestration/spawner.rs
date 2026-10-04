@@ -6700,9 +6700,6 @@ impl DynamicAgentSpawner {
         context: &SpawnContext,
         parent_selection: Option<&astra_turn_types::ModelSelection>,
     ) -> Result<(), SpawnError> {
-        if self.executor.is_none() {
-            return Err(SpawnError::ExecutorUnavailable);
-        }
         let input_count = inputs.len();
         for input in inputs.iter_mut() {
             let slot_identity = input

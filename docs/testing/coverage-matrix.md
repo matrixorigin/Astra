@@ -80,6 +80,7 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 |------------|-------------------------------|----------------------|-------|
 | Team CRUD + list/detail + upsert + delete; snapshots create/list/delete; HTTP negatives (401/404/400 validation); HTTP↔DB column fidelity + cross-user isolation | `journey_team_crud_matrix.rs`, `journey_team_snapshots_matrix.rs`, `journey_team_http_negatives_matrix.rs`, `journey_team_data_fidelity_matrix.rs`, `journey_team_isolation_matrix.rs` (`e2e_matrix_team_*` tests); DB: `team_definitions`, `team_snapshots` | `crates/runtime/tests/team_api_integration.rs` (Tower oneshot, `InMemoryTeamStore`, no DB) | — |
 | Team definitions + snapshots (SQL store) | CRUD + snapshots SQL in team journeys above | — | `team_persistence_integration` (MatrixOne, `#[ignore]`, direct service API) |
+| Native Team lead/member delivery, dependent Work assignments and restart rework | — | — | `astra-cli/tests/tui_pty_journey.rs::live_team_delivers_dependent_work_items_and_reworks_after_client_restart` (opt-in real provider and isolated Server; see [testing guide](../guides/testing.md)) |
 | Delegation mailbox with team-shaped agent ids | — | — | `crates/runtime/src/messaging/orchestrator_mailbox_tests.rs` |
 
 ## How to run
