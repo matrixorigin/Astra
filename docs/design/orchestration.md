@@ -447,6 +447,18 @@ it conveys no reusable authorization token.
 
 ## Failure handling
 
+Delegated-model assessment distinguishes a valid semantic refusal from an
+invalid service response. With supplied tasks, every resolved requirement
+explicitly names its applicable slot indices (an empty array means none);
+without supplied tasks, it carries no slot binding. Validation and provider
+recovery share one owner and at most two logical calls in total. A configured
+fallback, provider deadline retry or invalid-response correction consumes the
+same second-call allowance, respecting cancellation and execution budget.
+An exhausted invalid response is service unavailability, not evidence that
+the user's model reference is ambiguous. The failed decision is reused for
+the same authenticated intent; changing spawn parameters or reading workspace
+configuration cannot repair it. Physical attempts remain separately accounted.
+
 - Child failure is recorded as branch failure.
 - Parent may continue if aggregation policy allows partial results.
 - A launched `spawn` receipt or running `get_result` response is nonterminal,

@@ -30,6 +30,13 @@ Introspect reports system facts. Reflect reasons over those facts.
 
 Introspection must be factual, structured, and bounded. Reflection may synthesize strategy, uncertainty, and next actions, but should not mutate state by itself.
 
+The errors facet includes current-run pre-dispatch refusals from the existing
+tool records, explicitly marked `admission_rejected`, separately from execution
+failures. It does not increment executor health or infer a dispatch. Records
+without captured wall-clock time show unknown age rather than a fabricated
+timestamp. The bounded projection retains the rejection's call and round
+identity and credential-safe reason, without another storage read.
+
 ## On-demand authorized model discovery
 
 `model_catalog({"limit":16})` discovers authorized active Chat models as JSON.

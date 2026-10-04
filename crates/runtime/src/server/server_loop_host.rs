@@ -6548,6 +6548,7 @@ impl ServerAgenticLoopHost {
         stage: &'static str,
         max_output_tokens: usize,
         messages: &[Value],
+        validate: impl Fn(&str) -> Result<(), String>,
     ) -> Option<Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>>
     {
         let (client, configured_route) = self
@@ -6569,6 +6570,25 @@ impl ServerAgenticLoopHost {
             .as_ref()
             .err()
             .is_some_and(|error| error.kind == astra_core::ErrorKind::ProviderDeadline);
+        let invalid_response = response.as_ref().ok().is_some_and(|response| {
+            !response.is_ptl_error
+                && response.finish_reason.as_deref() == Some("stop")
+                && validate(&response.text).is_err()
+        });
+        // Repair only the response contract, never the authenticated source or
+        // candidate/slot snapshot. This shares the existing second-call budget
+        // with transport recovery; the main loop cannot reissue the judgment.
+        let mut repair_messages = Vec::new();
+        if invalid_response {
+            repair_messages.extend_from_slice(messages);
+            repair_messages.push(json!({"role":"user","content":
+                "The previous response violated the required JSON contract. Re-evaluate the same inputs and return one complete valid object using exactly the fields and task-index rules in the original contract. Do not change evidence or infer missing authority."}));
+        }
+        let retry_messages = if invalid_response {
+            repair_messages.as_slice()
+        } else {
+            messages
+        };
         let auxiliary_slice = crate::turn::llm::client::auxiliary_execution_budget(
             astra_turn_types::InferencePurpose::Introspection,
             crate::turn::llm::client::llm_total_budget(),
@@ -6586,7 +6606,7 @@ impl ServerAgenticLoopHost {
                     .is_some_and(|lost| lost.load(std::sync::atomic::Ordering::Acquire))
                 && host.clamp_execution_timeout(auxiliary_slice) == Some(auxiliary_slice)
         };
-        if response.is_err() && configured_route {
+        if (response.is_err() || invalid_response) && configured_route {
             if let Some(primary) = self
                 .turn_intent_summary_client(state, operation_id, max_output_tokens)
                 .await
@@ -6605,19 +6625,23 @@ impl ServerAgenticLoopHost {
                         operation_id,
                         stage,
                         "fallback",
-                        messages,
+                        retry_messages,
                     )
                     .await;
                 return Some(response);
             }
-        } else if retry_deadline && may_retry(self) {
+        } else if (retry_deadline || invalid_response) && may_retry(self) {
             return Some(
                 self.summarize_delegation_judgment_once(
                     client.as_ref(),
                     operation_id,
                     stage,
-                    "deadline_retry",
-                    messages,
+                    if invalid_response {
+                        "invalid_response_retry"
+                    } else {
+                        "deadline_retry"
+                    },
+                    retry_messages,
                 )
                 .await,
             );
@@ -6825,6 +6849,8 @@ impl ServerAgenticLoopHost {
             &assessment_request.candidate_snapshot_digest,
         );
         *assessment_operation_id = Some(operation_id.clone());
+        let explicit_requirement_presence =
+            presence == Some(astra_services::WorkAdmissionTruth::Yes);
         let Some(response) = self
             .call_delegation_judgment(
                 state,
@@ -6832,6 +6858,9 @@ impl ServerAgenticLoopHost {
                 "delegation_candidate_assessment",
                 assessment_request.max_output_tokens,
                 &assessment_request.messages,
+                |raw| astra_services::delegation_model_requirement::parse_delegation_intent_requirements_with_request(
+                    raw, explicit_requirement_presence, &assessment_request,
+                ).map(|_| ()),
             )
             .await
         else {
@@ -6865,8 +6894,6 @@ impl ServerAgenticLoopHost {
                 );
             }
         };
-        let explicit_requirement_presence =
-            presence == Some(astra_services::WorkAdmissionTruth::Yes);
         let extracted =
             match astra_services::delegation_model_requirement::parse_delegation_intent_requirements_with_request(
                 &response.text,
@@ -6881,9 +6908,7 @@ impl ServerAgenticLoopHost {
                         "delegation model assessment response was rejected"
                     );
                     return (
-                        unresolved(&format!(
-                            "Model requirement evidence was rejected ({error}); no child was started."
-                        )),
+                        unavailable("The model-selection service returned invalid evidence; no child was started. Changing spawn arguments or inspecting local configuration cannot repair this internal response."),
                         None,
                     );
                 }
@@ -6922,6 +6947,9 @@ impl ServerAgenticLoopHost {
                 "delegation_scope_binding",
                 astra_services::delegation_model_requirement::DELEGATION_SCOPE_BINDING_OUTPUT_TOKENS,
                 &messages,
+                |raw| astra_services::delegation_model_requirement::parse_delegation_scope_response(
+                    raw, scoped, slots.len(),
+                ).map(|_| ()),
             )
             .await
             .ok_or_else(|| "Delegated task scope could not be checked.".to_string())?;
@@ -40805,7 +40833,7 @@ mod tests {
         let reads = Arc::new(std::sync::Mutex::new(0));
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let response = json!({"disposition":"resolved","requirements":[{
-            "candidate_index":0,"model_quote":"Model-A"
+            "candidate_index":0,"model_quote":"Model-A","slots":[0]
         }]})
         .to_string();
         let client = |response: String| {
@@ -40964,12 +40992,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegation_response_recovery_is_bounded_and_does_not_cache_user_ambiguity() {
+        let valid = json!({"disposition":"resolved","requirements":[{
+            "candidate_index":0,"model_quote":"Model-A","slots":[0]
+        }]})
+        .to_string();
+        let unresolved =
+            json!({"disposition":"unresolved","reason":"The user must choose a variant."})
+                .to_string();
+        for (responses, expected_kind, expected_calls) in [
+            (vec!["invalid".to_string(), valid], None, 2),
+            (
+                vec!["invalid".to_string(), "invalid".to_string()],
+                Some("delegation_model_assessment_unavailable"),
+                2,
+            ),
+            (
+                vec![unresolved],
+                Some("delegation_model_scope_unresolved"),
+                1,
+            ),
+        ] {
+            let reads = Arc::new(std::sync::Mutex::new(0));
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut host = test_host_builder("user", "session")
+                .with_model_service(Some(Arc::new(DelegationCatalogSpy {
+                    reads: reads.clone(),
+                })))
+                .with_test_judgment_clients([Box::new(SequencedSummaryClient {
+                    provenance: astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                    responses: std::sync::Mutex::new(responses.into()),
+                    requests: requests.clone(),
+                }) as Box<dyn SummaryLlmClient>])
+                .build();
+            let mut state = create_test_state();
+            state.context_manifest_user_id = Some("user".into());
+            state.current_session_id = Some("session".into());
+            state.current_run_id = Some("root-run".into());
+            state.canonical_turn_chain_id = Some("chain".into());
+            state.current_run_owner_generation = Some(1);
+            state.user_intent = "Use Model-A for the delegated child.".into();
+            for id in ["first", "retry"] {
+                let call = json!({"id":id,"type":"function","function":{
+                    "name":"agent","arguments":json!({"action":"spawn", "description":"Independent", "prompt":"Reply OK"}).to_string()
+                }});
+                let (admitted, blocked) =
+                    host.admitted_delegation_models(&mut state, &[call]).await;
+                if let Some(kind) = expected_kind {
+                    assert!(admitted.is_empty());
+                    assert_eq!(blocked.len(), 1);
+                    assert_eq!(
+                        blocked[0].tool_result_fields.as_ref().unwrap()["error_kind"],
+                        kind
+                    );
+                    let fields = blocked[0].tool_result_fields.as_ref().unwrap();
+                    assert_eq!(fields["retryable"], false);
+                    assert_eq!(fields["executed"], false);
+                } else {
+                    assert!(blocked.is_empty(), "{blocked:?}");
+                    assert!(matches!(&admitted[id].outcome,
+                        astra_turn_types::DelegationModelAdmissionOutcome::Constrained { slots }
+                        if slots[0].model_selection.as_ref().unwrap().offering_id == "offer-a"));
+                    break;
+                }
+            }
+            assert_eq!(*reads.lock().unwrap(), 1);
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), expected_calls);
+            if expected_calls == 2 {
+                assert_eq!(
+                    &requests[1][..requests[0].len()],
+                    requests[0].as_slice(),
+                    "recovery must preserve the original source and candidate/slot snapshot"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn negative_model_presence_does_not_skip_natural_model_selection() {
         let reads = Arc::new(std::sync::Mutex::new(0));
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let response = json!({
             "disposition": "resolved",
-            "requirements": [{"candidate_index": 0, "model_quote": "Model-A"}]
+            "requirements": [{"candidate_index": 0, "model_quote": "Model-A", "slots": [0]}]
         })
         .to_string();
         let mut host = test_host_builder("negative-presence-user", "negative-presence-session")
@@ -41516,6 +41622,7 @@ mod tests {
                     "delegation_candidate_assessment",
                     128,
                     &[],
+                    |_| Ok(()),
                 )
                 .await
                 .expect("client");
@@ -50121,6 +50228,7 @@ mod tests {
                     "delegation_candidate_assessment",
                     128,
                     &[json!({"role":"user","content":"Select a candidate."})],
+                    |_| Ok(()),
                 )
                 .await
                 .expect("configured route");

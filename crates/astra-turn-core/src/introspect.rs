@@ -1655,7 +1655,7 @@ pub fn render_errors(s: &IntrospectSnapshot) -> String {
         return "## Recent Tool Errors\n(No failures in this live runtime projection. Admission rejections and durable session alerts may exist outside this recent-tool view; use reflect for session-wide evidence.)".to_string();
     }
     let mut out = String::from(
-        "## Recent Tool Errors (newest first)\n\
+        "## Recent Tool Errors (admission refusals and execution failures)\n\
          | Tool | Category | Turn | Age(s) | Preview |\n\
          |------|----------|------|--------|---------|\n",
     );
@@ -1664,7 +1664,11 @@ pub fn render_errors(s: &IntrospectSnapshot) -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     for e in &s.tool_errors {
-        let age = now.saturating_sub(e.at_epoch);
+        let age = if e.at_epoch == 0 {
+            "unknown".to_string()
+        } else {
+            format!("{}s", now.saturating_sub(e.at_epoch))
+        };
         let cat = e.failure_category.as_deref().unwrap_or("-");
         let preview = e
             .error_preview
@@ -1678,7 +1682,7 @@ pub fn render_errors(s: &IntrospectSnapshot) -> String {
             "-".to_string()
         };
         out.push_str(&format!(
-            "| {} | {} | {} | {}s | {} |\n",
+            "| {} | {} | {} | {} | {} |\n",
             e.tool, cat, turn_str, age, short,
         ));
         // Detail line for file errors

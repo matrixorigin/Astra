@@ -1525,7 +1525,40 @@ fn build_introspect_snapshot_with_tool_admission(
         stall_state,
         injection_freshness: Vec::new(),
         current_round,
-        tool_errors: state.turn_guard.health.recent_errors(10),
+        tool_errors: state
+            .stall
+            .tool_call_records
+            .iter()
+            .rev()
+            .filter(|record| record.effective_disposition() == ToolCallDisposition::Rejected)
+            .take(10)
+            .map(|record| {
+                let (safe_error, _) =
+                    astra_text_utils::credential_redaction::redact_credentials_for_display(
+                        record
+                            .error
+                            .as_deref()
+                            .unwrap_or("Tool request rejected before execution"),
+                    );
+                let preview: String = safe_error.chars().take(500).collect();
+                astra_turn_core::introspect::ToolErrorEntry {
+                    tool: record.name.clone(),
+                    signature_hint: record.tool_call_id.clone().unwrap_or_default(),
+                    failure_category: Some("admission_rejected".into()),
+                    error_preview: Some(preview.clone()),
+                    // Tool records do not capture wall-clock time. Do not
+                    // invent a timestamp or pretend this was dispatched.
+                    at_epoch: 0,
+                    error_message: preview,
+                    file_path: None,
+                    file_range: None,
+                    turn: state.session_turn,
+                    round: record.round.unwrap_or_default(),
+                }
+            })
+            .chain(state.turn_guard.health.recent_errors(10))
+            .take(10)
+            .collect(),
         circuit_breaker,
     };
 
@@ -13303,6 +13336,24 @@ print(json.dumps({'context': 'user said: ' + msg}))
             alert.contains("tool_admission_rejections=1")
                 && alert.contains("before executor dispatch")
         }));
+        let error = &snapshot.tool_errors[0];
+        assert_eq!(error.tool, "agent_fanout");
+        assert_eq!(
+            error.failure_category.as_deref(),
+            Some("admission_rejected")
+        );
+        assert_eq!(
+            error.error_preview.as_deref(),
+            Some("parallel topology was not admitted")
+        );
+        assert!(
+            state.turn_guard.health.recent_errors(10).is_empty(),
+            "admission must not manufacture executor failures"
+        );
+        assert!(
+            astra_turn_core::introspect::render_errors(&snapshot)
+                .contains("parallel topology was not admitted")
+        );
     }
 
     #[test]
