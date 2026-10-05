@@ -18,10 +18,10 @@
 //! It verifies the current schema and query semantics against MatrixOne
 //! instead of matching SQL strings.
 
-use astra_config::config_versions::{ConfigVersionStore, LocalFileStore, VersionId};
+use astra_config::config_versions::VersionId;
 use astra_services::config_version_cloud::{
     CONFIG_VERSIONS_INSERT_SQL, CONFIG_VERSIONS_LIST_SQL, CONFIG_VERSIONS_SELECT_TOML_SQL,
-    ConfigVersionPayload, pull_all_into_local_store,
+    ConfigVersionPayload,
 };
 use astra_services::storage::ensure_core_schema;
 use sqlx::Row;
@@ -159,31 +159,6 @@ async fn config_versions_schema_and_queries_hold_on_live_matrixone() {
             .try_get::<Option<String>, _>("first_seen_session")
             .unwrap(),
         newer.first_seen_session
-    );
-
-    let local_dir = tempfile::tempdir().expect("local config version dir");
-    let local = LocalFileStore::new(local_dir.path().to_path_buf());
-    let pull = pull_all_into_local_store(&pool, &owner, &local, 10)
-        .await
-        .expect("pull owner config versions into local store");
-    assert_eq!(pull.fetched, 2);
-    assert_eq!(pull.written, 2);
-    assert_eq!(pull.skipped_hash_mismatch, 0);
-    let older_id = VersionId::from_wire_string(older.version_id.clone());
-    let newer_id = VersionId::from_wire_string(newer.version_id.clone());
-    assert_eq!(
-        local
-            .get_toml(&older_id)
-            .expect("load older local TOML")
-            .as_deref(),
-        Some(older.toml_body.as_str())
-    );
-    assert_eq!(
-        local
-            .get_toml(&newer_id)
-            .expect("load newer local TOML")
-            .as_deref(),
-        Some(newer.toml_body.as_str())
     );
 
     let column_rows = sqlx::query(

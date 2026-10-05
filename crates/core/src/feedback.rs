@@ -131,20 +131,6 @@ pub enum Sentiment {
     Negative,
 }
 
-/// A hint derived from feedback signal analysis for downstream adaptation.
-///
-/// These are pure observations — the store reports facts, it does not
-/// decide what the runtime should do about them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdaptationHint {
-    /// Hint category: "high_retry_rate", "elevated_failure_rate", etc.
-    pub kind: String,
-    /// Human-readable detail for logging or prompt injection.
-    pub detail: String,
-    /// Severity: "info", "warning", "critical".
-    pub severity: String,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct FeedbackBuffer {
     signals: VecDeque<FeedbackSignal>,
@@ -157,7 +143,7 @@ struct FeedbackBuffer {
 /// To reduce filesystem pressure, `record()` buffers signals in memory
 /// and only persists every [`BATCH_PERSIST_INTERVAL`] signals (default 10).
 /// Call [`flush`] to force an immediate write (e.g., on shutdown or
-/// before reading signals for adaptation).
+/// before inspecting retained signals).
 pub struct FeedbackSignalStore {
     buffer: RwLock<FeedbackBuffer>,
     max_signals: usize,
@@ -233,62 +219,6 @@ impl FeedbackSignalStore {
         buffer.signals.iter().cloned().collect()
     }
 
-    /// Analyze recent feedback signals and produce adaptation hints.
-    ///
-    /// Returns a summary of the most frequent signal types and their
-    /// sentiment distribution. Callers (e.g., RuntimePolicy or SelfModel)
-    /// can use these hints to adjust behavior — the store only reports
-    /// facts, it does not decide what to do with them.
-    pub fn adaptation_hints(&self) -> Vec<AdaptationHint> {
-        let signals = self.recent_signals();
-        if signals.is_empty() {
-            return Vec::new();
-        }
-        let mut hints = Vec::new();
-        let total = signals.len() as f64;
-
-        // Repeated retries suggest the current approach is failing
-        let retry_count = signals
-            .iter()
-            .filter(|signal| matches!(signal.signal_type, SignalType::Retry { .. }))
-            .count();
-        if retry_count as f64 / total > 0.3 {
-            hints.push(AdaptationHint {
-                kind: "high_retry_rate".to_string(),
-                detail: format!(
-                    "{} retry signals in {} feedback events — consider changing approach",
-                    retry_count,
-                    signals.len()
-                ),
-                severity: if retry_count > 5 {
-                    "critical"
-                } else {
-                    "warning"
-                }
-                .to_string(),
-            });
-        }
-
-        // High error rate signals
-        let error_count = signals
-            .iter()
-            .filter(|signal| matches!(signal.signal_type, SignalType::TaskFailure { .. }))
-            .count();
-        if error_count > 0 && error_count as f64 / total > 0.2 {
-            hints.push(AdaptationHint {
-                kind: "elevated_failure_rate".to_string(),
-                detail: format!(
-                    "{} task failures in {} feedback events",
-                    error_count,
-                    signals.len()
-                ),
-                severity: "warning".to_string(),
-            });
-        }
-
-        hints
-    }
-
     /// Count of unpersisted signals since last flush/persist.
     pub fn dirty_count(&self) -> usize {
         *self.dirty_count.read().unwrap_or_else(|e| e.into_inner())
@@ -297,7 +227,7 @@ impl FeedbackSignalStore {
     /// Force immediate persistence of all buffered signals.
     ///
     /// Resets the dirty counter. Call this before shutdown, before reading
-    /// signals for adaptation analysis, or after a burst of high-value signals.
+    /// retained signals, or after a burst of high-value signals.
     pub fn flush(&self) -> std::io::Result<()> {
         self.persist()?;
         let mut dirty = self.dirty_count.write().unwrap_or_else(|e| e.into_inner());
@@ -349,62 +279,6 @@ mod tests {
         assert_eq!(signals[0].turn_id.as_deref(), Some("t1"));
         assert_eq!(signals[1].turn_id.as_deref(), Some("t2"));
         assert_eq!(signals[1].signal_type.type_name(), "correction");
-    }
-
-    #[test]
-    fn adaptation_hints_are_derived_from_typed_signals() {
-        let store = FeedbackSignalStore::new();
-        for _ in 0..4 {
-            store.record(FeedbackSignal::new(SignalType::Retry { count: 1 }));
-        }
-        for _ in 0..2 {
-            store.record(FeedbackSignal::new(SignalType::TaskFailure {
-                reason: "provider failed".to_string(),
-            }));
-        }
-
-        let hints = store.adaptation_hints();
-        assert!(
-            hints.iter().any(|hint| hint.kind == "high_retry_rate"),
-            "{hints:?}"
-        );
-        assert!(
-            hints
-                .iter()
-                .any(|hint| hint.kind == "elevated_failure_rate"),
-            "{hints:?}"
-        );
-    }
-
-    #[test]
-    fn adaptation_hints_are_empty_without_signals() {
-        let store = FeedbackSignalStore::new();
-
-        assert!(store.adaptation_hints().is_empty());
-    }
-
-    #[test]
-    fn adaptation_hints_do_not_trigger_at_exclusive_thresholds() {
-        let store = FeedbackSignalStore::new();
-        store.record(FeedbackSignal::new(SignalType::Retry { count: 1 }));
-        store.record(FeedbackSignal::new(SignalType::TaskFailure {
-            reason: "provider failed".to_string(),
-        }));
-        for _ in 0..3 {
-            store.record(FeedbackSignal::new(SignalType::Acceptance));
-        }
-
-        let hints = store.adaptation_hints();
-        assert!(
-            !hints.iter().any(|hint| hint.kind == "high_retry_rate"),
-            "20% retry rate must stay below the exclusive 30% threshold: {hints:?}"
-        );
-        assert!(
-            !hints
-                .iter()
-                .any(|hint| hint.kind == "elevated_failure_rate"),
-            "20% failure rate is the exclusive threshold and must not trigger: {hints:?}"
-        );
     }
 
     #[test]

@@ -6147,9 +6147,8 @@ async fn ensure_core_schema_while_leased(
     //
     // One row per unique RuntimeConfig hash per tenant. Populated by
     // the CLI via enqueue_journal_events → IngestionEvent::ConfigVersionSaved,
-    // consumed by `astra config sync pull` on new machines. See
-    // `crate::config_version_cloud` for the DDL string and bind helpers
-    // that the push / pull pipeline uses.
+    // retained as owner-scoped forensic configuration evidence. See
+    // `crate::config_version_cloud` for the DDL and ingestion payload contract.
 
     let config_version_schema = pool.owned_by("config_version_cloud");
     config_version_schema.authority.declare(

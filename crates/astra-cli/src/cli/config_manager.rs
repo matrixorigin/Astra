@@ -454,10 +454,6 @@ async fn config_version_dispatch(sub: ConfigVersionCmd) -> Result<(), String> {
             stdout_println!("{id}");
             Ok(())
         }
-        ConfigVersionCmd::Pull(_) => Err(
-            "config version pull is server-owned; CLI no longer connects to MatrixOne directly"
-                .to_string(),
-        ),
     }
 }
 

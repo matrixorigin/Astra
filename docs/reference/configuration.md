@@ -273,3 +273,10 @@ Server-loop Memoria observer and post-loop memory cleanup are fixed internal asy
 make dev-init
 make check
 ```
+
+Saved configuration versions are inspected locally with `astra config version`
+(`list`, `show`, `diff`, and `current`). There is no configuration cloud-pull
+command; Server ingestion retains owner-scoped version evidence.
+
+The local version index uses one JSON record per nonempty line. Inspection
+reports a corrupt row instead of returning a partially decoded index.

@@ -312,3 +312,25 @@ fn put_waits_for_exclusive_index_lock_before_appending() {
         "the delayed append should land exactly once"
     );
 }
+
+#[test]
+fn list_rejects_corrupt_rows_without_returning_a_valid_prefix() {
+    let (dir, store) = tmp_store();
+    store
+        .put(&RuntimeConfig::default(), PutMetadata::default())
+        .unwrap();
+    let index_path = dir.path().join("index.jsonl");
+    let row = std::fs::read_to_string(&index_path).unwrap();
+    let row = row.trim_end();
+    for corrupt_row in [format!("{row}junk"), format!("{row}{row}"), "{".into()] {
+        std::fs::write(&index_path, format!("{row}\n{corrupt_row}\n")).unwrap();
+        let error = store
+            .list()
+            .expect_err("corrupt index must fail as a whole");
+        assert!(
+            matches!(error, astra_config::config_versions::StoreError::CorruptIndex(ref detail)
+            if detail.contains("line 2:")),
+            "{error}"
+        );
+    }
+}

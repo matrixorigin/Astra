@@ -261,12 +261,10 @@ pub(crate) mod worktree;
 use crate::lock_recovery::LockRecovery;
 pub(crate) use worktree::GitWorktreeRollbackJournal;
 pub use worktree::WorktreeSession;
-#[path = "edge_tools/memoria.rs"]
-pub(crate) mod memoria;
-#[cfg(test)]
-use astra_tools::memoria::parse_memory_search_contents;
 #[path = "edge_tools/ask_user.rs"]
 mod ask_user;
+#[path = "edge_tools/memoria.rs"]
+pub(crate) mod memoria;
 pub(crate) use ask_user::parse_ask_user_prompt;
 #[path = "edge_tools/mcp_dispatch.rs"]
 mod mcp_dispatch;
@@ -6169,8 +6167,7 @@ pub(crate) mod tests {
         background_task_output_result_fields, cli_tool_output_is_error,
         embedded_work_unit_observation, file_checkpoint_dir_for, format_background_task_error,
         format_background_task_output, format_background_task_output_wait_timeout,
-        format_background_task_stop_error, memoria, parse_memory_search_contents,
-        utf16_col_to_char_idx,
+        format_background_task_stop_error, utf16_col_to_char_idx,
     };
     use crate::background_task_error::BackgroundTaskError;
     use crate::lock_recovery::LockRecovery;
@@ -10967,7 +10964,6 @@ pub(crate) mod tests {
     mod executor_core_tests;
 
     mod lsp_tests;
-    mod memoria_tests;
     mod sandbox_tests;
     mod schema_tests;
     mod self_mod_tests;

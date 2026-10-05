@@ -10,9 +10,6 @@ use serde_json::{Value, json};
 
 use super::ToolExecutor;
 
-#[cfg(test)]
-pub use astra_tools::memoria::parse_memory_search_hits;
-
 fn current_memoria_proxy_target() -> Result<(String, String), String> {
     let base = crate::cli::config_manager::resolve_api_url(None)?;
     let token =
