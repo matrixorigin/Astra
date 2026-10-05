@@ -304,6 +304,12 @@ the only physical-operation serialization boundary.
 
 ## Current implementation audit
 
+- Work criteria and task graphs change only through owner-scoped proposal
+  acceptance with the recorded payload hash and revision basis. Direct criteria
+  and graph writer APIs and the unexposed Goal editing prototype are retired.
+  The genesis Goal and its revision remain part of proposal, branch and delivery
+  fencing; this does not introduce a new Goal editing surface.
+
 - TUI `/work start` promotes its current durable Session through the Server Work
   binding API, creating and binding a Session when the TUI is pristine. It
   reuses the Session on exact retry, and prints the Work id, the next action,

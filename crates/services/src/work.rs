@@ -220,7 +220,7 @@ pub use recovery_point::{
 };
 pub use repository::{
     CreatedWork, DatabaseWorkRepository, WorkAcceptanceBasisResource, WorkCheckBasisResource,
-    WorkConflictResource, WorkGenesis, WorkGenesisParts, WorkGoalChange, WorkProposalBasisResource,
+    WorkConflictResource, WorkGenesis, WorkGenesisParts, WorkProposalBasisResource,
     WorkRecoveryPointBlocker, WorkRepository, WorkRepositoryError,
 };
 pub use runtime_event_outbox::{
@@ -1270,7 +1270,7 @@ pub(crate) const WORK_EVENTS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS work
     INDEX idx_work_events_branch_seq (owner_id, work_id, branch_id, event_seq),
     CONSTRAINT chk_work_event_seq CHECK (event_seq > 0),
     CONSTRAINT chk_work_event_kind CHECK (event_kind IN (
-        'work_created', 'goal_revised', 'criteria_accepted', 'branch_basis_adopted',
+        'work_created', 'criteria_accepted', 'branch_basis_adopted',
         'graph_replaced', 'delivery_branch_selected', 'branch_archived', 'branch_restored',
         'subject_changed', 'patch_artifact_exported',
         'plan_proposed', 'criteria_proposed', 'proposal_rejected',

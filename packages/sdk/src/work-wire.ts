@@ -1759,7 +1759,6 @@ export function decodeWorkReadCursorReceiptV1(
 
 const EVENT_KINDS = [
   "work_created",
-  "goal_revised",
   "criteria_accepted",
   "branch_basis_adopted",
   "graph_replaced",

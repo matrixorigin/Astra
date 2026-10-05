@@ -1,5 +1,5 @@
 use super::graph::{CanonicalGraph, validate_and_canonicalize_graph};
-use super::repository::{DatabaseWorkRepository, WorkConflictResource, WorkRepositoryError};
+use super::repository::{WorkConflictResource, WorkRepositoryError};
 use super::{
     ForkCursorRef, GraphRevision, WorkBranchRecord, WorkBranchRecordParts, WorkBranchRevision,
     WorkGraphChange, WorkGraphItemChange, WorkItemDeclarationState, WorkItemId, WorkItemKind,
@@ -926,50 +926,6 @@ pub(super) async fn apply_prepared_graph_change(
     .await;
     event_result?;
     load_branch(transaction, change).await
-}
-
-pub(super) async fn replace_graph(
-    repository: &DatabaseWorkRepository,
-    change: WorkGraphChange,
-) -> Result<WorkBranchRecord, WorkRepositoryError> {
-    let mut transaction = repository.pool.get().begin().await.map_err(|source| {
-        WorkRepositoryError::persistence("begin graph revision transaction", source)
-    })?;
-    let prepared = match prepare_graph_change(&mut transaction, change).await {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            return Err(super::repository::rollback_transaction(
-                transaction,
-                "rollback graph preparation transaction",
-                error,
-            )
-            .await);
-        }
-    };
-    let actor_id = prepared.change.owner_id.as_str();
-    let updated = match apply_prepared_graph_change(
-        &mut transaction,
-        &prepared,
-        "user",
-        actor_id,
-        None,
-    )
-    .await
-    {
-        Ok(updated) => updated,
-        Err(error) => {
-            return Err(super::repository::rollback_transaction(
-                transaction,
-                "rollback graph revision transaction",
-                error,
-            )
-            .await);
-        }
-    };
-    transaction.commit().await.map_err(|source| {
-        WorkRepositoryError::persistence("commit graph revision transaction", source)
-    })?;
-    Ok(updated)
 }
 
 #[cfg(test)]

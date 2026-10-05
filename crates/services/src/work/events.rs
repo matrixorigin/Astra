@@ -34,7 +34,6 @@ impl WorkEventSeq {
 #[serde(rename_all = "snake_case")]
 pub enum WorkEventKind {
     WorkCreated,
-    GoalRevised,
     CriteriaAccepted,
     BranchBasisAdopted,
     GraphReplaced,
@@ -60,7 +59,6 @@ impl WorkEventKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::WorkCreated => "work_created",
-            Self::GoalRevised => "goal_revised",
             Self::CriteriaAccepted => "criteria_accepted",
             Self::BranchBasisAdopted => "branch_basis_adopted",
             Self::GraphReplaced => "graph_replaced",
@@ -86,7 +84,6 @@ impl WorkEventKind {
     pub(crate) fn from_persisted(value: &str) -> Option<Self> {
         match value {
             "work_created" => Some(Self::WorkCreated),
-            "goal_revised" => Some(Self::GoalRevised),
             "criteria_accepted" => Some(Self::CriteriaAccepted),
             "branch_basis_adopted" => Some(Self::BranchBasisAdopted),
             "graph_replaced" => Some(Self::GraphReplaced),

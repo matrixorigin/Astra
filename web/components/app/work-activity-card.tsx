@@ -9,7 +9,6 @@ import type { WorkActivitySnapshot } from "@/lib/work-overview";
 
 const EVENT_LABELS: Record<WorkEventKind, string> = {
   work_created: "Work started",
-  goal_revised: "Goal updated",
   criteria_accepted: "Done-when criteria accepted",
   branch_basis_adopted: "Branch aligned with current Work",
   graph_replaced: "Plan updated",

@@ -3082,7 +3082,6 @@ export type WorkReadCursorReceiptV1 = {
 
 export type WorkEventKind =
   | "work_created"
-  | "goal_revised"
   | "criteria_accepted"
   | "branch_basis_adopted"
   | "graph_replaced"

@@ -157,7 +157,6 @@ async fn prune_expired_event_fact(
             "expired acceptance decision",
         )),
         WorkEventKind::WorkCreated
-        | WorkEventKind::GoalRevised
         | WorkEventKind::CriteriaAccepted
         | WorkEventKind::BranchBasisAdopted
         | WorkEventKind::GraphReplaced

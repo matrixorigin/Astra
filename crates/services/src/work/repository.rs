@@ -6,11 +6,11 @@ use super::{
     WorkAttentionCursorAdvance, WorkAttentionReceipt, WorkBranchBasisChange, WorkBranchId,
     WorkBranchRecord, WorkBranchRecordParts, WorkBranchRevision, WorkBranchSubject,
     WorkBranchSubjectChange, WorkChangeReason, WorkChangeRef, WorkCriteriaChange, WorkDomainError,
-    WorkEventPage, WorkEventQuery, WorkGoal, WorkGraphChange, WorkId, WorkItemRevisionRef,
-    WorkObservationQuery, WorkObservationReport, WorkOwnerId, WorkPatchArtifact,
-    WorkPatchArtifactBasisResource, WorkPatchArtifactId, WorkPlanContext,
-    WorkPlanProposalAcceptance, WorkProposalStatus, WorkRecord, WorkRecordParts, WorkRevision,
-    WorkSessionPlanBinding, WorkTaskExecutionSnapshot, WorkTaskGraphPage, WorkTaskGraphQuery,
+    WorkEventPage, WorkEventQuery, WorkGoal, WorkId, WorkItemRevisionRef, WorkObservationQuery,
+    WorkObservationReport, WorkOwnerId, WorkPatchArtifact, WorkPatchArtifactBasisResource,
+    WorkPatchArtifactId, WorkPlanContext, WorkPlanProposalAcceptance, WorkProposalStatus,
+    WorkRecord, WorkRecordParts, WorkRevision, WorkSessionPlanBinding, WorkTaskExecutionSnapshot,
+    WorkTaskGraphPage, WorkTaskGraphQuery,
 };
 use astra_core::SharedPool;
 use async_trait::async_trait;
@@ -187,15 +187,6 @@ pub enum WorkRepositoryError {
     #[error("delivery branch selection has a stale or incoherent {resource:?} basis")]
     StaleDeliverySelection {
         resource: super::WorkDeliverySelectionBasisResource,
-    },
-    #[error(
-        "stale Goal change: expected Work r{expected_work_revision:?}/Goal r{expected_goal_revision:?}, found Work r{actual_work_revision:?}/Goal r{actual_goal_revision:?}"
-    )]
-    StaleGoalRevision {
-        expected_work_revision: WorkRevision,
-        actual_work_revision: WorkRevision,
-        expected_goal_revision: GoalRevision,
-        actual_goal_revision: GoalRevision,
     },
     #[error(
         "stale criterion-set change: expected Work r{expected_work_revision:?}/set r{expected_criteria_set_revision:?}, found Work r{actual_work_revision:?}/set r{actual_criteria_set_revision:?}"
@@ -432,17 +423,6 @@ impl WorkGenesis {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkGoalChange {
-    pub owner_id: WorkOwnerId,
-    pub work_id: WorkId,
-    pub expected_work_revision: WorkRevision,
-    pub expected_goal_revision: GoalRevision,
-    pub goal: WorkGoal,
-    pub source_ref: super::WorkChangeRef,
-    pub reason: Option<WorkChangeReason>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatedWork {
     pub work: WorkRecord,
     pub delivery_branch: WorkBranchRecord,
@@ -483,22 +463,9 @@ pub trait WorkRepository: Send + Sync {
         query: super::WorkCatalogQuery,
     ) -> Result<super::WorkCatalogPage, WorkRepositoryError>;
 
-    async fn revise_goal(&self, change: WorkGoalChange)
-    -> Result<CreatedWork, WorkRepositoryError>;
-
-    async fn accept_criteria(
-        &self,
-        change: WorkCriteriaChange,
-    ) -> Result<CreatedWork, WorkRepositoryError>;
-
     async fn adopt_branch_basis(
         &self,
         change: WorkBranchBasisChange,
-    ) -> Result<WorkBranchRecord, WorkRepositoryError>;
-
-    async fn replace_graph(
-        &self,
-        change: WorkGraphChange,
     ) -> Result<WorkBranchRecord, WorkRepositoryError>;
 
     async fn set_branch_subject(
@@ -1394,7 +1361,6 @@ fn decode_branch(row: &sqlx::mysql::MySqlRow) -> Result<WorkBranchRecord, WorkRe
 
 struct CurrentWorkRevisions {
     work: WorkRevision,
-    goal: GoalRevision,
     criteria_set: CriterionSetRevision,
     archived: bool,
 }
@@ -1406,7 +1372,7 @@ async fn load_current_work_revisions(
     operation: &'static str,
 ) -> Result<CurrentWorkRevisions, WorkRepositoryError> {
     let row = query(
-        "SELECT work_revision, current_goal_revision, current_criteria_set_revision,
+        "SELECT work_revision, current_criteria_set_revision,
                 CASE WHEN archived_at IS NULL THEN 0 ELSE 1 END AS is_archived
          FROM works WHERE owner_id = ? AND work_id = ? LIMIT 1",
     )
@@ -1422,8 +1388,6 @@ async fn load_current_work_revisions(
     };
     Ok(CurrentWorkRevisions {
         work: WorkRevision::new(read_revision("work_revision")?)
-            .map_err(|source| WorkRepositoryError::corrupt("Work", source))?,
-        goal: GoalRevision::new(read_revision("current_goal_revision")?)
             .map_err(|source| WorkRepositoryError::corrupt("Work", source))?,
         criteria_set: CriterionSetRevision::new(read_revision("current_criteria_set_revision")?)
             .map_err(|source| WorkRepositoryError::corrupt("Work", source))?,
@@ -1858,169 +1822,11 @@ impl WorkRepository for DatabaseWorkRepository {
         super::catalog_repository::list_catalog(self, query).await
     }
 
-    async fn revise_goal(
-        &self,
-        change: WorkGoalChange,
-    ) -> Result<CreatedWork, WorkRepositoryError> {
-        let next_work_revision = change
-            .expected_work_revision
-            .checked_next()
-            .map_err(invalid_mutation)?;
-        let next_goal_revision = change
-            .expected_goal_revision
-            .checked_next()
-            .map_err(invalid_mutation)?;
-        let mut transaction = self.pool.get().begin().await.map_err(|source| {
-            WorkRepositoryError::persistence("begin Goal revision transaction", source)
-        })?;
-
-        let update = query(
-            "UPDATE works
-             SET work_revision = ?, current_goal_revision = ?, updated_at = NOW(6)
-             WHERE owner_id = ? AND work_id = ?
-               AND work_revision = ? AND current_goal_revision = ?
-               AND archived_at IS NULL",
-        )
-        .bind(next_work_revision.get())
-        .bind(next_goal_revision.get())
-        .bind(change.owner_id.as_str())
-        .bind(change.work_id.as_str())
-        .bind(change.expected_work_revision.get())
-        .bind(change.expected_goal_revision.get())
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| WorkRepositoryError::persistence("advance Goal revision CAS", source))?;
-
-        match update.rows_affected() {
-            1 => {}
-            0 => {
-                let current = load_current_work_revisions(
-                    &mut transaction,
-                    &change.owner_id,
-                    &change.work_id,
-                    "classify Goal revision CAS miss",
-                )
-                .await?;
-                if current.archived {
-                    return Err(WorkRepositoryError::Archived);
-                }
-                return Err(WorkRepositoryError::StaleGoalRevision {
-                    expected_work_revision: change.expected_work_revision,
-                    actual_work_revision: current.work,
-                    expected_goal_revision: change.expected_goal_revision,
-                    actual_goal_revision: current.goal,
-                });
-            }
-            affected => {
-                return Err(WorkRepositoryError::corrupt(
-                    "Work Goal CAS",
-                    std::io::Error::other(format!("owner-scoped CAS updated {affected} Work rows")),
-                ));
-            }
-        }
-
-        query(
-            "INSERT INTO work_goal_revisions
-             (owner_id, work_id, revision, goal_text, source_kind, source_ref,
-              accepted_by_kind, accepted_by_id, reason)
-             VALUES (?, ?, ?, ?, 'user_edit', ?, 'user', ?, ?)",
-        )
-        .bind(change.owner_id.as_str())
-        .bind(change.work_id.as_str())
-        .bind(next_goal_revision.get())
-        .bind(change.goal.as_str())
-        .bind(change.source_ref.as_str())
-        .bind(change.owner_id.as_str())
-        .bind(change.reason.as_ref().map(WorkChangeReason::as_str))
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| {
-            WorkRepositoryError::insert(
-                "insert Goal revision",
-                WorkConflictResource::GoalRevision,
-                source,
-            )
-        })?;
-
-        let event_result = super::events_repository::append_event(
-            &mut transaction,
-            &super::events::NewWorkEvent {
-                owner_id: change.owner_id.clone(),
-                work_id: change.work_id.clone(),
-                branch_id: None,
-                kind: super::WorkEventKind::GoalRevised,
-                work_revision: Some(next_work_revision),
-                goal_revision: Some(next_goal_revision),
-                criterion_set_revision: None,
-                branch_revision: None,
-                graph_revision: None,
-                source_ref: change.source_ref.clone(),
-            },
-        )
-        .await;
-        if let Err(error) = event_result {
-            return Err(rollback_transaction(
-                transaction,
-                "rollback Goal event transaction",
-                error,
-            )
-            .await);
-        }
-
-        let updated =
-            load_with_transaction(&mut transaction, &change.owner_id, &change.work_id).await?;
-        transaction.commit().await.map_err(|source| {
-            WorkRepositoryError::persistence("commit Goal revision transaction", source)
-        })?;
-        Ok(updated)
-    }
-
-    async fn accept_criteria(
-        &self,
-        change: WorkCriteriaChange,
-    ) -> Result<CreatedWork, WorkRepositoryError> {
-        let prepared = prepare_criteria_change(change)?;
-        let mut transaction = self.pool.get().begin().await.map_err(|source| {
-            WorkRepositoryError::persistence("begin criterion-set transaction", source)
-        })?;
-        let metadata = CriteriaAcceptanceMetadata {
-            definition_source_kind: "user_accepted",
-            definition_source_ref: &prepared.change.source_ref,
-            accepted_by_kind: "user",
-            accepted_by_id: prepared.change.owner_id.as_str(),
-            event_source_ref: &prepared.change.source_ref,
-            reason: prepared.change.reason.as_ref(),
-        };
-        let updated =
-            match apply_prepared_criteria_change(&mut transaction, &prepared, &metadata).await {
-                Ok(updated) => updated,
-                Err(error) => {
-                    return Err(rollback_transaction(
-                        transaction,
-                        "rollback criterion-set transaction",
-                        error,
-                    )
-                    .await);
-                }
-            };
-        transaction.commit().await.map_err(|source| {
-            WorkRepositoryError::persistence("commit criterion-set transaction", source)
-        })?;
-        Ok(updated)
-    }
-
     async fn adopt_branch_basis(
         &self,
         change: WorkBranchBasisChange,
     ) -> Result<WorkBranchRecord, WorkRepositoryError> {
         super::basis_repository::adopt_branch_basis(self, change).await
-    }
-
-    async fn replace_graph(
-        &self,
-        change: WorkGraphChange,
-    ) -> Result<WorkBranchRecord, WorkRepositoryError> {
-        super::graph_repository::replace_graph(self, change).await
     }
 
     async fn set_branch_subject(

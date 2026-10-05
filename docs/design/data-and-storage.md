@@ -38,7 +38,7 @@ published only after schema validation succeeds.
 
 ## Transcript persistence
 
-Fresh schema contract `2026-10-05-v95` stores transcript items and their
+Fresh schema contract `2026-10-05-v96` stores transcript items and their
 committed projection head. Physical page metadata and the unused source event
 position column are removed. The run lookup index is `(user_id, run_id)`.
 Model thinking observations use only the configuration-bound snapshot; obsolete
