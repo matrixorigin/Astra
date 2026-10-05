@@ -4,13 +4,12 @@ use astra_services::work::{
     AcceptanceDecisionId, AcceptanceGapReason, AcceptedCriterionGap, CheckCoverage,
     CheckEvidenceRef, CheckOutcome, CheckRunId, CheckVerifierKind, CriterionCommand,
     CriterionDefinition, CriterionId, CriterionRevision, CriterionRevisionRef,
-    CriterionSetMemberChange, CriterionSetRevision, CriterionStatement, DatabaseWorkRepository,
-    GoalRevision, GraphRevision, NewWorkAcceptanceDecision, NewWorkCheckRun, NewWorkCriterion,
-    NewWorkItem, ObservationScope, RevisionAlignment, WorkBranchBasisChange, WorkBranchId,
-    WorkBranchRevision, WorkBranchSubjectChange, WorkChangeReason, WorkChangeRef, WorkContentHash,
-    WorkCriteriaChange, WorkDeliveryStatus, WorkGenesis, WorkGoal, WorkGoalChange, WorkGraphChange,
-    WorkGraphItemChange, WorkId, WorkItemAttemptId, WorkItemEdge, WorkItemEdgeKind, WorkItemId,
-    WorkItemKind, WorkItemRevision, WorkItemRevisionRef, WorkItemText, WorkObservationQuery,
+    CriterionSetRevision, CriterionStatement, DatabaseWorkRepository, GoalRevision, GraphRevision,
+    NewWorkAcceptanceDecision, NewWorkCheckRun, NewWorkItem, ObservationScope, RevisionAlignment,
+    WorkBranchBasisChange, WorkBranchId, WorkBranchRevision, WorkBranchSubjectChange,
+    WorkChangeReason, WorkChangeRef, WorkContentHash, WorkDeliveryStatus, WorkGenesis, WorkId,
+    WorkItemAttemptId, WorkItemEdge, WorkItemEdgeKind, WorkItemId, WorkItemKind, WorkItemRevision,
+    WorkItemRevisionRef, WorkItemText, WorkObservationQuery,
     WorkObservationSatisfactionEvidenceRef, WorkOwnerId, WorkRepository, WorkRepositoryError,
     WorkRetentionState, WorkRevision, WorkSubjectRef,
 };
@@ -37,14 +36,14 @@ fn observation(owner_id: &str, work_id: &str) -> WorkObservationQuery {
     }
 }
 
-fn new_item(item_id: &str, kind: WorkItemKind) -> WorkGraphItemChange {
-    WorkGraphItemChange::New(NewWorkItem {
+fn new_item(item_id: &str, kind: WorkItemKind) -> NewWorkItem {
+    NewWorkItem {
         item_id: WorkItemId::parse(item_id).expect("item"),
         kind,
         objective: WorkItemText::parse(format!("Complete {item_id}")).expect("objective"),
         expected_result: WorkItemText::parse(format!("{item_id} is verified"))
             .expect("expected result"),
-    })
+    }
 }
 
 #[tokio::test]
@@ -63,14 +62,56 @@ async fn declared_work_observation_is_bounded_content_addressed_and_owner_scoped
         .await
         .expect("genesis");
 
-    let criterion_id = common::id("criterion");
-    repository
-        .accept_criteria(WorkCriteriaChange {
+    let plan = repository
+        .propose_plan(astra_services::work::NewWorkPlanProposal {
             owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
             work_id: WorkId::parse(&work_id).expect("work"),
+            branch_id: WorkBranchId::parse(&branch_id).expect("branch"),
+            expected_branch_revision: WorkBranchRevision::INITIAL,
+            expected_graph_revision: GraphRevision::INITIAL,
+            additions: vec![
+                new_item(&second_item, WorkItemKind::Task),
+                new_item(&first_item, WorkItemKind::Milestone),
+            ],
+            dependencies: vec![WorkItemEdge {
+                predecessor_item_id: WorkItemId::parse(&first_item).expect("predecessor"),
+                successor_item_id: WorkItemId::parse(&second_item).expect("successor"),
+                kind: WorkItemEdgeKind::Dependency,
+            }],
+            expected_work_revision: WorkRevision::INITIAL,
+            expected_goal_revision: GoalRevision::INITIAL,
+            expected_criteria_set_revision: CriterionSetRevision::INITIAL,
+            proposal_id: astra_services::work::WorkProposalId::parse(common::id("graph-proposal"))
+                .expect("proposal"),
+            source_kind: astra_services::work::WorkProposalSourceKind::Model,
+            revisions: Vec::new(),
+            dependency_removals: Vec::new(),
+            source_ref: WorkChangeRef::parse(common::id("graph-event")).expect("source"),
+            reason: WorkChangeReason::parse("Declared the first ready frontier.").expect("reason"),
+        })
+        .await
+        .expect("replace graph");
+
+    repository
+        .accept_plan_proposal(common::plan_acceptance(&plan, &common::id("accept-plan")))
+        .await
+        .expect("accept graph proposal");
+    let criterion_id = common::id("criterion");
+    let criteria = repository
+        .propose_criteria(astra_services::work::NewWorkCriteriaProposal {
+            owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
+            work_id: WorkId::parse(&work_id).expect("work"),
+            branch_id: WorkBranchId::parse(&branch_id).expect("branch"),
+            proposal_id: astra_services::work::WorkProposalId::parse(common::id(
+                "criteria-proposal",
+            ))
+            .expect("proposal"),
+            expected_goal_revision: GoalRevision::INITIAL,
+            expected_branch_revision: WorkBranchRevision::new(2).expect("branch r2"),
+            expected_graph_revision: GraphRevision::new(2).expect("graph r2"),
             expected_work_revision: WorkRevision::INITIAL,
             expected_criteria_set_revision: CriterionSetRevision::INITIAL,
-            members: vec![CriterionSetMemberChange::New(NewWorkCriterion {
+            members: vec![astra_services::work::WorkCriteriaProposalMember::New {
                 criterion_id: CriterionId::parse(criterion_id).expect("criterion"),
                 definition: CriterionDefinition::HumanReview {
                     statement: CriterionStatement::parse(
@@ -78,51 +119,19 @@ async fn declared_work_observation_is_bounded_content_addressed_and_owner_scoped
                     )
                     .expect("statement"),
                 },
-            })],
+            }],
             source_ref: WorkChangeRef::parse(common::id("criteria-event")).expect("source"),
-            reason: Some(WorkChangeReason::parse("Accepted the review boundary.").expect("reason")),
+            source_kind: astra_services::work::WorkProposalSourceKind::Model,
         })
         .await
         .expect("accept criteria");
     repository
-        .revise_goal(WorkGoalChange {
-            owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-            work_id: WorkId::parse(&work_id).expect("work"),
-            expected_work_revision: WorkRevision::new(2).expect("Work r2"),
-            expected_goal_revision: GoalRevision::INITIAL,
-            goal: WorkGoal::parse("Expose a bounded and verifiable declared-Work snapshot.")
-                .expect("goal"),
-            source_ref: WorkChangeRef::parse(common::id("goal-event")).expect("source"),
-            reason: Some(
-                WorkChangeReason::parse("Clarified the observable outcome.").expect("reason"),
-            ),
-        })
+        .accept_criteria_proposal(common::criteria_acceptance(
+            &criteria,
+            &common::id("accept-criteria"),
+        ))
         .await
-        .expect("revise goal");
-    repository
-        .replace_graph(WorkGraphChange {
-            owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-            work_id: WorkId::parse(&work_id).expect("work"),
-            branch_id: WorkBranchId::parse(&branch_id).expect("branch"),
-            expected_branch_revision: WorkBranchRevision::INITIAL,
-            expected_graph_revision: GraphRevision::INITIAL,
-            items: vec![
-                new_item(&second_item, WorkItemKind::Task),
-                new_item(&first_item, WorkItemKind::Milestone),
-            ],
-            edges: vec![WorkItemEdge {
-                predecessor_item_id: WorkItemId::parse(&first_item).expect("predecessor"),
-                successor_item_id: WorkItemId::parse(&second_item).expect("successor"),
-                kind: WorkItemEdgeKind::Dependency,
-            }],
-            source_ref: WorkChangeRef::parse(common::id("graph-event")).expect("source"),
-            reason: Some(
-                WorkChangeReason::parse("Declared the first ready frontier.").expect("reason"),
-            ),
-        })
-        .await
-        .expect("replace graph");
-
+        .expect("accept criterion proposal");
     let first = repository
         .observe_declared_work(observation(&owner_id, &work_id))
         .await
@@ -138,16 +147,16 @@ async fn declared_work_observation_is_bounded_content_addressed_and_owner_scoped
     assert_eq!(first.scope(), ObservationScope::DeclaredWork);
     assert_eq!(first.source_revisions().len(), 6);
     assert!(first.coverage_gaps().is_empty());
-    assert_eq!(first.overview().work_revision.get(), 3);
-    assert_eq!(first.overview().goal.revision.get(), 2);
+    assert_eq!(first.overview().work_revision.get(), 2);
+    assert_eq!(first.overview().goal.revision.get(), 1);
     assert_eq!(first.overview().criteria.revision.get(), 2);
     assert_eq!(first.overview().criteria.member_count, 1);
     assert_eq!(first.overview().graph.revision.get(), 2);
-    assert_eq!(first.overview().graph.item_count, 2);
+    assert_eq!(first.overview().graph.item_count, 3);
     assert_eq!(first.overview().graph.edge_count, 1);
     assert_eq!(
         first.overview().delivery_branch.goal_alignment,
-        RevisionAlignment::Behind
+        RevisionAlignment::Current
     );
     assert_eq!(
         first.overview().delivery_branch.criteria_alignment,
@@ -203,13 +212,21 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
         "an empty hard-criterion set must never become vacuously ready"
     );
 
-    repository
-        .accept_criteria(WorkCriteriaChange {
+    let criteria = repository
+        .propose_criteria(astra_services::work::NewWorkCriteriaProposal {
             owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
             work_id: WorkId::parse(&work_id).expect("work"),
+            branch_id: WorkBranchId::parse(&branch_id).expect("branch"),
+            proposal_id: astra_services::work::WorkProposalId::parse(common::id(
+                "criteria-proposal",
+            ))
+            .expect("proposal"),
+            expected_goal_revision: GoalRevision::INITIAL,
+            expected_branch_revision: WorkBranchRevision::INITIAL,
+            expected_graph_revision: GraphRevision::INITIAL,
             expected_work_revision: WorkRevision::INITIAL,
             expected_criteria_set_revision: CriterionSetRevision::INITIAL,
-            members: vec![CriterionSetMemberChange::New(NewWorkCriterion {
+            members: vec![astra_services::work::WorkCriteriaProposalMember::New {
                 criterion_id: CriterionId::parse(&criterion_id).expect("criterion"),
                 definition: CriterionDefinition::TestCheck {
                     statement: CriterionStatement::parse(
@@ -219,12 +236,19 @@ async fn delivery_is_ready_only_from_current_exact_evidence_or_acceptance() {
                     command: CriterionCommand::parse("verify exact delivery subject")
                         .expect("command"),
                 },
-            })],
+            }],
             source_ref: WorkChangeRef::parse(common::id("criteria-source")).expect("source"),
-            reason: None,
+            source_kind: astra_services::work::WorkProposalSourceKind::Model,
         })
         .await
         .expect("accept criterion");
+    repository
+        .accept_criteria_proposal(common::criteria_acceptance(
+            &criteria,
+            &common::id("accept-criteria"),
+        ))
+        .await
+        .expect("accept criterion proposal");
     let behind = repository
         .observe_declared_work(observation(&owner_id, &work_id))
         .await
