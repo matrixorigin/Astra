@@ -692,7 +692,6 @@ name = "astra-text-utils"
 version = "0.2.10"
 dependencies = [
  "regex",
- "serde",
  "serde_json",
  "sha2",
  "uuid",

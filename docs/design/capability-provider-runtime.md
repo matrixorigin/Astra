@@ -369,6 +369,11 @@ Three mechanisms are separate:
 | Semantic read-result cache | descriptor + canonical args + freshness context | Optionally reuse a fresh successful pure-read result |
 | Repetition/stall policy | sequence of distinct invocation IDs and observations | Detect likely model loops without collapsing user intent |
 
+Semantic near-duplicate detection emits guidance after observing the tool result.
+Its former source APIs for pre-execution blocking, context inventories and a
+private duplicate-audit buffer are retired. It does not authorize result reuse;
+actual invocation replay and journal/trace recording keep their canonical owners.
+
 Prompt caching is a fourth, unrelated optimization owned by prompt lifecycle.
 A prompt-cache key is never an invocation or semantic result-cache key.
 

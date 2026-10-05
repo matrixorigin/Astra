@@ -9,5 +9,4 @@ publish = false
 regex.workspace = true
 sha2.workspace = true
 uuid.workspace = true
-serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
