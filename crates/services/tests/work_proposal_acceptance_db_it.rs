@@ -2,11 +2,10 @@ mod common;
 
 use astra_services::work::{
     DatabaseWorkRepository, GoalRevision, GraphRevision, NewWorkItem, NewWorkPlanProposal,
-    WorkBranchId, WorkBranchRevision, WorkChangeRef, WorkContentHash, WorkGoal, WorkGoalChange,
-    WorkGraphChange, WorkGraphItemChange, WorkId, WorkItemDeclarationState, WorkItemEdge,
-    WorkItemEdgeKind, WorkItemId, WorkItemKind, WorkItemRevision, WorkItemRevisionChange,
-    WorkItemRevisionRef, WorkItemText, WorkOwnerId, WorkProposalId, WorkProposalSourceKind,
-    WorkProposalStatus, WorkRepository, WorkRepositoryError, WorkRevision,
+    WorkBranchId, WorkBranchRevision, WorkChangeRef, WorkContentHash, WorkId,
+    WorkItemDeclarationState, WorkItemEdge, WorkItemEdgeKind, WorkItemId, WorkItemKind,
+    WorkItemRevision, WorkItemRevisionChange, WorkItemText, WorkOwnerId, WorkProposalId,
+    WorkProposalSourceKind, WorkProposalStatus, WorkRepository, WorkRepositoryError, WorkRevision,
 };
 use sqlx::Row;
 
@@ -84,20 +83,26 @@ async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_id
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
         .expect("genesis");
-    let rooted = repository
-        .replace_graph(WorkGraphChange {
-            owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-            work_id: WorkId::parse(&work_id).expect("work"),
-            branch_id: WorkBranchId::parse(&branch_id).expect("branch"),
-            expected_branch_revision: WorkBranchRevision::INITIAL,
-            expected_graph_revision: GraphRevision::INITIAL,
-            items: vec![WorkGraphItemChange::New(item(&root_task))],
-            edges: Vec::new(),
-            source_ref: WorkChangeRef::parse(common::id("root-graph")).expect("source"),
-            reason: None,
-        })
+    let root_proposal = repository
+        .propose_plan(proposal(
+            &owner_id,
+            &work_id,
+            &branch_id,
+            &common::id("root-proposal"),
+            vec![item(&root_task)],
+            Vec::new(),
+        ))
         .await
-        .expect("materialize root task");
+        .expect("root proposal");
+    let rooted = repository
+        .accept_plan_proposal(common::plan_acceptance(
+            &root_proposal,
+            &common::id("accept-root"),
+        ))
+        .await
+        .expect("materialize root task")
+        .resolution
+        .expect("root resolution");
     let mut plan = proposal(
         &owner_id,
         &work_id,
@@ -109,8 +114,8 @@ async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_id
             dependency(&task_a, &task_b),
         ],
     );
-    plan.expected_branch_revision = rooted.parts().branch_revision;
-    plan.expected_graph_revision = rooted.parts().current_graph_revision;
+    plan.expected_branch_revision = rooted.result_branch_revision.expect("root branch");
+    plan.expected_graph_revision = rooted.result_graph_revision.expect("root graph");
     let proposed = repository.propose_plan(plan).await.expect("proposal");
     let command = common::plan_acceptance(&proposed, &common::id("root-action"));
     let mut wrong_hash = command.clone();
@@ -177,7 +182,7 @@ async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_id
     );
     assert_eq!(graph.try_get::<String, _>("actor_kind").unwrap(), "model");
     assert_eq!(graph.try_get::<String, _>("actor_id").unwrap(), proposal_id);
-    assert_eq!(graph.try_get::<i64, _>("item_count").unwrap(), 3);
+    assert_eq!(graph.try_get::<i64, _>("item_count").unwrap(), 4);
     assert_eq!(graph.try_get::<i64, _>("edge_count").unwrap(), 2);
     for (table, expected) in [
         ("work_items", 4_i64),
@@ -207,35 +212,29 @@ async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_id
         event_kinds,
         [
             "work_created",
+            "plan_proposed",
             "graph_replaced",
             "plan_proposed",
             "graph_replaced"
         ]
     );
 
+    let mut later = proposal(
+        &owner_id,
+        &work_id,
+        &branch_id,
+        &common::id("later-proposal"),
+        vec![item(&common::id("later-task"))],
+        Vec::new(),
+    );
+    later.expected_branch_revision = WorkBranchRevision::new(3).expect("branch r3");
+    later.expected_graph_revision = GraphRevision::new(3).expect("graph r3");
+    let later = repository
+        .propose_plan(later)
+        .await
+        .expect("later proposal");
     repository
-        .replace_graph(WorkGraphChange {
-            owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-            work_id: WorkId::parse(&work_id).expect("work"),
-            branch_id: WorkBranchId::parse(&branch_id).expect("branch"),
-            expected_branch_revision: WorkBranchRevision::new(3).expect("branch revision"),
-            expected_graph_revision: GraphRevision::new(3).expect("graph revision"),
-            items: [&root_task, &task_a, &task_b]
-                .into_iter()
-                .map(|item_id| {
-                    WorkGraphItemChange::Existing(WorkItemRevisionRef {
-                        item_id: WorkItemId::parse(item_id).expect("item"),
-                        revision: WorkItemRevision::INITIAL,
-                    })
-                })
-                .collect(),
-            edges: vec![
-                dependency(&root_task, &task_a),
-                dependency(&task_a, &task_b),
-            ],
-            source_ref: WorkChangeRef::parse(common::id("later-graph-change")).expect("source"),
-            reason: None,
-        })
+        .accept_plan_proposal(common::plan_acceptance(&later, &common::id("accept-later")))
         .await
         .expect("later branch advance");
     assert_eq!(
@@ -629,18 +628,39 @@ async fn stale_and_expired_acceptance_never_leave_graph_residue() {
         ))
         .await
         .expect("proposal");
-    repository
-        .revise_goal(WorkGoalChange {
-            owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-            work_id: WorkId::parse(&work_id).expect("work"),
+    let criteria = repository
+        .propose_criteria(astra_services::work::NewWorkCriteriaProposal {
+            owner_id: proposed.proposal.owner_id.clone(),
+            work_id: proposed.proposal.work_id.clone(),
+            branch_id: proposed.proposal.branch_id.clone(),
+            proposal_id: WorkProposalId::parse(common::id("criteria-proposal")).expect("proposal"),
             expected_work_revision: WorkRevision::INITIAL,
             expected_goal_revision: GoalRevision::INITIAL,
-            goal: WorkGoal::parse("A changed goal invalidates the proposed graph.").expect("goal"),
-            source_ref: WorkChangeRef::parse(common::id("goal-change")).expect("source"),
-            reason: None,
+            expected_criteria_set_revision: astra_services::work::CriterionSetRevision::INITIAL,
+            expected_branch_revision: WorkBranchRevision::INITIAL,
+            expected_graph_revision: GraphRevision::INITIAL,
+            members: vec![astra_services::work::WorkCriteriaProposalMember::New {
+                criterion_id: astra_services::work::CriterionId::parse(common::id("criterion"))
+                    .expect("criterion"),
+                definition: astra_services::work::CriterionDefinition::HumanReview {
+                    statement: astra_services::work::CriterionStatement::parse(
+                        "A reviewer accepts the result",
+                    )
+                    .expect("statement"),
+                },
+            }],
+            source_kind: WorkProposalSourceKind::Model,
+            source_ref: WorkChangeRef::parse(common::id("criteria-source")).expect("source"),
         })
         .await
-        .expect("revise goal");
+        .expect("criteria proposal");
+    repository
+        .accept_criteria_proposal(common::criteria_acceptance(
+            &criteria,
+            &common::id("accept-criteria"),
+        ))
+        .await
+        .expect("advance Work criteria basis");
     assert!(matches!(
         repository
             .accept_plan_proposal(common::plan_acceptance(
