@@ -214,7 +214,7 @@ impl ToolExecutionService {
         ToolExecutionServiceBuilder::default()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn new_for_test() -> Self {
         Self::builder().build()
     }
@@ -386,7 +386,7 @@ impl ToolExecutionService {
     }
 
     /// Check whether a tool is currently disabled.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) async fn is_tool_offer_disabled(&self, name: &str) -> bool {
         self.disabled_tool_offers.read().await.contains(name)
     }

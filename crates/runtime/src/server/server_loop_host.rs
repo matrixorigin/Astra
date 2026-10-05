@@ -34053,7 +34053,6 @@ mod tests {
                 ..Default::default()
             },
             model_used: "gpt-4".to_string(),
-            duration_ms: 500,
             finish_reason: Some("stop".to_string()),
             effective_finish_reason: None,
         };

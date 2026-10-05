@@ -877,8 +877,6 @@ pub(crate) struct LlmCallResult {
     /// zero-filled accounting buckets.
     pub usage_presence: crate::turn::token_usage::TokenUsagePresence,
     pub model_used: String,
-    #[allow(dead_code)] // validated in tests; reserved for future telemetry
-    pub duration_ms: u64,
     /// The finish_reason from the last SSE choice (e.g. "stop", "length", "tool_calls").
     /// `None` when the stream ended without an explicit finish_reason.
     pub finish_reason: Option<String>,
@@ -4663,7 +4661,7 @@ pub(crate) async fn call_llm_and_collect(
     call_llm_and_collect_with_stream_callback(call, cancel, None, None).await
 }
 
-#[allow(dead_code)] // retained as the unconstrained call boundary for non-server callers.
+/// Ordinary Server inference boundary with automatic tool choice.
 pub(crate) async fn call_llm_and_collect_with_stream_callback(
     call: LlmCall<'_>,
     cancel: LlmCancel<'_>,
@@ -6038,7 +6036,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             usage: usage.clone(),
             usage_presence: current_usage_presence(&usage_presence),
             model_used: model_name.to_string(),
-            duration_ms: started.elapsed().as_millis() as u64,
+
             finish_reason: finish_reason.clone(),
             effective_finish_reason: None,
         }
@@ -6549,7 +6547,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
         usage,
         usage_presence: current_usage_presence(&usage_presence),
         model_used: model_name.to_string(),
-        duration_ms: started.elapsed().as_millis() as u64,
+
         finish_reason,
         effective_finish_reason: None,
     })
@@ -6687,7 +6685,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
             usage: usage_tokens.to_qualified_json_map(reported_presence),
             usage_presence: reported_presence,
             model_used: model_name.to_string(),
-            duration_ms: started.elapsed().as_millis() as u64,
+
             finish_reason: finish_reason.clone(),
             effective_finish_reason: None,
         }
@@ -7157,7 +7155,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
         usage: usage_tokens.to_qualified_json_map(reported_presence),
         usage_presence: reported_presence,
         model_used: model_name.to_string(),
-        duration_ms: started.elapsed().as_millis() as u64,
+
         finish_reason,
         effective_finish_reason: None,
     })
@@ -7617,7 +7615,7 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         }
     };
     let mut result = if provider == "typesafe" {
-        match super::typesafe::response(&response_bytes, &body, started) {
+        match super::typesafe::response(&response_bytes, &body) {
             Ok(result) => result,
             Err(error) => {
                 finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
@@ -7629,7 +7627,6 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
             v.as_ref().expect("non-TypeSafe response was decoded"),
             provider,
             model_name,
-            started,
         )
     };
     if provider != "typesafe" {
@@ -7695,11 +7692,7 @@ fn map_bedrock_finish_reason(stop_reason: &str) -> String {
     }
 }
 
-fn parse_bedrock_nonstream_response(
-    v: &Value,
-    model_name: &str,
-    started: Instant,
-) -> LlmCallResult {
+fn parse_bedrock_nonstream_response(v: &Value, model_name: &str) -> LlmCallResult {
     let mut full_text = String::new();
     let mut reasoning = String::new();
     let mut reasoning_signature = String::new();
@@ -7770,7 +7763,7 @@ fn parse_bedrock_nonstream_response(
         usage,
         usage_presence,
         model_used: model_name.to_string(),
-        duration_ms: started.elapsed().as_millis() as u64,
+
         finish_reason: v
             .get("stopReason")
             .and_then(Value::as_str)
@@ -7779,11 +7772,7 @@ fn parse_bedrock_nonstream_response(
     }
 }
 
-fn parse_openai_compatible_nonstream_response(
-    v: &Value,
-    model_name: &str,
-    started: Instant,
-) -> LlmCallResult {
+fn parse_openai_compatible_nonstream_response(v: &Value, model_name: &str) -> LlmCallResult {
     let mut full_text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
@@ -7859,17 +7848,13 @@ fn parse_openai_compatible_nonstream_response(
         usage,
         usage_presence,
         model_used: model_name.to_string(),
-        duration_ms: started.elapsed().as_millis() as u64,
+
         finish_reason,
         effective_finish_reason: None,
     }
 }
 
-fn parse_anthropic_nonstream_response(
-    v: &Value,
-    model_name: &str,
-    started: Instant,
-) -> LlmCallResult {
+fn parse_anthropic_nonstream_response(v: &Value, model_name: &str) -> LlmCallResult {
     let mut full_text = String::new();
     let mut reasoning = String::new();
     // See `collect_anthropic_llm_stream` for the signature-echo contract.
@@ -7939,7 +7924,7 @@ fn parse_anthropic_nonstream_response(
         usage,
         usage_presence,
         model_used: model_name.to_string(),
-        duration_ms: started.elapsed().as_millis() as u64,
+
         finish_reason: v
             .get("stop_reason")
             .and_then(Value::as_str)
@@ -7952,17 +7937,12 @@ pub(crate) fn parse_nonstream_response_for_provider(
     v: &Value,
     provider: &str,
     model_name: &str,
-    started: Instant,
 ) -> LlmCallResult {
     match llm_provider_protocol(provider) {
-        LlmProviderProtocol::BedrockConverse => {
-            parse_bedrock_nonstream_response(v, model_name, started)
-        }
-        LlmProviderProtocol::AnthropicMessages => {
-            parse_anthropic_nonstream_response(v, model_name, started)
-        }
+        LlmProviderProtocol::BedrockConverse => parse_bedrock_nonstream_response(v, model_name),
+        LlmProviderProtocol::AnthropicMessages => parse_anthropic_nonstream_response(v, model_name),
         LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::TypeSafeSystemOne => {
-            parse_openai_compatible_nonstream_response(v, model_name, started)
+            parse_openai_compatible_nonstream_response(v, model_name)
         }
     }
 }
@@ -9615,7 +9595,6 @@ mod tests {
         let r = LlmCallResult::default();
         assert!(r.full_text.is_empty());
         assert!(r.tool_calls.is_empty());
-        assert_eq!(r.duration_ms, 0);
     }
 
     #[test]
@@ -9630,7 +9609,7 @@ mod tests {
             }],
             "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
         });
-        let r = parse_nonstream_response_for_provider(&v, "openai", "test-model", Instant::now());
+        let r = parse_nonstream_response_for_provider(&v, "openai", "test-model");
         assert_eq!(r.full_text, "hello");
         assert_eq!(r.reasoning, "think");
         assert_eq!(r.tool_calls.len(), 1);
@@ -9667,7 +9646,6 @@ mod tests {
             &v,
             "bedrock",
             "anthropic.claude-3-5-sonnet-v1:0",
-            Instant::now(),
         );
         assert_eq!(r.full_text, "hello");
         assert_eq!(r.reasoning, "think");
@@ -9713,7 +9691,6 @@ mod tests {
             &v,
             "bedrock",
             "anthropic.claude-sonnet-4-20250514-v1:0",
-            Instant::now(),
         );
         assert_eq!(
             r.usage.get("input_tokens").and_then(Value::as_u64),
@@ -17914,12 +17891,7 @@ mod tests {
                 "output_tokens": 5
             }
         });
-        let r = parse_nonstream_response_for_provider(
-            &v,
-            "anthropic",
-            "claude-sonnet-4-20250514",
-            Instant::now(),
-        );
+        let r = parse_nonstream_response_for_provider(&v, "anthropic", "claude-sonnet-4-20250514");
 
         assert_eq!(r.full_text, "hello");
         assert_eq!(r.finish_reason.as_deref(), Some("tool_use"));
@@ -17972,12 +17944,7 @@ mod tests {
             "stop_reason": "tool_use",
             "usage": {"input_tokens": 10, "output_tokens": 5}
         });
-        let r = parse_nonstream_response_for_provider(
-            &v,
-            "anthropic",
-            "claude-sonnet-4",
-            Instant::now(),
-        );
+        let r = parse_nonstream_response_for_provider(&v, "anthropic", "claude-sonnet-4");
         assert_eq!(r.reasoning, "let me check");
         assert_eq!(
             r.reasoning_signature, "sig_nonstream_abc",

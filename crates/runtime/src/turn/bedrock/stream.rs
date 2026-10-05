@@ -436,7 +436,7 @@ impl BedrockStreamAccumulator {
 
     /// Finalize into an [`LlmCallResult`]. Parses any in-flight tool-call
     /// JSON buffers and converts usage to the canonical key shape.
-    pub(crate) fn into_result(self, model_name: &str, duration_ms: u64) -> LlmCallResult {
+    pub(crate) fn into_result(self, model_name: &str) -> LlmCallResult {
         let tool_calls = self
             .tool_calls
             .into_values()
@@ -490,7 +490,6 @@ impl BedrockStreamAccumulator {
             usage: usage_map,
             usage_presence,
             model_used: model_name.to_string(),
-            duration_ms,
             finish_reason,
             effective_finish_reason: None,
         }
@@ -537,7 +536,7 @@ mod tests {
                 .unwrap();
             }
             assert!(acc.has_usage_metadata());
-            let result = acc.into_result("test-model", 0);
+            let result = acc.into_result("test-model");
             assert!(result.usage_presence.input_invalid);
             assert_eq!(
                 result.usage,
@@ -569,7 +568,7 @@ mod tests {
             acc.push_frame(&frame("event", "metadata", &payload))
                 .unwrap();
             assert!(acc.has_complete_terminal_facts());
-            let result = acc.into_result("test-model", 0);
+            let result = acc.into_result("test-model");
             assert!(result.usage.is_empty());
             assert!(!result.usage_presence.any());
             assert_eq!(result.finish_reason.as_deref(), Some("stop"));
@@ -608,7 +607,7 @@ mod tests {
                 assert_eq!(events, vec![BedrockStreamEvent::Usage(acc.usage.unwrap())]);
             }
             assert!(acc.has_usage_metadata());
-            let result = acc.into_result("test-model", 0);
+            let result = acc.into_result("test-model");
             assert_eq!(result.usage["input_tokens"], 0);
             assert_eq!(result.usage["cached_input_tokens"], 80);
             assert_eq!(result.usage["cache_creation_tokens"], 0);
@@ -681,7 +680,7 @@ mod tests {
         .unwrap();
 
         assert!(acc.has_usage_metadata());
-        let r = acc.into_result("claude", 42);
+        let r = acc.into_result("claude");
         assert_eq!(r.full_text, "Hello world");
         assert!(r.tool_calls.is_empty());
         assert_eq!(r.finish_reason.as_deref(), Some("stop"));
@@ -695,7 +694,6 @@ mod tests {
             terminal.usage_status,
             astra_services::InferenceUsageStatus::ProviderPartial
         );
-        assert_eq!(r.duration_ms, 42);
     }
 
     #[test]
@@ -710,7 +708,7 @@ mod tests {
         ))
         .unwrap();
 
-        let result = acc.into_result("claude", 0);
+        let result = acc.into_result("claude");
         assert_eq!(
             result.response_id.as_deref(),
             Some("bedrock-request-7"),
@@ -754,7 +752,7 @@ mod tests {
             evs,
             vec![BedrockStreamEvent::ReasoningDelta("thinking...".into())]
         );
-        let r = acc.into_result("claude", 0);
+        let r = acc.into_result("claude");
         assert_eq!(r.reasoning, "thinking...");
     }
 
@@ -768,7 +766,7 @@ mod tests {
             br#"{"contentBlockIndex":0,"delta":{"reasoningContent":{"reasoningText":{"text":"hm"}}}}"#,
         ))
         .unwrap();
-        let r = acc.into_result("claude", 0);
+        let r = acc.into_result("claude");
         assert_eq!(r.reasoning, "hm");
     }
 
@@ -792,7 +790,7 @@ mod tests {
             .unwrap();
         // Signature deltas produce no events (not forwarded to SSE).
         assert!(evs.is_empty());
-        let r = acc.into_result("claude", 0);
+        let r = acc.into_result("claude");
         assert_eq!(r.reasoning, "let me think");
         assert_eq!(r.reasoning_signature, "abc123sig");
     }
@@ -895,7 +893,7 @@ mod tests {
             br#"{"stopReason":"tool_use"}"#,
         ))
         .unwrap();
-        let r = acc.into_result("claude", 0);
+        let r = acc.into_result("claude");
         assert_eq!(r.finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.tool_calls[0]["id"], "tu-1");
@@ -944,7 +942,7 @@ mod tests {
             br#"{"usage":{"inputTokens":100,"outputTokens":20,"cacheReadInputTokens":800,"cacheWriteInputTokens":50,"totalTokens":970}}"#,
         ))
         .unwrap();
-        let r = acc.into_result("claude", 0);
+        let r = acc.into_result("claude");
         assert_eq!(r.usage["input_tokens"], 100);
         assert_eq!(r.usage["cached_input_tokens"], 800);
         assert_eq!(r.usage["cache_creation_tokens"], 50);
@@ -970,7 +968,7 @@ mod tests {
             }]
         );
         assert!(acc.has_exception());
-        let r = acc.into_result("claude", 0);
+        let r = acc.into_result("claude");
         assert_eq!(
             r.finish_reason.as_deref(),
             Some("exception:throttlingException")
@@ -1071,7 +1069,7 @@ mod tests {
             br#"{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"tu-clobber","name":"rm"}}}"#,
         ))
         .unwrap();
-        let r = acc.into_result("claude", 0);
+        let r = acc.into_result("claude");
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.tool_calls[0]["id"], "tu-first");
         assert_eq!(r.tool_calls[0]["function"]["name"], "bash");
@@ -1100,7 +1098,7 @@ mod tests {
             !acc.has_exception(),
             "messageStop must NOT flag as exception — metadata still follows"
         );
-        let r = acc.into_result("claude", 0);
+        let r = acc.into_result("claude");
         assert_eq!(r.finish_reason.as_deref(), Some("length"));
     }
 }

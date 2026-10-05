@@ -47,8 +47,6 @@ pub fn merge_tool_results_into_history(
     // Phase 1: Build index of assistant messages with tool_calls
     // This avoids repeated linear scans through history
     struct AssistantBlock {
-        #[allow(dead_code)] // Retained for debugging/future use
-        index: usize,
         tool_call_ids: Vec<String>,
         block_end: usize,
         // Map tool_call_id -> (follow_index, is_placeholder)
@@ -111,7 +109,6 @@ pub fn merge_tool_results_into_history(
         }
 
         assistant_blocks.push(AssistantBlock {
-            index: i,
             tool_call_ids,
             block_end,
             existing_tools,

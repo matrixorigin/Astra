@@ -148,19 +148,13 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
         .set_provider_response_id(bedrock_response_id(&response))
         .map_err(|error| BedrockStreamError::Transport {
             error: error.to_string(),
-            partial: accum
-                .clone()
-                .into_result(model_name, started.elapsed().as_millis() as u64),
+            partial: accum.clone().into_result(model_name),
         })?;
     let mut byte_stream = response.bytes_stream();
     let mut yield_state = StreamYieldState::new(TokioInstant::now());
     let mut delivered_tool_arguments = HashMap::<u64, String>::new();
     let provider_work_deadline = started + provider_work_budget;
-    let partial = |accum: &BedrockStreamAccumulator| {
-        accum
-            .clone()
-            .into_result(model_name, started.elapsed().as_millis() as u64)
-    };
+    let partial = |accum: &BedrockStreamAccumulator| accum.clone().into_result(model_name);
 
     'body: loop {
         if cancel.is_triggered() {
@@ -348,7 +342,7 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
         });
     }
 
-    Ok(accum.into_result(model_name, started.elapsed().as_millis() as u64))
+    Ok(accum.into_result(model_name))
 }
 
 #[cfg(test)]

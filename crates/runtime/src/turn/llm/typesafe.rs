@@ -8,7 +8,6 @@ use astra_turn_types::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::time::Instant;
 
 fn invalid(message: &'static str) -> ClassifiedError {
     ClassifiedError::new(ErrorKind::ContractViolation, message)
@@ -35,11 +34,7 @@ struct Response {
     usage: Option<Value>,
 }
 
-pub(super) fn response(
-    raw: &[u8],
-    request: &Value,
-    started: Instant,
-) -> Result<LlmCallResult, ClassifiedError> {
+pub(super) fn response(raw: &[u8], request: &Value) -> Result<LlmCallResult, ClassifiedError> {
     let value = parse_unique_judgment_json(raw)
         .map_err(|_| invalid("Malformed TypeSafe judgment response"))?;
     let response: Response = serde_json::from_value(value)
@@ -105,7 +100,7 @@ pub(super) fn response(
         model_used: response.model,
         usage_presence,
         usage,
-        duration_ms: started.elapsed().as_millis() as u64,
+
         finish_reason: Some("stop".into()),
         ..LlmCallResult::default()
     })
@@ -118,6 +113,7 @@ mod tests {
     use crate::memory_hooks::{DirectMemoryInferenceClient, MemoryInferencePort};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     fn scope() -> astra_turn_types::InferenceInvocationScope {
         astra_turn_types::InferenceInvocationScope::Session {
@@ -156,7 +152,7 @@ mod tests {
     }
 
     fn decode_response(value: &Value, request: &Value) -> Result<LlmCallResult, ClassifiedError> {
-        response(&serde_json::to_vec(value).unwrap(), request, Instant::now())
+        response(&serde_json::to_vec(value).unwrap(), request)
     }
 
     #[test]
@@ -277,7 +273,7 @@ mod tests {
         let req = request(&messages(), "jev-1.13.0").unwrap();
         let raw =
             br#"{"model":"jev-1.13.0","answers":{"0":{"type":"noul","noul":0.9,"noul":0.1}}}"#;
-        let error = response(raw, &req, Instant::now()).unwrap_err();
+        let error = response(raw, &req).unwrap_err();
         assert_eq!(error.kind, ErrorKind::ContractViolation);
     }
 
