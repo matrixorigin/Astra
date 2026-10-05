@@ -56,6 +56,10 @@ recorded in the event journal; its cursor remains embedded in the next heavy
 checkpoint. Standalone light files, their reader and pruning have been retired.
 The unused Step Protocol retry-policy APIs have also been retired. Provider retry
 and tool idempotency remain owned by their actual execution paths.
+Step scheduling retains the headless tool-round budget, checked between batches.
+Unused priority,
+per-tool timeout, backoff and retry-attempt fields have been retired; they did not
+control current execution. This changes source-level Step JSON, not heavy checkpoints.
 
 Checkpoint must include enough information to resume safely:
 
