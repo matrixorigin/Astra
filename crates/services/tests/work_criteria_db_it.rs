@@ -2,9 +2,8 @@ mod common;
 
 use astra_services::work::{
     CriterionCommand, CriterionDefinition, CriterionId, CriterionKind, CriterionRevision,
-    CriterionRevisionRef, CriterionSetMemberChange, CriterionSetRevision, CriterionStatement,
-    DatabaseWorkRepository, NewWorkCriterion, WorkChangeReason, WorkChangeRef, WorkCriteriaChange,
-    WorkGenesis, WorkId, WorkOwnerId, WorkRepository, WorkRepositoryError, WorkRevision,
+    CriterionSetRevision, CriterionStatement, DatabaseWorkRepository, WorkGenesis, WorkId,
+    WorkOwnerId, WorkRepository, WorkRepositoryError, WorkRevision,
 };
 use sqlx::Row;
 
@@ -12,14 +11,18 @@ fn genesis(owner_id: &str, work_id: &str) -> WorkGenesis {
     common::work_genesis(
         owner_id,
         work_id,
-        &common::id("branch"),
+        &format!("{work_id}-branch"),
         &common::id("session"),
         &common::id("intent"),
         "Implement and prove the acceptance contract.",
     )
 }
 
-fn new_criterion(id: &str, kind: CriterionKind, statement: &str) -> CriterionSetMemberChange {
+fn new_criterion(
+    id: &str,
+    kind: CriterionKind,
+    statement: &str,
+) -> astra_services::work::WorkCriteriaProposalMember {
     let statement = CriterionStatement::parse(statement).expect("statement");
     let definition = match kind {
         CriterionKind::CommandCheck => CriterionDefinition::CommandCheck {
@@ -33,25 +36,31 @@ fn new_criterion(id: &str, kind: CriterionKind, statement: &str) -> CriterionSet
         CriterionKind::HumanReview => CriterionDefinition::HumanReview { statement },
         unsupported => panic!("unsupported fixture criterion kind: {unsupported:?}"),
     };
-    CriterionSetMemberChange::New(NewWorkCriterion {
+    astra_services::work::WorkCriteriaProposalMember::New {
         criterion_id: CriterionId::parse(id).expect("criterion id"),
         definition,
-    })
+    }
 }
 
-fn criteria_change(
+fn proposal(
     owner_id: &str,
     work_id: &str,
-    members: Vec<CriterionSetMemberChange>,
-) -> WorkCriteriaChange {
-    WorkCriteriaChange {
+    members: Vec<astra_services::work::WorkCriteriaProposalMember>,
+) -> astra_services::work::NewWorkCriteriaProposal {
+    use astra_services::work::*;
+    NewWorkCriteriaProposal {
         owner_id: WorkOwnerId::parse(owner_id).expect("owner"),
         work_id: WorkId::parse(work_id).expect("work"),
+        branch_id: WorkBranchId::parse(format!("{work_id}-branch")).expect("branch"),
+        proposal_id: WorkProposalId::parse(common::id("proposal")).expect("proposal"),
         expected_work_revision: WorkRevision::INITIAL,
+        expected_goal_revision: GoalRevision::INITIAL,
         expected_criteria_set_revision: CriterionSetRevision::INITIAL,
+        expected_branch_revision: WorkBranchRevision::INITIAL,
+        expected_graph_revision: GraphRevision::INITIAL,
         members,
-        source_ref: WorkChangeRef::parse(common::id("event")).expect("source"),
-        reason: Some(WorkChangeReason::parse("User accepted Done when.").expect("reason")),
+        source_kind: WorkProposalSourceKind::Model,
+        source_ref: WorkChangeRef::parse(common::id("source")).expect("source"),
     }
 }
 
@@ -87,8 +96,8 @@ async fn accepted_criteria_are_immutable_canonical_and_leave_branch_basis_explic
         .await
         .expect("genesis");
 
-    let accepted = repository
-        .accept_criteria(criteria_change(
+    let recorded = repository
+        .propose_criteria(proposal(
             &owner_id,
             &work_id,
             vec![
@@ -105,7 +114,18 @@ async fn accepted_criteria_are_immutable_canonical_and_leave_branch_basis_explic
             ],
         ))
         .await
+        .expect("record criteria proposal");
+    repository
+        .accept_criteria_proposal(common::criteria_acceptance(
+            &recorded,
+            &common::id("accept"),
+        ))
+        .await
         .expect("accept criteria");
+    let accepted = repository
+        .load(&recorded.proposal.owner_id, &recorded.proposal.work_id)
+        .await
+        .expect("load accepted Work");
     assert_eq!(accepted.work.parts().work_revision.get(), 2);
     assert_eq!(accepted.work.parts().current_criteria_set_revision.get(), 2);
     assert_eq!(
@@ -209,37 +229,37 @@ async fn accepted_criteria_are_immutable_canonical_and_leave_branch_basis_explic
         }
     }
 
-    let cleared = repository
-        .accept_criteria(WorkCriteriaChange {
-            expected_work_revision: WorkRevision::new(2).expect("Work r2"),
-            expected_criteria_set_revision: CriterionSetRevision::new(2).expect("set r2"),
-            members: Vec::new(),
-            ..criteria_change(&owner_id, &work_id, Vec::new())
-        })
+    let mut empty = proposal(&owner_id, &work_id, Vec::new());
+    empty.expected_work_revision = WorkRevision::new(2).expect("Work r2");
+    empty.expected_criteria_set_revision = CriterionSetRevision::new(2).expect("set r2");
+    assert!(matches!(
+        repository.propose_criteria(empty).await,
+        Err(WorkRepositoryError::InvalidMutation { .. })
+    ));
+    let unchanged = repository
+        .load(&recorded.proposal.owner_id, &recorded.proposal.work_id)
         .await
-        .expect("accept explicit empty set");
-    assert_eq!(cleared.work.parts().work_revision.get(), 3);
-    assert_eq!(cleared.work.parts().current_criteria_set_revision.get(), 3);
-    let empty_manifest: String = sqlx::query(
-        "SELECT CAST(member_manifest_json AS CHAR) AS manifest_json
-         FROM work_criterion_sets WHERE owner_id = ? AND work_id = ? AND revision = 3",
-    )
-    .bind(&owner_id)
-    .bind(&work_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("empty set r3")
-    .try_get("manifest_json")
-    .expect("manifest");
-    let empty: serde_json::Value = serde_json::from_str(&empty_manifest).expect("empty manifest");
-    assert_eq!(empty["members"], serde_json::json!([]));
+        .expect("load after rejected empty proposal");
+    assert_eq!(unchanged, accepted);
+    assert_eq!(
+        count_work_rows(&pool, "work_criterion_sets", &owner_id, &work_id).await,
+        2
+    );
+    assert_eq!(
+        count_work_rows(&pool, "work_criterion_revisions", &owner_id, &work_id).await,
+        2
+    );
+    assert_eq!(
+        count_work_rows(&pool, "work_proposals", &owner_id, &work_id).await,
+        1
+    );
 
     common::cleanup_work_owner(&pool, &owner_id).await;
 }
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn invalid_or_missing_criterion_members_roll_back_the_work_cas() {
+async fn invalid_or_missing_criterion_proposals_leave_work_unchanged() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
     let owner_id = common::id("owner");
@@ -250,16 +270,12 @@ async fn invalid_or_missing_criterion_members_roll_back_the_work_cas() {
         .expect("genesis");
 
     let missing_id = CriterionId::parse(common::id("missing")).expect("missing id");
-    let missing_ref = CriterionRevisionRef {
-        criterion_id: missing_id.clone(),
-        revision: CriterionRevision::INITIAL,
-    };
     assert!(matches!(
         repository
-            .accept_criteria(criteria_change(
+            .propose_criteria(proposal(
                 &owner_id,
                 &work_id,
-                vec![CriterionSetMemberChange::Existing(missing_ref)],
+                vec![astra_services::work::WorkCriteriaProposalMember::Existing { criterion_id: missing_id.clone(), revision: CriterionRevision::INITIAL }],
             ))
             .await,
         Err(WorkRepositoryError::MissingCriterionRevisions { missing })
@@ -269,7 +285,7 @@ async fn invalid_or_missing_criterion_members_roll_back_the_work_cas() {
     let duplicate_id = common::id("duplicate");
     assert!(matches!(
         repository
-            .accept_criteria(criteria_change(
+            .propose_criteria(proposal(
                 &owner_id,
                 &work_id,
                 vec![
@@ -318,29 +334,39 @@ async fn concurrent_criterion_set_cas_has_one_complete_winner() {
         .await
         .expect("genesis");
 
-    let first = repository.clone();
-    let second = repository.clone();
-    let first_change = criteria_change(
-        &owner_id,
-        &work_id,
-        vec![new_criterion(
-            &common::id("criterion"),
-            CriterionKind::CommandCheck,
-            "The command succeeds.",
-        )],
-    );
-    let second_change = criteria_change(
-        &owner_id,
-        &work_id,
-        vec![new_criterion(
-            &common::id("criterion"),
-            CriterionKind::TestCheck,
-            "The second targeted test passes.",
-        )],
-    );
+    let first_proposal = repository
+        .propose_criteria(proposal(
+            &owner_id,
+            &work_id,
+            vec![new_criterion(
+                &common::id("criterion"),
+                CriterionKind::CommandCheck,
+                "The command succeeds.",
+            )],
+        ))
+        .await
+        .expect("first proposal");
+    let second_proposal = repository
+        .propose_criteria(proposal(
+            &owner_id,
+            &work_id,
+            vec![new_criterion(
+                &common::id("criterion"),
+                CriterionKind::TestCheck,
+                "The second targeted test passes.",
+            )],
+        ))
+        .await
+        .expect("second proposal");
     let (first_result, second_result) = tokio::join!(
-        first.accept_criteria(first_change),
-        second.accept_criteria(second_change)
+        repository.accept_criteria_proposal(common::criteria_acceptance(
+            &first_proposal,
+            &common::id("first-resolution")
+        )),
+        repository.accept_criteria_proposal(common::criteria_acceptance(
+            &second_proposal,
+            &common::id("second-resolution")
+        ))
     );
     let results = [first_result, second_result];
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
@@ -349,10 +375,44 @@ async fn concurrent_criterion_set_cas_has_one_complete_winner() {
             .iter()
             .filter(|result| matches!(
                 result,
-                Err(WorkRepositoryError::StaleCriteriaRevision { .. })
+                Err(WorkRepositoryError::InvalidWorkProposalBasis {
+                    resource: astra_services::work::WorkProposalBasisResource::WorkRevision
+                })
             ))
             .count(),
         1
+    );
+    let mut statuses = Vec::new();
+    for recorded in [&first_proposal, &second_proposal] {
+        let stored = repository
+            .load_criteria_proposal(
+                &recorded.proposal.owner_id,
+                &recorded.proposal.work_id,
+                &recorded.proposal.proposal_id,
+            )
+            .await
+            .expect("load raced proposal")
+            .expect("proposal remains discoverable");
+        assert_eq!(
+            stored.resolution.is_some(),
+            stored.status == astra_services::work::WorkProposalStatus::Accepted
+        );
+        statuses.push(stored.status);
+    }
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == astra_services::work::WorkProposalStatus::Accepted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == astra_services::work::WorkProposalStatus::Pending)
+            .count(),
+        1,
+        "the losing proposal remains pending without a resolution"
     );
     assert_eq!(
         count_work_rows(&pool, "work_criterion_sets", &owner_id, &work_id).await,
@@ -369,6 +429,25 @@ async fn concurrent_criterion_set_cas_has_one_complete_winner() {
         1,
         "losing criterion revisions must roll back"
     );
+
+    let loaded = repository
+        .load(
+            &first_proposal.proposal.owner_id,
+            &first_proposal.proposal.work_id,
+        )
+        .await
+        .expect("load winning Work");
+    assert_eq!(loaded.work.parts().work_revision.get(), 2);
+    assert_eq!(loaded.work.parts().current_criteria_set_revision.get(), 2);
+    let accepted_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_events WHERE owner_id = ? AND work_id = ? AND event_kind = 'criteria_accepted'",
+    )
+    .bind(&owner_id)
+    .bind(&work_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("accepted event count");
+    assert_eq!(accepted_events, 1);
 
     common::cleanup_work_owner(&pool, &owner_id).await;
 }
