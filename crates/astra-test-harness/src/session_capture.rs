@@ -1650,8 +1650,7 @@ pub const DEFAULT_MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Maximum events the loader will retain. Beyond this we evict
 /// from the head (oldest events) on each insert, so the newest
-/// events — where observability criteria (`[fork-cache]` lines,
-/// `ToolCallCompleted` near the end of the run) usually live —
+/// events, such as `ToolCallCompleted` near the end of the run,
 /// survive in the returned `SessionCapture` even for very long
 /// sessions.
 pub const DEFAULT_MAX_EVENTS: usize = 100_000;

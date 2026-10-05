@@ -2385,15 +2385,8 @@ pub struct SpawnRunConfig {
     pub live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     /// Client delivery lane inherited from the active parent run.
     pub client_tool_delivery_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
-    /// Captured parent prefix for prompt-cache inheritance. Present
-    /// only when the child spawn requested inherit_prefix AND the
-    /// resolver returned `Resolved`. Executors (CLI / server) that
-    /// implement fork-prefix consumption prepend
-    /// `inherited_prefix.prefix_messages` to the child's state.messages
-    /// and emit a `ForkCacheEvent` after the child's first response.
-    /// Executors that don't yet support it can ignore this field — the
-    /// child will simply run without cache inheritance (equivalent to
-    /// the PR 4 soft-fallback path).
+    /// Resolved parent prefix requested at admission. The child executor
+    /// owns consumption of these inputs.
     pub inherited_prefix: Option<InheritedChildPrefix>,
     /// UI/runtime execution binding metadata inherited from the parent run.
     pub execution_metadata: Option<serde_json::Value>,
@@ -2509,14 +2502,11 @@ pub enum SpawnRunCancellationDurability {
 /// needing to know about prefix storage internals.
 #[derive(Debug, Clone)]
 pub struct InheritedChildPrefix {
-    /// Cross-reference to the captured prefix. Forwarded into the
-    /// `ForkCacheEvent` the executor emits after the child's first
-    /// response, so telemetry can join back to the capture.
+    /// Identity of the captured parent prefix.
     pub prefix_id: String,
-    /// Parent run id (for the same join key).
+    /// Run that produced the prefix.
     pub parent_run_id: String,
-    /// Provider-scoped model id the prefix was captured against;
-    /// required for ForkCacheEvent payload.
+    /// Provider identity captured with the prefix.
     pub provider: astra_turn_core::fork_prefix::ProviderKind,
     /// Captured thinking metadata from the parent prefix. Executors use this to
     /// keep replay normalization active even when the child model selector does
@@ -2536,13 +2526,6 @@ pub struct InheritedChildPrefix {
     /// schemas (e.g., older captures, or capture happened before
     /// tool_schema hashing was wired).
     pub frozen_tool_schemas: Option<Vec<serde_json::Value>>,
-    /// Estimated cache-eligible tokens from the parent's perspective.
-    /// Used as the `expected_cache_read_tokens` baseline when the
-    /// executor evaluates the child's first response for a
-    /// `ForkCacheEvent`. Zero is a valid sentinel for "no estimate
-    /// available" — the evaluator handles it via the degenerate
-    /// branch in `evaluate_fork_cache`.
-    pub expected_cache_read_tokens: u64,
 }
 
 impl std::fmt::Debug for SpawnRunConfig {
@@ -10717,26 +10700,10 @@ pub(crate) fn build_inherited_child_prefix(
                 thinking: prefix.thinking.clone(),
                 prefix_messages: r.messages,
                 frozen_tool_schemas: frozen_tools,
-                expected_cache_read_tokens: estimate_cache_read_tokens(prefix),
             })
         }
         Err(_) => None,
     }
-}
-
-fn estimate_cache_read_tokens(prefix: &astra_turn_core::fork_prefix::ForkPrefix) -> u64 {
-    fn bytes_to_tokens(bytes: usize) -> u64 {
-        // Conservative, provider-neutral approximation: four bytes per
-        // token, rounded up. The probe only needs a nonzero baseline
-        // good enough to distinguish full misses from useful reuse.
-        u64::try_from(bytes.div_ceil(4)).unwrap_or(u64::MAX)
-    }
-
-    // `size_bytes()` is already the canonical serialized prefix region
-    // (system + tools + messages). Re-adding system/tool payload sizes
-    // would double-count those bytes and systematically understate the
-    // observed/expected cache-hit ratio in telemetry.
-    bytes_to_tokens(prefix.size_bytes()).max(1)
 }
 
 /// Build permission summary from spawn context.
@@ -24848,49 +24815,5 @@ pub(crate) mod tests {
             .publish_fanout_fixture("new-local", "new", 1, None, "new-local-parent", None)
             .await
             .expect("terminal workspace history must not block live groups");
-    }
-
-    #[tokio::test]
-    async fn inherited_prefix_expected_cache_read_tokens_uses_nonzero_estimate() {
-        let store: Arc<dyn PrefixCaptureSink> = Arc::new(InMemoryPrefixStore::new());
-        let exec = Arc::new(CapturingPrefixExecutor::new());
-        let spawner = DynamicAgentSpawner::new(mock_router())
-            .with_prefix_store(store.clone())
-            .with_executor(exec.clone() as Arc<dyn SpawnAgentExecutor>);
-        capture_parent_for(&*store, "run-parent-estimate", TEST_CHILD_MODEL);
-
-        let input = child_with_inherit(false);
-        let SpawnAgentOutput::Launched { agent_id, .. } = spawner
-            .spawn(input, &parent_context("run-parent-estimate"))
-            .await
-            .unwrap();
-        assert!(
-            spawner
-                .wait_for_agent(&agent_id, Duration::from_secs(2))
-                .await
-                .is_some()
-        );
-
-        let inherited = exec.take_captured().unwrap().unwrap();
-        assert!(
-            inherited.expected_cache_read_tokens > 0,
-            "resolved fork children need a nonzero expected cache-read baseline"
-        );
-    }
-
-    #[test]
-    fn inherited_prefix_expected_cache_read_tokens_matches_canonical_prefix_size() {
-        let store = InMemoryPrefixStore::new();
-        capture_parent_for(&store, "run-parent-estimate-shape", TEST_CHILD_MODEL);
-        let prefix = store
-            .get_prefix("run-parent-estimate-shape")
-            .expect("capture must have persisted");
-
-        let expected = u64::try_from(prefix.size_bytes().div_ceil(4)).unwrap_or(u64::MAX);
-        assert_eq!(
-            estimate_cache_read_tokens(&prefix),
-            expected,
-            "cache-read estimate should be derived from the canonical serialized prefix once"
-        );
     }
 }

@@ -1468,17 +1468,17 @@ steps:
         let path = dir.path().join("c.yaml");
         std::fs::write(
             &path,
-            "name: c\nprompt: p\ncriteria:\n  - type: fork_cache_class\n    expect: [hit]\n",
+            "name: c\nprompt: p\ncriteria:\n  - type: fork_cache_outcome\n    expect: [hit]\n",
         )
         .unwrap();
-        let err = Case::from_path(&path).expect_err("old type name must fail");
+        let err = Case::from_path(&path).expect_err("retired criterion must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("unknown variant"),
             "serde's well-shaped error is preserved: {msg}"
         );
         assert!(
-            msg.contains("fork_cache_class"),
+            msg.contains("fork_cache_outcome"),
             "offending name must appear: {msg}"
         );
         assert!(

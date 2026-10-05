@@ -21,7 +21,6 @@
 //!   extensions. Still NOT wired into the live spawner.
 //! - PR 4.5: spawner calls the resolver; reconstructor consumes
 //!   canonical bytes when assembling the child's first request.
-//! - PR 5: `ForkCacheEvent` telemetry on child's first response.
 //!
 //! ## Why Fallback vs Failed is the caller's choice
 //!

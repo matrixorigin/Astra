@@ -763,3 +763,9 @@ must satisfy one suite:
   lifecycle and safety semantics.
 - No compatibility constraint from a current provider upgrade path may define
   Astra's canonical internal model.
+
+The first-child fork-cache estimate telemetry prototype is retired: its sink
+configuration, event/probe APIs and stderr criterion were never connected to
+production execution. Prefix capture and required-prefix admission remain.
+Provider cache facts continue to come from canonical request usage, trace and
+Explain; child admission and result adoption do not prove a provider cache hit.

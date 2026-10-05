@@ -103,7 +103,7 @@ pub enum Criterion {
     ToolsCountBetween { min: u32, max: u32 },
 
     /// Regex match against the run's stderr. Intended for
-    /// observability checks — `^\[fork-cache\]` / `^\[audit\]`.
+    /// observability checks — `^\[diagnostic\]` / `^\[audit\]`.
     /// The regex is compiled per-evaluation; test stays
     /// robust across Rust regex version bumps.
     StderrMatches { pattern: String },
@@ -377,29 +377,6 @@ pub enum Criterion {
         /// order or model prose.
         #[serde(default)]
         min_turns_after_producer: Option<u32>,
-    },
-
-    /// Passes when at least one `[fork-cache]` JSON event in stderr
-    /// has its `outcome` field in `expect`. Pins the exact runtime
-    /// contract (see `ForkCacheEvent` in astra-turn-core) — outcomes
-    /// are one of `hit`, `partial_drift`, `miss`, `exceeded_expected`.
-    ///
-    /// Example:
-    /// ```yaml
-    /// - type: fork_cache_outcome
-    ///   expect: [hit]
-    /// ```
-    ///
-    /// Accepted field aliases: `outcome` (current wire name) and
-    /// `class` (earlier harness-facing name; deprecated, still read so
-    /// existing YAML doesn't silently break).
-    ForkCacheOutcome {
-        /// Accepted outcome names (snake_case — `hit`, `partial_drift`,
-        /// `miss`, `exceeded_expected`, plus any future variant added
-        /// to `astra_turn_core::fork_cache_event::ForkCacheOutcome`).
-        /// A stderr event whose `outcome` equals any of these passes.
-        #[serde(default)]
-        expect: Vec<String>,
     },
 
     /// LLM judger — calls a scoring model with the prompt +
@@ -758,7 +735,6 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::JournalWorkItemExecutionFromStart { .. }
         | Criterion::JournalWorkReplacementLifecycle { .. }
         | Criterion::JournalWorkGraphPatch { .. }
-        | Criterion::ForkCacheOutcome { .. }
         | Criterion::HardJudger { .. }
         | Criterion::JournalTurnEvaluationSignalCount { .. }
         | Criterion::JournalTurnEvaluationSuccess { .. }
@@ -1856,7 +1832,7 @@ fn evaluate_one_with_primary_cache(
         Criterion::StderrMatches { pattern } => {
             // Multi-line mode so `^` / `$` anchor at line boundaries —
             // stderr is almost always a log stream, and users write
-            // patterns like `^\[fork-cache\]` expecting per-line match.
+            // patterns like `^\[diagnostic\]` expecting per-line match.
             match Regex::new(&format!("(?m){pattern}")) {
                 Ok(re) => {
                     let hit = re.is_match(&outcome.stderr);
@@ -3704,26 +3680,6 @@ fn evaluate_one_with_primary_cache(
                 score: None,
             }
         }
-        Criterion::ForkCacheOutcome { expect } => {
-            let hits = parse_fork_cache_outcomes(&outcome.stderr);
-            let pass = hits.iter().any(|c| expect.iter().any(|e| e == c));
-            CriterionResult {
-                criterion: c.clone(),
-                severity: criterion_severity(c),
-                passed: pass,
-                detail: if pass {
-                    format!(
-                        "fork-cache event with outcome in {expect:?} observed (all seen: {hits:?})"
-                    )
-                } else if hits.is_empty() {
-                    "no [fork-cache] events observed in stderr".to_string()
-                } else {
-                    format!("no [fork-cache] event matched {expect:?}; seen outcomes: {hits:?}")
-                },
-                full_detail: None,
-                score: None,
-            }
-        }
         Criterion::Judger { .. } | Criterion::HardJudger { .. } => CriterionResult {
             criterion: c.clone(),
             severity: criterion_severity(c),
@@ -4443,41 +4399,6 @@ fn evaluate_prompt_cache_reuse_scope(
     }
 }
 
-/// Scan stderr for `[fork-cache] {...}` JSON lines and return the
-/// `outcome` field from each. Silently skips malformed lines and
-/// lines where the outcome can't be found — a single corrupt event
-/// should not hide the valid ones.
-///
-/// Field precedence: `outcome` (current wire name as serialized by
-/// `astra_turn_core::fork_cache_event::ForkCacheEvent`) then `class`
-/// (earlier harness-facing name; kept for YAML backward-compat). No
-/// positional / first-key fallback — that was a schema-churn footgun
-/// that would misclassify a re-tagged event.
-fn parse_fork_cache_outcomes(stderr: &str) -> Vec<String> {
-    let mut outcomes = Vec::new();
-    for line in stderr.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("[fork-cache]") else {
-            continue;
-        };
-        let rest = rest.trim_start();
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) else {
-            continue;
-        };
-        // Only accept the two named fields. Unknown shapes are
-        // skipped entirely — loud missing-outcome surface is
-        // preferable to a silent misclassification.
-        let name = v
-            .get("outcome")
-            .and_then(|c| c.as_str())
-            .or_else(|| v.get("class").and_then(|c| c.as_str()));
-        if let Some(s) = name {
-            outcomes.push(s.to_string());
-        }
-    }
-    outcomes
-}
-
 /// Reject a criterion whose bounds are internally inconsistent —
 /// typos in YAML (`min: 5, max: 2`, `threshold: 2.0`, empty expect
 /// list) otherwise turn into permanent-FAIL or permanent-PASS cases
@@ -4988,15 +4909,6 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             } else {
                 Ok(())
             }
-        }
-        Criterion::ForkCacheOutcome { expect } => {
-            if expect.is_empty() {
-                return Err(
-                    "ForkCacheOutcome.expect must not be empty (no outcome would ever match)"
-                        .into(),
-                );
-            }
-            Ok(())
         }
         Criterion::StderrMatches { pattern } => {
             // Compile-check the regex at load so a bad pattern fails
@@ -5593,10 +5505,10 @@ mod tests {
     #[test]
     fn stderr_matches_uses_regex() {
         let mut out = outcome_with_tools(&[]);
-        out.stderr = "some noise\n[fork-cache] {...}\nmore noise".into();
+        out.stderr = "some noise\n[diagnostic] {...}\nmore noise".into();
         let r = evaluate_deterministic(
             &[Criterion::StderrMatches {
-                pattern: r"^\[fork-cache\]".into(),
+                pattern: r"^\[diagnostic\]".into(),
             }],
             &out,
         );
@@ -9494,13 +9406,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_fork_cache_outcome_rejects_empty_expect() {
-        let err = validate_criterion(&Criterion::ForkCacheOutcome { expect: vec![] })
-            .expect_err("empty expect should fail");
-        assert!(err.contains("must not be empty"));
-    }
-
-    #[test]
     fn validate_stderr_matches_rejects_bad_regex() {
         let err = validate_criterion(&Criterion::StderrMatches {
             pattern: "(".into(),
@@ -9632,124 +9537,6 @@ mod tests {
         let err = validate_criteria(&criteria).expect_err("second criterion is bad");
         assert!(err.contains("criteria[2]"), "1-based index expected: {err}");
         assert!(err.contains("min (5) > max (2)"));
-    }
-
-    // ── ForkCacheOutcome tests ──
-
-    fn outcome_with_stderr(stderr: &str) -> RunOutcome {
-        let mut out = outcome_with_tools(&[]);
-        out.stderr = stderr.to_string();
-        out
-    }
-
-    #[test]
-    fn fork_cache_outcome_passes_on_real_wire_shape() {
-        // Real wire shape emitted by
-        // `astra_turn_core::fork_cache_event::StderrForkCacheSink`.
-        // The field is `outcome`, rename_all = snake_case.
-        let out = outcome_with_stderr(
-            "[fork-cache] {\"prefix_id\":\"pfx-1\",\"outcome\":\"hit\",\"ratio\":0.9}",
-        );
-        let r = evaluate_deterministic(
-            &[Criterion::ForkCacheOutcome {
-                expect: vec!["hit".into()],
-            }],
-            &out,
-        );
-        assert!(r[0].passed);
-    }
-
-    #[test]
-    fn fork_cache_outcome_accepts_legacy_class_alias() {
-        // Back-compat: older harness tooling + a brief YAML window
-        // used `class` as the field name. The parser still accepts
-        // it so a rename on the consumer side doesn't silently
-        // break cases that predate the rename.
-        let out = outcome_with_stderr("[fork-cache] {\"class\":\"hit\"}");
-        let r = evaluate_deterministic(
-            &[Criterion::ForkCacheOutcome {
-                expect: vec!["hit".into()],
-            }],
-            &out,
-        );
-        assert!(r[0].passed);
-    }
-
-    #[test]
-    fn fork_cache_outcome_rejects_unknown_shape_instead_of_guessing() {
-        // Regression: the previous implementation fell back to "first
-        // object key" for events it couldn't parse, which silently
-        // misclassified `{"metadata":{...}}` or similar as a valid
-        // class. Now: unknown shapes produce NO outcome, and the
-        // criterion reports zero events seen rather than guessing.
-        let out = outcome_with_stderr("[fork-cache] {\"prefix_id\":\"x\",\"metadata\":{}}");
-        let r = evaluate_deterministic(
-            &[Criterion::ForkCacheOutcome {
-                expect: vec!["hit".into(), "partial_drift".into()],
-            }],
-            &out,
-        );
-        assert!(!r[0].passed);
-        assert!(
-            r[0].detail.contains("no [fork-cache]"),
-            "unknown-shape events must not be fabricated into outcomes; detail = {:?}",
-            r[0].detail
-        );
-    }
-
-    #[test]
-    fn fork_cache_outcome_fails_when_only_other_outcomes_seen() {
-        let out = outcome_with_stderr("[fork-cache] {\"outcome\":\"miss\"}");
-        let r = evaluate_deterministic(
-            &[Criterion::ForkCacheOutcome {
-                expect: vec!["hit".into()],
-            }],
-            &out,
-        );
-        assert!(!r[0].passed);
-        assert!(r[0].detail.contains("miss"));
-    }
-
-    #[test]
-    fn fork_cache_outcome_fails_when_no_events_seen() {
-        let out = outcome_with_stderr("unrelated noise");
-        let r = evaluate_deterministic(
-            &[Criterion::ForkCacheOutcome {
-                expect: vec!["hit".into()],
-            }],
-            &out,
-        );
-        assert!(!r[0].passed);
-        assert!(r[0].detail.contains("no [fork-cache]"));
-    }
-
-    #[test]
-    fn fork_cache_outcome_ignores_malformed_event_and_uses_good_ones() {
-        let out = outcome_with_stderr(
-            "[fork-cache] this is not json\n[fork-cache] {\"outcome\":\"hit\"}\n",
-        );
-        let r = evaluate_deterministic(
-            &[Criterion::ForkCacheOutcome {
-                expect: vec!["hit".into()],
-            }],
-            &out,
-        );
-        assert!(
-            r[0].passed,
-            "one malformed event must not mask a later valid hit"
-        );
-    }
-
-    #[test]
-    fn fork_cache_outcome_accepts_any_of_multiple_expected_values() {
-        let out = outcome_with_stderr("[fork-cache] {\"outcome\":\"partial_drift\"}");
-        let r = evaluate_deterministic(
-            &[Criterion::ForkCacheOutcome {
-                expect: vec!["hit".into(), "partial_drift".into()],
-            }],
-            &out,
-        );
-        assert!(r[0].passed);
     }
 
     #[test]

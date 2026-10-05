@@ -239,7 +239,7 @@ pub(crate) async fn stream_chat_sse(
     //   2. AgentActionContext.run_id (so the spawner's resolver looks
     //      up the same key)
     // Pre-fix these were different ("ephemeral" vs None), so the
-    // parent capture never happened and fork-cache probes were dead.
+    // parent capture would be skipped.
     let parent_turn_run_id = p
         .stream_json_emitter
         .as_ref()

@@ -14,7 +14,6 @@
 //!   child suffix. Downstream provider adapters (astra's
 //!   `chat_turn_base_payload` in particular) use the result as the
 //!   `messages` field of the child's first request.
-//! - PR 5c: `ForkCacheEvent` telemetry on child's first response.
 //!
 //! ## Why this lives in turn-core
 //!

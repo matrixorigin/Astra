@@ -77,7 +77,6 @@ fn is_deterministic_product_oracle(criterion: &Criterion) -> bool {
         | Criterion::JournalArtifactConsumed { .. }
         | Criterion::JournalToolValueFlow { .. }
         | Criterion::JournalToolValueFlowBound { .. }
-        | Criterion::ForkCacheOutcome { .. }
         | Criterion::ToolSequence { .. }
         | Criterion::JournalToolSequence { .. }
         | Criterion::JournalToolPrecedence { .. }

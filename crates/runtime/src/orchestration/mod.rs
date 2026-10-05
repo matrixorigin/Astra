@@ -6,7 +6,6 @@
 mod agent_result_status;
 pub mod agent_tool;
 pub mod agent_trace_status;
-mod fork_cache_probe;
 pub(crate) mod spawner;
 
 pub use agent_result_status::{
@@ -38,7 +37,6 @@ pub use astra_turn_core::orchestration_types::CancellationOrigin;
 pub mod permission_sync {
     pub use astra_turn_core::permission::sync::*;
 }
-pub use fork_cache_probe::{ForkCacheProbeState, maybe_emit_fork_cache_probe};
 pub use permission_sync::{
     ChildPermissionMode, InheritedPermissions, PermissionAction, PermissionCallback,
     PermissionDecision, PermissionMode, PermissionRequest, PermissionRequestHandler,

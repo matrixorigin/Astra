@@ -78,8 +78,6 @@ happened.
 
 | Round | Pitfall | What it looked like |
 |------|---------|---------------------|
-| R2 | `ForkCacheEvent` field `outcome`, not `class` | Criterion read `class`; every real event had `outcome`. Silent zero matches. |
-| R3 | `fork_cache_outcome: [hit]` on a case that SHOULDN'T emit an event | Criterion FAILed the "no event" success path; judger was gated on the FAIL so it never ran. |
 | R4 | `tool_invocation` doesn't exist; tool calls nest in `llm_round.tool_calls[]` | Criterion returned empty on every real session. Two shipped cases failed every run. |
 | R4 | Loader returned early on legacy file; step_events dead | `ToolCallCompleted` unmatchable on any session that also had legacy output (all of them). |
 

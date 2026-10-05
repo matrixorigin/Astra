@@ -52,7 +52,6 @@
 //! - Capture from a live turn (that's PR 3).
 //! - Store prefixes keyed by run_id (that's PR 2).
 //! - Reconstruct wire requests in a provider adapter (that's PR 4+).
-//! - Emit `ForkCacheEvent` telemetry (that's PR 5).
 
 use std::sync::Arc;
 
@@ -252,8 +251,7 @@ pub struct SystemBlock {
 /// rather than vaguely "tools changed".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSchemaEntry {
-    /// Tool name as the provider sees it. Used for attribution in
-    /// `ForkCacheEvent::drift`.
+    /// Tool name as the provider sees it.
     pub name: String,
     /// Canonical serialized schema bytes.
     pub canonical_bytes: Vec<u8>,
@@ -319,9 +317,7 @@ pub const PREFIX_SOFT_CAP_BYTES: usize = 2 * 1024 * 1024;
 /// cheaply even when callers clone the outer `ForkPrefix` by value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForkPrefix {
-    /// Unique id for this captured prefix. Enables diagnostics to
-    /// cross-reference a `ForkCacheEvent` back to the capture that
-    /// produced it.
+    /// Unique id for this captured prefix.
     pub prefix_id: String,
     /// Wall-clock seconds since UNIX epoch at capture time. Used for
     /// soft-TTL eviction (PR 2) and stale-prefix detection.
@@ -587,8 +583,7 @@ pub fn hash_tool_schema(value: &serde_json::Value) -> (Vec<u8>, ContentHash) {
 /// same helper when populating [`crate::fork_capture::CaptureRequest`].
 ///
 /// Nameless schemas are dropped: a schema with no detectable name
-/// cannot be attributed in `ForkCacheEvent::drift`, so inventing a
-/// placeholder would produce a misleading telemetry event. The order
+/// cannot identify a tool, so no placeholder is invented. The order
 /// of returned entries preserves input order.
 pub fn build_tool_schema_entries(schemas: &[serde_json::Value]) -> Vec<ToolSchemaEntry> {
     schemas
@@ -1313,7 +1308,7 @@ mod tests {
     fn build_tool_schema_entries_is_key_order_independent() {
         // Critical: cache identity depends on canonical_bytes being
         // stable across key reorderings. If this test ever fails,
-        // `fork-cache` events stop attributing correctly.
+        // prefix diagnostics lose tool identity.
         let a = serde_json::json!({
             "function": {"name": "X", "parameters": {"a": 1, "b": 2}}
         });

@@ -294,7 +294,6 @@ focus without duplicating the whole scripted journey.
 | `text_json_array_count { path, min, max }`          | selected JSON array length is within the inclusive range      | envelope |
 | `text_json_path_absent { path }`                    | selected JSON pointer is absent (`null` is still present)      | envelope |
 | `text_json_dag { nodes_path, node_id_path, node_required_string_paths?, edges_path, predecessor_path, successor_path }` | required node strings are non-empty, endpoints are unique/resolved, and the graph is acyclic | envelope |
-| `fork_cache_outcome { expect }`                     | `[fork-cache]` event `outcome` ∈ `expect`                    | stderr      |
 | `session_event_count { event_type, min, max?, optional }` | session-capture event count is within bounds; JSON predicates can link a step event's `run_id` to another event such as its `agent_spawned` record | journal + step events |
 | `session_child_result_adopted { expected_result, spawn_match? }` | exact completed child result is adopted before its parent's finalization; optional `{ path, equals }` predicate binds that same child's spawn to a model or slot | journal + trace events |
 | `journal_tool_called { name, optional }`            | tool name appears in journal `tool_calls`                    | journal     |
@@ -394,9 +393,8 @@ correctly do X?"). Key features:
   fenced ` ```data ` blocks with an explicit preamble calling out
   untrusted data. A fabricated `SCORE:` line in an agent's output
   can't hijack the judge's output.
-- **Sees stderr**: the `[fork-cache]` / `[selector]` observability
-  events are embedded (head+tail truncated to 8k chars) so the
-  judger can read them.
+- **Sees stderr**: captured diagnostics are embedded with head+tail
+  truncation to 8k chars so the judger can read them.
 - **Sees durable tool receipts**: when a session is captured, bounded complete
   call arguments/results are projected from the journal into the judger's
   untrusted-data section. The durable journal remains the source of truth.

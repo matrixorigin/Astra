@@ -52,13 +52,6 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub safety: SafetyConfig,
 
-    /// Fork-prefix cache telemetry configuration.
-    ///
-    /// Parent-prefix capture and eligible child inheritance are always on.
-    /// This section controls only telemetry emission.
-    #[serde(default)]
-    pub fork_prefix: ForkPrefixConfig,
-
     /// Tool surface configuration — which tools are pinned into the
     /// LLM `tools[]` array vs. exposed through the deferred
     /// system-reminder listing. See [`ToolSurfaceConfig`].
@@ -283,39 +276,6 @@ impl RuntimeLimitsConfig {
     }
 }
 
-// ─── Fork-Prefix Configuration ───────────────────────────────────────────────
-
-/// Telemetry sink selection for fork-cache events.
-///
-/// Serialized as lowercase strings in TOML so config files stay
-/// readable (`sink = "stderr"` rather than `sink = "Stderr"`). Adding
-/// a new variant is a breaking config change — update the TOML docs
-/// and any deployed config files in lockstep.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ForkCacheSinkKind {
-    /// No events emitted. Safe default — zero observable behavior.
-    #[default]
-    Noop,
-    /// Write each event as a JSON line to stderr with `[fork-cache]`
-    /// prefix. Intended for local development and `jq`-friendly
-    /// pipelines without a full observability backend.
-    Stderr,
-}
-
-/// Fork-prefix pipeline configuration.
-///
-/// Captures happen on every parent turn end, spawns with
-/// `inherit_prefix` reuse captured prefixes, and telemetry events
-/// flow to the configured `sink`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct ForkPrefixConfig {
-    /// Telemetry sink to install. `Noop` discards events; `Stderr`
-    /// writes JSON lines with `[fork-cache]` prefix.
-    #[serde(default)]
-    pub sink: ForkCacheSinkKind,
-}
-
 /// Safety-guard configuration.
 ///
 /// Kept deliberately small — this struct is a contract between config files
@@ -383,7 +343,6 @@ impl Default for RuntimeConfig {
             tool_policy: ToolPolicyConfig::default(),
             trace: SessionTraceConfig::default(),
             safety: SafetyConfig::default(),
-            fork_prefix: ForkPrefixConfig::default(),
             tool_surface: ToolSurfaceConfig::default(),
             runtime_limits: RuntimeLimitsConfig::default(),
             agent_binding_registry: AgentBindingRegistryConfig::default(),
@@ -1541,7 +1500,7 @@ mod tests {
         let toml = config.to_toml().unwrap();
         assert!(toml.contains("max_history_tokens"));
         assert!(toml.contains("retrieval_top_k"));
-        for retired in ["token_budget", "tool_selection"] {
+        for retired in ["token_budget", "tool_selection", "fork_prefix"] {
             assert!(!toml.contains(retired));
             assert!(toml::from_str::<RuntimeConfig>(&format!("[{retired}]\n")).is_err());
             assert!(
@@ -1555,11 +1514,6 @@ mod tests {
         assert!(!toml.contains("tool_budget_tokens"));
         assert!(!toml.contains("round_budget_warning"));
         assert!(!toml.contains("round_budget_limit"));
-
-        let fork_prefix = toml::to_string(&config.fork_prefix).unwrap();
-        assert!(!fork_prefix.contains("enabled"));
-        assert!(!fork_prefix.contains("hit_threshold"));
-        assert!(!fork_prefix.contains("miss_floor"));
     }
 
     #[test]
@@ -2359,49 +2313,6 @@ mod tests {
         // …while the zero-valued fields inherit the global default.
         assert_eq!(policy.max_identical_tool_calls, 3);
         assert_eq!(policy.max_tools_per_turn, 100);
-    }
-
-    // ─── Fork-prefix config ─────────────────────────────────────────
-
-    #[test]
-    fn fork_prefix_defaults_to_noop_sink() {
-        let cfg = ForkPrefixConfig::default();
-        assert_eq!(cfg.sink, ForkCacheSinkKind::Noop);
-    }
-
-    #[test]
-    fn fork_prefix_parses_from_toml() {
-        let toml_str = r#"
-            version = "1.0"
-
-            [fork_prefix]
-            sink = "stderr"
-        "#;
-        let cfg: RuntimeConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.fork_prefix.sink, ForkCacheSinkKind::Stderr);
-    }
-
-    #[test]
-    fn fork_prefix_missing_section_uses_defaults() {
-        // A TOML without the section must not fail — defaults fill in.
-        let toml_str = r#"version = "1.0""#;
-        let cfg: RuntimeConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.fork_prefix.sink, ForkCacheSinkKind::Noop);
-    }
-
-    #[test]
-    fn fork_prefix_sink_rename_to_lowercase() {
-        // Serialization uses lowercase literals for readability. The
-        // tripwire pins both directions so a future rename to e.g.
-        // `SnakeCase` is an explicit breaking config change.
-        let s = toml::to_string(&ForkPrefixConfig {
-            sink: ForkCacheSinkKind::Stderr,
-        })
-        .unwrap();
-        assert!(
-            s.contains("sink = \"stderr\""),
-            "expected lowercase serialization, got {s}"
-        );
     }
 
     // ─── SessionTraceConfig::from_cli() tests ─────────────────────

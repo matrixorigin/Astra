@@ -208,7 +208,6 @@ pub use pipeline::session_serde as pipeline_session_serde;
 pub use pipeline::stats as pipeline_stats;
 
 // Re-exports: fork_* → fork::*
-pub use fork::cache_event as fork_cache_event;
 pub use fork::capture as fork_capture;
 pub use fork::prefix as fork_prefix;
 pub use fork::prefix_store as fork_prefix_store;

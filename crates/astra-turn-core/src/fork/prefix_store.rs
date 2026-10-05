@@ -49,7 +49,6 @@
 //!
 //! - Capture at parent turn boundary (PR 3).
 //! - Spawn-time resolution and child attachment (PR 4).
-//! - `ForkCacheEvent` telemetry (PR 5).
 //! - Disk-backed persistence.
 
 use std::sync::{Arc, Mutex};
