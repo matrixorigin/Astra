@@ -86,33 +86,6 @@ pub struct McpRegisteredBindingRecord {
     pub server_name: String,
 }
 
-#[derive(Clone, PartialEq)]
-pub struct McpRuntimeBindingRecord {
-    pub binding_id: String,
-    pub mcp_id: String,
-    pub server_name: String,
-    pub server_description: Option<String>,
-    pub transport: String,
-    pub url: String,
-    pub key_value: serde_json::Value,
-    pub tools: Vec<McpDiscoveredToolData>,
-}
-
-impl fmt::Debug for McpRuntimeBindingRecord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("McpRuntimeBindingRecord")
-            .field("binding_id", &self.binding_id)
-            .field("mcp_id", &self.mcp_id)
-            .field("server_name", &self.server_name)
-            .field("server_description", &self.server_description)
-            .field("transport", &self.transport)
-            .field("url", &self.url)
-            .field("key_value", &"[REDACTED]")
-            .field("tools", &self.tools)
-            .finish()
-    }
-}
-
 pub fn mcp_schema_hash(parts: &serde_json::Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(parts.to_string().as_bytes());
@@ -137,12 +110,6 @@ pub trait McpRegistryService: Send + Sync {
         binding_id: String,
         discovered_tools: Vec<McpDiscoveredToolData>,
     ) -> Result<McpRegisterRecord, (StatusCode, Json<ErrorResponse>)>;
-
-    async fn load_runtime_bindings(
-        &self,
-        owner_user_id: String,
-        binding_ids: &[String],
-    ) -> Result<Vec<McpRuntimeBindingRecord>, (StatusCode, Json<ErrorResponse>)>;
 }
 
 #[derive(Default)]
@@ -168,18 +135,6 @@ impl McpRegistryService for UnconfiguredMcpRegistryService {
         _binding_id: String,
         _discovered_tools: Vec<McpDiscoveredToolData>,
     ) -> Result<McpRegisterRecord, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response_coded(
-            StatusCode::NOT_IMPLEMENTED,
-            "MCP registry service not configured",
-            "mcp_registry_unconfigured",
-        ))
-    }
-
-    async fn load_runtime_bindings(
-        &self,
-        _owner_user_id: String,
-        _binding_ids: &[String],
-    ) -> Result<Vec<McpRuntimeBindingRecord>, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,
             "MCP registry service not configured",
@@ -233,26 +188,6 @@ impl DatabaseMcpRegistryService {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to encrypt MCP credential",
                 "mcp_credential_encrypt_failed",
-            )
-        })
-    }
-
-    fn decrypt_key_value(
-        &self,
-        encrypted: &str,
-    ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
-        let plaintext = self.encryptor.decrypt(encrypted).map_err(|_| {
-            error_response_coded(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to decrypt MCP credential",
-                "mcp_credential_decrypt_failed",
-            )
-        })?;
-        serde_json::from_str(&plaintext).map_err(|_| {
-            error_response_coded(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "stored MCP credential is not valid JSON",
-                "mcp_credential_invalid",
             )
         })
     }
@@ -417,68 +352,6 @@ fn mcp_server_id(owner_user_id: &str, server_name: &str) -> String {
 
 fn mcp_binding_id(owner_user_id: &str, mcp_id: &str, key_hash: &str) -> String {
     stable_mcp_id("mcp_bind", &[owner_user_id, mcp_id, key_hash])
-}
-
-fn mcp_decode_error(
-    column: &'static str,
-    message: impl Into<String>,
-) -> (StatusCode, Json<ErrorResponse>) {
-    internal_error(format!(
-        "MCP registry decode column `{column}`: {}",
-        message.into()
-    ))
-}
-
-fn required_string(
-    row: &sqlx::mysql::MySqlRow,
-    column: &'static str,
-) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    let value = row.try_get::<String, _>(column).map_err(internal_error)?;
-    if value.trim().is_empty() {
-        return Err(mcp_decode_error(column, "must not be empty"));
-    }
-    Ok(value)
-}
-
-fn optional_string(
-    row: &sqlx::mysql::MySqlRow,
-    column: &'static str,
-) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
-    row.try_get::<Option<String>, _>(column)
-        .map_err(internal_error)
-}
-
-fn parse_json_column(
-    column: &'static str,
-    raw: Option<String>,
-) -> Result<Option<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    match raw {
-        Some(value) => serde_json::from_str::<serde_json::Value>(&value)
-            .map(Some)
-            .map_err(|source| mcp_decode_error(column, source.to_string())),
-        None => Ok(None),
-    }
-}
-
-fn canonical_binding_ids(
-    binding_ids: &[String],
-) -> Result<Vec<String>, (StatusCode, Json<ErrorResponse>)> {
-    let mut unique_ids = Vec::new();
-    let mut seen = HashSet::new();
-    for id in binding_ids {
-        if id.trim().is_empty() {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                "binding_ids must not contain empty values",
-                "mcp_binding_invalid",
-            ));
-        }
-        if seen.insert(id.as_str()) {
-            unique_ids.push(id.clone());
-        }
-    }
-    unique_ids.sort();
-    Ok(unique_ids)
 }
 
 #[async_trait]
@@ -684,108 +557,6 @@ impl McpRegistryService for DatabaseMcpRegistryService {
                 .collect(),
         })
     }
-
-    async fn load_runtime_bindings(
-        &self,
-        owner_user_id: String,
-        binding_ids: &[String],
-    ) -> Result<Vec<McpRuntimeBindingRecord>, (StatusCode, Json<ErrorResponse>)> {
-        if binding_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let unique_ids = canonical_binding_ids(binding_ids)?;
-
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        let mut builder = QueryBuilder::<MySql>::new(
-            "SELECT b.id AS binding_id, b.mcp_id AS mcp_id, b.key_value_encrypted AS key_value_encrypted, \
-             s.name AS server_name, s.description AS server_description, \
-             s.transport AS transport, s.url AS url \
-             FROM mcp_bindings b JOIN mcp_servers s \
-               ON b.owner_user_id = s.owner_user_id AND b.mcp_id = s.id \
-             WHERE b.owner_user_id = ",
-        );
-        builder.push_bind(&owner_user_id);
-        builder.push(" AND b.is_active = 1 AND s.is_active = 1 AND b.id IN (");
-        {
-            let mut separated = builder.separated(", ");
-            for id in &unique_ids {
-                separated.push_bind(id);
-            }
-        }
-        builder.push(") ORDER BY b.id ASC");
-
-        let rows = builder
-            .build()
-            .fetch_all(&pool)
-            .await
-            .map_err(internal_error)?;
-        if rows.len() != unique_ids.len() {
-            return Err(error_response_coded(
-                StatusCode::NOT_FOUND,
-                "one or more MCP bindings were not found",
-                "mcp_binding_not_found",
-            ));
-        }
-
-        let mut records = Vec::with_capacity(rows.len());
-        for row in rows {
-            let encrypted = required_string(&row, "key_value_encrypted")?;
-            records.push(McpRuntimeBindingRecord {
-                binding_id: required_string(&row, "binding_id")?,
-                mcp_id: required_string(&row, "mcp_id")?,
-                server_name: required_string(&row, "server_name")?,
-                server_description: optional_string(&row, "server_description")?,
-                transport: required_string(&row, "transport")?,
-                url: required_string(&row, "url")?,
-                key_value: self.decrypt_key_value(&encrypted)?,
-                tools: Vec::new(),
-            });
-        }
-
-        let mut tool_builder = QueryBuilder::<MySql>::new(
-            "SELECT binding_id, tool_name, public_name, description, \
-             CAST(input_schema_json AS CHAR) AS input_schema_json, \
-             CAST(output_schema_json AS CHAR) AS output_schema_json, schema_hash \
-             FROM mcp_tools WHERE owner_user_id = ",
-        );
-        tool_builder.push_bind(&owner_user_id);
-        tool_builder.push(" AND binding_id IN (");
-        {
-            let mut separated = tool_builder.separated(", ");
-            for id in &unique_ids {
-                separated.push_bind(id);
-            }
-        }
-        tool_builder.push(") ORDER BY binding_id ASC, public_name ASC");
-        let tool_rows = tool_builder
-            .build()
-            .fetch_all(&pool)
-            .await
-            .map_err(internal_error)?;
-
-        for row in tool_rows {
-            let binding_id = required_string(&row, "binding_id")?;
-            if let Some(record) = records
-                .iter_mut()
-                .find(|record| record.binding_id == binding_id)
-            {
-                let input_schema_raw = optional_string(&row, "input_schema_json")?;
-                let output_schema_raw = optional_string(&row, "output_schema_json")?;
-                record.tools.push(McpDiscoveredToolData {
-                    tool_name: required_string(&row, "tool_name")?,
-                    public_name: required_string(&row, "public_name")?,
-                    description: optional_string(&row, "description")?,
-                    input_schema_json: parse_json_column("input_schema_json", input_schema_raw)?,
-                    output_schema_json: parse_json_column("output_schema_json", output_schema_raw)?,
-                    schema_hash: required_string(&row, "schema_hash")?,
-                });
-            }
-        }
-
-        records.sort_by(|left, right| left.binding_id.cmp(&right.binding_id));
-        Ok(records)
-    }
 }
 
 #[cfg(test)]
@@ -800,24 +571,26 @@ mod tests {
     }
 
     #[test]
-    fn runtime_record_debug_redacts_key_value() {
-        let record = McpRuntimeBindingRecord {
-            binding_id: "mcp_bind_1".to_string(),
-            mcp_id: "mcp_srv_2".to_string(),
-            server_name: "srv".to_string(),
-            server_description: None,
-            transport: "sse".to_string(),
-            url: "http://example.test/mcp".to_string(),
-            key_value: serde_json::json!({"headers": {"Authorization": "Bearer secret-token"}}),
-            tools: Vec::new(),
+    fn register_request_debug_redacts_key_value() {
+        let request = McpRegisterRequestData {
+            server: McpServerRequestData {
+                name: "server".into(),
+                description: None,
+                transport: "streamable_http".into(),
+                url: "http://example.test/mcp".into(),
+            },
+            binding: McpBindingRequestData {
+                key_value: serde_json::json!({"headers": {"Authorization": "Bearer secret-token"}}),
+                comment: None,
+            },
         };
-        let debug = format!("{record:?}");
+        let debug = format!("{request:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("secret-token"));
     }
 
-    #[tokio::test]
-    async fn key_value_encrypt_decrypt_round_trips() {
+    #[test]
+    fn key_value_encryption_round_trips() {
         let service = DatabaseMcpRegistryService::new(
             MatrixOneSettings {
                 host: "localhost".to_string(),
@@ -839,7 +612,8 @@ mod tests {
         });
         let encrypted = service.encrypted_key_value(&key_value).unwrap();
         assert!(!encrypted.contains("token-value"));
-        let decrypted = service.decrypt_key_value(&encrypted).unwrap();
+        let plaintext = service.encryptor.decrypt(&encrypted).unwrap();
+        let decrypted: serde_json::Value = serde_json::from_str(&plaintext).unwrap();
         assert_eq!(decrypted, key_value);
     }
 
@@ -883,32 +657,5 @@ mod tests {
             error.error_code.as_deref(),
             Some("mcp_public_name_conflict")
         );
-    }
-
-    #[test]
-    fn canonical_binding_ids_dedupes_and_sorts() {
-        assert_eq!(
-            canonical_binding_ids(&[
-                "mcp_bind_301".to_string(),
-                "mcp_bind_7".to_string(),
-                "mcp_bind_301".to_string(),
-                "mcp_bind_42".to_string(),
-            ])
-            .unwrap(),
-            vec![
-                "mcp_bind_301".to_string(),
-                "mcp_bind_42".to_string(),
-                "mcp_bind_7".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn canonical_binding_ids_rejects_empty_ids() {
-        let (status, Json(error)) =
-            canonical_binding_ids(&["mcp_bind_1".to_string(), " ".to_string()]).unwrap_err();
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(error.error_code.as_deref(), Some("mcp_binding_invalid"));
-        assert_eq!(error.detail, "binding_ids must not contain empty values");
     }
 }

@@ -227,8 +227,8 @@ pub use marketplace_stats::{
 pub use mcp_registry::{
     DatabaseMcpRegistryService, McpBindingRequestData, McpDiscoveredToolData, McpRegisterRecord,
     McpRegisterRequestData, McpRegisteredBindingRecord, McpRegisteredToolRecord,
-    McpRegistryService, McpRuntimeBindingRecord, McpServerRequestData,
-    UnconfiguredMcpRegistryService, mcp_binding_tool_namespace, mcp_schema_hash,
+    McpRegistryService, McpServerRequestData, UnconfiguredMcpRegistryService,
+    mcp_binding_tool_namespace, mcp_schema_hash,
 };
 pub use model_request_context::{
     MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestBudget, ModelRequestCache, ModelRequestCompaction,

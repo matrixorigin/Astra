@@ -23,7 +23,7 @@ fn register_request(server_name: String) -> McpRegisterRequestData {
         server: McpServerRequestData {
             name: server_name,
             description: Some("live registry test server".to_string()),
-            transport: "http".to_string(),
+            transport: "streamable_http".to_string(),
             url: "http://127.0.0.1:3000/mcp".to_string(),
         },
         binding: McpBindingRequestData {
@@ -70,7 +70,7 @@ async fn cleanup_owner(pool: &sqlx::Pool<sqlx::MySql>, owner_user_id: &str) {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn mcp_registry_round_trips_runtime_binding_on_live_matrixone() {
+async fn mcp_registry_persists_registration_and_discovered_tools() {
     let (shared, settings) = common::setup_pool_and_settings().await;
     let pool = shared.get().clone();
     let owner = format!("mcp-owner-{}", Uuid::new_v4());
@@ -109,28 +109,38 @@ async fn mcp_registry_round_trips_runtime_binding_on_live_matrixone() {
         .expect("replace discovered tools");
     assert_eq!(registered.tools.len(), 2);
 
-    let bindings = service
-        .load_runtime_bindings(owner.clone(), &[binding_id.clone(), binding_id])
-        .await
-        .expect("load runtime bindings");
-    assert_eq!(bindings.len(), 1);
-    let loaded = &bindings[0];
-    assert_eq!(loaded.server_name, server_name);
-    assert_eq!(loaded.transport, "http");
+    assert_eq!(registered.binding_id, binding_id);
+    assert_eq!(registered.server_name, server_name);
+    assert_eq!(registered.tool_namespace, format!("binding_{binding_id}"));
+    let (stored_server, transport, ciphertext): (String, String, String) = sqlx::query_as(
+        "SELECT s.name, s.transport, b.key_value_encrypted FROM mcp_bindings b JOIN mcp_servers s ON s.owner_user_id = b.owner_user_id AND s.id = b.mcp_id WHERE b.owner_user_id = ? AND b.id = ?",
+    ).bind(&owner).bind(&binding_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(stored_server, server_name);
+    assert_eq!(transport, "streamable_http");
+    assert!(!ciphertext.contains("live-test-token"));
+    let plaintext = encryptor().decrypt(&ciphertext).unwrap();
     assert_eq!(
-        loaded.key_value["headers"]["Authorization"],
-        "Bearer live-test-token"
+        serde_json::from_str::<serde_json::Value>(&plaintext).unwrap(),
+        register_request(server_name).binding.key_value
     );
-    assert_eq!(loaded.tools.len(), 2);
-    assert_eq!(loaded.tools[0].public_name, "mcp__test__read_file");
-    assert_eq!(loaded.tools[0].input_schema_json, Some(first_schema));
+    let stored: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT tool_name, public_name, CAST(input_schema_json AS CHAR), schema_hash FROM mcp_tools WHERE owner_user_id = ? AND binding_id = ? ORDER BY public_name",
+    ).bind(&owner).bind(&binding_id).fetch_all(&pool).await.unwrap();
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].0, "read_file");
+    assert_eq!(stored[0].1, "mcp__test__read_file");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stored[0].2).unwrap(),
+        first_schema
+    );
+    assert_eq!(stored[0].3, mcp_schema_hash(&first_schema));
 
     cleanup_owner(&pool, &owner).await;
 }
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn mcp_registry_runtime_load_fails_loud_on_empty_tool_name() {
+async fn mcp_registry_rejected_replacement_preserves_owned_tools() {
     let (shared, settings) = common::setup_pool_and_settings().await;
     let pool = shared.get().clone();
     let owner = format!("mcp-owner-{}", Uuid::new_v4());
@@ -153,22 +163,41 @@ async fn mcp_registry_runtime_load_fails_loud_on_empty_tool_name() {
         .await
         .expect("replace discovered tools");
 
-    sqlx::query("UPDATE mcp_tools SET tool_name = '' WHERE binding_id = ?")
-        .bind(binding_id.clone())
-        .execute(&pool)
+    let stored_sql = "SELECT tool_name, public_name, schema_hash FROM mcp_tools WHERE owner_user_id = ? AND binding_id = ? ORDER BY public_name";
+    let before: Vec<(String, String, String)> = sqlx::query_as(stored_sql)
+        .bind(&owner)
+        .bind(&binding_id)
+        .fetch_all(&pool)
         .await
-        .expect("corrupt tool name");
-
-    let (status, error) = service
-        .load_runtime_bindings(owner.clone(), &[binding_id])
+        .unwrap();
+    for invalid in ["", " "] {
+        let (status, error) = service
+            .replace_binding_tools(
+                owner.clone(),
+                binding_id.clone(),
+                vec![tool(
+                    invalid,
+                    "mcp__test__invalid",
+                    json!({"type":"object"}),
+                )],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.0.error_code.as_deref(), Some("mcp_discovery_failed"));
+    }
+    let (status, _) = service
+        .replace_binding_tools(format!("foreign-{owner}"), binding_id.clone(), Vec::new())
         .await
-        .expect_err("empty persisted tool_name must fail loud");
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(
-        error.0.detail.contains("tool_name") && error.0.detail.contains("must not be empty"),
-        "unexpected error detail: {}",
-        error.0.detail
-    );
+        .unwrap_err();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let after: Vec<(String, String, String)> = sqlx::query_as(stored_sql)
+        .bind(&owner)
+        .bind(&binding_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(after, before);
 
     cleanup_owner(&pool, &owner).await;
 }

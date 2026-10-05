@@ -36,6 +36,11 @@ visible(tool) and execute(tool_call) must come from the same provider decision.
 
 No host loop, schema builder, or executor should maintain a separate shadow allowlist.
 
+MCP registry registration retains owner-scoped metadata, encrypted credentials
+and discovered tool schemas. Server MCP connections and discovery are prepared
+from the authorized request or Agent Binding. The unused registry-to-runtime
+loader and its Rust source result type are retired; registration remains available.
+
 ## Concepts
 
 | Concept | Meaning |
