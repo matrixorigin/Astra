@@ -3,11 +3,10 @@ mod common;
 use astra_services::work::{
     CheckCoverage, CheckEvidenceRef, CheckOutcome, CheckRunId, CheckVerifierKind, CriterionCommand,
     CriterionDefinition, CriterionId, CriterionRevision, CriterionRevisionRef,
-    CriterionSetMemberChange, CriterionSetRevision, DatabaseWorkPatchCommitService,
-    DatabaseWorkPatchMaterializationService, DatabaseWorkRepository, GraphRevision,
-    NewWorkCheckRun, NewWorkCriterion, NewWorkPatchArtifact, WorkBranchBasisChange,
-    WorkBranchSubjectChange, WorkBranchSubjectRevision, WorkChangeRef, WorkContentHash,
-    WorkCriteriaChange, WorkItemAttemptId, WorkItemId, WorkItemRevision, WorkItemRevisionRef,
+    CriterionSetRevision, DatabaseWorkPatchCommitService, DatabaseWorkPatchMaterializationService,
+    DatabaseWorkRepository, GraphRevision, NewWorkCheckRun, NewWorkPatchArtifact,
+    WorkBranchBasisChange, WorkBranchSubjectChange, WorkBranchSubjectRevision, WorkChangeRef,
+    WorkContentHash, WorkItemAttemptId, WorkItemId, WorkItemRevision, WorkItemRevisionRef,
     WorkMaterializationProviderRef, WorkPatchArtifactBasisResource, WorkPatchArtifactId,
     WorkPatchCommitCommitted, WorkPatchCommitConflict, WorkPatchCommitError, WorkPatchCommitPhase,
     WorkPatchCommitProviderRef, WorkPatchCommitRequest, WorkPatchCommitState, WorkPatchFormat,
@@ -435,13 +434,25 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
         materialization.admit(&unverified_target_request).await,
         Err(WorkPatchMaterializationError::VerificationRequired)
     ));
-    repository
-        .accept_criteria(WorkCriteriaChange {
+    let basis = repository
+        .load(&request.owner_id, &request.work_id)
+        .await
+        .expect("current proposal basis");
+    let criteria = repository
+        .propose_criteria(astra_services::work::NewWorkCriteriaProposal {
             owner_id: request.owner_id.clone(),
             work_id: request.work_id.clone(),
-            expected_work_revision: WorkRevision::INITIAL,
-            expected_criteria_set_revision: CriterionSetRevision::INITIAL,
-            members: vec![CriterionSetMemberChange::New(NewWorkCriterion {
+            branch_id: basis.delivery_branch.parts().branch_id.clone(),
+            proposal_id: astra_services::work::WorkProposalId::parse(common::id(
+                "criteria-proposal",
+            ))
+            .expect("proposal"),
+            expected_work_revision: basis.work.parts().work_revision,
+            expected_goal_revision: basis.work.parts().current_goal_revision,
+            expected_criteria_set_revision: basis.work.parts().current_criteria_set_revision,
+            expected_branch_revision: basis.delivery_branch.parts().branch_revision,
+            expected_graph_revision: basis.delivery_branch.parts().current_graph_revision,
+            members: vec![astra_services::work::WorkCriteriaProposalMember::New {
                 criterion_id: CriterionId::parse(&criterion_id).expect("criterion"),
                 definition: CriterionDefinition::TestCheck {
                     statement: astra_services::work::CriterionStatement::parse(
@@ -451,11 +462,18 @@ async fn patch_export_binds_verified_payload_once_and_rejects_stale_or_tampered_
                     command: CriterionCommand::parse("verify-materialized-result")
                         .expect("criterion command"),
                 },
-            })],
+            }],
+            source_kind: astra_services::work::WorkProposalSourceKind::Model,
             source_ref: WorkChangeRef::parse(common::id("criteria-source"))
                 .expect("criteria source"),
-            reason: None,
         })
+        .await
+        .expect("propose verification criterion");
+    repository
+        .accept_criteria_proposal(common::criteria_acceptance(
+            &criteria,
+            &common::id("accept-criteria"),
+        ))
         .await
         .expect("accept verification criterion");
     let adopted_target = repository
