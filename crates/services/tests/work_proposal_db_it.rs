@@ -2,10 +2,9 @@ mod common;
 
 use astra_services::work::{
     DatabaseWorkRepository, GoalRevision, GraphRevision, NewWorkItem, NewWorkPlanProposal,
-    WorkBranchId, WorkBranchRevision, WorkChangeRef, WorkGoal, WorkGoalChange, WorkId,
-    WorkItemEdge, WorkItemEdgeKind, WorkItemId, WorkItemKind, WorkItemText, WorkOwnerId,
-    WorkProposalId, WorkProposalSourceKind, WorkProposalStatus, WorkRepository,
-    WorkRepositoryError, WorkRevision,
+    WorkBranchId, WorkBranchRevision, WorkChangeRef, WorkId, WorkItemEdge, WorkItemEdgeKind,
+    WorkItemId, WorkItemKind, WorkItemText, WorkOwnerId, WorkProposalId, WorkProposalSourceKind,
+    WorkProposalStatus, WorkRepository, WorkRepositoryError, WorkRevision,
 };
 use sqlx::Row;
 
@@ -273,34 +272,46 @@ async fn proposal_is_canonical_idempotent_non_authoritative_and_revision_pinned(
         })
     ));
 
-    let revised = repository
-        .revise_goal(WorkGoalChange {
-            owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-            work_id: WorkId::parse(&work_id).expect("work"),
-            expected_work_revision: WorkRevision::INITIAL,
-            expected_goal_revision: GoalRevision::INITIAL,
-            goal: WorkGoal::parse("A new goal makes delayed proposals stale.").expect("goal"),
-            source_ref: WorkChangeRef::parse(common::id("goal-source")).expect("source"),
-            reason: None,
-        })
-        .await
-        .expect("revise goal");
-    let mut incoherent = proposal(
+    let mut forged_goal = proposal(
         &owner_id,
         &work_id,
         &branch_id,
-        &common::id("incoherent-proposal"),
-        vec![item(&common::id("incoherent-task"))],
+        &common::id("forged-goal"),
+        vec![item(&common::id("forged-task"))],
         Vec::new(),
     );
-    incoherent.expected_work_revision = revised.work.parts().work_revision;
-    incoherent.expected_goal_revision = revised.work.parts().current_goal_revision;
+    forged_goal.expected_goal_revision = GoalRevision::new(2).expect("forged Goal r2");
     assert!(matches!(
-        repository.propose_plan(incoherent).await,
+        repository.propose_plan(forged_goal).await,
+        Err(WorkRepositoryError::InvalidWorkProposalBasis {
+            resource: astra_services::work::WorkProposalBasisResource::GoalRevision
+        })
+    ));
+    // Deliberately corrupt the stored branch basis to exercise recovery fencing;
+    // production has no Goal-edit writer.
+    sqlx::query("UPDATE work_branches SET goal_revision_ref = 2 WHERE owner_id = ? AND work_id = ? AND branch_id = ?")
+        .bind(&owner_id).bind(&work_id).bind(&branch_id).execute(pool.get()).await.expect("inject corrupt Goal basis");
+    assert!(matches!(
+        repository
+            .propose_plan(proposal(
+                &owner_id,
+                &work_id,
+                &branch_id,
+                &common::id("incoherent-proposal"),
+                vec![item(&common::id("incoherent-task"))],
+                Vec::new(),
+            ))
+            .await,
         Err(WorkRepositoryError::InvalidWorkProposalBasis {
             resource: astra_services::work::WorkProposalBasisResource::BranchGoalRevision
         })
     ));
+    sqlx::query("UPDATE work_branches SET goal_revision_ref = 1 WHERE owner_id = ? AND work_id = ? AND branch_id = ?")
+        .bind(&owner_id).bind(&work_id).bind(&branch_id).execute(pool.get()).await.expect("restore Goal basis");
+    repository
+        .accept_plan_proposal(common::plan_acceptance(&left, &common::id("accept-plan")))
+        .await
+        .expect("advance branch through real acceptance");
     let stale = proposal(
         &owner_id,
         &work_id,
@@ -312,7 +323,7 @@ async fn proposal_is_canonical_idempotent_non_authoritative_and_revision_pinned(
     assert!(matches!(
         repository.propose_plan(stale).await,
         Err(WorkRepositoryError::InvalidWorkProposalBasis {
-            resource: astra_services::work::WorkProposalBasisResource::WorkRevision
+            resource: astra_services::work::WorkProposalBasisResource::BranchRevision
         })
     ));
     let event_kinds: Vec<String> = sqlx::query_scalar(
@@ -326,7 +337,7 @@ async fn proposal_is_canonical_idempotent_non_authoritative_and_revision_pinned(
     .expect("events");
     assert_eq!(
         event_kinds,
-        ["work_created", "plan_proposed", "goal_revised"]
+        ["work_created", "plan_proposed", "graph_replaced"]
     );
 
     common::cleanup_work_owner(&pool, &owner_id).await;
