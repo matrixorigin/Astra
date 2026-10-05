@@ -3,11 +3,11 @@ mod common;
 use astra_services::work::{
     CheckCoverage, CheckEvidenceRef, CheckOutcome, CheckRunId, CheckVerifierKind, CriterionCommand,
     CriterionDefinition, CriterionId, CriterionRevision, CriterionRevisionRef,
-    CriterionSetMemberChange, CriterionSetRevision, DatabaseWorkRepository, GraphRevision,
-    NewWorkCheckRun, NewWorkCriterion, WorkBranchBasisChange, WorkBranchId, WorkBranchRevision,
-    WorkBranchSubjectChange, WorkChangeRef, WorkContentHash, WorkCriteriaChange, WorkGenesis,
-    WorkGraphChange, WorkId, WorkItemAttemptId, WorkItemId, WorkItemRevision, WorkItemRevisionRef,
-    WorkOwnerId, WorkRepository, WorkRepositoryError, WorkRevision, WorkSubjectRef,
+    CriterionSetRevision, DatabaseWorkRepository, GraphRevision, NewWorkCheckRun,
+    WorkBranchBasisChange, WorkBranchId, WorkBranchRevision, WorkBranchSubjectChange,
+    WorkChangeRef, WorkContentHash, WorkGenesis, WorkId, WorkItemAttemptId, WorkItemId,
+    WorkItemRevision, WorkItemRevisionRef, WorkOwnerId, WorkRepository, WorkRepositoryError,
+    WorkRevision, WorkSubjectRef,
 };
 use sqlx::Row;
 
@@ -37,13 +37,21 @@ async fn accept_test_criterion(
     branch_id: &str,
     criterion_id: &str,
 ) {
-    repository
-        .accept_criteria(WorkCriteriaChange {
+    let proposed = repository
+        .propose_criteria(astra_services::work::NewWorkCriteriaProposal {
             owner_id: WorkOwnerId::parse(owner_id).expect("owner"),
             work_id: WorkId::parse(work_id).expect("work"),
+            branch_id: WorkBranchId::parse(branch_id).expect("branch"),
+            proposal_id: astra_services::work::WorkProposalId::parse(common::id(
+                "criteria-proposal",
+            ))
+            .expect("proposal"),
+            expected_goal_revision: astra_services::work::GoalRevision::INITIAL,
+            expected_branch_revision: WorkBranchRevision::INITIAL,
+            expected_graph_revision: GraphRevision::INITIAL,
             expected_work_revision: WorkRevision::INITIAL,
             expected_criteria_set_revision: CriterionSetRevision::INITIAL,
-            members: vec![CriterionSetMemberChange::New(NewWorkCriterion {
+            members: vec![astra_services::work::WorkCriteriaProposalMember::New {
                 criterion_id: CriterionId::parse(criterion_id).expect("criterion"),
                 definition: CriterionDefinition::TestCheck {
                     statement: astra_services::work::CriterionStatement::parse(
@@ -53,12 +61,19 @@ async fn accept_test_criterion(
                     command: CriterionCommand::parse("cargo test -p example targeted_test")
                         .expect("command"),
                 },
-            })],
+            }],
             source_ref: WorkChangeRef::parse(common::id("criteria-source")).expect("source"),
-            reason: None,
+            source_kind: astra_services::work::WorkProposalSourceKind::Model,
         })
         .await
         .expect("accept criterion");
+    repository
+        .accept_criteria_proposal(common::criteria_acceptance(
+            &proposed,
+            &common::id("accept-criteria"),
+        ))
+        .await
+        .expect("accept criterion proposal");
     repository
         .adopt_branch_basis(WorkBranchBasisChange {
             owner_id: WorkOwnerId::parse(owner_id).expect("owner"),
@@ -188,13 +203,21 @@ async fn check_admission_requires_an_explicit_revision_pinned_branch_basis() {
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
         .expect("genesis");
-    repository
-        .accept_criteria(WorkCriteriaChange {
+    let proposed = repository
+        .propose_criteria(astra_services::work::NewWorkCriteriaProposal {
             owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
             work_id: WorkId::parse(&work_id).expect("work"),
+            branch_id: WorkBranchId::parse(&branch_id).expect("branch"),
+            proposal_id: astra_services::work::WorkProposalId::parse(common::id(
+                "criteria-proposal",
+            ))
+            .expect("proposal"),
+            expected_goal_revision: astra_services::work::GoalRevision::INITIAL,
+            expected_branch_revision: WorkBranchRevision::INITIAL,
+            expected_graph_revision: GraphRevision::INITIAL,
             expected_work_revision: WorkRevision::INITIAL,
             expected_criteria_set_revision: CriterionSetRevision::INITIAL,
-            members: vec![CriterionSetMemberChange::New(NewWorkCriterion {
+            members: vec![astra_services::work::WorkCriteriaProposalMember::New {
                 criterion_id: CriterionId::parse(&criterion_id).expect("criterion"),
                 definition: CriterionDefinition::TestCheck {
                     statement: astra_services::work::CriterionStatement::parse(
@@ -204,12 +227,19 @@ async fn check_admission_requires_an_explicit_revision_pinned_branch_basis() {
                     command: CriterionCommand::parse("verify exact adopted basis")
                         .expect("command"),
                 },
-            })],
+            }],
             source_ref: WorkChangeRef::parse(common::id("criteria-source")).expect("source"),
-            reason: None,
+            source_kind: astra_services::work::WorkProposalSourceKind::Model,
         })
         .await
         .expect("accept criteria");
+    repository
+        .accept_criteria_proposal(common::criteria_acceptance(
+            &proposed,
+            &common::id("accept-criteria"),
+        ))
+        .await
+        .expect("accept criterion proposal");
     repository
         .set_branch_subject(WorkBranchSubjectChange {
             owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
@@ -476,7 +506,7 @@ async fn concurrent_check_retry_is_idempotent_and_canonical() {
     .expect("Work events");
     assert_eq!(
         events.len(),
-        9,
+        10,
         "one semantic event per committed check, never per retry"
     );
     for (index, event) in events.iter().enumerate() {
@@ -616,18 +646,49 @@ async fn wrong_owner_or_unaccepted_basis_cannot_leave_check_rows() {
         })
     ));
 
-    repository
-        .replace_graph(WorkGraphChange {
-            owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-            work_id: WorkId::parse(&work_id).expect("work"),
-            branch_id: WorkBranchId::parse(&branch_id).expect("branch"),
-            expected_branch_revision: WorkBranchRevision::new(4).expect("branch r4"),
-            expected_graph_revision: GraphRevision::INITIAL,
-            items: Vec::new(),
-            edges: Vec::new(),
+    let basis = repository
+        .load(
+            &WorkOwnerId::parse(&owner_id).expect("owner"),
+            &WorkId::parse(&work_id).expect("work"),
+        )
+        .await
+        .expect("current graph proposal basis");
+    let graph = repository
+        .propose_plan(astra_services::work::NewWorkPlanProposal {
+            owner_id: basis.work.parts().owner_id.clone(),
+            work_id: basis.work.parts().work_id.clone(),
+            branch_id: basis.delivery_branch.parts().branch_id.clone(),
+            proposal_id: astra_services::work::WorkProposalId::parse(common::id("graph-proposal"))
+                .expect("proposal"),
+            expected_work_revision: basis.work.parts().work_revision,
+            expected_goal_revision: basis.work.parts().current_goal_revision,
+            expected_criteria_set_revision: basis.work.parts().current_criteria_set_revision,
+            expected_branch_revision: basis.delivery_branch.parts().branch_revision,
+            expected_graph_revision: basis.delivery_branch.parts().current_graph_revision,
+            additions: vec![astra_services::work::NewWorkItem {
+                item_id: WorkItemId::parse(common::id("task")).expect("task"),
+                kind: astra_services::work::WorkItemKind::Task,
+                objective: astra_services::work::WorkItemText::parse(
+                    "Advance the graph with a real task",
+                )
+                .expect("objective"),
+                expected_result: astra_services::work::WorkItemText::parse(
+                    "Evidence must bind the current graph",
+                )
+                .expect("result"),
+            }],
+            revisions: Vec::new(),
+            dependencies: Vec::new(),
+            dependency_removals: Vec::new(),
+            source_kind: astra_services::work::WorkProposalSourceKind::Model,
             source_ref: WorkChangeRef::parse(common::id("graph-source")).expect("source"),
-            reason: None,
+            reason: astra_services::work::WorkChangeReason::parse("Refine the task graph")
+                .expect("reason"),
         })
+        .await
+        .expect("propose graph refinement");
+    repository
+        .accept_plan_proposal(common::plan_acceptance(&graph, &common::id("accept-graph")))
         .await
         .expect("advance graph");
     let stale = check(
@@ -663,10 +724,12 @@ async fn wrong_owner_or_unaccepted_basis_cannot_leave_check_rows() {
         event_kinds,
         [
             "work_created",
+            "criteria_proposed",
             "criteria_accepted",
             "branch_basis_adopted",
             "subject_changed",
             "subject_changed",
+            "plan_proposed",
             "graph_replaced"
         ],
         "the graph mutation commits once while rejected checks leave no events"
@@ -714,7 +777,7 @@ async fn corrupt_retention_source_rolls_back_the_new_check_and_event_sequence() 
     .expect("simulate corrupt missing check detail");
     sqlx::query(
         "UPDATE work_event_sequences
-         SET last_event_seq = 10004, retained_from_event_seq = 5
+         SET last_event_seq = 10005, retained_from_event_seq = 6
          WHERE owner_id = ? AND work_id = ?",
     )
     .bind(&owner_id)
@@ -752,18 +815,18 @@ async fn corrupt_retention_source_rolls_back_the_new_check_and_event_sequence() 
     .expect("event sequence");
     assert_eq!(
         sequence.try_get::<i64, _>("last_event_seq").expect("head"),
-        10004
+        10005
     );
     assert_eq!(
         sequence
             .try_get::<i64, _>("retained_from_event_seq")
             .expect("floor"),
-        5
+        6
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM work_events
-             WHERE owner_id = ? AND work_id = ? AND event_seq = 10005",
+             WHERE owner_id = ? AND work_id = ? AND event_seq = 10006",
         )
         .bind(&owner_id)
         .bind(&work_id)
