@@ -1209,7 +1209,6 @@ pub(crate) async fn stream_chat_sse(
         budget_pressure: state.telemetry.first_budget_pressure,
         stall_events: state.stall.events,
         verdict_events: state.stall.verdict_events,
-        step_recorder: &state.step_recorder,
         turn_guard: &state.turn_guard,
         last_heavy_checkpoint: state.stall.last_heavy_checkpoint,
         ttft_ms: state.telemetry.first_ttft_ms,
@@ -2082,24 +2081,20 @@ mod tests {
 
     #[test]
     fn cli_step_recorder_uses_runtime_run_id_as_trace_identity() {
-        let recorder =
-            step_recorder_for_cli_turn("user-1", Some("session-1"), "run-parent-visible");
-        let summary = recorder.summary();
-        assert_eq!(summary.session_id, "session-1");
-        assert_eq!(summary.task_id, "run-parent-visible");
-        assert!(
-            !summary.task_id.starts_with("chat-"),
-            "StepRecorder identity must not diverge from AgenticLoopState.current_run_id"
-        );
-
-        let ephemeral = step_recorder_for_cli_turn("user-1", None, "run-parent-ephemeral");
-        let summary = ephemeral.summary();
-        assert_eq!(summary.session_id, "ephemeral");
-        assert_eq!(summary.task_id, "run-parent-ephemeral");
-        assert!(
-            !summary.task_id.starts_with("chat-"),
-            "ephemeral CLI sessions still use the runtime run id for trace identity"
-        );
+        for (session_id, run_id) in [
+            (Some("session-1"), "run-parent-visible"),
+            (None, "run-parent-ephemeral"),
+        ] {
+            let mut recorder = step_recorder_for_cli_turn("user-1", session_id, run_id);
+            recorder.begin_turn(0);
+            let step = recorder.current_step().expect("active CLI step");
+            assert_eq!(step.task_id(), run_id);
+            assert!(step.step_id().starts_with(&format!(
+                "{}-run-{run_id}-",
+                session_id.unwrap_or("ephemeral")
+            )));
+            assert_eq!(recorder.events()[0].step_id, step.step_id());
+        }
     }
 
     #[test]

@@ -159,12 +159,17 @@ pub fn apply_agentic_post_tool_policy(ctx: AgenticPostToolPolicyRequest<'_>) {
                         workspace_observation_quarantine.cloned();
                 }
                 if owns_session_composite_snapshot {
-                    let _ = step_checkpoint::write_step_checkpoint(
-                        current_user_id.map(|s| s.as_str()).unwrap_or(""),
-                        sid,
-                        step_recorder.summary().checkpoints,
-                        &cp,
-                    );
+                    let user_id = current_user_id.map(|s| s.as_str()).unwrap_or("");
+                    let result =
+                        step_checkpoint::next_checkpoint_number(user_id, sid).and_then(|number| {
+                            step_checkpoint::write_step_checkpoint(user_id, sid, number, &cp)
+                        });
+                    if let Err(error) = result {
+                        astra_core::agent_warn!(
+                            "checkpoint",
+                            "Failed to persist warning checkpoint for {sid}: {error}"
+                        );
+                    }
                 }
                 *last_heavy_checkpoint = Some(cp);
             }
@@ -339,6 +344,13 @@ mod tests {
             .as_nanos();
         let user_id = format!("uid-{suffix}");
         let session_id = format!("post-tool-policy-{suffix}");
+        let earlier = StepCheckpoint::heavy(
+            "earlier-root-step".into(),
+            "earlier-root-task".into(),
+            session_id.clone(),
+            astra_pipeline::step_protocol::ExecutionCursor::default(),
+        );
+        step_checkpoint::write_step_checkpoint(&user_id, &session_id, 5, &earlier).unwrap();
         let mut step_recorder =
             StepRecorder::with_persistence_for_run(&user_id, &session_id, "tid", "test-run");
         step_recorder.begin_turn(0);
@@ -419,7 +431,14 @@ mod tests {
 
         let parent_artifacts = step_checkpoint::list_checkpoints(&user_id, &session_id)
             .expect("root warning checkpoint listing");
-        assert_eq!(parent_artifacts.len(), 1);
+        assert_eq!(parent_artifacts.len(), 2);
+        assert_eq!(
+            parent_artifacts
+                .iter()
+                .map(|(number, _)| *number)
+                .collect::<Vec<_>>(),
+            vec![5, 6]
+        );
         let parent_checkpoint = serde_json::to_value(checkpoint).expect("checkpoint JSON");
         messages.push(json!({"role": "assistant", "content": "child-only state"}));
         last_heavy_checkpoint = None;

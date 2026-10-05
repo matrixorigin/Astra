@@ -403,9 +403,8 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         return;
     }
 
-    // A delegated run does not own the parent session timeline. Its recorder
-    // counter is run-local, so writing it into the parent checkpoint directory
-    // can overwrite a root checkpoint or a sibling's state. Durable delegated
+    // A delegated run does not own the parent session timeline. Publishing its
+    // private execution state there would corrupt parent recovery. Durable delegated
     // recovery belongs to the canonical run record/transcript; keep this copy
     // only for the live loop's local recovery.
     if !state.owns_session_composite_snapshot() {

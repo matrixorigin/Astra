@@ -48,6 +48,9 @@ the recovery authority. The CLI has no manual history-edit/checkpoint frontend.
 Only the root execution publishes the local session checkpoint timeline.
 Delegated warning checkpoints remain in memory; they must not replace the
 parent session recovery artifact.
+Recorder observations live in the event journal and active execution cursor;
+there is no separate CLI recorder summary or profiling history. Checkpoint file
+numbers are allocated from the persisted session timeline at publication.
 Startup retention maintenance runs on a blocking worker with a captured owner
 path and protects the explicit resume target, including compressed journals.
 

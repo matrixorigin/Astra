@@ -533,9 +533,9 @@ pub fn list_checkpoints(
 
 /// Allocate the next checkpoint number in the session-owned namespace.
 ///
-/// Recorder counters are run-scoped and restart for every run, while checkpoint
-/// filenames are session-scoped. Timeline owners must allocate from persisted
-/// session state so a later run cannot overwrite an earlier turn's checkpoint.
+/// Filenames are session-scoped. Timeline owners allocate from persisted state
+/// so a later run cannot overwrite an earlier turn's checkpoint. The writer
+/// lock resolves collisions; this lookup does not reserve a number.
 pub fn next_checkpoint_number(user_id: &str, session_id: &str) -> std::io::Result<u32> {
     list_checkpoints(user_id, session_id)?
         .into_iter()

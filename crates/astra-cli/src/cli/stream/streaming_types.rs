@@ -750,8 +750,6 @@ pub(crate) struct StreamResult {
     /// advisory threshold, error pressure, and health telemetry). Only
     /// non-Healthy verdicts.
     pub(crate) verdict_events: Vec<VerdictEvent>,
-    /// Step Protocol recorder summary for debugging and audit.
-    pub(crate) step_recorder_summary: Option<astra_pipeline::step_recorder::RecorderSummary>,
     /// Exported tool health entries from this turn's TurnGuard (for cross-session persistence).
     pub(crate) tool_health_export: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     /// Last heavy checkpoint built during the agentic loop (for cloud persistence).
@@ -1582,7 +1580,6 @@ impl Default for StreamResult {
             budget_pressure: 0.0,
             stall_events: vec![],
             verdict_events: vec![],
-            step_recorder_summary: None,
             tool_health_export: vec![],
             last_heavy_checkpoint: None,
             ttft_ms: None,

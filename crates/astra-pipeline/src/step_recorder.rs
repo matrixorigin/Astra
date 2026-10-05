@@ -19,20 +19,20 @@
 //! recorder.begin_tool(tool_name, &args);
 //!
 //! // After each tool result:
-//! recorder.complete_tool(tool_name, is_error, elapsed_ms);
+//! recorder.complete_tool(tool_name, is_error, elapsed_ms, false);
 //!
 //! // After turn_guard.evaluate():
 //! recorder.record_verdict(severity, stall, divergence, strong_advisory, injections);
 //!
 //! // After main loop:
-//! let summary = recorder.finalize();
+//! recorder.end_turn(true);
+//! let events = recorder.events();
 //! ```
 
 use crate::step_checkpoint::FileBackedEventStore;
 use crate::step_protocol::*;
 use astra_turn_types::InferencePurpose;
 use regex::Regex;
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// Bound persisted previews by Unicode scalar count without splitting UTF-8.
@@ -311,12 +311,6 @@ pub struct StepRecorder {
     step_sequence: u32,
     current_step_sequence: Option<u32>,
     slot_counter: u32,
-    /// Per-tool timing for lightweight profiling
-    tool_timings: HashMap<String, Vec<u64>>,
-    /// Phase transitions recorded for debugging
-    phase_log: Vec<(u32, StepAction, u64)>,
-    /// Session checkpoint sequence carried across recorder turns
-    checkpoint_count: u32,
     /// Optional file-backed persistence (JSONL) for events
     file_store: Option<FileBackedEventStore>,
     /// A host explicitly requested persistence once an authoritative session
@@ -341,9 +335,6 @@ impl StepRecorder {
             step_sequence: 0,
             current_step_sequence: None,
             slot_counter: 0,
-            tool_timings: HashMap::new(),
-            phase_log: Vec::new(),
-            checkpoint_count: 0,
             file_store: None,
             attach_persistence_on_session_adoption: false,
             persistence_required: false,
@@ -354,8 +345,6 @@ impl StepRecorder {
 
     /// Create with file-backed persistence (events written to JSONL on disk).
     ///
-    /// Scans existing checkpoints so `checkpoint_count` starts after the
-    /// highest existing file number, preventing cross-turn overwrites.
     /// Create a recorder with an explicit server-owned invocation identity.
     /// `task_id` is only a local step label; it must never be inferred as the
     /// run identity for child/delegated executions.
@@ -367,12 +356,6 @@ impl StepRecorder {
     ) -> Self {
         let file_store = FileBackedEventStore::empty(user_id, session_id);
         let persisted_summary = persisted_event_summary(user_id, session_id);
-        let existing_max = crate::step_checkpoint::list_checkpoints(user_id, session_id)
-            .unwrap_or_default()
-            .iter()
-            .map(|(n, _)| *n)
-            .max()
-            .unwrap_or(0);
         Self {
             file_store: Some(file_store),
             attach_persistence_on_session_adoption: false,
@@ -380,7 +363,6 @@ impl StepRecorder {
             invocation_run_id: Some(run_id.to_string()),
             events: Vec::new(),
             step_sequence: persisted_summary.next_step_sequence,
-            checkpoint_count: existing_max.saturating_add(1),
             persisted_tail_event_id: persisted_summary.tail_event_id,
             ..Self::new(user_id, session_id, task_id)
         }
@@ -484,8 +466,6 @@ impl StepRecorder {
         self.events.clear();
         self.current_step = None;
         self.current_step_sequence = None;
-        self.phase_log.clear();
-        self.tool_timings.clear();
         self.invocation_run_id = None;
         self.attach_persistence_on_session_adoption = false;
         self.persistence_error = None;
@@ -502,14 +482,6 @@ impl StepRecorder {
         }
 
         self.rebind_session_id(session_id);
-
-        let existing_max = crate::step_checkpoint::list_checkpoints(&self.user_id, session_id)
-            .unwrap_or_default()
-            .iter()
-            .map(|(n, _)| *n)
-            .max()
-            .unwrap_or(0);
-        self.checkpoint_count = self.checkpoint_count.max(existing_max.saturating_add(1));
 
         let persisted_summary = persisted_event_summary(&self.user_id, session_id);
         self.step_sequence = self.step_sequence.max(persisted_summary.next_step_sequence);
@@ -563,8 +535,6 @@ impl StepRecorder {
         );
 
         self.emit(step.step_id(), StepEventType::StepCreated);
-        self.phase_log
-            .push((visible_turn, StepAction::Perceive, epoch_ms()));
         self.current_step = Some(step);
     }
 
@@ -879,7 +849,6 @@ impl StepRecorder {
             payload["output"] = serde_json::json!(redacted);
         }
         self.emit_with_payload(StepEventType::ToolCallSkipped, payload);
-        self.checkpoint_count += 1;
     }
 
     /// Attach a cached result to the most recently completed slot.
@@ -1093,13 +1062,6 @@ impl StepRecorder {
         }
 
         self.emit_with_payload(event_type, payload);
-
-        self.tool_timings
-            .entry(tool_name.to_string())
-            .or_default()
-            .push(elapsed_ms);
-
-        self.checkpoint_count += 1;
     }
 
     fn active_call_id_for_tool(&self, tool_name: &str) -> Option<String> {
@@ -1319,8 +1281,6 @@ impl StepRecorder {
                 "injections": injections_count,
             }),
         );
-
-        self.checkpoint_count += 1;
     }
 
     /// Record LLM token usage for the turn.
@@ -1363,40 +1323,6 @@ impl StepRecorder {
             .as_ref()
             .map_or("unknown".to_string(), |s| s.step_id().to_string());
         self.emit(&step_id, event_type);
-    }
-
-    /// Get the execution summary after all turns complete.
-    pub fn summary(&self) -> RecorderSummary {
-        let total_tools: usize = self.tool_timings.values().map(|v| v.len()).sum();
-        let total_tool_time_ms: u64 = self.tool_timings.values().flatten().sum();
-
-        let mut slowest_tools: Vec<(String, u64)> = self
-            .tool_timings
-            .iter()
-            .map(|(name, times)| {
-                let avg = times.iter().sum::<u64>() / times.len().max(1) as u64;
-                (name.clone(), avg)
-            })
-            .collect();
-        slowest_tools.sort_by_key(|b| std::cmp::Reverse(b.1));
-        slowest_tools.truncate(5);
-
-        RecorderSummary {
-            user_id: self.user_id.clone(),
-            session_id: self.session_id.clone(),
-            task_id: self.task_id.clone(),
-            iterations: if self.events.is_empty() {
-                0
-            } else {
-                self.turn_number + 1
-            },
-            total_events: self.events.len(),
-            total_tools,
-            total_tool_time_ms,
-            slowest_tools,
-            checkpoints: self.checkpoint_count,
-            phase_log: self.phase_log.clone(),
-        }
     }
 
     /// Get all recorded events (for persistence/audit).
@@ -1516,7 +1442,6 @@ impl StepRecorder {
     // ── Internal helpers ──
 
     fn transition_phase(&mut self, action: StepAction) {
-        self.phase_log.push((self.turn_number, action, epoch_ms()));
         if let Some(ref mut step) = self.current_step {
             step.execution.cursor.phase = action;
         }
@@ -1730,21 +1655,6 @@ fn step_sequence_from_event(event: &StepEvent) -> Option<u32> {
                 .next()
                 .and_then(|seq| seq.parse::<u32>().ok())
         })
-}
-
-/// Summary of a recorded session for debugging/audit.
-#[derive(Debug, Clone)]
-pub struct RecorderSummary {
-    pub user_id: String,
-    pub session_id: String,
-    pub task_id: String,
-    pub iterations: u32,
-    pub total_events: usize,
-    pub total_tools: usize,
-    pub total_tool_time_ms: u64,
-    pub slowest_tools: Vec<(String, u64)>,
-    pub checkpoints: u32,
-    pub phase_log: Vec<(u32, StepAction, u64)>,
 }
 
 fn epoch_ms() -> u64 {
@@ -2360,37 +2270,6 @@ mod tests {
     }
 
     #[test]
-    fn recorder_summary() {
-        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
-
-        // Turn 0: 2 tools
-        rec.begin_turn(0);
-        rec.begin_act(2);
-        rec.begin_tool("grep", "c1");
-        rec.complete_tool("grep", false, 100, false);
-        rec.begin_tool("read_file", "c2");
-        rec.complete_tool("read_file", false, 30, false);
-        rec.end_turn(false);
-
-        // Turn 1: 1 tool
-        rec.begin_turn(1);
-        rec.begin_act(1);
-        rec.begin_tool("grep", "c3");
-        rec.complete_tool("grep", false, 80, false);
-        rec.end_turn(true);
-
-        let summary = rec.summary();
-        assert_eq!(summary.user_id, TEST_USER_ID);
-        assert_eq!(summary.session_id, "sess-1");
-        assert_eq!(summary.task_id, "task-1");
-        assert_eq!(summary.iterations, 2);
-        assert_eq!(summary.total_tools, 3);
-        assert_eq!(summary.total_tool_time_ms, 210);
-        assert!(!summary.slowest_tools.is_empty());
-        assert_eq!(summary.slowest_tools[0].0, "grep"); // grep is slowest (avg 90ms)
-    }
-
-    #[test]
     fn recorder_events_form_causal_chain() {
         let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
@@ -2410,57 +2289,40 @@ mod tests {
     }
 
     #[test]
-    fn recorder_multi_turn_phase_log() {
+    fn recorder_multi_turn_phase_cursor() {
         let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
-        rec.record_plan(&["grep".into()], 0.0, 4000);
-        rec.begin_act(1);
-        rec.record_verdict("Healthy", false, false, false, 0);
-        rec.end_turn(false);
-
-        rec.begin_turn(1);
-        rec.begin_act(1);
-        rec.end_turn(true);
-
-        // Phase log should capture all transitions
-        let phases: Vec<StepAction> = rec.summary().phase_log.iter().map(|(_, a, _)| *a).collect();
-        // Turn 0: Perceive, Plan, Act, Evaluate
-        // Turn 1: Perceive, Act
-        assert!(phases.contains(&StepAction::Perceive));
-        assert!(phases.contains(&StepAction::Plan));
-        assert!(phases.contains(&StepAction::Act));
-        assert!(phases.contains(&StepAction::Evaluate));
-    }
-
-    #[test]
-    fn with_persistence_starts_after_existing_checkpoints() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
-        let sid = "test-cp-resume";
-
-        let earlier = crate::step_protocol::StepCheckpoint::heavy(
-            "step-3".to_string(),
-            "task-1".to_string(),
-            sid.to_string(),
-            crate::step_protocol::ExecutionCursor::default(),
-        );
-        crate::step_checkpoint::write_step_checkpoint(TEST_USER_ID, sid, 3, &earlier).unwrap();
-        let heavy = crate::step_protocol::StepCheckpoint::heavy(
-            "step-5".to_string(),
-            "task-1".to_string(),
-            sid.to_string(),
-            crate::step_protocol::ExecutionCursor::default(),
-        );
-        crate::step_checkpoint::write_step_checkpoint(TEST_USER_ID, sid, 5, &heavy).unwrap();
-
-        let rec = StepRecorder::with_persistence_for_run(TEST_USER_ID, sid, "task-1", "test-run");
-        // checkpoint_count should be max(5,3) + 1 = 6
         assert_eq!(
-            rec.summary().checkpoints,
-            6,
-            "checkpoint_count must start after existing max"
+            rec.current_step().unwrap().execution.cursor.phase,
+            StepAction::Perceive
         );
-        // tmp is dropped here, cleaning up automatically
+        rec.record_plan(&["grep".into()], 0.0, 4000);
+        assert_eq!(
+            rec.current_step().unwrap().execution.cursor.phase,
+            StepAction::Plan
+        );
+        rec.begin_act(1);
+        assert_eq!(
+            rec.current_step().unwrap().execution.cursor.phase,
+            StepAction::Act
+        );
+        rec.record_verdict("Healthy", false, false, false, 0);
+        assert_eq!(
+            rec.current_step().unwrap().execution.cursor.phase,
+            StepAction::Evaluate
+        );
+        rec.end_turn(false);
+        rec.begin_turn(1);
+        assert_eq!(
+            rec.current_step().unwrap().execution.cursor.phase,
+            StepAction::Perceive
+        );
+        rec.begin_act(1);
+        assert_eq!(
+            rec.current_step().unwrap().execution.cursor.phase,
+            StepAction::Act
+        );
+        rec.end_turn(true);
     }
 
     #[test]
@@ -2474,8 +2336,6 @@ mod tests {
         rec.attach_persistence("sess-adopted");
         rec.end_turn(true);
 
-        assert_eq!(rec.summary().user_id, TEST_USER_ID);
-        assert_eq!(rec.summary().session_id, "sess-adopted");
         assert_eq!(
             rec.current_step().unwrap().step_id(),
             "sess-adopted-run-task-1-turn-0-step-0"

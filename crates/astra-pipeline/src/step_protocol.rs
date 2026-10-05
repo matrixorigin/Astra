@@ -3,8 +3,8 @@
 //! # Architecture: 3 Concerns, 3 Types
 //!
 //! ```text
-//! ┌─ StepDescriptor ──────────────┐  Scheduling layer (who/when/retry)
-//! │  step_id, task_id, action,    │  Immutable after creation
+//! ┌─ StepDescriptor ──────────────┐  Identity and timeout metadata
+//! │  step_id, task_id, action,    │  Rebound on session adoption
 //! │  scheduling                  │
 //! ├─ StepExecution ───────────────┤  Runtime layer (cursor/progress)
 //! │  cursor, execution_slots,     │  Mutable during execution
@@ -94,7 +94,7 @@ impl Default for SchedulingContract {
     }
 }
 
-/// Step identity and execution timeout, immutable after creation.
+/// Step identity and timeout; session adoption may rebind identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepDescriptor {
     pub step_id: String,
@@ -161,7 +161,7 @@ pub enum MemoryGovernanceAction {
 }
 
 /// Composite Step = descriptor + execution + idempotency key.
-/// This is the full Step passed between Scheduler and Agent.
+/// The recorder updates execution progress and captures recovery state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     pub descriptor: StepDescriptor,

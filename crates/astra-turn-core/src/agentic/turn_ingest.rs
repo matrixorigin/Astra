@@ -544,11 +544,21 @@ mod tests {
             p.current_session_id.as_deref(),
             Some("authoritative-session")
         );
-        let summary = p.step_recorder.summary();
-        assert_eq!(summary.user_id, TEST_USER_ID);
-        assert_eq!(
-            summary.session_id, "ephemeral",
-            "a session-only frame may update in-memory identity, but it cannot persist recorder events"
+        assert!(
+            p.step_recorder
+                .current_step()
+                .unwrap()
+                .step_id()
+                .starts_with("ephemeral-run-")
+        );
+        assert!(
+            astra_pipeline::step_checkpoint::FileBackedEventStore::new(
+                TEST_USER_ID,
+                "authoritative-session"
+            )
+            .all_events()
+            .is_empty(),
+            "a session-only frame must not persist recorder events"
         );
 
         // A later frame carrying both identities establishes the durable run
@@ -583,8 +593,25 @@ mod tests {
             p.ingest_mut(),
         );
         assert_eq!(outcome, AgenticTurnIngestOutcome::Break);
-        let summary = p.step_recorder.summary();
-        assert_eq!(summary.session_id, "authoritative-session");
+        assert!(
+            p.step_recorder
+                .current_step()
+                .unwrap()
+                .step_id()
+                .starts_with("authoritative-session-run-")
+        );
+        let persisted = astra_pipeline::step_checkpoint::FileBackedEventStore::new(
+            TEST_USER_ID,
+            "authoritative-session",
+        );
+        assert!(!persisted.all_events().is_empty());
+        assert!(
+            persisted
+                .all_events()
+                .iter()
+                .all(|event| event.run_id == "authoritative-run"
+                    && event.step_id.starts_with("authoritative-session-run-"))
+        );
         assert!(!p.step_recorder.events().is_empty());
         assert!(
             p.step_recorder
