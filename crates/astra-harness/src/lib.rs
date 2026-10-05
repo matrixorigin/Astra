@@ -1,5 +1,4 @@
 pub mod capability_matrix;
-pub mod forensics;
 mod kernel;
 mod snapshot_diff;
 pub mod trace;
