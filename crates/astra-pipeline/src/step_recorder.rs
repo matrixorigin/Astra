@@ -315,7 +315,7 @@ pub struct StepRecorder {
     tool_timings: HashMap<String, Vec<u64>>,
     /// Phase transitions recorded for debugging
     phase_log: Vec<(u32, StepAction, u64)>,
-    /// Light checkpoint after each tool, heavy after each turn
+    /// Session checkpoint sequence carried across recorder turns
     checkpoint_count: u32,
     /// Optional file-backed persistence (JSONL) for events
     file_store: Option<FileBackedEventStore>,
@@ -1424,7 +1424,7 @@ impl StepRecorder {
     }
 
     /// Build a light checkpoint from current recorder state.
-    /// Light checkpoints capture cursor position only — fast, small, frequent.
+    /// Captures the cursor and metadata embedded in a heavy recovery checkpoint.
     pub fn build_light_checkpoint(&self) -> Option<LightCheckpoint> {
         let step = self.current_step.as_ref()?;
         Some(LightCheckpoint {
@@ -2438,13 +2438,13 @@ mod tests {
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
         let sid = "test-cp-resume";
 
-        let light = crate::step_protocol::StepCheckpoint::light(
+        let earlier = crate::step_protocol::StepCheckpoint::heavy(
             "step-3".to_string(),
             "task-1".to_string(),
             sid.to_string(),
             crate::step_protocol::ExecutionCursor::default(),
         );
-        crate::step_checkpoint::write_step_checkpoint(TEST_USER_ID, sid, 3, &light).unwrap();
+        crate::step_checkpoint::write_step_checkpoint(TEST_USER_ID, sid, 3, &earlier).unwrap();
         let heavy = crate::step_protocol::StepCheckpoint::heavy(
             "step-5".to_string(),
             "task-1".to_string(),

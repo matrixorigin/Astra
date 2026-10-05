@@ -1,4 +1,4 @@
-//! Step Protocol v2: Slot-based execution, tiered checkpoints, DB-first events.
+//! Step Protocol v2: Slot-based execution, recovery checkpoints, DB-first events.
 //!
 //! # Architecture: 3 Concerns, 3 Types
 //!
@@ -9,9 +9,9 @@
 //! ├─ StepExecution ───────────────┤  Runtime layer (cursor/progress)
 //! │  cursor, execution_slots,     │  Mutable during execution
 //! │  result, memory_context       │
-//! ├─ StepCheckpoint ──────────────┤  Persistence layer (2-tier)
-//! │  Light: cursor + metadata     │  Frequent, cheap
-//! │  Heavy: + messages + results  │  Infrequent, full recovery
+//! ├─ StepCheckpoint ──────────────┤  Persistence layer
+//! │  Light: cursor + metadata     │  Embedded cursor
+//! │  Heavy: + messages + results  │  Durable, full recovery
 //! └───────────────────────────────┘
 //! ```
 //!
@@ -19,8 +19,7 @@
 //!
 //! - **Versioned**: checkpoints must match the current protocol exactly.
 //! - **Slot-based cursor**: `ExecutionSlot` per tool (state machine), not sequential index.
-//! - **Tiered checkpoints**: `LightCheckpoint` (frequent) + `HeavyCheckpoint` (full recovery).
-//! - **Checkpoint strategy**: `CheckpointTrigger` maps events to Light/Heavy tier.
+//! - **Recovery checkpoints**: `HeavyCheckpoint` embeds the `LightCheckpoint` cursor.
 //! - **Semantic idempotency**: Keys optionally include `workspace_version` + `memory_snapshot_id`.
 //! - **IdempotencyCache trait**: pluggable backends (InMemory, MatrixOne).
 //! - **Wait triggers**: `WaitTrigger` (User/Webhook/Timer) with `continuation_token`.
@@ -31,7 +30,6 @@
 //!
 //! - **Memory governance**: `MemoryGovernanceAction` enum carried in `MemoryContext` for lifecycle tracking.
 //! - **IdempotencyCache trait**: Abstraction over in-memory and MatrixOne-backed caches.
-//! - **Checkpoint triggers**: `CheckpointTrigger` / `CheckpointTier` for strategy-driven checkpointing.
 //! - **Canonical idempotency keys**: `compute_idempotency_key` uses `canonical_json` for determinism.
 
 use serde::{Deserialize, Serialize};
@@ -607,7 +605,7 @@ impl ExecutionCursor {
 // ─── Checkpoint (Tiered: Light / Heavy) ──────────────────────────────────────
 
 /// Light checkpoint: cursor + metadata only.
-/// Written frequently (every tool completion), cheap to serialize.
+/// Embedded in heavy recovery checkpoints; not persisted as a standalone file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightCheckpoint {
     pub protocol_version: u32,
@@ -1032,32 +1030,7 @@ impl StepCheckpoint {
     }
 }
 
-// ─── Checkpoint Trigger Strategy ─────────────────────────────────────────────
-
-/// When to write checkpoints. Enforced by the execution engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CheckpointTrigger {
-    /// After every slot completion → LightCheckpoint
-    SlotCompleted,
-    /// On phase transition (Perceive→Plan→Act→Evaluate) → HeavyCheckpoint
-    PhaseTransition,
-    /// Before expensive operations (LLM call, bash) → LightCheckpoint
-    BeforeExpensiveOp,
-    /// Explicit user/system request → HeavyCheckpoint
-    Explicit,
-}
-
-impl CheckpointTrigger {
-    /// What tier of checkpoint should this trigger produce?
-    pub fn checkpoint_tier(&self) -> CheckpointTier {
-        match self {
-            Self::SlotCompleted | Self::BeforeExpensiveOp => CheckpointTier::Light,
-            Self::PhaseTransition | Self::Explicit => CheckpointTier::Heavy,
-        }
-    }
-}
-
-/// Tier of checkpoint produced by a trigger.
+/// Tier of a persisted checkpoint artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheckpointTier {
     Light,
@@ -2907,43 +2880,6 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert!(cache.check(&old).is_none());
         assert_eq!(cache.check(&new).unwrap().output, "new");
-    }
-
-    // ── Checkpoint Trigger Strategy ──
-
-    #[test]
-    fn checkpoint_trigger_tier_mapping() {
-        assert_eq!(
-            CheckpointTrigger::SlotCompleted.checkpoint_tier(),
-            CheckpointTier::Light
-        );
-        assert_eq!(
-            CheckpointTrigger::BeforeExpensiveOp.checkpoint_tier(),
-            CheckpointTier::Light
-        );
-        assert_eq!(
-            CheckpointTrigger::PhaseTransition.checkpoint_tier(),
-            CheckpointTier::Heavy
-        );
-        assert_eq!(
-            CheckpointTrigger::Explicit.checkpoint_tier(),
-            CheckpointTier::Heavy
-        );
-    }
-
-    #[test]
-    fn checkpoint_trigger_serde_roundtrip() {
-        let triggers = [
-            CheckpointTrigger::SlotCompleted,
-            CheckpointTrigger::PhaseTransition,
-            CheckpointTrigger::BeforeExpensiveOp,
-            CheckpointTrigger::Explicit,
-        ];
-        for t in &triggers {
-            let json = serde_json::to_string(t).unwrap();
-            let restored: CheckpointTrigger = serde_json::from_str(&json).unwrap();
-            assert_eq!(&restored, t);
-        }
     }
 
     // ── Canonical JSON Consistency ──

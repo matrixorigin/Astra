@@ -2084,7 +2084,13 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_batch_records_tool_starts_before_terminal_events() {
+        let journal = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal.path());
         let mut harness = PipelineHarness::new();
+        let session_id = harness.session_id.clone();
+        let run_id = harness.run_id.clone();
+        harness.step_recorder =
+            StepRecorder::with_persistence_for_run("test-user", &session_id, "test-task", &run_id);
         harness.edge_tool_round.push(EdgeToolExecResult {
             execution_completion: None,
             request_id: String::new(),
@@ -2099,6 +2105,9 @@ mod tests {
 
         {
             let mut pipeline = harness.pipeline();
+            pipeline.ctx.current_user_id = Some("test-user");
+            pipeline.ctx.current_session_id = Some(&session_id);
+            pipeline.ctx.current_run_id = Some(&run_id);
             assert!(
                 pipeline
                     .run_batch_concurrent(&[
@@ -2147,6 +2156,27 @@ mod tests {
                 .and_then(|payload| payload.get("elapsed_ms"))
                 .and_then(Value::as_u64),
             Some(7)
+        );
+        let persisted =
+            astra_pipeline::step_checkpoint::FileBackedEventStore::new("test-user", &session_id);
+        let persisted_tools: Vec<_> = persisted
+            .all_events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    astra_pipeline::step_protocol::StepEventType::ToolCallStarted
+                        | astra_pipeline::step_protocol::StepEventType::ToolCallCompleted
+                )
+            })
+            .map(|event| (event.event_type.clone(), event.payload.clone()))
+            .collect();
+        assert_eq!(persisted_tools, tool_events);
+        assert!(
+            !astra_pipeline::step_checkpoint::owner_session_dir_for("test-user", &session_id,)
+                .unwrap()
+                .join("step_checkpoints")
+                .exists()
         );
     }
 

@@ -47,6 +47,14 @@ The execution checkpoint reader accepts only the exact current protocol version.
 Same-major versions are not implicitly compatible; a mismatch fails restoration
 before execution. There is no version-negotiation or migration path.
 
+Checkpoint scheduling belongs to the actual execution hooks. The unused
+`CheckpointTrigger` source API has been retired; it did not drive scheduling.
+The unused per-file `delete_step_checkpoint` API has also been retired; composite
+index retention and session deletion continue to own checkpoint cleanup.
+Local persistence accepts heavy recovery checkpoints only. Tool completion is
+recorded in the event journal; its cursor remains embedded in the next heavy
+checkpoint. Standalone light files, their reader and pruning have been retired.
+
 Checkpoint must include enough information to resume safely:
 
 - current stage;

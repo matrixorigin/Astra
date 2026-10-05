@@ -14,7 +14,6 @@ use astra_turn_core::headless_tool_journal::journal_record_executed_tool_call;
 use astra_turn_core::headless_tool_postprocess::{
     HeadlessCacheableRecordCtx, format_headless_tool_duration,
     record_headless_cacheable_success_and_semantic_hint_if_ok,
-    try_write_light_headless_step_checkpoint,
 };
 use astra_turn_core::headless_tool_status_display::{
     tool_call_detail, tool_error_summary, tool_result_summary,
@@ -1064,11 +1063,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 );
         }
         self.executed_this_turn += 1;
-
-        if let (Some(user_id), Some(sid)) = (self.ctx.current_user_id, self.ctx.current_session_id)
-        {
-            try_write_light_headless_step_checkpoint(user_id, sid, self.ctx.step_recorder);
-        }
 
         let observed_workspace_mutation = self.ctx.tool_call_records.last().is_some_and(|record| {
             record.name == "bash"

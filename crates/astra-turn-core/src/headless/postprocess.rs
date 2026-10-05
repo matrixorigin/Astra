@@ -6,9 +6,8 @@ use crate::guardrails::error_recovery::{ErrorCategory, build_recovery_message_wi
 use crate::guardrails::turn_guard::TurnGuard;
 use crate::headless_tool_assembly::{HeadlessRoundToolIdx, headless_timeout_aborted_tool_names};
 use crate::result_quality::ResultQuality;
-use astra_pipeline::step_checkpoint;
 use astra_pipeline::step_protocol::{
-    CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache, StepCheckpoint, epoch_ms,
+    CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache, epoch_ms,
 };
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
@@ -252,19 +251,6 @@ pub fn record_headless_cacheable_success_and_semantic_hint(
         )
     {
         ctx.advisories.push(hint);
-    }
-}
-
-/// Best-effort light checkpoint after each tool (matches CLI headless path).
-pub fn try_write_light_headless_step_checkpoint(
-    user_id: &str,
-    session_id: &str,
-    step_recorder: &StepRecorder,
-) {
-    if let Some(light) = step_recorder.build_light_checkpoint() {
-        let cp = StepCheckpoint::Light(light);
-        let n = step_recorder.summary().checkpoints;
-        let _ = step_checkpoint::write_step_checkpoint(user_id, session_id, n, &cp);
     }
 }
 
