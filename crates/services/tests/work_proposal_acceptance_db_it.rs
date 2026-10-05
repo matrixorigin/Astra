@@ -5,8 +5,8 @@ use astra_services::work::{
     WorkBranchId, WorkBranchRevision, WorkChangeRef, WorkContentHash, WorkGoal, WorkGoalChange,
     WorkGraphChange, WorkGraphItemChange, WorkId, WorkItemDeclarationState, WorkItemEdge,
     WorkItemEdgeKind, WorkItemId, WorkItemKind, WorkItemRevision, WorkItemRevisionChange,
-    WorkItemRevisionRef, WorkItemText, WorkOwnerId, WorkPlanProposalAcceptance, WorkProposalId,
-    WorkProposalSourceKind, WorkProposalStatus, WorkRepository, WorkRepositoryError, WorkRevision,
+    WorkItemRevisionRef, WorkItemText, WorkOwnerId, WorkProposalId, WorkProposalSourceKind,
+    WorkProposalStatus, WorkRepository, WorkRepositoryError, WorkRevision,
 };
 use sqlx::Row;
 
@@ -68,25 +68,6 @@ fn proposal(
     }
 }
 
-fn acceptance(
-    recorded: &astra_services::work::RecordedWorkPlanProposal,
-    resolution_ref: &str,
-) -> WorkPlanProposalAcceptance {
-    WorkPlanProposalAcceptance {
-        owner_id: recorded.proposal.owner_id.clone(),
-        work_id: recorded.proposal.work_id.clone(),
-        branch_id: recorded.proposal.branch_id.clone(),
-        proposal_id: recorded.proposal.proposal_id.clone(),
-        payload_hash: recorded.payload_hash.clone(),
-        expected_work_revision: recorded.proposal.expected_work_revision,
-        expected_goal_revision: recorded.proposal.expected_goal_revision,
-        expected_criteria_set_revision: recorded.proposal.expected_criteria_set_revision,
-        expected_branch_revision: recorded.proposal.expected_branch_revision,
-        expected_graph_revision: recorded.proposal.expected_graph_revision,
-        resolution_ref: WorkChangeRef::parse(resolution_ref).expect("resolution"),
-    }
-}
-
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_idempotent() {
@@ -131,7 +112,7 @@ async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_id
     plan.expected_branch_revision = rooted.parts().branch_revision;
     plan.expected_graph_revision = rooted.parts().current_graph_revision;
     let proposed = repository.propose_plan(plan).await.expect("proposal");
-    let command = acceptance(&proposed, &common::id("root-action"));
+    let command = common::plan_acceptance(&proposed, &common::id("root-action"));
     let mut wrong_hash = command.clone();
     wrong_hash.payload_hash =
         WorkContentHash::parse(format!("sha256:{}", "f".repeat(64))).expect("different hash");
@@ -266,7 +247,8 @@ async fn concurrent_acceptance_materializes_one_graph_revision_and_is_exactly_id
         "idempotent acceptance returns its original immutable result"
     );
 
-    let different_resolution = acceptance(&proposed, &common::id("different-root-action"));
+    let different_resolution =
+        common::plan_acceptance(&proposed, &common::id("different-root-action"));
     assert!(matches!(
         repository.accept_plan_proposal(different_resolution).await,
         Err(WorkRepositoryError::WorkProposalAlreadyResolved {
@@ -303,7 +285,10 @@ async fn replan_creates_successor_item_revisions_and_removes_dependencies_atomic
         .await
         .expect("initial proposal");
     let first = repository
-        .accept_plan_proposal(acceptance(&first, &common::id("initial-acceptance")))
+        .accept_plan_proposal(common::plan_acceptance(
+            &first,
+            &common::id("initial-acceptance"),
+        ))
         .await
         .expect("initial acceptance");
     let first_resolution = first.resolution.expect("initial resolution");
@@ -352,7 +337,10 @@ async fn replan_creates_successor_item_revisions_and_removes_dependencies_atomic
         .await
         .expect("replan proposal");
     let accepted = repository
-        .accept_plan_proposal(acceptance(&replan, &common::id("replan-acceptance")))
+        .accept_plan_proposal(common::plan_acceptance(
+            &replan,
+            &common::id("replan-acceptance"),
+        ))
         .await
         .expect("replan acceptance");
     let result_graph_revision = accepted
@@ -638,7 +626,10 @@ async fn stale_and_expired_acceptance_never_leave_graph_residue() {
         .expect("revise goal");
     assert!(matches!(
         repository
-            .accept_plan_proposal(acceptance(&proposed, &common::id("root-action")))
+            .accept_plan_proposal(common::plan_acceptance(
+                &proposed,
+                &common::id("root-action")
+            ))
             .await,
         Err(WorkRepositoryError::InvalidWorkProposalBasis {
             resource: astra_services::work::WorkProposalBasisResource::WorkRevision
@@ -683,7 +674,10 @@ async fn stale_and_expired_acceptance_never_leave_graph_residue() {
     .expect("expire pending proposal");
     assert!(matches!(
         repository
-            .accept_plan_proposal(acceptance(&proposed, &common::id("expired-action")))
+            .accept_plan_proposal(common::plan_acceptance(
+                &proposed,
+                &common::id("expired-action")
+            ))
             .await,
         Err(WorkRepositoryError::WorkProposalAlreadyResolved {
             status: WorkProposalStatus::Expired
@@ -758,7 +752,10 @@ async fn acceptance_event_conflict_rolls_back_graph_items_branch_and_proposal() 
     .expect("inject graph event identity conflict");
     assert!(matches!(
         repository
-            .accept_plan_proposal(acceptance(&proposed, &common::id("root-action")))
+            .accept_plan_proposal(common::plan_acceptance(
+                &proposed,
+                &common::id("root-action")
+            ))
             .await,
         Err(WorkRepositoryError::Conflict {
             resource: astra_services::work::WorkConflictResource::WorkEventIdentity
@@ -839,7 +836,10 @@ async fn acceptance_racing_direct_graph_change_has_one_complete_winner() {
         reason: None,
     };
     let (accepted, replaced) = tokio::join!(
-        repository.accept_plan_proposal(acceptance(&proposed, &common::id("root-action"))),
+        repository.accept_plan_proposal(common::plan_acceptance(
+            &proposed,
+            &common::id("root-action")
+        )),
         repository.replace_graph(direct)
     );
     let acceptance_won = accepted.is_ok();
