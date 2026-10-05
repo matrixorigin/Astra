@@ -276,7 +276,9 @@ make check
 
 Saved configuration versions are inspected locally with `astra config version`
 (`list`, `show`, `diff`, and `current`). There is no configuration cloud-pull
-command; Server ingestion retains owner-scoped version evidence.
+command. Configuration changes retain their version IDs in the canonical
+journal; full configuration bodies remain in the local version store. The old
+cloud body mirror and its dedicated ingestion protocol are retired.
 
 The local version index uses one JSON record per nonempty line. Inspection
 reports a corrupt row instead of returning a partially decoded index.

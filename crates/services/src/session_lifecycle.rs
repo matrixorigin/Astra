@@ -145,10 +145,6 @@ const SESSION_DELETE_ORPHAN_MANIFEST_REFERENCES_SQL: &str =
 const SESSION_DELETE_WORKSPACE_CLEANUP_DEBT_MESSAGE: &str =
     "session hard delete requested cloud workspace cleanup";
 
-const SESSION_CLEAR_CONFIG_VERSION_FIRST_SEEN_SESSION_SQL: &str = "UPDATE config_versions \
-     SET first_seen_session = NULL \
-     WHERE user_id = ? AND first_seen_session = ?";
-
 const SESSION_DELETE_SESSION_ORIGIN_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "session_state_item_events",
@@ -610,7 +606,6 @@ pub(crate) struct SessionTableDeleteOutcome {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SessionDatabaseDeleteOutcome {
     pub rows_deleted: u64,
-    pub session_references_cleared: u64,
     pub workspace_cleanup_debts_enqueued: u64,
     pub tables: Vec<SessionTableDeleteOutcome>,
 }
@@ -784,20 +779,6 @@ async fn enqueue_workspace_cleanup_debts_for_session_delete(
     }
 
     Ok(enqueued)
-}
-
-async fn clear_session_provenance_references(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    session_id: &str,
-    user_id: &str,
-) -> Result<u64, String> {
-    query(SESSION_CLEAR_CONFIG_VERSION_FIRST_SEEN_SESSION_SQL)
-        .bind(user_id)
-        .bind(session_id)
-        .execute(&mut **tx)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(|source| format!("delete_session.config_versions.first_seen_session: {source}"))
 }
 
 async fn delete_child_fork_state(
@@ -992,8 +973,6 @@ pub(crate) async fn hard_delete_session_rows(
 
     outcome.workspace_cleanup_debts_enqueued =
         enqueue_workspace_cleanup_debts_for_session_delete(tx, session_id, user_id).await?;
-    outcome.session_references_cleared =
-        clear_session_provenance_references(tx, session_id, user_id).await?;
 
     // A child fork owns the pin that keeps its parent's exact prefix alive.
     // Remove that dependency before deleting the child; parent deletion keeps
@@ -1161,7 +1140,6 @@ pub(crate) async fn hard_delete_session_rows(
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SessionHardDeleteOutcome {
     pub database_rows_deleted: u64,
-    pub session_references_cleared: u64,
     pub workspace_cleanup_debts_enqueued: u64,
     pub database_tables_deleted: Vec<SessionTableDeleteOutcome>,
     pub local_bytes_freed: u64,
@@ -1473,7 +1451,6 @@ pub(crate) async fn hard_delete_session(
 
     let mut outcome = SessionHardDeleteOutcome {
         database_rows_deleted: database_delete.rows_deleted,
-        session_references_cleared: database_delete.session_references_cleared,
         workspace_cleanup_debts_enqueued: database_delete.workspace_cleanup_debts_enqueued,
         database_tables_deleted: database_delete.tables,
         database_delete_ms,
@@ -1629,7 +1606,6 @@ mod tests {
     fn session_database_delete_outcome_fails_loudly_on_row_total_overflow() {
         let mut outcome = SessionDatabaseDeleteOutcome {
             rows_deleted: u64::MAX,
-            session_references_cleared: 0,
             workspace_cleanup_debts_enqueued: 0,
             tables: Vec::new(),
         };

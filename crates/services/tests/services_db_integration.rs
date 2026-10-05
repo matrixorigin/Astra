@@ -1932,11 +1932,6 @@ fn deleted_rows_for_table(details: &serde_json::Value, label: &str) -> u64 {
         .unwrap_or_else(|| panic!("database_tables_deleted.{label}.rows_deleted must be u64"))
 }
 
-fn config_version_fixture_id() -> String {
-    let uuid_hex = Uuid::new_v4().simple().to_string();
-    format!("cfg_{}", &uuid_hex[..20])
-}
-
 async fn cleanup_session_delete_fixture_for_owner(
     pool: &sqlx::Pool<sqlx::MySql>,
     user_id: &str,
@@ -7733,21 +7728,9 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     let owner_workspace_without_debt_id = format!("workspace-{}", Uuid::new_v4());
     let foreign_workspace_id = format!("workspace-{}", Uuid::new_v4());
     let owner_cleanup_debt_id = format!("debt-{}", Uuid::new_v4());
-    let owner_config_version_id = config_version_fixture_id();
-    let foreign_config_version_id = config_version_fixture_id();
 
     cleanup_session_delete_fixture_for_owner(&pool, &owner_user_id, &session_id).await;
     cleanup_session_delete_fixture_for_owner(&pool, &other_user_id, &session_id).await;
-    for (user_id, version_id) in [
-        (&owner_user_id, &owner_config_version_id),
-        (&other_user_id, &foreign_config_version_id),
-    ] {
-        let _ = sqlx::query("DELETE FROM config_versions WHERE user_id = ? AND version_id = ?")
-            .bind(user_id)
-            .bind(version_id)
-            .execute(&pool)
-            .await;
-    }
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
@@ -8028,24 +8011,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     .await
     .expect("insert unresolved cleanup debt");
 
-    for (user_id, version_id, marker) in [
-        (&owner_user_id, &owner_config_version_id, "owner"),
-        (&other_user_id, &foreign_config_version_id, "foreign"),
-    ] {
-        sqlx::query(
-            "INSERT INTO config_versions \
-             (version_id, user_id, toml_body, created_at, first_seen_session) \
-             VALUES (?, ?, ?, NOW(6), ?)",
-        )
-        .bind(version_id)
-        .bind(user_id)
-        .bind(format!("model = \"{marker}\""))
-        .bind(&session_id)
-        .execute(&pool)
-        .await
-        .expect("insert config version provenance");
-    }
-
     let decision_service = DatabaseDecisionService::new(settings.clone()).with_pool(shared.clone());
     let retained_request = DecisionCreateRequestData {
         session_id: session_id.clone(),
@@ -8072,13 +8037,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     assert_eq!(error.1.0.detail, format!("Session {session_id} not found"));
 
     let delete_audit = load_session_delete_audit_details(&pool, &owner_user_id, &session_id).await;
-    assert_eq!(
-        delete_audit
-            .get("session_references_cleared")
-            .and_then(serde_json::Value::as_u64),
-        Some(1),
-        "session delete audit must report live config_versions provenance cleanup"
-    );
     assert_eq!(
         delete_audit
             .get("workspace_cleanup_debts_enqueued")
@@ -8277,49 +8235,8 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         "session delete must enqueue cleanup debt before deleting cloud workspace records"
     );
 
-    let owner_first_seen_session: Option<String> = sqlx::query(
-        "SELECT first_seen_session FROM config_versions WHERE user_id = ? AND version_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&owner_config_version_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load owner config version")
-    .try_get("first_seen_session")
-    .expect("decode owner first_seen_session");
-    assert!(
-        owner_first_seen_session.is_none(),
-        "session delete must clear owner config version session provenance"
-    );
-
-    let foreign_first_seen_session: Option<String> = sqlx::query(
-        "SELECT first_seen_session FROM config_versions WHERE user_id = ? AND version_id = ?",
-    )
-    .bind(&other_user_id)
-    .bind(&foreign_config_version_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load foreign config version")
-    .try_get("first_seen_session")
-    .expect("decode foreign first_seen_session");
-    assert_eq!(
-        foreign_first_seen_session.as_deref(),
-        Some(session_id.as_str()),
-        "owner delete must not clear foreign config version provenance"
-    );
-
     cleanup_session_delete_fixture_for_owner(&pool, &other_user_id, &session_id).await;
     cleanup_session_delete_fixture_for_owner(&pool, &owner_user_id, &session_id).await;
-    for (user_id, version_id) in [
-        (&owner_user_id, &owner_config_version_id),
-        (&other_user_id, &foreign_config_version_id),
-    ] {
-        let _ = sqlx::query("DELETE FROM config_versions WHERE user_id = ? AND version_id = ?")
-            .bind(user_id)
-            .bind(version_id)
-            .execute(&pool)
-            .await;
-    }
 }
 
 #[tokio::test(flavor = "current_thread")]

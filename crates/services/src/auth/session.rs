@@ -443,7 +443,6 @@ pub struct DatabaseSessionService {
 struct SessionDeletionOutcome {
     session: SessionRecord,
     database_rows_deleted: u64,
-    session_references_cleared: u64,
     workspace_cleanup_debts_enqueued: u64,
     database_tables_deleted: Vec<SessionTableDeleteOutcome>,
     local_bytes_freed: u64,
@@ -656,7 +655,6 @@ impl DatabaseSessionService {
         Ok(SessionDeletionOutcome {
             session: existing,
             database_rows_deleted: hard_delete.database_rows_deleted,
-            session_references_cleared: hard_delete.session_references_cleared,
             workspace_cleanup_debts_enqueued: hard_delete.workspace_cleanup_debts_enqueued,
             database_tables_deleted: hard_delete.database_tables_deleted,
             local_bytes_freed: hard_delete.local_bytes_freed,
@@ -1004,7 +1002,6 @@ impl SessionService for DatabaseSessionService {
         let details = serde_json::json!({
             "title": outcome.session.title,
             "database_rows_deleted": outcome.database_rows_deleted,
-            "session_references_cleared": outcome.session_references_cleared,
             "workspace_cleanup_debts_enqueued": outcome.workspace_cleanup_debts_enqueued,
             "database_tables_deleted": outcome.database_tables_deleted,
             "local_bytes_freed": outcome.local_bytes_freed,

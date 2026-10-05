@@ -58,14 +58,6 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
         hot_path_hint="cold establishment/recovery path with bounded idempotency lookup",
     ),
     SchemaSource(
-        owner="astra_services::config_version_cloud",
-        domain="config_versions",
-        path="crates/services/src/config_version_cloud.rs",
-        startup_owner="ensure_core_schema via CONFIG_VERSIONS_CREATE_SQL",
-        state_class_hint="durable fact",
-        hot_path_hint="warm append/read",
-    ),
-    SchemaSource(
         owner="astra_messaging::db_transport",
         domain="messaging",
         path="crates/astra-messaging/src/db_transport.rs",
@@ -540,16 +532,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="do not merge with transcript or audit events; it serves model-context reconstruction",
         migration_owner="astra_turn_core::conversation_log",
         product_owner="LLM context assembly and session continuity",
-    ),
-    "config_versions": TableMetadata(
-        semantic_owner="astra_services::config_version_cloud / event_ingestion",
-        state_class="durable tenant config version fact",
-        primary_query="config version fetch by user_id/version_id and recent version list by user_id/created_at",
-        retention_policy="retain while cloud config sync, first_seen_session linkage, and rollback/history need the TOML body; session hard delete clears first_seen_session without deleting the version fact",
-        rebuildability="not rebuildable after toml_body is removed unless the same local config version still exists outside the database",
-        merge_guidance="keep separate from agent_events; event ingestion may dual-write discovery events, but config_versions owns idempotent version fetch by user_id/version_id",
-        migration_owner="astra_services::config_version_cloud",
-        product_owner="cloud config sync and config rollback/history",
     ),
     "session_transcript_items": TableMetadata(
         semantic_owner="runtime run lifecycle persistence",

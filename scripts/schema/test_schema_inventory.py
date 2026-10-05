@@ -53,7 +53,6 @@ class SchemaInventoryTest(unittest.TestCase):
             "llm_provider_admission_windows": "runtime_admission",
             "workspace_records": "workspace_records",
             "workspace_cleanup_debts": "workspace_records",
-            "config_versions": "config_versions",
         }
         for table, domain in expected.items():
             with self.subTest(table=table):
@@ -454,7 +453,6 @@ fn char_literal() { let slash = '/'; }
 
     def test_state_task_workspace_tables_have_semantic_metadata(self) -> None:
         second_batch = {
-            "config_versions",
             "context_manifests",
             "session_device_leases",
             "session_device_lease_events",
@@ -836,6 +834,7 @@ fn char_literal() { let slash = '/'; }
 
     def test_retired_session_projection_tables_are_absent_from_production_schema(self) -> None:
         retired = {
+            "config_versions",
             "plan_step_runs",
             "session_state_revisions",
             "session_history_chunks",

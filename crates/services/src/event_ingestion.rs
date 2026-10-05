@@ -512,51 +512,6 @@ impl IngestionEvent {
         Self::from_journal_event_with_redact(event, user_id, false)
     }
 
-    /// Build an `IngestionEvent` that carries a saved config version
-    /// to the cloud. The worker classifier uses the event_type tag
-    /// (see `config_version_cloud::CONFIG_VERSION_SAVED_EVENT_TYPE`)
-    /// to dual-write: agent_events row AND config_versions row.
-    ///
-    /// Event id == version id so hash-fenced agent-event insertion also
-    /// handles exact replay — pushing the same config twice records "the fact
-    /// of pushing it" exactly once on both tables.
-    pub fn for_config_version(
-        row: &crate::config_version_cloud::ConfigVersionPayload,
-    ) -> Result<Self, String> {
-        let session_id = row
-            .first_seen_session
-            .as_deref()
-            .map(str::trim)
-            .filter(|session_id| !session_id.is_empty())
-            .ok_or_else(|| {
-                format!(
-                    "config version push requires first_seen_session for version_id={}",
-                    row.version_id
-                )
-            })?;
-        Ok(Self {
-            event_id: row.version_id.clone(),
-            session_id: session_id.to_string(),
-            user_id: row.user_id.clone(),
-            event_type: crate::config_version_cloud::CONFIG_VERSION_SAVED_EVENT_TYPE.to_string(),
-            content: Some(row.toml_body.clone()),
-            token_usage: None,
-            llm_model_used: None,
-            skill_name: None,
-            metadata: None,
-            // Cloud side uses the server's CURRENT_TIMESTAMP default
-            // for `config_versions.created_at`; this field is carried
-            // for `agent_events.created_at` to stay consistent with
-            // other rows in the same batch.
-            created_at: chrono::Utc::now().to_rfc3339(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: None,
-            history_work_queue_reservation: None,
-            ingestion_enqueued_at: None,
-        })
-    }
-
     /// Like [`from_journal_event`] but optionally replaces the `content` field
     /// with a deterministic privacy marker when `redact_content == true`.
     pub fn from_journal_event_with_redact(
@@ -1768,14 +1723,8 @@ struct TokenUsageDbFields {
 
 impl<'a> IngestionEventInsertValues<'a> {
     fn from_event(event: &'a IngestionEvent) -> Result<Self, String> {
-        let mut complete_payload = serde_json::to_value(event)
+        let complete_payload = serde_json::to_value(event)
             .map_err(|error| format!("serialize complete ingestion event payload: {error}"))?;
-        if event.event_type == crate::config_version_cloud::CONFIG_VERSION_SAVED_EVENT_TYPE {
-            // ConfigVersionPayload has no occurrence timestamp. Its queued
-            // created_at is delivery time, regenerated on every reconstruction,
-            // whereas version_id and content are the durable identity.
-            complete_payload["created_at"] = Value::Null;
-        }
         let payload_hash = canonical_observation_payload_hash(
             ObservationPayloadDomain::AgentEvent,
             &complete_payload,
@@ -2946,26 +2895,6 @@ impl EventIngestionWorker {
             .map_err(|e| format!("session close for {session_id}: {e}"))?;
         }
 
-        // Step 4b: dual-write config-version events into the
-        // `config_versions` table. Only events classified as newly inserted
-        // reach this projection. The content-addressed PK remains a secondary
-        // safeguard, and the shared transaction keeps the agent_events row
-        // and config_versions row atomic.
-        for event in inserted_events {
-            let Some(payload) = crate::config_version_cloud::extract_config_version_payload(event)?
-            else {
-                continue;
-            };
-            sqlx::query(crate::config_version_cloud::CONFIG_VERSIONS_INSERT_SQL)
-                .bind(&payload.version_id)
-                .bind(&payload.user_id)
-                .bind(&payload.toml_body)
-                .bind(payload.first_seen_session.as_deref())
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| format!("config_versions insert for {}: {e}", payload.version_id))?;
-        }
-
         for observation in events.iter().filter_map(delivery_observation) {
             observation.commit_started();
         }
@@ -3802,7 +3731,7 @@ mod tests {
             "agent_cancelled",
             "agent_interrupted",
             "sync_marker",
-            crate::config_version_cloud::CONFIG_VERSION_SAVED_EVENT_TYPE,
+            "config_change",
         ] {
             assert_eq!(
                 ingestion_event_priority_for_type(event_type),
@@ -5031,36 +4960,6 @@ mod tests {
         event.skill_name = Some(" ".to_string());
         let values = IngestionEventInsertValues::from_event(&event).expect("valid event");
         assert_eq!(values.skill_name, None);
-    }
-
-    #[test]
-    fn reconstructed_config_version_delivery_time_is_not_new_content() {
-        let row = crate::config_version_cloud::ConfigVersionPayload {
-            version_id: "config-version".into(),
-            user_id: "owner".into(),
-            toml_body: "model = 'example'".into(),
-            first_seen_session: Some("session".into()),
-        };
-        let mut first = IngestionEvent::for_config_version(&row).unwrap();
-        let mut retry = IngestionEvent::for_config_version(&row).unwrap();
-        first.created_at = "2026-01-01T00:00:00Z".into();
-        retry.created_at = "2026-01-02T00:00:00Z".into();
-        let first_hash = IngestionEventInsertValues::from_event(&first)
-            .unwrap()
-            .payload_hash;
-        assert_eq!(
-            first_hash,
-            IngestionEventInsertValues::from_event(&retry)
-                .unwrap()
-                .payload_hash
-        );
-        retry.content = Some("model = 'changed'".into());
-        assert_ne!(
-            first_hash,
-            IngestionEventInsertValues::from_event(&retry)
-                .unwrap()
-                .payload_hash
-        );
     }
 
     #[test]

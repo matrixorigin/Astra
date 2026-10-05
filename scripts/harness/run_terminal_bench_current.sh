@@ -445,7 +445,6 @@ PY
     crates/services/src/storage.rs
     crates/services/src/work.rs
     crates/services/src/work/establishment_operation.rs
-    crates/services/src/config_version_cloud.rs
     crates/services/src/resource_governor.rs
     crates/services/src/workspace_records.rs
     crates/services/src/context_manifest.rs

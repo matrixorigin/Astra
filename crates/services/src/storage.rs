@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-05-v96";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-05-v97";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -6143,23 +6143,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    // ─── Content-addressed config versions (Step 4a) ────────────────────────────
-    //
-    // One row per unique RuntimeConfig hash per tenant. Populated by
-    // the CLI via enqueue_journal_events → IngestionEvent::ConfigVersionSaved,
-    // retained as owner-scoped forensic configuration evidence. See
-    // `crate::config_version_cloud` for the DDL and ingestion payload contract.
-
-    let config_version_schema = pool.owned_by("config_version_cloud");
-    config_version_schema.authority.declare(
-        config_version_schema.owner,
-        "config_versions",
-        crate::config_version_cloud::CONFIG_VERSIONS_CREATE_SQL,
-    );
-    query(crate::config_version_cloud::CONFIG_VERSIONS_CREATE_SQL)
-        .execute(&config_version_schema)
-        .await?;
-
     verify_core_schema_shape(&pool, &settings.database).await?;
     let declarations = pool.authority.declarations()?;
     publish_core_schema_table_contracts(&pool, &declarations).await?;
