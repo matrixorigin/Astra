@@ -1,10 +1,9 @@
 mod common;
 
 use astra_services::work::{
-    DatabaseWorkRepository, GoalRevision, WorkAttentionCursorAdvance, WorkAttentionCursorKind,
-    WorkChangeReason, WorkChangeRef, WorkConflictResource, WorkEventCoverage, WorkEventPageLimit,
-    WorkEventQuery, WorkEventSeq, WorkGenesis, WorkGoal, WorkGoalChange, WorkId, WorkOwnerId,
-    WorkRepository, WorkRepositoryError, WorkRevision,
+    DatabaseWorkRepository, WorkAttentionCursorAdvance, WorkAttentionCursorKind,
+    WorkConflictResource, WorkEventCoverage, WorkEventPageLimit, WorkEventQuery, WorkEventSeq,
+    WorkGenesis, WorkId, WorkOwnerId, WorkRepository, WorkRepositoryError,
 };
 use sqlx::Row;
 
@@ -19,15 +18,35 @@ fn genesis(owner_id: &str, work_id: &str, branch_id: &str, session_id: &str) -> 
     )
 }
 
-fn goal_change(owner_id: &str, work_id: &str, goal: &str) -> WorkGoalChange {
-    WorkGoalChange {
-        owner_id: WorkOwnerId::parse(owner_id).expect("owner id"),
-        work_id: WorkId::parse(work_id).expect("work id"),
+fn event_proposal(
+    owner_id: &str,
+    work_id: &str,
+    branch_id: &str,
+    objective: &str,
+) -> astra_services::work::NewWorkPlanProposal {
+    use astra_services::work::*;
+    NewWorkPlanProposal {
+        owner_id: WorkOwnerId::parse(owner_id).expect("owner"),
+        work_id: WorkId::parse(work_id).expect("work"),
+        branch_id: WorkBranchId::parse(branch_id).expect("branch"),
+        proposal_id: WorkProposalId::parse(common::id("proposal")).expect("proposal"),
         expected_work_revision: WorkRevision::INITIAL,
         expected_goal_revision: GoalRevision::INITIAL,
-        goal: WorkGoal::parse(goal).expect("goal"),
-        source_ref: WorkChangeRef::parse(common::id("event")).expect("goal change ref"),
-        reason: Some(WorkChangeReason::parse("User clarified the outcome.").expect("reason")),
+        expected_criteria_set_revision: CriterionSetRevision::INITIAL,
+        expected_branch_revision: WorkBranchRevision::INITIAL,
+        expected_graph_revision: GraphRevision::INITIAL,
+        additions: vec![NewWorkItem {
+            item_id: WorkItemId::parse(common::id("task")).expect("task"),
+            kind: WorkItemKind::Task,
+            objective: WorkItemText::parse(objective).expect("objective"),
+            expected_result: WorkItemText::parse("A committed proposal event").expect("result"),
+        }],
+        revisions: Vec::new(),
+        dependencies: Vec::new(),
+        dependency_removals: Vec::new(),
+        source_kind: WorkProposalSourceKind::Model,
+        source_ref: WorkChangeRef::parse(common::id("source")).expect("source"),
+        reason: WorkChangeReason::parse("Exercise the semantic event boundary").expect("reason"),
     }
 }
 
@@ -325,241 +344,17 @@ async fn session_binding_is_owner_scoped_and_same_owner_conflict_rolls_back_ever
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn goal_revision_cas_preserves_branch_basis_and_rejects_stale_or_archived_writes() {
-    let pool = common::setup_pool().await;
-    let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = common::id("owner");
-    let work_id = common::id("work");
-    repository
-        .create_genesis(genesis(
-            &owner_id,
-            &work_id,
-            &common::id("branch"),
-            &common::id("session"),
-        ))
-        .await
-        .expect("Work genesis");
-
-    let change = goal_change(
-        &owner_id,
-        &work_id,
-        "Repair the invariant and prove concurrent safety.",
-    );
-    let updated = repository
-        .revise_goal(change.clone())
-        .await
-        .expect("revise Goal");
-    assert_eq!(updated.work.parts().work_revision.get(), 2);
-    assert_eq!(updated.work.parts().current_goal_revision.get(), 2);
-    assert_eq!(
-        updated.delivery_branch.parts().goal_revision_ref.get(),
-        1,
-        "a Goal change must make the old branch basis explicit, not rewrite history"
-    );
-
-    let goal_row = sqlx::query(
-        "SELECT goal_text, source_kind, source_ref, accepted_by_kind, accepted_by_id, reason
-         FROM work_goal_revisions
-         WHERE owner_id = ? AND work_id = ? AND revision = 2",
-    )
-    .bind(&owner_id)
-    .bind(&work_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("Goal revision 2");
-    assert_eq!(
-        goal_row.try_get::<String, _>("goal_text").expect("goal"),
-        "Repair the invariant and prove concurrent safety."
-    );
-    assert_eq!(
-        goal_row
-            .try_get::<String, _>("source_kind")
-            .expect("source kind"),
-        "user_edit"
-    );
-    assert_eq!(
-        goal_row
-            .try_get::<String, _>("accepted_by_kind")
-            .expect("actor kind"),
-        "user"
-    );
-    assert_eq!(
-        goal_row
-            .try_get::<String, _>("accepted_by_id")
-            .expect("actor id"),
-        owner_id
-    );
-    assert_eq!(
-        goal_row.try_get::<String, _>("reason").expect("reason"),
-        "User clarified the outcome."
-    );
-
-    assert!(matches!(
-        repository.revise_goal(change.clone()).await,
-        Err(WorkRepositoryError::StaleGoalRevision {
-            expected_work_revision,
-            actual_work_revision,
-            expected_goal_revision,
-            actual_goal_revision,
-        }) if expected_work_revision.get() == 1
-            && actual_work_revision.get() == 2
-            && expected_goal_revision.get() == 1
-            && actual_goal_revision.get() == 2
-    ));
-    assert_eq!(
-        count_work_rows(&pool, "work_goal_revisions", &owner_id, &work_id).await,
-        2,
-        "a stale CAS must not leave an orphan Goal revision"
-    );
-
-    let reused_source = WorkGoalChange {
-        owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-        work_id: WorkId::parse(&work_id).expect("work"),
-        expected_work_revision: WorkRevision::new(2).expect("Work r2"),
-        expected_goal_revision: GoalRevision::new(2).expect("Goal r2"),
-        goal: WorkGoal::parse("A source identity cannot describe a different revision.")
-            .expect("goal"),
-        source_ref: change.source_ref.clone(),
-        reason: None,
-    };
-    assert!(matches!(
-        repository.revise_goal(reused_source).await,
-        Err(WorkRepositoryError::Conflict {
-            resource: WorkConflictResource::WorkEventIdentity
-        })
-    ));
-    let unchanged = repository
-        .load(
-            &WorkOwnerId::parse(&owner_id).expect("owner"),
-            &WorkId::parse(&work_id).expect("work"),
-        )
-        .await
-        .expect("load after event identity conflict");
-    assert_eq!(unchanged.work.parts().work_revision.get(), 2);
-    assert_eq!(unchanged.work.parts().current_goal_revision.get(), 2);
-    assert_eq!(
-        count_work_rows(&pool, "work_goal_revisions", &owner_id, &work_id).await,
-        2,
-        "event failure must roll back the Goal revision"
-    );
-    let sequence = sqlx::query(
-        "SELECT last_event_seq FROM work_event_sequences
-         WHERE owner_id = ? AND work_id = ?",
-    )
-    .bind(&owner_id)
-    .bind(&work_id)
-    .fetch_one(pool.get())
-    .await
-    .expect("event sequence after conflict")
-    .try_get::<i64, _>("last_event_seq")
-    .expect("event sequence");
-    assert_eq!(sequence, 2, "failed events must not leave sequence gaps");
-
-    let foreign_change = WorkGoalChange {
-        owner_id: WorkOwnerId::parse(common::id("owner")).expect("foreign owner"),
-        expected_work_revision: WorkRevision::new(2).expect("Work r2"),
-        expected_goal_revision: GoalRevision::new(2).expect("Goal r2"),
-        ..goal_change(&owner_id, &work_id, "A foreign owner must observe nothing.")
-    };
-    assert!(matches!(
-        repository.revise_goal(foreign_change).await,
-        Err(WorkRepositoryError::NotFound)
-    ));
-
-    sqlx::query("UPDATE works SET archived_at = NOW(6) WHERE owner_id = ? AND work_id = ?")
-        .bind(&owner_id)
-        .bind(&work_id)
-        .execute(pool.get())
-        .await
-        .expect("archive Work fixture");
-    let archived_change = WorkGoalChange {
-        expected_work_revision: WorkRevision::new(2).expect("Work r2"),
-        expected_goal_revision: GoalRevision::new(2).expect("Goal r2"),
-        ..goal_change(&owner_id, &work_id, "This write must be rejected.")
-    };
-    assert!(matches!(
-        repository.revise_goal(archived_change).await,
-        Err(WorkRepositoryError::Archived)
-    ));
-    assert_eq!(
-        count_work_rows(&pool, "work_goal_revisions", &owner_id, &work_id).await,
-        2,
-        "an archived Work must not gain a Goal revision"
-    );
-
-    common::cleanup_work_owner(&pool, &owner_id).await;
-}
-
-#[tokio::test]
-#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn concurrent_goal_revision_cas_has_one_winner_and_no_orphan_revision() {
-    let pool = common::setup_pool().await;
-    let repository = DatabaseWorkRepository::new(pool.clone());
-    let owner_id = common::id("owner");
-    let work_id = common::id("work");
-    repository
-        .create_genesis(genesis(
-            &owner_id,
-            &work_id,
-            &common::id("branch"),
-            &common::id("session"),
-        ))
-        .await
-        .expect("Work genesis");
-
-    let first = repository.clone();
-    let second = repository.clone();
-    let first_change = goal_change(&owner_id, &work_id, "First concurrent clarification.");
-    let second_change = goal_change(&owner_id, &work_id, "Second concurrent clarification.");
-    let (first_result, second_result) = tokio::join!(
-        first.revise_goal(first_change),
-        second.revise_goal(second_change)
-    );
-    let results = [first_result, second_result];
-    assert_eq!(
-        results.iter().filter(|result| result.is_ok()).count(),
-        1,
-        "exactly one compare-and-swap may win"
-    );
-    assert_eq!(
-        results
-            .iter()
-            .filter(|result| matches!(result, Err(WorkRepositoryError::StaleGoalRevision { .. })))
-            .count(),
-        1,
-        "the losing writer must receive revision facts, not a text-classified error"
-    );
-
-    let loaded = repository
-        .load(
-            &WorkOwnerId::parse(&owner_id).expect("owner"),
-            &WorkId::parse(&work_id).expect("work"),
-        )
-        .await
-        .expect("load winner");
-    assert_eq!(loaded.work.parts().work_revision.get(), 2);
-    assert_eq!(loaded.work.parts().current_goal_revision.get(), 2);
-    assert_eq!(
-        count_work_rows(&pool, "work_goal_revisions", &owner_id, &work_id).await,
-        2,
-        "genesis plus exactly one winning revision must remain"
-    );
-
-    common::cleanup_work_owner(&pool, &owner_id).await;
-}
-
-#[tokio::test]
-#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn event_retention_advances_in_constant_work_at_the_window_boundary() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
     let owner_id = common::id("owner");
     let work_id = common::id("work");
+    let branch_id = common::id("branch");
     repository
         .create_genesis(genesis(
             &owner_id,
             &work_id,
-            &common::id("branch"),
+            &branch_id,
             &common::id("session"),
         ))
         .await
@@ -577,9 +372,10 @@ async fn event_retention_advances_in_constant_work_at_the_window_boundary() {
     .expect("place event sequence at the retention boundary");
 
     repository
-        .revise_goal(goal_change(
+        .propose_plan(event_proposal(
             &owner_id,
             &work_id,
+            &branch_id,
             "Advance retention without scanning session or event history.",
         ))
         .await
@@ -632,7 +428,7 @@ async fn event_retention_advances_in_constant_work_at_the_window_boundary() {
         boundary_event
             .try_get::<String, _>("event_kind")
             .expect("event kind"),
-        "goal_revised"
+        "plan_proposed"
     );
 
     common::cleanup_work_owner(&pool, &owner_id).await;
@@ -646,11 +442,12 @@ async fn attention_cursors_are_owner_scoped_monotonic_and_naturally_idempotent()
     let owner_id = common::id("owner");
     let other_owner_id = common::id("owner");
     let work_id = common::id("work");
+    let branch_id = common::id("branch");
     repository
         .create_genesis(genesis(
             &owner_id,
             &work_id,
-            &common::id("branch"),
+            &branch_id,
             &common::id("session"),
         ))
         .await
@@ -718,17 +515,18 @@ async fn attention_cursors_are_owner_scoped_monotonic_and_naturally_idempotent()
 
     let event_writer = repository.clone();
     let cursor_writer = repository.clone();
-    let goal = goal_change(
+    let proposed_event = event_proposal(
         &owner_id,
         &work_id,
+        &branch_id,
         "Produce a second committed semantic event.",
     );
     let seen_through_old_head = advance(WorkAttentionCursorKind::Seen, 1);
-    let (goal_result, old_cursor_result) = tokio::join!(
-        event_writer.revise_goal(goal),
+    let (event_result, old_cursor_result) = tokio::join!(
+        event_writer.propose_plan(proposed_event),
         cursor_writer.advance_attention_cursor(seen_through_old_head)
     );
-    goal_result.expect("append Goal event");
+    event_result.expect("append proposal event");
     assert_eq!(
         old_cursor_result.expect("advance through the old head"),
         delivered,
@@ -778,23 +576,25 @@ async fn event_pages_are_bounded_contiguous_owner_scoped_and_retention_explicit(
     let owner_id = common::id("owner");
     let other_owner_id = common::id("owner");
     let work_id = common::id("work");
+    let branch_id = common::id("branch");
     repository
         .create_genesis(genesis(
             &owner_id,
             &work_id,
-            &common::id("branch"),
+            &branch_id,
             &common::id("session"),
         ))
         .await
         .expect("Work genesis");
     repository
-        .revise_goal(goal_change(
+        .propose_plan(event_proposal(
             &owner_id,
             &work_id,
+            &branch_id,
             "Create a second semantic event for cursor pagination.",
         ))
         .await
-        .expect("Goal revision");
+        .expect("proposal event");
 
     let event_query = |owner_id: &str, after_event_seq, limit| WorkEventQuery {
         owner_id: WorkOwnerId::parse(owner_id).expect("owner"),
@@ -827,7 +627,7 @@ async fn event_pages_are_bounded_contiguous_owner_scoped_and_retention_explicit(
     assert_eq!(second.events[0].event_seq.get(), 2);
     assert_eq!(
         second.events[0].kind,
-        astra_services::work::WorkEventKind::GoalRevised
+        astra_services::work::WorkEventKind::PlanProposed
     );
     assert_eq!(second.next_after_event_seq.map(WorkEventSeq::get), Some(2));
 
