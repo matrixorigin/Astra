@@ -9,20 +9,46 @@ use astra_services::{
         DatabaseWorkAttemptSettlementService, DatabaseWorkRepository, GraphRevision,
         NewWorkAttemptSettlement, NewWorkItem, NewWorkItemAttempt, PrimaryWorkAttemptAdvance,
         WorkAttemptBlockerKind, WorkAttemptExecutionMode, WorkAttemptOutcome,
-        WorkAttemptSettlementError, WorkBranchId, WorkBranchRevision, WorkChangeRef,
-        WorkGraphChange, WorkGraphItemChange, WorkId, WorkItemAttemptId, WorkItemDeliveryStatus,
-        WorkItemId, WorkItemKind, WorkItemRevision, WorkItemRevisionRef, WorkItemText, WorkOwnerId,
-        WorkRepository, WorkTaskGraphQuery,
+        WorkAttemptSettlementError, WorkBranchId, WorkId, WorkItemAttemptId,
+        WorkItemDeliveryStatus, WorkItemId, WorkItemKind, WorkItemRevision, WorkItemRevisionRef,
+        WorkItemText, WorkOwnerId, WorkRepository, WorkTaskGraphQuery,
     },
 };
 
-fn task(item_id: &str) -> WorkGraphItemChange {
-    WorkGraphItemChange::New(NewWorkItem {
+fn task(item_id: &str) -> NewWorkItem {
+    NewWorkItem {
         item_id: WorkItemId::parse(item_id).expect("item id"),
         kind: WorkItemKind::Task,
         objective: WorkItemText::parse(format!("Execute {item_id}")).expect("objective"),
         expected_result: WorkItemText::parse(format!("Verify {item_id}")).expect("result"),
-    })
+    }
+}
+
+fn task_plan(
+    owner_id: &str,
+    work_id: &str,
+    branch_id: &str,
+    additions: Vec<NewWorkItem>,
+) -> astra_services::work::NewWorkPlanProposal {
+    use astra_services::work::*;
+    NewWorkPlanProposal {
+        owner_id: WorkOwnerId::parse(owner_id).expect("owner"),
+        work_id: WorkId::parse(work_id).expect("work"),
+        branch_id: WorkBranchId::parse(branch_id).expect("branch"),
+        proposal_id: WorkProposalId::parse(common::id("task-proposal")).expect("proposal"),
+        expected_work_revision: WorkRevision::INITIAL,
+        expected_goal_revision: GoalRevision::INITIAL,
+        expected_criteria_set_revision: CriterionSetRevision::INITIAL,
+        expected_branch_revision: WorkBranchRevision::INITIAL,
+        expected_graph_revision: GraphRevision::INITIAL,
+        additions,
+        revisions: Vec::new(),
+        dependencies: Vec::new(),
+        dependency_removals: Vec::new(),
+        source_kind: WorkProposalSourceKind::Model,
+        source_ref: WorkChangeRef::parse(common::id("task-source")).expect("source"),
+        reason: WorkChangeReason::parse("Prepare executable tasks").expect("reason"),
+    }
 }
 
 #[tokio::test]
@@ -48,20 +74,22 @@ async fn one_primary_run_executes_multiple_attempts_without_child_run_identity_a
         ))
         .await
         .expect("create Work");
-    repository
-        .replace_graph(WorkGraphChange {
-            owner_id: WorkOwnerId::parse(&owner_id).unwrap(),
-            work_id: WorkId::parse(&work_id).unwrap(),
-            branch_id: WorkBranchId::parse(&branch_id).unwrap(),
-            expected_branch_revision: WorkBranchRevision::INITIAL,
-            expected_graph_revision: GraphRevision::INITIAL,
-            items: vec![task(&task_a), task(&task_b)],
-            edges: Vec::new(),
-            source_ref: WorkChangeRef::parse(common::id("graph-change")).unwrap(),
-            reason: None,
-        })
+    let proposed = repository
+        .propose_plan(task_plan(
+            &owner_id,
+            &work_id,
+            &branch_id,
+            vec![task(&task_a), task(&task_b)],
+        ))
         .await
-        .expect("replace graph");
+        .expect("task proposal");
+    repository
+        .accept_plan_proposal(common::plan_acceptance(
+            &proposed,
+            &common::id("accept-tasks"),
+        ))
+        .await
+        .expect("accept tasks");
     let mut root_run = item_run(&owner_id, &run_id, &session_id, &work_id, &branch_id);
     root_run.work_binding = None;
     DatabaseRunStateStore::new(pool.clone())
@@ -378,20 +406,22 @@ async fn competing_terminal_cut_rolls_back_the_attempt_settlement() {
         ))
         .await
         .expect("create Work");
-    repository
-        .replace_graph(WorkGraphChange {
-            owner_id: WorkOwnerId::parse(&owner_id).unwrap(),
-            work_id: WorkId::parse(&work_id).unwrap(),
-            branch_id: WorkBranchId::parse(&branch_id).unwrap(),
-            expected_branch_revision: WorkBranchRevision::INITIAL,
-            expected_graph_revision: GraphRevision::INITIAL,
-            items: vec![task(&task_id)],
-            edges: Vec::new(),
-            source_ref: WorkChangeRef::parse(common::id("graph-change")).unwrap(),
-            reason: None,
-        })
+    let proposed = repository
+        .propose_plan(task_plan(
+            &owner_id,
+            &work_id,
+            &branch_id,
+            vec![task(&task_id)],
+        ))
         .await
-        .expect("replace graph");
+        .expect("task proposal");
+    repository
+        .accept_plan_proposal(common::plan_acceptance(
+            &proposed,
+            &common::id("accept-tasks"),
+        ))
+        .await
+        .expect("accept tasks");
     let mut root_run = item_run(&owner_id, &run_id, &session_id, &work_id, &branch_id);
     root_run.work_binding = None;
     DatabaseRunStateStore::new(pool.clone())
@@ -499,20 +529,22 @@ async fn blocked_primary_settlement_does_not_start_a_successor() {
         ))
         .await
         .expect("create Work");
-    repository
-        .replace_graph(WorkGraphChange {
-            owner_id: WorkOwnerId::parse(&owner_id).unwrap(),
-            work_id: WorkId::parse(&work_id).unwrap(),
-            branch_id: WorkBranchId::parse(&branch_id).unwrap(),
-            expected_branch_revision: WorkBranchRevision::INITIAL,
-            expected_graph_revision: GraphRevision::INITIAL,
-            items: vec![task(&task_a), task(&task_b)],
-            edges: Vec::new(),
-            source_ref: WorkChangeRef::parse(common::id("graph-change")).unwrap(),
-            reason: None,
-        })
+    let proposed = repository
+        .propose_plan(task_plan(
+            &owner_id,
+            &work_id,
+            &branch_id,
+            vec![task(&task_a), task(&task_b)],
+        ))
         .await
-        .expect("replace graph");
+        .expect("task proposal");
+    repository
+        .accept_plan_proposal(common::plan_acceptance(
+            &proposed,
+            &common::id("accept-tasks"),
+        ))
+        .await
+        .expect("accept tasks");
     let mut root_run = item_run(&owner_id, &run_id, &session_id, &work_id, &branch_id);
     root_run.work_binding = None;
     DatabaseRunStateStore::new(pool.clone())
@@ -593,20 +625,22 @@ async fn paused_primary_attempt_takeover_requires_inactive_old_run_and_same_sess
         ))
         .await
         .expect("create Work");
-    repository
-        .replace_graph(WorkGraphChange {
-            owner_id: WorkOwnerId::parse(&owner_id).unwrap(),
-            work_id: WorkId::parse(&work_id).unwrap(),
-            branch_id: WorkBranchId::parse(&branch_id).unwrap(),
-            expected_branch_revision: WorkBranchRevision::INITIAL,
-            expected_graph_revision: GraphRevision::INITIAL,
-            items: vec![task(&task_id)],
-            edges: Vec::new(),
-            source_ref: WorkChangeRef::parse(common::id("graph-change")).unwrap(),
-            reason: None,
-        })
+    let proposed = repository
+        .propose_plan(task_plan(
+            &owner_id,
+            &work_id,
+            &branch_id,
+            vec![task(&task_id)],
+        ))
         .await
-        .expect("replace graph");
+        .expect("task proposal");
+    repository
+        .accept_plan_proposal(common::plan_acceptance(
+            &proposed,
+            &common::id("accept-tasks"),
+        ))
+        .await
+        .expect("accept tasks");
     let run_store = DatabaseRunStateStore::new(pool.clone());
     run_store
         .insert_run(item_run(
