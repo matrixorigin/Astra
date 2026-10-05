@@ -45,6 +45,9 @@ an independent process-wide completion flag. Remote governance and consolidation
 share one bounded deadline, including authentication transitions.
 Canonical continuation, owner/cursor/root checks and the execution lease remain
 the recovery authority. The CLI has no manual history-edit/checkpoint frontend.
+Only the root execution publishes the local session checkpoint timeline.
+Delegated warning checkpoints remain in memory; they must not replace the
+parent session recovery artifact.
 Startup retention maintenance runs on a blocking worker with a captured owner
 path and protects the explicit resume target, including compressed journals.
 

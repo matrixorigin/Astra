@@ -3039,7 +3039,9 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             state.clear_volatile(super::host::VolatileKind::SourceRecoveryAdvisory);
         }
 
+        let owns_session_composite_snapshot = state.owns_session_composite_snapshot();
         apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            owns_session_composite_snapshot,
             run_execution_budget: state.run_execution_budget_snapshot(),
             run_execution_control: state.run_execution_control_snapshot(),
             turn_index: turn_index as u32,
