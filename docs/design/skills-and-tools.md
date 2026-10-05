@@ -22,6 +22,10 @@ Skill maturity is progressive: prompt-only, structured prompt, tool-backed,
 resource-backed, evaluated, then governed. A package must not claim a maturity
 level unless its production discovery and activation path demonstrates it.
 
+The unused source-public `SkillLifecycleEvent` enum has been retired. Real
+skill invocation hooks and session-event dispatch remain the execution paths;
+constructing an event enum never provided telemetry delivery.
+
 ## Tools
 
 A tool is a callable schema. Tool visibility and execution are decided by the capability system.

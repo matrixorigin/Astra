@@ -126,7 +126,6 @@ pub const REDUNDANT_VALIDATION_RETRIES_THRESHOLD: usize = 2;
 /// typed low-yield observation also proves that a long turn is not progressing.
 pub const LLM_ROUND_CHURN_THRESHOLD: usize = 8;
 pub const EXPLORATION_FAMILY_CHURN_THRESHOLD: usize = 3;
-pub const ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE: usize = 2;
 pub const PROMPT_GROWTH_CHURN_MIN_ROUNDS: u32 = 4;
 pub const PROMPT_GROWTH_CHURN_MIN_DELTA_TOKENS: u64 = 8_000;
 pub const PROMPT_GROWTH_CHURN_MIN_RATIO_NUMERATOR: u64 = 2;
@@ -163,75 +162,6 @@ pub struct TurnEvaluationTelemetry {
     pub prompt_tokens: Option<u64>,
     pub first_round_prompt_tokens: Option<u64>,
     pub max_round_prompt_tokens: Option<u64>,
-}
-
-/// Conservative mid-loop progress policy.
-///
-/// This is intentionally narrower than post-mortem turn evaluation: it does
-/// not infer task intent from user prose, does not parse tool output text, and
-/// never hard-stops a turn. It only recommends low-risk advisory evidence when
-/// structured observations show repeated low-yield work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OnlineProgressPolicy {
-    pub redundant_overlapping_reads_threshold: usize,
-    pub min_tool_calls_before_nudge: usize,
-}
-
-impl Default for OnlineProgressPolicy {
-    fn default() -> Self {
-        Self {
-            redundant_overlapping_reads_threshold: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
-            min_tool_calls_before_nudge: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct OnlineProgressSignals {
-    pub tool_calls: usize,
-    pub redundant_overlapping_reads: usize,
-    pub stronger_advisory_emitted: bool,
-    pub advisory_already_emitted: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OnlineProgressDecision {
-    Continue,
-    ReuseKnownContext { redundant_overlapping_reads: usize },
-}
-
-impl OnlineProgressDecision {
-    const fn continue_turn() -> Self {
-        Self::Continue
-    }
-}
-
-pub fn decide_online_progress(
-    signals: OnlineProgressSignals,
-    policy: OnlineProgressPolicy,
-) -> OnlineProgressDecision {
-    if signals.stronger_advisory_emitted || signals.advisory_already_emitted {
-        return OnlineProgressDecision::continue_turn();
-    }
-
-    if signals.tool_calls < policy.min_tool_calls_before_nudge {
-        return OnlineProgressDecision::continue_turn();
-    }
-
-    if threshold_reached(
-        signals.redundant_overlapping_reads,
-        policy.redundant_overlapping_reads_threshold,
-    ) {
-        return OnlineProgressDecision::ReuseKnownContext {
-            redundant_overlapping_reads: signals.redundant_overlapping_reads,
-        };
-    }
-
-    OnlineProgressDecision::continue_turn()
-}
-
-const fn threshold_reached(count: usize, threshold: usize) -> bool {
-    threshold > 0 && count >= threshold
 }
 
 /// Result of evaluating a turn's success and quality.
@@ -5433,68 +5363,6 @@ mod tests {
             "{:?}",
             eval.signals
         );
-    }
-
-    #[test]
-    fn online_progress_continues_when_signal_is_below_threshold() {
-        let decision = decide_online_progress(
-            OnlineProgressSignals {
-                tool_calls: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE,
-                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD - 1,
-                ..OnlineProgressSignals::default()
-            },
-            OnlineProgressPolicy::default(),
-        );
-
-        assert_eq!(decision, OnlineProgressDecision::Continue);
-    }
-
-    #[test]
-    fn online_progress_requires_minimum_observation_volume() {
-        let decision = decide_online_progress(
-            OnlineProgressSignals {
-                tool_calls: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE - 1,
-                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
-                ..OnlineProgressSignals::default()
-            },
-            OnlineProgressPolicy::default(),
-        );
-
-        assert_eq!(decision, OnlineProgressDecision::Continue);
-    }
-
-    #[test]
-    fn online_progress_nudges_on_structured_redundant_reads_only_after_threshold() {
-        let decision = decide_online_progress(
-            OnlineProgressSignals {
-                tool_calls: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE,
-                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
-                ..OnlineProgressSignals::default()
-            },
-            OnlineProgressPolicy::default(),
-        );
-
-        assert_eq!(
-            decision,
-            OnlineProgressDecision::ReuseKnownContext {
-                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD
-            }
-        );
-    }
-
-    #[test]
-    fn online_progress_does_not_stack_on_existing_intervention() {
-        let decision = decide_online_progress(
-            OnlineProgressSignals {
-                tool_calls: 100,
-                redundant_overlapping_reads: 100,
-                stronger_advisory_emitted: true,
-                ..OnlineProgressSignals::default()
-            },
-            OnlineProgressPolicy::default(),
-        );
-
-        assert_eq!(decision, OnlineProgressDecision::Continue);
     }
 
     #[test]

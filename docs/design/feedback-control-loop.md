@@ -5,6 +5,10 @@
 
 The feedback control loop turns user feedback, trace facts, eval results, and operational signals into controlled product improvement. It is the upstream system for tuning jobs and evaluation.
 
+The unused source-public online-progress policy, signals, and decision prototype
+has been retired. Runtime feedback continues through the existing authoritative
+execution path; shared turn-evaluation thresholds and telemetry remain intact.
+
 ## Principles
 
 - Feedback is evidence, not automatic truth.

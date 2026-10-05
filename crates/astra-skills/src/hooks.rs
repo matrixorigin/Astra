@@ -1504,35 +1504,6 @@ async fn run_hook_action_fire_and_forget(
     }
 }
 
-/// Events emitted during the skill lifecycle.
-///
-/// Can be consumed by telemetry, logging, or debugging systems.
-#[derive(Clone, Debug)]
-pub enum SkillLifecycleEvent {
-    /// A skill was discovered from a source.
-    Discovered {
-        name: String,
-        source: super::manifest::SkillSourceKind,
-    },
-    /// A skill's instructions were fully loaded.
-    Loaded { name: String },
-    /// A conditional skill was activated by a path match.
-    Activated { name: String, trigger: String },
-    /// A skill invocation started.
-    Invoked {
-        name: String,
-        context: super::manifest::ExecutionContext,
-    },
-    /// A skill invocation completed successfully.
-    Completed {
-        name: String,
-        tokens_used: u32,
-        turns: u32,
-    },
-    /// A skill invocation failed.
-    Failed { name: String, error: String },
-}
-
 // ── Session event hooks (CC-compatible) ─────────────────────────────────
 
 /// Session lifecycle events that can trigger hooks.
@@ -2411,37 +2382,6 @@ mod tests {
         let yaml = serde_yaml_ng::to_string(&hooks).unwrap();
         let parsed: SkillHooks = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(hooks, parsed);
-    }
-
-    #[test]
-    fn lifecycle_event_variants_constructible() {
-        let events = [
-            SkillLifecycleEvent::Discovered {
-                name: "test".into(),
-                source: super::super::manifest::SkillSourceKind::Local,
-            },
-            SkillLifecycleEvent::Loaded {
-                name: "test".into(),
-            },
-            SkillLifecycleEvent::Activated {
-                name: "test".into(),
-                trigger: "src/main.rs".into(),
-            },
-            SkillLifecycleEvent::Invoked {
-                name: "test".into(),
-                context: super::super::manifest::ExecutionContext::Inline,
-            },
-            SkillLifecycleEvent::Completed {
-                name: "test".into(),
-                tokens_used: 1000,
-                turns: 3,
-            },
-            SkillLifecycleEvent::Failed {
-                name: "test".into(),
-                error: "timeout".into(),
-            },
-        ];
-        assert_eq!(events.len(), 6);
     }
 
     // ── Glob matching tests ─────────────────────────────────────────────
