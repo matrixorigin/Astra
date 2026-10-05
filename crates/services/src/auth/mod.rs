@@ -60,13 +60,12 @@ pub use admin::{
 };
 pub use encryption::FernetTokenEncryptor;
 use encryption::sha256_hex;
+use external::validate_provider_runtime_context;
 pub use external::{
     ExternalAuthProviderConfig, ExternalAuthorizeRequestData, ExternalAuthorizedRequest,
-    ExternalCatalogResponse, ExternalLoginRequestData, ExternalProviderClient,
-    ExternalProviderPublicRecord, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
-    ExternalRuntimeContextResponse, ExternalSessionRecord, HttpExternalProviderClient,
+    ExternalCatalogResponse, ExternalProviderClient, ExternalRequestDescriptor,
+    ExternalRuntimeContextRequestData, ExternalRuntimeContextResponse, HttpExternalProviderClient,
 };
-use external::validate_provider_runtime_context;
 use jwt::{JwtTokenClaims, create_jwt_token, decode_jwt_claims, decode_jwt_claims_with_detail};
 pub use provider_request::{ProviderAuthorizedRequest, ProviderRequestDescriptor};
 pub use session::UnconfiguredSessionService;
@@ -514,46 +513,6 @@ pub trait AuthService: Send + Sync {
         _token: &str,
     ) -> Result<EdgeTokenBinding, (StatusCode, Json<ErrorResponse>)> {
         Ok(EdgeTokenBinding::NotEdgeToken)
-    }
-
-    async fn external_providers(
-        &self,
-    ) -> Result<Vec<ExternalProviderPublicRecord>, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "External auth providers are not configured",
-        ))
-    }
-
-    async fn external_login(
-        &self,
-        _request: ExternalLoginRequestData,
-    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "External auth providers are not configured",
-        ))
-    }
-
-    async fn external_catalog(
-        &self,
-        _principal: &AuthPrincipal,
-    ) -> Result<ExternalCatalogResponse, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "External runtime catalog is not configured",
-        ))
-    }
-
-    async fn external_runtime_context(
-        &self,
-        _principal: &AuthPrincipal,
-        _request: ExternalRuntimeContextRequestData,
-    ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "External runtime context is not configured",
-        ))
     }
 
     /// List catalog for an authorized-request principal (edge-JWT) using scope and subject
@@ -2217,16 +2176,6 @@ impl AuthService for DatabaseAuthService {
             edge_agent_id: claims.edge_agent_id,
             workspace_id: claims.workspace_id,
         })
-    }
-
-    async fn external_providers(
-        &self,
-    ) -> Result<Vec<ExternalProviderPublicRecord>, (StatusCode, Json<ErrorResponse>)> {
-        Ok(self
-            .ext_providers
-            .iter()
-            .map(ExternalProviderPublicRecord::from)
-            .collect())
     }
 
     async fn external_catalog_by_scope(

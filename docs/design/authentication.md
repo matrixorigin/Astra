@@ -2,6 +2,8 @@
 
 Authentication owns identity, session issuance and credential binding. Request-authorized external providers keep their existing authorization protocol; verified scoped-key providers reuse the canonical identity mapping and Astra refresh-session lifecycle.
 
+External provider catalog and runtime-context requests carry the verified `provider_scope_id` and `external_subject` from the authorized principal. The adapter exposes request authorization and these scope-based operations. Current provider-request HMAC and Edge-token admission use local verification; Edge registration also checks revocation. Login, refresh and logout use Astra's canonical authenticated-session services; the retired password/session-handle adapter interfaces and their source-level exports are removed.
+
 ## Identity and provenance
 
 External principals are identified by issuer/provider and subject, never subject or email alone. Memoria's provider ID is `memoria:` followed by the SHA-256 of its normalized issuer URL. The issuer defaults to the configured API base URL; an explicitly stable `MEMORIA_ISSUER` lets administrators move the transport without changing the identity authority.

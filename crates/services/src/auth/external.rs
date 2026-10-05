@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use astra_core::{ErrorResponse, error_response, error_response_coded, internal_error};
+use astra_core::{ErrorResponse, error_response_coded};
 
 #[derive(Clone, Debug)]
 pub struct ExternalAuthProviderConfig {
@@ -24,31 +24,6 @@ use crate::runs::{
     RuntimeMcpBindingRequest, RuntimeSemanticReadCapabilityRequest, RuntimeSkillBindingRequest,
 };
 use astra_turn_types::ModelSelection;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExternalProviderPublicRecord {
-    pub id: String,
-    pub display_name: String,
-    pub credential_type: String,
-}
-
-impl From<&ExternalAuthProviderConfig> for ExternalProviderPublicRecord {
-    fn from(value: &ExternalAuthProviderConfig) -> Self {
-        Self {
-            id: value.id.clone(),
-            display_name: value.display_name.clone(),
-            credential_type: "password".to_string(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExternalLoginRequestData {
-    pub provider_id: String,
-    pub username: String,
-    pub password: String,
-    pub scope_id: Option<String>,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExternalAuthorizeRequestData {
@@ -76,58 +51,6 @@ pub struct ExternalRuntimeContextRequestData {
     pub requested_tool_ids: Vec<String>,
     pub requested_skill_ids: Vec<String>,
     pub requested_knowledge_base_ids: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExternalSessionRecord {
-    pub external_session_id: String,
-    pub provider_id: String,
-    pub astra_user_id: String,
-    pub external_subject: String,
-    pub provider_scope_id: String,
-    pub provider_scope_display_name: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExternalProviderScope {
-    pub id: String,
-    pub workspace_id: String,
-    pub name: String,
-    #[serde(default)]
-    pub account_name: Option<String>,
-    #[serde(default)]
-    pub is_default: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExternalProviderAuthResponse {
-    pub external_subject: ExternalSubject,
-    pub display_info: ExternalDisplayInfo,
-    pub workspace_scopes: Vec<ExternalProviderScope>,
-    pub selected_scope: ExternalProviderScope,
-    pub default_scope: ExternalProviderScope,
-    pub provider_session_handle: String,
-    pub expires_at: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExternalSubject {
-    pub id: String,
-    pub provider: String,
-    pub kind: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExternalDisplayInfo {
-    pub username: String,
-    #[serde(default)]
-    pub nickname: Option<String>,
-    #[serde(default)]
-    pub email: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -522,27 +445,6 @@ pub struct ExternalRuntimeScopeResponse {
     pub allowed_knowledge_bases: Vec<ExternalCatalogKnowledgeBase>,
 }
 
-#[derive(Clone, Debug)]
-pub struct ExternalProviderSessionHandle {
-    pub provider_session_handle: String,
-    pub provider_scope_id: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExternalRefreshSessionResponse {
-    pub provider_session_handle: String,
-    pub provider_scope_id: String,
-    pub expires_at: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExternalLogoutResponse {
-    pub provider_session_handle: String,
-    pub logged_out: bool,
-}
-
 #[async_trait]
 pub trait ExternalProviderClient: Send + Sync {
     async fn authorize_request(
@@ -550,37 +452,6 @@ pub trait ExternalProviderClient: Send + Sync {
         provider: &ExternalAuthProviderConfig,
         request: ExternalAuthorizeRequestData,
     ) -> Result<ExternalAuthorizedRequest, (StatusCode, Json<ErrorResponse>)>;
-
-    async fn authenticate(
-        &self,
-        provider: &ExternalAuthProviderConfig,
-        request: ExternalLoginRequestData,
-    ) -> Result<ExternalProviderAuthResponse, (StatusCode, Json<ErrorResponse>)>;
-
-    async fn list_catalog(
-        &self,
-        provider: &ExternalAuthProviderConfig,
-        session: ExternalProviderSessionHandle,
-    ) -> Result<ExternalCatalogResponse, (StatusCode, Json<ErrorResponse>)>;
-
-    async fn issue_runtime_context(
-        &self,
-        provider: &ExternalAuthProviderConfig,
-        session: ExternalProviderSessionHandle,
-        request: ExternalRuntimeContextRequestData,
-    ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)>;
-
-    async fn refresh_session(
-        &self,
-        provider: &ExternalAuthProviderConfig,
-        session: ExternalProviderSessionHandle,
-    ) -> Result<ExternalRefreshSessionResponse, (StatusCode, Json<ErrorResponse>)>;
-
-    async fn logout(
-        &self,
-        provider: &ExternalAuthProviderConfig,
-        session: ExternalProviderSessionHandle,
-    ) -> Result<ExternalLogoutResponse, (StatusCode, Json<ErrorResponse>)>;
 
     /// List the catalog for an authorized-request principal using provider_scope_id and
     /// external_subject directly, without a session handle. Used for edge-JWT principals.
@@ -815,78 +686,6 @@ impl ExternalProviderClient for HttpExternalProviderClient {
         response.into_authorization(&provider.id)
     }
 
-    async fn authenticate(
-        &self,
-        provider: &ExternalAuthProviderConfig,
-        request: ExternalLoginRequestData,
-    ) -> Result<ExternalProviderAuthResponse, (StatusCode, Json<ErrorResponse>)> {
-        self.post_action(
-            provider,
-            "authenticate",
-            AuthenticateActionPayload {
-                username: request.username,
-                password: request.password,
-                provider_scope_id: request.scope_id,
-            },
-        )
-        .await
-    }
-
-    async fn list_catalog(
-        &self,
-        provider: &ExternalAuthProviderConfig,
-        session: ExternalProviderSessionHandle,
-    ) -> Result<ExternalCatalogResponse, (StatusCode, Json<ErrorResponse>)> {
-        self.post_action(
-            provider,
-            "list_catalog",
-            SessionActionPayload::from(session),
-        )
-        .await
-    }
-
-    async fn issue_runtime_context(
-        &self,
-        provider: &ExternalAuthProviderConfig,
-        session: ExternalProviderSessionHandle,
-        request: ExternalRuntimeContextRequestData,
-    ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
-        self.post_action(
-            provider,
-            "issue_runtime_context",
-            IssueRuntimeContextActionPayload {
-                session: SessionActionPayload::from(session),
-                requested_model_id: request.requested_model_id,
-                requested_tool_ids: request.requested_tool_ids,
-                requested_skill_ids: request.requested_skill_ids,
-                requested_knowledge_base_ids: request.requested_knowledge_base_ids,
-            },
-        )
-        .await
-    }
-
-    async fn refresh_session(
-        &self,
-        provider: &ExternalAuthProviderConfig,
-        session: ExternalProviderSessionHandle,
-    ) -> Result<ExternalRefreshSessionResponse, (StatusCode, Json<ErrorResponse>)> {
-        self.post_action(
-            provider,
-            "refresh_session",
-            SessionActionPayload::from(session),
-        )
-        .await
-    }
-
-    async fn logout(
-        &self,
-        provider: &ExternalAuthProviderConfig,
-        session: ExternalProviderSessionHandle,
-    ) -> Result<ExternalLogoutResponse, (StatusCode, Json<ErrorResponse>)> {
-        self.post_action(provider, "logout", SessionActionPayload::from(session))
-            .await
-    }
-
     async fn list_catalog_by_scope(
         &self,
         provider: &ExternalAuthProviderConfig,
@@ -941,42 +740,6 @@ struct ExternalProviderActionRequest<'a, T> {
 struct AuthorizeRequestActionPayload {
     token: String,
     request: ExternalRequestDescriptor,
-}
-
-#[derive(Serialize)]
-struct AuthenticateActionPayload {
-    username: String,
-    password: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider_scope_id: Option<String>,
-}
-
-#[derive(Serialize)]
-struct SessionActionPayload {
-    provider_session_handle: String,
-    provider_scope_id: String,
-}
-
-impl From<ExternalProviderSessionHandle> for SessionActionPayload {
-    fn from(value: ExternalProviderSessionHandle) -> Self {
-        Self {
-            provider_session_handle: value.provider_session_handle,
-            provider_scope_id: value.provider_scope_id,
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct IssueRuntimeContextActionPayload {
-    #[serde(flatten)]
-    session: SessionActionPayload,
-    requested_model_id: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    requested_tool_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    requested_skill_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    requested_knowledge_base_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -1269,95 +1032,6 @@ fn provider_context_conflict(detail: impl Into<String>) -> (StatusCode, Json<Err
     )
 }
 
-pub fn resolve_selected_scope(
-    requested_scope_id: Option<&str>,
-    response: &ExternalProviderAuthResponse,
-) -> Result<ExternalProviderScope, (StatusCode, Json<ErrorResponse>)> {
-    let visible_selected = response
-        .workspace_scopes
-        .iter()
-        .find(|scope| scope.id == response.selected_scope.id)
-        .cloned()
-        .ok_or_else(|| {
-            error_response_coded(
-                StatusCode::FORBIDDEN,
-                "provider selected scope is not visible",
-                "external_scope_not_visible",
-            )
-        })?;
-
-    if let Some(scope_id) = requested_scope_id {
-        let visible_requested = response
-            .workspace_scopes
-            .iter()
-            .find(|scope| scope.id == scope_id)
-            .cloned()
-            .ok_or_else(|| {
-                error_response_coded(
-                    StatusCode::FORBIDDEN,
-                    "external scope is missing or no longer visible",
-                    "external_scope_not_visible",
-                )
-            })?;
-        if visible_selected.id != visible_requested.id {
-            return Err(error_response_coded(
-                StatusCode::FORBIDDEN,
-                "provider selected scope does not match requested external scope",
-                "external_scope_not_visible",
-            ));
-        }
-        return Ok(visible_selected);
-    }
-
-    let default_scopes = response
-        .workspace_scopes
-        .iter()
-        .filter(|scope| scope.is_default)
-        .cloned()
-        .collect::<Vec<_>>();
-    match default_scopes.as_slice() {
-        [scope] if scope.id == visible_selected.id => Ok(visible_selected),
-        [scope] => Err(error_response_coded(
-            StatusCode::FORBIDDEN,
-            format!(
-                "provider selected scope '{}' does not match default scope '{}'",
-                visible_selected.id, scope.id
-            ),
-            "external_scope_not_visible",
-        )),
-        [] => Err(error_response_coded(
-            StatusCode::FORBIDDEN,
-            "external scope must be selected",
-            "external_scope_required",
-        )),
-        _ => Err(error_response_coded(
-            StatusCode::FORBIDDEN,
-            "external provider returned multiple default scopes",
-            "external_scope_ambiguous",
-        )),
-    }
-}
-
-pub fn decrypt_provider_session_handle(
-    encryptor: &super::FernetTokenEncryptor,
-    encrypted: &str,
-) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    encryptor.decrypt(encrypted).map_err(internal_error)
-}
-
-pub fn encrypt_provider_session_handle(
-    encryptor: &super::FernetTokenEncryptor,
-    handle: &str,
-) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    if handle.is_empty() {
-        return Err(error_response(
-            StatusCode::BAD_GATEWAY,
-            "external provider session handle must not be empty",
-        ));
-    }
-    encryptor.encrypt(handle).map_err(internal_error)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1442,11 +1116,8 @@ mod tests {
             captured.lock().await.push(body.clone());
             match body["action"].as_str() {
                 Some("authorize_request") => Json(authorize_request_fixture()),
-                Some("authenticate") => Json(authenticate_fixture()),
-                Some("list_catalog") => Json(list_catalog_fixture()),
-                Some("issue_runtime_context") => Json(issue_runtime_context_fixture()),
-                Some("refresh_session") => Json(refresh_session_fixture()),
-                Some("logout") => Json(logout_fixture()),
+                Some("list_catalog_by_scope") => Json(list_catalog_fixture()),
+                Some("issue_runtime_context_by_scope") => Json(issue_runtime_context_fixture()),
                 action => Json(json!({
                     "code": 3,
                     "message": format!("unexpected action {action:?}")
@@ -1487,31 +1158,11 @@ mod tests {
         assert_eq!(authorized.provider_id, "moi");
         assert_eq!(authorized.external_subject, "moi-user-1");
 
-        let response = client
-            .authenticate(
-                &provider(endpoint.clone()),
-                ExternalLoginRequestData {
-                    provider_id: "moi".to_string(),
-                    username: "admin".to_string(),
-                    password: "secret".to_string(),
-                    scope_id: None,
-                },
-            )
-            .await
-            .expect("authenticate should succeed");
-
-        assert_eq!(response.external_subject.id, "moi-user-1");
-        assert_eq!(response.display_info.username, "admin");
-        assert_eq!(response.selected_scope.id, "ws-1");
-        assert_eq!(response.provider_session_handle, "provider-session-secret");
-
         let catalog = client
-            .list_catalog(
+            .list_catalog_by_scope(
                 &provider(endpoint.clone()),
-                ExternalProviderSessionHandle {
-                    provider_session_handle: "provider-session-secret".to_string(),
-                    provider_scope_id: "ws-1".to_string(),
-                },
+                "ws-1".to_string(),
+                "moi-user-1".to_string(),
             )
             .await
             .expect("list_catalog should parse MOI catalog");
@@ -1530,12 +1181,10 @@ mod tests {
         assert_eq!(model.name, "Qwen 2.5");
 
         let runtime_context = client
-            .issue_runtime_context(
+            .issue_runtime_context_by_scope(
                 &provider(endpoint.clone()),
-                ExternalProviderSessionHandle {
-                    provider_session_handle: "provider-session-secret".to_string(),
-                    provider_scope_id: "ws-1".to_string(),
-                },
+                "ws-1".to_string(),
+                "moi-user-1".to_string(),
                 ExternalRuntimeContextRequestData {
                     requested_model_id: "model-qwen".to_string(),
                     requested_tool_ids: vec!["tool-search".to_string()],
@@ -1557,31 +1206,6 @@ mod tests {
         );
         assert_eq!(runtime_context.runtime_scope.allowed_model_id, "model-qwen");
 
-        let refresh = client
-            .refresh_session(
-                &provider(endpoint.clone()),
-                ExternalProviderSessionHandle {
-                    provider_session_handle: "provider-session-secret".to_string(),
-                    provider_scope_id: "ws-1".to_string(),
-                },
-            )
-            .await
-            .expect("refresh_session should parse MOI response");
-        assert_eq!(refresh.provider_session_handle, "provider-session-secret-2");
-        assert_eq!(refresh.provider_scope_id, "ws-1");
-
-        let logout = client
-            .logout(
-                &provider(endpoint),
-                ExternalProviderSessionHandle {
-                    provider_session_handle: "provider-session-secret-2".to_string(),
-                    provider_scope_id: "ws-1".to_string(),
-                },
-            )
-            .await
-            .expect("logout should parse MOI response");
-        assert!(logout.logged_out);
-
         let bodies = captured.lock().await.clone();
         assert_eq!(bodies[0]["action"], "authorize_request");
         assert_eq!(bodies[0]["provider_id"], "moi");
@@ -1594,45 +1218,31 @@ mod tests {
         assert!(bodies[0].get("has_agent_binding").is_none());
         assert!(bodies[0].get("has_runtime_auth").is_none());
         assert!(bodies[0].get("selected_model_gateway").is_none());
-        assert_eq!(bodies[1]["action"], "authenticate");
-        assert_eq!(bodies[1]["provider_id"], "moi");
-        assert_eq!(bodies[1]["username"], "admin");
-        assert_eq!(bodies[1]["password"], "secret");
-        assert!(bodies[1].get("provider_session_handle").is_none());
-        assert_eq!(bodies[2]["action"], "list_catalog");
-        assert_eq!(
-            bodies[2]["provider_session_handle"],
-            "provider-session-secret"
-        );
-        assert_eq!(bodies[2]["provider_scope_id"], "ws-1");
-        assert!(bodies[2].get("external_session_handle").is_none());
-        assert_eq!(bodies[3]["action"], "issue_runtime_context");
-        assert_eq!(bodies[3]["requested_model_id"], "model-qwen");
-        assert_eq!(bodies[3]["requested_tool_ids"], json!(["tool-search"]));
-        assert!(bodies[3].get("requested_model").is_none());
-        assert_eq!(bodies[4]["action"], "refresh_session");
-        assert_eq!(
-            bodies[4]["provider_session_handle"],
-            "provider-session-secret"
-        );
-        assert_eq!(bodies[4]["provider_scope_id"], "ws-1");
-        assert_eq!(bodies[5]["action"], "logout");
-        assert_eq!(
-            bodies[5]["provider_session_handle"],
-            "provider-session-secret-2"
-        );
-        assert_eq!(bodies[5]["provider_scope_id"], "ws-1");
+        assert_eq!(bodies.len(), 3);
+        for body in &bodies[1..] {
+            assert_eq!(body["provider_id"], "moi");
+            assert_eq!(body["provider_scope_id"], "ws-1");
+            assert_eq!(body["external_subject"], "moi-user-1");
+            assert!(body.get("provider_session_handle").is_none());
+            assert!(body.get("username").is_none());
+            assert!(body.get("password").is_none());
+        }
+        assert_eq!(bodies[1]["action"], "list_catalog_by_scope");
+        assert_eq!(bodies[2]["action"], "issue_runtime_context_by_scope");
+        assert_eq!(bodies[2]["requested_model_id"], "model-qwen");
+        assert_eq!(bodies[2]["requested_tool_ids"], json!(["tool-search"]));
+        assert!(bodies[2].get("requested_model").is_none());
         server.abort();
     }
 
     #[tokio::test]
-    async fn http_provider_client_logout_failure_returns_error() {
+    async fn http_provider_client_catalog_failure_returns_error() {
         async fn handler(Json(_body): Json<Value>) -> (StatusCode, Json<Value>) {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
                     "code": 14,
-                    "message": "provider logout failed"
+                    "message": "provider catalog failed"
                 })),
             )
         }
@@ -1649,15 +1259,13 @@ mod tests {
 
         let client = HttpExternalProviderClient;
         let err = client
-            .logout(
+            .list_catalog_by_scope(
                 &provider(endpoint),
-                ExternalProviderSessionHandle {
-                    provider_session_handle: "provider-session-secret".to_string(),
-                    provider_scope_id: "ws-1".to_string(),
-                },
+                "ws-1".to_string(),
+                "moi-user-1".to_string(),
             )
             .await
-            .expect_err("provider logout failure must be explicit");
+            .expect_err("provider catalog failure must be explicit");
 
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -1746,42 +1354,6 @@ mod tests {
         assert_eq!(
             err.1.error_code.as_deref(),
             Some("external_provider_runtime_context_disallowed")
-        );
-    }
-
-    #[test]
-    fn resolve_selected_scope_requires_visible_scope() {
-        let scope = ExternalProviderScope {
-            id: "ws-1".to_string(),
-            workspace_id: "workspace-1".to_string(),
-            name: "Workspace".to_string(),
-            account_name: None,
-            is_default: true,
-        };
-        let response = ExternalProviderAuthResponse {
-            external_subject: ExternalSubject {
-                id: "subject".to_string(),
-                provider: "moi".to_string(),
-                kind: "user".to_string(),
-            },
-            display_info: ExternalDisplayInfo {
-                username: "user".to_string(),
-                nickname: None,
-                email: None,
-            },
-            workspace_scopes: vec![scope.clone()],
-            selected_scope: scope.clone(),
-            default_scope: scope,
-            provider_session_handle: "handle".to_string(),
-            expires_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-
-        let err = resolve_selected_scope(Some("missing"), &response)
-            .expect_err("requested scope must be visible");
-        assert_eq!(err.0, StatusCode::FORBIDDEN);
-        assert_eq!(
-            err.1.error_code.as_deref(),
-            Some("external_scope_not_visible")
         );
     }
 
@@ -1918,37 +1490,6 @@ mod tests {
         );
     }
 
-    fn authenticate_fixture() -> Value {
-        JsonFixture(json!({
-            "external_subject": {"id": "moi-user-1", "provider": "moi", "kind": "user"},
-            "display_info": {"username": "admin", "nickname": "Admin", "email": "admin@example.com"},
-            "workspace_scopes": [{
-                "id": "ws-1",
-                "workspace_id": "workspace-1",
-                "name": "Default Workspace",
-                "account_name": "default",
-                "is_default": true
-            }],
-            "selected_scope": {
-                "id": "ws-1",
-                "workspace_id": "workspace-1",
-                "name": "Default Workspace",
-                "account_name": "default",
-                "is_default": true
-            },
-            "default_scope": {
-                "id": "ws-1",
-                "workspace_id": "workspace-1",
-                "name": "Default Workspace",
-                "account_name": "default",
-                "is_default": true
-            },
-            "provider_session_handle": "provider-session-secret",
-            "expires_at": "2026-01-01T00:00:00Z"
-        }))
-        .success()
-    }
-
     fn authorize_request_fixture() -> Value {
         JsonFixture(json!({
             "ok": true,
@@ -2042,23 +1583,6 @@ mod tests {
             "task_id": "task-1",
             "manifest_id": "manifest-1",
             "provider_scope_id": "ws-1"
-        }))
-        .success()
-    }
-
-    fn refresh_session_fixture() -> Value {
-        JsonFixture(json!({
-            "provider_session_handle": "provider-session-secret-2",
-            "provider_scope_id": "ws-1",
-            "expires_at": "2026-01-01T01:00:00Z"
-        }))
-        .success()
-    }
-
-    fn logout_fixture() -> Value {
-        JsonFixture(json!({
-            "provider_session_handle": "provider-session-secret-2",
-            "logged_out": true
         }))
         .success()
     }
