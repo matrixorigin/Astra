@@ -4,10 +4,9 @@ use astra_services::work::{
     AcceptanceDecisionId, AcceptanceGapReason, AcceptedCriterionGap, CheckCoverage,
     CheckCoverageGap, CheckEvidenceRef, CheckOutcome, CheckRunId, CheckVerifierKind,
     CriterionCommand, CriterionDefinition, CriterionId, CriterionRevision, CriterionRevisionRef,
-    CriterionSetMemberChange, CriterionSetRevision, DatabaseWorkRepository, GoalRevision,
-    GraphRevision, NewWorkAcceptanceDecision, NewWorkCheckRun, NewWorkCriterion,
-    WorkBranchBasisChange, WorkBranchId, WorkBranchRevision, WorkBranchSubjectChange,
-    WorkChangeRef, WorkContentHash, WorkCriteriaChange, WorkGenesis, WorkGoal, WorkGoalChange,
+    CriterionSetRevision, DatabaseWorkRepository, GoalRevision, GraphRevision,
+    NewWorkAcceptanceDecision, NewWorkCheckRun, WorkBranchBasisChange, WorkBranchId,
+    WorkBranchRevision, WorkBranchSubjectChange, WorkChangeRef, WorkContentHash, WorkGenesis,
     WorkId, WorkItemAttemptId, WorkItemId, WorkItemRevision, WorkItemRevisionRef, WorkOwnerId,
     WorkRepository, WorkRepositoryError, WorkRevision, WorkSubjectRef,
 };
@@ -46,16 +45,24 @@ async fn accept_criteria(
     branch_id: &str,
     criterion_ids: &[String],
 ) {
-    repository
-        .accept_criteria(WorkCriteriaChange {
+    let proposed = repository
+        .propose_criteria(astra_services::work::NewWorkCriteriaProposal {
             owner_id: WorkOwnerId::parse(owner_id).expect("owner"),
             work_id: WorkId::parse(work_id).expect("work"),
+            branch_id: WorkBranchId::parse(branch_id).expect("branch"),
+            proposal_id: astra_services::work::WorkProposalId::parse(common::id(
+                "criteria-proposal",
+            ))
+            .expect("proposal"),
+            expected_goal_revision: GoalRevision::INITIAL,
+            expected_branch_revision: WorkBranchRevision::INITIAL,
+            expected_graph_revision: GraphRevision::INITIAL,
             expected_work_revision: WorkRevision::INITIAL,
             expected_criteria_set_revision: CriterionSetRevision::INITIAL,
             members: criterion_ids
                 .iter()
-                .map(|criterion_id| {
-                    CriterionSetMemberChange::New(NewWorkCriterion {
+                .map(
+                    |criterion_id| astra_services::work::WorkCriteriaProposalMember::New {
                         criterion_id: CriterionId::parse(criterion_id).expect("criterion"),
                         definition: CriterionDefinition::TestCheck {
                             statement: astra_services::work::CriterionStatement::parse(format!(
@@ -65,12 +72,19 @@ async fn accept_criteria(
                             command: CriterionCommand::parse(format!("verify {criterion_id}"))
                                 .expect("command"),
                         },
-                    })
-                })
+                    },
+                )
                 .collect(),
             source_ref: WorkChangeRef::parse(common::id("criteria-source")).expect("source"),
-            reason: None,
+            source_kind: astra_services::work::WorkProposalSourceKind::Model,
         })
+        .await
+        .expect("propose criteria");
+    repository
+        .accept_criteria_proposal(common::criteria_acceptance(
+            &proposed,
+            &common::id("accept-criteria"),
+        ))
         .await
         .expect("accept criteria");
     repository
@@ -299,19 +313,57 @@ async fn acceptance_is_canonical_idempotent_and_revision_bound() {
         })
     ));
 
-    repository
-        .revise_goal(WorkGoalChange {
-            owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-            work_id: WorkId::parse(&work_id).expect("work"),
-            expected_work_revision: WorkRevision::new(2).expect("Work r2"),
-            expected_goal_revision: GoalRevision::INITIAL,
-            goal: WorkGoal::parse("Changed Goal invalidates the old acceptance basis.")
-                .expect("goal"),
-            source_ref: WorkChangeRef::parse(common::id("goal-source")).expect("source"),
-            reason: None,
+    let mut forged_goal = decision(
+        &owner_id,
+        &work_id,
+        &branch_id,
+        &common::id("forged-goal-decision"),
+        &criterion_ids,
+    );
+    forged_goal.goal_revision = GoalRevision::new(2).expect("forged Goal r2");
+    assert!(matches!(
+        repository.accept_gaps(forged_goal).await,
+        Err(WorkRepositoryError::InvalidAcceptanceBasis {
+            resource: astra_services::work::WorkAcceptanceBasisResource::GoalRevision
+        })
+    ));
+    let basis = repository
+        .load(
+            &WorkOwnerId::parse(&owner_id).expect("owner"),
+            &WorkId::parse(&work_id).expect("work"),
+        )
+        .await
+        .expect("current criteria proposal basis");
+    let proposed = repository
+        .propose_criteria(astra_services::work::NewWorkCriteriaProposal {
+            owner_id: basis.work.parts().owner_id.clone(),
+            work_id: basis.work.parts().work_id.clone(),
+            branch_id: basis.delivery_branch.parts().branch_id.clone(),
+            proposal_id: astra_services::work::WorkProposalId::parse(common::id(
+                "criteria-refinement",
+            ))
+            .expect("proposal"),
+            expected_work_revision: basis.work.parts().work_revision,
+            expected_goal_revision: basis.work.parts().current_goal_revision,
+            expected_criteria_set_revision: basis.work.parts().current_criteria_set_revision,
+            expected_branch_revision: basis.delivery_branch.parts().branch_revision,
+            expected_graph_revision: basis.delivery_branch.parts().current_graph_revision,
+            members: vec![astra_services::work::WorkCriteriaProposalMember::Existing {
+                criterion_id: criterion_ref(&criterion_ids[0]).criterion_id,
+                revision: CriterionRevision::INITIAL,
+            }],
+            source_kind: astra_services::work::WorkProposalSourceKind::Model,
+            source_ref: WorkChangeRef::parse(common::id("refinement-source")).expect("source"),
         })
         .await
-        .expect("revise Goal");
+        .expect("refined criteria proposal");
+    repository
+        .accept_criteria_proposal(common::criteria_acceptance(
+            &proposed,
+            &common::id("accept-refinement"),
+        ))
+        .await
+        .expect("advance Work acceptance basis");
     let stale = decision(
         &owner_id,
         &work_id,
@@ -321,7 +373,9 @@ async fn acceptance_is_canonical_idempotent_and_revision_bound() {
     );
     assert!(matches!(
         repository.accept_gaps(stale).await,
-        Err(WorkRepositoryError::InvalidAcceptanceBasis { .. })
+        Err(WorkRepositoryError::InvalidAcceptanceBasis {
+            resource: astra_services::work::WorkAcceptanceBasisResource::WorkRevision
+        })
     ));
     assert_eq!(decision_count(&pool, &owner_id, &work_id).await, 1);
     assert_eq!(current_gap_count(&pool, &owner_id, &work_id).await, 2);
@@ -336,7 +390,7 @@ async fn acceptance_is_canonical_idempotent_and_revision_bound() {
     .expect("Work events");
     assert_eq!(
         event_rows.len(),
-        6,
+        8,
         "rejected acceptance attempts must not produce semantic events"
     );
     let event_kinds = event_rows
@@ -347,11 +401,13 @@ async fn acceptance_is_canonical_idempotent_and_revision_bound() {
         event_kinds,
         [
             "work_created",
+            "criteria_proposed",
             "criteria_accepted",
             "branch_basis_adopted",
             "subject_changed",
             "gaps_accepted",
-            "goal_revised",
+            "criteria_proposed",
+            "criteria_accepted",
         ]
     );
     for (index, row) in event_rows.iter().enumerate() {
@@ -493,7 +549,7 @@ async fn partial_evidence_must_reference_a_same_criterion_check_run() {
         current_gap
             .try_get::<i64, _>("decision_event_seq")
             .expect("event sequence"),
-        8
+        9
     );
     assert_eq!(
         current_gap
@@ -524,6 +580,7 @@ async fn partial_evidence_must_reference_a_same_criterion_check_run() {
         event_kinds,
         [
             "work_created",
+            "criteria_proposed",
             "criteria_accepted",
             "branch_basis_adopted",
             "subject_changed",
@@ -703,7 +760,7 @@ async fn event_retention_prunes_history_without_erasing_current_gap_acceptance()
         projection
             .try_get::<i64, _>("decision_event_seq")
             .expect("event sequence"),
-        6
+        7
     );
     let resolved_refs: serde_json::Value = serde_json::from_str(
         &projection
@@ -725,10 +782,10 @@ async fn event_retention_prunes_history_without_erasing_current_gap_acceptance()
     );
 
     // Jump to the fixed retention boundary instead of performing 9,998
-    // irrelevant writes. Events 5 and 6 are the check and decision above.
+    // irrelevant writes. Events 6 and 7 are the check and decision above.
     sqlx::query(
         "UPDATE work_event_sequences
-         SET last_event_seq = 10004, retained_from_event_seq = 5
+         SET last_event_seq = 10005, retained_from_event_seq = 6
          WHERE owner_id = ? AND work_id = ?",
     )
     .bind(&owner_id)
@@ -790,7 +847,7 @@ async fn event_retention_prunes_history_without_erasing_current_gap_acceptance()
         retained_projection
             .try_get::<i64, _>("decision_event_seq")
             .expect("event sequence"),
-        6,
+        7,
         "history pruning must not rewrite acceptance causality"
     );
     assert_eq!(
