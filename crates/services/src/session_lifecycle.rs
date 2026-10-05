@@ -86,13 +86,6 @@ const SESSION_LOCK_AGENT_RUNS_SQL: &str = "SELECT run_id FROM agent_runs
          ORDER BY run_id ASC
          FOR UPDATE";
 
-const SESSION_DELETE_PLAN_STEP_RUNS_SQL: &str = "DELETE FROM plan_step_runs
-         WHERE user_id = ?
-           AND plan_id IN (
-               SELECT plan_id FROM plans
-               WHERE session_id = ? AND user_id = ?
-           )";
-
 const SESSION_DELETE_CHILD_FORKS_SELECT_SQL: &str =
     "SELECT isolation_domain, fork_id, parent_session_id
        FROM session_forks
@@ -984,16 +977,6 @@ pub(crate) async fn hard_delete_session_rows(
         .await?;
         record_table_delete(&mut outcome, statement.label, rows_deleted)?;
     }
-
-    let rows_deleted = query(SESSION_DELETE_PLAN_STEP_RUNS_SQL)
-        .bind(user_id)
-        .bind(session_id)
-        .bind(user_id)
-        .execute(&mut **tx)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(|source| format!("delete_session.plan_step_runs: {source}"))?;
-    record_table_delete(&mut outcome, "plan_step_runs", rows_deleted)?;
 
     for statement in SESSION_DELETE_DERIVED_PARENT_TABLES {
         let rows_deleted = delete_session_rows_session_user(
@@ -1969,12 +1952,6 @@ mod tests {
             .join(" ");
         assert!(lock_agent_runs_sql.contains("session_id = ? AND user_id = ?"));
         assert!(lock_agent_runs_sql.ends_with("ORDER BY run_id ASC FOR UPDATE"));
-        let plan_step_runs_sql = SESSION_DELETE_PLAN_STEP_RUNS_SQL
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(plan_step_runs_sql.contains("user_id = ?"));
-        assert!(plan_step_runs_sql.contains("session_id = ? AND user_id = ?"));
     }
 
     #[test]

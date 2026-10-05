@@ -697,7 +697,6 @@ fn char_literal() { let slash = '/'; }
             "user_preferences",
             "edge_agent_registry",
             "plans",
-            "plan_step_runs",
             "infra_sandbox_metadata",
             "team_definitions",
             "team_snapshots",
@@ -745,10 +744,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "current mutable plan state",
             self.tables["plans"]["merge_guidance"],
-        )
-        self.assertIn(
-            "append-only attempt history",
-            self.tables["plan_step_runs"]["merge_guidance"],
         )
         self.assertIn(
             "workspace_records track reusable workspaces",
@@ -841,6 +836,7 @@ fn char_literal() { let slash = '/'; }
 
     def test_retired_session_projection_tables_are_absent_from_production_schema(self) -> None:
         retired = {
+            "plan_step_runs",
             "session_state_revisions",
             "session_history_chunks",
             "session_artifacts_grants",

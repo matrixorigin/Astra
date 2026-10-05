@@ -7,8 +7,8 @@ pub mod state;
 
 pub use model::{SubtaskPlan, TaskPlan, TaskStatus};
 pub use repository::{
-    CloudPlanRepository, FinalizeStepRun, InMemoryPlanRepository, NewStepRun, PlanListFilter,
-    PlanLoadError, PlanRepository, PlanStepRun, RecordCompletedStepRun, SavedPlanInfo,
+    CloudPlanRepository, InMemoryPlanRepository, PlanListFilter, PlanLoadError, PlanRepository,
+    SavedPlanInfo,
 };
 pub use resume::{
     PlanResumeSnapshot, plan_mode_authoring_active, plan_resume_digest,

@@ -69,6 +69,7 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         );
     }
     for retired in [
+        "plan_step_runs",
         "work_plan_proposal_sequences",
         "work_plan_proposals",
         "harness_runs",
@@ -2730,24 +2731,6 @@ async fn phase4_state_projection_schema_contract() {
             .await
             .is_empty(),
         "plans must not keep ownerless session index idx_plans_session"
-    );
-
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "plan_step_runs",
-            "idx_step_runs_plan_started"
-        )
-        .await,
-        ["user_id", "plan_id", "started_at"],
-        "step-run history must be owner-bound before plan ordering"
-    );
-    assert!(
-        index_columns(&pool, &schema, "plan_step_runs", "idx_step_runs_session")
-            .await
-            .is_empty(),
-        "plan_step_runs must not keep an ownerless session scan index"
     );
 
     let state_items = column_names(&pool, &schema, "session_state_items").await;

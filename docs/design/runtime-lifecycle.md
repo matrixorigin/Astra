@@ -443,7 +443,9 @@ Required invariants:
 
 ## Plan mode
 
-Plan mode is a policy overlay.
+Plan mode is a policy overlay. Plan persistence owns authoring state and active
+session bindings. Execution attempts, cancellation and custody remain in Work
+and Run; there is no separate plan-step attempt audit.
 
 Allowed by default:
 

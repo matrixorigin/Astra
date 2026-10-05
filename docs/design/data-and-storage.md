@@ -38,12 +38,15 @@ published only after schema validation succeeds.
 
 ## Transcript persistence
 
-Fresh schema contract `2026-10-05-v94` stores transcript items and their
+Fresh schema contract `2026-10-05-v95` stores transcript items and their
 committed projection head. Physical page metadata and the unused source event
 position column are removed. The run lookup index is `(user_id, run_id)`.
 Model thinking observations use only the configuration-bound snapshot; obsolete
 capability and error mirror columns are absent.
-The retired session-level physical-workspace claim and unexecuted workflow-trigger tables are not part of this contract. There is no migration, replacement table, page cache, or rebuild job;
+The retired session-level physical-workspace claim, unexecuted workflow-trigger
+and plan-step attempt tables are not part of this contract. Plans retain their
+owner-scoped authoring state and session binding; execution and attempt evidence
+remain with Work and Run. There is no migration, replacement table, page cache, or rebuild job;
 an older database must be recreated from the current schema.
 
 One append implementation requires canonical session admission in the same
