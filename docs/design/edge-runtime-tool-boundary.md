@@ -131,6 +131,12 @@ must describe the bytes actually committed, not an implicit later rewrite.
 
 ## Cloud workspace boundary
 
+The current implementation has no production `gateway_relay` or
+`sandbox_resident_agent` execution adapter. These bindings retain explicit route
+metadata and fail with `transport_unavailable`; they never fall back to
+Server-local execution. A future provider must use the canonical owned
+invocation boundary and supply real enforcement evidence.
+
 A cloud workspace runtime is not the same as the Astra server process. It requires explicit provider binding and isolation metadata.
 
 Required metadata:
@@ -220,6 +226,13 @@ Working-directory names are verified display labels, not IO authority; an
 unavailable label is reported as unknown rather than silently as the root.
 
 ## Result boundary
+
+Tool-output governance preserves retained plaintext segments and decoded JSON
+string content, including line endings and whitespace. It removes injection lines
+and redacts credentials; JSON serialization may normalize the surrounding format. Reapplying governance must preserve the same governed result; display
+projections cannot replace full journal evidence. CLI and Server journal records
+use the same governed content without UI-only diff attachments; the original
+callback and local UI output remain separate.
 
 Tool output crossing runtime boundaries must be enveloped:
 

@@ -22,6 +22,9 @@ import sys
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+import urllib.parse
+
+import benchmark_model_seed
 
 
 SCHEMA_VERSION = 2
@@ -156,7 +159,6 @@ def _mysql_rows(sql: str, database: str | None = None) -> list[list[str]]:
         f"-h{host}",
         f"-P{port}",
         f"-u{user}",
-        "--skip-ssl",
         "--batch",
         "--skip-column-names",
     ]
@@ -635,17 +637,42 @@ def _model_state(database: str) -> dict[str, str | int | None]:
         raise ContractError(
             "ASTRA_HARNESS_MODEL_THINKING must be exactly 'none' or 'high'"
         )
-    rows = _mysql_rows(
-        "SELECT model_name, is_active, COALESCE(thinking_capability,''), "
-        "COALESCE(thinking_probe_error,''), CAST(updated_at AS CHAR) "
-        "FROM infra_llm_models",
-        database,
-    )
-    if len(rows) != 1 or len(rows[0]) != 5:
+    query = "SELECT model_id, model_name, is_active, CAST(updated_at AS CHAR) FROM infra_llm_models"
+    rows = _mysql_rows(query, database)
+    if len(rows) != 1 or len(rows[0]) != 4:
         raise ContractError(f"expected exactly one model offering, found {len(rows)}")
-    name, active, capability, probe_error, updated_at = rows[0]
+    model_id, name, active, updated_at = rows[0]
     if name != EXPECTED_MODEL or active != "1":
         raise ContractError("the exact selected model offering is not uniquely active")
+    api_url = _required_env("ASTRA_HARNESS_CONTROL_API_URL").rstrip("/")
+    parsed = urllib.parse.urlsplit(api_url)
+    if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
+        or parsed.username is not None or parsed.password is not None
+        or parsed.path or parsed.query or parsed.fragment):
+        raise ContractError("model state requires the owned loopback Astra API origin")
+    try:
+        model = benchmark_model_seed._request_json(
+            benchmark_model_seed.owned_api_opener(),
+            api_url + "/models/" + urllib.parse.quote(name, safe=""),
+            _required_env("ASTRA_ACCESS_TOKEN"), None, 200, "selected model state",
+            method="GET", timeout=8,
+        )
+    except benchmark_model_seed.SeedError as error:
+        raise ContractError(str(error)) from None
+    if (model.get("model_id") != model_id or model.get("name") != name
+        or model.get("is_active") is not True):
+        raise ContractError("the owned API does not match the exact database offering")
+    if _mysql_rows(query, database) != rows:
+        raise ContractError("selected model changed while reading its bound observation")
+    capability = model.get("thinking_capability")
+    if capability not in (None, "both", "effort_only", "native_only", "none"):
+        raise ContractError("the selected offering returned an invalid thinking capability")
+    probe = model.get("thinking_probe")
+    if probe is not None and not isinstance(probe, dict):
+        raise ContractError("the selected offering returned an invalid thinking observation")
+    probe_error = probe.get("error") if probe is not None else None
+    if probe_error is not None and not isinstance(probe_error, str):
+        raise ContractError("the selected offering returned an invalid thinking probe error")
     if (
         EXPECTED_THINKING_MODE == "high"
         and capability not in {"both", "effort_only"}
@@ -656,7 +683,7 @@ def _model_state(database: str) -> dict[str, str | int | None]:
     return {
         "model_name": name,
         "is_active": 1,
-        "thinking_capability": capability,
+        "thinking_capability": capability or "",
         "thinking_probe_error": probe_error or None,
         "requested_thinking_mode": EXPECTED_THINKING_MODE,
         "checked_updated_at": updated_at,

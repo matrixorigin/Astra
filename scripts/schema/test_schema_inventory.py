@@ -818,8 +818,8 @@ fn char_literal() { let slash = '/'; }
         state_sync = (
             schema_inventory.REPO_ROOT / "crates/services/src/state_sync.rs"
         ).read_text(encoding="utf-8")
-        self.assertIn("SyncAuditWriter", state_sync)
-        self.assertIn("Audit is intentionally not persisted to MatrixOne", state_sync)
+        self.assertIn("pull_all_preferences", state_sync)
+        self.assertIn("user_preferences", state_sync)
         self.assertNotIn("session_sync_log", state_sync)
 
     def test_session_deletion_tombstones_are_removed_from_production_schema(self) -> None:
@@ -892,7 +892,7 @@ fn char_literal() { let slash = '/'; }
                     self.assertNotEqual(review[field], "")
                     self.assertNotIn("TBD", review[field])
 
-        self.assertIn("tracing-only", self.p1_5_reviews["session_sync_log"]["user_api_impact"])
+        self.assertIn("no storage", self.p1_5_reviews["session_sync_log"]["user_api_impact"])
         self.assertIn(
             "hydration",
             self.p1_5_reviews["session_state_revisions"]["rationale"],
@@ -913,8 +913,8 @@ fn char_literal() { let slash = '/'; }
     def test_p1_5_consolidation_source_evidence_still_exists(self) -> None:
         expectations = {
             "crates/services/src/state_sync.rs": [
-                "SyncAuditWriter",
-                "Audit is intentionally not persisted to MatrixOne",
+                "pull_all_preferences",
+                "user_preferences",
             ],
             "crates/services/src/data_versioning.rs": [
                 "data_versioning_checkpoints",

@@ -926,7 +926,6 @@ fn spawn_server(
         .env("no_proxy", "127.0.0.1,localhost")
         // Keep the child hermetic even when dotenv discovery finds an
         // unrelated ancestor file. dotenvy preserves explicitly-set values.
-        .env("ASTRA_OUTPUT_STYLE", "default")
         .env(
             "ASTRA_PROMPT_OVERRIDES_DIR",
             local_state_root.path().join("prompts"),
@@ -987,7 +986,6 @@ fn spawn_edge(
         .env(ASTRA_CONFIG_SOURCE_ENV, ASTRA_CONFIG_SOURCE_EXPLICIT_ENV)
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
-        .env("ASTRA_OUTPUT_STYLE", "default")
         .env(
             "ASTRA_PROMPT_OVERRIDES_DIR",
             local_state_root.path().join("prompts"),
@@ -1500,7 +1498,6 @@ async fn run_cli_turn(
         .env(ASTRA_CONFIG_SOURCE_ENV, ASTRA_CONFIG_SOURCE_EXPLICIT_ENV)
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
-        .env("ASTRA_OUTPUT_STYLE", "default")
         .env(
             "ASTRA_PROMPT_OVERRIDES_DIR",
             local_state_root.path().join("prompts"),

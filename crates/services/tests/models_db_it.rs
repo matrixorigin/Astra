@@ -11,6 +11,25 @@ use axum::http::StatusCode;
 use serial_test::serial;
 use uuid::Uuid;
 
+fn model_patch() -> ModelUpdateRequestData {
+    ModelUpdateRequestData {
+        api_key: None,
+        base_url: None,
+        provider: None,
+        description: None,
+        context_window: None,
+        max_completion_tokens: None,
+        input_modalities: None,
+        output_modalities: None,
+        supported_parameters: None,
+        pricing: None,
+        architecture: None,
+        tags: None,
+        is_active: None,
+        quirks: None,
+    }
+}
+
 async fn seed_model(pool: &sqlx::Pool<sqlx::MySql>, model_name: &str) -> String {
     let model_id = Uuid::new_v4().to_string();
     sqlx::query(
@@ -93,28 +112,9 @@ async fn configured_catalog_price_matches_full_and_paginated_reads() {
         .execute(&pool)
         .await
         .unwrap();
-    service
-        .update_model(
-            model_name,
-            ModelUpdateRequestData {
-                api_key: None,
-                base_url: None,
-                provider: None,
-                description: Some("unrelated description change".into()),
-                context_window: None,
-                max_completion_tokens: None,
-                input_modalities: None,
-                output_modalities: None,
-                supported_parameters: None,
-                pricing: None,
-                architecture: None,
-                tags: None,
-                is_active: None,
-                quirks: None,
-            },
-        )
-        .await
-        .unwrap();
+    let mut description = model_patch();
+    description.description = Some("unrelated description change".into());
+    service.update_model(model_name, description).await.unwrap();
     let updated = service.list_models(String::new(), true).await.unwrap();
     assert!(
         updated
@@ -124,6 +124,11 @@ async fn configured_catalog_price_matches_full_and_paginated_reads() {
             .pricing
             .is_none()
     );
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&model_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -230,7 +235,7 @@ async fn batch_admission_is_ordered_owner_scoped_and_fresh() {
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
-async fn database_model_corrupt_capability_and_json_shape_fail_loud() {
+async fn database_model_unknown_capability_and_invalid_json_are_explicit() {
     let (shared_pool, settings) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get().clone();
     let service = DatabaseModelService::new(
@@ -241,27 +246,14 @@ async fn database_model_corrupt_capability_and_json_shape_fail_loud() {
     let model_name = format!("model_{}", Uuid::new_v4().simple());
     seed_model(&pool, &model_name).await;
 
-    sqlx::query("UPDATE infra_llm_models SET thinking_capability = ? WHERE model_name = ?")
-        .bind("mystery")
-        .bind(&model_name)
-        .execute(&pool)
-        .await
-        .expect("corrupt thinking_capability");
+    let model = service.get_model(model_name.clone()).await.unwrap();
+    assert!(model.thinking_capability.is_none());
+    assert!(model.thinking_probe.is_none());
+    let catalog = service.list_models(String::new(), true).await.unwrap();
+    let item = catalog.iter().find(|item| item.name == model_name).unwrap();
+    assert!(item.thinking_capability.is_none());
 
-    let err = match service.get_model(model_name.clone()).await {
-        Ok(_) => panic!("unknown persisted thinking_capability must fail loudly"),
-        Err(err) => err,
-    };
-    assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(
-        err.1
-            .detail
-            .contains("infra_llm_models.thinking_capability"),
-        "unexpected error detail: {}",
-        err.1.detail
-    );
-
-    sqlx::query("UPDATE infra_llm_models SET thinking_capability = NULL, input_modalities = ? WHERE model_name = ?")
+    sqlx::query("UPDATE infra_llm_models SET input_modalities = ? WHERE model_name = ?")
         .bind("null")
         .bind(&model_name)
         .execute(&pool)
@@ -280,6 +272,23 @@ async fn database_model_corrupt_capability_and_json_shape_fail_loud() {
         "unexpected error detail: {}",
         err.1.detail
     );
+
+    // A response decode failure rolls back the PATCH rather than leaving a
+    // partial write while returning an error to its caller.
+    let mut patch = model_patch();
+    patch.context_window = Some(64000);
+    let failure = service.update_model(model_name.clone(), patch).await;
+    assert!(matches!(
+        failure,
+        Err((StatusCode::INTERNAL_SERVER_ERROR, _))
+    ));
+    let context_window: i32 =
+        sqlx::query_scalar("SELECT context_window FROM infra_llm_models WHERE model_name = ?")
+            .bind(&model_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(context_window, 128000);
 
     sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)

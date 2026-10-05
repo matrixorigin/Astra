@@ -29,7 +29,6 @@ pub(crate) struct TurnExecutionInput<'a> {
     pub(crate) message: &'a str,
     pub(crate) user_intent: &'a str,
     pub(crate) input_runtime_required_texts: &'a [String],
-    pub(crate) input_active_system_skills: &'a [String],
     pub(crate) input_runtime_volatile_texts: &'a [String],
     /// Canonical session identity established before interactive turn admission.
     ///
@@ -134,7 +133,6 @@ fn build_turn_stream_params<'a>(
         message: input.message,
         user_intent: input.user_intent,
         input_runtime_required_texts: input.input_runtime_required_texts,
-        input_active_system_skills: input.input_active_system_skills,
         input_runtime_volatile_texts: input.input_runtime_volatile_texts,
         input_work_unit_observations: &prepared.input_work_unit_observations,
         semantic_query_override: input.semantic_query_override,
@@ -537,7 +535,6 @@ mod tests {
                 message: "what work is running?",
                 user_intent: "what work is running?",
                 input_runtime_required_texts: &[],
-                input_active_system_skills: &[],
                 input_runtime_volatile_texts: &[],
                 session_id: &session_id,
                 semantic_query_override: None,
@@ -647,7 +644,6 @@ mod tests {
                 message: "continue",
                 user_intent: "continue",
                 input_runtime_required_texts: &[],
-                input_active_system_skills: &[],
                 input_runtime_volatile_texts: &[],
                 session_id: "sess-1",
                 semantic_query_override: None,

@@ -12,7 +12,7 @@ const { Terminal } = require('@xterm/headless');
 const binary = path.resolve(process.env.ASTRA_TEST_BINARY || '../../target/debug/astra');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function journey(sizes, draft = false, rapid = false, displacedCursor = false) {
+async function journey(sizes, draft = false, rapid = false, displacedCursor = false, expiredReply = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'astra-reflow-'));
   const terminal = new Terminal({ cols: 100, rows: 30, scrollback: 2000, allowProposedApi: true });
   const child = spawn('python3', ['-u', path.join(__dirname, 'pty_bridge.py'), binary, root], {
@@ -103,6 +103,35 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
       await settle();
     }
     check('initial 100x30');
+    if (expiredReply) {
+      tracingResize = true;
+      holdCursorReply = true;
+      const before = cursorReports;
+      terminal.resize(100, 15);
+      send({ resize: [100, 15] });
+      await waitFor(() => cursorReports > before);
+      const expired = heldCursorReply;
+      terminal.resize(100, 30);
+      send({ resize: [100, 30] });
+      // Outlast the query deadline. A terminal with no response must remain
+      // usable, but another indistinguishable DSR must not overlap this one.
+      await settle();
+      send({ input: '\x1b[200~ PENDING_INPUT\x1b[201~' });
+      await waitFor(() => lines().join('').includes('PENDING_INPUT'));
+      await settle();
+      assert.equal(cursorReports, before + 1, 'issued another cursor query before the expired reply was consumed');
+      check('cursor reply deadline; paste remains responsive');
+      holdCursorReply = false;
+      send({ input: expired });
+      send({ input: '\x1b[200~ RECOVERED_INPUT\x1b[201~' });
+      await waitFor(() => lines().join('').includes('RECOVERED_INPUT'));
+      terminal.resize(160, 30);
+      send({ resize: [160, 30] });
+      await waitFor(() => cursorReports > before + 1);
+      await settle();
+      check('late cursor reply quarantined; fresh resize recovered');
+      return;
+    }
     tracingResize = rapid;
     for (const [index, [cols, rows]] of sizes.entries()) {
       const reportsBeforeResize = cursorReports;
@@ -155,4 +184,5 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
   await journey(rapidSizes, false, true);
   await journey(rapidSizes, true, true);
   await journey(rapidSizes, true, true, true);
+  await journey([], true, true, false, true);
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -29,18 +29,14 @@ pub(crate) fn checkpoint_lessons_from_runtime(state: &mut SessionState) {
         return;
     }
 
-    let memoria_lessons: Vec<astra_runtime::learning::synthesizer::ExtractedLesson> = delta
+    let memoria_lessons: Vec<astra_runtime::learning::lesson::ExtractedLesson> = delta
         .into_iter()
-        .filter(|lesson| {
-            astra_runtime::learning::synthesizer::is_high_quality_lesson(&lesson.action)
+        .filter(|lesson| astra_runtime::learning::lesson::is_high_quality_lesson(&lesson.action))
+        .map(|lesson| astra_runtime::learning::lesson::ExtractedLesson {
+            memory_type: "working",
+            content: format!("💡 LESSON: {}", lesson.action),
+            trust_tier: "T4",
         })
-        .map(
-            |lesson| astra_runtime::learning::synthesizer::ExtractedLesson {
-                memory_type: "working",
-                content: format!("💡 LESSON: {}", lesson.action),
-                trust_tier: "T4",
-            },
-        )
         .collect();
     if memoria_lessons.is_empty() {
         return;

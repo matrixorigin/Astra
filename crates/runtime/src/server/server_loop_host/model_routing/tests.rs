@@ -2,6 +2,7 @@ use super::super::tests::{
     admitted_test_offering, create_durable_execution_test_state, mock_encryptor, mock_matrixone,
 };
 use super::*;
+use crate::server::provider_test_support::{ProviderGateway, ProviderResponse, ProviderScript};
 use astra_services::{
     ModelCreateRequestData, ModelListItem, ModelRecord, ModelUpdateRequestData,
     ResolvedModelOffering,
@@ -48,14 +49,20 @@ async fn auto_entrypoint_reuses_builtin_judge_and_dispatches_the_selected_model(
             responses: std::sync::Mutex::new(Default::default()),
             requests: judgment_requests.clone(),
         };
-        let (url, requests, server) = super::super::tests::spawn_gateway(
-            StatusCode::OK,
-            json!({
-                "choices":[{"message":{"content":"done"},"finish_reason":"stop"}],
-                "usage":{"prompt_tokens":12,"completion_tokens":24}
-            }),
-        )
+        let response = json!({
+            "choices":[{"message":{"content":"done"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":12,"completion_tokens":24}
+        });
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "auto_entrypoint_reuses_builtin_judge_and_dispatches_the_selected_model",
+            |request| request.path == "/v1/chat/completions",
+            (0..1)
+                .map(|_| ProviderResponse::OpenAi(response.clone()))
+                .collect(),
+        )])
         .await;
+        let url = format!("{}/v1/chat/completions", provider.base_url);
+        let requests = provider.requests.clone();
         for model in catalog.models.write().unwrap().values_mut() {
             model.completions_url_override = Some(url.clone());
         }
@@ -130,14 +137,14 @@ async fn auto_entrypoint_reuses_builtin_judge_and_dispatches_the_selected_model(
         host.execute_turn(&mut state).await.unwrap();
         let recorded = requests.lock().await.clone();
         assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0]["model"], expected_model);
+        assert_eq!(recorded[0].body["model"], expected_model);
         assert_eq!(
             judgment_requests.lock().unwrap().len(),
             expected_judgments,
             "later preparation and primary execution must not repeat the assessment"
         );
         ledger.assert_quiescent();
-        server.abort();
+        provider.assert_complete();
     }
 }
 

@@ -13,6 +13,8 @@ pub(crate) struct InternalEventReader {
     events: VecDeque<InternalEvent>,
     source: Option<Box<dyn EventSource>>,
     skipped_events: Vec<InternalEvent>,
+    #[cfg(unix)]
+    pub(super) cursor_query_pending: bool,
 }
 
 impl Default for InternalEventReader {
@@ -28,6 +30,8 @@ impl Default for InternalEventReader {
             source,
             events: VecDeque::with_capacity(32),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         }
     }
 }
@@ -69,7 +73,9 @@ impl InternalEventReader {
         let poll_timeout = PollTimeout::new(timeout);
 
         loop {
-            let maybe_event = match event_source.try_read(poll_timeout.leftover()) {
+            let available = event_source.try_read(poll_timeout.leftover());
+            let source_empty = matches!(available, Ok(None));
+            let maybe_event = match available {
                 Ok(None) => None,
                 Ok(Some(event)) => {
                     #[cfg(unix)]
@@ -93,7 +99,9 @@ impl InternalEventReader {
                 }
             };
 
-            if poll_timeout.elapsed() || maybe_event.is_some() {
+            if (poll_timeout.elapsed() && (timeout != Some(Duration::ZERO) || source_empty))
+                || maybe_event.is_some()
+            {
                 self.events.extend(self.skipped_events.drain(..));
 
                 if let Some(event) = maybe_event {
@@ -143,6 +151,8 @@ mod tests {
             events: VecDeque::new(),
             source: None,
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert!(reader.poll(None, &InternalEventFilter).is_err());
@@ -160,6 +170,8 @@ mod tests {
             events: vec![InternalEvent::Event(Event::Resize(10, 10))].into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert!(reader.poll(None, &InternalEventFilter).unwrap());
@@ -176,6 +188,8 @@ mod tests {
             .into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert!(reader.poll(None, &CursorPositionFilter).unwrap());
@@ -189,6 +203,8 @@ mod tests {
             events: vec![EVENT].into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
@@ -203,6 +219,8 @@ mod tests {
             events: vec![InternalEvent::Event(Event::Resize(10, 10)), CURSOR_EVENT].into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert_eq!(reader.read(&CursorPositionFilter).unwrap(), CURSOR_EVENT);
@@ -218,6 +236,8 @@ mod tests {
             events: vec![SKIPPED_EVENT, CURSOR_EVENT].into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert_eq!(reader.read(&CursorPositionFilter).unwrap(), CURSOR_EVENT);
@@ -238,6 +258,8 @@ mod tests {
             .into(),
             source: None,
             skipped_events: Vec::new(),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
         reader.read(&CursorPositionFilter).unwrap();
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), first);
@@ -252,6 +274,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert!(!reader
@@ -267,6 +291,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert!(reader.poll(None, &InternalEventFilter).unwrap());
@@ -285,6 +311,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
@@ -300,6 +328,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
@@ -317,6 +347,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
@@ -333,6 +365,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(FakeSource::new(&[]))),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert_eq!(
@@ -350,6 +384,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(FakeSource::new(&[]))),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert_eq!(
@@ -371,6 +407,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
@@ -389,6 +427,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(FakeSource::new(&[first.clone(), second.clone()]))),
             skipped_events: Vec::new(),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
         assert!(reader
             .poll(Some(Duration::from_secs(1)), &CursorPositionFilter)
@@ -407,11 +447,43 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            cursor_query_pending: false,
         };
 
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
         assert!(reader.read(&InternalEventFilter).is_err());
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn zero_timeout_filtered_poll_reaches_ready_reply_and_preserves_input() {
+        let first = InternalEvent::Event(Event::Key(crate::event::KeyCode::Char('a').into()));
+        let second = InternalEvent::Event(Event::Key(crate::event::KeyCode::Char('b').into()));
+        let resize = InternalEvent::Event(Event::Resize(80, 24));
+        let reply = InternalEvent::CursorPosition(2, 4);
+        let mut reader = InternalEventReader {
+            events: VecDeque::new(),
+            source: Some(Box::new(FakeSource::with_events(&[
+                first.clone(),
+                resize.clone(),
+                second.clone(),
+                reply.clone(),
+            ]))),
+            skipped_events: Vec::new(),
+            cursor_query_pending: false,
+        };
+        assert!(reader
+            .poll(Some(Duration::ZERO), &CursorPositionFilter)
+            .unwrap());
+        assert_eq!(reader.read(&CursorPositionFilter).unwrap(), reply);
+        assert!(!reader
+            .poll(Some(Duration::ZERO), &CursorPositionFilter)
+            .unwrap());
+        for expected in [first, resize, second] {
+            assert_eq!(reader.read(&InternalEventFilter).unwrap(), expected);
+        }
     }
 
     #[derive(Default)]

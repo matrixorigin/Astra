@@ -1,4 +1,4 @@
-//! Phase N (proptest-rewrite) — invariant testing for `parse_tool_call_tags`.
+//! Phase N (proptest-rewrite) — invariant testing for `parse_degraded_tool_calls`.
 //!
 //! Rationale: the v1 of this file pinned a handful of hand-picked corrupted
 //! inputs with loose assertions (`!calls.is_empty()`, `.is_object()`). A
@@ -7,14 +7,17 @@
 //! This rewrite asserts **design invariants** that must hold for ANY input.
 //! A property test that finds a single counterexample surfaces a real bug.
 //!
-//! Invariants asserted for every input string:
+//! Tool-call-tag generators retain all six invariants. Arbitrary text may
+//! include invoke syntax, whose nonempty names are validated at tool admission;
+//! it checks the common shape/JSON/count invariants and never-panics contract.
+//! Invariants for tool-call-tag inputs:
 //!   I1. Never panics.
 //!   I2. If Some(calls) is returned, every `function.arguments` string is
 //!       valid JSON. (Contract: executor always gets parseable args.)
 //!   I3. Every `function.name` is non-empty and contains only `[A-Za-z0-9_-]`.
 //!   I4. Null bytes never leak into names or arguments (the parser strips
 //!       them up front).
-//!   I5. Call count is bounded by the number of `<tool_call>` occurrences
+//!   I5. Call count is bounded by the number of opening tool-call markers
 //!       in the input. (Guards against duplication bugs.)
 //!   I6. Every returned call has a stable JSON shape: `{id, type:"function",
 //!       function:{name, arguments}}`.
@@ -22,17 +25,22 @@
 //! Anchor cases (not property-generated) still cover specific real-world
 //! corrupted shapes: parenthesized args, JSON args, prose-heavy guard.
 
-use astra_turn_core::xml_tool_call_fallback::parse_tool_call_tags;
+use astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls;
 use proptest::prelude::*;
 use serde_json::Value;
 
 // ── Invariant check helper ──────────────────────────────────────────────────
 
-fn assert_invariants(input: &str, result: Option<Vec<Value>>) {
+fn assert_invariants(input: &str, result: Option<Vec<Value>>, tool_call_only: bool) {
     let Some(calls) = result else { return };
 
-    let tag_count = input.matches("<tool_call>").count();
-    // I5: cannot synthesize more calls than there are opening tags.
+    let tag_count = if tool_call_only {
+        input.matches("<tool_call>").count()
+    } else {
+        // Every syntax family requires an opening '<'. This independent upper
+        // bound includes case-insensitive and whitespace-tolerant DSML tags.
+        input.matches('<').count()
+    };
     assert!(
         calls.len() <= tag_count,
         "I5 violated: {} calls from {} tags\ninput={:?}",
@@ -64,16 +72,18 @@ fn assert_invariants(input: &str, result: Option<Vec<Value>>) {
 
         // I3: name well-formed.
         assert!(!name.is_empty(), "I3: empty name in call {idx}");
-        assert!(
-            name.chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '-'),
-            "I3: bad name chars {:?} in call {idx}\ninput={:?}",
-            name,
-            input
-        );
+        if tool_call_only {
+            assert!(
+                name.chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-'),
+                "I3: bad name chars {:?} in call {idx}\ninput={:?}",
+                name,
+                input
+            );
 
-        // I4: no null bytes in name / args.
-        assert!(!name.contains('\0'), "I4: null byte in name");
+            // I4: no null bytes in name / args.
+            assert!(!name.contains('\0'), "I4: null byte in name");
+        }
         assert!(
             !args.contains('\0'),
             "I4: null byte in args\ninput={input:?}"
@@ -108,9 +118,9 @@ proptest! {
 
     #[test]
     fn phase_n_no_panic_on_arbitrary_text(s in ".*") {
-        // I1 (never panics) + I2–I6 for arbitrary unicode input.
-        let r = parse_tool_call_tags(&s);
-        assert_invariants(&s, r);
+        // Never panics and preserves universal call-shape/JSON invariants.
+        let r = parse_degraded_tool_calls(&s);
+        assert_invariants(&s, r, false);
     }
 
     // Generator: a realistic "tool_call with noise" input space.
@@ -143,8 +153,8 @@ proptest! {
         }
         s.push_str(&suffix);
 
-        let r = parse_tool_call_tags(&s);
-        assert_invariants(&s, r);
+        let r = parse_degraded_tool_calls(&s);
+        assert_invariants(&s, r, true);
     }
 
     // Property: null bytes injected anywhere must never leak out.
@@ -158,8 +168,8 @@ proptest! {
             "<tool_call>\0{}\0{}\0(\0echo\0 hi\0)\0{}\0</tool_call>",
             noise_prefix, name, noise_suffix
         );
-        let r = parse_tool_call_tags(&s);
-        assert_invariants(&s, r);
+        let r = parse_degraded_tool_calls(&s);
+        assert_invariants(&s, r, true);
     }
 }
 
@@ -168,7 +178,7 @@ proptest! {
 #[test]
 fn phase_n_anchor_parenthesized_args_yield_command_json() {
     let text = "<tool_call>bash)(echo hello)</tool_call>";
-    let calls = parse_tool_call_tags(text).expect("should parse");
+    let calls = parse_degraded_tool_calls(text).expect("should parse");
     assert_eq!(calls.len(), 1);
     let args = calls[0]["function"]["arguments"].as_str().unwrap();
     // Strong assertion: the recovered args are JSON AND wrap echo hello as a
@@ -181,7 +191,7 @@ fn phase_n_anchor_parenthesized_args_yield_command_json() {
 #[test]
 fn phase_n_anchor_valid_json_args_preserved_exactly() {
     let text = r#"<tool_call>read_file({"path":"a.rs"})</tool_call>"#;
-    let calls = parse_tool_call_tags(text).expect("should parse");
+    let calls = parse_degraded_tool_calls(text).expect("should parse");
     let args = calls[0]["function"]["arguments"].as_str().unwrap();
     let v: Value = serde_json::from_str(args).expect("valid JSON");
     assert_eq!(v["path"], "a.rs");
@@ -193,20 +203,20 @@ fn phase_n_anchor_prose_heavy_rejected_to_avoid_false_positives() {
     let prose = "Let me explain the tool_call concept at length. ".repeat(20);
     let text = format!("{prose}<tool_call>bash(ls)</tool_call>");
     assert!(
-        parse_tool_call_tags(&text).is_none(),
+        parse_degraded_tool_calls(&text).is_none(),
         "prose-heavy text must be rejected"
     );
 }
 
 #[test]
 fn phase_n_anchor_empty_body_yields_none() {
-    assert!(parse_tool_call_tags("<tool_call></tool_call>").is_none());
+    assert!(parse_degraded_tool_calls("<tool_call></tool_call>").is_none());
 }
 
 #[test]
 fn phase_n_anchor_no_tag_returns_none() {
-    assert!(parse_tool_call_tags("plain text no tags").is_none());
-    assert!(parse_tool_call_tags("").is_none());
+    assert!(parse_degraded_tool_calls("plain text no tags").is_none());
+    assert!(parse_degraded_tool_calls("").is_none());
 }
 
 // ── Regression anchor: bug caught by proptest on first run ──────────────────
@@ -226,7 +236,7 @@ fn phase_n_regression_control_chars_in_recovered_args_are_valid_json() {
     // Real-world stand-in: LLM streams a byte like 0x01 (SOH) in the middle
     // of a corrupted tool-call body.
     let text = "<tool_call>bash echo \u{0001}hello\u{0002}world</tool_call>";
-    let calls = parse_tool_call_tags(text).expect("should parse");
+    let calls = parse_degraded_tool_calls(text).expect("should parse");
     let args = calls[0]["function"]["arguments"].as_str().unwrap();
     let v: Value = serde_json::from_str(args).expect("MUST be valid JSON even with control chars");
     assert!(v.get("command").and_then(|x| x.as_str()).is_some());

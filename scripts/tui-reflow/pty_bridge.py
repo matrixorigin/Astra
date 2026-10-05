@@ -39,8 +39,10 @@ if pid == 0:
                        "--profile", "resize-test", "--model", "resize-model",
                        "--bare", "--no-instructions", "interactive"], env)
 
+pending_commands = bytearray()
+running = True
 try:
-    while True:
+    while running:
         ready, _, _ = select.select([fd, sys.stdin], [], [], 1)
         if fd in ready:
             try:
@@ -51,16 +53,24 @@ try:
                 break
             print(json.dumps({"data": base64.b64encode(data).decode()}), flush=True)
         if sys.stdin in ready:
-            line = sys.stdin.readline()
-            if not line:
+            # select observes the fd, not TextIO's hidden read-ahead buffer.
+            # Decode every complete command from the same raw read in order.
+            data = os.read(sys.stdin.fileno(), 65536)
+            if not data:
                 break
-            command = json.loads(line)
-            if "resize" in command:
-                resize(fd, *command["resize"])
-            elif "input" in command:
-                os.write(fd, command["input"].encode())
-            elif "stop" in command:
-                break
+            pending_commands.extend(data)
+            while b"\n" in pending_commands:
+                line, _, rest = pending_commands.partition(b"\n")
+                pending_commands = bytearray(rest)
+                command = json.loads(line)
+                if "resize" in command:
+                    resize(fd, *command["resize"])
+                elif "input" in command:
+                    os.write(fd, command["input"].encode())
+                elif "stop" in command:
+                    running = False
+                    break
+
 finally:
     try:
         os.kill(pid, signal.SIGHUP)

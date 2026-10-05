@@ -2673,30 +2673,6 @@ pub async fn acquire_external_effect_observation_lease_with_options(
     Ok(Some(ExternalEffectObservationLease { leases }))
 }
 
-pub fn acquire_external_effect_observation_lease_sync_with_options(
-    args: &serde_json::Value,
-    workspace_root: &Path,
-    cancel_token: Option<&CancellationToken>,
-    max_wait: Duration,
-) -> Result<Option<ExternalEffectObservationLease>, String> {
-    let Some(roots) = external_effect_observation_roots(args, workspace_root)? else {
-        return Ok(None);
-    };
-    let deadline = Instant::now() + max_wait;
-    let mut leases = Vec::with_capacity(roots.len());
-    for root in roots {
-        let Some(lease) = acquire_workspace_observation_lease_sync_with_options(
-            &root,
-            cancel_token,
-            deadline.saturating_duration_since(Instant::now()),
-        ) else {
-            return Ok(None);
-        };
-        leases.push(lease);
-    }
-    Ok(Some(ExternalEffectObservationLease { leases }))
-}
-
 fn external_effect_observation_roots(
     args: &serde_json::Value,
     workspace_root: &Path,

@@ -504,18 +504,14 @@ fn decisions_populated_from_explanations() {
 
 // ─── Session summary ───────────────────────────────────────────────
 
-// ─── ActiveSkill fallback + Compaction section ──────────────────
+// ─── Selected skill fallback + Compaction section ──────────────────
 
 #[test]
-fn skills_fall_back_to_last_turn_selected_skills_before_active_system_skills() {
-    use super::model::{ActiveSkill, ContextSnapshot};
+fn skills_fall_back_to_last_turn_selected_skills_when_trace_silent() {
+    use super::model::ContextSnapshot;
     let t = trace(100_000, 1_000, 0, 0, 0, 0);
     let mut snap = ContextSnapshot::default();
     snap.selected_skills = vec!["review_changes".into(), "verify_task".into()];
-    snap.active_skills = vec![ActiveSkill {
-        name: "loaded_only".into(),
-        description: "loaded".into(),
-    }];
     let b = ContextBreakdown::from_trace_with(&t, &snap);
     let names: Vec<&str> = b.skills.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, vec!["review_changes", "verify_task"]);
@@ -523,37 +519,13 @@ fn skills_fall_back_to_last_turn_selected_skills_before_active_system_skills() {
         b.skills
             .iter()
             .all(|s| s.source.as_deref() == Some("selected")),
-        "selected-skill fallback should outrank loaded-skill fallback"
+        "selected skills remain visible without injection trace"
     );
 }
 
 #[test]
-fn skills_fall_back_to_active_system_skills_when_trace_silent() {
-    use super::model::{ActiveSkill, ContextSnapshot};
-    let t = trace(100_000, 1_000, 0, 0, 0, 0);
-    let mut snap = ContextSnapshot::default();
-    snap.active_skills = vec![
-        ActiveSkill {
-            name: "concise".into(),
-            description: "Keep replies short".into(),
-        },
-        ActiveSkill {
-            name: "markdown".into(),
-            description: "Output markdown".into(),
-        },
-    ];
-    let b = ContextBreakdown::from_trace_with(&t, &snap);
-    let names: Vec<&str> = b.skills.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["concise", "markdown"]);
-    assert!(
-        b.skills.iter().all(|s| s.tokens == 0),
-        "ActiveSkill fallback carries no token counts"
-    );
-}
-
-#[test]
-fn active_system_skills_do_not_override_trace_injected_skills() {
-    use super::model::{ActiveSkill, ContextSnapshot};
+fn selected_skills_do_not_override_trace_injected_skills() {
+    use super::model::ContextSnapshot;
     let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
     t.system_prompt = SystemPromptBreakdown {
         skills_injected: vec![SkillInjection {
@@ -565,10 +537,7 @@ fn active_system_skills_do_not_override_trace_injected_skills() {
         ..SystemPromptBreakdown::default()
     };
     let mut snap = ContextSnapshot::default();
-    snap.active_skills = vec![ActiveSkill {
-        name: "fallback_ignored".into(),
-        description: String::new(),
-    }];
+    snap.selected_skills = vec!["fallback_ignored".into()];
     let b = ContextBreakdown::from_trace_with(&t, &snap);
     let names: Vec<&str> = b.skills.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, vec!["real_from_trace"]);

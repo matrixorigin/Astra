@@ -571,7 +571,7 @@ impl std::fmt::Debug for ModelUpdateRequestData {
 
 /// Thinking capability of a model, determined by provider-aware probe.
 ///
-/// Persisted to DB column `thinking_capability`. NULL means unprobed.
+/// Derived from a current configuration-bound `thinking_probe_json` observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingCapability {
@@ -604,43 +604,11 @@ impl ThinkingCapability {
             Self::None => "none",
         }
     }
-
-    pub fn from_db(s: Option<&str>) -> Option<Self> {
-        match s? {
-            "both" => Some(Self::Both),
-            "effort_only" => Some(Self::EffortOnly),
-            "native_only" => Some(Self::NativeOnly),
-            "none" => Some(Self::None),
-            _ => Option::None,
-        }
-    }
-
-    fn try_from_db_column(s: Option<&str>) -> Result<Option<Self>, String> {
-        match s {
-            None => Ok(None),
-            Some("both") => Ok(Some(Self::Both)),
-            Some("effort_only") => Ok(Some(Self::EffortOnly)),
-            Some("native_only") => Ok(Some(Self::NativeOnly)),
-            Some("none") => Ok(Some(Self::None)),
-            Some(other) => Err(format!(
-                "invalid infra_llm_models.thinking_capability: {other}"
-            )),
-        }
-    }
-
-    pub fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Both => "both",
-            Self::EffortOnly => "effort_only",
-            Self::NativeOnly => "native_only",
-            Self::None => "none",
-        }
-    }
 }
 
 /// Result of the two-phase thinking behavior probe.
 ///
-/// Ephemeral — returned during `check_model`, but the capability is persisted to DB.
+/// Returned from a configuration-bound persisted observation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThinkingProbeResult {
     pub capability: ThinkingCapability,
@@ -1438,11 +1406,6 @@ fn build_resolved_active_llm_from_row(
         .map_err(|e| format!("invalid infra_llm_models.tags: {e}"))?;
     let tags: Vec<String> = parse_json_column("tags_json", &tags_json)?;
 
-    let thinking_cap_str: Option<String> = row
-        .try_get("thinking_capability")
-        .map_err(|e| format!("invalid infra_llm_models.thinking_capability: {e}"))?;
-    let thinking_capability = ThinkingCapability::try_from_db_column(thinking_cap_str.as_deref())?;
-
     let thinking_protocol = quirks.thinking_protocol.unwrap_or_else(|| {
         canonical_thinking_protocol(
             &provider,
@@ -1460,11 +1423,7 @@ fn build_resolved_active_llm_from_row(
         &encrypted,
         &quirks_json,
     );
-    let thinking_capability = if snapshot.is_some() {
-        cached_capability(snapshot.as_deref(), &identity, thinking_protocol)
-    } else {
-        thinking_capability
-    };
+    let thinking_capability = cached_capability(snapshot.as_deref(), &identity, thinking_protocol);
     let fallback_chain = quirks.fallback_chain;
     let wire_model_name = quirks.wire_model_name;
     let prompt_cache_capability = quirks.prompt_cache_capability;
@@ -1562,7 +1521,7 @@ const RESOLVE_COLS: &str = "\
     CAST(quirks AS CHAR) AS quirks_json, \
     CAST(pricing AS CHAR) AS pricing_json, \
     CAST(tags AS CHAR) AS tags_json, \
-    thinking_capability, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json, context_window, max_completion_tokens";
+    CAST(thinking_probe_json AS CHAR) AS thinking_probe_json, context_window, max_completion_tokens";
 const REQUIRED_MODEL_SELECTION_ERROR: &str =
     astra_core::model_override::MISSING_MODEL_SELECTION_MESSAGE;
 
@@ -2354,10 +2313,24 @@ fn row_has_selector_tag(row: &sqlx::mysql::MySqlRow) -> Result<bool, String> {
 fn row_thinking_capability(
     row: &sqlx::mysql::MySqlRow,
 ) -> Result<Option<ThinkingCapability>, String> {
-    let thinking_cap_str: Option<String> = row
-        .try_get("thinking_capability")
-        .map_err(|e| format!("invalid infra_llm_models.thinking_capability: {e}"))?;
-    ThinkingCapability::try_from_db_column(thinking_cap_str.as_deref())
+    let name: String = row.try_get("model_name").map_err(|e| e.to_string())?;
+    let provider: String = row.try_get("provider").map_err(|e| e.to_string())?;
+    let base_url: Option<String> = row.try_get("base_url").map_err(|e| e.to_string())?;
+    let base_url = base_url.as_deref().unwrap_or("https://api.openai.com/v1");
+    let encrypted: String = row
+        .try_get("api_key_encrypted")
+        .map_err(|e| e.to_string())?;
+    let config: String = row.try_get("quirks_json").map_err(|e| e.to_string())?;
+    let quirks: QuirksData = parse_json_column("quirks_json", &config)?;
+    let upstream = quirks.wire_model_name.as_deref().unwrap_or(&name);
+    let protocol = quirks
+        .thinking_protocol
+        .unwrap_or_else(|| canonical_thinking_protocol(&provider, base_url, upstream));
+    let identity = probe_identity(&provider, base_url, upstream, &encrypted, &config);
+    let raw: Option<String> = row
+        .try_get("thinking_probe_json")
+        .map_err(|e| e.to_string())?;
+    Ok(cached_capability(raw.as_deref(), &identity, protocol))
 }
 
 /// Priority tiers for model sorting in the memory-selector chain.
@@ -2367,19 +2340,13 @@ fn row_thinking_capability(
 ///    general models.
 /// 2. Within each tier, models compatible with `thinking=off` are preferred over
 ///    models that only support thinking modes.
-/// 3. Models with unknown capability (capability is `None`, or `Both` which
-///    means "supports both on/off but we haven't concretely probed it") sit
-///    in the middle — preferred over known thinking-only, but behind known
-///    off-compatible.
+/// 3. Models without a current bound observation sit in the middle — preferred
+///    over known thinking-only, but behind observed off-compatible models.
 fn memory_model_priority(
     has_selector_tag: bool,
     thinking_capability: Option<ThinkingCapability>,
 ) -> u8 {
-    // Both is treated as off-compatible because it means the model supports
-    // thinking=off.  It is also treated as "not incompatible" so that a
-    // `Both` model sorts *ahead* of a known thinking-only model but *behind*
-    // a model we know is explicitly off-compatible (i.e. `None` with proven
-    // off support).
+    // Both and None are observed off-compatible capabilities.
     let off_compatible = matches!(
         thinking_capability,
         Some(ThinkingCapability::Both | ThinkingCapability::None)
@@ -2432,7 +2399,7 @@ fn rank_memory_model_candidate_indices(
 }
 
 /// Resolve ordered candidates for memory-related decisions (relevance
-/// filtering, lesson synthesis, L1b extraction).
+/// filtering and L1b extraction).
 ///
 /// Ordering prioritizes:
 /// 1. `"selector"`-tagged models that are known to support `thinking=off`
@@ -3139,32 +3106,33 @@ impl DatabaseModelService {
         let tags_json: String = row.try_get("tags_json").map_err(internal_error)?;
         let quirks_json: String = row.try_get("quirks_json").map_err(internal_error)?;
 
-        let thinking_cap_str: Option<String> =
-            row.try_get("thinking_capability").map_err(internal_error)?;
-        let thinking_capability =
-            ThinkingCapability::try_from_db_column(thinking_cap_str.as_deref())
-                .map_err(internal_error)?;
-        let thinking_probe_error: Option<String> = row
-            .try_get("thinking_probe_error")
-            .map_err(internal_error)?;
-
-        // Build ThinkingProbeResult when the model has been probed (capability is known)
-        // OR when a probe error exists (probe ran but failed — surface the error).
-        let thinking_probe = match (thinking_capability, thinking_probe_error) {
-            (Some(cap), err) => Some(ThinkingProbeResult {
-                capability: cap,
-                error: err,
-            }),
-            // Probe failed: no capability determined, but error must be surfaced.
-            // Default to ThinkingCapability::None so the picker stays safe.
-            (None, Some(err)) => Some(ThinkingProbeResult {
-                capability: ThinkingCapability::None,
-                error: Some(err),
-            }),
-            // Never probed.
-            (None, None) => None,
-        };
         let model_name: String = row.try_get("model_name").map_err(internal_error)?;
+        let provider: String = row.try_get("provider").map_err(internal_error)?;
+        let base_url: Option<String> = row.try_get("base_url").map_err(internal_error)?;
+        let encrypted: Option<String> = row.try_get("api_key_encrypted").map_err(internal_error)?;
+        let quirks: QuirksData =
+            parse_json_column("quirks_json", &quirks_json).map_err(internal_error)?;
+        let upstream = quirks.wire_model_name.as_deref().unwrap_or(&model_name);
+        let base = base_url.as_deref().unwrap_or("https://api.openai.com/v1");
+        let protocol = quirks
+            .thinking_protocol
+            .unwrap_or_else(|| canonical_thinking_protocol(&provider, base, upstream));
+        let raw: Option<String> = row.try_get("thinking_probe_json").map_err(internal_error)?;
+        let (thinking_capability, thinking_probe) = match (encrypted.as_deref(), raw.as_deref()) {
+            (Some(encrypted), Some(raw)) => {
+                let identity = probe_identity(&provider, base, upstream, encrypted, &quirks_json);
+                serde_json::from_str::<ThinkingProbeSnapshot>(raw)
+                    .ok()
+                    .map(|snapshot| {
+                        (
+                            snapshot.capability(&identity, protocol),
+                            snapshot.result(&identity, protocol),
+                        )
+                    })
+                    .unwrap_or_default()
+            }
+            _ => (None, None),
+        };
         let context_window: i32 = row.try_get("context_window").map_err(internal_error)?;
         let context_window = model_context_window_from_db(context_window, &model_name)
             .map_err(internal_error)? as i32;
@@ -3172,8 +3140,8 @@ impl DatabaseModelService {
         Ok(ModelRecord {
             model_id: row.try_get("model_id").map_err(internal_error)?,
             name: model_name,
-            provider: row.try_get("provider").map_err(internal_error)?,
-            base_url: row.try_get("base_url").map_err(internal_error)?,
+            provider,
+            base_url,
             description: row.try_get("description").map_err(internal_error)?,
             is_active: is_active_int != 0,
             context_window,
@@ -3189,7 +3157,7 @@ impl DatabaseModelService {
             pricing: parse_json_column("pricing_json", &pricing_json).map_err(internal_error)?,
             architecture: row.try_get("architecture").map_err(internal_error)?,
             tags: parse_json_column("tags_json", &tags_json).map_err(internal_error)?,
-            quirks: parse_json_column("quirks_json", &quirks_json).map_err(internal_error)?,
+            quirks,
             connectivity: None,
             thinking_capability,
             thinking_probe,
@@ -3219,9 +3187,6 @@ impl DatabaseModelService {
         let context_window: i32 = row.try_get("context_window").map_err(internal_error)?;
         let context_window =
             model_context_window_from_db(context_window, &name).map_err(internal_error)? as i32;
-        let cap_str: Option<String> = row.try_get("thinking_capability").map_err(internal_error)?;
-        let thinking_capability =
-            ThinkingCapability::try_from_db_column(cap_str.as_deref()).map_err(internal_error)?;
         let pricing_json: String = row.try_get("pricing_json").map_err(internal_error)?;
         let configuration_updated_at: String = row
             .try_get("configuration_updated_at")
@@ -3242,19 +3207,17 @@ impl DatabaseModelService {
 
         let snapshot: Option<String> =
             row.try_get("thinking_probe_json").map_err(internal_error)?;
-        let thinking_capability = if snapshot.is_some() {
-            let encrypted: String = row.try_get("api_key_encrypted").map_err(internal_error)?;
+        let encrypted: Option<String> = row.try_get("api_key_encrypted").map_err(internal_error)?;
+        let thinking_capability = encrypted.as_deref().and_then(|encrypted| {
             let identity = probe_identity(
                 &provider,
                 base_url.as_deref().unwrap_or("https://api.openai.com/v1"),
                 quirks.wire_model_name.as_deref().unwrap_or(&name),
-                &encrypted,
+                encrypted,
                 &quirks_json,
             );
             cached_capability(snapshot.as_deref(), &identity, protocol)
-        } else {
-            thinking_capability
-        };
+        });
 
         Ok(ModelListItem {
             thinking_protocol: Some(protocol),
@@ -3466,12 +3429,12 @@ pub const MODEL_SELECT_COLS: &str = "\
     CAST(pricing AS CHAR) AS pricing_json, \
     CAST(tags AS CHAR) AS tags_json, \
     CAST(quirks AS CHAR) AS quirks_json, \
-    thinking_capability, thinking_probe_error";
+    api_key_encrypted, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json";
 const MODEL_LIST_SELECT_COLS: &str = "\
     model_id, model_name, provider, base_url, CAST(quirks AS CHAR) AS quirks_json, description, is_active, \
     api_key_encrypted, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json, \
     context_window, max_completion_tokens, architecture, \
-    thinking_capability, CAST(pricing AS CHAR) AS pricing_json, \
+    CAST(pricing AS CHAR) AS pricing_json, \
     CAST(updated_at AS CHAR) AS configuration_updated_at";
 const MODEL_LIST_CURSOR_SQL: &str = " AND (provider > ? \
      OR (provider = ? AND model_name > ?) \
@@ -3978,7 +3941,6 @@ impl ModelService for DatabaseModelService {
             row.try_get::<Option<String>, _>("thinking_probe_json")
                 .map_err(internal_error)?
                 .as_deref(),
-            None,
         );
         let json = serde_json::to_string(&snapshot).map_err(internal_error)?;
         // A check must never publish an observation for a concurrently rotated
@@ -4230,7 +4192,7 @@ impl ModelService for DatabaseModelService {
 
         // Thinking probe is NOT run during create — it's a separate
         // concern triggered by `model check`.  create_model only validates
-        // connectivity; thinking_capability stays NULL until probed.
+        // connectivity; thinking observations remain absent until explicitly probed.
 
         let select_sql = format!(
             "SELECT {} FROM infra_llm_models WHERE model_id = ?",
@@ -4449,146 +4411,171 @@ impl ModelService for DatabaseModelService {
                 .validate()
                 .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
         }
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        invalidate_active_llm_model_resolution_cache();
         validate_update_context_window(request.context_window)?;
-
-        let existing = query(
-            "SELECT model_id, base_url, provider, \
-                    CAST(quirks AS CHAR) AS quirks_json \
-             FROM infra_llm_models WHERE model_name = ?",
-        )
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let existing = query(&format!(
+            "SELECT {MODEL_SELECT_COLS}, CAST(updated_at AS CHAR) AS configuration_updated_at \
+             FROM infra_llm_models WHERE model_name = ?"
+        ))
         .bind(&model_name)
         .fetch_optional(&pool)
         .await
-        .map_err(internal_error)?;
-        let existing = existing.ok_or_else(|| {
+        .map_err(internal_error)?
+        .ok_or_else(|| {
             error_response(
                 StatusCode::NOT_FOUND,
                 format!("Model '{}' not found", model_name),
             )
         })?;
-        let _model_id: String = existing.try_get("model_id").map_err(internal_error)?;
+        let model_id: String = existing.try_get("model_id").map_err(internal_error)?;
+        let updated_at: String = existing
+            .try_get("configuration_updated_at")
+            .map_err(internal_error)?;
         let stored_provider: String = existing.try_get("provider").map_err(internal_error)?;
-        let effective_provider = request.provider.as_deref().unwrap_or(&stored_provider);
-
-        // Compute the upstream probe name: request's incoming quirks
-        // (when re-sync supplies a new wire_model_name) takes precedence;
-        // otherwise fall back to the stored quirks from DB; otherwise the
-        // local row name.
+        let stored_base_url: Option<String> =
+            existing.try_get("base_url").map_err(internal_error)?;
+        let stored_encrypted: Option<String> = existing
+            .try_get("api_key_encrypted")
+            .map_err(internal_error)?;
         let stored_quirks_json: String = existing.try_get("quirks_json").map_err(internal_error)?;
         let stored_quirks: QuirksData =
             parse_json_column("quirks_json", &stored_quirks_json).map_err(internal_error)?;
-        let probe_name: String = request
-            .quirks
-            .as_ref()
-            .and_then(|q| q.wire_model_name.clone())
-            .or(stored_quirks.wire_model_name)
-            .unwrap_or_else(|| model_name.clone());
-
-        let mut conn_result: Option<String> = None;
-
-        if let Some(api_key) = &request.api_key {
+        // Quirks are a complete replacement: an omitted wire name in a new
+        // quirks object must not keep the prior override during validation.
+        let quirks = request.quirks.as_ref().unwrap_or(&stored_quirks);
+        let provider = request.provider.as_deref().unwrap_or(&stored_provider);
+        let base_url = request.base_url.as_deref().or(stored_base_url.as_deref());
+        let probe_name = quirks.wire_model_name.as_deref().unwrap_or(&model_name);
+        let mut connectivity = None;
+        let mut active = request.is_active.map(i16::from);
+        let encrypted = if let Some(api_key) = request.api_key.as_deref() {
             let encrypted = self.encryptor.encrypt(api_key).map_err(internal_error)?;
-            let stored_base_url: Option<String> =
-                existing.try_get("base_url").map_err(internal_error)?;
-            let base_url: Option<String> = request.base_url.clone().or(stored_base_url);
             let check = validate_connectivity(
-                effective_provider,
-                &probe_name,
+                provider,
+                probe_name,
                 api_key,
-                base_url.as_deref(),
-                request
-                    .quirks
-                    .as_ref()
-                    .and_then(|q| q.probe_headers.as_ref()),
-                request
-                    .quirks
-                    .as_ref()
-                    .and_then(|q| q.probe_endpoint.as_deref()),
+                base_url,
+                quirks.probe_headers.as_ref(),
+                quirks.probe_endpoint.as_deref(),
             )
             .await;
-
-            query("UPDATE infra_llm_models SET api_key_encrypted = ?, updated_at = NOW(6) WHERE model_name = ?")
-                .bind(&encrypted)
-                .bind(&model_name)
-                .execute(&pool)
-                .await
-                .map_err(internal_error)?;
-
-            if request.is_active.is_none() {
-                let active: i16 = if check.is_none() { 1 } else { 0 };
-                query(
-                    "UPDATE infra_llm_models SET is_active = ?, updated_at = NOW(6) WHERE model_name = ?",
-                )
-                    .bind(active)
-                    .bind(&model_name)
-                    .execute(&pool)
-                    .await
-                    .map_err(internal_error)?;
+            if active.is_none() {
+                active = Some(i16::from(check.is_none()));
             }
-            conn_result = Some(check.unwrap_or_else(|| "ok".to_string()));
-        }
+            connectivity = Some(check.unwrap_or_else(|| "ok".to_string()));
+            Some(encrypted)
+        } else {
+            None
+        };
 
-        macro_rules! update_field {
-            ($field:ident, $col:expr) => {
-                if let Some(val) = &request.$field {
-                    let sql = format!("UPDATE infra_llm_models SET {} = ?, updated_at = NOW(6) WHERE model_name = ?", $col);
-                    query(&sql).bind(val).bind(&model_name).execute(&pool).await.map_err(internal_error)?;
-                }
-            };
-            ($field:ident, $col:expr, json) => {
-                if let Some(val) = &request.$field {
-                    let json_str = serde_json::to_string(val).map_err(internal_error)?;
-                    let sql = format!("UPDATE infra_llm_models SET {} = ?, updated_at = NOW(6) WHERE model_name = ?", $col);
-                    query(&sql).bind(&json_str).bind(&model_name).execute(&pool).await.map_err(internal_error)?;
-                }
-            };
-        }
-        update_field!(provider, "provider");
-        update_field!(base_url, "base_url");
-        update_field!(description, "description");
-        update_field!(context_window, "context_window");
-        update_field!(max_completion_tokens, "max_completion_tokens");
-        update_field!(architecture, "architecture");
-        update_field!(input_modalities, "input_modalities", json);
-        update_field!(output_modalities, "output_modalities", json);
-        update_field!(supported_parameters, "supported_parameters", json);
-        update_field!(pricing, "pricing", json);
-        update_field!(tags, "tags", json);
-        update_field!(quirks, "quirks", json);
-
-        if request.api_key.is_some()
-            || request.base_url.is_some()
-            || request.provider.is_some()
-            || request.quirks.is_some()
+        let mut update = QueryBuilder::<sqlx::MySql>::new("UPDATE infra_llm_models SET ");
+        let mut changed = false;
         {
-            query("UPDATE infra_llm_models SET thinking_capability = NULL, thinking_probe_error = NULL, thinking_probe_json = NULL WHERE model_name = ?")
-                .bind(&model_name).execute(&pool).await.map_err(internal_error)?;
+            let mut fields = update.separated(", ");
+            macro_rules! update_field {
+                ($value:expr, $column:literal) => {
+                    if let Some(value) = $value {
+                        fields
+                            .push(concat!($column, " = "))
+                            .push_bind_unseparated(value);
+                        changed = true;
+                    }
+                };
+                ($value:expr, $column:literal, json) => {
+                    if let Some(value) = $value {
+                        fields.push(concat!($column, " = ")).push_bind_unseparated(
+                            serde_json::to_string(value).map_err(internal_error)?,
+                        );
+                        changed = true;
+                    }
+                };
+            }
+            update_field!(encrypted.as_ref(), "api_key_encrypted");
+            update_field!(request.provider.as_ref(), "provider");
+            update_field!(request.base_url.as_ref(), "base_url");
+            update_field!(request.description.as_ref(), "description");
+            update_field!(request.context_window.as_ref(), "context_window");
+            update_field!(
+                request.max_completion_tokens.as_ref(),
+                "max_completion_tokens"
+            );
+            update_field!(request.architecture.as_ref(), "architecture");
+            update_field!(request.input_modalities.as_ref(), "input_modalities", json);
+            update_field!(
+                request.output_modalities.as_ref(),
+                "output_modalities",
+                json
+            );
+            update_field!(
+                request.supported_parameters.as_ref(),
+                "supported_parameters",
+                json
+            );
+            update_field!(request.pricing.as_ref(), "pricing", json);
+            update_field!(request.tags.as_ref(), "tags", json);
+            update_field!(request.quirks.as_ref(), "quirks", json);
+            update_field!(active.as_ref(), "is_active");
+            if !changed {
+                return Self::model_record_from_row(existing);
+            }
+            if encrypted.is_some()
+                || request.provider.is_some()
+                || request.base_url.is_some()
+                || request.quirks.is_some()
+            {
+                fields.push("thinking_probe_json = NULL");
+            }
+            fields.push("updated_at = NOW(6)");
         }
+        update
+            .push(" WHERE model_id = ")
+            .push_bind(&model_id)
+            .push(" AND model_name = ")
+            .push_bind(&model_name)
+            .push(" AND CAST(updated_at AS CHAR) = ")
+            .push_bind(&updated_at)
+            .push(" AND provider = ")
+            .push_bind(&stored_provider)
+            .push(" AND base_url <=> ")
+            .push_bind(stored_base_url.as_deref())
+            .push(" AND api_key_encrypted <=> ")
+            .push_bind(stored_encrypted.as_deref())
+            .push(" AND CAST(quirks AS CHAR) = ")
+            .push_bind(&stored_quirks_json);
 
-        if let Some(active) = request.is_active {
-            let val: i16 = if active { 1 } else { 0 };
-            query("UPDATE infra_llm_models SET is_active = ?, updated_at = NOW(6) WHERE model_name = ?")
-                .bind(val)
-                .bind(&model_name)
-                .execute(&pool)
-                .await
-                .map_err(internal_error)?;
-        }
-
-        let sql = format!(
-            "SELECT {} FROM infra_llm_models WHERE model_name = ?",
-            MODEL_SELECT_COLS
-        );
-        let row = query(&sql)
-            .bind(&model_name)
-            .fetch_one(&pool)
+        // Network validation completes before taking a write lock. Commit all
+        // fields and observation invalidation together, then read this commit's
+        // response before releasing the row to another writer.
+        let mut connection = crate::CancellationSafePoolConnection::acquire(&pool)
             .await
             .map_err(internal_error)?;
-
+        let mut tx = connection.begin().await.map_err(internal_error)?;
+        let updated = update
+            .build()
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+        if updated.rows_affected() == 0 {
+            tx.rollback().await.map_err(internal_error)?;
+            connection.release();
+            invalidate_active_llm_model_resolution_cache();
+            self.invalidate_catalog_revision_cache();
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "Model changed during update; refresh and retry",
+            ));
+        }
+        let row = query(&format!(
+            "SELECT {MODEL_SELECT_COLS} FROM infra_llm_models WHERE model_id = ?"
+        ))
+        .bind(&model_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(internal_error)?;
         let mut record = Self::model_record_from_row(row)?;
-        record.connectivity = conn_result;
+        record.connectivity = connectivity;
+        tx.commit().await.map_err(internal_error)?;
+        connection.release();
         invalidate_active_llm_model_resolution_cache();
         self.invalidate_catalog_revision_cache();
         Ok(record)
@@ -4599,25 +4586,19 @@ impl ModelService for DatabaseModelService {
         model_name: String,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        invalidate_active_llm_model_resolution_cache();
-        let existing = query("SELECT model_id FROM infra_llm_models WHERE model_name = ?")
-            .bind(&model_name)
-            .fetch_optional(&pool)
-            .await
-            .map_err(internal_error)?;
-        if existing.is_none() {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("Model '{}' not found", model_name),
-            ));
-        }
-        query("DELETE FROM infra_llm_models WHERE model_name = ?")
+        let deleted = query("DELETE FROM infra_llm_models WHERE model_name = ?")
             .bind(&model_name)
             .execute(&pool)
             .await
             .map_err(internal_error)?;
         invalidate_active_llm_model_resolution_cache();
         self.invalidate_catalog_revision_cache();
+        if deleted.rows_affected() == 0 {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found", model_name),
+            ));
+        }
         Ok(())
     }
 
@@ -4628,8 +4609,8 @@ impl ModelService for DatabaseModelService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         invalidate_active_llm_model_resolution_cache();
         let row = query(
-            "SELECT api_key_encrypted, provider, base_url, \
-                    CAST(quirks AS CHAR) AS quirks_json, thinking_capability, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json \
+            "SELECT model_id, api_key_encrypted, provider, base_url, \
+                    CAST(quirks AS CHAR) AS quirks_json, CAST(thinking_probe_json AS CHAR) AS thinking_probe_json \
              FROM infra_llm_models WHERE model_name = ?",
         )
         .bind(&model_name)
@@ -4643,6 +4624,7 @@ impl ModelService for DatabaseModelService {
             )
         })?;
 
+        let model_id: String = row.try_get("model_id").map_err(internal_error)?;
         let encrypted: String = row.try_get("api_key_encrypted").map_err(internal_error)?;
         let provider: String = row.try_get("provider").map_err(internal_error)?;
         let base_url: Option<String> = row.try_get("base_url").map_err(internal_error)?;
@@ -4673,17 +4655,35 @@ impl ModelService for DatabaseModelService {
         .await;
 
         let is_active: i16 = if check.is_none() { 1 } else { 0 };
-        query(
-            "UPDATE infra_llm_models SET is_active = ?, updated_at = NOW(6) WHERE model_name = ?",
+        // A network result belongs to the row and configuration checked, not
+        // whatever configuration is installed when the request completes.
+        let updated = query(
+            "UPDATE infra_llm_models SET is_active = ?, updated_at = NOW(6) WHERE model_id = ? \
+             AND model_name = ? AND provider = ? AND base_url <=> ? \
+             AND api_key_encrypted = ? AND CAST(quirks AS CHAR) = ?",
         )
         .bind(is_active)
+        .bind(&model_id)
         .bind(&model_name)
+        .bind(&provider)
+        .bind(base_url.as_deref())
+        .bind(&encrypted)
+        .bind(&quirks_json)
         .execute(&pool)
         .await
         .map_err(internal_error)?;
+        if updated.rows_affected() == 0 {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "Model changed during connectivity check; check again",
+            ));
+        }
+
+        invalidate_active_llm_model_resolution_cache();
+        self.invalidate_catalog_revision_cache();
 
         // Phase 2: two-phase thinking behavior probe (only when connected)
-        let thinking_probe = if check.is_none() {
+        if check.is_none() {
             let protocol = quirks.thinking_protocol.unwrap_or_else(|| {
                 canonical_thinking_protocol(
                     &provider,
@@ -4714,29 +4714,18 @@ impl ModelService for DatabaseModelService {
                 row.try_get::<Option<String>, _>("thinking_probe_json")
                     .map_err(internal_error)?
                     .as_deref(),
-                ThinkingCapability::try_from_db_column(
-                    row.try_get::<Option<String>, _>("thinking_capability")
-                        .map_err(internal_error)?
-                        .as_deref(),
-                )
-                .map_err(internal_error)?,
             );
             let snapshot_json = serde_json::to_string(&snapshot).map_err(internal_error)?;
-            // Persist probe result to DB.
-            // Latest error is independent of still-valid prior capability.
-            let cap_str = snapshot.persisted_capability().map(|cap| cap.as_db_str());
-            let err_str = result.error.as_deref();
+            // The bound snapshot owns both capability and the latest error.
             let updated = query(
-                "UPDATE infra_llm_models SET thinking_capability = ?, \
-                 thinking_probe_error = ?, thinking_probe_json = ?, updated_at = NOW(6) WHERE model_name = ? \
-                 AND provider = ? AND COALESCE(base_url, '') = ? AND api_key_encrypted = ? AND CAST(quirks AS CHAR) = ? AND CAST(thinking_probe_json AS CHAR) <=> ?",
+                "UPDATE infra_llm_models SET thinking_probe_json = ?, updated_at = NOW(6) WHERE model_id = ? AND model_name = ? \
+                 AND provider = ? AND base_url <=> ? AND api_key_encrypted = ? AND CAST(quirks AS CHAR) = ? AND CAST(thinking_probe_json AS CHAR) <=> ?",
             )
-            .bind(cap_str)
-            .bind(err_str)
             .bind(snapshot_json)
+            .bind(&model_id)
             .bind(&model_name)
             .bind(&provider)
-            .bind(base_url.as_deref().unwrap_or(""))
+            .bind(base_url.as_deref())
             .bind(&encrypted)
             .bind(&quirks_json)
             .bind(row.try_get::<Option<String>, _>("thinking_probe_json").map_err(internal_error)?)
@@ -4750,29 +4739,32 @@ impl ModelService for DatabaseModelService {
             }
             invalidate_active_llm_model_resolution_cache();
             self.invalidate_catalog_revision_cache();
-            Some(ThinkingProbeResult {
-                capability: snapshot
-                    .persisted_capability()
-                    .unwrap_or(ThinkingCapability::None),
-                error: result.error,
-            })
-        } else {
-            None
-        };
+        }
 
         let sql = format!(
-            "SELECT {} FROM infra_llm_models WHERE model_name = ?",
+            "SELECT {} FROM infra_llm_models WHERE model_id = ? AND model_name = ? \
+             AND provider = ? AND base_url <=> ? AND api_key_encrypted = ? AND CAST(quirks AS CHAR) = ?",
             MODEL_SELECT_COLS
         );
         let result_row = query(&sql)
+            .bind(&model_id)
             .bind(&model_name)
-            .fetch_one(&pool)
+            .bind(&provider)
+            .bind(base_url.as_deref())
+            .bind(&encrypted)
+            .bind(&quirks_json)
+            .fetch_optional(&pool)
             .await
-            .map_err(internal_error)?;
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::CONFLICT,
+                    "Model changed during check; check again",
+                )
+            })?;
 
         let mut record = Self::model_record_from_row(result_row)?;
         record.connectivity = Some(check.unwrap_or_else(|| "ok".to_string()));
-        record.thinking_probe = thinking_probe;
         invalidate_active_llm_model_resolution_cache();
         self.invalidate_catalog_revision_cache();
         Ok(record)
@@ -8153,11 +8145,7 @@ mod tests {
         assert_eq!(error.kind, crate::service_error::ServiceErrorKind::Conflict);
     }
 
-    /// After the thinking probe UPDATE writes `thinking_capability` and
-    /// `thinking_probe_error`, GET /models/:name must surface BOTH via
-    /// `ModelResponse.thinking_probe`.  Regression: before this fix
-    /// `thinking_probe` was always `None` because `model_record_from_row`
-    /// never read `thinking_probe_error`.
+    /// DTO conversion preserves capability and diagnostics from a bound observation.
     #[test]
     fn model_response_includes_thinking_probe_when_probed() {
         let record = ModelRecord {
@@ -8192,8 +8180,7 @@ mod tests {
         assert!(probe.error.is_none());
     }
 
-    /// When the probe fails, `thinking_probe_error` is preserved through
-    /// the round-trip into `ModelResponse`.
+    /// DTO conversion preserves the observation's diagnostic error.
     #[test]
     fn model_response_includes_thinking_probe_error() {
         let record = ModelRecord {
@@ -8227,11 +8214,9 @@ mod tests {
         assert_eq!(probe.error.as_deref(), Some("connection refused"));
     }
 
-    /// Probe failed: DB has thinking_capability=NULL but thinking_probe_error is set.
-    /// The new `model_record_from_row` match arm surfaces this as a ThinkingProbeResult
-    /// with capability=None + the error, so the API caller sees the failure reason.
+    /// An inconclusive bound observation has an error without a known capability.
     #[test]
-    fn model_response_surfaces_orphan_probe_error() {
+    fn model_response_preserves_inconclusive_observation() {
         let record = ModelRecord {
             model_id: "m-orphan".into(),
             name: "orphan-err".into(),
@@ -8249,9 +8234,9 @@ mod tests {
             tags: vec![],
             quirks: QuirksData::default(),
             connectivity: None,
-            // DB: thinking_capability = NULL (unprobed/failed)
+            // The bound observation did not establish a capability.
             thinking_capability: None,
-            // But model_record_from_row now constructs this when error exists
+            // Its error still belongs in the response.
             thinking_probe: Some(ThinkingProbeResult {
                 capability: ThinkingCapability::None,
                 error: Some("connection timeout".into()),
@@ -8260,12 +8245,12 @@ mod tests {
         let resp = ModelResponse::from(record);
         let probe = resp
             .thinking_probe
-            .expect("orphan probe error must be surfaced");
+            .expect("inconclusive observation must be surfaced");
         assert_eq!(probe.capability, ThinkingCapability::None);
         assert_eq!(probe.error.as_deref(), Some("connection timeout"));
     }
 
-    /// Unprobed model (thinking_capability = NULL) → thinking_probe is None.
+    /// A model without an observation has no probe diagnostics.
     #[test]
     fn model_response_no_probe_when_unprobed() {
         let record = ModelRecord {

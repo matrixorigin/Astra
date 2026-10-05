@@ -2646,6 +2646,695 @@ mod context_cache_contract_tests {
         }
     }
 
+    /// Defaults only: every test still invokes the production assembler with
+    /// its real typed tool surface, runtime signals, and session state.
+    fn context_contract_input<'a>(
+        state: &'a mut AgenticLoopState,
+        tool_surface: ToolSurfacePlan<'a>,
+        runtime_signals: RuntimeSignals<'a>,
+        cache_cfg: &'a PromptCacheConfig,
+    ) -> LlmContextAssemblyInput<'a> {
+        LlmContextAssemblyInput {
+            state,
+            session_id: "sid-context-contract",
+            tool_surface,
+            runtime_signals,
+            cache_cfg,
+            provider: "openai",
+            model_name: "gpt-4o",
+            context_window: Some(200_000),
+            max_completion_tokens: None,
+            cache_capability: None,
+            user_content: "continue the task",
+            query_source: "test",
+        }
+    }
+
+    #[test]
+    fn shared_assembly_preserves_normal_tool_descriptions() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let mut schema = tool("bash");
+        schema["function"]["description"] =
+            json!("Execute a shell command. Runs inside a sandbox with a two-minute timeout.");
+        let tools = vec![schema];
+        let restricted = HashSet::new();
+        let edge = Map::new();
+        let cache = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let output = assemble_context_pipeline(context_contract_input(
+            &mut state,
+            ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+            RuntimeSignals::new(&edge, None),
+            &cache,
+        ))
+        .expect("shared pipeline");
+        assert_eq!(
+            output.tier,
+            astra_turn_core::compaction_types::CompactionTier::Normal
+        );
+        assert_eq!(output.tool_schemas, tools);
+        assert!(!output.system_messages.is_empty());
+        assert!(output.breakdown.repository_memories.is_empty());
+        assert!(output.breakdown.session_memory_injected.is_none());
+        assert_eq!(
+            output.breakdown.total_tokens,
+            output
+                .system_messages
+                .iter()
+                .map(estimate_json_tokens)
+                .sum::<u32>()
+        );
+    }
+
+    #[test]
+    fn shared_assembly_keeps_profiles_lessons_and_plain_text_in_their_real_lanes() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(
+            &crate::turn::prompt_cache::CACHE_ENV_MUTEX,
+        );
+        let available = astra_tools::schemas::all_tool_schemas()
+            .into_iter()
+            .filter(|schema| matches!(schema["function"]["name"].as_str(), Some("bash" | "memory")))
+            .collect::<Vec<_>>();
+        assert_eq!(available.len(), 2);
+        for tools in [Vec::new(), available] {
+            for profile in [false, true] {
+                let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+                let restricted = HashSet::new();
+                let mut edge = Map::new();
+                let entries = if profile {
+                    edge.insert("cwd".into(), json!("/tmp/TestProj"));
+                    edge.insert("git_branch".into(), json!("fixture-profile-main"));
+                    edge.insert(
+                        "lessons_text".into(),
+                        json!("Use the project's declared test command"),
+                    );
+                    edge.insert(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS.into(), json!(["## System Prompt Override\nOrdinary required context"]));
+                    vec![
+                        astra_turn_core::context_sources::MemoryEntry::new("prefers Rust")
+                            .with_memory_identity("profile-rust", "profile"),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                let cache = PromptCacheConfig {
+                    cache_enabled: false,
+                    is_anthropic: false,
+                };
+                let output = assemble_context_pipeline(context_contract_input(
+                    &mut state,
+                    ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+                    RuntimeSignals::new(&edge, None).with_memory_entries(&entries),
+                    &cache,
+                ))
+                .expect("actual context pipeline");
+                assert_eq!(output.tool_schemas, tools);
+                assert!(!output.system_messages.is_empty());
+                assert!(
+                    output
+                        .system_messages
+                        .iter()
+                        .all(|message| !message_text(message).trim().is_empty())
+                );
+                let model_text = output
+                    .system_messages
+                    .iter()
+                    .chain(&output.volatile_preamble)
+                    .map(message_text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(model_text.contains("NEVER fabricate"));
+                assert!(!model_text.contains("Memory Rules"));
+                assert!(
+                    !output.breakdown.context_signals.system_prompt_override,
+                    "ordinary text does not grant override provenance"
+                );
+                assert_eq!(model_text.contains("## Session Lessons"), profile);
+                assert_eq!(model_text.contains("prefers Rust"), profile);
+                if profile {
+                    assert!(model_text.contains("/tmp/TestProj"));
+                    assert!(model_text.contains("Branch: fixture-profile-main"));
+                    assert!(model_text.contains("## Session Lessons (Learned from Past Corrections)\nUse the project's declared test command"));
+                    assert!(model_text.contains("## System Prompt Override"));
+                    assert_eq!(
+                        output.breakdown.repository_memories[0].memory_id,
+                        "profile-rust"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_assembly_measures_history_without_lossy_reduction() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = (0..16)
+            .map(|index| {
+                json!({
+                    "role": if index % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("round {index}: {}", "working context ".repeat(700)),
+                })
+            })
+            .collect();
+        let history = state.messages.clone();
+        let tools = vec![
+            astra_tools::schemas::all_tool_schemas()
+                .into_iter()
+                .find(|schema| schema["function"]["name"] == "introspect")
+                .expect("canonical introspect schema"),
+        ];
+        let restricted = HashSet::new();
+        let edge = Map::new();
+        let cache = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let mut input = context_contract_input(
+            &mut state,
+            ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+            RuntimeSignals::new(&edge, None),
+            &cache,
+        );
+        input.context_window = Some(8_000);
+        let output = assemble_context_pipeline(input).expect("shared pipeline");
+        assert_eq!(
+            output.tier,
+            astra_turn_core::compaction_types::CompactionTier::AggressivePrune
+        );
+        assert_eq!(output.messages, history);
+        assert_eq!(state.messages, history);
+        for field in ["explain", "artifact", "offset", "max_bytes"] {
+            assert!(
+                output.tool_schemas[0]["function"]["parameters"]["properties"]
+                    .get(field)
+                    .is_some(),
+                "pressure must retain recovery field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_assembly_preserves_large_runtime_section_sets() {
+        use crate::prompts::{CacheScope, PromptSection, PromptTokenBucket};
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let stable: Vec<_> = (0..125)
+            .map(|index| {
+                PromptSection::stable(format!("[stable-extra-{index}]"), CacheScope::Session)
+            })
+            .collect();
+        let volatile: Vec<_> = (0..125)
+            .map(|index| {
+                PromptSection::dynamic(
+                    format!("[volatile-extra-{index}]"),
+                    PromptTokenBucket::Environment,
+                )
+            })
+            .collect();
+        let tools = vec![tool("bash")];
+        let restricted = HashSet::new();
+        let edge = Map::new();
+        let cache = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let output = assemble_context_pipeline(context_contract_input(
+            &mut state,
+            ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+            RuntimeSignals::new(&edge, None).with_extra_sections(&stable, &volatile),
+            &cache,
+        ))
+        .expect("shared pipeline");
+        let stable_text = output
+            .system_messages
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let volatile_text = output
+            .volatile_preamble
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for index in 0..125 {
+            assert!(stable_text.contains(&format!("[stable-extra-{index}]")));
+            assert!(volatile_text.contains(&format!("[volatile-extra-{index}]")));
+        }
+        assert!(!stable_text.contains("[volatile-extra-"));
+        assert!(!volatile_text.contains("[stable-extra-"));
+    }
+
+    #[test]
+    fn shared_assembly_ranks_recall_and_keeps_session_memory_volatile() {
+        use astra_turn_core::context_sources::MemoryEntry;
+        for provider in ["openai", "anthropic"] {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            let tools = vec![tool("bash")];
+            let restricted = HashSet::new();
+            let edge = Map::new();
+            let cache = PromptCacheConfig {
+                cache_enabled: true,
+                is_anthropic: provider == "anthropic",
+            };
+            let entries = vec![
+                MemoryEntry::scored("lower value memory", 1.0),
+                MemoryEntry::scored("higher value memory", 2.0),
+            ];
+            let mut input = context_contract_input(
+                &mut state,
+                ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+                RuntimeSignals::new(&edge, None)
+                    .with_memory_entries(&entries)
+                    .with_session_memory_entry(Some(
+                        MemoryEntry::new("## Session State\nLatest working progress")
+                            .with_source("turn_learning"),
+                    )),
+                &cache,
+            );
+            input.provider = provider;
+            let output = assemble_context_pipeline(input).expect("shared pipeline");
+            let stable = output
+                .system_messages
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let volatile = output
+                .volatile_preamble
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let high = volatile
+                .find("higher value memory")
+                .expect("high-priority recall visible");
+            let low = volatile
+                .find("lower value memory")
+                .expect("low-priority recall visible");
+            assert!(high < low);
+            assert!(volatile.contains("## Session State\nLatest working progress"));
+            for text in [
+                "higher value memory",
+                "lower value memory",
+                "## Session State\nLatest working progress",
+            ] {
+                assert!(
+                    !stable.contains(text),
+                    "memory must stay outside stable prefix: {provider}"
+                );
+            }
+            let memory = output
+                .breakdown
+                .session_memory_injected
+                .as_ref()
+                .expect("session memory trace");
+            assert_eq!(memory.memory_id, "session-memory");
+            assert_eq!(memory.memory_type, "turn_learning");
+            assert_eq!(
+                memory.tokens,
+                astra_turn_core::section_types::estimate_text_tokens(
+                    "## Session State\nLatest working progress"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn shared_assembly_places_system_override_in_runtime_identity() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let tools = vec![tool("bash")];
+        let restricted = HashSet::new();
+        let mut edge = Map::new();
+        edge.insert(
+            "system_prompt_override".into(),
+            json!("Stable custom instruction"),
+        );
+        let cache = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let output = assemble_context_pipeline(context_contract_input(
+            &mut state,
+            ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+            RuntimeSignals::new(&edge, None),
+            &cache,
+        ))
+        .expect("shared pipeline");
+        assert!(
+            output
+                .system_messages
+                .iter()
+                .any(|message| message_text(message).contains("Stable custom instruction"))
+        );
+        assert!(
+            !output
+                .volatile_preamble
+                .iter()
+                .any(|message| message_text(message).contains("Stable custom instruction"))
+        );
+        assert!(output.breakdown.context_signals.system_prompt_override);
+    }
+
+    #[test]
+    fn shared_assembly_preserves_typed_recall_identity_without_prefix_churn() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(
+            &crate::turn::prompt_cache::CACHE_ENV_MUTEX,
+        );
+        use astra_turn_core::context_sources::MemoryEntry;
+        let tools = vec![tool("bash")];
+        let restricted = HashSet::new();
+        let edge = Map::new();
+        let cache = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let assemble = |id: &str, content: &str| {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            let entries = vec![
+                MemoryEntry::scored(content, 0.9)
+                    .with_memory_identity(id, "semantic")
+                    .with_source("memoria.prefetch"),
+            ];
+            let mut input = context_contract_input(
+                &mut state,
+                ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+                RuntimeSignals::new(&edge, None).with_memory_entries(&entries),
+                &cache,
+            );
+            input.provider = "anthropic";
+            let output = assemble_context_pipeline(input).expect("shared pipeline");
+            assert_eq!(
+                output.breakdown.repository_memories[0].tokens,
+                entries[0].token_estimate
+            );
+            output
+        };
+        let first = assemble("m1", "first typed recall evidence");
+        let second = assemble("m2", "second typed recall evidence");
+        assert_eq!(first.system_messages, second.system_messages);
+        assert_ne!(first.volatile_preamble, second.volatile_preamble);
+        for (output, id, text) in [
+            (&first, "m1", "first typed recall evidence"),
+            (&second, "m2", "second typed recall evidence"),
+        ] {
+            assert!(
+                output
+                    .volatile_preamble
+                    .iter()
+                    .any(|message| message_text(message).contains(text))
+            );
+            assert!(
+                !output
+                    .system_messages
+                    .iter()
+                    .any(|message| message_text(message).contains(text))
+            );
+            let recall = &output.breakdown.repository_memories[0];
+            assert_eq!(recall.memory_id, id);
+            assert_eq!(recall.memory_type, "semantic");
+            assert_eq!(recall.relevance_score, 0.9);
+        }
+    }
+
+    #[test]
+    fn shared_assembly_versions_capability_prefix_from_real_surfaces() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(
+            &crate::turn::prompt_cache::CACHE_ENV_MUTEX,
+        );
+        for provider in ["openai", "anthropic"] {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            let restricted = HashSet::new();
+            let edge = Map::new();
+            let cache = PromptCacheConfig {
+                cache_enabled: true,
+                is_anthropic: provider == "anthropic",
+            };
+            let mut assemble = |tools: &[Value], manifest: &str| {
+                let mut input = context_contract_input(
+                    &mut state,
+                    ToolSurfacePlan::from_visible_tools(tools, &restricted)
+                        .with_deferred_tools_block(manifest),
+                    RuntimeSignals::new(&edge, None),
+                    &cache,
+                );
+                input.provider = provider;
+                assemble_context_pipeline(input).expect("shared pipeline")
+            };
+            let bash = vec![tool("bash")];
+            let first = assemble(&bash, "<deferred-tools>github</deferred-tools>");
+            let changed_manifest =
+                assemble(&bash, "<deferred-tools>github web_fetch</deferred-tools>");
+            assert_ne!(first.system_messages, changed_manifest.system_messages);
+            assert_eq!(first.volatile_preamble, changed_manifest.volatile_preamble);
+            let changed_tools = assemble(
+                &[tool("bash"), tool("tool_search")],
+                "<deferred-tools>github web_fetch</deferred-tools>",
+            );
+            assert_ne!(
+                changed_manifest.system_messages,
+                changed_tools.system_messages
+            );
+            assert_eq!(
+                changed_manifest.volatile_preamble,
+                changed_tools.volatile_preamble
+            );
+            let stable = changed_tools
+                .system_messages
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(stable.contains("tool_search"));
+            assert!(stable.contains("<deferred-tools>"));
+            let dynamic = changed_tools
+                .volatile_preamble
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!dynamic.contains("<deferred-tools>"));
+            if provider == "anthropic" {
+                assert!(cache_control_count(&json!(changed_tools.system_messages)) > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_assembly_keeps_edge_runtime_advice_and_extra_text_volatile() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(
+            &crate::turn::prompt_cache::CACHE_ENV_MUTEX,
+        );
+        use crate::prompts::{PromptSection, PromptTokenBucket};
+        let tools = vec![tool("bash")];
+        let restricted = HashSet::new();
+        let cache = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let extra = vec![
+            PromptSection::dynamic(
+                "## Session Anchor\nKeep the accepted goal.",
+                PromptTokenBucket::Environment,
+            ),
+            PromptSection::dynamic(
+                "## Feedback Rules\nReport validation failures.",
+                PromptTokenBucket::Environment,
+            ),
+        ];
+        let assemble = |advice: &str| {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            let mut edge = Map::new();
+            edge.insert(
+                "system_prompt_override".into(),
+                json!("Stable session contract"),
+            );
+            edge.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS
+                    .into(),
+                json!([format!(
+                    "## Runtime Turn Context\n{{\"raw_advice\":\"{advice}\"}}"
+                )]),
+            );
+            assemble_context_pipeline(context_contract_input(
+                &mut state,
+                ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+                RuntimeSignals::new(&edge, None).with_extra_sections(&[], &extra),
+                &cache,
+            ))
+            .expect("shared pipeline")
+        };
+        let first = assemble("first");
+        let second = assemble("second");
+        assert_eq!(first.system_messages, second.system_messages);
+        assert_ne!(first.volatile_preamble, second.volatile_preamble);
+        for (output, advice) in [(&first, "first"), (&second, "second")] {
+            let stable = output
+                .system_messages
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let dynamic = output
+                .volatile_preamble
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(stable.contains("Stable session contract"));
+            assert!(!stable.contains("raw_advice"));
+            assert!(dynamic.contains(&format!("\"raw_advice\":\"{advice}\"")));
+            for text in [
+                "## Session Anchor\nKeep the accepted goal.",
+                "## Feedback Rules\nReport validation failures.",
+            ] {
+                assert!(dynamic.contains(text));
+                assert!(!stable.contains(text));
+            }
+        }
+    }
+
+    #[test]
+    fn shared_assembly_uses_declared_layout_and_stable_bytes() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(
+            &crate::turn::prompt_cache::CACHE_ENV_MUTEX,
+        );
+        use astra_turn_core::cache_placement::{
+            CacheCapability, CacheProtocol, VolatileDeliveryPolicy, VolatilePlacement,
+        };
+        let explicit = CacheCapability {
+            protocol: CacheProtocol::MarkerExplicit,
+            volatile_placement: VolatilePlacement::MarkerIsolated,
+            volatile_delivery: VolatileDeliveryPolicy::All,
+            reuse_scope: None,
+        };
+        for (provider, capability, blocks) in [
+            ("openai", None, false),
+            ("anthropic", None, true),
+            ("openai", Some(explicit), true),
+        ] {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            let tools = vec![tool("bash")];
+            let restricted = HashSet::new();
+            let edge = Map::new();
+            let cache = PromptCacheConfig {
+                cache_enabled: true,
+                is_anthropic: blocks,
+            };
+            let mut assemble = || {
+                let mut input = context_contract_input(
+                    &mut state,
+                    ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+                    RuntimeSignals::new(&edge, None),
+                    &cache,
+                );
+                input.provider = provider;
+                input.cache_capability = capability;
+                assemble_context_pipeline(input).expect("shared pipeline")
+            };
+            let first = assemble();
+            let second = assemble();
+            assert_eq!(
+                serde_json::to_vec(&first.system_messages).unwrap(),
+                serde_json::to_vec(&second.system_messages).unwrap()
+            );
+            assert!(!first.system_messages.is_empty());
+            for message in &first.system_messages {
+                if blocks {
+                    assert!(
+                        message["content"]
+                            .as_array()
+                            .is_some_and(|blocks| !blocks.is_empty())
+                    );
+                } else {
+                    assert!(
+                        message["content"]
+                            .as_str()
+                            .is_some_and(|text| !text.is_empty())
+                    );
+                }
+            }
+            assert_eq!(
+                cache_control_count(&json!(first.system_messages)) > 0,
+                blocks
+            );
+            let stable = first
+                .system_messages
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let dynamic = first
+                .volatile_preamble
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!stable.contains("Model: gpt-4o"));
+            assert!(dynamic.contains("Model: gpt-4o"));
+        }
+    }
+
+    #[test]
+    fn shared_assembly_prompt_override_is_cached_until_new_session() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(
+            &crate::turn::prompt_cache::CACHE_ENV_MUTEX,
+        );
+        struct RestoreOverride(Option<std::ffi::OsString>);
+        impl Drop for RestoreOverride {
+            fn drop(&mut self) {
+                // SAFETY: this test holds the shared prompt environment mutex.
+                unsafe {
+                    if let Some(value) = self.0.take() {
+                        std::env::set_var("ASTRA_PROMPT_OVERRIDES_DIR", value);
+                    } else {
+                        std::env::remove_var("ASTRA_PROMPT_OVERRIDES_DIR");
+                    }
+                }
+            }
+        }
+        let _restore = RestoreOverride(std::env::var_os("ASTRA_PROMPT_OVERRIDES_DIR"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("core_rules.txt");
+        // SAFETY: this test holds the shared prompt environment mutex.
+        unsafe {
+            std::env::set_var("ASTRA_PROMPT_OVERRIDES_DIR", dir.path());
+        }
+        let tools = vec![tool("bash")];
+        let restricted = HashSet::new();
+        let edge = Map::new();
+        let cache = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let assemble = |state: &mut AgenticLoopState| {
+            let output = assemble_context_pipeline(context_contract_input(
+                state,
+                ToolSurfacePlan::from_visible_tools(&tools, &restricted),
+                RuntimeSignals::new(&edge, None),
+                &cache,
+            ))
+            .expect("shared pipeline");
+            output
+                .system_messages
+                .iter()
+                .map(message_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        std::fs::write(&path, "FIRST_OVERRIDE_SENTINEL").unwrap();
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let first = assemble(&mut state);
+        assert!(first.contains("FIRST_OVERRIDE_SENTINEL"));
+        std::fs::write(&path, "SECOND_OVERRIDE_SENTINEL").unwrap();
+        let cached = assemble(&mut state);
+        assert!(cached.contains("FIRST_OVERRIDE_SENTINEL"));
+        assert!(!cached.contains("SECOND_OVERRIDE_SENTINEL"));
+        let refreshed = assemble(&mut crate::turn::agentic_loop::host::make_test_loop_state());
+        assert!(refreshed.contains("SECOND_OVERRIDE_SENTINEL"));
+        assert!(!refreshed.contains("FIRST_OVERRIDE_SENTINEL"));
+    }
+
     #[test]
     fn normalized_volatile_delivery_maps_without_behavior_guessing() {
         let capability =

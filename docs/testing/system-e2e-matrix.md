@@ -52,7 +52,7 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 
 | Test name | File / module | Scope |
 |-----------|---------------|-------|
-| `product_matrix_api_journey_hits_multiple_tables` | `journey_full.rs` | Full journey: sessions (list/get/put, close/resume, activity, **platform snapshot**), agents, events, context, decisions, memory proxy, edge, jobs, sandbox, triggers, skills, introspection, reflect/decision-trace, evaluation reads, marketplace probe, server-owned `chat/stream` SSE + `agent_events`, audit/replay fail-closed guardrail, logout |
+| `product_matrix_api_journey_hits_multiple_tables` | `journey_full.rs` | Full journey: sessions (list/get/put, close/resume, activity, **platform snapshot**), agents, events, context, decisions, memory proxy, edge, jobs, sandbox, triggers, skills, introspection, reflect/decision-trace, evaluation reads, marketplace probe, server-owned `chat/stream` SSE + `agent_events`, audit ownership, logout |
 | `e2e_matrix_chat_run_pause_resume_http` | `journey_tasks_runs.rs` | `POST /chat` (background run), `POST .../pause`, `GET /chat/runs/{id}`, `POST .../resume` |
 | `e2e_matrix_session_cancel_delete` | `journey_extended.rs` | `POST /sessions/{id}/cancel` + `agent_sessions.status`, `DELETE /sessions/{id}` |
 | `e2e_matrix_chat_stream_session_info` | `journey_extended.rs` | `POST /chat/stream` SSE → `session_info` + `run_id` |
@@ -116,7 +116,6 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Chat / runs | P0 | `POST /chat`, `/chat/stream`, `/chat/runs/*` | **In-memory** run store in `build_server_state` (not Matrix table today) | `e2e_matrix_chat_run_pause_resume_http`, `e2e_matrix_chat_stream_session_info` |
 | Platform | P1 | `GET /platform/snapshot` | — | `product_matrix_*` |
 | Data versioning | P1 | lineage GETs | — | `product_matrix_*` |
-| Replay | P1 | `/sessions/{id}/replay` + `/sessions/{id}/replay/compare` | No replay rows or summary mutation; owned 501 / foreign or missing 404 | `product_matrix_*` + `e2e_matrix_saas_session_replay_*_unavailable_guardrail` |
 | Admin | P1 | `GET /admin/tokens` | — | `e2e_matrix_saas_admin_tokens_rbac_smoke` |
 | WebSocket | — | `/chat/ws` | — | — |
 | Delegation | P1 | `GET .../delegations`, `POST .../delegate` (validation-only path) | **In-memory** tracker | `e2e_matrix_delegate_http_boundaries` |
@@ -147,7 +146,7 @@ Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../crates/ru
 | runs | `/runs` | Partial | List in `product_matrix_*`; lifecycle in `e2e_matrix_chat_run_pause_resume_http` |
 | teams | `/teams` | Partial | CRUD + snapshots + negatives + `team_definitions` / `team_snapshots` in `e2e_matrix_team_*`; native lead/member delivery is covered by the opt-in real-provider PTY journey |
 
-Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **context** (`/context`), **decisions** (`/decisions`), **models** (`/models`), **data-versioning** (`/data-versioning`), **replay guardrails** (`/sessions/.../replay`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
+Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **context** (`/context`), **decisions** (`/decisions`), **models** (`/models`), **data-versioning** (`/data-versioning`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
 
 ## Explicit coverage gaps
 

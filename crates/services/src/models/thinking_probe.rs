@@ -10,8 +10,6 @@ pub(crate) struct ThinkingProbeSnapshot {
     capability: Option<ThinkingCapability>,
     error: Option<String>,
     observed_at: String,
-    #[serde(default)]
-    legacy_hint: bool,
 }
 
 impl ThinkingProbeSnapshot {
@@ -40,39 +38,18 @@ impl ThinkingProbeSnapshot {
             capability: result.error.is_none().then_some(result.capability),
             error: result.error.clone(),
             observed_at: chrono::Utc::now().to_rfc3339(),
-            legacy_hint: false,
         }
     }
 
     /// An inconclusive check is not a negative capability observation. Keep
     /// prior knowledge only for exactly the same configuration and protocol.
-    pub(super) fn with_previous(
-        mut self,
-        raw: Option<&str>,
-        legacy: Option<ThinkingCapability>,
-    ) -> Self {
-        // A baseline observation cannot disprove previously known controls.
+    pub(super) fn with_previous(mut self, raw: Option<&str>) -> Self {
         if self.error.is_some()
-            || (self.protocol == ThinkingProtocol::Unknown
-                && self.capability == Some(ThinkingCapability::NativeOnly))
+            && let Some(capability) = cached_capability(raw, &self.identity, self.protocol)
         {
-            if let Some(raw) = raw {
-                if let Ok(previous) = serde_json::from_str::<Self>(raw)
-                    && let Some(capability) = previous.capability(&self.identity, self.protocol)
-                {
-                    self.capability = Some(capability);
-                    self.legacy_hint = previous.legacy_hint;
-                }
-            } else if let Some(legacy) = legacy {
-                self.capability = Some(legacy);
-                self.legacy_hint = true;
-            }
+            self.capability = Some(capability);
         }
         self
-    }
-
-    pub(super) fn persisted_capability(&self) -> Option<ThinkingCapability> {
-        self.capability
     }
 
     pub(super) fn capability(
@@ -544,7 +521,7 @@ mod tests {
         let old = ThinkingProbeSnapshot::new("identity".into(), protocol, &success);
         let raw = serde_json::to_string(&old).unwrap();
         let retained = ThinkingProbeSnapshot::new("identity".into(), protocol, &failure)
-            .with_previous(Some(&raw), None);
+            .with_previous(Some(&raw));
         assert_eq!(
             retained.capability("identity", protocol),
             Some(ThinkingCapability::Both)
@@ -558,33 +535,25 @@ mod tests {
         );
         for changed in ["rotated-key", "changed-model"] {
             let invalid = ThinkingProbeSnapshot::new(changed.into(), protocol, &failure)
-                .with_previous(Some(&raw), Some(ThinkingCapability::Both));
+                .with_previous(Some(&raw));
             assert_eq!(invalid.capability(changed, protocol), None);
         }
-        let legacy = ThinkingProbeSnapshot::new("identity".into(), protocol, &failure)
-            .with_previous(None, Some(ThinkingCapability::NativeOnly));
-        assert!(legacy.legacy_hint);
-        assert_eq!(
-            legacy.persisted_capability(),
-            Some(ThinkingCapability::NativeOnly)
-        );
+        let unobserved =
+            ThinkingProbeSnapshot::new("identity".into(), protocol, &failure).with_previous(None);
+        assert_eq!(unobserved.capability("identity", protocol), None);
         let malformed = ThinkingProbeSnapshot::new("identity".into(), protocol, &failure)
-            .with_previous(Some("invalid"), Some(ThinkingCapability::Both));
-        assert_eq!(malformed.persisted_capability(), None);
+            .with_previous(Some("invalid"));
+        assert_eq!(malformed.capability("identity", protocol), None);
         let native = ThinkingProbeResult {
             capability: ThinkingCapability::NativeOnly,
             error: None,
         };
         let baseline =
             ThinkingProbeSnapshot::new("identity".into(), ThinkingProtocol::Unknown, &native)
-                .with_previous(None, Some(ThinkingCapability::Both));
+                .with_previous(None);
         assert_eq!(
-            baseline.persisted_capability(),
-            Some(ThinkingCapability::Both)
-        );
-        assert!(
-            baseline.legacy_hint,
-            "baseline must not claim it verified a toggle"
+            baseline.capability("identity", ThinkingProtocol::Unknown),
+            Some(ThinkingCapability::NativeOnly)
         );
     }
 
@@ -733,6 +702,31 @@ mod tests {
         stale.revision += 1;
         assert_eq!(
             stale.capability(&identity, ThinkingProtocol::ThinkingObject),
+            None
+        );
+        let mut previous_revision = serde_json::to_value(&snapshot).unwrap();
+        previous_revision["revision"] = serde_json::json!(1);
+        previous_revision["legacy_hint"] = serde_json::json!(true);
+        let previous_raw = previous_revision.to_string();
+        assert_eq!(
+            cached_capability(
+                Some(&previous_raw),
+                &identity,
+                ThinkingProtocol::ThinkingObject
+            ),
+            None
+        );
+        let inconclusive = ThinkingProbeSnapshot::new(
+            identity.clone(),
+            ThinkingProtocol::ThinkingObject,
+            &ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: Some("inconclusive".into()),
+            },
+        )
+        .with_previous(Some(&previous_raw));
+        assert_eq!(
+            inconclusive.capability(&identity, ThinkingProtocol::ThinkingObject),
             None
         );
         let failed = ThinkingProbeSnapshot::new(

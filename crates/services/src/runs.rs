@@ -3173,26 +3173,6 @@ pub struct RunExecutionBoundaryAuthorizationRequest<'a> {
     pub expected_owner_generation: u64,
 }
 
-/// Immutable returned-intent facts to append after terminal settlement won.
-#[derive(Clone, Copy, Debug)]
-pub struct AtomicRunTerminalIntentReturnRequest<'a> {
-    pub user_id: &'a str,
-    pub run_id: &'a str,
-    pub expected_session_id: &'a str,
-    pub events: &'a [serde_json::Value],
-}
-
-/// Typed result of exact terminal intent-return append/reconciliation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AtomicRunTerminalIntentReturn {
-    Committed { event_indices: Vec<i64> },
-    AckRecovered { event_indices: Vec<i64> },
-    AlreadyReturned { event_indices: Vec<i64> },
-    NotTerminal { status: String },
-    IdentityConflict,
-    Missing,
-}
-
 /// Immutable authority and source identities for one atomic durable
 /// user-intent application. The owner generation is captured by the executor
 /// when it claims the run; stores must never reconstruct it from current
@@ -5289,16 +5269,6 @@ pub trait RunStateStore: Send + Sync {
         )
     }
 
-    /// Append exact terminal intent-return facts without hydrating unrelated
-    /// run history. Implementations must validate duplicate immutable payloads
-    /// and reconcile ambiguous commit acknowledgement through indexed keys.
-    async fn return_terminal_user_intents(
-        &self,
-        _request: AtomicRunTerminalIntentReturnRequest<'_>,
-    ) -> Result<AtomicRunTerminalIntentReturn, String> {
-        Err("atomic terminal user-intent return is not implemented for this run store".to_string())
-    }
-
     /// Atomically append exact `user_intent_applied` facts without hydrating
     /// unrelated run history. Shared stores must validate live execution
     /// authority with their database clock and reconcile ambiguous commit
@@ -6811,57 +6781,6 @@ fn decode_user_intent_admission_gate_row(
     })
 }
 
-fn validate_terminal_user_intent_return_event(event: &serde_json::Value) -> Result<String, String> {
-    if extract_event_type(event) != "user_intent_returned" {
-        return Err("terminal intent-return batch contains a non-return event".to_string());
-    }
-    let intent_id = event
-        .pointer("/data/intent_id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "terminal intent-return event requires a non-empty intent_id".to_string())?;
-    let expected_key = format!("user_intent_returned:{intent_id}");
-    if extract_optional_string(event, "idempotency_key").as_deref() != Some(expected_key.as_str()) {
-        return Err(format!(
-            "terminal intent-return event for {intent_id} has an invalid idempotency key"
-        ));
-    }
-    if event
-        .pointer("/data/event_index")
-        .and_then(serde_json::Value::as_u64)
-        .is_none()
-        || event.pointer("/data/delivery").is_none()
-        || event.pointer("/data/input").is_none()
-        || event
-            .pointer("/data/status")
-            .and_then(serde_json::Value::as_str)
-            != Some("returned")
-    {
-        return Err(format!(
-            "terminal intent-return event for {intent_id} has incomplete immutable facts"
-        ));
-    }
-    Ok(expected_key)
-}
-
-fn validate_terminal_user_intent_return_request(
-    request: AtomicRunTerminalIntentReturnRequest<'_>,
-) -> Result<Vec<String>, String> {
-    validate_expected_run_session_id(request.expected_session_id)?;
-    let mut keys = Vec::with_capacity(request.events.len());
-    let mut unique = std::collections::HashSet::with_capacity(request.events.len());
-    for event in request.events {
-        let key = validate_terminal_user_intent_return_event(event)?;
-        if !unique.insert(key.clone()) {
-            return Err(format!(
-                "terminal intent-return batch contains duplicate identity {key}"
-            ));
-        }
-        keys.push(key);
-    }
-    Ok(keys)
-}
-
 /// Canonical user-facing content for accepted durable user intent payloads.
 /// Runtime prompt injection delegates to this function so the authoritative
 /// store and consumer cannot derive different immutable applied facts.
@@ -7942,105 +7861,6 @@ impl RunStateStore for InMemoryRunStateStore {
             projection.updated_at = run.updated_at.clone();
         }
         Ok(AtomicRunUserIntentAdmissionTransition::Changed { event_index })
-    }
-
-    async fn return_terminal_user_intents(
-        &self,
-        request: AtomicRunTerminalIntentReturnRequest<'_>,
-    ) -> Result<AtomicRunTerminalIntentReturn, String> {
-        let keys = validate_terminal_user_intent_return_request(request)?;
-        if keys.is_empty() {
-            return Ok(AtomicRunTerminalIntentReturn::AlreadyReturned {
-                event_indices: Vec::new(),
-            });
-        }
-        let action_fence = self.action_fence_for(request.user_id, request.run_id);
-        let _action_fence = action_fence.lock_owned().await;
-        let mut runs = self.runs.write().await;
-        let Some(run) = runs.get_mut(request.run_id).filter(|run| {
-            run.user_id == request.user_id && run.session_id == request.expected_session_id
-        }) else {
-            return Ok(AtomicRunTerminalIntentReturn::Missing);
-        };
-
-        let mut existing_indices = std::collections::HashMap::with_capacity(keys.len());
-        for (position, existing) in run.events.iter().enumerate() {
-            let Some(key) = extract_optional_string(existing, "idempotency_key") else {
-                continue;
-            };
-            if let Some(request_position) = keys.iter().position(|candidate| candidate == &key) {
-                if !run_events_have_same_immutable_payload(
-                    existing,
-                    &request.events[request_position],
-                ) {
-                    return Ok(AtomicRunTerminalIntentReturn::IdentityConflict);
-                }
-                let event_index = existing
-                    .get("index")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(position as i64);
-                existing_indices.insert(key, event_index);
-            }
-        }
-        if existing_indices.len() == keys.len() {
-            return Ok(AtomicRunTerminalIntentReturn::AlreadyReturned {
-                event_indices: keys
-                    .iter()
-                    .filter_map(|key| existing_indices.get(key).copied())
-                    .collect(),
-            });
-        }
-        if !durable_run_status_is_terminal(&run.status) {
-            return Ok(AtomicRunTerminalIntentReturn::NotTerminal {
-                status: run.status.clone(),
-            });
-        }
-
-        let mut next_event_index = run
-            .last_event_idx
-            .checked_add(1)
-            .ok_or_else(|| format!("run {} event index overflow", request.run_id))?
-            .max(i64::try_from(run.events.len()).unwrap_or(i64::MAX));
-        let mut event_indices = Vec::with_capacity(keys.len());
-        for (event, key) in request.events.iter().zip(&keys) {
-            if let Some(event_index) = existing_indices.get(key).copied() {
-                event_indices.push(event_index);
-                continue;
-            }
-            let mut event = event.clone();
-            if let Some(object) = event.as_object_mut() {
-                object.insert("index".to_string(), serde_json::json!(next_event_index));
-            }
-            run.events.push(event);
-            existing_indices.insert(key.clone(), next_event_index);
-            event_indices.push(next_event_index);
-            next_event_index = next_event_index
-                .checked_add(1)
-                .ok_or_else(|| format!("run {} event index overflow", request.run_id))?;
-        }
-        let last_event_index = event_indices
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(run.last_event_idx);
-        run.last_event_idx = run.last_event_idx.max(last_event_index);
-        run.updated_at = chrono::Utc::now().to_rfc3339();
-
-        let mut projections = self.projections.write().await;
-        let projection = projections
-            .entry(run.run_id.clone())
-            .or_insert_with(|| build_run_display_projection(run, None, None));
-        if projection.projection_event_idx <= run.last_event_idx {
-            projection.projection_event_idx = run.last_event_idx;
-            projection.latest_event_type = Some("user_intent_returned".to_string());
-            projection.projection_hash = event_metadata_projection_patch_hash(
-                &run.run_id,
-                run.last_event_idx,
-                Some("user_intent_returned"),
-            );
-            projection.updated_at = run.updated_at.clone();
-        }
-        Ok(AtomicRunTerminalIntentReturn::Committed { event_indices })
     }
 
     async fn apply_run_user_intents(
@@ -17899,310 +17719,6 @@ impl RunStateStore for DatabaseRunStateStore {
         Ok(AtomicRunUserIntentAdmissionTransition::Changed { event_index })
     }
 
-    async fn return_terminal_user_intents(
-        &self,
-        request: AtomicRunTerminalIntentReturnRequest<'_>,
-    ) -> Result<AtomicRunTerminalIntentReturn, String> {
-        let keys = validate_terminal_user_intent_return_request(request)?;
-        if keys.is_empty() {
-            return Ok(AtomicRunTerminalIntentReturn::AlreadyReturned {
-                event_indices: Vec::new(),
-            });
-        }
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| {
-                db_error("acquire_terminal_intent_returns", request.run_id, source).to_string()
-            })?;
-        let mut tx = connection.begin().await.map_err(|source| {
-            db_error("begin_terminal_intent_returns", request.run_id, source).to_string()
-        })?;
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(
-                &mut tx,
-                request.user_id,
-                request.expected_session_id,
-                request.run_id,
-            )
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_missing_terminal_intent_returns",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(AtomicRunTerminalIntentReturn::Missing);
-        };
-
-        let mut builder =
-            sqlx::QueryBuilder::<sqlx::MySql>::new(RUN_CONTROL_EVENTS_BY_KEY_SELECT_PREFIX);
-        builder.push_bind(request.user_id);
-        builder.push(" AND run_id = ");
-        builder.push_bind(request.run_id);
-        builder.push(" AND idempotency_key IN (");
-        let mut separated = builder.separated(", ");
-        for key in &keys {
-            separated.push_bind(key);
-        }
-        separated.push_unseparated(") ORDER BY event_idx ASC FOR UPDATE");
-        let existing_rows = builder
-            .build()
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|source| {
-                db_error(
-                    "load_existing_terminal_intent_returns",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-        let mut existing = std::collections::HashMap::with_capacity(existing_rows.len());
-        for row in existing_rows {
-            let payload_json: String = row.try_get("payload_json").map_err(|source| {
-                db_error(
-                    "decode_terminal_intent_return_payload",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            let payload = serde_json::from_str(&payload_json).map_err(|source| {
-                DatabaseRunStateStoreError::Json {
-                    operation: "decode_terminal_intent_return_payload",
-                    entity: request.run_id.to_string(),
-                    source,
-                }
-                .to_string()
-            })?;
-            let recovered = RecoveredRunControlEvent {
-                id: row.try_get("id").map_err(|source| {
-                    db_error("decode_terminal_intent_return_id", request.run_id, source).to_string()
-                })?,
-                event_idx: row.try_get("event_idx").map_err(|source| {
-                    db_error(
-                        "decode_terminal_intent_return_index",
-                        request.run_id,
-                        source,
-                    )
-                    .to_string()
-                })?,
-                event_type: row.try_get("event_type").map_err(|source| {
-                    db_error("decode_terminal_intent_return_type", request.run_id, source)
-                        .to_string()
-                })?,
-                event_id: row.try_get("event_id").map_err(|source| {
-                    db_error(
-                        "decode_terminal_intent_return_event_id",
-                        request.run_id,
-                        source,
-                    )
-                    .to_string()
-                })?,
-                idempotency_key: row.try_get("idempotency_key").map_err(|source| {
-                    db_error("decode_terminal_intent_return_key", request.run_id, source)
-                        .to_string()
-                })?,
-                event_hash: row.try_get("event_hash").map_err(|source| {
-                    db_error("decode_terminal_intent_return_hash", request.run_id, source)
-                        .to_string()
-                })?,
-                producer_pod_id: row.try_get("producer_pod_id").map_err(|source| {
-                    db_error(
-                        "decode_terminal_intent_return_producer",
-                        request.run_id,
-                        source,
-                    )
-                    .to_string()
-                })?,
-                payload_json,
-                payload,
-            };
-            existing.insert(recovered.idempotency_key.clone(), recovered);
-        }
-        for (key, expected_event) in keys.iter().zip(request.events) {
-            if let Some(actual) = existing.get(key)
-                && !recovered_run_control_event_is_equivalent(actual, expected_event, key)
-            {
-                tx.rollback().await.map_err(|source| {
-                    db_error(
-                        "rollback_conflicting_terminal_intent_returns",
-                        request.run_id,
-                        source,
-                    )
-                    .to_string()
-                })?;
-                connection.release();
-                return Ok(AtomicRunTerminalIntentReturn::IdentityConflict);
-            }
-        }
-        if existing.len() == keys.len() {
-            let event_indices = keys
-                .iter()
-                .filter_map(|key| existing.get(key).map(|event| event.event_idx))
-                .collect();
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_idempotent_terminal_intent_returns",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(AtomicRunTerminalIntentReturn::AlreadyReturned { event_indices });
-        }
-        if !durable_run_status_is_terminal(&run.status) {
-            let status = run.status;
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_nonterminal_intent_returns",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(AtomicRunTerminalIntentReturn::NotTerminal { status });
-        }
-
-        let missing = keys
-            .iter()
-            .zip(request.events)
-            .filter(|(key, _)| !existing.contains_key(*key))
-            .collect::<Vec<_>>();
-        let first_event_index = run
-            .last_event_idx
-            .checked_add(1)
-            .ok_or_else(|| format!("run {} event index overflow", request.run_id))?;
-        let inserted = missing
-            .iter()
-            .enumerate()
-            .map(|(offset, (_, event))| {
-                build_run_event_insert_row(
-                    request.user_id,
-                    request.run_id,
-                    &run.session_id,
-                    run.agent_id.as_deref(),
-                    first_event_index + offset as i64,
-                    &self.owner_pod_id,
-                    event,
-                )
-                .map_err(|error| error.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let last_event_index = inserted
-            .last()
-            .map(|row| row.event_idx)
-            .ok_or_else(|| "terminal intent-return batch lost its missing rows".to_string())?;
-        let updated = sqlx::query(
-            "UPDATE agent_runs SET last_event_idx = ?, updated_at = NOW(6) \
-             WHERE user_id = ? AND run_id = ? AND last_event_idx = ? \
-               AND status IN (?, ?, ?, ?)",
-        )
-        .bind(last_event_index)
-        .bind(request.user_id)
-        .bind(request.run_id)
-        .bind(run.last_event_idx)
-        .bind(STATUS_COMPLETED)
-        .bind(STATUS_DELEGATED)
-        .bind(STATUS_FAILED)
-        .bind(STATUS_CANCELLED)
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| {
-            db_error("update_terminal_intent_returns", request.run_id, source).to_string()
-        })?;
-        if updated.rows_affected() != 1 {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "rollback_lost_terminal_intent_returns",
-                    request.run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(AtomicRunTerminalIntentReturn::NotTerminal { status: run.status });
-        }
-        Self::insert_run_event_rows_tx(
-            &mut tx,
-            request.run_id,
-            &inserted,
-            "insert_terminal_intent_returns",
-        )
-        .await?;
-        Self::upsert_event_metadata_projection_tx(
-            &mut tx,
-            &run,
-            last_event_index,
-            "user_intent_returned",
-        )
-        .await?;
-
-        let mut committed_indices = existing
-            .iter()
-            .map(|(key, event)| (key.clone(), event.event_idx))
-            .collect::<std::collections::HashMap<_, _>>();
-        for row in &inserted {
-            if let Some(key) = row.idempotency_key.as_ref() {
-                committed_indices.insert(key.clone(), row.event_idx);
-            }
-        }
-        let event_indices = keys
-            .iter()
-            .filter_map(|key| committed_indices.get(key).copied())
-            .collect::<Vec<_>>();
-        let commit_error = match tx.commit().await {
-            Ok(()) => {
-                connection.release();
-                #[cfg(test)]
-                {
-                    self.user_intent_control_commit_ack_loss_once
-                        .swap(false, std::sync::atomic::Ordering::SeqCst)
-                        .then(|| {
-                            format!(
-                                "injected terminal intent-return commit acknowledgement loss for {}",
-                                request.run_id
-                            )
-                        })
-                }
-                #[cfg(not(test))]
-                {
-                    None
-                }
-            }
-            Err(source) => {
-                drop(connection);
-                Some(db_error("commit_terminal_intent_returns", request.run_id, source).to_string())
-            }
-        };
-        if let Some(commit_error) = commit_error {
-            return match self
-                .reconcile_terminal_intent_returns(request, &keys, &inserted)
-                .await
-                .map_err(|error| format!("{commit_error}; {error}"))?
-            {
-                TerminalIntentReturnRecovery::ThisAttempt(event_indices) => {
-                    Ok(AtomicRunTerminalIntentReturn::AckRecovered { event_indices })
-                }
-                TerminalIntentReturnRecovery::Equivalent(event_indices) => {
-                    Ok(AtomicRunTerminalIntentReturn::AlreadyReturned { event_indices })
-                }
-                TerminalIntentReturnRecovery::Conflict => {
-                    Ok(AtomicRunTerminalIntentReturn::IdentityConflict)
-                }
-                TerminalIntentReturnRecovery::NotCommitted => Err(commit_error),
-            };
-        }
-        Ok(AtomicRunTerminalIntentReturn::Committed { event_indices })
-    }
-
     async fn apply_run_user_intents(
         &self,
         request: AtomicRunUserIntentApplyRequest<'_>,
@@ -24303,51 +23819,6 @@ impl DatabaseRunStateStore {
         Ok(recovery)
     }
 
-    async fn reconcile_terminal_intent_returns(
-        &self,
-        request: AtomicRunTerminalIntentReturnRequest<'_>,
-        keys: &[String],
-        inserted: &[RunEventInsertRow],
-    ) -> Result<TerminalIntentReturnRecovery, String> {
-        let recovered = self
-            .load_run_control_events_by_keys(
-                request.user_id,
-                request.run_id,
-                keys,
-                "reconcile_terminal_intent_returns",
-            )
-            .await?;
-        if recovered.len() != keys.len() {
-            return Ok(TerminalIntentReturnRecovery::NotCommitted);
-        }
-        let by_key = recovered
-            .iter()
-            .map(|event| (event.idempotency_key.as_str(), event))
-            .collect::<std::collections::HashMap<_, _>>();
-        let mut event_indices = Vec::with_capacity(keys.len());
-        for (key, expected_event) in keys.iter().zip(request.events) {
-            let Some(actual) = by_key.get(key.as_str()).copied() else {
-                return Ok(TerminalIntentReturnRecovery::NotCommitted);
-            };
-            if !recovered_run_control_event_is_equivalent(actual, expected_event, key) {
-                return Ok(TerminalIntentReturnRecovery::Conflict);
-            }
-            event_indices.push(actual.event_idx);
-        }
-        let this_attempt = inserted.iter().all(|expected| {
-            expected
-                .idempotency_key
-                .as_deref()
-                .and_then(|key| by_key.get(key).copied())
-                .is_some_and(|actual| recovered_run_control_event_is_exact(actual, expected))
-        });
-        if !inserted.is_empty() && this_attempt {
-            Ok(TerminalIntentReturnRecovery::ThisAttempt(event_indices))
-        } else {
-            Ok(TerminalIntentReturnRecovery::Equivalent(event_indices))
-        }
-    }
-
     async fn reconcile_user_intent_apply(
         &self,
         request: AtomicRunUserIntentApplyRequest<'_>,
@@ -25976,14 +25447,6 @@ fn classify_user_intent_admission_transition_recovery(
     } else {
         UserIntentAdmissionTransitionRecovery::Equivalent(recovered.event_idx)
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum TerminalIntentReturnRecovery {
-    ThisAttempt(Vec<i64>),
-    Equivalent(Vec<i64>),
-    Conflict,
-    NotCommitted,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -28960,6 +28423,18 @@ mod tests {
         })];
         let returned = terminal_user_intent_return_events(&intent_history, true);
         assert_eq!(returned.len(), 1);
+        let mut conflicting = returned[0].clone();
+        conflicting["data"]["content"] = json!("different");
+        assert!(matches!(
+            validate_atomic_terminal_return_prefix(
+                &intent_history,
+                vec![atomic_terminal_test_row(10, conflicting, "batch")],
+                10,
+                "batch",
+            ),
+            AtomicTerminalReturnPrefixResolution::Conflict(_)
+        ));
+
         let full_batch = returned
             .iter()
             .cloned()
@@ -33897,6 +33372,20 @@ mod tests {
             .insert_run(run)
             .await
             .expect("insert transition ACK-loss run");
+        store
+            .append_event(
+                &user_id,
+                &session_id,
+                &run_id,
+                json!({
+                    "event_type": "user_intent",
+                    "idempotency_key": "user_intent:transition-ack-intent",
+                    "data": {"intent_id":"transition-ack-intent", "delivery":"guide_current_run",
+                             "input":{"content":"preserve accepted intent"}}
+                }),
+            )
+            .await
+            .expect("accept intent before cancellation");
         assert!(
             store
                 .request_run_cancellation(&user_id, &run_id)
@@ -33926,7 +33415,7 @@ mod tests {
                     STATUS_CANCELLED,
                     None,
                     None,
-                    &[terminal_event],
+                    std::slice::from_ref(&terminal_event),
                 )
                 .await
                 .expect("exact terminal transition survives lost COMMIT acknowledgement")
@@ -33945,6 +33434,62 @@ mod tests {
                 .count(),
             1
         );
+
+        let accepted = durable
+            .events
+            .iter()
+            .find(|event| event["event_type"] == "user_intent")
+            .unwrap();
+        let returned = durable
+            .events
+            .iter()
+            .position(|event| event["event_type"] == "user_intent_returned")
+            .expect("accepted intent returned in terminal commit");
+        let finished = durable
+            .events
+            .iter()
+            .position(|event| event["event_type"] == "run_finished")
+            .unwrap();
+        assert_eq!(returned + 1, finished);
+        assert_eq!(
+            durable.events[returned]["data"]["event_index"],
+            accepted["index"]
+        );
+        assert_eq!(
+            durable.events[returned]["data"]["content"],
+            "preserve accepted intent"
+        );
+        assert_eq!(
+            durable.events[returned]["data"]["input"],
+            accepted["data"]["input"]
+        );
+        assert!(
+            !store
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    &[STATUS_RUNNING],
+                    None,
+                    STATUS_CANCELLED,
+                    None,
+                    None,
+                    std::slice::from_ref(&terminal_event),
+                )
+                .await
+                .unwrap()
+        );
+        let retry = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+        for kind in ["user_intent_returned", "run_finished"] {
+            assert_eq!(
+                retry
+                    .events
+                    .iter()
+                    .filter(|event| event["event_type"] == kind)
+                    .count(),
+                1
+            );
+        }
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
         sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
@@ -37250,66 +36795,6 @@ mod tests {
                 event_index: Some(2)
             }
         );
-        assert!(
-            store
-                .update_run_status_with_event_if_current(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    &[STATUS_RUNNING],
-                    STATUS_COMPLETED,
-                    None,
-                    None,
-                    json!({
-                        "event_type": "run_finished",
-                        "idempotency_key": format!("run_finished:{run_id}"),
-                        "data": {"status": STATUS_COMPLETED}
-                    }),
-                )
-                .await
-                .expect("settle control ACK run")
-        );
-
-        let return_store = DatabaseRunStateStore::new(pool.clone())
-            .with_owner_pod_id("intent-control-ack-owner")
-            .with_user_intent_control_commit_ack_loss_once();
-        let returned = json!({
-            "event_type": "user_intent_returned",
-            "idempotency_key": "user_intent_returned:intent-control-ack",
-            "data": {
-                "intent_id": "intent-control-ack",
-                "delivery": "guide_current_run",
-                "status": "returned",
-                "event_index": 0,
-                "content": "reconcile",
-                "input": {"content": "reconcile"}
-            }
-        });
-        assert!(matches!(
-            return_store
-                .return_terminal_user_intents(AtomicRunTerminalIntentReturnRequest {
-                    user_id: &user_id,
-                    run_id: &run_id,
-                    expected_session_id: &session_id,
-                    events: std::slice::from_ref(&returned),
-                })
-                .await
-                .expect("lost terminal-return ACK must reconcile"),
-            AtomicRunTerminalIntentReturn::AckRecovered { .. }
-        ));
-        assert!(matches!(
-            return_store
-                .return_terminal_user_intents(AtomicRunTerminalIntentReturnRequest {
-                    user_id: &user_id,
-                    run_id: &run_id,
-                    expected_session_id: &session_id,
-                    events: std::slice::from_ref(&returned),
-                })
-                .await
-                .expect("terminal-return retry is exact-idempotent"),
-            AtomicRunTerminalIntentReturn::AlreadyReturned { .. }
-        ));
-
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
         sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
             .bind(&user_id)
@@ -46069,75 +45554,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_intent_return_is_exact_bounded_and_conflict_safe() {
-        let store = InMemoryRunStateStore::new();
-        let mut run = durable_run_record("terminal-return-large-tail");
-        run.events = (0..34_000)
-            .map(|index| make_event("agent_progress", json!({"index": index})))
-            .collect();
-        run.events.push(json!({
-            "event_type": "user_intent",
-            "idempotency_key": "user_intent:intent-large",
-            "index": 34_000,
-            "data": {
-                "intent_id": "intent-large",
-                "delivery": "guide_current_run",
-                "input": {"content": "preserve"}
-            }
-        }));
-        run.last_event_idx = 34_000;
-        run.status = STATUS_COMPLETED.to_string();
-        store.insert_run(run).await.unwrap();
-        let returned = json!({
-            "event_type": "user_intent_returned",
-            "idempotency_key": "user_intent_returned:intent-large",
-            "data": {
-                "intent_id": "intent-large",
-                "delivery": "guide_current_run",
-                "status": "returned",
-                "event_index": 34_000,
-                "content": "preserve",
-                "input": {"content": "preserve"}
-            }
-        });
-        let request = AtomicRunTerminalIntentReturnRequest {
-            user_id: "u1",
-            run_id: "terminal-return-large-tail",
-            expected_session_id: "s1",
-            events: std::slice::from_ref(&returned),
-        };
-        assert_eq!(
-            store.return_terminal_user_intents(request).await.unwrap(),
-            AtomicRunTerminalIntentReturn::Committed {
-                event_indices: vec![34_001]
-            }
-        );
-        assert_eq!(store.load_run_call_count(), 0);
-        assert_eq!(
-            store.return_terminal_user_intents(request).await.unwrap(),
-            AtomicRunTerminalIntentReturn::AlreadyReturned {
-                event_indices: vec![34_001]
-            }
-        );
-        let mut conflicting = returned;
-        conflicting["data"]["content"] = json!("different");
-        assert_eq!(
-            store
-                .return_terminal_user_intents(AtomicRunTerminalIntentReturnRequest {
-                    user_id: "u1",
-                    run_id: "terminal-return-large-tail",
-                    expected_session_id: "s1",
-                    events: std::slice::from_ref(&conflicting),
-                })
-                .await
-                .unwrap(),
-            AtomicRunTerminalIntentReturn::IdentityConflict
-        );
-        assert_eq!(store.load_run_call_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn user_intent_control_mutations_fail_closed_on_terminal_or_nonterminal_state() {
+    async fn terminal_user_intent_admission_control_is_rejected() {
         let store = InMemoryRunStateStore::new();
         let mut terminal = durable_run_record("terminal-gate");
         terminal.status = STATUS_FAILED.to_string();
@@ -46162,35 +45579,6 @@ mod tests {
                 .unwrap(),
             AtomicRunUserIntentAdmissionTransition::Inactive {
                 status: STATUS_FAILED.to_string()
-            }
-        );
-
-        let active = durable_run_record("active-return");
-        store.insert_run(active).await.unwrap();
-        let returned = json!({
-            "event_type": "user_intent_returned",
-            "idempotency_key": "user_intent_returned:intent-active",
-            "data": {
-                "intent_id": "intent-active",
-                "delivery": "guide_current_run",
-                "status": "returned",
-                "event_index": 0,
-                "content": "no",
-                "input": {"content": "no"}
-            }
-        });
-        assert_eq!(
-            store
-                .return_terminal_user_intents(AtomicRunTerminalIntentReturnRequest {
-                    user_id: "u1",
-                    run_id: "active-return",
-                    expected_session_id: "s1",
-                    events: std::slice::from_ref(&returned),
-                })
-                .await
-                .unwrap(),
-            AtomicRunTerminalIntentReturn::NotTerminal {
-                status: STATUS_RUNNING.to_string()
             }
         );
     }
@@ -46291,10 +45679,12 @@ mod tests {
     #[tokio::test]
     async fn terminal_batch_atomically_returns_every_unsettled_user_intent_before_finish() {
         let store = InMemoryRunStateStore::new();
-        store
-            .insert_run(durable_run_record("terminal-intent-return"))
-            .await
-            .unwrap();
+        let mut initial = durable_run_record("terminal-intent-return");
+        initial.events = (0..34_000)
+            .map(|index| make_event("agent_progress", json!({"index": index})))
+            .collect();
+        initial.last_event_idx = 33_999;
+        store.insert_run(initial).await.unwrap();
         store
             .append_event(
                 "u1",
@@ -46312,6 +45702,11 @@ mod tests {
             )
             .await
             .unwrap();
+        let terminal_event = json!({
+            "event_type": "run_finished",
+            "idempotency_key": "run_finished:terminal-intent-return",
+            "data": {"status": STATUS_FAILED}
+        });
         assert!(
             store
                 .update_run_status_with_events_if_current(
@@ -46323,15 +45718,29 @@ mod tests {
                     STATUS_FAILED,
                     None,
                     Some("executor lost"),
-                    &[json!({
-                        "event_type": "run_finished",
-                        "idempotency_key": "run_finished:terminal-intent-return",
-                        "data": {"status": STATUS_FAILED}
-                    })],
+                    std::slice::from_ref(&terminal_event),
                 )
                 .await
                 .unwrap()
         );
+        assert!(
+            !store
+                .update_run_status_with_events_if_current(
+                    "u1",
+                    "s1",
+                    "terminal-intent-return",
+                    &[STATUS_RUNNING],
+                    None,
+                    STATUS_FAILED,
+                    None,
+                    Some("executor lost"),
+                    std::slice::from_ref(&terminal_event),
+                )
+                .await
+                .unwrap(),
+            "retry cannot append another returned/finished pair"
+        );
+        assert_eq!(store.load_run_call_count(), 0);
         let run = store
             .load_run("u1", "terminal-intent-return")
             .await
@@ -46350,6 +45759,17 @@ mod tests {
             run.events[types.len() - 2]["data"]["content"],
             "preserve me"
         );
+        assert_eq!(run.events[types.len() - 2]["data"]["event_index"], 34_000);
+        assert_eq!(
+            run.events[types.len() - 2]["data"]["input"],
+            json!({"content":"preserve me"})
+        );
+        for kind in ["user_intent_returned", "run_finished"] {
+            assert_eq!(
+                types.iter().filter(|event| event.as_str() == kind).count(),
+                1
+            );
+        }
     }
 
     #[tokio::test]

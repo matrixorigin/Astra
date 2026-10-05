@@ -36,7 +36,6 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 | Triggers + fire + delete + DB | `journey_full` | `triggers_contract` |
 | Marketplace probe | `journey_full` | `marketplace_contract` |
 | Data versioning lineage | `journey_full` | `data_versioning_contract` |
-| Replay fail-closed guardrails (owned 501; foreign/missing 404; no replay rows) | `journey_full` + `replay_*_unavailable_guardrail` | — (positive durable replay contract unimplemented) |
 | `GET /models` (authenticated paginated catalog) | `journey_full` + `e2e_matrix_models` | cursor continuation, global total, revision stability |
 | Models admin CRUD + `infra_llm_models` | `journey_extended::run_models_admin_crud_with_db` (`provider: mock`, `grant_astra_admin_role`) | `model_crud_contract` |
 | `GET /admin/tokens` (403 → grant `astra_admin` → 200 array) | `e2e_matrix_saas_admin_tokens_rbac_smoke` | — |
@@ -64,7 +63,7 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 ## Developer-loop coverage
 
 - **Topology journeys:** `web_agent_e2e.rs` proves CLI+Server single admission, Server-only internal tools, Edge+Server callbacks, offline blocking, and unknown-run isolation.
-- **Durability:** `system_matrix_http_e2e` owns fail-closed replay guardrails, concurrency, callback, and retention coverage; positive replay remains reserved until durable reconstruction exists.
+- **Durability:** `system_matrix_http_e2e` covers concurrency, callbacks, and retention. `http_contract` rejects retired session re-execution routes; Thin Client and Run lifecycle tests cover recorded run event replay.
 - **Logic:** prefer unit tests beside the canonical server loop and provider transports; do not introduce a second loop-shaped integration harness.
 
 ## Services crate

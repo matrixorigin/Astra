@@ -323,7 +323,6 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         message: "hi",
         user_intent: "hi",
         input_runtime_required_texts: &[],
-        input_active_system_skills: &[],
         input_runtime_volatile_texts: &[],
         input_work_unit_observations: &[],
         semantic_query_override: None,
@@ -496,7 +495,6 @@ async fn stream_chat_sse_simple_text_response() {
         message: "hi",
         user_intent: "hi",
         input_runtime_required_texts: &[],
-        input_active_system_skills: &[],
         input_runtime_volatile_texts: &[],
         input_work_unit_observations: &[],
         semantic_query_override: None,
@@ -577,13 +575,17 @@ async fn stream_chat_sse_simple_text_response() {
 
 #[tokio::test]
 async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace() {
+    use futures_util::StreamExt;
+
     #[derive(Clone)]
     struct MockState {
         turn_payloads: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+        finish: std::sync::Arc<tokio::sync::Notify>,
     }
 
     let state = MockState {
         turn_payloads: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        finish: std::sync::Arc::new(tokio::sync::Notify::new()),
     };
     let app = Router::new().route(
         "/chat/stream",
@@ -593,7 +595,18 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
                 let state = state.clone();
                 async move {
                     state.turn_payloads.lock().await.push(body);
-                    (TEST_SSE_HEADERS, sse_text_response("Hello!", "sess-traced"))
+                    let response = sse_text_response("Hello!", "sess-traced");
+                    let terminal = response.find("data: {\"type\":\"text_done\"").unwrap();
+                    let first_frame = response.split_once("\n\n").unwrap().0;
+                    let early = format!("{first_frame}\n\n{}", &response[..terminal]);
+                    let final_frames = response[terminal..].to_owned();
+                    let body = futures_util::stream::iter([Ok::<_, std::io::Error>(early)]).chain(
+                        futures_util::stream::once(async move {
+                            state.finish.notified().await;
+                            Ok(final_frames)
+                        }),
+                    );
+                    (TEST_SSE_HEADERS, axum::body::Body::from_stream(body))
                 }
             }
         }),
@@ -603,14 +616,14 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
-    let result = stream_chat_sse(ChatTurnParams {
+    let (event_tx, mut event_rx) = crate::cli::chat_stream::stream_event_channel();
+    let turn = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
         auth_profile: None,
         message: "hi",
         user_intent: "hi",
         input_runtime_required_texts: &[],
-        input_active_system_skills: &[],
         input_runtime_volatile_texts: &[],
         input_work_unit_observations: &[],
         semantic_query_override: None,
@@ -644,7 +657,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         incremental_state: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
-        stream_event_tx: None,
+        stream_event_tx: Some(event_tx),
         explain_analyze_terminal_degraded: None,
         stream_json_emitter: None,
         agent_live_event_sink: None,
@@ -680,11 +693,39 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         harness_trace: None,
         #[cfg(feature = "harness")]
         benchmark_profile: None,
-    })
-    .await
-    .unwrap();
-
+    });
+    let observe_binding = async {
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut bindings = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    crate::cli::chat_stream::StreamEvent::SessionBound(id) => {
+                        bindings.push(("session", id))
+                    }
+                    crate::cli::chat_stream::StreamEvent::RunBound(id) => {
+                        bindings.push(("run", id))
+                    }
+                    crate::cli::chat_stream::StreamEvent::Token { .. } => return bindings,
+                    _ => {}
+                }
+            }
+            panic!("stream closed before the first text");
+        })
+        .await;
+        state.finish.notify_one();
+        observed.expect("bindings and first text must be visible before the terminal frames")
+    };
+    let (result, bindings) = tokio::join!(turn, observe_binding);
+    let result = result.unwrap();
     assert_eq!(result.session_id.as_deref(), Some("sess-traced"));
+    assert_eq!(
+        bindings,
+        vec![
+            ("session", "sess-traced".into()),
+            ("run", "run-sess-traced".into()),
+        ],
+        "duplicate wire frames must publish the resumed binding once before completion"
+    );
 
     let payloads = state.turn_payloads.lock().await;
     assert_eq!(payloads.len(), 1);
@@ -730,7 +771,6 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
             message: "delegate this work",
             user_intent: "delegate this work",
             input_runtime_required_texts: &[],
-            input_active_system_skills: &[],
             input_runtime_volatile_texts: &[],
             input_work_unit_observations: &[],
             semantic_query_override: None,
@@ -845,7 +885,6 @@ async fn stream_chat_sse_api_error_propagated() {
         message: "hi",
         user_intent: "hi",
         input_runtime_required_texts: &[],
-        input_active_system_skills: &[],
         input_runtime_volatile_texts: &[],
         input_work_unit_observations: &[],
         semantic_query_override: None,
@@ -924,23 +963,31 @@ async fn stream_chat_sse_api_error_propagated() {
 
 #[tokio::test]
 async fn stream_chat_sse_rejects_client_tool_continuation() {
-    // A malformed Server stream must never authorize another admission.
-    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let cc = call_count.clone();
-    let app = Router::new().route(
+    // Neither text syntax nor a malformed typed continuation authorizes admission.
+    for native_tool_call in [false, true] {
+        let partial_text = "Observed partial response\n<invoke name=\"introspect\"/>";
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cc = call_count.clone();
+        let app = Router::new().route(
             "/chat/stream",
             post(move || {
                 let cc = cc.clone();
                 async move {
                     cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let body =
-                        "data: {\"type\":\"session_info\",\"session_id\":\"sess-tc\",\"run_id\":\"run-sess-tc\"}\n\n\
-                         data: {\"type\":\"text_delta\",\"content\":\"Observed partial response\"}\n\n\
-                         data: {\"type\":\"usage\",\"input_tokens\":10,\"output_tokens\":5}\n\n\
-                         data: {\"type\":\"tool_call\",\"id\":\"tc-1\",\"name\":\"bash\",\"arguments\":{\"command\":\"echo hi\"}}\n\n\
-                         data: {\"type\":\"turn_complete\",\"has_tool_calls\":true}\n\n\
+                    let native_event = if native_tool_call {
+                        "data: {\"type\":\"tool_call\",\"id\":\"tc-1\",\"name\":\"bash\",\"arguments\":{\"command\":\"echo hi\"}}\n\n"
+                    } else {
+                        ""
+                    };
+                    let text_event = serde_json::json!({"type":"text_delta", "content":partial_text});
+                    let body = format!(
+                        "data: {{\"type\":\"session_info\",\"session_id\":\"sess-tc\",\"run_id\":\"run-sess-tc\"}}\n\n\
+                         data: {text_event}\n\n\
+                         data: {{\"type\":\"usage\",\"input_tokens\":10,\"output_tokens\":5}}\n\n\
+                         {native_event}\
+                         data: {{\"type\":\"turn_complete\",\"has_tool_calls\":{native_tool_call}}}\n\n\
                          data: [DONE]\n\n"
-                            .to_string();
+                    );
                     (
                         TEST_SSE_HEADERS,
                         with_root_communication(body, "sess-tc"),
@@ -948,104 +995,111 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
                 }
             }),
         );
-    let base = spawn_mock(app).await;
-    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-    let mut pm = PermissionManager::new(true); // auto-approve
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let result = stream_chat_sse(ChatTurnParams {
-        api: &api,
-        token: "fake-token",
-        auth_profile: None,
-        message: "run echo hi",
-        user_intent: "run echo hi",
-        input_runtime_required_texts: &[],
-        input_active_system_skills: &[],
-        input_runtime_volatile_texts: &[],
-        input_work_unit_observations: &[],
-        semantic_query_override: None,
-        session_id: None,
-        offering_id: None,
-        model: Some("test-model"),
-        provider: None,
-        explain: ExplainMode::Off,
-        runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::default()),
-        render_md: false,
-        history: &[],
-        perm_manager: &mut pm,
-        verbose_mode: false,
-        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
-        cli_context: None,
-        recent_tools: &[],
-        deferred_tool_activations: None,
-        resume_restricted_tools: &[],
-        tool_health_entries: &[],
-        workspace_observation_quarantine: None,
-        session_lessons: &[],
-        memory_selection_reports: &[],
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let mut pm = PermissionManager::new(true); // auto-approve
+        let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+        let result = stream_chat_sse(ChatTurnParams {
+            api: &api,
+            token: "fake-token",
+            auth_profile: None,
+            message: "run echo hi",
+            user_intent: "run echo hi",
+            input_runtime_required_texts: &[],
+            input_runtime_volatile_texts: &[],
+            input_work_unit_observations: &[],
+            semantic_query_override: None,
+            session_id: None,
+            offering_id: None,
+            model: Some("test-model"),
+            provider: None,
+            explain: ExplainMode::Off,
+            runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::default()),
+            render_md: false,
+            history: &[],
+            perm_manager: &mut pm,
+            verbose_mode: false,
+            render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
+            cli_context: None,
+            recent_tools: &[],
+            deferred_tool_activations: None,
+            resume_restricted_tools: &[],
+            tool_health_entries: &[],
+            workspace_observation_quarantine: None,
+            session_lessons: &[],
+            memory_selection_reports: &[],
 
-        latest_turn_quality_feedback: None,
-        unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
-        is_plan_subtask: false,
-        plan_subtask_id: None,
-        cancel_token: None,
-        execution_time_budget: None,
-        run_control: None,
-        incremental_state: None,
-        request_session_execution_lease: None,
-        plan_assemble_line_release: None,
-        stream_event_tx: None,
-        explain_analyze_terminal_degraded: None,
-        stream_json_emitter: None,
-        agent_live_event_sink: None,
-        approval_request_tx: None,
-        ask_user_request_tx: None,
-        plan_review_request_tx: None,
-        mcp_manager: None,
-        skill_quality_tracker: &mut skill_qt,
-        discovered_skills: None,
-        agent_spawner: None,
-        root_agent_id: None,
-        observability_hub: None,
-        observability_session: None,
-        file_journal: None,
-        file_state: None,
-        database_snapshot_journal: None,
+            latest_turn_quality_feedback: None,
+            unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            cancel_token: None,
+            execution_time_budget: None,
+            run_control: None,
+            incremental_state: None,
+            request_session_execution_lease: None,
+            plan_assemble_line_release: None,
+            stream_event_tx: None,
+            explain_analyze_terminal_degraded: None,
+            stream_json_emitter: None,
+            agent_live_event_sink: None,
+            approval_request_tx: None,
+            ask_user_request_tx: None,
+            plan_review_request_tx: None,
+            mcp_manager: None,
+            skill_quality_tracker: &mut skill_qt,
+            discovered_skills: None,
+            agent_spawner: None,
+            root_agent_id: None,
+            observability_hub: None,
+            observability_session: None,
+            file_journal: None,
+            file_state: None,
+            database_snapshot_journal: None,
 
-        git_worktree_journal: None,
-        session_state_journal: None,
-        bg_task_commands: None,
-        bg_task_list_cache: None,
-        bash_detach_slot: None,
-        turn_index: DEFAULT_TURN_INDEX,
-        pipeline_state: None,
-        compaction_state: None,
-        consecutive_context_window_errors: 0,
-        idempotency_cache: None,
-        pre_loaded_messages: None,
-        append_system_prompt: None,
-        #[cfg(feature = "harness")]
-        harness_sink: None,
-        #[cfg(feature = "harness")]
-        harness_trace: None,
-        #[cfg(feature = "harness")]
-        benchmark_profile: None,
-    })
-    .await
-    .expect_err("Server-owned streams cannot delegate continuation to the CLI");
-    assert!(result.error.contains("terminal execution evidence"));
-    assert_eq!(result.partial.partial_text, "Observed partial response");
-    assert_eq!(result.partial.prompt_tokens, 10);
-    assert_eq!(result.partial.completion_tokens, 5);
-    assert_eq!(result.partial.tool_calls_count, 0);
-    let evidence = result
-        .partial
-        .run_transcript_messages
-        .iter()
-        .filter_map(|message| message.get("evidence"))
-        .collect::<Vec<_>>();
-    assert_eq!(evidence.len(), 1);
-    assert_eq!(evidence[0]["event"]["observed_by"]["run_id"], "run-sess-tc");
-    assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+            git_worktree_journal: None,
+            session_state_journal: None,
+            bg_task_commands: None,
+            bg_task_list_cache: None,
+            bash_detach_slot: None,
+            turn_index: DEFAULT_TURN_INDEX,
+            pipeline_state: None,
+            compaction_state: None,
+            consecutive_context_window_errors: 0,
+            idempotency_cache: None,
+            pre_loaded_messages: None,
+            append_system_prompt: None,
+            #[cfg(feature = "harness")]
+            harness_sink: None,
+            #[cfg(feature = "harness")]
+            harness_trace: None,
+            #[cfg(feature = "harness")]
+            benchmark_profile: None,
+        })
+        .await
+        .expect_err("Server-owned streams cannot delegate continuation to the CLI");
+        assert!(result.error.contains("terminal execution evidence"));
+        assert_eq!(
+            result.partial.partial_text,
+            if native_tool_call {
+                "Observed partial response"
+            } else {
+                partial_text
+            }
+        );
+        assert_eq!(result.partial.prompt_tokens, 10);
+        assert_eq!(result.partial.completion_tokens, 5);
+        assert_eq!(result.partial.tool_calls_count, 0);
+        let evidence = result
+            .partial
+            .run_transcript_messages
+            .iter()
+            .filter_map(|message| message.get("evidence"))
+            .collect::<Vec<_>>();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0]["event"]["observed_by"]["run_id"], "run-sess-tc");
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1127,7 +1181,6 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         message: "write inside a transaction",
         user_intent: "write inside a transaction",
         input_runtime_required_texts: &[],
-        input_active_system_skills: &[],
         input_runtime_volatile_texts: &[],
         input_work_unit_observations: &[],
         semantic_query_override: None,
@@ -1299,7 +1352,6 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         message: "review local changes",
         user_intent: "review local changes",
         input_runtime_required_texts: &[],
-        input_active_system_skills: &[],
         input_runtime_volatile_texts: &[],
         input_work_unit_observations: &[],
         semantic_query_override: None,
@@ -1469,7 +1521,6 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         message: "continue after interrupted turn",
         user_intent: "continue after interrupted turn",
         input_runtime_required_texts: &[],
-        input_active_system_skills: &[],
         input_runtime_volatile_texts: &[],
         input_work_unit_observations: &[],
         semantic_query_override: None,

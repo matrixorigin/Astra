@@ -280,7 +280,7 @@ Paired evidence requires the same decision-time input, environment/tool/budget
 snapshot and candidate profiles. Mutable sandbox IDs must differ. Both models
 must have passed capability/access checks. The importer validates these
 attestations and identities; it does not implement live historical replay or
-prove isolation from a string. The existing replay API is still unavailable.
+prove isolation from a string. There is no historical-session re-execution API.
 Use the existing model-matrix harness in independently provisioned isolated
 fixtures to collect evidence; never replay production side effects or treat a
 recorded transcript as the unchosen model's rollout.

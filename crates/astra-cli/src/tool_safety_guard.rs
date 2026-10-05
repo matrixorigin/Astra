@@ -21,9 +21,6 @@ impl ToolSafetyGuard {
         name: &str,
         args: &Value,
     ) -> crate::cli::permission_manager::GateOutcome {
-        if let Err(error) = Self::check_dispatch(name, args) {
-            return crate::cli::permission_manager::GateOutcome::Deny(error);
-        }
         match perm_manager {
             Some(pm) => pm.check_nonblocking(name, args),
             None => crate::cli::permission_manager::GateOutcome::Allow,
@@ -38,9 +35,6 @@ impl ToolSafetyGuard {
         name: &str,
         args: &Value,
     ) -> crate::cli::permission_manager::GateOutcome {
-        if let Err(error) = Self::check_dispatch(name, args) {
-            return crate::cli::permission_manager::GateOutcome::Deny(error);
-        }
         match perm_manager {
             Some(pm) => pm.check_nonblocking_read_only(name, args),
             None => {
@@ -66,15 +60,6 @@ impl ToolSafetyGuard {
                 }
             }
         }
-    }
-
-    /// Safety checks are now handled by [`evaluate_permission`] (Step 2) which
-    /// respects [`PermissionMode::Auto`]. This function is a pass-through to
-    /// avoid double-evaluating the safety middleware.
-    pub(crate) fn check_dispatch(_name: &str, _args: &Value) -> Result<(), String> {
-        // Safety checks delegate to evaluate_permission (engine.rs Step 2),
-        // which is mode-aware (auto mode relaxes shell obfuscation rules).
-        Ok(())
     }
 
     pub(crate) fn check_chain(chain: &ToolChain) -> Result<(), String> {

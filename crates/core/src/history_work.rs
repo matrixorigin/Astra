@@ -89,7 +89,6 @@ pub enum HistoryWorkSite {
     ProviderBodySerialization,
     LlmCaptureArtifactClone,
     LlmCaptureArtifactSerialization,
-    EphemeralPipelineInputMaterialization,
     ServerCslPersistClone,
     ServerObserverQueue,
     ServerCompactionFixedContextClone,
@@ -114,7 +113,6 @@ pub enum HistoryWorkSite {
     ToolSchemaCacheStabilizationClone,
     ToolSchemaWireSortSerialization,
     SessionRestoreHydration,
-    SessionRestoreTranscriptHydration,
     ResumeHintHistoryClone,
     TailPersistHistoryClone,
     CompactionHistoryClone,
@@ -143,7 +141,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 123;
+    const COUNT: usize = 121;
 
     /// Current instrumented sites; retired producers do not retain zero-only entries.
     pub const ALL: [Self; Self::COUNT] = [
@@ -219,7 +217,6 @@ impl HistoryWorkSite {
         Self::ProviderBodySerialization,
         Self::LlmCaptureArtifactClone,
         Self::LlmCaptureArtifactSerialization,
-        Self::EphemeralPipelineInputMaterialization,
         Self::ServerCslPersistClone,
         Self::ServerObserverQueue,
         Self::ServerCompactionFixedContextClone,
@@ -244,7 +241,6 @@ impl HistoryWorkSite {
         Self::ToolSchemaCacheStabilizationClone,
         Self::ToolSchemaWireSortSerialization,
         Self::SessionRestoreHydration,
-        Self::SessionRestoreTranscriptHydration,
         Self::ResumeHintHistoryClone,
         Self::TailPersistHistoryClone,
         Self::CompactionHistoryClone,
@@ -354,9 +350,6 @@ impl HistoryWorkSite {
             Self::ProviderBodySerialization => "provider_body_serialization",
             Self::LlmCaptureArtifactClone => "llm_capture_artifact_clone",
             Self::LlmCaptureArtifactSerialization => "llm_capture_artifact_serialization",
-            Self::EphemeralPipelineInputMaterialization => {
-                "ephemeral_pipeline_input_materialization"
-            }
             Self::ServerCslPersistClone => "server_csl_persist_clone",
             Self::ServerObserverQueue => "server_observer_queue",
             Self::ServerCompactionFixedContextClone => "server_compaction_fixed_context_clone",
@@ -381,7 +374,6 @@ impl HistoryWorkSite {
             Self::ToolSchemaCacheStabilizationClone => "tool_schema_cache_stabilization_clone",
             Self::ToolSchemaWireSortSerialization => "tool_schema_wire_sort_serialization",
             Self::SessionRestoreHydration => "session_restore_hydration",
-            Self::SessionRestoreTranscriptHydration => "session_restore_transcript_hydration",
             Self::ResumeHintHistoryClone => "resume_hint_history_clone",
             Self::TailPersistHistoryClone => "tail_persist_history_clone",
             Self::CompactionHistoryClone => "compaction_history_clone",
@@ -494,7 +486,6 @@ impl HistoryWorkSite {
             Self::LlmCaptureArtifactClone | Self::LlmCaptureArtifactSerialization => {
                 "runtime.turn.llm_capture"
             }
-            Self::EphemeralPipelineInputMaterialization => "runtime.turn.prompt_cache",
             Self::ServerCslPersistClone => "runtime.server.csl",
             Self::ServerObserverQueue => "runtime.server.observer",
             Self::ServerCompactionFixedContextClone => "runtime.server.compaction",
@@ -521,9 +512,7 @@ impl HistoryWorkSite {
             Self::ServerContextTraceClone => "runtime.server.llm_trace",
             Self::ToolSchemaCacheStabilizationClone => "runtime.turn.llm_context",
             Self::ToolSchemaWireSortSerialization => "runtime.turn.llm_context",
-            Self::SessionRestoreHydration | Self::SessionRestoreTranscriptHydration => {
-                "services.session_restore"
-            }
+            Self::SessionRestoreHydration => "services.session_restore",
             Self::ResumeHintHistoryClone => "turn_core.resume_hydration",
             Self::TailPersistHistoryClone => "turn_core.tail_persist",
             Self::CompactionHistoryClone => "turn_core.compaction",
@@ -569,7 +558,6 @@ impl HistoryWorkSite {
             | Self::ObservabilityRollbackSnapshotClone
             | Self::ObservabilityRollbackRestoreClone => 1,
             Self::SessionRestoreHydration
-            | Self::SessionRestoreTranscriptHydration
             | Self::ResumeHintHistoryClone
             | Self::CliDisplayHistoryProjectionClone
             | Self::CliRecoveryCslLogRead
@@ -599,7 +587,6 @@ impl HistoryWorkSite {
             | Self::CliPromptContinuationSanitization
             | Self::CliPromptNormalizationClone
             | Self::CliPromptPayloadClone
-            | Self::EphemeralPipelineInputMaterialization
             | Self::ServerCompactionFixedContextClone
             | Self::ServerToolPolicySchemaClone
             | Self::MemoryExtractionPromptSanitization

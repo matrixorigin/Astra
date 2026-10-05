@@ -491,7 +491,7 @@ mod tests {
     };
     use clap::Parser;
     use cli::cli_config::cli_args::{
-        AuditCmd, AuditShowArgs, AuditToolsArgs, Command, ReplayArgs, SessionCmd, SessionShowArgs,
+        AuditCmd, AuditShowArgs, AuditToolsArgs, Command, SessionCmd, SessionShowArgs,
     };
     use cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
@@ -633,30 +633,6 @@ mod tests {
             None,
             "delete should clear matching stale pointer even when another profile holds it"
         );
-    }
-
-    #[tokio::test]
-    async fn execute_cli_replay_rejects_invalid_session_id_before_auth() {
-        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let error = execute_cli_command(
-            Some(Command::Replay(ReplayArgs {
-                session_id: "../escape".to_string(),
-                sandbox_name: None,
-                mock_mode: true,
-                compare: false,
-            })),
-            None,
-            None,
-            false,
-            None,
-            &api,
-            false,
-            &cli::cli_config::cli_context::CliContext::default(),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(error.contains("invalid session_id"), "got: {error}");
     }
 
     #[tokio::test]
@@ -1077,11 +1053,7 @@ mod tests {
     fn prepare_input_routes_project_instructions_out_of_user_message() {
         let mut state = SessionState::default();
         state.project_instructions = Some("Always use Rust.".to_string());
-        let result = crate::cli::session::session_input::prepare_input(
-            "hello",
-            &state,
-            &mut crate::cli::ui_adapter::LineUiAdapter,
-        );
+        let result = crate::cli::session::session_input::prepare_input("hello", &state);
         assert!(
             result.runtime_required_texts[0].contains("<project_instructions>"),
             "should wrap in tags"
@@ -1093,11 +1065,7 @@ mod tests {
     #[test]
     fn prepare_input_has_no_runtime_context_when_none() {
         let state = SessionState::default();
-        let result = crate::cli::session::session_input::prepare_input(
-            "hello",
-            &state,
-            &mut crate::cli::ui_adapter::LineUiAdapter,
-        );
+        let result = crate::cli::session::session_input::prepare_input("hello", &state);
         assert!(
             result.runtime_required_texts.is_empty(),
             "should not inject when None"

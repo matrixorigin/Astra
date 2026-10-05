@@ -111,18 +111,6 @@ fn build_bug_report(state: &SessionState) -> String {
     lines.push("(Use `/mcp status` for detailed MCP server info)".to_string());
     lines.push(String::new());
 
-    // ── Active skills ──
-    lines.push("## Active Skills".to_string());
-    lines.push(String::new());
-    if state.active_system_skills.is_empty() {
-        lines.push("- (none)".to_string());
-    } else {
-        for skill in &state.active_system_skills {
-            lines.push(format!("- {}", skill.name));
-        }
-    }
-    lines.push(String::new());
-
     // ── Last response (truncated) ──
     lines.push("## Last Response (truncated)".to_string());
     lines.push(String::new());

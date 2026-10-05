@@ -13141,7 +13141,6 @@ impl AgenticRunLifecycleService {
                     })
                 }),
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 tool_event_hooks: facts.tool_event_hooks,
                 session_event_hooks: facts.session_event_hooks,
                 ..Default::default()
@@ -13206,6 +13205,9 @@ impl AgenticRunLifecycleService {
         run_id: &str,
         request: &ChatRequestData,
         state: &AgenticLoopState,
+        host: &server_loop_host::ServerAgenticLoopHost,
+        runtime_capabilities: &PreparedRuntimeCapabilities,
+        work_runtime_binding: Option<&ValidatedWorkRuntimeBinding>,
     ) -> runtime_tool_executor::RuntimeToolExecutor {
         let mut executor = runtime_tool_executor::RuntimeToolExecutor::new(
             workspace,
@@ -13258,6 +13260,56 @@ impl AgenticRunLifecycleService {
                 builder = builder.edge_registry_service(Arc::clone(svc));
             }
             executor = executor.with_tool_execution_service(builder.build());
+        }
+        if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
+            if let Some(manager) = &bundle.manager {
+                executor.set_mcp_manager(manager.clone());
+            }
+            if let Some(agent_binding_mcp) = &bundle.agent_binding_mcp {
+                executor.set_agent_binding_mcp(agent_binding_mcp.clone());
+            }
+            executor.set_request_scoped_mcp_schemas(bundle.schemas.clone());
+            executor.set_provider_policy_index(bundle.provider_policy_index.clone());
+        }
+        // Wire the plan repository so enter/exit_plan_mode tools work and
+        // the write-tool guard can check `active_plan_id`.
+        if let Some(shared) = &self.shared_pool {
+            executor.set_context_manifest_pool(shared.clone());
+            if let Some(binding) = work_runtime_binding {
+                executor.set_work_binding(runtime_tool_executor::WorkRuntimeBinding::new(
+                    shared.clone(),
+                    binding.owner_id.clone(),
+                    binding.session_id.clone(),
+                    binding.work_id.clone(),
+                    binding.branch_id.clone(),
+                ));
+            }
+            executor = executor.with_session_artifact_store(
+                astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
+                    .with_pool(shared.clone()),
+            );
+            executor.set_plan_repository(std::sync::Arc::new(
+                astra_plan::CloudPlanRepository::new(shared.get().clone()),
+            ));
+        }
+        executor.set_invocation_ledger(
+            self.invocation_ledger
+                .clone()
+                .expect("invocation composition was validated before run start"),
+        );
+        configure_runtime_semantic_read_cache(
+            &mut executor,
+            runtime_capabilities.mcp_bundle.as_ref(),
+        );
+        // Share the host's plan-resume hint slot so tool-triggered
+        // plan-mode changes refresh the system prompt mid-run.
+        executor.set_plan_resume_hint_handle(host.plan_resume_hint_handle());
+        executor.set_plan_authoring_active_handle(host.plan_authoring_active_handle());
+        if let Some(observability_session) = state.telemetry.observability_session.clone() {
+            executor.set_observability_session(observability_session);
+        }
+        if let Some(writer) = self.auxiliary_event_writer.clone() {
+            executor.set_auxiliary_event_writer(writer);
         }
         executor
     }
@@ -16836,59 +16888,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &run_id,
                 &request,
                 &loop_state,
+                &host,
+                &runtime_capabilities,
+                work_runtime_binding.as_ref(),
             );
-
-            if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
-                if let Some(manager) = &bundle.manager {
-                    executor.set_mcp_manager(manager.clone());
-                }
-                if let Some(agent_binding_mcp) = &bundle.agent_binding_mcp {
-                    executor.set_agent_binding_mcp(agent_binding_mcp.clone());
-                }
-                executor.set_request_scoped_mcp_schemas(bundle.schemas.clone());
-                executor.set_provider_policy_index(bundle.provider_policy_index.clone());
-            }
-            // Wire the plan repository so enter/exit_plan_mode tools work and
-            // the write-tool guard can check `active_plan_id`.
-            if let Some(shared) = &self.shared_pool {
-                executor.set_context_manifest_pool(shared.clone());
-                if let Some(binding) = work_runtime_binding.as_ref() {
-                    executor.set_work_binding(runtime_tool_executor::WorkRuntimeBinding::new(
-                        shared.clone(),
-                        binding.owner_id.clone(),
-                        binding.session_id.clone(),
-                        binding.work_id.clone(),
-                        binding.branch_id.clone(),
-                    ));
-                }
-                executor = executor.with_session_artifact_store(
-                    astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
-                        .with_pool(shared.clone()),
-                );
-                executor.set_plan_repository(std::sync::Arc::new(
-                    astra_plan::CloudPlanRepository::new(shared.get().clone()),
-                ));
-            }
-            executor.set_invocation_ledger(
-                self.invocation_ledger
-                    .clone()
-                    .expect("invocation composition was validated before run start"),
-            );
-            configure_runtime_semantic_read_cache(
-                &mut executor,
-                runtime_capabilities.mcp_bundle.as_ref(),
-            );
-            // Share the host's plan-resume hint slot so tool-triggered
-            // plan-mode changes refresh the system prompt mid-run.
-            executor.set_plan_resume_hint_handle(host.plan_resume_hint_handle());
-            executor.set_plan_authoring_active_handle(host.plan_authoring_active_handle());
-            if let Some(observability_session) = loop_state.telemetry.observability_session.clone()
-            {
-                executor.set_observability_session(observability_session);
-            }
-            if let Some(writer) = self.auxiliary_event_writer.clone() {
-                executor.set_auxiliary_event_writer(writer);
-            }
             let binding_snapshot = execution_bindings.clone().unwrap_or_else(|| {
                 let (workspace_binding, executor_binding) =
                     resolve_request_execution_bindings(&request, workspace.as_path());
@@ -18314,53 +18317,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &run_id,
                 &request,
                 &state,
+                &host,
+                &runtime_capabilities,
+                work_runtime_binding.as_ref(),
             );
-
-            // ── MCP: inject request-scoped provider state into executor ────
-            if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
-                if let Some(manager) = &bundle.manager {
-                    executor.set_mcp_manager(manager.clone());
-                }
-                if let Some(agent_binding_mcp) = &bundle.agent_binding_mcp {
-                    executor.set_agent_binding_mcp(agent_binding_mcp.clone());
-                }
-                executor.set_request_scoped_mcp_schemas(bundle.schemas.clone());
-                executor.set_provider_policy_index(bundle.provider_policy_index.clone());
-            }
-            if let Some(shared) = &self.shared_pool {
-                executor.set_context_manifest_pool(shared.clone());
-                if let Some(binding) = work_runtime_binding.as_ref() {
-                    executor.set_work_binding(runtime_tool_executor::WorkRuntimeBinding::new(
-                        shared.clone(),
-                        binding.owner_id.clone(),
-                        binding.session_id.clone(),
-                        binding.work_id.clone(),
-                        binding.branch_id.clone(),
-                    ));
-                }
-                executor = executor.with_session_artifact_store(
-                    astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
-                        .with_pool(shared.clone()),
-                );
-                executor.set_plan_repository(std::sync::Arc::new(
-                    astra_plan::CloudPlanRepository::new(shared.get().clone()),
-                ));
-            }
-            executor.set_invocation_ledger(
-                self.invocation_ledger
-                    .clone()
-                    .expect("invocation composition was validated before stream start"),
-            );
-            configure_runtime_semantic_read_cache(
-                &mut executor,
-                runtime_capabilities.mcp_bundle.as_ref(),
-            );
-            if let Some(observability_session) = state.telemetry.observability_session.clone() {
-                executor.set_observability_session(observability_session);
-            }
-            if let Some(writer) = self.auxiliary_event_writer.clone() {
-                executor.set_auxiliary_event_writer(writer);
-            }
             let binding_snapshot = execution_bindings.clone().unwrap_or_else(|| {
                 let (workspace_binding, executor_binding) =
                     resolve_request_execution_bindings(&request, workspace.as_path());
@@ -24789,7 +24749,6 @@ impl ServerSubRunExecutor {
                 resolver: skill_resolver,
                 request_constraints: config.request_constraints.clone(),
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 tool_event_hooks,
                 session_event_hooks,
                 ..Default::default()

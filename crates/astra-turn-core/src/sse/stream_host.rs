@@ -1269,29 +1269,9 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             .await;
     }
 
-    // Degraded tool-call fallback: if the model emitted <invoke> or <tool_call>
-    // XML in text instead of native tool_call events, recover them here.
-    //
-    // NOTE: keep in sync with bridge_llm_stream.rs (server-side equivalent).
-    //
-    // This only fires when tool_calls is empty (pure XML output). When the
-    // model emits *both* native tool_call events and degraded XML text, the
-    // native calls are already in accum.tool_calls and the XML stays in
-    // full_text. The CLI strips that residual XML in consume_turn_sse
-    // (stream_render.rs) when has_tool_calls is true.
-    // A Server-owned terminal has already executed and settled its tool
-    // ledger. Its final text is display data, never a new client-side action
-    // carrier. Re-parsing that text would violate the single continuation
-    // owner invariant and can replay examples or quoted XML as real work.
-    if !accum.server_loop_terminal && accum.tool_calls.is_empty() {
-        if let Some(parsed) =
-            crate::xml_tool_call_fallback::parse_degraded_tool_calls(&accum.full_text)
-        {
-            accum.full_text =
-                crate::xml_tool_call_fallback::strip_degraded_tool_calls(&accum.full_text);
-            accum.tool_calls = parsed;
-        }
-    }
+    // Provider text is display data. Only typed Server tool requests can
+    // authorize local execution; provider-level degraded calls are resolved
+    // by the Server before this transport boundary.
 
     host.on_stream_complete();
 
@@ -4654,12 +4634,11 @@ mod tests {
         assert_eq!(result.tool_results[0].request_id, "shared-1");
     }
 
-    // ── XML invoke fallback ───────────────────────────────────────────────────
+    // ── Text is not execution authority ───────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn xml_invoke_in_text_is_recovered_as_tool_calls() {
-        // Model degrades to <invoke> XML instead of native tool_call events.
-        // consume_sse_stream must parse these and move them into accum.tool_calls.
+    async fn tool_syntax_in_text_never_creates_client_tool_calls() {
+        // Even executable-looking syntax is not a typed Server tool request.
         let xml_text = concat!(
             "I'll create the file now.\n",
             "<invoke name=\"write_file\">\n",
@@ -4685,19 +4664,10 @@ mod tests {
         )
         .await;
         assert!(abort.is_none());
-        assert_eq!(
-            result.accum.tool_calls.len(),
-            1,
-            "expected 1 recovered tool call, got: {:?}",
-            result.accum.tool_calls
-        );
-        assert_eq!(result.accum.tool_calls[0]["function"]["name"], "write_file");
-        assert!(
-            !result.accum.full_text.contains("<invoke"),
-            "XML should be stripped from full_text, got: {}",
-            result.accum.full_text
-        );
-        assert!(result.accum.full_text.contains("create the file"));
+        assert!(result.accum.tool_calls.is_empty());
+        assert!(!result.accum.has_tool_calls);
+        assert!(result.tool_results.is_empty());
+        assert_eq!(result.accum.full_text, xml_text);
     }
 
     #[tokio::test]

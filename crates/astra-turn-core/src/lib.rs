@@ -35,7 +35,6 @@ pub mod chat_turn_step_plan;
 pub mod cloud;
 pub mod compaction_types;
 pub mod compression_types;
-pub mod confidence_contract;
 pub mod context;
 pub mod conversation_log;
 pub mod edge_ledger;

@@ -2915,9 +2915,7 @@ impl SummaryClientWorkAdmissionJudge {
             });
         }
         let messages = astra_services::work_admission_plan_messages(ctx, &classification);
-        let mut decision = planner
-            .judge_messages(ctx, messages, Some(&classification))
-            .await?;
+        let mut decision = planner.judge_messages(ctx, messages).await?;
         classification.validate_plan(&decision)?;
         if let astra_services::WorkAdmissionDecision::Required { assessment, .. } = &mut decision {
             *assessment = classification.assessment.or(*assessment);
@@ -2995,20 +2993,10 @@ impl SummaryClientWorkAdmissionJudge {
         result.map_err(astra_services::TurnIntentJudgeError::Inference)
     }
 
-    #[cfg(test)]
-    async fn judge(
-        &self,
-        ctx: &astra_services::TurnIntentJudgeContext,
-    ) -> Result<astra_services::WorkAdmissionDecision, astra_services::TurnIntentJudgeError> {
-        let messages = astra_services::work_admission_judge_messages(ctx);
-        self.judge_messages(ctx, messages, None).await
-    }
-
     async fn judge_messages(
         &self,
         ctx: &astra_services::TurnIntentJudgeContext,
         messages: Vec<Value>,
-        classification: Option<&astra_services::WorkAdmissionClassification>,
     ) -> Result<astra_services::WorkAdmissionDecision, astra_services::TurnIntentJudgeError> {
         let response = self.summarize("work_plan", "initial", &messages).await?;
         tracing::debug!(
@@ -3034,38 +3022,8 @@ impl SummaryClientWorkAdmissionJudge {
             _ => false,
         };
         if repair_allowed {
-            // A malformed auxiliary response gets the existing bounded repair.
-            // A valid Required+Parallel response gets one semantic repair too:
-            // models commonly mistake intermediate fanout perspectives for
-            // independently accepted Work outcomes. This repair is deliberately
-            // limited to the model-authored response.
-            let semantic_conflict = matches!(
-                &decision,
-                Err(astra_services::TurnIntentJudgeError::UnsupportedCombination(_))
-            );
-            let repair_instruction = if semantic_conflict {
-                "The previous object chose an unsupported combination: durable Work plus parallel sub-runs. Re-evaluate the user-facing acceptance boundary. Intermediate agents, reviewers, perspectives, findings, and fanout slots that feed one synthesized final answer are not independently accepted outcomes. Return work_lifecycle=not_required with execution_topology=parallel_subruns, required_capabilities=[agent_spawner] unless the user explicitly requested durable task lifecycle control. Only retain required+parallel when both facts are explicit. Return one complete JSON object matching the original schema, with no prose."
-            } else {
-                "The previous object was malformed, truncated, or inconsistent with the schema. Re-evaluate the acceptance boundary from the original user request; the previous lifecycle and graph are not authoritative until they form one valid contract. Return one compact, complete JSON object matching the original schema. Every not_required object must include execution_topology; return classification fields only, not output descriptions. If execution_topology is parallel_subruns, required_capabilities must include agent_spawner; otherwise do not invent that capability. Only an explicit required lifecycle decision creates the Work graph. A cohesive change, its checks, and its report remain one ordinary turn. Multiple outputs without an explicit durable lifecycle request remain ordinary; parallel children remain non-durable subrun outputs. Do not use string matching or infer lifecycle from tool counts. An explicit same-turn multi-agent request without tracked lifecycle is not durable Work. Required Work omits execution_topology because the runtime owns its primary topology. Preserve every requested lifecycle mutation after the initial graph. Mutation objects use kind=add|cancel|replace (not action or type): add requires task; cancel requires target_initial_task; replace requires both. `target_initial_task` is a 1-based integer ordinal into initial_tasks, never task text; choose an initial target only when the user delegates that choice. Never invent an externally bound target or omit a requested mutation. Mutation after_initial_tasks gates graph changes; nested task.after_initial_tasks gates execution. Preserve the requested payload and source in additions. Cancel+add remain two mutations and must not become replace. For read_only or may_mutate, mutation_completion_scope is unknown; for external or mixed must_mutate, typed domain is mandatory; null is valid only for other scopes. Do not declare counts or final state; runtime derives them. Aim for goal <=320 chars; task fields <=160 chars, without discarding required meaning. No prose."
-            };
-            let repair_instruction = if classification.is_some() {
-                "Repair only the graph and JSON shape. The classification in the system message is authoritative: preserve lifecycle=required, activation, domain, mutation intent, completion scope, and capabilities exactly. Never reclassify or downgrade. Return the complete Required graph schema with all requested tasks, dependencies, and mutations, no prose."
-            } else {
-                repair_instruction
-            };
-            let repair_instruction = if let Some(hints) = classification
-                .is_none()
-                .then(|| astra_services::work_admission_repair_hints(response.text.as_str()))
-                .flatten()
-            {
-                let hints = serde_json::to_string(&hints)
-                    .expect("typed Work admission repair hints must serialize");
-                format!(
-                    "{repair_instruction}\nValidated typed boundary from the malformed candidate (preserve these fields; repair only shape; never downgrade it without a typed contradiction): {hints}"
-                )
-            } else {
-                repair_instruction.to_string()
-            };
+            // Repair the graph under the already confirmed classification.
+            let repair_instruction = "Repair only the graph and JSON shape. The classification in the system message is authoritative: preserve lifecycle=required, activation, domain, mutation intent, completion scope, and capabilities exactly. Never reclassify or downgrade. Return the complete Required graph schema with all requested tasks, dependencies, and mutations, no prose.".to_string();
             let repair_instruction = match &decision {
                 Err(astra_services::TurnIntentJudgeError::Malformed { detail, .. }) => {
                     let diagnostic = json!({"validation_error": detail});
@@ -3082,8 +3040,8 @@ impl SummaryClientWorkAdmissionJudge {
             );
             // The malformed object is not replayed wholesale: it can be large
             // or syntactically incomplete. The repair receives only the
-            // parser diagnostic and structurally validated boundary hints so a shape error cannot
-            // erase a valid lifecycle/activation decision.
+            // parser diagnostic; the original request retains the locked
+            // classification so a shape error cannot erase its authority.
             let mut repair_messages = messages;
             repair_messages.push(json!({
                 "role": "user",
@@ -4002,13 +3960,9 @@ pub struct ServerAgenticLoopHost {
     /// Optional receiver for agent progress events (multi-agent tree updates).
     progress_rx: Option<tokio::sync::broadcast::Receiver<crate::orchestration::AgentProgressEvent>>,
     progress_filter: Option<RunScopedAgentProgressFilter>,
-    /// Latches the first lifecycle summary built for this host/user turn.
-    /// Keeps prompt and introspection lifecycle context byte-consistent across
-    /// multi-round tool loops.
+    /// Latches fixed lifecycle facts for this host/user turn. The live plan
+    /// hint is rendered separately from its shared handle each round.
     turn_start_lifecycle_summary: Option<String>,
-    /// Tracks which plan hint was baked into the latched lifecycle summary so
-    /// mid-turn plan enter/exit can refresh only the plan line.
-    turn_start_plan_resume_hint: Option<String>,
     /// Attempt identity that already received its one bounded-execution
     /// convergence boundary. This is process-local pacing only; durable Work
     /// facts remain the sole lifecycle authority.
@@ -5884,7 +5838,6 @@ impl ServerAgenticLoopHostBuilder {
             progress_rx,
             progress_filter,
             turn_start_lifecycle_summary: None,
-            turn_start_plan_resume_hint: None,
             work_attempt_start_contract_emitted: None,
             work_attempt_scheduler_replayed: None,
             execution_metadata: self.execution_bindings.as_ref().map(|snapshot| {
@@ -11353,23 +11306,12 @@ impl ServerAgenticLoopHost {
         admission
     }
 
-    fn update_latched_plan_resume_line(summary: &str, plan_hint: Option<&str>) -> String {
-        let plan_line = plan_hint
+    fn lifecycle_summary_with_plan_hint(summary: &str, plan_hint: Option<&str>) -> String {
+        let hint = plan_hint
             .map(str::trim)
             .filter(|hint| !hint.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| "none".to_string());
-        summary
-            .lines()
-            .map(|line| {
-                if line.starts_with("- Resume context: ") {
-                    format!("- Resume context: {plan_line}")
-                } else {
-                    line.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .unwrap_or("none");
+        format!("{summary}\n- Resume context: {hint}")
     }
 
     /// Handle to the shared plan-resume hint slot. Mid-run callers
@@ -12191,11 +12133,7 @@ impl ServerAgenticLoopHost {
         }
     }
 
-    fn render_turn_start_lifecycle_summary(
-        &self,
-        state: &AgenticLoopState,
-        plan_hint: Option<&str>,
-    ) -> String {
+    fn render_turn_start_lifecycle_summary(&self, state: &AgenticLoopState) -> String {
         let session_id = state
             .current_session_id
             .as_deref()
@@ -12241,12 +12179,6 @@ impl ServerAgenticLoopHost {
             .map(|record| format!("{:?}", record.kind))
             .unwrap_or_else(|| "none".to_string());
 
-        let plan_line = plan_hint
-            .map(str::trim)
-            .filter(|hint| !hint.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| "none".to_string());
-
         let mut lines = vec![
             "# Turn-start session execution state".to_string(),
             format!(
@@ -12261,7 +12193,6 @@ impl ServerAgenticLoopHost {
                 executor_binding_summary(&self.executor_binding)
             ),
             format!("- Session: {session_id} · run: {run_id} · model: {model}"),
-            format!("- Resume context: {plan_line}"),
             format!(
                 "- Delegation: engine={} · this_turn={} · progress_stream={}",
                 if state.delegation_engine.is_some() {
@@ -17503,19 +17434,12 @@ impl ServerAgenticLoopHost {
     ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
         let plan_hint = self.read_plan_resume_hint();
         let lifecycle_summary = if let Some(existing) = &self.turn_start_lifecycle_summary {
-            if self.turn_start_plan_resume_hint.as_deref() != plan_hint.as_deref() {
-                let updated = Self::update_latched_plan_resume_line(existing, plan_hint.as_deref());
-                self.turn_start_lifecycle_summary = Some(updated.clone());
-                self.turn_start_plan_resume_hint = plan_hint.clone();
-                updated
-            } else {
-                existing.clone()
-            }
+            Self::lifecycle_summary_with_plan_hint(existing, plan_hint.as_deref())
         } else {
-            let summary = self.render_turn_start_lifecycle_summary(state, plan_hint.as_deref());
-            self.turn_start_lifecycle_summary = Some(summary.clone());
-            self.turn_start_plan_resume_hint = plan_hint.clone();
-            summary
+            let summary = self.render_turn_start_lifecycle_summary(state);
+            let rendered = Self::lifecycle_summary_with_plan_hint(&summary, plan_hint.as_deref());
+            self.turn_start_lifecycle_summary = Some(summary);
+            rendered
         };
         let lifecycle_sections = vec![crate::prompts::PromptSection::dynamic(
             lifecycle_summary,
@@ -19817,15 +19741,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         self.pending_terminal_control_outcome.take()
     }
     fn turn_start_lifecycle_summary(&self, state: &AgenticLoopState) -> String {
-        if let Some(summary) = &self.turn_start_lifecycle_summary {
-            let plan_hint = self.read_plan_resume_hint();
-            if self.turn_start_plan_resume_hint.as_deref() != plan_hint.as_deref() {
-                return Self::update_latched_plan_resume_line(summary, plan_hint.as_deref());
-            }
-            return summary.clone();
-        }
         let plan_hint = self.read_plan_resume_hint();
-        self.render_turn_start_lifecycle_summary(state, plan_hint.as_deref())
+        if let Some(summary) = &self.turn_start_lifecycle_summary {
+            return Self::lifecycle_summary_with_plan_hint(summary, plan_hint.as_deref());
+        }
+        Self::lifecycle_summary_with_plan_hint(
+            &self.render_turn_start_lifecycle_summary(state),
+            plan_hint.as_deref(),
+        )
     }
 
     fn tool_admission_snapshot(
@@ -23800,6 +23723,7 @@ fn canonical_edge_dispatch_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::provider_test_support::{ProviderGateway, ProviderResponse, ProviderScript};
 
     fn test_host_builder(
         user_id: impl Into<String>,
@@ -25919,6 +25843,12 @@ mod tests {
             let text = "x".repeat(length);
             let response = json!({"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Assess health","initial_tasks":[{"objective":text,"expected_result":"Evidence-based report"}],"mutations":[]});
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let classifier =
+                SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                    provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                    responses: std::sync::Mutex::new([classification_response(true)].into()),
+                    requests: Default::default(),
+                }));
             let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
                 provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: std::sync::Mutex::new(std::collections::VecDeque::from([
@@ -25926,9 +25856,10 @@ mod tests {
                 ])),
                 requests: requests.clone(),
             }));
-            let decision = judge
-                .judge(&astra_services::TurnIntentJudgeContext::default())
+            let decision = classifier
+                .classify_and_plan(&judge, &astra_services::TurnIntentJudgeContext::default())
                 .await
+                .map(|admission| admission.decision)
                 .unwrap();
             let astra_services::WorkAdmissionDecision::Required { tasks, .. } = decision else {
                 panic!("required Work")
@@ -26202,9 +26133,17 @@ mod tests {
         for required in [false, true] {
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let plan_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut classification: Value =
+                serde_json::from_str(&classification_response(required)).unwrap();
+            if !required {
+                classification["answers"]["mutation.read_only"]["noul"] = json!(0.0);
+                classification["answers"]["mutation.must_mutate"]["noul"] = json!(1.0);
+                classification["answers"]["scope.unknown"]["noul"] = json!(0.0);
+                classification["answers"]["scope.workspace"]["noul"] = json!(1.0);
+            }
             let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
                 provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new([classification_response(required)].into()),
+                responses: std::sync::Mutex::new([classification.to_string()].into()),
                 requests: requests.clone(),
             }));
             let plan = json!({"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Assess health","initial_tasks":[{"objective":"Inspect","expected_result":"Report"}],"mutations":[]});
@@ -26224,6 +26163,16 @@ mod tests {
                 ),
                 required
             );
+            if !required {
+                assert_eq!(
+                    result.decision.turn_intent().workspace_mutation,
+                    astra_config::user_profile::WorkspaceMutationIntent::MustMutate
+                );
+                assert_eq!(
+                    result.decision.turn_intent().mutation_completion_scope,
+                    astra_config::user_profile::MutationCompletionScope::Workspace
+                );
+            }
             assert_eq!(requests.lock().unwrap().len(), 1);
             assert_eq!(plan_requests.lock().unwrap().len(), usize::from(required));
         }
@@ -26581,7 +26530,23 @@ mod tests {
 
     #[tokio::test]
     async fn work_judgment_malformed_never_becomes_not_required_or_calls_planner() {
+        let mut missing_topology: Value =
+            serde_json::from_str(&classification_response(false)).unwrap();
+        missing_topology["answers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("parallel_subruns");
+        let mut conflicting: Value = serde_json::from_str(&classification_response(true)).unwrap();
+        conflicting["answers"]["parallel_subruns"]["noul"] = json!(1.0);
         for (provenance, response) in [
+            (
+                astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                missing_topology.to_string(),
+            ),
+            (
+                astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                conflicting.to_string(),
+            ),
             (
                 astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 "{}".to_string(),
@@ -26616,13 +26581,19 @@ mod tests {
 
     #[tokio::test]
     async fn work_judgment_repair_rejects_truncated_or_failed_responses() {
-        let valid = r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","mutation_completion_scope":"unknown","execution_topology":"primary","required_capabilities":[]}"#;
+        let valid = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Assess health","initial_tasks":[{"objective":"Observe","expected_result":"Report"}],"mutations":[]}"#;
         for (is_ptl_error, finish_reason) in
             [(false, Some("length")), (true, Some("stop")), (false, None)]
         {
             let mut repaired = summary_response_with_usage(valid, 5, 0, 2);
             repaired.is_ptl_error = is_ptl_error;
             repaired.finish_reason = finish_reason.map(str::to_string);
+            let classifier =
+                SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                    provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                    responses: std::sync::Mutex::new([classification_response(true)].into()),
+                    requests: Default::default(),
+                }));
             let judge =
                 SummaryClientWorkAdmissionJudge::new(Box::new(UsageSequencedSummaryClient {
                     responses: std::sync::Mutex::new(std::collections::VecDeque::from([
@@ -26631,11 +26602,13 @@ mod tests {
                     ])),
                 }));
             assert!(matches!(
-                judge
-                    .judge(&astra_services::TurnIntentJudgeContext::default())
-                    .await,
+                classifier
+                    .classify_and_plan(&judge, &astra_services::TurnIntentJudgeContext::default())
+                    .await
+                    .map(|admission| admission.decision),
                 Err(astra_services::TurnIntentJudgeError::Rejected(_))
             ));
+            assert_eq!(judge.usage.lock().unwrap().attempts, 2);
         }
     }
 
@@ -27009,6 +26982,12 @@ mod tests {
         malformed["initial_tasks"][0]["objective"] = json!(private_candidate);
         for repair_succeeds in [true, false] {
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let classifier =
+                SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                    provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                    responses: std::sync::Mutex::new([classification_response(true)].into()),
+                    requests: Default::default(),
+                }));
             let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
                 provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: std::sync::Mutex::new(std::collections::VecDeque::from([
@@ -27021,9 +27000,10 @@ mod tests {
                 ])),
                 requests: requests.clone(),
             }));
-            let result = judge
-                .judge(&astra_services::TurnIntentJudgeContext::default())
-                .await;
+            let result = classifier
+                .classify_and_plan(&judge, &astra_services::TurnIntentJudgeContext::default())
+                .await
+                .map(|admission| admission.decision);
             assert_eq!(result.is_ok(), repair_succeeds);
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), 2, "repair remains bounded");
@@ -27035,7 +27015,12 @@ mod tests {
 
     #[tokio::test]
     async fn work_admission_accounts_for_initial_and_repair_provider_usage() {
-        let valid = r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","mutation_completion_scope":"unknown","execution_topology":"primary","required_capabilities":[]}"#;
+        let valid = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Assess health","initial_tasks":[{"objective":"Observe","expected_result":"Report"}],"mutations":[]}"#;
+        let classifier = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+            responses: std::sync::Mutex::new([classification_response(true)].into()),
+            requests: Default::default(),
+        }));
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(UsageSequencedSummaryClient {
             responses: std::sync::Mutex::new(std::collections::VecDeque::from([
                 Ok(summary_response_with_usage("{", 7, 11, 2)),
@@ -27044,13 +27029,17 @@ mod tests {
         }));
         let usage = judge.usage.clone();
 
-        judge
-            .judge(&astra_services::TurnIntentJudgeContext {
-                message: "answer once".to_string(),
-                turn_count: 1,
-                ..Default::default()
-            })
+        classifier
+            .classify_and_plan(
+                &judge,
+                &astra_services::TurnIntentJudgeContext {
+                    message: "answer once".to_string(),
+                    turn_count: 1,
+                    ..Default::default()
+                },
+            )
             .await
+            .map(|admission| admission.decision)
             .expect("repair");
 
         let usage = *usage.lock().expect("usage");
@@ -27084,13 +27073,20 @@ mod tests {
                 responses.push_back(Ok(summary_response_with_usage("{", 7, 11, 2)));
             }
             responses.push_back(Err(error));
+            let classifier =
+                SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                    provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                    responses: std::sync::Mutex::new([classification_response(true)].into()),
+                    requests: Default::default(),
+                }));
             let judge =
                 SummaryClientWorkAdmissionJudge::new(Box::new(UsageSequencedSummaryClient {
                     responses: std::sync::Mutex::new(responses),
                 }));
-            let error = judge
-                .judge(&astra_services::TurnIntentJudgeContext::default())
+            let error = classifier
+                .classify_and_plan(&judge, &astra_services::TurnIntentJudgeContext::default())
                 .await
+                .map(|admission| admission.decision)
                 .unwrap_err();
             let astra_services::TurnIntentJudgeError::Inference(error) = error else {
                 panic!("failure must retain inference error");
@@ -27330,119 +27326,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_topology_repair_is_bounded_and_never_defaults_to_primary() {
-        let missing = r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only"}"#;
-        for repaired_topology in [None, Some("primary"), Some("parallel_subruns")] {
-            let mut repaired: Value = serde_json::from_str(missing).unwrap();
-            if let Some(topology) = repaired_topology {
-                repaired["execution_topology"] = json!(topology);
-            }
+    async fn malformed_work_admission_is_repaired_once_without_erasing_mutation() {
+        let malformed = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"defer","goal":"Run A and B, cancel one, then add one","initial_tasks":[{"objective":"A","expected_result":"Evidence A"},{"objective":"B","expected_result":"Evidence B"}],"mutations":[{"target_initial_task":1,"objective":"B","expected_result":"Evidence B"}]}"#;
+        let repaired = json!({"work_lifecycle":"required","workspace_mutation":"read_only","activation":"defer","goal":"Run A and B, cancel one, then add one","initial_tasks":[{"objective":"A","expected_result":"Evidence A"},{"objective":"B","expected_result":"Evidence B"}],"mutations":[{"kind":"cancel","target_initial_task":2},{"kind":"add","task":{"objective":"B","expected_result":"Evidence B"}}]});
+        for activation in ["defer", "start"] {
+            let mut classification: Value =
+                serde_json::from_str(&classification_response(true)).unwrap();
+            classification["answers"]["defer"]["noul"] = json!(1.0);
+            let classifier =
+                SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                    provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                    responses: std::sync::Mutex::new([classification.to_string()].into()),
+                    requests: Default::default(),
+                }));
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            let mut repair = repaired.clone();
+            repair["activation"] = json!(activation);
+            let planner = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
                 provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                    missing.to_string(),
-                    repaired.to_string(),
-                ])),
+                responses: std::sync::Mutex::new(
+                    [malformed.to_string(), repair.to_string()].into(),
+                ),
                 requests: requests.clone(),
             }));
-            let decision = judge
-                .judge(&astra_services::TurnIntentJudgeContext::default())
+            let result = classifier
+                .classify_and_plan(
+                    &planner,
+                    &astra_services::TurnIntentJudgeContext {
+                        message: "run A and B, cancel one, add one".to_string(),
+                        turn_count: 1,
+                        recent_tools: Vec::new(),
+                        has_prior_assistant_turn: false,
+                        ..Default::default()
+                    },
+                )
                 .await;
-            assert_eq!(requests.lock().unwrap().len(), 2);
-            match repaired_topology {
-                None => assert!(matches!(
-                    decision,
-                    Err(astra_services::TurnIntentJudgeError::Malformed { .. })
-                )),
-                Some(topology) => {
-                    let decision = decision.expect("explicit topology repairs the contract");
-                    assert!(decision.initial_work_plan().is_none());
-                    assert_eq!(
-                        serde_json::to_value(decision.execution_topology()).unwrap(),
-                        json!(topology)
-                    );
-                }
+            if activation == "defer" {
+                let astra_services::WorkAdmissionDecision::Required {
+                    deferred_graph_mutations,
+                    activation,
+                    ..
+                } = result.unwrap().decision
+                else {
+                    panic!("expected required Work");
+                };
+                assert_eq!(activation, astra_services::WorkAdmissionActivation::Defer);
+                assert!(matches!(
+                    deferred_graph_mutations.as_slice(),
+                    [
+                        astra_services::WorkAdmissionGraphMutation::Cancel { .. },
+                        astra_services::WorkAdmissionGraphMutation::Add { .. }
+                    ]
+                ));
+            } else {
+                assert!(
+                    matches!(result, Err(astra_services::TurnIntentJudgeError::Malformed { detail, .. }) if detail == "work_classification: plan contradicts locked classification")
+                );
             }
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[1].len(), requests[0].len() + 1);
+            assert!(
+                requests[1]
+                    .iter()
+                    .all(|message| message["content"].as_str() != Some(malformed))
+            );
+            assert!(requests[1].iter().any(|message| {
+                message["role"] == "system"
+                    && message["content"].as_str().is_some_and(|text| {
+                        text.contains("Locked classification")
+                            && text.contains("\"activation\":\"defer\"")
+                    })
+            }));
+            assert!(
+                requests[1].last().unwrap()["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Never reclassify or downgrade")
+            );
         }
-    }
-
-    #[tokio::test]
-    async fn malformed_work_admission_is_repaired_once_without_erasing_mutation() {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let malformed = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"defer","goal":"Run A and B, cancel one, then add one","initial_tasks":[{"objective":"A","expected_result":"Evidence A"},{"objective":"B","expected_result":"Evidence B"}],"mutations":[{"target_initial_task":1,"objective":"B","expected_result":"Evidence B"}]}"#;
-        let repaired = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Run A and B, cancel one, then add one","initial_tasks":[{"objective":"A","expected_result":"Evidence A"},{"objective":"B","expected_result":"Evidence B"}],"mutations":[{"kind":"cancel","target_initial_task":2},{"kind":"add","task":{"objective":"B","expected_result":"Evidence B"}}]}"#;
-        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
-            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-            responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                malformed.to_string(),
-                repaired.to_string(),
-            ])),
-            requests: requests.clone(),
-        }));
-        let decision = judge
-            .judge(&astra_services::TurnIntentJudgeContext {
-                message: "run A and B, cancel one, add one".to_string(),
-                turn_count: 1,
-                recent_tools: Vec::new(),
-                has_prior_assistant_turn: false,
-                ..Default::default()
-            })
-            .await
-            .expect("repair returns a closed decision");
-        let astra_services::WorkAdmissionDecision::Required {
-            deferred_graph_mutations,
-            ..
-        } = decision
-        else {
-            panic!("expected required Work");
-        };
-        assert!(matches!(
-            deferred_graph_mutations.as_slice(),
-            [
-                astra_services::WorkAdmissionGraphMutation::Cancel { .. },
-                astra_services::WorkAdmissionGraphMutation::Add { .. }
-            ]
-        ));
-        let requests = requests.lock().expect("requests");
-        assert_eq!(requests.len(), 2);
-        assert_eq!(
-            requests[1].len(),
-            3,
-            "repair must append only the closed correction contract to the original request"
-        );
-        assert!(requests[1].iter().all(|message| {
-            message.get("content").and_then(Value::as_str)
-                != Some("{\"work_lifecycle\":\"required\"")
-        }));
-        assert!(requests[1].iter().any(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("malformed") && text.contains("No prose"))
-        }));
-        assert!(requests[1].iter().any(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|text| {
-                    text.contains("runtime derives them")
-                        && text.contains("Cancel+add remain two mutations")
-                        && text.contains("parallel_subruns")
-                        && text.contains("required_capabilities")
-                        && text.contains("agent_spawner")
-                })
-        }));
-        assert!(requests[1].iter().any(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|text| {
-                    text.contains("Validated typed boundary")
-                        && text.contains("\"work_lifecycle\":\"required\"")
-                        && text.contains("\"activation\":\"defer\"")
-                })
-        }));
     }
 
     #[tokio::test]
@@ -27450,6 +27412,11 @@ mod tests {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let impossible = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Deliver A, retire B, and add C","initial_tasks":[{"objective":"A","expected_result":"Evidence A"},{"objective":"B","expected_result":"Evidence B","after_initial_tasks":[1]}],"mutations":[{"kind":"cancel","target_initial_task":2,"after_initial_tasks":[1]},{"kind":"add","after_initial_tasks":[2],"task":{"objective":"C","expected_result":"Evidence C"}}]}"#;
         let repaired = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Deliver A, retire B, and add C","initial_tasks":[{"objective":"A","expected_result":"Evidence A"},{"objective":"B","expected_result":"Evidence B","after_initial_tasks":[1]}],"mutations":[{"kind":"cancel","target_initial_task":2,"after_initial_tasks":[1]},{"kind":"add","after_initial_tasks":[1],"task":{"objective":"C","expected_result":"Evidence C"}}]}"#;
+        let classifier = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+            responses: std::sync::Mutex::new([classification_response(true)].into()),
+            requests: Default::default(),
+        }));
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
             provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
             responses: std::sync::Mutex::new(std::collections::VecDeque::from([
@@ -27459,15 +27426,19 @@ mod tests {
             requests: requests.clone(),
         }));
 
-        let decision = judge
-            .judge(&astra_services::TurnIntentJudgeContext {
-                message: "Deliver A, retire B, and add C after A".to_string(),
-                turn_count: 1,
-                recent_tools: Vec::new(),
-                has_prior_assistant_turn: false,
-                ..Default::default()
-            })
+        let decision = classifier
+            .classify_and_plan(
+                &judge,
+                &astra_services::TurnIntentJudgeContext {
+                    message: "Deliver A, retire B, and add C after A".to_string(),
+                    turn_count: 1,
+                    recent_tools: Vec::new(),
+                    has_prior_assistant_turn: false,
+                    ..Default::default()
+                },
+            )
             .await
+            .map(|admission| admission.decision)
             .expect("one corrected graph must be admitted");
         let astra_services::WorkAdmissionDecision::Required {
             deferred_graph_mutations,
@@ -27495,7 +27466,7 @@ mod tests {
                 .get("content")
                 .and_then(Value::as_str)
                 .is_some_and(|text| {
-                    text.contains("Validated typed boundary")
+                    text.contains("Locked classification")
                         && text.contains("\"work_lifecycle\":\"required\"")
                         && text.contains("\"activation\":\"start\"")
                 })
@@ -27518,6 +27489,12 @@ mod tests {
                 repaired["mutations"][0]["target_initial_task"] = json!(target);
             }
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let classifier =
+                SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+                    provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+                    responses: std::sync::Mutex::new([classification_response(true)].into()),
+                    requests: Default::default(),
+                }));
             let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
                 provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
                 responses: std::sync::Mutex::new(std::collections::VecDeque::from([
@@ -27526,12 +27503,16 @@ mod tests {
                 ])),
                 requests: requests.clone(),
             }));
-            let result = judge
-                .judge(&astra_services::TurnIntentJudgeContext {
-                    message: "Run A and B, choose one to cancel and add its replacement".into(),
-                    ..Default::default()
-                })
-                .await;
+            let result = classifier
+                .classify_and_plan(
+                    &judge,
+                    &astra_services::TurnIntentJudgeContext {
+                        message: "Run A and B, choose one to cancel and add its replacement".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(|admission| admission.decision);
             if repaired_target.is_some() {
                 let decision = result.expect("valid repair preserves both mutations");
                 assert_eq!(decision.deferred_graph_mutations().len(), 2);
@@ -27556,201 +27537,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_owner_repair_does_not_preserve_null_domain_hint() {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let malformed = r#"{"work_lifecycle":"not_required","workspace_mutation":"must_mutate","mutation_completion_scope":"external","domain":null,"execution_topology":"primary"}"#;
-        let repaired = r#"{"work_lifecycle":"not_required","workspace_mutation":"must_mutate","mutation_completion_scope":"external","domain":"memory","execution_topology":"primary"}"#;
-        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
-            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-            responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                malformed.to_string(),
-                repaired.to_string(),
-            ])),
-            requests: requests.clone(),
-        }));
-
-        let decision = judge
-            .judge(&astra_services::TurnIntentJudgeContext {
-                message: "persist a project fact in memory".to_string(),
-                turn_count: 1,
-                ..Default::default()
-            })
-            .await
-            .expect("the bounded repair should restore the typed owner");
-        assert_eq!(
-            decision.domain(),
-            Some(astra_config::user_profile::TurnIntentDomain::Memory)
-        );
-
-        let requests = requests.lock().expect("requests");
-        assert_eq!(requests.len(), 2);
-        let repair = requests[1]
-            .last()
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_str)
-            .expect("repair instruction");
-        assert!(repair.contains("external or mixed must_mutate"));
-        assert!(
-            !repair.contains("\"domain\":null"),
-            "a malformed null owner must not be replayed as authoritative repair input"
-        );
-    }
-
-    #[tokio::test]
-    async fn external_owner_repair_that_remains_unknown_stays_unavailable() {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let malformed = r#"{"work_lifecycle":"not_required","workspace_mutation":"must_mutate","mutation_completion_scope":"mixed","domain":null,"execution_topology":"primary"}"#;
-        let unresolved = r#"{"work_lifecycle":"not_required","workspace_mutation":"must_mutate","mutation_completion_scope":"mixed","domain":null,"execution_topology":"primary"}"#;
-        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
-            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-            responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                malformed.to_string(),
-                unresolved.to_string(),
-            ])),
-            requests: requests.clone(),
-        }));
-
-        let error = judge
-            .judge(&astra_services::TurnIntentJudgeContext {
-                message: "change workspace and external state".to_string(),
-                turn_count: 1,
-                ..Default::default()
-            })
-            .await
-            .expect_err("an ownerless external boundary cannot be installed");
-        assert!(matches!(
-            error,
-            astra_services::TurnIntentJudgeError::Malformed { .. }
-        ));
-        assert_eq!(requests.lock().expect("requests").len(), 2);
-    }
-
-    #[tokio::test]
-    async fn closed_non_durable_work_admission_is_accepted_without_repair() {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
-            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                    "```json\n{\"work_lifecycle\":\"not_required\",\"workspace_mutation\":\"must_mutate\",\"mutation_completion_scope\":\"workspace\",\"execution_topology\":\"primary\"}\n```".to_string(),
-                ])),
-                requests: requests.clone(),
-            }));
-
-        let decision = judge
-            .judge(&astra_services::TurnIntentJudgeContext {
-                message: "create the requested workspace artifact".to_string(),
-                turn_count: 1,
-                ..Default::default()
-            })
-            .await
-            .expect("a closed non-durable response must not trigger semantic repair");
-
-        assert_eq!(
-            decision.turn_intent().workspace_mutation,
-            astra_config::user_profile::WorkspaceMutationIntent::MustMutate
-        );
-        assert_eq!(
-            requests.lock().expect("requests").len(),
-            1,
-            "valid semantic content must cost exactly one auxiliary inference"
-        );
-    }
-
-    #[tokio::test]
-    async fn model_owned_required_topology_is_repaired_to_parallel_non_durable_work() {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let initially_conflicting = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","goal":"Review three dimensions and synthesize the findings","initial_tasks":[{"objective":"Correctness","expected_result":"Evidence"},{"objective":"Concurrency","expected_result":"Evidence"}],"execution_topology":"parallel_subruns","required_capabilities":["agent_spawner"]}"#;
-        let repaired = r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"parallel_subruns","required_capabilities":["agent_spawner"]}"#;
-        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
-            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-            responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                initially_conflicting.to_string(),
-                repaired.to_string(),
-            ])),
-            requests: requests.clone(),
-        }));
-
-        let decision = judge
-            .judge(&astra_services::TurnIntentJudgeContext {
-                message: "Use multiple perspectives, then provide one synthesized report"
-                    .to_string(),
-                turn_count: 1,
-                ..Default::default()
-            })
-            .await
-            .expect("intermediate fanout perspectives are not durable Work");
-        assert_eq!(
-            decision.execution_topology(),
-            astra_services::WorkExecutionTopology::ParallelSubruns
-        );
-        assert!(matches!(
-            &decision,
-            astra_services::WorkAdmissionDecision::NotRequired { .. }
-        ));
-
-        let requests = requests.lock().expect("requests");
-        assert_eq!(requests.len(), 2);
-        assert!(requests[1].iter().any(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|text| {
-                    text.contains("acceptance boundary")
-                        && text.contains("same-turn multi-agent request")
-                        && text.contains("Required Work omits execution_topology")
-                        && text.contains("not_required object")
-                })
-        }));
-    }
-
-    #[tokio::test]
-    async fn malformed_work_admission_re_evaluates_instead_of_preserving_invalid_shape() {
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let invalid = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","basis":"explicit_lifecycle_control","goal":"Return two same-turn agent results","initial_tasks":[{"objective":"Result A","expected_result":"Payload A"},{"objective":"Result B","expected_result":"Payload B"}],"execution_topology":"primary"}"#;
-        let repaired = r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"parallel_subruns","required_capabilities":["agent_spawner"]}"#;
-        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
-            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-            responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                invalid.to_string(),
-                repaired.to_string(),
-            ])),
-            requests: requests.clone(),
-        }));
-
-        let decision = judge
-            .judge(&astra_services::TurnIntentJudgeContext {
-                message: "Use two agents now and return their results".to_string(),
-                turn_count: 1,
-                ..Default::default()
-            })
-            .await
-            .expect("the bounded repair must replace a self-inconsistent lifecycle basis");
-
-        assert!(matches!(
-            &decision,
-            astra_services::WorkAdmissionDecision::NotRequired { .. }
-        ));
-        assert_eq!(
-            decision.execution_topology(),
-            astra_services::WorkExecutionTopology::ParallelSubruns
-        );
-        let requests = requests.lock().expect("requests");
-        assert_eq!(requests.len(), 2);
-        assert!(requests[1].iter().any(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|text| {
-                    text.contains("previous lifecycle and graph are not authoritative")
-                        && text.contains("same-turn multi-agent request")
-                })
-        }));
-    }
-
-    #[tokio::test]
     async fn trusted_parallel_conflict_is_not_repaired_or_downgraded() {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let conflicting = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","goal":"Persist separate outcomes","initial_tasks":[{"objective":"A","expected_result":"A"},{"objective":"B","expected_result":"B"}],"required_capabilities":["agent_spawner"]}"#;
+        let classifier = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+            provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
+            responses: std::sync::Mutex::new([classification_response(true)].into()),
+            requests: Default::default(),
+        }));
         let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
             provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
             responses: std::sync::Mutex::new(std::collections::VecDeque::from([
@@ -27759,16 +27553,20 @@ mod tests {
             requests: requests.clone(),
         }));
 
-        let error = judge
-            .judge(&astra_services::TurnIntentJudgeContext {
-                message: "Use the loaded workflow".to_string(),
-                turn_count: 1,
-                loaded_workflow_execution_topology: Some(
-                    astra_services::WorkExecutionTopology::ParallelSubruns,
-                ),
-                ..Default::default()
-            })
+        let error = classifier
+            .classify_and_plan(
+                &judge,
+                &astra_services::TurnIntentJudgeContext {
+                    message: "Use the loaded workflow".to_string(),
+                    turn_count: 1,
+                    loaded_workflow_execution_topology: Some(
+                        astra_services::WorkExecutionTopology::ParallelSubruns,
+                    ),
+                    ..Default::default()
+                },
+            )
             .await
+            .map(|admission| admission.decision)
             .expect_err("trusted durable-plus-parallel topology remains unsupported");
         assert!(matches!(
             error,
@@ -27779,23 +27577,26 @@ mod tests {
 
     #[tokio::test]
     async fn trusted_parallel_workflow_cannot_be_downgraded_by_judge_response() {
-        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
+        let classifier = SummaryClientWorkAdmissionJudge::new(Box::new(SequencedSummaryClient {
             provenance: astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
-                    r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary","required_capabilities":[]}"#.to_string(),
-                ])),
-                requests: Arc::new(std::sync::Mutex::new(Vec::new())),
-            }));
-        let decision = judge
-            .judge(&astra_services::TurnIntentJudgeContext {
-                message: "Follow the loaded workflow".to_string(),
-                turn_count: 1,
-                loaded_workflow_execution_topology: Some(
-                    astra_services::WorkExecutionTopology::ParallelSubruns,
-                ),
-                ..Default::default()
-            })
+            responses: std::sync::Mutex::new([classification_response(false)].into()),
+            requests: Default::default(),
+        }));
+        let judge = SummaryClientWorkAdmissionJudge::new(Box::new(PendingClassificationClient));
+        let decision = classifier
+            .classify_and_plan(
+                &judge,
+                &astra_services::TurnIntentJudgeContext {
+                    message: "Follow the loaded workflow".to_string(),
+                    turn_count: 1,
+                    loaded_workflow_execution_topology: Some(
+                        astra_services::WorkExecutionTopology::ParallelSubruns,
+                    ),
+                    ..Default::default()
+                },
+            )
             .await
+            .map(|admission| admission.decision)
             .expect("trusted manifest topology must reconcile after parsing");
         assert_eq!(
             decision.execution_topology(),
@@ -27806,6 +27607,9 @@ mod tests {
                 .required_capabilities()
                 .contains(&astra_services::WorkAdmissionCapability::AgentSpawner)
         );
+
+        assert_eq!(classifier.usage.lock().unwrap().attempts, 1);
+        assert_eq!(judge.usage.lock().unwrap().attempts, 0);
 
         let mut host = test_host_builder("u-trusted-workflow", "s-trusted-workflow")
             .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
@@ -37243,6 +37047,8 @@ mod tests {
         .with_plan_resume_hint(Some("[plan-resume] goal=\"initial\"".to_string()))
         .build();
 
+        host.workspace_binding.display_name =
+            "demo - Resume context: none\n- Resume context: none".into();
         let mut state = create_test_state();
         state.current_session_id = Some("s-latch".into());
         state.current_run_id = Some("run-latch".into());
@@ -37280,6 +37086,36 @@ mod tests {
             round3_text.contains("this_turn=0"),
             "delegation counters should remain turn-start snapshot values: {round3_text}"
         );
+
+        let full_hint = astra_plan::plan_resume_prompt_hint(&astra_plan::PlanModeState::new(
+            "multiline-plan".into(),
+        ))
+        .unwrap();
+        *host.plan_resume_hint_handle().write().unwrap() = Some(full_hint.clone());
+        assert!(
+            host.turn_start_lifecycle_summary(&state)
+                .contains(full_hint.trim())
+        );
+        let authored = host
+            .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
+            .expect("authoring pipeline");
+        let authored_text = pipeline_outcome_text(&authored);
+        assert!(authored_text.contains(full_hint.trim()));
+        *host.plan_resume_hint_handle().write().unwrap() = None;
+        let current = host.turn_start_lifecycle_summary(&state);
+        assert!(!current.contains("[plan-resume]"));
+        assert!(current.contains("this_turn=0"));
+        let exited = host
+            .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
+            .expect("exited pipeline");
+        let exited_text = pipeline_outcome_text(&exited);
+        assert!(exited_text.contains("Resume context: none"));
+        assert!(!exited_text.contains("[plan-resume]"));
+        assert!(!exited_text.contains("## Active Plan"));
+        assert!(!exited_text.contains("A plan draft is awaiting trusted user review"));
+        assert!(exited_text.contains("this_turn=0"));
+        assert!(authored_text.contains("name=demo - Resume context: none\n- Resume context: none"));
+        assert!(exited_text.contains("name=demo - Resume context: none\n- Resume context: none"));
     }
 
     #[test]
@@ -38422,6 +38258,285 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edge_delivery_rejects_malformed_batches_before_committing_interactions() {
+        let cases = [
+            vec![
+                json!({"type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}),
+            ],
+            vec![
+                json!({"id":"duplicate","type":"function","function":{"name":"read_file","arguments":"{}"}}),
+                json!({"id":"duplicate","type":"function","function":{"name":"bash","arguments":"{}"}}),
+            ],
+            vec![
+                json!({"id":"malformed","type":"function","function":{"name":"bash","arguments":"{\"command\":"}}),
+            ],
+        ];
+        for calls in cases {
+            let mut host = test_host_builder("u-invalid", "s-invalid")
+                .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+                .build();
+            let sink = install_in_memory_interaction_sink(&mut host);
+            let context = test_edge_action_context("u-invalid", "test-run").await;
+            let outcome = host
+                .deliver_edge_tools_via_ledger("test-run", "test-chain", &calls, &context)
+                .await;
+            assert_eq!(outcome.control, AdmittedToolCallControl::FailedClosed);
+            assert!(outcome.results.is_empty());
+            assert!(host.edge_callback_ledger.lock().await.is_empty());
+            assert!(sink.committed.lock().expect("interactions").is_empty());
+            assert!(!host.emitted_events.iter().any(|event| matches!(
+                event["type"].as_str(),
+                Some(
+                    "tool_call" | "tool_request" | "approval_required" | "approval_batch_required"
+                )
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn edge_worktree_removal_requires_explicit_approval_before_dispatch() {
+        for allowed in [false, true] {
+            let mut host = test_host_builder("u-remove", "s-remove")
+                .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
+                .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+                .build();
+            let sink = install_in_memory_interaction_sink(&mut host);
+            host.install_runtime_tool_schemas(vec![json!({"type":"function","function":{"name":"worktree","parameters":{"type":"object","properties":{}}}})], Default::default());
+            host.set_approval_audit_context(test_approval_audit_context("u-remove", "s-remove"));
+            let calls = vec![
+                json!({"id":"wt-remove","type":"function","function":{"name":"worktree","arguments":r#"{"action":"exit","exit_action":"remove","discard_changes":true}"#}}),
+            ];
+            let ledger = host.edge_callback_ledger.clone();
+            let actor_sink = sink.clone();
+            let actor_ledger = ledger.clone();
+            let actor = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let approval = actor_sink.committed.lock().expect("interactions").iter().any(|event| event["type"] == "approval_required");
+                        if approval { break; }
+                        tokio::task::yield_now().await;
+                    }
+                    let mut decision = approval_allow_entry("s-remove", "wt-remove");
+                    if !allowed { decision["body"]["decision"] = json!("deny"); decision["body"]["reason"] = json!("user declined removal"); }
+                    actor_ledger.lock().await.insert(test_approval_key("u-remove", "s-remove", "wt-remove"), decision);
+                    if allowed {
+                        loop {
+                            let dispatched = actor_sink.committed.lock().expect("interactions").iter().any(|event| event["type"] == "tool_request");
+                            if dispatched { break; }
+                            tokio::task::yield_now().await;
+                        }
+                        actor_ledger.lock().await.insert(tool_callback_key("u-remove", "s-remove", "wt-remove"), json!({"body":{"request_id":"wt-remove","status":"ok","output":"removed"}}));
+                    }
+                }).await.expect("approval/request progress");
+            });
+            let context = test_edge_action_context("u-remove", "test-run").await;
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                host.deliver_edge_tools_via_ledger("test-run", "test-chain", &calls, &context),
+            )
+            .await
+            .expect("worktree removal must settle");
+            actor.await.expect("callback actor");
+            assert_eq!(outcome.results.len(), 1);
+            let committed = sink.committed.lock().expect("interactions");
+            let approval = committed
+                .iter()
+                .position(|event| event["type"] == "approval_required")
+                .expect("explicit approval");
+            assert_eq!(committed[approval]["approval_kind"], "explicit");
+            let request = committed
+                .iter()
+                .position(|event| event["type"] == "tool_request");
+            assert!(
+                host.emitted_events.iter().any(
+                    |event| event["type"] == "tool_call_end" && event["call_id"] == "wt-remove"
+                )
+            );
+            if allowed {
+                assert!(request.expect("approved removal dispatched") > approval);
+                assert_eq!(outcome.results[0].output, "status=ok\nremoved");
+                assert_eq!(outcome.results[0].status, "ok");
+            } else {
+                assert!(request.is_none());
+                assert_eq!(outcome.results[0].status, "denied");
+                assert!(outcome.results[0].output.contains("user_denied"));
+                assert!(outcome.results[0].output.contains("user declined removal"));
+                assert!(!astra_turn_core::edge_ledger::ledger_entry_is_expected(
+                    &ledger,
+                    &tool_callback_key("u-remove", "s-remove", "wt-remove"),
+                    "edge-1"
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn edge_read_batch_dispatches_all_requests_before_accepting_results() {
+        for write_approval in [None, Some(true), Some(false)] {
+            let mut host = test_host_builder("u-parallel", "s-parallel")
+                .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
+                .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+                .build();
+            let sink = install_in_memory_interaction_sink(&mut host);
+            host.install_runtime_tool_schemas(["read_file", "write_file"].map(|name| json!({"type":"function","function":{"name":name,"parameters":{"type":"object","properties":{}}}})).to_vec(), Default::default());
+            host.set_approval_audit_context(test_approval_audit_context(
+                "u-parallel",
+                "s-parallel",
+            ));
+            let mut calls = Vec::new();
+            if write_approval.is_some() {
+                calls.push(json!({"id":"w","type":"function","function":{"name":"write_file","arguments":r#"{"path":"b.rs","content":"x"}"#}}));
+            }
+            let read_ids = if write_approval.is_some() {
+                vec!["r1", "r2"]
+            } else {
+                vec!["r1", "r2", "r3"]
+            };
+            calls.extend(read_ids.iter().map(|id| json!({"id":id,"type":"function","function":{"name":"read_file","arguments":r#"{"path":"a.rs"}"#}})));
+            host.emit_admitted_tool_call_events(0, &calls);
+            let ledger = host.edge_callback_ledger.clone();
+            let actor_ledger = ledger.clone();
+            let actor_sink = sink.clone();
+            let actor_ids = read_ids.clone();
+            let actor = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    if let Some(allowed) = write_approval {
+                        loop {
+                            let approval = actor_sink.committed.lock().expect("interactions").iter().any(|event| event["type"] == "approval_required");
+                            if approval { break; }
+                            tokio::task::yield_now().await;
+                        }
+                        let mut decision = approval_allow_entry("s-parallel", "w");
+                        if !allowed { decision["body"]["decision"] = json!("deny"); decision["body"]["reason"] = json!("policy"); }
+                        actor_ledger.lock().await.insert(test_approval_key("u-parallel", "s-parallel", "w"), decision);
+                        if allowed {
+                            loop {
+                                let dispatched = actor_sink.committed.lock().expect("interactions").iter().any(|event| event["type"] == "tool_request" && event["request_id"] == "w");
+                                if dispatched { break; }
+                                tokio::task::yield_now().await;
+                            }
+                            actor_ledger.lock().await.insert(tool_callback_key("u-parallel", "s-parallel", "w"), json!({"body":{"request_id":"w","status":"ok","output":"wrote"}}));
+                        }
+                    }
+                    // A sequential reader deadlocks here: no read callback is
+                    // published until every read has crossed the real dispatch boundary.
+                    loop {
+                        let all_dispatched = {
+                            let committed = actor_sink.committed.lock().expect("interactions");
+                            actor_ids.iter().all(|id| committed.iter().any(|event| event["type"] == "tool_request" && event["request_id"] == *id))
+                        };
+                        if all_dispatched { break; }
+                        tokio::task::yield_now().await;
+                    }
+                    for id in actor_ids.iter().rev() {
+                        actor_ledger.lock().await.insert(tool_callback_key("u-parallel", "s-parallel", id), json!({"body":{"request_id":id,"status":"ok","output":format!("file-{id}")}}));
+                        tokio::task::yield_now().await;
+                    }
+                }).await.expect("all requests dispatched before callbacks");
+            });
+            let context = test_edge_action_context("u-parallel", "test-run").await;
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                host.deliver_edge_tools_via_ledger("test-run", "test-chain", &calls, &context),
+            )
+            .await
+            .expect("mixed read batch settles");
+            actor.await.expect("callback actor");
+            assert_eq!(outcome.control, AdmittedToolCallControl::Continue);
+            assert_eq!(
+                outcome
+                    .results
+                    .iter()
+                    .map(|result| result.request_id.as_str())
+                    .collect::<Vec<_>>(),
+                calls
+                    .iter()
+                    .map(|call| call["id"].as_str().unwrap())
+                    .collect::<Vec<_>>()
+            );
+            let committed = sink.committed.lock().expect("interactions");
+            // Admission emits the observer tool call once; dispatch and
+            // completion retain their own exact request identity.
+            for id in &read_ids {
+                assert_eq!(
+                    host.emitted_events
+                        .iter()
+                        .filter(|event| event["type"] == "tool_call"
+                            && event.pointer("/tool_call/id") == Some(&json!(id)))
+                        .count(),
+                    1
+                );
+                for event_type in ["tool_request", "tool_call_end"] {
+                    let field = if event_type == "tool_request" {
+                        "request_id"
+                    } else {
+                        "call_id"
+                    };
+                    assert_eq!(
+                        host.emitted_events
+                            .iter()
+                            .filter(|event| event["type"] == event_type && event[field] == *id)
+                            .count(),
+                        1
+                    );
+                }
+                let result = outcome
+                    .results
+                    .iter()
+                    .find(|result| result.request_id == *id)
+                    .unwrap();
+                assert_eq!(result.status, "ok");
+                assert_eq!(result.output, format!("status=ok\nfile-{id}"));
+            }
+            if let Some(allowed) = write_approval {
+                let write = &outcome.results[0];
+                assert_eq!(write.args["path"], "b.rs");
+                if allowed {
+                    assert_eq!(write.output, "status=ok\nwrote");
+                    let write_end = host
+                        .emitted_events
+                        .iter()
+                        .position(|event| {
+                            event["type"] == "tool_call_end" && event["call_id"] == "w"
+                        })
+                        .unwrap();
+                    let first_read = host
+                        .emitted_events
+                        .iter()
+                        .position(|event| {
+                            event["type"] == "tool_request" && event["request_id"] == "r1"
+                        })
+                        .unwrap();
+                    assert!(write_end < first_read);
+                } else {
+                    assert_eq!(write.status, "denied");
+                    assert!(
+                        write.output.contains("user_denied") && write.output.contains("policy")
+                    );
+                    assert!(
+                        !committed
+                            .iter()
+                            .any(|event| event["type"] == "tool_request"
+                                && event["request_id"] == "w")
+                    );
+                    assert!(!astra_turn_core::edge_ledger::ledger_entry_is_expected(
+                        &ledger,
+                        &tool_callback_key("u-parallel", "s-parallel", "w"),
+                        "edge-1"
+                    ));
+                }
+            } else {
+                assert!(!committed.iter().any(|event| matches!(
+                    event["type"].as_str(),
+                    Some("approval_required" | "approval_batch_required")
+                )));
+            }
+            drop(committed);
+            assert!(ledger.lock().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn deliver_edge_tools_batches_multiple_approval_prompts() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -38544,6 +38659,11 @@ mod tests {
             2,
             "each approved serial action crosses its own guarded tool-request boundary"
         );
+        assert!(
+            !committed
+                .iter()
+                .any(|event| event["type"] == "approval_required")
+        );
         drop(committed);
 
         let tool_request_positions: Vec<_> = host
@@ -38571,6 +38691,8 @@ mod tests {
         assert_eq!(results.results[1].request_id, "w2");
         assert_eq!(results.results[0].status, "ok");
         assert_eq!(results.results[1].status, "ok");
+        assert_eq!(results.results[0].output, "status=ok\nwrote-a");
+        assert_eq!(results.results[1].output, "status=ok\nwrote-b");
 
         let explain_batch_finished = Instant::now();
         host.on_turn_phase(crate::turn::agentic_loop::host::TurnPhaseReceipt {
@@ -44221,17 +44343,23 @@ mod tests {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-work-establishment-retry";
         let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
-        let (gateway_url, requests, server) = spawn_gateway(
-            axum::http::StatusCode::OK,
-            json!({
-                "choices": [{
-                    "message": {"content": "I will answer without creating Work."},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 8, "completion_tokens": 4}
-            }),
-        )
+        let response = json!({
+            "choices": [{
+                "message": {"content": "I will answer without creating Work."},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4}
+        });
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "required_unbound_work_retries_text_only_provider_once_without_named_tool_choice",
+            |request| request.path == "/v1/chat/completions",
+            (0..2)
+                .map(|_| ProviderResponse::OpenAi(response.clone()))
+                .collect(),
+        )])
         .await;
+        let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
+        let requests = provider.requests.clone();
         let mut host = test_host_builder("user-work-establishment-retry", session_id.to_string())
             .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
                 true, false,
@@ -44258,7 +44386,7 @@ mod tests {
 
         let requests = requests.lock().await.clone();
         assert_eq!(requests.len(), 2, "the corrective boundary is exactly once");
-        for request in &requests {
+        for request in requests.iter().map(|request| &request.body) {
             assert_eq!(
                 request["tool_choice"], "auto",
                 "the generic OpenAI-compatible request must not assume named tool forcing support"
@@ -44283,6 +44411,7 @@ mod tests {
         }
         assert!(
             requests[1]
+                .body
                 .to_string()
                 .contains("canonical_work_establishment_retry.v1"),
             "only the retry request receives the structured runtime correction"
@@ -44301,7 +44430,7 @@ mod tests {
             "unaccepted provider prose must not leak before the Work lifecycle exists: {emitted:?}"
         );
         inference_ledger.assert_quiescent();
-        server.abort();
+        provider.assert_complete();
     }
 
     #[tokio::test]
@@ -44546,7 +44675,7 @@ mod tests {
             .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
             .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
             .build();
-        install_in_memory_interaction_sink(&mut host);
+        let sink = install_in_memory_interaction_sink(&mut host);
         // Register read_file and write_file as valid tools so the edge ledger delivery path admits them.
         host.install_runtime_tool_schemas(
             vec![
@@ -44672,6 +44801,33 @@ mod tests {
         assert_eq!(results.results[1].request_id, "w1");
         assert_eq!(results.results[2].request_id, "r2");
         assert_eq!(results.results[3].request_id, "w2");
+        assert_eq!(
+            results
+                .results
+                .iter()
+                .map(|result| result.output.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "status=ok\nread-a",
+                "status=ok\nwrote-b",
+                "status=ok\nread-c",
+                "status=ok\nwrote-d"
+            ]
+        );
+        let committed = sink.committed.lock().expect("interactions");
+        let approval = committed
+            .iter()
+            .find(|event| event["type"] == "approval_batch_required")
+            .expect("complete approval batch");
+        assert_eq!(
+            approval["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|request| request["request_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["w1", "w2"]
+        );
     }
 
     // ── Mock host tests for agentic loop integration ───────────────────────
@@ -44851,301 +45007,6 @@ mod tests {
             assert!(pair[1].get("ttft_ms").is_some());
             assert!(pair[1].get("duration_ms").and_then(Value::as_u64).is_some());
         }
-    }
-
-    #[derive(Clone)]
-    struct GatewayState {
-        requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
-        status: axum::http::StatusCode,
-        response: Value,
-    }
-
-    pub(super) async fn spawn_gateway(
-        status: axum::http::StatusCode,
-        response: Value,
-    ) -> (
-        String,
-        Arc<tokio::sync::Mutex<Vec<Value>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        use axum::{
-            Router,
-            body::Bytes,
-            extract::State,
-            http::header,
-            response::{IntoResponse, Response},
-            routing::post,
-        };
-        use tokio::net::TcpListener;
-
-        fn build_streaming_gateway_body(response: &Value) -> String {
-            let content = response["choices"]
-                .as_array()
-                .and_then(|choices| choices.first())
-                .and_then(|choice| choice.get("message"))
-                .and_then(|message| message.get("content"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let finish_reason = response["choices"]
-                .as_array()
-                .and_then(|choices| choices.first())
-                .and_then(|choice| choice.get("finish_reason"))
-                .cloned()
-                .unwrap_or_else(|| json!("stop"));
-            let usage = response.get("usage").cloned().unwrap_or_else(|| json!({}));
-            format!(
-                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-                json!({"choices":[{"delta":{"content": content}}]}),
-                json!({"choices":[{"delta":{},"finish_reason": finish_reason}],"usage": usage}),
-            )
-        }
-
-        async fn handler(State(state): State<GatewayState>, body: Bytes) -> Response {
-            let payload: Value = serde_json::from_slice(&body).expect("gateway request json");
-            let index = {
-                let mut requests = state.requests.lock().await;
-                let index = requests.len();
-                requests.push(payload.clone());
-                index
-            };
-            let response = state
-                .response
-                .as_array()
-                .map(|responses| &responses[index.min(responses.len() - 1)])
-                .unwrap_or(&state.response);
-            let wants_stream = payload
-                .get("stream")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if state.status.is_success() && wants_stream {
-                (
-                    state.status,
-                    [(header::CONTENT_TYPE, "text/event-stream")],
-                    build_streaming_gateway_body(response),
-                )
-                    .into_response()
-            } else {
-                (state.status, axum::Json(response.clone())).into_response()
-            }
-        }
-
-        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let app = Router::new()
-            .route("/gateway/chat/completions", post(handler))
-            .with_state(GatewayState {
-                requests: requests.clone(),
-                status,
-                response,
-            });
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("gateway server should run");
-        });
-        (
-            format!("http://{addr}/gateway/chat/completions"),
-            requests,
-            server,
-        )
-    }
-
-    #[derive(Clone)]
-    struct SequencedGatewayState {
-        requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
-        primary_responses: Arc<tokio::sync::Mutex<std::collections::VecDeque<Value>>>,
-    }
-
-    async fn spawn_sequenced_openai_gateway(
-        primary_responses: Vec<Value>,
-    ) -> (
-        String,
-        Arc<tokio::sync::Mutex<Vec<Value>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        use axum::{
-            Router,
-            body::Bytes,
-            extract::State,
-            http::header,
-            response::{IntoResponse, Response},
-            routing::post,
-        };
-        use tokio::net::TcpListener;
-
-        fn streaming_body(response: &Value) -> String {
-            let message = response
-                .pointer("/choices/0/message")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            let mut events = Vec::new();
-            if let Some(content) = message.get("content").and_then(Value::as_str)
-                && !content.is_empty()
-            {
-                events.push(json!({"choices":[{"delta":{"content":content}}]}));
-            }
-            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array)
-                && !tool_calls.is_empty()
-            {
-                events.push(json!({"choices":[{"delta":{"tool_calls":tool_calls}}]}));
-            }
-            events.push(json!({
-                "choices": [{
-                    "delta": {},
-                    "finish_reason": response
-                        .pointer("/choices/0/finish_reason")
-                        .cloned()
-                        .unwrap_or_else(|| json!("stop")),
-                }],
-                "usage": response.get("usage").cloned().unwrap_or_else(|| json!({})),
-            }));
-            let mut body = events
-                .into_iter()
-                .map(|event| format!("data: {event}\n\n"))
-                .collect::<String>();
-            body.push_str("data: [DONE]\n\n");
-            body
-        }
-
-        async fn handler(State(state): State<SequencedGatewayState>, body: Bytes) -> Response {
-            let request: Value = serde_json::from_slice(&body).expect("gateway request json");
-            state.requests.lock().await.push(request.clone());
-            // Compaction summaries and other auxiliary inference do not carry
-            // the main agent's tool surface. Keep them deterministic without
-            // consuming the primary search/carrier script.
-            let response = if request.get("tools").and_then(Value::as_array).is_some() {
-                state
-                    .primary_responses
-                    .lock()
-                    .await
-                    .pop_front()
-                    .expect("unexpected primary provider request")
-            } else {
-                json!({
-                    "choices": [{
-                        "message": {"content": "bounded compaction summary"},
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {"prompt_tokens": 8, "completion_tokens": 4}
-                })
-            };
-            if request.get("stream").and_then(Value::as_bool) == Some(true) {
-                (
-                    axum::http::StatusCode::OK,
-                    [(header::CONTENT_TYPE, "text/event-stream")],
-                    streaming_body(&response),
-                )
-                    .into_response()
-            } else {
-                (axum::http::StatusCode::OK, axum::Json(response)).into_response()
-            }
-        }
-
-        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let state = SequencedGatewayState {
-            requests: Arc::clone(&requests),
-            primary_responses: Arc::new(tokio::sync::Mutex::new(
-                primary_responses.into_iter().collect(),
-            )),
-        };
-        let app = Router::new()
-            .route("/gateway/chat/completions", post(handler))
-            .with_state(state);
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind sequenced gateway listener");
-        let addr = listener.local_addr().expect("sequenced gateway address");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("sequenced gateway should run");
-        });
-        (
-            format!("http://{addr}/gateway/chat/completions"),
-            requests,
-            server,
-        )
-    }
-
-    #[derive(Clone)]
-    struct DelayedGatewayState {
-        delay: Duration,
-        completed: Arc<AtomicBool>,
-        requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
-        initial_events: Vec<Value>,
-        final_events: Vec<Value>,
-    }
-
-    async fn spawn_delayed_streaming_gateway(
-        delay: Duration,
-        initial_events: Vec<Value>,
-        final_events: Vec<Value>,
-    ) -> (
-        String,
-        Arc<AtomicBool>,
-        Arc<tokio::sync::Mutex<Vec<Value>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        use axum::{
-            Router,
-            body::{Body, Bytes},
-            extract::State,
-            http::header,
-            response::Response,
-            routing::post,
-        };
-        use std::convert::Infallible;
-        use tokio::net::TcpListener;
-
-        async fn handler(State(state): State<DelayedGatewayState>, body: Bytes) -> Response {
-            let payload: Value = serde_json::from_slice(&body).expect("gateway request json");
-            state.requests.lock().await.push(payload);
-            let stream = async_stream::stream! {
-                for event in state.initial_events {
-                    yield Ok::<Bytes, Infallible>(Bytes::from(format!("data: {event}\n\n")));
-                }
-                tokio::time::sleep(state.delay).await;
-                state.completed.store(true, Ordering::SeqCst);
-                for event in state.final_events {
-                    yield Ok::<Bytes, Infallible>(Bytes::from(format!("data: {event}\n\n")));
-                }
-                yield Ok::<Bytes, Infallible>(Bytes::from("data: [DONE]\n\n"));
-            };
-            Response::builder()
-                .header(header::CONTENT_TYPE, "text/event-stream")
-                .body(Body::from_stream(stream))
-                .expect("delayed gateway response")
-        }
-
-        let completed = Arc::new(AtomicBool::new(false));
-        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let app = Router::new()
-            .route("/gateway/chat/completions", post(handler))
-            .with_state(DelayedGatewayState {
-                delay,
-                completed: completed.clone(),
-                requests: requests.clone(),
-                initial_events,
-                final_events,
-            });
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind delayed gateway listener");
-        let addr = listener.local_addr().expect("delayed gateway address");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("delayed gateway server should run");
-        });
-        (
-            format!("http://{addr}/gateway/chat/completions"),
-            completed,
-            requests,
-            server,
-        )
     }
 
     fn read_journal_events(user_id: &str, session_id: &str) -> Vec<Value> {
@@ -45411,7 +45272,16 @@ mod tests {
             ),
             text_response("repository status inspected"),
         ];
-        let (gateway_url, requests, gateway) = spawn_sequenced_openai_gateway(responses).await;
+        let provider = ProviderGateway::start(vec![
+            ProviderScript::new("primary selection and resumed invocation",
+                |request| request.path == "/v1/chat/completions" && request.body["model"] == "gpt-5-mini" && request.body["tools"].is_array(),
+                responses.into_iter().map(ProviderResponse::OpenAi).collect()),
+            ProviderScript::optional_background_json("compaction summary",
+                |request| request.path == "/v1/chat/completions" && request.body["model"] == "gpt-5-mini" && request.body.get("tools").is_none() && request.body["messages"].is_array(),
+                json!({"choices":[{"message":{"content":"bounded compaction summary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4}})),
+        ]).await;
+        let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
+        let requests = provider.requests.clone();
         let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
         let run_engine = crate::server::run::engine::RunEngine::new(Arc::new(
             astra_services::runs::InMemoryRunStateStore::new(),
@@ -45650,6 +45520,7 @@ mod tests {
         let captured = requests.lock().await.clone();
         let primary = captured
             .iter()
+            .map(|request| &request.body)
             .filter(|request| request.get("tools").and_then(Value::as_array).is_some())
             .collect::<Vec<_>>();
         assert_eq!(primary.len(), 4);
@@ -45691,7 +45562,7 @@ mod tests {
             assert!(complete_tool_pairs(request["messages"].as_array().unwrap()));
         }
         inference_ledger.assert_quiescent();
-        gateway.abort();
+        provider.assert_complete();
                 });
             })
             .expect("spawn production-sized composition test stack")
@@ -48912,22 +48783,36 @@ mod tests {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-stream-window";
         let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
-        let delay = Duration::from_millis(750);
-        let (gateway_url, provider_completed, _requests, server) = spawn_delayed_streaming_gateway(
-            delay,
-            vec![
-                json!({"choices":[{"delta":{"reasoning_content":"private preface"}}]}),
-                json!({"choices":[{"delta":{"content":"visible first"}}]}),
-            ],
-            vec![
-                json!({"choices":[{"delta":{"content":" tail"}}]}),
-                json!({
-                    "choices":[{"delta":{},"finish_reason":"stop"}],
-                    "usage":{"prompt_tokens":8,"completion_tokens":4}
-                }),
-            ],
-        )
+        let initial_events = vec![
+            json!({"choices":[{"delta":{"reasoning_content":"private preface"}}]}),
+            json!({"choices":[{"delta":{"content":"visible first"}}]}),
+        ];
+        let final_events = vec![
+            json!({"choices":[{"delta":{"content":" tail"}}]}),
+            json!({
+                "choices":[{"delta":{},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":8,"completion_tokens":4}
+            }),
+        ];
+        let release = Arc::new(tokio::sync::Notify::new());
+        let boundary = initial_events.len();
+        let chunks = initial_events
+            .into_iter()
+            .chain(final_events)
+            .map(|event| format!("data: {event}\n\n").into_bytes())
+            .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
+            .collect();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "text_first_control_window_streams_before_provider_completion",
+            |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks,
+                release_before_chunk: Some((boundary, release.clone())),
+            }],
+        )])
         .await;
+        let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
         let public_name = "mcp__provider__runtime_control";
         let descriptor =
             crate::turn::terminal_control::RuntimeControlToolDescriptor::from_metadata(
@@ -48981,10 +48866,6 @@ mod tests {
                 if event_type == "agent_progress"
                     && event.get("status").and_then(Value::as_str) == Some("llm_call_started")
                 {
-                    assert!(
-                        !provider_completed.load(Ordering::SeqCst),
-                        "LLM start waited for provider response completion"
-                    );
                     saw_llm_call_started = true;
                 }
                 if matches!(event_type, "reasoning_delta" | "text_delta") {
@@ -48996,10 +48877,7 @@ mod tests {
                         saw_llm_call_started,
                         "visible provider output arrived before the LLM start lifecycle event"
                     );
-                    assert!(
-                        !provider_completed.load(Ordering::SeqCst),
-                        "text-first control window waited for the full provider response"
-                    );
+                    release.notify_one();
                     break visible_order;
                 }
             }
@@ -49010,14 +48888,15 @@ mod tests {
         let result = result.expect("text-first turn");
         assert_eq!(visible_order, vec!["reasoning_delta", "text_delta"]);
         assert_eq!(result.accum.full_text, "visible first tail");
-        assert!(provider_completed.load(Ordering::SeqCst));
+        assert_eq!(result.accum.prompt_tokens, 8);
+        assert_eq!(result.accum.completion_tokens, 4);
         assert!(matches!(
             host.take_terminal_control_outcome(),
             None | Some(crate::turn::terminal_control::TerminalControlOutcome::Passthrough)
         ));
         assert_root_llm_progress_pairs(&host.take_emitted_events(), 1);
         inference_ledger.assert_quiescent();
-        server.abort();
+        provider.assert_complete();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -49026,18 +48905,33 @@ mod tests {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-no-judgment-stream";
         let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
-        let (gateway_url, provider_completed, _requests, server) = spawn_delayed_streaming_gateway(
-            Duration::from_millis(750),
-            vec![json!({"choices":[{"delta":{"content":"visible first"}}]})],
-            vec![
-                json!({"choices":[{"delta":{"content":" tail"}}]}),
-                json!({
-                    "choices":[{"delta":{},"finish_reason":"stop"}],
-                    "usage":{"prompt_tokens":8,"completion_tokens":4}
-                }),
-            ],
-        )
+        let initial_events = vec![json!({"choices":[{"delta":{"content":"visible first"}}]})];
+        let final_events = vec![
+            json!({"choices":[{"delta":{"content":" tail"}}]}),
+            json!({
+                "choices":[{"delta":{},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":8,"completion_tokens":4}
+            }),
+        ];
+        let release = Arc::new(tokio::sync::Notify::new());
+        let boundary = initial_events.len();
+        let chunks = initial_events
+            .into_iter()
+            .chain(final_events)
+            .map(|event| format!("data: {event}\n\n").into_bytes())
+            .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
+            .collect();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "missing_judgment_offering_keeps_primary_text_streaming",
+            |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks,
+                release_before_chunk: Some((boundary, release.clone())),
+            }],
+        )])
         .await;
+        let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
         let mut host = test_host_builder("user-no-judgment-stream", session_id.to_string())
             .with_test_inference_ledger(inference_ledger.clone())
             .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
@@ -49056,10 +48950,7 @@ mod tests {
                     .expect("event channel remains open");
                 if event.get("type").and_then(Value::as_str) == Some("text_delta") {
                     assert_eq!(event["content"].as_str(), Some("visible first"));
-                    assert!(
-                        !provider_completed.load(Ordering::SeqCst),
-                        "missing optional judgment must not buffer primary text"
-                    );
+                    release.notify_one();
                     break;
                 }
             }
@@ -49069,7 +48960,7 @@ mod tests {
         let result = result.expect("ordinary primary turn");
         assert_eq!(result.accum.full_text, "visible first tail");
         inference_ledger.assert_quiescent();
-        server.abort();
+        provider.assert_complete();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -49078,19 +48969,34 @@ mod tests {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-work-admission-reasoning";
         let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
-        let delay = Duration::from_millis(750);
-        let (gateway_url, provider_completed, _requests, server) = spawn_delayed_streaming_gateway(
-            delay,
-            vec![json!({"choices":[{"delta":{"reasoning_content":"live work analysis"}}]})],
-            vec![
-                json!({"choices":[{"delta":{"content":"final answer"}}]}),
-                json!({
-                    "choices":[{"delta":{},"finish_reason":"stop"}],
-                    "usage":{"prompt_tokens":8,"completion_tokens":4}
-                }),
-            ],
-        )
+        let initial_events =
+            vec![json!({"choices":[{"delta":{"reasoning_content":"live work analysis"}}]})];
+        let final_events = vec![
+            json!({"choices":[{"delta":{"content":"final answer"}}]}),
+            json!({
+                "choices":[{"delta":{},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":8,"completion_tokens":4}
+            }),
+        ];
+        let release = Arc::new(tokio::sync::Notify::new());
+        let boundary = initial_events.len();
+        let chunks = initial_events
+            .into_iter()
+            .chain(final_events)
+            .map(|event| format!("data: {event}\n\n").into_bytes())
+            .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
+            .collect();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "provisional_work_admission_keeps_reasoning_preview_live",
+            |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks,
+                release_before_chunk: Some((boundary, release.clone())),
+            }],
+        )])
         .await;
+        let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
         let mut host = test_host_builder("user-work-preview", session_id.to_string())
             .with_test_inference_ledger(inference_ledger.clone())
             .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
@@ -49122,10 +49028,7 @@ mod tests {
                     .expect("event channel remains open");
                 if event.get("type").and_then(Value::as_str) == Some("reasoning_delta") {
                     assert_eq!(event["content"].as_str(), Some("live work analysis"));
-                    assert!(
-                        !provider_completed.load(Ordering::SeqCst),
-                        "Work admission buffered reasoning until provider completion"
-                    );
+                    release.notify_one();
                     break;
                 }
             }
@@ -49135,7 +49038,7 @@ mod tests {
         let result = result.expect("an unavailable auxiliary vote must preserve primary text");
         assert_eq!(result.accum.full_text, "final answer");
         inference_ledger.assert_quiescent();
-        server.abort();
+        provider.assert_complete();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -49144,18 +49047,30 @@ mod tests {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-explicit-work-stream-failure";
         let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
-        let (gateway_url, _provider_completed, _requests, server) =
-            spawn_delayed_streaming_gateway(
-                Duration::from_millis(1),
-                vec![json!({
-                    "choices": [{"delta": {"content": "must stay buffered"}}]
-                })],
-                vec![json!({
-                    "choices": [{"delta": {}, "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": 8, "completion_tokens": 4}
-                })],
-            )
-            .await;
+        let initial_events = vec![json!({
+            "choices": [{"delta": {"content": "must stay buffered"}}]
+        })];
+        let final_events = vec![json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4}
+        })];
+        let chunks = initial_events
+            .into_iter()
+            .chain(final_events)
+            .map(|event| format!("data: {event}\n\n").into_bytes())
+            .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
+            .collect();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "failed_explicit_work_does_not_stream_provisional_text_before_retry",
+            |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks,
+                release_before_chunk: None,
+            }],
+        )])
+        .await;
+        let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
         let mut host =
             test_host_builder("user-explicit-work-stream-failure", session_id.to_string())
                 .with_test_inference_ledger(inference_ledger.clone())
@@ -49219,7 +49134,7 @@ mod tests {
                     == Some("provider-work-failed-retry1"))
         );
         inference_ledger.assert_quiescent();
-        server.abort();
+        provider.assert_complete();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -49228,16 +49143,29 @@ mod tests {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-pending-completion-stream";
         let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
-        let (gateway_url, _provider_completed, _requests, server) =
-            spawn_delayed_streaming_gateway(
-                Duration::from_millis(1),
-                vec![json!({"choices": [{"delta": {"content": "Fixed and verified."}}]})],
-                vec![json!({
-                    "choices": [{"delta": {}, "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": 8, "completion_tokens": 4}
-                })],
-            )
-            .await;
+        let initial_events =
+            vec![json!({"choices": [{"delta": {"content": "Fixed and verified."}}]})];
+        let final_events = vec![json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4}
+        })];
+        let chunks = initial_events
+            .into_iter()
+            .chain(final_events)
+            .map(|event| format!("data: {event}\n\n").into_bytes())
+            .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
+            .collect();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "pending_completion_action_does_not_stream_provisional_success",
+            |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks,
+                release_before_chunk: None,
+            }],
+        )])
+        .await;
+        let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
         let mut host = test_host_builder("user-pending-completion-stream", session_id.to_string())
             .with_test_inference_ledger(inference_ledger.clone())
             .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
@@ -49269,7 +49197,7 @@ mod tests {
         );
         assert!(result.is_ok(), "provider round should remain recoverable");
         inference_ledger.assert_quiescent();
-        server.abort();
+        provider.assert_complete();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -49281,26 +49209,41 @@ mod tests {
         let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
         let ordinary_tool = "mcp__provider__status";
         let terminal_tool = "mcp__provider__runtime_control";
-        let delay = Duration::from_millis(750);
-        let (gateway_url, provider_completed, requests, server) = spawn_delayed_streaming_gateway(
-            delay,
-            vec![
-                json!({"choices":[{"delta":{"reasoning_content":"ordinary tool reasoning"}}]}),
-                json!({
-                    "choices":[{"delta":{"tool_calls":[{
-                        "index":0,
-                        "id":"call-status",
-                        "type":"function",
-                        "function":{"name":ordinary_tool,"arguments":"{}"}
-                    }]}}]
-                }),
-            ],
-            vec![json!({
-                "choices":[{"delta":{},"finish_reason":"tool_calls"}],
-                "usage":{"prompt_tokens":8,"completion_tokens":4}
-            })],
-        )
+        let initial_events = vec![
+            json!({"choices":[{"delta":{"reasoning_content":"ordinary tool reasoning"}}]}),
+            json!({
+                "choices":[{"delta":{"tool_calls":[{
+                    "index":0,
+                    "id":"call-status",
+                    "type":"function",
+                    "function":{"name":ordinary_tool,"arguments":"{}"}
+                }]}}]
+            }),
+        ];
+        let final_events = vec![json!({
+            "choices":[{"delta":{},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":8,"completion_tokens":4}
+        })];
+        let release = Arc::new(tokio::sync::Notify::new());
+        let boundary = initial_events.len();
+        let chunks = initial_events
+            .into_iter()
+            .chain(final_events)
+            .map(|event| format!("data: {event}\n\n").into_bytes())
+            .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
+            .collect();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "ordinary_tool_first_closes_control_window_before_provider_completion",
+            |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks,
+                release_before_chunk: Some((boundary, release.clone())),
+            }],
+        )])
         .await;
+        let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
+        let requests = provider.requests.clone();
         let descriptor =
             crate::turn::terminal_control::RuntimeControlToolDescriptor::from_metadata(
                 terminal_tool,
@@ -49363,10 +49306,7 @@ mod tests {
                     .expect("event channel remains open");
                 if event.get("type").and_then(Value::as_str) == Some("reasoning_delta") {
                     assert_eq!(event["content"].as_str(), Some("ordinary tool reasoning"));
-                    assert!(
-                        !provider_completed.load(Ordering::SeqCst),
-                        "ordinary tool action waited for the full provider response"
-                    );
+                    release.notify_one();
                     break;
                 }
             }
@@ -49375,7 +49315,7 @@ mod tests {
         let (result, ()) = tokio::join!(host.execute_turn(&mut state), observe_reasoning_release);
         let requests = requests.lock().await;
         assert_eq!(requests.len(), 1);
-        let wire_tool_names = requests[0]["tools"]
+        let wire_tool_names = requests[0].body["tools"]
             .as_array()
             .into_iter()
             .flatten()
@@ -49391,10 +49331,11 @@ mod tests {
             result.accum.tool_calls[0]["function"]["name"].as_str(),
             Some(ordinary_tool)
         );
-        assert!(provider_completed.load(Ordering::SeqCst));
+        assert_eq!(result.accum.prompt_tokens, 8);
+        assert_eq!(result.accum.completion_tokens, 4);
         assert!(host.take_terminal_control_outcome().is_none());
         inference_ledger.assert_quiescent();
-        server.abort();
+        provider.assert_complete();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -49405,28 +49346,42 @@ mod tests {
         let session_id = "session-terminal-stream";
         let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
         let terminal_tool = "mcp__provider__arbitrary_control_name";
-        let (gateway_url, provider_completed, requests, server) = spawn_delayed_streaming_gateway(
-            Duration::from_millis(200),
-            vec![
-                json!({"choices":[{"delta":{"reasoning_content":"private handoff reasoning"}}]}),
-                json!({
-                    "choices":[{"delta":{"tool_calls":[{
-                        "index":0,
-                        "id":"call-handoff",
-                        "type":"function",
-                        "function":{
-                            "name":terminal_tool,
-                            "arguments":r#"{"action":"revise_current_agent"}"#
-                        }
-                    }]}}]
-                }),
-            ],
-            vec![json!({
-                "choices":[{"delta":{},"finish_reason":"tool_calls"}],
-                "usage":{"prompt_tokens":8,"completion_tokens":4}
-            })],
-        )
+        let initial_events = vec![
+            json!({"choices":[{"delta":{"reasoning_content":"private handoff reasoning"}}]}),
+            json!({
+                "choices":[{"delta":{"tool_calls":[{
+                    "index":0,
+                    "id":"call-handoff",
+                    "type":"function",
+                    "function":{
+                        "name":terminal_tool,
+                        "arguments":r#"{"action":"revise_current_agent"}"#
+                    }
+                }]}}]
+            }),
+        ];
+        let final_events = vec![json!({
+            "choices":[{"delta":{},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":8,"completion_tokens":4}
+        })];
+        let chunks = initial_events
+            .into_iter()
+            .chain(final_events)
+            .map(|event| format!("data: {event}\n\n").into_bytes())
+            .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
+            .collect();
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "streamed_terminal_handoff_never_projects_buffered_reasoning",
+            |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks,
+                release_before_chunk: None,
+            }],
+        )])
         .await;
+        let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
+        let requests = provider.requests.clone();
         let descriptor =
             crate::turn::terminal_control::RuntimeControlToolDescriptor::from_metadata(
                 terminal_tool,
@@ -49477,7 +49432,8 @@ mod tests {
         state.commit_volatile_attempt_lease();
         assert!(result.edge_tool_round.is_empty());
         assert!(host.edge_callback_ledger.lock().await.is_empty());
-        assert!(provider_completed.load(Ordering::SeqCst));
+        assert_eq!(result.accum.prompt_tokens, 8);
+        assert_eq!(result.accum.completion_tokens, 4);
         let mut streamed_events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             streamed_events.push(event);
@@ -49498,7 +49454,7 @@ mod tests {
         let requests = requests.lock().await;
         assert_eq!(requests.len(), 1);
         assert!(
-            requests[0]["tools"].as_array().is_some_and(|tools| {
+            requests[0].body["tools"].as_array().is_some_and(|tools| {
                 tools
                     .iter()
                     .any(|schema| tool_schema_name(schema) == Some(terminal_tool))
@@ -49506,7 +49462,7 @@ mod tests {
             "the terminal handoff must have been declared on the exact provider request"
         );
         inference_ledger.assert_quiescent();
-        server.abort();
+        provider.assert_complete();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -49518,19 +49474,25 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "00000000-0000-0000-0000-000000000126";
-        let (gateway_url, requests, server) = spawn_gateway(
-            axum::http::StatusCode::OK,
-            json!({
-                "choices": [
-                    {
-                        "message": { "content": "journal capture reply" },
-                        "finish_reason": "stop"
-                    }
-                ],
-                "usage": { "prompt_tokens": 12, "completion_tokens": 5 }
-            }),
-        )
+        let response = json!({
+            "choices": [
+                {
+                    "message": { "content": "journal capture reply" },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": { "prompt_tokens": 12, "completion_tokens": 5 }
+        });
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "execute_turn_persists_full_journal_request_and_response_when_session_capture_enabled",
+            |request| request.path == "/v1/chat/completions",
+            (0..1)
+                .map(|_| ProviderResponse::OpenAi(response.clone()))
+                .collect(),
+        )])
         .await;
+        let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
+        let requests = provider.requests.clone();
 
         let mut host = test_host_builder("user-journal", session_id.to_string())
             .with_edge_tools(sample_edge_tools())
@@ -49761,7 +49723,7 @@ mod tests {
         assert_eq!(gateway_requests.len(), 1, "one upstream request expected");
 
         inference_ledger.assert_quiescent();
-        server.abort();
+        provider.assert_complete();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -49775,11 +49737,20 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "00000000-0000-0000-0000-000000000127";
-        let (gateway_url, requests, server) = spawn_gateway(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            json!({"error": {"message": "upstream exploded"}}),
-        )
+        let response = json!({"error": {"message": "upstream exploded"}});
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "execute_turn_persists_full_journal_error_response_when_session_capture_enabled",
+            |request| request.path == "/v1/chat/completions",
+            (0..crate::turn::llm::client::LLM_MAX_RETRIES + 1)
+                .map(|_| ProviderResponse::Json {
+                    status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    body: response.clone(),
+                })
+                .collect(),
+        )])
         .await;
+        let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
+        let requests = provider.requests.clone();
 
         let mut host = test_host_builder("user-journal", session_id.to_string())
             .with_edge_tools(sample_edge_tools())
@@ -49999,7 +49970,7 @@ mod tests {
         );
 
         inference_ledger.assert_quiescent();
-        server.abort();
+        provider.assert_complete();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -50010,19 +49981,25 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "00000000-0000-0000-0000-000000000128";
-        let (gateway_url, requests, server) = spawn_gateway(
-            axum::http::StatusCode::OK,
-            json!({
-                "choices": [
-                    {
-                        "message": { "content": "journal capture reply" },
-                        "finish_reason": "stop"
-                    }
-                ],
-                "usage": { "prompt_tokens": 12, "completion_tokens": 5 }
-            }),
-        )
+        let response = json!({
+            "choices": [
+                {
+                    "message": { "content": "journal capture reply" },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": { "prompt_tokens": 12, "completion_tokens": 5 }
+        });
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "execute_turn_does_not_persist_full_journal_events_when_session_capture_disabled",
+            |request| request.path == "/v1/chat/completions",
+            (0..1)
+                .map(|_| ProviderResponse::OpenAi(response.clone()))
+                .collect(),
+        )])
         .await;
+        let gateway_url = format!("{}/v1/chat/completions", provider.base_url);
+        let requests = provider.requests.clone();
 
         let mut host = test_host_builder("user-journal", session_id.to_string())
             .with_edge_tools(sample_edge_tools())
@@ -50074,7 +50051,7 @@ mod tests {
         assert_eq!(gateway_requests.len(), 1, "one upstream request expected");
 
         inference_ledger.assert_quiescent();
-        server.abort();
+        provider.assert_complete();
     }
 
     #[cfg(feature = "e2e-hooks")]
@@ -50135,14 +50112,20 @@ mod tests {
 
     #[tokio::test]
     async fn delegation_selector_respects_route_ceiling_without_primary_fallback() {
-        let (url, requests, server) = spawn_gateway(
-            axum::http::StatusCode::OK,
-            json!({
-                "choices": [{"message": {"content": "{\"disposition\":\"not_applicable\"}"}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-            }),
-        )
+        let response = json!({
+            "choices": [{"message": {"content": "{\"disposition\":\"not_applicable\"}"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "delegation_selector_respects_route_ceiling_without_primary_fallback",
+            |request| request.path == "/v1/chat/completions",
+            (0..3)
+                .map(|_| ProviderResponse::OpenAi(response.clone()))
+                .collect(),
+        )])
         .await;
+        let url = format!("{}/v1/chat/completions", provider.base_url);
+        let requests = provider.requests.clone();
         let state = create_test_state();
         for (cap, expected) in [(Some(128), 128), (Some(8192), 4096), (None, 4096)] {
             let mut execution = test_gateway_execution(url.clone(), Some(3000));
@@ -50180,19 +50163,29 @@ mod tests {
             let body = captured
                 .last()
                 .expect("the real route dispatched a request");
-            assert_eq!(body["max_completion_tokens"], expected);
+            assert_eq!(body.body["max_completion_tokens"], expected);
         }
         assert_eq!(requests.lock().await.len(), 3);
-        server.abort();
+        provider.assert_complete();
     }
 
     #[tokio::test]
     async fn delegation_selector_fallback_shares_retry_bound() {
-        let (url, requests, server) = spawn_gateway(
-            axum::http::StatusCode::BAD_REQUEST,
-            json!({"error":{"message":"fixture rejection","type":"invalid_request_error"}}),
-        )
+        let response =
+            json!({"error":{"message":"fixture rejection","type":"invalid_request_error"}});
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "delegation_selector_fallback_shares_retry_bound",
+            |request| request.path == "/v1/chat/completions",
+            (0..3)
+                .map(|_| ProviderResponse::Json {
+                    status: axum::http::StatusCode::BAD_REQUEST,
+                    body: response.clone(),
+                })
+                .collect(),
+        )])
         .await;
+        let url = format!("{}/v1/chat/completions", provider.base_url);
+        let requests = provider.requests.clone();
         for (primary_succeeds, partial_budget) in [(true, false), (false, false), (false, true)] {
             let execution = test_gateway_execution(url.clone(), Some(3000));
             let mut config = summary_test_config(String::new());
@@ -50240,7 +50233,7 @@ mod tests {
         }
         // HTTP 400 is permanent: one physical configured request per case.
         assert_eq!(requests.lock().await.len(), 3);
-        server.abort();
+        provider.assert_complete();
     }
 
     #[tokio::test]
@@ -50344,45 +50337,20 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn maybe_pre_turn_compact_requires_a_durable_inference_ledger() {
-        use axum::{Router, routing::post};
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-        use tokio::net::TcpListener;
-
         let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
 
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let request_count_for_handler = request_count.clone();
-        let app = Router::new().route(
-            "/gateway/chat/completions",
-            post(move || {
-                let request_count = request_count_for_handler.clone();
-                async move {
-                    request_count.fetch_add(1, AtomicOrdering::SeqCst);
-                    axum::Json(json!({
-                        "choices": [{
-                            "message": { "content": "inline summary" },
-                            "finish_reason": "stop"
-                        }],
-                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-                    }))
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("test server should run");
-        });
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "pre-turn inference must not dispatch",
+            |request| request.path == "/v1/chat/completions",
+            vec![],
+        )])
+        .await;
 
         let mut host = test_host_builder("user-inline", "session-inline")
             .with_edge_tools(sample_edge_tools())
             .with_execution_binding_snapshot(edge_runtime_snapshot())
             .build();
-        host.resolved_llm_config = Some(summary_test_config(format!("http://{addr}/gateway")));
+        host.resolved_llm_config = Some(summary_test_config(format!("{}/v1", provider.base_url)));
 
         let mut state = create_test_state();
         state.max_turn_input_tokens = 100;
@@ -50409,58 +50377,30 @@ mod tests {
             CompactionTier::Normal,
             "auxiliary inference must not bypass its durable admission ledger",
         );
-        assert_eq!(
-            request_count.load(AtomicOrdering::SeqCst),
-            0,
+        assert!(
+            provider.requests.lock().await.is_empty(),
             "provider I/O must not begin without durable admission material",
         );
 
-        server.abort();
+        provider.assert_complete();
     }
 
     #[tokio::test]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn maybe_pre_turn_compact_skips_gateway_when_provider_admission_is_enabled() {
-        use axum::{Router, routing::post};
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-        use tokio::net::TcpListener;
-
         let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
         let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
         let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
 
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let request_count_for_handler = request_count.clone();
-        let app = Router::new().route(
-            "/gateway/chat/completions",
-            post(move || {
-                let request_count = request_count_for_handler.clone();
-                async move {
-                    request_count.fetch_add(1, AtomicOrdering::SeqCst);
-                    axum::Json(json!({
-                        "choices": [
-                            {
-                                "message": { "content": "inline summary" },
-                                "finish_reason": "stop"
-                            }
-                        ],
-                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-                    }))
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("test server should run");
-        });
+        let provider = ProviderGateway::start(vec![ProviderScript::new(
+            "pre-turn inference must not dispatch",
+            |request| request.path == "/v1/chat/completions",
+            vec![],
+        )])
+        .await;
 
         let mut host = test_host_builder("user-inline", "session-inline").build();
-        host.resolved_llm_config = Some(summary_test_config(format!("http://{addr}/gateway")));
+        host.resolved_llm_config = Some(summary_test_config(format!("{}/v1", provider.base_url)));
 
         let mut state = create_test_state();
         state.max_turn_input_tokens = 100;
@@ -50484,13 +50424,12 @@ mod tests {
         assert!(event.is_none());
 
         assert_eq!(state.compact_tier_applied, CompactionTier::Normal);
-        assert_eq!(
-            request_count.load(AtomicOrdering::SeqCst),
-            0,
+        assert!(
+            provider.requests.lock().await.is_empty(),
             "capacity-aware default must not spend provider RPM on pre-turn LLM compaction"
         );
 
-        server.abort();
+        provider.assert_complete();
     }
 
     // ── progress_event_to_sse tests ──

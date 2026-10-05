@@ -13,21 +13,15 @@
 //! Local-only restore is a separate API path and intentionally never reads MatrixOne.
 //! Cloud restore is always owner-bound.
 
-use astra_core::is_duplicate_key_error;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use sqlx::{Acquire, Row};
 use std::collections::BTreeMap;
 
 use astra_core::canonical_names::{append_unique_names, normalize_name_list};
 
-use crate::{
-    CancellationSafePoolConnection, SessionArtifactJsonRecord, SessionArtifactJsonStore,
-    StoredSessionArtifact,
-};
+use crate::{SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact};
 
-const STEP_CHECKPOINT_NUMBER_OFFSET: u32 = 1_000_000_000;
 const MAX_CLOUD_RESTORE_CHECKPOINTS: u32 = 200;
 pub const COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND: &str = "composite_snapshot_index";
 pub const COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID: &str = "projection:composite-snapshot-index";
@@ -124,12 +118,6 @@ pub const PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL: &str = "\
           OR (r.run_id IS NOT NULL AND r.parent_run_id IS NULL) \
       ) \
     LIMIT 1";
-const PUSH_SESSION_STATE_INSERT_SQL: &str = "INSERT INTO agent_sessions \
-             (session_id, user_id, status, metadata, created_at, updated_at, last_active_at) \
-             VALUES (?, ?, 'active', ?, NOW(6), NOW(6), NOW(6))";
-const PUSH_SESSION_STATE_UPDATE_SQL: &str = "UPDATE agent_sessions \
-             SET metadata = ?, updated_at = NOW(6), last_active_at = NOW(6) \
-             WHERE user_id = ? AND session_id = ?";
 
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
@@ -196,9 +184,6 @@ fn mysql_i32(row: &impl SessionRestoreRow, context: &str, column: &str) -> Resul
 struct CloudRestoreTimings {
     session_query_ms: u64,
     heavy_checkpoint_ms: u64,
-    transcript_ms: u64,
-    context_trace_ms: u64,
-    recent_tools_ms: u64,
     total_ms: u64,
 }
 
@@ -210,9 +195,6 @@ impl CloudRestoreTimings {
             restored,
             session_query_ms = self.session_query_ms,
             heavy_checkpoint_ms = self.heavy_checkpoint_ms,
-            transcript_ms = self.transcript_ms,
-            context_trace_ms = self.context_trace_ms,
-            recent_tools_ms = self.recent_tools_ms,
             total_ms = self.total_ms,
             "cloud session restore timings"
         );
@@ -449,14 +431,6 @@ pub trait SessionRestoreService: Send + Sync {
         session_id: &str,
     ) -> Result<Vec<RestoredCheckpoint>, String>;
 
-    /// Restore session state to a specific checkpoint.
-    async fn restore_to_checkpoint(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        checkpoint_number: u32,
-    ) -> Result<Option<RestoredSession>, String>;
-
     /// List resumable sessions for a user (active or paused).
     async fn list_resumable_sessions(&self, user_id: &str) -> Result<Vec<RestoredSession>, String>;
 }
@@ -535,20 +509,6 @@ impl HybridRestoreService {
         self.list_checkpoints_inner(None, session_id).await
     }
 
-    /// Restore only local filesystem state to a checkpoint.
-    pub async fn restore_local_to_checkpoint(
-        &self,
-        session_id: &str,
-        checkpoint_number: u32,
-    ) -> Result<Option<RestoredSession>, String> {
-        let session = match self.restore_local_session(session_id).await? {
-            Some(session) => session,
-            None => return Ok(None),
-        };
-        let checkpoints = self.list_local_checkpoints(session_id).await?;
-        Self::apply_checkpoint(session_id, session, &checkpoints, checkpoint_number)
-    }
-
     async fn require_owned_cloud_session(
         &self,
         user_id: &str,
@@ -561,30 +521,6 @@ impl HybridRestoreService {
         crate::storage::agent_session_exists_for_user(pool, session_id, user_id)
             .await
             .map_err(|error| format!("session owner check: {error}"))
-    }
-
-    fn apply_checkpoint(
-        session_id: &str,
-        session: RestoredSession,
-        checkpoints: &[RestoredCheckpoint],
-        checkpoint_number: u32,
-    ) -> Result<Option<RestoredSession>, String> {
-        let Some(ckpt) = checkpoints
-            .iter()
-            .find(|checkpoint| checkpoint.number == checkpoint_number)
-        else {
-            return Err(format!(
-                "checkpoint {} not found for session {}",
-                checkpoint_number, session_id
-            ));
-        };
-        Ok(Some(RestoredSession {
-            turn_count: ckpt.turn,
-            total_tokens_in: ckpt.total_tokens,
-            total_tokens_out: 0,
-            checkpoint_count: checkpoint_number,
-            ..session
-        }))
     }
 
     async fn restore_session_inner(
@@ -880,33 +816,9 @@ impl HybridRestoreService {
                     .await?;
                 let heavy_checkpoint_ms = elapsed_ms(heavy_started_at);
 
-                let transcript_started_at = std::time::Instant::now();
-                let transcript_messages = match heavy_state.as_ref() {
-                    Some(heavy) if !heavy.messages.is_empty() => Vec::new(),
-                    _ => {
-                        self.restore_cloud_transcript_messages(user_id, session_id)
-                            .await?
-                    }
-                };
-                let transcript_ms = elapsed_ms(transcript_started_at);
-
-                // Context traces are asynchronous diagnostics and currently
-                // carry no conversation cursor. Do not query or hydrate them
-                // on the causal resume path.
-                let context_trace_ms = 0;
-
-                // Recent-tool state influences prompt assembly, so only the
-                // checkpoint copy carrying the selected conversation cursor
-                // is admissible. Do not issue another unversioned projection
-                // query and then splice its result into this generation.
-                let recent_tools_ms = 0;
-
                 CloudRestoreTimings {
                     session_query_ms,
                     heavy_checkpoint_ms,
-                    transcript_ms,
-                    context_trace_ms,
-                    recent_tools_ms,
                     total_ms: elapsed_ms(started_at),
                 }
                 .emit(session_id, true);
@@ -926,7 +838,7 @@ impl HybridRestoreService {
                         std::mem::take(&mut heavy.messages)
                     })
                     .filter(|messages| !messages.is_empty())
-                    .unwrap_or(transcript_messages);
+                    .unwrap_or_default();
                 let resume_bundle = build_resume_bundle(
                     user_id,
                     session_id,
@@ -1042,78 +954,6 @@ impl HybridRestoreService {
             return Ok(None);
         };
         parse_cloud_heavy_checkpoint_state(&state_json)
-    }
-
-    async fn restore_cloud_transcript_messages(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<Vec<serde_json::Value>, String> {
-        let pool = match &self.pool {
-            Some(p) => p,
-            None => return Ok(Vec::new()),
-        };
-
-        let rows = sqlx::query(PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL)
-            .bind(session_id)
-            .bind(user_id)
-            .bind(MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| format!("restore_cloud_transcript_messages: {e}"))?;
-
-        let mut messages = Vec::new();
-        for (index, row) in rows.iter().enumerate() {
-            let role = mysql_string(row, "restore_cloud_transcript_messages", "role")?;
-            let content = mysql_string(row, "restore_cloud_transcript_messages", "content")?;
-            let has_prompt_content = !content.trim().is_empty();
-            // This fallback restores only prompt-safe rows. Canonical
-            // transcript restoration owns complete assistant/tool-call
-            // reconstruction; bare tool evidence never consumes this bounded
-            // provider-history quota.
-            if prompt_history_role_is_provider_safe(&role, has_prompt_content) {
-                messages.push(serde_json::json!({
-                    "role": role,
-                    "content": content,
-                }));
-            }
-            let run_id = row
-                .try_get::<Option<String>, _>("run_id")
-                .map_err(|e| format!("restore_cloud_transcript_messages.run_id: {e}"))?;
-            let next_run_id = rows
-                .get(index + 1)
-                .and_then(|next| next.try_get::<Option<String>, _>("run_id").ok().flatten());
-            let run_status = row
-                .try_get::<Option<String>, _>("run_status")
-                .map_err(|e| format!("restore_cloud_transcript_messages.run_status: {e}"))?;
-            if let Some(boundary) = prompt_history_boundary_after_message(
-                &role,
-                has_prompt_content,
-                run_id.as_deref(),
-                next_run_id.as_deref(),
-                run_status.as_deref(),
-            ) {
-                messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": boundary,
-                }));
-            }
-        }
-        if astra_core::history_work::instrumentation_enabled() {
-            match astra_core::history_work::serialized_bytes(&messages) {
-                Ok(bytes) => astra_core::history_work::record_operation(
-                    astra_core::history_work::HistoryWorkSite::SessionRestoreTranscriptHydration,
-                    bytes,
-                    rows.len().try_into().unwrap_or(u64::MAX),
-                    0,
-                ),
-                Err(error) => astra_core::history_work::record_serialization_failure(
-                    astra_core::history_work::HistoryWorkSite::SessionRestoreTranscriptHydration,
-                    &error,
-                ),
-            }
-        }
-        Ok(messages)
     }
 
     /// List checkpoints from MatrixOne.
@@ -1893,20 +1733,6 @@ impl SessionRestoreService for HybridRestoreService {
         self.list_checkpoints_inner(Some(user_id), session_id).await
     }
 
-    async fn restore_to_checkpoint(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        checkpoint_number: u32,
-    ) -> Result<Option<RestoredSession>, String> {
-        let session = match self.restore_session(user_id, session_id).await? {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-        let checkpoints = self.list_checkpoints(user_id, session_id).await?;
-        Self::apply_checkpoint(session_id, session, &checkpoints, checkpoint_number)
-    }
-
     async fn list_resumable_sessions(&self, user_id: &str) -> Result<Vec<RestoredSession>, String> {
         let pool = match &self.pool {
             Some(p) => p,
@@ -2007,565 +1833,6 @@ impl SessionRestoreService for HybridRestoreService {
     }
 }
 
-// ─── MatrixOneSyncService push methods ─────────────────────────────────────
-
-impl crate::state_sync::MatrixOneSyncService {
-    /// Push a checkpoint to MatrixOne for cross-device availability.
-    pub async fn push_checkpoint(
-        &self,
-        session_id: &str,
-        user_id: &str,
-        checkpoint: &super::session_checkpoint::Checkpoint,
-    ) -> Result<(), String> {
-        let started_at = std::time::Instant::now();
-        let checkpoint_id = uuid::Uuid::new_v4().to_string();
-        let tools_json = checkpoint_tools_json(checkpoint);
-
-        let payload_size = checkpoint.title.len() + checkpoint.summary.len() + tools_json.len();
-
-        let log_result = |status: &str, error_msg: Option<&str>| {
-            log_checkpoint_sync(
-                &self.audit,
-                checkpoint.number,
-                SessionSyncLogEntry {
-                    user_id,
-                    session_id,
-                    sync_type: "checkpoint",
-                    payload_size,
-                    duration_ms: Some(elapsed_ms(started_at)),
-                    status,
-                    error_msg,
-                },
-            );
-        };
-
-        match crate::storage::agent_session_exists_for_user(&self.pool, session_id, user_id).await {
-            Ok(true) => {}
-            Ok(false) => {
-                let err = "push_checkpoint owner mismatch".to_string();
-                log_result("error", Some(&err));
-                return Err(err);
-            }
-            Err(e) => {
-                let err = format!("push_checkpoint owner check: {e}");
-                log_result("error", Some(&err));
-                return Err(err);
-            }
-        }
-
-        let updated = match sqlx::query(
-            "UPDATE session_checkpoints SET \
-                turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
-                had_stalls = ?, error_count = ? \
-             WHERE user_id = ? AND session_id = ? AND number = ?",
-        )
-        .bind(checkpoint.turn as i32)
-        .bind(&checkpoint.title)
-        .bind(&checkpoint.summary)
-        .bind(&tools_json)
-        .bind(checkpoint.total_tokens as i64)
-        .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
-        .bind(checkpoint.error_count as i32)
-        .bind(user_id)
-        .bind(session_id)
-        .bind(checkpoint.number as i32)
-        .execute(&self.pool)
-        .await
-        {
-            Ok(u) => u,
-            Err(e) => {
-                let err = format!("push_checkpoint update: {e}");
-                log_result("error", Some(&err));
-                return Err(err);
-            }
-        };
-
-        if updated.rows_affected() == 0 {
-            let inserted = sqlx::query(
-                "INSERT INTO session_checkpoints \
-                 (checkpoint_id, session_id, user_id, number, turn, title, summary, \
-                  tools_json, total_tokens, had_stalls, error_count, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-            )
-            .bind(&checkpoint_id)
-            .bind(session_id)
-            .bind(user_id)
-            .bind(checkpoint.number as i32)
-            .bind(checkpoint.turn as i32)
-            .bind(&checkpoint.title)
-            .bind(&checkpoint.summary)
-            .bind(&tools_json)
-            .bind(checkpoint.total_tokens as i64)
-            .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
-            .bind(checkpoint.error_count as i32)
-            .execute(&self.pool)
-            .await;
-
-            if let Err(e) = inserted {
-                if is_duplicate_key_error(&e) {
-                    let retry = sqlx::query(
-                        "UPDATE session_checkpoints SET \
-                            turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
-                            had_stalls = ?, error_count = ? \
-             WHERE user_id = ? AND session_id = ? AND number = ?",
-                    )
-                    .bind(checkpoint.turn as i32)
-                    .bind(&checkpoint.title)
-                    .bind(&checkpoint.summary)
-                    .bind(&tools_json)
-                    .bind(checkpoint.total_tokens as i64)
-                    .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
-                    .bind(checkpoint.error_count as i32)
-                    .bind(user_id)
-                    .bind(session_id)
-                    .bind(checkpoint.number as i32)
-                    .execute(&self.pool)
-                    .await;
-                    match retry {
-                        Ok(updated) if updated.rows_affected() > 0 => {}
-                        Ok(_) => {
-                            let err = "push_checkpoint owner mismatch".to_string();
-                            log_result("error", Some(&err));
-                            return Err(err);
-                        }
-                        Err(e) => {
-                            let err = format!("push_checkpoint retry update: {e}");
-                            log_result("error", Some(&err));
-                            return Err(err);
-                        }
-                    }
-                } else {
-                    let err = format!("push_checkpoint insert: {e}");
-                    log_result("error", Some(&err));
-                    return Err(err);
-                }
-            }
-        }
-
-        log_result("success", None);
-        Ok(())
-    }
-
-    /// Push a Step Protocol checkpoint to MatrixOne with full state_json.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn push_step_checkpoint(
-        &self,
-        session_id: &str,
-        user_id: &str,
-        checkpoint_number: u32,
-        turn: u32,
-        tier: &str,
-        title: &str,
-        tools_json: &str,
-        state_json: &str,
-    ) -> Result<(), String> {
-        let started_at = std::time::Instant::now();
-        let checkpoint_id = uuid::Uuid::new_v4().to_string();
-        let cloud_number = cloud_step_checkpoint_number(checkpoint_number)?;
-        let payload_size = title.len() + tier.len() + tools_json.len() + state_json.len();
-
-        let log_result = |status: &str, error_msg: Option<&str>| {
-            log_checkpoint_sync(
-                &self.audit,
-                checkpoint_number,
-                SessionSyncLogEntry {
-                    user_id,
-                    session_id,
-                    sync_type: "step_checkpoint",
-                    payload_size,
-                    duration_ms: Some(elapsed_ms(started_at)),
-                    status,
-                    error_msg,
-                },
-            );
-        };
-
-        match crate::storage::agent_session_exists_for_user(&self.pool, session_id, user_id).await {
-            Ok(true) => {}
-            Ok(false) => {
-                let err = "push_step_checkpoint owner mismatch".to_string();
-                log_result("error", Some(&err));
-                return Err(err);
-            }
-            Err(e) => {
-                let err = format!("push_step_checkpoint owner check: {e}");
-                log_result("error", Some(&err));
-                return Err(err);
-            }
-        }
-
-        let updated = match sqlx::query(
-            "UPDATE session_checkpoints SET \
-                turn = ?, title = ?, summary = ?, tools_json = ?, state_json = ? \
-	             WHERE user_id = ? AND session_id = ? AND number = ?",
-        )
-        .bind(turn as i32)
-        .bind(title)
-        .bind(tier)
-        .bind(tools_json)
-        .bind(state_json)
-        .bind(user_id)
-        .bind(session_id)
-        .bind(cloud_number)
-        .execute(&self.pool)
-        .await
-        {
-            Ok(updated) => updated,
-            Err(e) => {
-                let err = format!("push_step_checkpoint update: {e}");
-                log_result("error", Some(&err));
-                return Err(err);
-            }
-        };
-
-        if updated.rows_affected() == 0 {
-            let inserted = sqlx::query(
-                "INSERT INTO session_checkpoints \
-                 (checkpoint_id, session_id, user_id, number, turn, title, summary, \
-                  tools_json, state_json, total_tokens, had_stalls, error_count, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, NOW())",
-            )
-            .bind(&checkpoint_id)
-            .bind(session_id)
-            .bind(user_id)
-            .bind(cloud_number)
-            .bind(turn as i32)
-            .bind(title)
-            .bind(tier)
-            .bind(tools_json)
-            .bind(state_json)
-            .execute(&self.pool)
-            .await;
-
-            if let Err(e) = inserted {
-                if is_duplicate_key_error(&e) {
-                    let retry = sqlx::query(
-                        "UPDATE session_checkpoints SET \
-                            turn = ?, title = ?, summary = ?, tools_json = ?, state_json = ? \
-                         WHERE user_id = ? AND session_id = ? AND number = ?",
-                    )
-                    .bind(turn as i32)
-                    .bind(title)
-                    .bind(tier)
-                    .bind(tools_json)
-                    .bind(state_json)
-                    .bind(user_id)
-                    .bind(session_id)
-                    .bind(cloud_number)
-                    .execute(&self.pool)
-                    .await;
-                    match retry {
-                        Ok(updated) if updated.rows_affected() > 0 => {}
-                        Ok(_) => {
-                            let err = "push_step_checkpoint owner mismatch".to_string();
-                            log_result("error", Some(&err));
-                            return Err(err);
-                        }
-                        Err(error) => {
-                            let err = format!("push_step_checkpoint retry update: {error}");
-                            log_result("error", Some(&err));
-                            return Err(err);
-                        }
-                    }
-                } else {
-                    let err = format!("push_step_checkpoint insert: {e}");
-                    log_result("error", Some(&err));
-                    return Err(err);
-                }
-            }
-        }
-
-        log_result("success", None);
-        Ok(())
-    }
-
-    /// Push resumable session state to cloud via the agent_sessions.metadata JSON column.
-    pub async fn push_session_state(
-        &self,
-        session_id: &str,
-        user_id: &str,
-        git_branch: Option<&str>,
-        model: Option<&str>,
-    ) -> Result<(), String> {
-        let started_at = std::time::Instant::now();
-        let result: Result<usize, String> = async {
-            let mut connection = CancellationSafePoolConnection::acquire(&self.pool)
-                .await
-                .map_err(|e| format!("push_session_state acquire connection: {e}"))?;
-            let mut tx = connection
-                .connection_mut()
-                .begin()
-                .await
-                .map_err(|e| format!("push_session_state begin: {e}"))?;
-            crate::storage::lock_agent_session_write_fence(&mut tx, session_id, user_id)
-                .await
-                .map_err(|e| format!("push_session_state lifecycle fence: {e}"))?;
-            let existing_metadata_row = sqlx::query(
-                "SELECT CAST(metadata AS CHAR) AS metadata_json \
-                 FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| format!("push_session_state load owner state: {e}"))?;
-            let existing_metadata_json = existing_metadata_row
-                .as_ref()
-                .map(|row| mysql_optional_string(row, "push_session_state", "metadata_json"))
-                .transpose()?
-                .flatten();
-            let metadata_json =
-                merge_session_state_metadata(existing_metadata_json.as_deref(), git_branch, model)?;
-
-            if existing_metadata_row.is_some() {
-                sqlx::query(PUSH_SESSION_STATE_UPDATE_SQL)
-                    .bind(&metadata_json)
-                    .bind(user_id)
-                    .bind(session_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| format!("push_session_state update: {e}"))?;
-            } else {
-                sqlx::query(PUSH_SESSION_STATE_INSERT_SQL)
-                    .bind(session_id)
-                    .bind(user_id)
-                    .bind(&metadata_json)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| format!("push_session_state insert: {e}"))?;
-            }
-            tx.commit()
-                .await
-                .map_err(|e| format!("push_session_state commit: {e}"))?;
-            connection.release();
-            Ok(metadata_json.len())
-        }
-        .await;
-
-        let (status, error_msg) = match &result {
-            Ok(_) => ("success", None),
-            Err(e) => ("error", Some(e.as_str())),
-        };
-        log_session_sync(
-            &self.audit,
-            SessionSyncLogEntry {
-                user_id,
-                session_id,
-                sync_type: "session_state",
-                payload_size: result.as_ref().copied().unwrap_or(0),
-                duration_ms: Some(elapsed_ms(started_at)),
-                status,
-                error_msg,
-            },
-        );
-
-        result.map(|_| ())
-    }
-
-    /// Push a structured context-trace signal as a first-class cloud event.
-    pub async fn push_context_trace_signal(
-        &self,
-        session_id: &str,
-        user_id: &str,
-        signal: &super::session_workspace::ContextTraceSignal,
-    ) -> Result<(), String> {
-        let started_at = std::time::Instant::now();
-        let metadata_json = serde_json::to_string(signal)
-            .map_err(|e| format!("serialize context_trace_signal: {e}"))?;
-        let duration_ms = signal
-            .timing
-            .as_ref()
-            .map(|timing| timing.total_ms.min(i32::MAX as u64) as i32);
-        let content = {
-            let preview = signal.preview();
-            if preview.is_empty() {
-                "context trace signal".to_string()
-            } else {
-                preview
-            }
-        };
-        let payload_size = metadata_json.len() + content.len();
-
-        let log_result = |status: &str, error_msg: Option<&str>| {
-            log_session_sync(
-                &self.audit,
-                SessionSyncLogEntry {
-                    user_id,
-                    session_id,
-                    sync_type: "context_trace",
-                    payload_size,
-                    duration_ms: Some(elapsed_ms(started_at)),
-                    status,
-                    error_msg,
-                },
-            );
-        };
-
-        let event_id = uuid::Uuid::now_v7().to_string();
-        let mut connection = match CancellationSafePoolConnection::acquire(&self.pool).await {
-            Ok(connection) => connection,
-            Err(e) => {
-                let err = format!("push_context_trace_signal acquire connection: {e}");
-                log_result("error", Some(&err));
-                return Err(err);
-            }
-        };
-        let mut tx = match connection.begin().await {
-            Ok(tx) => tx,
-            Err(e) => {
-                let err = format!("push_context_trace_signal begin transaction: {e}");
-                log_result("error", Some(&err));
-                return Err(err);
-            }
-        };
-        if let Err(e) =
-            crate::storage::admit_session_event_write(&mut tx, session_id, user_id, true).await
-        {
-            let err = format!("push_context_trace_signal session admission: {e}");
-            log_result("error", Some(&err));
-            return Err(err);
-        }
-
-        let meta_tool_name = signal
-            .tool_surface
-            .as_ref()
-            .and_then(|selection| selection.visible_tools.first().cloned());
-        let payload_hash = crate::observation_capture::canonical_observation_payload_hash(
-            crate::observation_capture::ObservationPayloadDomain::AgentEvent,
-            &serde_json::json!({
-                "event_id": event_id,
-                "session_id": session_id,
-                "user_id": user_id,
-                "agent_id": "astra-cli",
-                "agent_version": env!("CARGO_PKG_VERSION"),
-                "event_type": "context_trace_signal",
-                "content": content,
-                "parent_event_id": null,
-                "causal_chain_id": signal.turn_id,
-                "metadata": serde_json::from_str::<serde_json::Value>(&metadata_json)
-                    .map_err(|error| format!("context trace metadata: {error}"))?,
-                "reasoning_content": null,
-                "meta_tool_name": meta_tool_name,
-                "meta_duration_ms": duration_ms,
-            }),
-        );
-        let insert_result = match sqlx::query(
-            "INSERT INTO agent_events \
-             (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
-              parent_event_id, causal_chain_id, metadata, reasoning_content, meta_tool_name, \
-              meta_duration_ms, payload_hash, ingestion_write_id, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-        )
-        .bind(&event_id)
-        .bind(session_id)
-        .bind(user_id)
-        .bind("astra-cli")
-        .bind(env!("CARGO_PKG_VERSION"))
-        .bind("context_trace_signal")
-        .bind(content)
-        .bind(None::<String>)
-        .bind(&signal.turn_id)
-        .bind(metadata_json)
-        .bind(None::<String>)
-        .bind(meta_tool_name)
-        .bind(duration_ms)
-        .bind(payload_hash)
-        .bind(uuid::Uuid::new_v4().to_string())
-        .execute(&mut *tx)
-        .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                let err = format!("push_context_trace_signal insert event: {e}");
-                log_result("error", Some(&err));
-                return Err(err);
-            }
-        };
-        let inserted_events = match i64::try_from(insert_result.rows_affected()) {
-            Ok(count) if count > 0 => count,
-            Ok(_) => {
-                let err = "push_context_trace_signal inserted no event rows".to_string();
-                log_result("error", Some(&err));
-                return Err(err);
-            }
-            Err(_) => {
-                let err = "push_context_trace_signal inserted row count overflow".to_string();
-                log_result("error", Some(&err));
-                return Err(err);
-            }
-        };
-
-        if let Err(e) = crate::storage::bump_agent_session_event_count(
-            &mut *tx,
-            session_id,
-            user_id,
-            inserted_events,
-            Some(&event_id),
-        )
-        .await
-        {
-            let err = format!("push_context_trace_signal event_count delta: {e}");
-            log_result("error", Some(&err));
-            return Err(err);
-        }
-
-        if let Err(e) = tx.commit().await {
-            let err = format!("push_context_trace_signal commit: {e}");
-            log_result("error", Some(&err));
-            return Err(err);
-        }
-        connection.release();
-
-        log_result("success", None);
-        Ok(())
-    }
-}
-
-fn checkpoint_tools_json(checkpoint: &super::session_checkpoint::Checkpoint) -> String {
-    let tools_used = normalize_name_list(checkpoint.tools_used.iter().map(String::as_str));
-    serde_json::to_string(&tools_used).expect("canonical checkpoint tools must serialize")
-}
-
-struct SessionSyncLogEntry<'a> {
-    user_id: &'a str,
-    session_id: &'a str,
-    sync_type: &'a str,
-    payload_size: usize,
-    duration_ms: Option<u64>,
-    status: &'a str,
-    error_msg: Option<&'a str>,
-}
-
-fn log_session_sync(audit: &crate::state_sync::SyncAuditWriter, entry: SessionSyncLogEntry<'_>) {
-    audit.log(crate::state_sync::SyncAuditEntry {
-        user_id: entry.user_id.to_string(),
-        session_id: entry.session_id.to_string(),
-        sync_type: entry.sync_type.to_string(),
-        direction: crate::state_sync::SyncDirection::Push,
-        payload_size: entry.payload_size,
-        duration_ms: entry.duration_ms,
-        status: entry.status.to_string(),
-        error_message: entry.error_msg.map(|s| s.to_string()),
-    });
-}
-
-fn log_checkpoint_sync(
-    audit: &crate::state_sync::SyncAuditWriter,
-    checkpoint_number: u32,
-    entry: SessionSyncLogEntry<'_>,
-) {
-    let error_with_number = entry
-        .error_msg
-        .map(|e| format!("[checkpoint #{}] {}", checkpoint_number, e));
-    log_session_sync(
-        audit,
-        SessionSyncLogEntry {
-            error_msg: error_with_number.as_deref().or(entry.error_msg),
-            ..entry
-        },
-    );
-}
-
 /// Pull the latest Heavy step checkpoint JSON from MatrixOne for session recovery.
 /// Returns the raw state_json string — caller deserializes to StepCheckpoint.
 pub async fn pull_step_checkpoint_from_cloud(
@@ -2597,75 +1864,7 @@ pub async fn pull_step_checkpoint_from_cloud(
     }
 }
 
-// ─── Plan State Cloud Sync ──────────────────────────────────────────────────
-
-fn cloud_step_checkpoint_number(checkpoint_number: u32) -> Result<i32, String> {
-    let namespaced = STEP_CHECKPOINT_NUMBER_OFFSET
-        .checked_add(checkpoint_number)
-        .ok_or_else(|| format!("step checkpoint number overflow: {checkpoint_number}"))?;
-    i32::try_from(namespaced)
-        .map_err(|_| format!("step checkpoint number out of range: {namespaced}"))
-}
-
-fn merge_session_state_metadata(
-    existing_metadata_json: Option<&str>,
-    git_branch: Option<&str>,
-    model: Option<&str>,
-) -> Result<String, String> {
-    let mut metadata = session_metadata_object_for_merge(existing_metadata_json)?;
-
-    if let Some(branch) = git_branch {
-        metadata.insert(
-            "git_branch".to_string(),
-            serde_json::Value::String(branch.to_string()),
-        );
-    } else {
-        metadata.remove("git_branch");
-    }
-
-    if let Some(model) = astra_core::model_override::normalize_model_override(model) {
-        metadata.insert(
-            "model".to_string(),
-            serde_json::Value::String(model.to_string()),
-        );
-    } else {
-        metadata.remove("model");
-    }
-
-    Ok(serde_json::Value::Object(metadata).to_string())
-}
-
-fn session_metadata_object_for_merge(
-    existing_metadata_json: Option<&str>,
-) -> Result<serde_json::Map<String, serde_json::Value>, String> {
-    let Some(metadata) = existing_metadata_json
-        .map(str::trim)
-        .filter(|raw| !raw.is_empty())
-    else {
-        return Ok(serde_json::Map::new());
-    };
-    let parsed: serde_json::Value = serde_json::from_str(metadata).map_err(|e| {
-        let prefix = &metadata[..metadata.len().min(200)];
-        format!("session metadata JSON parse failed before merge: {e}; payload_prefix={prefix:?}")
-    })?;
-    parsed.as_object().cloned().ok_or_else(|| {
-        format!(
-            "session metadata JSON must be an object before merge, got {}",
-            value_type_name(&parsed)
-        )
-    })
-}
-
-fn value_type_name(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "bool",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
+// ─── Session Metadata Decoding ──────────────────────────────────────────────
 
 pub fn extract_session_state_from_metadata(
     metadata_json: &str,
@@ -2906,52 +2105,6 @@ mod tests {
                 "error should identify decode context: {err}"
             );
         }
-    }
-
-    #[test]
-    fn push_session_state_writes_only_the_owner_scoped_identity() {
-        let insert = PUSH_SESSION_STATE_INSERT_SQL;
-        let update = PUSH_SESSION_STATE_UPDATE_SQL;
-        assert!(
-            insert.contains("VALUES (?, ?, 'active', ?, NOW(6), NOW(6), NOW(6))"),
-            "insert path must target the owner-bound (user_id, session_id) primary key directly"
-        );
-        assert!(
-            !insert.contains("ON DUPLICATE KEY") && !update.contains("ON DUPLICATE KEY"),
-            "the fence-locked owner lookup, not upsert row-count behavior, selects the write path"
-        );
-        assert!(
-            !insert.contains("user_id <>") && !update.contains("user_id <>"),
-            "owner-bound sessions must allow different users to persist the same logical session_id independently"
-        );
-        assert!(
-            !insert.contains("WHERE NOT EXISTS") && !update.contains("WHERE NOT EXISTS"),
-            "insert path must not retain the old global-session-id guard"
-        );
-        assert!(
-            update.contains("WHERE user_id = ? AND session_id = ?"),
-            "updates must be scoped by the complete owner identity"
-        );
-        assert!(!update.contains("status ="));
-    }
-
-    #[test]
-    fn cloud_restore_timings_are_structured_segments() {
-        let timings = CloudRestoreTimings {
-            session_query_ms: 1,
-            heavy_checkpoint_ms: 2,
-            transcript_ms: 3,
-            context_trace_ms: 4,
-            recent_tools_ms: 5,
-            total_ms: 8,
-        };
-
-        assert_eq!(timings.session_query_ms, 1);
-        assert_eq!(timings.heavy_checkpoint_ms, 2);
-        assert_eq!(timings.transcript_ms, 3);
-        assert_eq!(timings.context_trace_ms, 4);
-        assert_eq!(timings.recent_tools_ms, 5);
-        assert_eq!(timings.total_ms, 8);
     }
 
     #[test]
@@ -3232,18 +2385,6 @@ mod tests {
         let svc = HybridRestoreService::local_only();
         let sessions = svc.list_resumable_sessions("user1").await.unwrap();
         assert!(sessions.is_empty());
-    }
-
-    #[tokio::test]
-    async fn restore_to_nonexistent_checkpoint_errors() {
-        let svc = HybridRestoreService::local_only();
-        let result = svc.restore_local_to_checkpoint("nonexistent", 5).await;
-        // Either None (session not found) or Error (checkpoint not found)
-        match result {
-            Ok(None) => {} // session not found → ok
-            Err(_) => {}   // checkpoint not found → ok
-            Ok(Some(_)) => panic!("should not restore from nonexistent"),
-        }
     }
 
     // ── Integration-style test with real workspace ──
@@ -3950,16 +3091,6 @@ mod tests {
         assert_eq!(merged[0].total_tokens, 1234);
     }
 
-    #[tokio::test]
-    async fn local_only_restore_to_checkpoint_session_not_found() {
-        let svc = HybridRestoreService::local_only();
-        // Session doesn't exist → returns Ok(None)
-        let result = svc
-            .restore_local_to_checkpoint("nonexistent-session-id", 1)
-            .await;
-        assert!(matches!(result, Ok(None)));
-    }
-
     // ── Restore field completeness ──
 
     #[test]
@@ -4246,206 +3377,6 @@ mod tests {
             .expect("SharedPool::new")
     }
 
-    async fn cleanup_prompt_history_restore_fixture(
-        pool: &astra_core::SharedPool,
-        user_id: &str,
-        session_id: &str,
-    ) {
-        for sql in [
-            "DELETE FROM session_transcript_items WHERE user_id = ? AND session_id = ?",
-            "DELETE FROM agent_runs WHERE user_id = ? AND session_id = ?",
-            "DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?",
-        ] {
-            let _ = sqlx::query(sql)
-                .bind(user_id)
-                .bind(session_id)
-                .execute(pool.get())
-                .await;
-        }
-    }
-
-    async fn insert_prompt_history_restore_session(
-        pool: &astra_core::SharedPool,
-        user_id: &str,
-        session_id: &str,
-    ) {
-        sqlx::query(
-            "INSERT INTO agent_sessions (session_id, user_id, status, created_at, updated_at, last_active_at)
-             VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .execute(pool.get())
-        .await
-        .expect("insert restore fixture session");
-    }
-
-    async fn insert_prompt_history_restore_run(
-        pool: &astra_core::SharedPool,
-        user_id: &str,
-        session_id: &str,
-        run_id: &str,
-        parent_run_id: Option<&str>,
-        depth: i32,
-        status: &str,
-    ) {
-        let root_run_id = parent_run_id.unwrap_or(run_id);
-        let ancestor_path = match parent_run_id {
-            Some(parent) => format!("{parent}/{run_id}"),
-            None => run_id.to_string(),
-        };
-        sqlx::query(
-            "INSERT INTO agent_runs
-             (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(run_id)
-        .bind(user_id)
-        .bind(session_id)
-        .bind(parent_run_id)
-        .bind(root_run_id)
-        .bind(ancestor_path)
-        .bind(depth)
-        .bind(status)
-        .execute(pool.get())
-        .await
-        .expect("insert restore fixture run");
-    }
-
-    async fn insert_prompt_history_restore_transcript(
-        pool: &astra_core::SharedPool,
-        user_id: &str,
-        session_id: &str,
-        item_seq: i64,
-        run_id: Option<&str>,
-        role: &str,
-        content: &str,
-    ) {
-        sqlx::query(
-            "INSERT INTO session_transcript_items
-             (session_id, item_seq, user_id, run_id, role, content, content_hash, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        )
-        .bind(session_id)
-        .bind(item_seq)
-        .bind(user_id)
-        .bind(run_id)
-        .bind(role)
-        .bind(content)
-        .bind(format!("fixture:{item_seq}"))
-        .execute(pool.get())
-        .await
-        .expect("insert restore fixture transcript");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-    async fn prompt_history_transcript_restore_matches_real_run_lineage_and_limit_on_matrixone() {
-        let pool = setup_session_restore_db_it().await;
-        let user_id = format!("user-{}", uuid::Uuid::new_v4());
-        let session_id = format!("sess-{}", uuid::Uuid::new_v4());
-        let root_run_id = format!("root-{}", uuid::Uuid::new_v4());
-        let child_run_id = format!("child-{}", uuid::Uuid::new_v4());
-        cleanup_prompt_history_restore_fixture(&pool, &user_id, &session_id).await;
-
-        insert_prompt_history_restore_session(&pool, &user_id, &session_id).await;
-        insert_prompt_history_restore_run(
-            &pool,
-            &user_id,
-            &session_id,
-            &root_run_id,
-            None,
-            0,
-            "cancelled",
-        )
-        .await;
-        insert_prompt_history_restore_run(
-            &pool,
-            &user_id,
-            &session_id,
-            &child_run_id,
-            Some(&root_run_id),
-            1,
-            "completed",
-        )
-        .await;
-        for seq in 1..=90 {
-            insert_prompt_history_restore_transcript(
-                &pool,
-                &user_id,
-                &session_id,
-                seq,
-                Some(&root_run_id),
-                "user",
-                &format!("root-{seq:02}"),
-            )
-            .await;
-        }
-        insert_prompt_history_restore_transcript(
-            &pool,
-            &user_id,
-            &session_id,
-            905,
-            Some(&child_run_id),
-            "assistant",
-            "child-output-must-not-be-prompt-history",
-        )
-        .await;
-        insert_prompt_history_restore_transcript(
-            &pool,
-            &user_id,
-            &session_id,
-            91,
-            None,
-            "system",
-            "session-note",
-        )
-        .await;
-        for offset in 0..MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS {
-            insert_prompt_history_restore_transcript(
-                &pool,
-                &user_id,
-                &session_id,
-                1_000 + offset,
-                Some(&root_run_id),
-                "tool",
-                &format!("tool-tail-{offset}"),
-            )
-            .await;
-        }
-
-        let service = HybridRestoreService::new(pool.get().clone());
-        let messages = service
-            .restore_cloud_transcript_messages(&user_id, &session_id)
-            .await
-            .expect("restore transcript prompt history");
-
-        cleanup_prompt_history_restore_fixture(&pool, &user_id, &session_id).await;
-
-        assert_eq!(
-            messages.len(),
-            MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS as usize + 1,
-            "the bounded durable rows may add one synthetic terminal boundary"
-        );
-        assert_eq!(messages.first().unwrap()["content"], "root-12");
-        assert_eq!(messages.last().unwrap()["content"], "session-note");
-        assert!(messages.iter().any(|message| {
-            message["role"] == "system"
-                && message["content"]
-                    .as_str()
-                    .is_some_and(|content| content.contains("cancelled before completion"))
-        }));
-        assert!(
-            messages.iter().all(|message| {
-                message["content"].as_str() != Some("child-output-must-not-be-prompt-history")
-                    && !message["content"]
-                        .as_str()
-                        .is_some_and(|content| content.starts_with("tool-tail-"))
-            }),
-            "child output and bare tool rows are not main prompt history"
-        );
-    }
-
     #[serial_test::serial]
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
@@ -4527,26 +3458,7 @@ mod tests {
     // ── Checkpoint convergence ──
 
     #[test]
-    fn checkpoint_tools_json_for_cloud_push_is_canonical() {
-        let ckpt = crate::session_checkpoint::Checkpoint {
-            number: 3,
-            turn: 15,
-            title: "Phase A done".into(),
-            summary: "Token efficiency implemented".into(),
-            tools_used: vec![" bash ".into(), "bash".into(), "".into(), " grep".into()],
-            total_tokens: 50_000,
-            had_stalls: true,
-            error_count: 1,
-        };
-        assert_eq!(ckpt.number, 3);
-        assert_eq!(ckpt.turn, 15);
-        assert!(ckpt.had_stalls);
-        assert_eq!(ckpt.error_count, 1);
-        assert_eq!(checkpoint_tools_json(&ckpt), r#"["bash","grep"]"#);
-    }
-
-    #[test]
-    fn restored_checkpoint_covers_rewind_fields() {
+    fn restored_checkpoint_covers_listing_fields() {
         let ckpt = RestoredCheckpoint {
             number: 7,
             turn: 35,
@@ -4554,100 +3466,12 @@ mod tests {
             summary: "All tests passing after auth refactor".into(),
             total_tokens: 120_000,
         };
-        // Verify the fields needed for /rewind from cloud
+        // Keep the fields returned by cloud checkpoint listing.
         assert_eq!(ckpt.number, 7);
         assert_eq!(ckpt.turn, 35);
         assert!(!ckpt.title.is_empty());
         assert!(!ckpt.summary.is_empty());
         assert!(ckpt.total_tokens > 0);
-    }
-
-    // ── restore_to_checkpoint semantics ──
-
-    #[test]
-    fn restored_session_rewind_preserves_identity() {
-        // Simulate what restore_to_checkpoint does: rewind turn but keep session_id
-        let original = RestoredSession {
-            session_id: "s-rewind".into(),
-            turn_count: 20,
-            total_tokens_in: 80_000,
-            model: Some("gpt-4".into()),
-            ..Default::default()
-        };
-        let rewound = RestoredSession {
-            turn_count: 10,
-            total_tokens_in: 40_000,
-            checkpoint_count: 3,
-            ..original.clone()
-        };
-        assert_eq!(rewound.session_id, "s-rewind");
-        assert_eq!(rewound.model, Some("gpt-4".into()));
-        assert_eq!(rewound.turn_count, 10);
-        assert!(rewound.turn_count < original.turn_count);
-    }
-
-    #[test]
-    fn merge_session_state_metadata_preserves_unrelated_fields() {
-        let merged = merge_session_state_metadata(
-            Some(r#"{"agent_id":"astra-server","note":"keep me"}"#),
-            Some("main"),
-            Some("gpt-5.4"),
-        )
-        .unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        assert_eq!(
-            parsed.get("agent_id").and_then(|v| v.as_str()),
-            Some("astra-server")
-        );
-        assert_eq!(parsed.get("note").and_then(|v| v.as_str()), Some("keep me"));
-        assert_eq!(
-            parsed.get("git_branch").and_then(|v| v.as_str()),
-            Some("main")
-        );
-        assert_eq!(
-            parsed.get("model").and_then(|v| v.as_str()),
-            Some("gpt-5.4")
-        );
-    }
-
-    #[test]
-    fn merge_session_state_metadata_does_not_persist_symbolic_default_model() {
-        let merged = merge_session_state_metadata(
-            Some(r#"{"agent_id":"astra-server"}"#),
-            None,
-            Some(" default "),
-        )
-        .unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        assert!(parsed.get("model").is_none());
-    }
-
-    #[test]
-    fn merge_session_state_metadata_fails_loudly_on_corrupt_existing_metadata() {
-        let error = merge_session_state_metadata(Some("{not-json"), None, None).unwrap_err();
-
-        assert!(
-            error.contains("session metadata JSON parse failed before merge"),
-            "merge must report corrupt existing metadata: {error}"
-        );
-        assert!(
-            error.contains("payload_prefix"),
-            "merge error should include bounded payload context: {error}"
-        );
-    }
-
-    #[test]
-    fn merge_session_state_metadata_fails_loudly_on_non_object_existing_metadata() {
-        let error = merge_session_state_metadata(Some("[]"), None, None).unwrap_err();
-
-        assert!(
-            error.contains("session metadata JSON must be an object before merge"),
-            "merge must reject non-object metadata: {error}"
-        );
-        assert!(
-            error.contains("array"),
-            "merge error should identify the JSON type: {error}"
-        );
     }
 
     #[test]
@@ -4739,18 +3563,6 @@ mod tests {
     }
 
     #[test]
-    fn is_duplicate_key_error_non_database_error() {
-        let err = sqlx::Error::RowNotFound;
-        assert!(!astra_core::is_duplicate_key_error(&err));
-    }
-
-    #[test]
-    fn is_duplicate_key_error_detects_protocol_duplicate_wrapper() {
-        let fake_err = sqlx::Error::Protocol("1062: Duplicate entry 'test' for key".into());
-        assert!(astra_core::is_duplicate_key_error(&fake_err));
-    }
-
-    #[test]
     fn restored_session_conversation_messages_preserved() {
         let s = RestoredSession {
             session_id: "s1".into(),
@@ -4785,15 +3597,6 @@ mod tests {
         // Empty vecs should not appear in serialized JSON
         assert!(!json.contains("conversation_messages"));
         assert!(!json.contains("blocked_tools"));
-    }
-
-    #[test]
-    fn cloud_step_checkpoint_number_uses_disjoint_namespace() {
-        assert_eq!(
-            cloud_step_checkpoint_number(1).unwrap(),
-            1_000_000_001,
-            "step checkpoints should avoid the session-checkpoint number range"
-        );
     }
 
     #[test]

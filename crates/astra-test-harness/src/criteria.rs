@@ -7401,6 +7401,30 @@ mod tests {
             !wrong_stage[0].passed,
             "another rejection stage must not match"
         );
+
+        let case: crate::case::Case =
+            serde_yaml_ng::from_str(include_str!("../cases/fanout_completion_truth.yaml")).unwrap();
+        let no_extra_spawn = case.criteria.iter().find(|criterion| {
+            matches!(criterion, Criterion::JournalToolCallCount { name, .. } if name == "agent")
+        }).unwrap();
+        for (action, allowed) in [("wait", true), ("spawn", false)] {
+            let session = mk_session(&[(
+                "turn",
+                serde_json::json!({
+                    "tool_calls": [{
+                        "tool_call_id": "parent-control", "name": "agent", "ok": true,
+                        "args_full": serde_json::json!({"action": action}).to_string(),
+                        "result_full": "{}"
+                    }]
+                }),
+            )]);
+            let result = evaluate_deterministic_with_session(
+                std::slice::from_ref(no_extra_spawn),
+                &outcome_with_tools(&[]),
+                Some(&session),
+            );
+            assert_eq!(result[0].passed, allowed, "{action}: {result:?}");
+        }
     }
 
     #[test]

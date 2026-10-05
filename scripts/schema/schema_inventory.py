@@ -945,7 +945,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         semantic_owner="astra_services::state_sync",
         state_class="durable user preference fact",
         primary_query="preference read/update by user_id, pref_key, version, and updated_at; pull sync by user_id",
-        retention_policy="retain until the user or sync layer overwrites/deletes the preference; version increments are used for conflict detection",
+        retention_policy="retain until the user or sync layer overwrites/deletes the preference; versions describe updates; they are not compare-and-swap tokens",
         rebuildability="not rebuildable after pref_value and version are lost unless an external preference source exists",
         merge_guidance="keep separate from admin_config; user_preferences are per-user sync state while admin_config is server control-plane state",
         migration_owner="astra_services::storage / state_sync",
@@ -1112,23 +1112,23 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         product_owner="edge agent status, dispatch routing, no-sticky edge recovery",
     ),
     "plans": TableMetadata(
-        semantic_owner="runtime::server::plan_handlers / astra_services::state_sync",
+        semantic_owner="astra_plan::repository / runtime plan tools and lifecycle",
         state_class="durable plan execution state",
         primary_query="plan list/get/update by user_id, plan_id, session_id, phase, updated_at, and version",
-        retention_policy="retain while plan mode, rewind/redo, execution status, and edge/cloud sync need plan_json/plan_md; session hard delete removes owner/session plans after dependent plan_step_runs",
+        retention_policy="retain while plan mode, rewind/redo, and execution status need plan_json/plan_md; session hard delete removes owner/session plans after dependent plan_step_runs",
         rebuildability="not rebuildable after plan_json, plan_md, version, progress, and subtask_count are lost",
         merge_guidance="keep separate from plan_step_runs; plans own current mutable plan state while step runs are append-only attempt history",
-        migration_owner="astra_services::storage / runtime plan handlers",
-        product_owner="plan mode, plan execution, rewind/redo, edge sync",
+        migration_owner="astra_services::storage / astra_plan::repository",
+        product_owner="plan mode, plan execution, rewind/redo",
     ),
     "plan_step_runs": TableMetadata(
-        semantic_owner="runtime::server::plan_handlers / astra_services::state_sync",
+        semantic_owner="astra_plan::repository / runtime plan tools and lifecycle",
         state_class="durable plan step attempt audit fact",
         primary_query="step attempt history by user_id, plan_id, subtask_id, attempt, run_id, request_id, and started_at",
-        retention_policy="retain with parent plans while step status, retry history, artifacts, and edge/cloud sync need attempt chains; session hard delete removes rows before plans",
+        retention_policy="retain with parent plans while step status, retry history, and artifacts need attempt chains; session hard delete removes rows before plans",
         rebuildability="not rebuildable after attempt numbers, request_id, error, artifact_ref, and timing are lost",
         merge_guidance="keep separate from plans; this table is append-only attempt history with unique subtask attempt semantics",
-        migration_owner="astra_services::storage / runtime plan handlers",
+        migration_owner="astra_services::storage / astra_plan::repository",
         product_owner="plan step audit, retry/redo, execution history",
     ),
     "infra_sandbox_metadata": TableMetadata(
@@ -1759,13 +1759,13 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         candidate="session_sync_log",
         decision="removed",
         current_read_paths=[
-            "none; MatrixOneSyncService::status no longer queries audit storage",
+            "none; sync status comes from canonical outbox facts",
         ],
         current_write_paths=[
-            "none; SyncAuditWriter emits tracing debug events only",
+            "none; context trace facts are written through DatabaseEventService",
         ],
         user_api_impact=(
-            "sync audit is tracing-only; durable sync facts remain in domain tables, and "
+            "the retired sync audit has no storage; durable sync facts remain in domain tables, and "
             "sync status no longer depends on session_sync_log"
         ),
         migration_backfill=(

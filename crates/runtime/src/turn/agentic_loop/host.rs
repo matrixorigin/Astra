@@ -426,12 +426,6 @@ impl TurnIntentJudgeOutcome {
     }
 }
 
-pub enum ControlToolRecovery {
-    Unsupported,
-    Missing,
-    Recovered(Box<EdgeToolExecResult>),
-}
-
 /// Typed control outcome of publishing already-admitted provider tool calls.
 ///
 /// Edge delivery can discover a newer durable user intent at the same point
@@ -1152,27 +1146,6 @@ pub trait AgenticLoopHost: Send {
         astra_turn_core::capability::CapabilitySet::all()
     }
 
-    /// Recover a host-owned control-tool result when the LLM emitted a tool
-    /// call but the post-SSE edge result row is missing.
-    ///
-    /// This is intentionally host-scoped: replaying arbitrary missing tools
-    /// would duplicate side effects. Implementations must recover only from
-    /// an authoritative host state source, such as the multi-agent fanout
-    /// registry for `agent_fanout`, and must return [`ControlToolRecovery::Unsupported`]
-    /// for tool names they do not own. `prior_duration_ms` is the elapsed time
-    /// already charged to an unusable transport result, when one existed; a
-    /// recovered terminal event must add repair time instead of replacing it.
-    async fn recover_missing_control_tool_result(
-        &mut self,
-        _parent_run_id: Option<&str>,
-        _tool_call_id: &str,
-        _tool_name: &str,
-        _args: &Value,
-        _prior_duration_ms: Option<u64>,
-    ) -> ControlToolRecovery {
-        ControlToolRecovery::Unsupported
-    }
-
     /// Inject an additional tool schema into the host's tool list.
     ///
     /// Called by the runtime in the loop preamble to auto-register tools
@@ -1776,8 +1749,6 @@ pub struct SkillState {
     /// against this baseline so historical outcomes are not re-attributed to
     /// every later turn.
     pub quality_tracker_baseline: crate::skills::quality::SkillQualityTracker,
-    /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
-    pub improvement_tracker: astra_skills::improvement::ImprovementTracker,
     /// Skill listing message (available skill names + descriptions).
     /// Stored here instead of in `messages` so hosts can inject it ephemerally
     /// into each LLM request without bloating the persistent conversation history.
@@ -1802,7 +1773,6 @@ impl Default for SkillState {
             request_constraints: Default::default(),
             quality_tracker: Default::default(),
             quality_tracker_baseline: Default::default(),
-            improvement_tracker: Default::default(),
             listing_message: None,
             tool_event_hooks: Default::default(),
             session_event_hooks: Default::default(),
@@ -3874,13 +3844,6 @@ pub struct AgenticLoopState {
     /// Written to HeavyCheckpoint so approval decisions survive session restarts.
     pub approval_overrides: Option<astra_turn_core::approval_fingerprint::FingerprintedOverrides>,
 
-    // ── Confidence tracking ──
-    /// Tracks selector confidence trends across turns to detect floor loops.
-    pub confidence_trend: astra_turn_core::confidence_contract::ConfidenceTrendTracker,
-    /// Last diagnosis computed after tool selection (for telemetry and fallback).
-    pub last_confidence_diagnosis:
-        Option<astra_turn_core::confidence_contract::ConfidenceDiagnosis>,
-
     // ── Turn observability (Phase 1) ──
     /// In-memory collector for fine-grained turn events (llm_round, tool timing).
     /// Session-level turn number (1-based). Set by the CLI from ReplState.turn
@@ -4084,7 +4047,6 @@ impl AgenticLoopState {
             telemetry: Default::default(),
             skills: SkillState {
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 ..Default::default()
             },
             hooks: Default::default(),
@@ -4138,8 +4100,6 @@ impl AgenticLoopState {
             session_memory_state: Default::default(),
             compact_strategy: Default::default(),
             approval_overrides: None,
-            confidence_trend: Default::default(),
-            last_confidence_diagnosis: None,
             session_turn: 0,
             canonical_turn_chain_id: None,
             root_user_query_event_id: None,
@@ -6610,8 +6570,6 @@ pub(crate) mod tests {
         turn_intent_decision_required: bool,
         admission_hook_enabled: bool,
         cancel_child_agents_delay: Option<std::time::Duration>,
-        recovered_control_tool_results: HashMap<String, ControlToolRecovery>,
-        pub(crate) recovered_control_requests: Vec<(String, String, Value, Option<String>)>,
         terminal_control_outcome: Option<crate::turn::terminal_control::TerminalControlOutcome>,
         stop_after_success_completion: Option<RuntimeSuccessfulToolCompletion>,
         continuation_authority: ContinuationAuthority,
@@ -6675,8 +6633,6 @@ pub(crate) mod tests {
                 turn_intent_decision_required: false,
                 admission_hook_enabled: false,
                 cancel_child_agents_delay: None,
-                recovered_control_tool_results: HashMap::new(),
-                recovered_control_requests: Vec::new(),
                 terminal_control_outcome: None,
                 stop_after_success_completion: None,
                 continuation_authority: ContinuationAuthority::Runtime,
@@ -6758,16 +6714,6 @@ pub(crate) mod tests {
             decisions: impl IntoIterator<Item = Result<bool, String>>,
         ) -> Self {
             self.committed_work_synthesis_sequence = decisions.into_iter().collect();
-            self
-        }
-
-        pub(crate) fn with_recovered_control_tool_result(
-            mut self,
-            tool_call_id: &str,
-            recovery: ControlToolRecovery,
-        ) -> Self {
-            self.recovered_control_tool_results
-                .insert(tool_call_id.to_string(), recovery);
             self
         }
 
@@ -7115,25 +7061,6 @@ pub(crate) mod tests {
             self.final_output_ready.push(state.final_text.clone());
             self.final_policy_snapshots
                 .push(serde_json::to_value(&state.stall.runtime_policy_evaluation).unwrap());
-        }
-
-        async fn recover_missing_control_tool_result(
-            &mut self,
-            parent_run_id: Option<&str>,
-            tool_call_id: &str,
-            tool_name: &str,
-            args: &Value,
-            _prior_duration_ms: Option<u64>,
-        ) -> ControlToolRecovery {
-            self.recovered_control_requests.push((
-                tool_name.to_string(),
-                tool_call_id.to_string(),
-                args.clone(),
-                parent_run_id.map(str::to_string),
-            ));
-            self.recovered_control_tool_results
-                .remove(tool_call_id)
-                .unwrap_or(ControlToolRecovery::Missing)
         }
 
         async fn cancel_child_agents(

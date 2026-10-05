@@ -60,7 +60,7 @@ pub(crate) fn compact_delegation_result(status: Option<&str>, payload: Option<&s
             .and_then(|value| value.get("status"))
             .and_then(serde_json::Value::as_str)
             .or(status)
-            .unwrap_or("completed")
+            .unwrap_or("uncertain")
     };
     let skipped = payload.is_some_and(|payload| {
         astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_receipt_kind(payload)
@@ -169,6 +169,29 @@ mod tests {
         assert_eq!(
             agent_control_interrupted_message(false, None),
             "Agent stopped before completing its result."
+        );
+    }
+
+    #[test]
+    fn missing_delegation_status_does_not_claim_completion() {
+        for payload in [
+            None,
+            Some("invalid JSON"),
+            Some("{}"),
+            Some(r#"{"status":7}"#),
+        ] {
+            assert_eq!(
+                compact_delegation_result(None, payload),
+                "Agent control: uncertain · Ctrl+G agents",
+            );
+        }
+        assert_eq!(
+            compact_delegation_result(None, Some(r#"{"status":"completed"}"#)),
+            "Agent control: completed · Ctrl+G agents",
+        );
+        assert_eq!(
+            compact_delegation_result(Some("failed"), Some(r#"{"status":"completed"}"#)),
+            "Agent control: failed · Ctrl+G agents",
         );
     }
 

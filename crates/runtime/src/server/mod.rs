@@ -79,7 +79,6 @@ pub(crate) mod tool_edge_transport;
 pub(crate) mod tool_execution_binding;
 pub(crate) mod tool_execution_result;
 pub(crate) mod tool_execution_service;
-pub(crate) mod tool_external_transport;
 pub(crate) mod tool_file_runtime;
 pub(crate) mod tool_introspect;
 pub mod tool_invocation_compactor;

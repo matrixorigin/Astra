@@ -25,6 +25,15 @@ class SeedError(RuntimeError):
     pass
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def owned_api_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
 def _load_yaml(path: Path) -> Any:
     try:
         import yaml
@@ -180,15 +189,18 @@ def _request_json(
     payload: dict[str, Any] | None,
     expected_status: int,
     operation: str,
+    *,
+    method: str = "POST",
+    timeout: float = 60,
 ) -> dict[str, Any]:
     body = None
     headers = {"Authorization": f"Bearer {token}"}
     if payload is not None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with opener.open(request, timeout=60) as response:
+        with opener.open(request, timeout=timeout) as response:
             status = response.status
             response_body = response.read(2 * 1024 * 1024)
     except urllib.error.HTTPError as error:
@@ -216,7 +228,7 @@ def register_selected_model(
     model_name, thinking = selected_model_name(config)
     entry = _selected_entry(_load_yaml(models_file), model_name)
     payload = model_create_payload(entry, model_name)
-    opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = opener or owned_api_opener()
     base_url = api_url.rstrip("/")
     created = _request_json(
         opener,

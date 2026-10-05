@@ -673,6 +673,35 @@ impl<'a> SuiteRunner<'a> {
             .session_id
             .as_deref()
             .is_some_and(is_valid_server_session_id);
+        // A bound session can outlive a failed or timed-out invocation. Admit
+        // another turn only from success or an already-proven negative test.
+        let mut root_terminal_allows_follow_up =
+            outcome.exit_code == 0 || accepts_negative_terminal(&case.criteria, &outcome, None);
+        if !root_terminal_allows_follow_up
+            && !setup_failed
+            && !case.steps.is_empty()
+            && root_session_is_valid
+            && has_exit_code_expectation(&case.criteria, outcome.exit_code)
+            && requires_session_capture(&case.criteria)
+            && let (Some(session_id), Some(run_id)) =
+                (outcome.session_id.as_deref(), outcome.run_id.as_deref())
+            && let Some(capture) = self
+                .load_session_until_settled(
+                    session_id,
+                    crate::criteria::unconditional_settled_subsystem(&case.criteria).as_deref(),
+                )
+                .await
+            && capture.session_id == session_id
+            && capture.skipped_lines == 0
+            && capture.dropped_lines == 0
+            && !capture.has_integrity_errors()
+            && capture.has_canonical_run_evidence_since(run_id, invocation_started_at)
+        {
+            let root_capture =
+                capture.scoped_to_invocation(&[run_id.to_string()], invocation_started_at);
+            root_terminal_allows_follow_up =
+                accepts_negative_terminal(&case.criteria, &outcome, Some(&root_capture));
+        }
         if !setup_failed && !case.steps.is_empty() && outcome.session_id.is_none() {
             eprintln!(
                 "[astra-test] WARNING: case {} has {} steps but turn 1 returned no session_id — \
@@ -687,10 +716,16 @@ impl<'a> SuiteRunner<'a> {
             lifecycle_errors.push(format!(
                 "follow-up turns require a valid server-issued UUID session_id (got {invalid_id:?})"
             ));
+        } else if !setup_failed && !case.steps.is_empty() && !root_terminal_allows_follow_up {
+            lifecycle_errors.push(
+                "follow-up turns require a successful root or an already-proven negative terminal"
+                    .into(),
+            );
         }
         if !setup_failed
             && !case.steps.is_empty()
             && root_session_is_valid
+            && root_terminal_allows_follow_up
             && let Some(ref session_id) = outcome.session_id
         {
             for (idx, step) in case.steps.iter().enumerate() {
@@ -846,6 +881,11 @@ impl<'a> SuiteRunner<'a> {
                 if !step_outcome.stderr.is_empty() {
                     outcome.stderr.push('\n');
                     outcome.stderr.push_str(&step_outcome.stderr);
+                }
+                if !step_lifecycle_ok {
+                    // A timeout or broken identity cannot admit a dependent
+                    // turn. Retain this outcome, then use the shared cleanup.
+                    break;
                 }
             }
         }
@@ -3533,53 +3573,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_gate_rejects_nonzero_root_and_follow_up_outcomes() {
-        let exec = FakeExecutor::new();
-        let mut root = outcome_ok("m", "root", &["Read"]);
-        root.exit_code = 9;
-        exec.seed("lifecycle-root", "m", root);
-        let mut step = outcome_ok("m", "step", &[]);
-        step.exit_code = -1;
-        step.session_id = None;
-        exec.seed("lifecycle-root__step0", "m", step);
+    async fn lifecycle_gate_rejects_failed_root_before_follow_up() {
+        for exit_code in [-1, 5, 9, 124] {
+            let exec = FakeExecutor::new();
+            let mut root = outcome_ok("m", "root", &["Read"]);
+            root.exit_code = exit_code;
+            root.completion_tokens = 11;
+            exec.seed("lifecycle-root", "m", root);
+            exec.seed("lifecycle-root__step0", "m", outcome_ok("m", "step", &[]));
 
-        let judger = FixedJudger { score: 1.0 };
-        let loader = NoopSessionLoader;
-        let runner = SuiteRunner {
-            executor: &exec,
-            judger: &judger,
-            session_loader: &loader,
-            digest_collector: None,
-            runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
-                .with_fallback_models(vec!["m".into()]),
-            no_judger: true,
-            session_mode: SessionCaptureMode::Never,
-            suite_cfg: SuiteConfig::default(),
-            dashboard_tx: None,
-            run_id: String::new(),
-            cancel_flag: None,
-        };
-        let mut case = case_with(
-            "lifecycle-root",
-            vec![Criterion::ToolCalled {
-                name: "Read".into(),
-            }],
-        );
-        case.steps = vec![crate::case::CaseStep {
-            prompt: "follow up".into(),
-            criteria: vec![],
-            timeout_seconds: None,
-        }];
+            let directory = tempfile::tempdir().unwrap();
+            let mut config =
+                RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+            config.working_dir = Some(directory.path().to_owned());
+            let judger = FixedJudger { score: 1.0 };
+            let loader = NoopSessionLoader;
+            let runner = SuiteRunner {
+                executor: &exec,
+                judger: &judger,
+                session_loader: &loader,
+                digest_collector: None,
+                runner_cfg: config,
+                no_judger: true,
+                session_mode: SessionCaptureMode::Never,
+                suite_cfg: SuiteConfig::default(),
+                dashboard_tx: None,
+                run_id: String::new(),
+                cancel_flag: None,
+            };
+            let mut case = case_with(
+                "lifecycle-root",
+                vec![Criterion::ToolCalled {
+                    name: "Read".into(),
+                }],
+            );
+            case.teardown_cmd = Some("printf done > teardown-marker".into());
+            case.steps = vec![crate::case::CaseStep {
+                prompt: "follow up".into(),
+                criteria: vec![],
+                timeout_seconds: None,
+            }];
 
-        let report = runner.run_all(&[case]).await;
-        assert!(!report.runs[0].is_passed());
-        assert!(
-            report.runs[0]
-                .outcome
-                .stderr
-                .contains("lifecycle: root turn did not reach")
-        );
-        assert!(!report.runs[0].steps[0].passed);
+            let report = runner.run_all(&[case]).await;
+            assert!(!report.runs[0].is_passed());
+            assert!(
+                report.runs[0]
+                    .outcome
+                    .stderr
+                    .contains("lifecycle: root turn did not reach")
+            );
+            assert_eq!(exec.calls.lock().unwrap().len(), 1);
+            assert!(report.runs[0].steps.is_empty());
+            assert_eq!(report.runs[0].outcome.completion_tokens, 11);
+            assert_eq!(report.runs[0].outcome.duration_ms, 12);
+            assert_eq!(report.runs[0].outcome.text, "root");
+            assert_eq!(
+                std::fs::read_to_string(directory.path().join("teardown-marker")).unwrap(),
+                "done"
+            );
+        }
     }
 
     fn negative_outcome(text: &str) -> RunOutcome {
@@ -3587,6 +3639,134 @@ mod tests {
             .with_exit_code(5)
             .with_final_state("interrupted")
             .with_interruption_kind("execution_incomplete")
+    }
+
+    #[tokio::test]
+    async fn root_negative_journal_witness_must_precede_follow_up() {
+        for evidence in [
+            "current",
+            "delayed_settlement",
+            "zero_settlement_budget",
+            "stale",
+            "other_run",
+            "other_session",
+            "incomplete",
+        ] {
+            let exec = FakeExecutor::new();
+            let root = negative_outcome("root");
+            exec.seed("negative-journal", "m", root.clone());
+            let mut step = outcome_ok("m", "step", &[]);
+            step.run_id = Some("run-step".into());
+            exec.seed("negative-journal__step0", "m", step);
+            let fresh_timestamp = chrono::Utc::now() + chrono::Duration::minutes(1);
+            let mut capture = SessionCapture {
+                session_id: root.session_id.clone().unwrap(),
+                events: vec![crate::session_capture::JournalEvent {
+                    event_type: "turn_error".into(),
+                    raw: serde_json::json!({
+                        "ts": fresh_timestamp.to_rfc3339(),
+                        "turn": 1,
+                        "metadata": {"run_id": "run-test"}
+                    }),
+                }],
+                ..Default::default()
+            };
+            let mut final_capture = capture.clone();
+            final_capture
+                .events
+                .push(crate::session_capture::JournalEvent {
+                    event_type: "turn".into(),
+                    raw: serde_json::json!({
+                        "ts": fresh_timestamp.to_rfc3339(),
+                        "metadata": {"run_id": "run-step"}
+                    }),
+                });
+            let expects_settlement =
+                matches!(evidence, "delayed_settlement" | "zero_settlement_budget");
+            if expects_settlement {
+                final_capture
+                    .events
+                    .push(crate::session_capture::JournalEvent {
+                        event_type: "subsystem_settled".into(),
+                        raw: serde_json::json!({
+                            "ts": fresh_timestamp.to_rfc3339(), "turn": 1,
+                            "metadata": {"run_id": "run-test", "subsystem": "post_loop_memory"}
+                        }),
+                    });
+            }
+            match evidence {
+                "stale" => capture.events[0].raw["ts"] = "2000-01-01T00:00:00Z".into(),
+                "other_run" => capture.events[0].raw["metadata"]["run_id"] = "old-run".into(),
+                "other_session" => {
+                    capture.session_id = "660e8400-e29b-41d4-a716-446655440000".into()
+                }
+                "incomplete" => capture.integrity_errors = 1,
+                _ => {}
+            }
+            let loader = DelayedSessionLoader {
+                unsettled: capture,
+                settled: final_capture,
+                calls: AtomicUsize::new(0),
+            };
+            let judger = FixedJudger { score: 1.0 };
+            let mut config =
+                RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+            if evidence == "delayed_settlement" {
+                config.session_settle_timeout = Duration::from_secs(1);
+            }
+            let runner = SuiteRunner {
+                executor: &exec,
+                judger: &judger,
+                session_loader: &loader,
+                digest_collector: None,
+                runner_cfg: config,
+                no_judger: true,
+                session_mode: SessionCaptureMode::Never,
+                suite_cfg: SuiteConfig::default(),
+                dashboard_tx: None,
+                run_id: String::new(),
+                cancel_flag: None,
+            };
+            let mut case = case_with(
+                "negative-journal",
+                vec![Criterion::AllOf {
+                    criteria: vec![
+                        Criterion::ExitCode { code: 5 },
+                        if expects_settlement {
+                            Criterion::SessionSubsystemHealthy {
+                                settled_subsystem: Some("post_loop_memory".into()),
+                            }
+                        } else {
+                            Criterion::SessionEventCount {
+                                event_type: "turn_error".into(),
+                                min: 1,
+                                max: Some(1),
+                                json_match: None,
+                                optional: false,
+                            }
+                        },
+                    ],
+                }],
+            );
+            case.steps.push(crate::case::CaseStep {
+                prompt: "recover after expected failure".into(),
+                criteria: vec![],
+                timeout_seconds: None,
+            });
+            let report = runner.run_all(&[case]).await;
+            let admitted = matches!(evidence, "current" | "delayed_settlement");
+            assert_eq!(
+                exec.calls.lock().unwrap().len(),
+                if admitted { 2 } else { 1 },
+                "{evidence}"
+            );
+            assert_eq!(
+                report.runs[0].steps.len(),
+                usize::from(admitted),
+                "{evidence}"
+            );
+            assert_eq!(report.runs[0].is_passed(), admitted, "{evidence}");
+        }
     }
 
     async fn run_negative_fixture(
@@ -3725,6 +3905,11 @@ mod tests {
                 expected_pass,
                 "root={root_code} step_expected={step_expected}"
             );
+            assert_eq!(
+                report.steps.len(),
+                1,
+                "admitted roots must execute the step"
+            );
         }
         // Only a later step supplies this branch's text. It cannot retroactively
         // authorize the root's negative result through the aggregate outcome.
@@ -3756,7 +3941,7 @@ mod tests {
         )
         .await;
         assert!(!report.is_passed());
-        assert!(report.steps[0].passed);
+        assert!(report.steps.is_empty());
         assert!(report.outcome.stderr.contains("root turn did not reach"));
     }
 
@@ -3798,45 +3983,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_gate_rejects_follow_up_session_identity_drift() {
-        let exec = FakeExecutor::new();
-        exec.seed("lifecycle-session", "m", outcome_ok("m", "root", &[]));
-        let mut step = outcome_ok("m", "step", &[]);
-        step.session_id = Some("660e8400-e29b-41d4-a716-446655440000".into());
-        exec.seed("lifecycle-session__step0", "m", step);
+    async fn lifecycle_gate_stops_unsafe_follow_ups_and_preserves_teardown() {
+        for scenario in [
+            "timeout",
+            "identity_drift",
+            "expected_negative",
+            "assertion_failure",
+        ] {
+            let exec = FakeExecutor::new();
+            exec.seed("lifecycle-session", "m", outcome_ok("m", "root", &[]));
+            let mut step = if matches!(scenario, "timeout" | "expected_negative") {
+                negative_outcome("step evidence")
+            } else {
+                outcome_ok("m", "step evidence", &[])
+            };
+            if scenario == "timeout" {
+                step.exit_code = 124;
+                step.session_id = None;
+            } else if scenario == "identity_drift" {
+                step.session_id = Some("660e8400-e29b-41d4-a716-446655440000".into());
+            }
+            step.completion_tokens = 11;
+            step.duration_ms = 17;
+            exec.seed("lifecycle-session__step0", "m", step);
+            exec.seed(
+                "lifecycle-session__step1",
+                "m",
+                outcome_ok("m", "later", &[]),
+            );
 
-        let judger = FixedJudger { score: 1.0 };
-        let loader = NoopSessionLoader;
-        let runner = SuiteRunner {
-            executor: &exec,
-            judger: &judger,
-            session_loader: &loader,
-            digest_collector: None,
-            runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
-                .with_fallback_models(vec!["m".into()]),
-            no_judger: true,
-            session_mode: SessionCaptureMode::Never,
-            suite_cfg: SuiteConfig::default(),
-            dashboard_tx: None,
-            run_id: String::new(),
-            cancel_flag: None,
-        };
-        let mut case = case_with("lifecycle-session", vec![]);
-        case.steps = vec![crate::case::CaseStep {
-            prompt: "follow up".into(),
-            criteria: vec![],
-            timeout_seconds: None,
-        }];
-
-        let report = runner.run_all(&[case]).await;
-        assert!(!report.runs[0].is_passed());
-        assert!(
-            report.runs[0]
-                .outcome
-                .stderr
-                .contains("session identity diverged")
-        );
-        assert!(!report.runs[0].steps[0].passed);
+            let directory = tempfile::tempdir().unwrap();
+            let judger = FixedJudger { score: 1.0 };
+            let loader = NoopSessionLoader;
+            let mut config =
+                RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+            config.working_dir = Some(directory.path().to_owned());
+            let runner = SuiteRunner {
+                executor: &exec,
+                judger: &judger,
+                session_loader: &loader,
+                digest_collector: None,
+                runner_cfg: config,
+                no_judger: true,
+                session_mode: SessionCaptureMode::Never,
+                suite_cfg: SuiteConfig::default(),
+                dashboard_tx: None,
+                run_id: String::new(),
+                cancel_flag: None,
+            };
+            let mut case = case_with("lifecycle-session", vec![]);
+            case.teardown_cmd = Some("printf done > teardown-marker".into());
+            case.steps = vec![
+                crate::case::CaseStep {
+                    prompt: "follow up".into(),
+                    criteria: match scenario {
+                        "expected_negative" => vec![Criterion::ExitCode { code: 5 }],
+                        "assertion_failure" => vec![Criterion::TextContains {
+                            needle: "absent".into(),
+                        }],
+                        _ => vec![],
+                    },
+                    timeout_seconds: None,
+                },
+                crate::case::CaseStep {
+                    prompt: "dependent follow up".into(),
+                    criteria: vec![],
+                    timeout_seconds: None,
+                },
+            ];
+            let report = runner.run_all(&[case]).await;
+            let run = &report.runs[0];
+            let unsafe_lifecycle = matches!(scenario, "timeout" | "identity_drift");
+            assert_eq!(
+                exec.calls.lock().unwrap().len(),
+                if unsafe_lifecycle { 2 } else { 3 },
+                "{scenario}"
+            );
+            assert_eq!(
+                run.steps.len(),
+                if unsafe_lifecycle { 1 } else { 2 },
+                "{scenario}"
+            );
+            assert_eq!(
+                run.is_passed(),
+                scenario == "expected_negative",
+                "{scenario}"
+            );
+            assert_eq!(run.steps[0].outcome.completion_tokens, 11);
+            assert_eq!(run.steps[0].duration_ms, 17);
+            assert_eq!(run.outcome.completion_tokens, 11);
+            assert_eq!(
+                run.outcome.duration_ms,
+                if unsafe_lifecycle { 29 } else { 41 }
+            );
+            assert_eq!(run.steps[0].passed, scenario == "expected_negative");
+            if scenario == "identity_drift" {
+                assert!(run.outcome.stderr.contains("session identity diverged"));
+            }
+            assert!(run.outcome.text.contains("step evidence"));
+            if unsafe_lifecycle {
+                assert!(run.outcome.stderr.contains("lifecycle:"));
+            }
+            assert_eq!(
+                std::fs::read_to_string(directory.path().join("teardown-marker")).unwrap(),
+                "done"
+            );
+        }
     }
 
     #[tokio::test]

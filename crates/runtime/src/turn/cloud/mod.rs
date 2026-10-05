@@ -22,7 +22,6 @@
 //!   adjusts the effective budget between layers, stops when satisfied.
 //! - **Layers** (`layers/*.rs`): each implements `CompressionLayer`.
 
-pub mod analytics;
 pub mod compaction;
 pub mod compaction_engine;
 pub(crate) mod helpers;

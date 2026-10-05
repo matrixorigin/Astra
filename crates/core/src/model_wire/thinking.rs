@@ -17,7 +17,7 @@ pub enum ThinkingProtocol {
 }
 
 impl ThinkingProtocol {
-    pub const REVISION: u32 = 1;
+    pub const REVISION: u32 = 2;
 
     pub fn can_disable(self) -> bool {
         matches!(

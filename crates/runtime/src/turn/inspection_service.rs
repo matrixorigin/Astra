@@ -1,16 +1,15 @@
 //! `InspectionService` — provider-fusion layer that bridges `introspect` and
-//! `reflect` tools with the three [`super::providers`] traits.
+//! `reflect` tools with runtime providers and authoritative snapshots.
 //!
 //! # Role in the Observation Plane
 //!
-//! The three provider traits ([`LiveRuntimeProvider`], [`ObservationProvider`],
-//! [`SessionStateProvider`]) abstract data *acquisition*. `InspectionService`
-//! adds the *fusion* layer:
+//! [`LiveRuntimeProvider`] and [`SessionStateProvider`] abstract data
+//! acquisition. `InspectionService` adds the fusion layer:
 //!
 //! | Method | Purpose |
 //! |--------|---------|
 //! | `enrich_snapshot()` | Add live alerts/circuit state without rewriting canonical feedback |
-//! | `local_reflect_summary()` | Local-only reflect text from journal + live data |
+//! | `local_reflect_from_snapshot()` | Local reflect text from the authoritative runtime snapshot |
 //! | `build_live_metrics()` | Return a pure-data `LiveMetrics` struct |
 //!
 //! # Unhappy-path guarantees
@@ -31,28 +30,19 @@ use astra_turn_core::introspect::{
     prompt_cache_read_share_pct, prompt_cache_stable_prefix_tokens, turn_budget_label,
 };
 
-use super::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
+use super::providers::{LiveRuntimeProvider, SessionStateProvider};
 
 // ─── InspectionService ────────────────────────────────────────────────────────
 
-/// Fuses the three provider traits into a single observation surface for tools.
+/// Fuses runtime providers into a single observation surface for tools.
 pub struct InspectionService<'a> {
     live: &'a dyn LiveRuntimeProvider,
-    observation: &'a dyn ObservationProvider,
     session: &'a dyn SessionStateProvider,
 }
 
 impl<'a> InspectionService<'a> {
-    pub fn new(
-        live: &'a dyn LiveRuntimeProvider,
-        observation: &'a dyn ObservationProvider,
-        session: &'a dyn SessionStateProvider,
-    ) -> Self {
-        Self {
-            live,
-            observation,
-            session,
-        }
+    pub fn new(live: &'a dyn LiveRuntimeProvider, session: &'a dyn SessionStateProvider) -> Self {
+        Self { live, session }
     }
 }
 
@@ -78,7 +68,7 @@ pub struct LiveMetrics {
 // ─── Snapshot enrichment ─────────────────────────────────────────────────────
 
 impl InspectionService<'_> {
-    /// Build live metrics from all three providers.
+    /// Build live metrics from the runtime providers.
     pub fn build_live_metrics(&self) -> LiveMetrics {
         let mut alerts: Vec<String> = Vec::new();
 
@@ -134,115 +124,13 @@ impl InspectionService<'_> {
     }
 }
 
-// ─── Local reflect ───────────────────────────────────────────────────────────
-
-impl InspectionService<'_> {
-    /// Build a local-only reflect text summary from journal and live data.
-    ///
-    /// Used as fallback when the cloud `reflect` service is unavailable and the
-    /// caller's `source_policy` allows local data.
-    ///
-    /// The output is a plain-text summary suitable for direct consumption by
-    /// the LLM agent. It does NOT attempt to build the full `ReflectReport`
-    /// envelope — that remains the cloud service's concern.
-    pub fn local_reflect_summary(&self, facet: ObservationFacet, last_n: usize) -> String {
-        let facts = self.observation.extract_facts();
-        let trends = self.observation.compute_trends();
-        let journal_len = self.observation.journal_len();
-
-        let mut lines: Vec<String> = Vec::new();
-        lines.push("## Local Reflect Summary".to_string());
-        lines.push(format!("source=local_journal entries={journal_len}"));
-
-        match facet {
-            ObservationFacet::Session | ObservationFacet::Overview => {
-                // ── Live metrics ──
-                let pressure = self.live.token_pressure();
-                let cache = self.live.cache_hit_ratio().map_or_else(
-                    || "unknown".to_string(),
-                    |ratio| format!("{:.0}%", ratio * 100.0),
-                );
-                let error_rate = self.live.current_error_rate();
-                let remaining = self.session.remaining_turns();
-                let max_budget = self.session.max_turns();
-                lines.push(format!(
-                    "live: pressure={:.0}% prompt_cache_read_share={} prompt_cache_scope=current_runtime_snapshot error_rate={:.0}% remaining_turns={}/{}",
-                    pressure * 100.0,
-                    cache,
-                    error_rate * 100.0,
-                    remaining,
-                    max_budget,
-                ));
-
-                // ── Outcome streaks ──
-                lines.push(format!(
-                    "streaks: outcomes={} no_outcomes={}",
-                    facts.streaks.consecutive_rounds_with_outcome,
-                    facts.streaks.consecutive_rounds_without_outcome,
-                ));
-
-                // ── Circuit breaker ──
-                let cb_state = self.session.circuit_breaker_state();
-                lines.push(format!("circuit_breaker: {cb_state}"));
-            }
-
-            ObservationFacet::Errors => {
-                let error_rate = self.live.current_error_rate();
-                lines.push(format!("error_rate={:.0}%", error_rate * 100.0));
-
-                if facts.streaks.consecutive_rounds_without_outcome > 0 {
-                    lines.push(format!(
-                        "consecutive_rounds_without_outcome={}",
-                        facts.streaks.consecutive_rounds_without_outcome,
-                    ));
-                }
-            }
-
-            ObservationFacet::Stall => {
-                lines.push(format!(
-                    "read_only_streak={}",
-                    facts.streaks.consecutive_read_only,
-                ));
-                lines.push(format!(
-                    "consecutive_rounds_without_outcome={}",
-                    facts.streaks.consecutive_rounds_without_outcome,
-                ));
-            }
-
-            ObservationFacet::Recent | ObservationFacet::Trace => {
-                lines.push(format!("journal_entries={journal_len}"));
-                // Show the most recent trend data
-                let shown = trends.iter().take(last_n.min(10));
-                for trend in shown {
-                    lines.push(format!(
-                        "  {name}: {value} ({direction})",
-                        name = trend.metric,
-                        value = trend.current,
-                        direction = trend.direction,
-                    ));
-                }
-            }
-
-            _ => {
-                lines.push(format!(
-                    "facet={} — local reflect summary not available for this facet",
-                    facet.as_str(),
-                ));
-            }
-        }
-
-        lines.join("\n")
-    }
-}
-
 // ─── Snapshot-based local reflect (for tool fallback) ────────────────────────
 
 /// Build a local reflect text summary from an [`IntrospectSnapshot`].
 ///
 /// This is a lightweight fallback used when the cloud `reflect` service is
-/// unavailable but the caller's `source_policy` allows local data. Unlike
-/// [`InspectionService::local_reflect_summary`], this function does not
-/// require the provider traits — it works with the already-populated snapshot.
+/// unavailable but the caller's `source_policy` allows local data. It uses
+/// the already-populated snapshot without recomputing runtime facts from a journal.
 pub fn local_reflect_from_snapshot(
     snapshot: &astra_turn_core::introspect::IntrospectSnapshot,
     facet: ObservationFacet,
@@ -429,7 +317,7 @@ mod tests {
         F: FnOnce(&InspectionService<'_>) -> R,
     {
         let provider = LocalSessionProvider::new(state);
-        let svc = InspectionService::new(&provider, &provider, &provider);
+        let svc = InspectionService::new(&provider, &provider);
         f(&svc)
     }
 
@@ -490,50 +378,6 @@ mod tests {
     }
 
     #[test]
-    fn local_reflect_summary_session_excludes_removed_task_progress_authority() {
-        let state = host::make_test_loop_state();
-        with_inspection(&state, |svc| {
-            let summary = svc.local_reflect_summary(ObservationFacet::Session, 20);
-            assert!(summary.contains("Local Reflect Summary"));
-            assert!(summary.contains("source=local_journal"));
-            assert!(summary.contains("live:"));
-            assert!(summary.contains("prompt_cache_read_share=unknown"));
-            assert!(summary.contains("streaks:"));
-            assert!(!summary.contains("tasks:"));
-            assert!(summary.contains("circuit_breaker:"));
-        });
-    }
-
-    #[test]
-    fn local_reflect_distinguishes_zero_cache_reads_from_missing_input() {
-        let mut state = host::make_test_loop_state();
-        state.total_prompt = 100;
-        with_inspection(&state, |svc| {
-            let summary = svc.local_reflect_summary(ObservationFacet::Session, 20);
-            assert!(summary.contains("prompt_cache_read_share=0%"));
-        });
-    }
-
-    #[test]
-    fn local_reflect_summary_errors() {
-        let state = host::make_test_loop_state();
-        with_inspection(&state, |svc| {
-            let summary = svc.local_reflect_summary(ObservationFacet::Errors, 20);
-            assert!(summary.contains("error_rate="));
-        });
-    }
-
-    #[test]
-    fn local_reflect_summary_custom_facet_graceful() {
-        let state = host::make_test_loop_state();
-        with_inspection(&state, |svc| {
-            // Cache facet is not handled → graceful message
-            let summary = svc.local_reflect_summary(ObservationFacet::Cache, 20);
-            assert!(summary.contains("local reflect summary not available"));
-        });
-    }
-
-    #[test]
     fn local_reflect_from_snapshot_session() {
         let snapshot = IntrospectSnapshot {
             runtime_feedback: Some(sample_frame(3, 3, 7)),
@@ -549,6 +393,7 @@ mod tests {
         };
         let summary = local_reflect_from_snapshot(&snapshot, ObservationFacet::Session);
         assert!(summary.contains("Local Reflect Summary"));
+        assert!(!summary.contains("tasks:"));
         assert!(summary.contains("pressure=42%"));
         assert!(summary.contains("prompt_cache_read_share=88%"));
         assert!(summary.contains("prompt_cache_scope=current_runtime_snapshot"));
@@ -561,6 +406,31 @@ mod tests {
         assert!(summary.contains("execution_topology: server_only"));
         assert!(summary.contains("test_alert"));
         assert!(summary.contains("circuit_breaker: monitoring"));
+    }
+
+    #[test]
+    fn local_reflect_from_snapshot_distinguishes_unknown_and_zero_cache_reads() {
+        use astra_turn_core::token_accounting::TokenAccounting;
+
+        let mut frame = sample_frame(1, 1, 9);
+        for (usage, expected) in [
+            (None, "unknown"),
+            (Some(TokenAccounting::from_fields(0, 0, 0, 0)), "unknown"),
+            (Some(TokenAccounting::from_fields(100, 0, 0, 0)), "0%"),
+        ] {
+            frame.request_usage = usage;
+            frame.run_usage = usage;
+            let snapshot = IntrospectSnapshot {
+                runtime_feedback: Some(frame.clone()),
+                ..Default::default()
+            };
+            let summary = local_reflect_from_snapshot(&snapshot, ObservationFacet::Session);
+            assert!(
+                summary.contains(&format!("prompt_cache_read_share={expected}")),
+                "{summary}"
+            );
+            assert!(!summary.contains("tasks:"));
+        }
     }
 
     #[test]

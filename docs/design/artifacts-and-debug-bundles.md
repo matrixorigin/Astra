@@ -95,6 +95,10 @@ Requirements:
 - redaction boundary;
 - exclusion from default learning pipeline.
 
+CLI context dumps use `astra.context_dump/v2`. They retain the recorded prompt
+trace, conversation, usage and compaction facts; the empty local built-in skill
+selection field is retired. Actual skill injection remains in the trace.
+
 ## Tool output handling
 
 Large or unsafe tool output should be stored as artifact and summarized through the tool result quality firewall.

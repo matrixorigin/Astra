@@ -146,8 +146,20 @@ pub fn query_cursor_position(timeout: Duration) -> io::Result<CursorPositionRepo
         }
         while reader.poll(Some(Duration::ZERO), &CursorPositionFilter)? {
             reader.read(&CursorPositionFilter)?;
+            reader.cursor_query_pending = false;
         }
         let size = crate::terminal::size()?;
+        // CPR has no request identifier. A reply still in flight after a
+        // deadline cannot be attributed to a new query. Keep the one existing
+        // request outstanding until its reply has been consumed above.
+        if reader.cursor_query_pending {
+            return Ok(CursorPositionReport {
+                size,
+                position: None,
+                interrupted: reader.poll(Some(Duration::ZERO), &ResizeFilter)?,
+            });
+        }
+        reader.cursor_query_pending = true;
         let mut stdout = io::stdout().lock();
         stdout.write_all(b"\x1b[6n")?;
         stdout.flush()?;
@@ -157,6 +169,7 @@ pub fn query_cursor_position(timeout: Duration) -> io::Result<CursorPositionRepo
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             if reader.poll(Some(remaining), &CursorPositionFilter)? {
                 if let InternalEvent::CursorPosition(x, y) = reader.read(&CursorPositionFilter)? {
+                    reader.cursor_query_pending = false;
                     return Ok(CursorPositionReport {
                         size,
                         position: Some((x, y)),

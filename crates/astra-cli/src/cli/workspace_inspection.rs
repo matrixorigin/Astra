@@ -385,7 +385,6 @@ pub(crate) async fn handle_review_command(
         message: &prompt,
         user_intent: &prompt,
         input_runtime_required_texts: &[],
-        input_active_system_skills: &[],
         input_runtime_volatile_texts: &[],
         input_work_unit_observations: &[],
         semantic_query_override: None,

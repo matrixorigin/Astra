@@ -33,8 +33,6 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use crate::prompts;
-#[cfg(test)]
-use astra_text_utils::output_style::current_output_style;
 use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
 use astra_turn_core::rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
@@ -6155,7 +6153,6 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                     }
                     return Err(StreamCollectError::IdleTimeout {
                         elapsed_ms: idle.as_millis() as u64,
-                        made_progress,
                         partial: partial_result(
                             &response_id,
                             &full_text,
@@ -6811,7 +6808,6 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                     }
                     return Err(StreamCollectError::IdleTimeout {
                         elapsed_ms: idle.as_millis() as u64,
-                        made_progress,
                         partial: partial_result(
                             &response_id,
                             &full_text,
@@ -7168,11 +7164,9 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Transport variant reserved for future network error handling
 enum StreamCollectError {
     IdleTimeout {
         elapsed_ms: u64,
-        made_progress: bool,
         partial: LlmCallResult,
     },
     SemanticProgressTimeout {
@@ -7993,7 +7987,9 @@ pub(crate) fn parse_openai_sse_json_stream(
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
-                    yield Err(e.to_string());
+                    // Display omits the body-read cause (for example an early EOF).
+                    // Keep that diagnostic without retaining the request URL.
+                    yield Err(redact_provider_secrets(&format!("{:?}", e.without_url())));
                     return;
                 }
             };
@@ -10675,14 +10671,60 @@ mod tests {
 
     #[tokio::test]
     async fn parse_openai_sse_json_stream_surfaces_byte_stream_error() {
-        let err = sample_reqwest_stream_error().await;
-        let parts: Vec<Result<Bytes, reqwest::Error>> = vec![Err(err)];
-        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let mut used = 0;
+            while !request[..used].ends_with(b"\r\n\r\n") {
+                let read = socket.read(&mut request[used..]).await.unwrap();
+                assert!(
+                    read > 0,
+                    "complete request headers must precede the response"
+                );
+                used += read;
+            }
+            socket.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 256\r\nConnection: close\r\n\r\ndata: {\"x\":1}\n\n",
+            ).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(format!(
+                "http://{address}/private-route?key=private-query-marker"
+            ))
+            .send()
+            .await
+            .unwrap();
+        let request_url = response.url().clone();
+        let body = response.bytes_stream().map(move |chunk| {
+            chunk.map_err(|error| {
+                let error = error.with_url(request_url.clone());
+                assert!(format!("{error:?}").contains("private-query-marker"));
+                error
+            })
+        });
+        let st = parse_openai_sse_json_stream(body);
         tokio::pin!(st);
-        let r = st.next().await.expect("one item");
-        let msg = r.expect_err("transport");
-        assert!(!msg.is_empty());
+        assert_eq!(
+            st.next().await.unwrap().unwrap(),
+            ParsedSseEvent::Data(json!({"x": 1}))
+        );
+        let msg = st.next().await.unwrap().expect_err("truncated HTTP body");
+        assert!(
+            msg.contains("IncompleteBody"),
+            "the transport cause must survive: {msg}"
+        );
+        assert!(!msg.contains("private-route") && !msg.contains("private-query-marker"));
         assert!(st.next().await.is_none());
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -11475,19 +11517,13 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(
-                res,
-                Err(StreamCollectError::IdleTimeout {
-                    made_progress: false,
-                    ..
-                })
-            ),
+            matches!(res, Err(StreamCollectError::IdleTimeout { .. })),
             "expected idle timeout, got: {res:?}"
         );
     }
 
     #[tokio::test]
-    async fn stream_idle_timeout_after_partial_output_marks_progress() {
+    async fn stream_idle_timeout_retains_partial_output() {
         let _guard = set_test_stream_timeouts(1, Some(1));
         let d1 = json!({"choices":[{"delta":{"content":"partial"}}]});
         let stream = stream::iter(vec![Ok(Bytes::from(format!("data: {d1}\n\n")))])
@@ -11503,12 +11539,7 @@ mod tests {
         )
         .await;
         match res.expect_err("idle timeout after partial output") {
-            StreamCollectError::IdleTimeout {
-                made_progress,
-                partial,
-                ..
-            } => {
-                assert!(made_progress, "partial output should mark progress");
+            StreamCollectError::IdleTimeout { partial, .. } => {
                 assert_eq!(partial.full_text, "partial");
             }
             other => panic!("expected idle timeout after partial output, got {other:?}"),
@@ -13920,7 +13951,7 @@ mod tests {
     }
 
     /// Session 5c5cbf78 (2026-05-08) regression: after seven tool-loop rounds,
-    /// enough `MICRO_COMPACT_STUB`-cleared tool results had accumulated that the
+    /// enough placeholder-cleared tool results had accumulated that the
     /// now-removed `insert_cache_edits_block` helper emitted a
     /// `{type: "cache_edits", edits: [...]}` content block on the final user
     /// message. Real Anthropic `/v1/messages` returns HTTP 400:
@@ -13933,7 +13964,7 @@ mod tests {
     #[test]
     fn build_anthropic_wire_never_contains_cache_edits_or_cache_reference() {
         // Shape: system + 3 turns with tool-loop activity, including a
-        // MICRO_COMPACT_STUB-cleared tool output (the pattern that used to
+        // placeholder-cleared tool output (the pattern that used to
         // trigger cache_edits emission). Even hand-seeded cache_reference
         // keys in the input must be stripped by the converter.
         let messages = vec![
@@ -13961,7 +13992,7 @@ mod tests {
             json!({
                 "role": "tool",
                 "tool_call_id": "c2",
-                "content": crate::turn::cloud::analytics::MICRO_COMPACT_STUB,
+                "content": "[tool result cleared — re-run if needed]",
                 "cache_reference": "c2",
             }),
             json!({"role": "user", "content": "turn 3 continue"}),

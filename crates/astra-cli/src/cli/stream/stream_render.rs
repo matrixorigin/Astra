@@ -115,11 +115,10 @@ pub(crate) fn agent_id_from_output(output: &str) -> Option<String> {
         })
 }
 
-/// Execution may create a fanout group and still lose its launch response.
-/// Such a local result or server projection is transport evidence, not a
-/// semantic terminal: the owning host reconciles the same call from the group
-/// registry and emits the single authoritative completion. Ordinary tools and
-/// usable typed fanout receipts remain immediate.
+/// A fanout completion requires a typed control receipt. Transport delivery
+/// alone is not terminal evidence; Server owns execution settlement and emits
+/// the authoritative result. Ordinary tools and usable fanout receipts remain
+/// immediate display evidence.
 fn tool_completion_is_authoritative(tool: &str, output: &str) -> bool {
     tool != "agent_fanout"
         || astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_result_is_usable(
@@ -4635,8 +4634,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let changed = self.executor.active_session_id().as_deref() != Some(session_id);
         if changed {
             self.executor.set_active_session_id(session_id.to_string());
-            self.try_emit_stream_event(chat_stream::StreamEvent::SessionBound(session_id.into()));
         }
+        // The shared SSE consumer de-duplicates this stream's identity. A
+        // resumed executor already having the id does not bind a new observer.
+        self.try_emit_stream_event(chat_stream::StreamEvent::SessionBound(session_id.into()));
         if let Some(pm) = self.perm_manager.as_mut() {
             pm.set_active_session_id(session_id);
         }
@@ -5850,12 +5851,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 reason: Some("approval requires run_id".to_string()),
             };
         };
-        // `resolve_cloud_approval` writes to stderr only. Never bump `lines_written` here:
-        // that counter drives stdout `MoveUp` when clearing streamed text before the first
-        // tool line; mixing in stderr line counts caused a large blank gap after prompts.
-        //
-        // Stop spinner/animation before prompting so inquire::Select renders
-        // cleanly and doesn't fight the running-tool spinner on stderr.
+        // Approval uses the TUI bottom pane, outside the streamed stdout text.
+        // Stop animations before handing off without changing `lines_written`,
+        // which only counts stdout rows for clearing streamed text.
         self.render.stop_tool_stderr_running();
         self.render.stop_tool_stdout_anim();
         self.render.stop_thinking();
@@ -8137,22 +8135,6 @@ async fn acquire_tool_permit_or_cancel(
     }
 }
 
-pub(crate) async fn execute_with_metadata_responsive(
-    executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
-    tool_name: String,
-    args: Value,
-    cancel_token: Option<tokio_util::sync::CancellationToken>,
-) -> crate::edge_tools::ToolExecutionOutcome {
-    execute_with_invocation_metadata_responsive(
-        executor,
-        tool_name,
-        args,
-        astra_tools::tool_engine::ToolInvocationMetadata::default(),
-        cancel_token,
-    )
-    .await
-}
-
 pub(crate) async fn execute_with_invocation_metadata_responsive(
     executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
     tool_name: String,
@@ -8171,9 +8153,7 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
     // The async Bash path owns the workspace pre/post observer and its
     // per-root lease. Keep it on this path even when the caller is the
     // responsive stream renderer; the shell itself is moved to a blocking
-    // worker by `bash_outcome_with_cancel_async`. The legacy synchronous
-    // helper cannot safely await that shared lease and would re-open the
-    // cross-session attribution race.
+    // worker by `bash_outcome_with_cancel_async`.
     if tool_name == "bash" {
         return executor
             .execute_with_invocation_metadata_cancelable(
@@ -8196,11 +8176,8 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
             .await;
     }
 
-    // The cancelable bash/powershell paths are sync work wrapped in an
-    // `async fn`, so we can call the sync core directly inside
-    // `spawn_blocking`. This avoids re-entering the runtime via
-    // `Handle::block_on` from a blocking-pool thread, which is fragile on
-    // `current_thread` runtimes and a well-known anti-pattern.
+    // Windows PowerShell uses a synchronous process core. Offload it without
+    // re-entering the async runtime from the blocking worker.
     let executor_for_blocking = std::sync::Arc::clone(&executor);
     let tool_for_blocking = tool_name.clone();
     let args_for_blocking = args.clone();
@@ -8757,11 +8734,11 @@ mod tests {
         approval_unavailable_tool_output, catch_tool_execution_panic, dispatch_turn_event_block,
         durable_allow_was_acknowledged, edge_callback_detach_message, edge_callback_error_kind,
         edge_tool_is_cacheable_read, edge_tool_outcome_status,
-        execute_with_invocation_metadata_responsive, execute_with_metadata_responsive,
-        extract_cli_diff_block, file_content_sha256, finalize_cli_skill_execution,
-        format_terminal_tool_summary, format_tool_display_from_preview, is_edge_auth_failure,
-        merge_edge_tool_rounds, normalize_sandbox_denied_outcome, path_mtime_ms,
-        recorded_approval_decision, request_token_usage_from_accum, sanitize_final_stream_text,
+        execute_with_invocation_metadata_responsive, extract_cli_diff_block, file_content_sha256,
+        finalize_cli_skill_execution, format_terminal_tool_summary,
+        format_tool_display_from_preview, is_edge_auth_failure, merge_edge_tool_rounds,
+        normalize_sandbox_denied_outcome, path_mtime_ms, recorded_approval_decision,
+        request_token_usage_from_accum, sanitize_final_stream_text,
         server_context_window_policy_from_accum, server_tool_completion_id,
         server_tool_completion_is_authoritative, server_tool_completion_output,
         server_tool_completion_status, server_tool_event_is_client_owned, server_tool_event_owner,
@@ -10815,13 +10792,14 @@ mod tests {
     async fn blocking_bash_execution_yields_to_runtime_ticks() {
         let dir = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(dir.path()));
-        let execution = execute_with_metadata_responsive(
+        let execution = execute_with_invocation_metadata_responsive(
             executor,
             "bash".to_string(),
             serde_json::json!({
                 "command": "sleep 0.2 && echo responsive",
                 "timeout": 2.0,
             }),
+            astra_tools::tool_engine::ToolInvocationMetadata::default(),
             None,
         );
         tokio::pin!(execution);
@@ -10849,7 +10827,7 @@ mod tests {
             crate::edge_tools::ToolExecutor::new(dir.path()).with_bash_detach_slot(slot),
         );
 
-        let execution = tokio::spawn(execute_with_metadata_responsive(
+        let execution = tokio::spawn(execute_with_invocation_metadata_responsive(
             executor,
             "bash".to_string(),
             serde_json::json!({
@@ -10859,6 +10837,7 @@ mod tests {
                 "command": "sleep 5",
                 "timeout": 30.0,
             }),
+            astra_tools::tool_engine::ToolInvocationMetadata::default(),
             None,
         ));
 
@@ -13052,76 +13031,154 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn cloud_approval_always_persists_benign_project_scope() {
-        let server = MockServer::start().await;
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        let mut pm =
-            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
-        let (approval_tx, mut approval_rx) =
-            tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(
-                chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
-            );
-
-        let decision = {
-            let mut host = CliSseStreamHost::from_edge_ctx(
-                EdgeSseContext {
-                    api: &api,
-                    token: "tok",
-                    executor_id: "edge-test",
-                    executor,
-                    render_policy: RenderPolicy::Stream,
-                    perm_manager: Some(&mut pm),
-                    cancel_token: None,
-                    stream_event_tx: None,
-                    stream_event_sink: None,
-                    approval_request_tx: Some(approval_tx),
-                    ask_user_request_tx: None,
-                    skill_resolver: None,
-                    skill_continuation: false,
-                    turn_rollback_on_failure: false,
-                    tool_cache: &mut tool_cache,
-                    incremental_state: None,
-                    request_session_execution_lease: None,
-                },
-                80,
-                false,
-            );
-            let decision_fut = host.resolve_cloud_approval_via_tui(
+        for (tool, detail, kind) in [
+            (
                 "write_file",
-                Some("src/main.rs"),
-                None,
+                "src/main.rs",
                 astra_thin_client::ApprovalKind::Standard,
-            );
-            let responder = async {
-                let request = approval_rx.recv().await.expect("approval request");
-                assert_eq!(
-                    request.args["path"].as_str(),
-                    Some("src/main.rs"),
-                    "cloud approval card should carry command args for re-evaluation"
+            ),
+            (
+                "bash",
+                "cargo test --lib",
+                astra_thin_client::ApprovalKind::Explicit,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+            let temp = tempdir().expect("tempdir");
+            let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+            let mut tool_cache = EdgeToolCache::new(8);
+            let mut pm =
+                crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
+            let (approval_tx, mut approval_rx) =
+                tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(
+                    chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
                 );
-                request
-                    .response_tx
-                    .send(chat_stream::ApprovalResponse::AlwaysAllow)
-                    .expect("send response");
+
+            let later_detail = if tool == "bash" {
+                format!(
+                    "cd {} && cargo test -p astra-cli --lib",
+                    temp.path().display()
+                )
+            } else {
+                "tests/another.rs".to_string()
             };
-            let (decision, ()) = tokio::join!(decision_fut, responder);
-            decision
-        };
+            let args = if tool == "bash" {
+                serde_json::json!({"command": later_detail})
+            } else {
+                serde_json::json!({"path": later_detail})
+            };
+            let decision = {
+                let mut host = CliSseStreamHost::from_edge_ctx(
+                    EdgeSseContext {
+                        api: &api,
+                        token: "tok",
+                        executor_id: "edge-test",
+                        executor,
+                        render_policy: RenderPolicy::Stream,
+                        perm_manager: Some(&mut pm),
+                        cancel_token: None,
+                        stream_event_tx: None,
+                        stream_event_sink: None,
+                        approval_request_tx: Some(approval_tx),
+                        ask_user_request_tx: None,
+                        skill_resolver: None,
+                        skill_continuation: false,
+                        turn_rollback_on_failure: false,
+                        tool_cache: &mut tool_cache,
+                        incremental_state: None,
+                        request_session_execution_lease: None,
+                    },
+                    80,
+                    false,
+                );
+                let decision_fut =
+                    host.resolve_cloud_approval_via_tui(tool, Some(detail), None, kind);
+                let responder = async {
+                    let request = approval_rx.recv().await.expect("approval request");
+                    assert_eq!(
+                        request.args[if tool == "bash" { "command" } else { "path" }].as_str(),
+                        Some(detail),
+                        "cloud approval card should carry command args for re-evaluation"
+                    );
+                    request
+                        .response_tx
+                        .send(chat_stream::ApprovalResponse::AlwaysAllow)
+                        .expect("send response");
+                };
+                let (decision, ()) = tokio::join!(decision_fut, responder);
+                let second = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    host.resolve_cloud_approval_via_tui(tool, Some(&later_detail), None, kind),
+                )
+                .await
+                .expect("the matching family must not prompt again");
+                assert_eq!(second, Ok(astra_thin_client::ApprovalDecision::Allow));
+                assert!(matches!(
+                    approval_rx.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ));
+                decision
+            };
 
-        assert_eq!(
-            decision,
-            Ok(astra_thin_client::ApprovalDecision::AllowSession)
-        );
+            assert_eq!(
+                decision,
+                Ok(astra_thin_client::ApprovalDecision::AllowSession)
+            );
 
-        let args = serde_json::json!({"path": "src/main.rs"});
-        let mut reloaded =
-            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
-        assert!(matches!(
-            reloaded.check_nonblocking("write_file", &args),
-            crate::cli::permission_manager::GateOutcome::Allow
-        ));
+            let saved: crate::cli::permission_manager::PermissionSettings = serde_json::from_slice(
+                &std::fs::read(temp.path().join(".astra/permissions.json"))
+                    .expect("persisted project permission JSON"),
+            )
+            .expect("valid permission JSON");
+            assert!(
+                !saved.allow.is_empty(),
+                "the real TUI response must persist a project rule"
+            );
+            if tool == "bash" {
+                assert!(
+                    saved
+                        .allow
+                        .iter()
+                        .any(|rule| rule == r#"Bash(argv_prefix="cargo test", op="execute")"#),
+                    "{saved:?}"
+                );
+                assert_eq!(
+                    pm.preflight_cloud_approval_decision("bash", Some("cargo build"), kind, false),
+                    None,
+                    "a different command family must not inherit the grant"
+                );
+            }
+            for quiet in [false, true] {
+                assert_eq!(
+                    pm.preflight_cloud_approval_decision(tool, Some(&later_detail), kind, quiet),
+                    Some(astra_thin_client::ApprovalDecision::Allow)
+                );
+            }
+            assert!(matches!(
+                pm.check_nonblocking(tool, &args),
+                crate::cli::permission_manager::GateOutcome::Allow
+            ));
+            let mut reloaded =
+                crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
+            if tool == "bash" {
+                assert_eq!(
+                    reloaded.preflight_cloud_approval_decision(
+                        tool,
+                        Some(&later_detail),
+                        kind,
+                        false
+                    ),
+                    None,
+                    "a persistent rule cannot skip the explicit approval boundary after the session grant ends"
+                );
+            } else {
+                assert!(matches!(
+                    reloaded.check_nonblocking(tool, &args),
+                    crate::cli::permission_manager::GateOutcome::Allow
+                ));
+            }
+        }
     }
 
     #[serial_test::serial]
@@ -13202,6 +13259,12 @@ mod tests {
             pm.check_nonblocking("write_file", &args),
             crate::cli::permission_manager::GateOutcome::Allow
         ));
+        let saved = crate::cli::permission_manager::PermissionSettings::try_load(temp.path());
+        assert!(saved.error.is_none(), "{saved:?}");
+        assert!(
+            saved.settings.allow.is_empty(),
+            "session-only approval must not persist any project grant"
+        );
         let mut reloaded =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         assert!(matches!(
@@ -13294,6 +13357,12 @@ mod tests {
             "same-session explicit git Always should avoid re-prompting"
         );
 
+        let saved = crate::cli::permission_manager::PermissionSettings::try_load(temp.path());
+        assert!(saved.error.is_none(), "{saved:?}");
+        assert!(
+            saved.settings.allow.is_empty(),
+            "session-only approval must not persist any project grant"
+        );
         let mut reloaded =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         assert_eq!(
@@ -17536,35 +17605,57 @@ mod tests {
 
     #[test]
     fn sync_incremental_tool_result() {
-        // pushes record and adds tool_used
-        let state = IncrementalTurnState::default();
-        sync_incremental_tool_result_state(
-            &state,
-            &EdgeToolExecResult {
+        for (tool, output, canonical) in [
+            ("read_file", "pub fn main() {}", "pub fn main() {}"),
+            ("bash", "first\r\nsecond\r\n", "first\r\nsecond\r\n"),
+            (
+                "write_file",
+                r#"{"status":"written","_cli_unified_diff":"UI diff"}"#,
+                r#"{"status":"written"}"#,
+            ),
+            (
+                "str_replace",
+                "Updated\n<<<ASTRA_UNIFIED_DIFF>>>\nUI diff\n<<<END_ASTRA_UNIFIED_DIFF>>>\n",
+                "Updated",
+            ),
+            (
+                "multi_edit",
+                "Updated\n<<<ASTRA_UNIFIED_DIFF>>>\nUI diff\n<<<END_ASTRA_UNIFIED_DIFF>>>\n",
+                "Updated",
+            ),
+        ] {
+            let state = IncrementalTurnState::default();
+            let result = EdgeToolExecResult {
                 execution_completion: None,
                 request_id: "req-1".into(),
-                tool: "read_file".into(),
+                tool: tool.into(),
                 args: serde_json::json!({"path": "lib.rs"}),
-                output: "pub fn main() {}".into(),
+                output: output.into(),
                 tool_result_fields: None,
                 status: "completed".into(),
                 duration_ms: 42,
-            },
-        );
-        let snap = state.snapshot();
-        assert_eq!(snap.tool_call_records.len(), 1);
-        assert_eq!(
-            snap.tool_call_records[0].tool_call_id.as_deref(),
-            Some("req-1")
-        );
-        assert_eq!(snap.tool_call_records[0].name, "read_file");
-        assert!(snap.tool_call_records[0].ok);
-        assert_eq!(snap.tool_call_records[0].ms, 42);
-        assert_eq!(
-            snap.tool_call_records[0].effective_disposition(),
-            astra_services::session_journal::ToolCallDisposition::Executed
-        );
-        assert_eq!(snap.tools_used, vec!["read_file"]);
+            };
+            sync_incremental_tool_result_state(&state, &result);
+            let snap = state.snapshot();
+            assert_eq!(snap.tool_call_records.len(), 1);
+            let record = &snap.tool_call_records[0];
+            assert_eq!(record.tool_call_id.as_deref(), Some("req-1"));
+            assert_eq!(record.name, tool);
+            assert!(record.ok);
+            assert_eq!(record.ms, 42);
+            assert_eq!(
+                record.effective_disposition(),
+                astra_services::session_journal::ToolCallDisposition::Executed
+            );
+            assert_eq!(record.result_full.as_deref(), Some(canonical));
+            assert_eq!(record.result_preview.as_deref(), Some(canonical));
+            assert_eq!(record.output_bytes, Some(canonical.len() as u32));
+            assert_eq!(snap.tools_used, vec![tool]);
+            assert_eq!(
+                result.output, output,
+                "UI/callback output remains unchanged"
+            );
+        }
 
         // error status records error
         let state = IncrementalTurnState::default();

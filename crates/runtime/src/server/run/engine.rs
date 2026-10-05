@@ -4696,12 +4696,11 @@ use crate::turn::run_control::{
     UserIntentPoll, UserIntentPollIssue, UserIntentPollIssueKind, UserIntentProvider,
 };
 
-fn durable_event_index(event: &serde_json::Value, fallback: usize) -> usize {
+fn durable_event_index(event: &serde_json::Value) -> Option<usize> {
     event
         .get("index")
-        .and_then(serde_json::Value::as_u64)
+        .and_then(serde_json::Value::as_i64)
         .and_then(|index| usize::try_from(index).ok())
-        .unwrap_or(fallback)
 }
 
 fn user_intent_issue(
@@ -4772,13 +4771,9 @@ fn parse_queued_user_intent(
 }
 
 fn parse_applied_user_intent(
+    durable_index: usize,
     event: &serde_json::Value,
 ) -> Result<QueuedUserIntent, UserIntentPollIssue> {
-    let durable_index = event
-        .get("index")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(0);
     let Some(data) = event.get("data") else {
         return Err(user_intent_issue(
             durable_index,
@@ -5303,6 +5298,36 @@ impl UserIntentProvider for RunEngine {
                 };
             }
         };
+        // A control page is a filtered durable stream: gaps are legitimate,
+        // so its positions cannot supply missing event identities. Validate
+        // the entire page before delivering any intent or advancing its cursor.
+        let Some(event_indices) = delta
+            .events
+            .iter()
+            .map(durable_event_index)
+            .collect::<Option<Vec<_>>>()
+        else {
+            record_control_poll_attempt(
+                self.metrics_registry.as_ref(),
+                "user_intent_poll",
+                "error",
+            );
+            record_control_poll_error(
+                self.metrics_registry.as_ref(),
+                "user_intent_poll",
+                "invalid_event",
+            );
+            return UserIntentPoll {
+                next_cursor: after_event_index,
+                snapshot_has_more: false,
+                snapshot_page_fact_count: 0,
+                inputs: Vec::new(),
+                issues: Vec::new(),
+                error: Some(
+                    "user-intent control page contains an invalid durable event index".into(),
+                ),
+            };
+        };
         let snapshot_has_more = delta.has_more;
         let snapshot_page_fact_count = delta.events.len();
         let mut settled_indices = delta
@@ -5328,14 +5353,12 @@ impl UserIntentProvider for RunEngine {
         } else {
             after_event_index.max(authoritative_tail)
         };
-        for (position, event) in delta.events.iter().enumerate() {
-            let fallback = after_event_index.saturating_add(position).saturating_add(1);
-            let event_index = durable_event_index(event, fallback);
+        for (event, event_index) in delta.events.iter().zip(event_indices) {
             let parsed = match event.get("event_type").and_then(serde_json::Value::as_str) {
                 Some("user_intent") if !settled_indices.contains(&event_index) => {
                     Some(parse_queued_user_intent(event_index, event))
                 }
-                Some("user_intent_applied") => Some(parse_applied_user_intent(event)),
+                Some("user_intent_applied") => Some(parse_applied_user_intent(event_index, event)),
                 _ => None,
             };
             let Some(parsed) = parsed else { continue };
@@ -7388,6 +7411,7 @@ mod tests {
         cancellation_lookup_failures: AtomicUsize,
         load_run_control_failures: AtomicUsize,
         load_user_intent_control_delta_failures: AtomicUsize,
+        control_delta_index_corruption: Option<(usize, Option<serde_json::Value>)>,
         recovery_claim_failures: AtomicUsize,
         attempts: AtomicUsize,
         projection_repairs: AtomicUsize,
@@ -7439,6 +7463,7 @@ mod tests {
                 cancellation_lookup_failures: AtomicUsize::new(0),
                 load_run_control_failures: AtomicUsize::new(0),
                 load_user_intent_control_delta_failures: AtomicUsize::new(0),
+                control_delta_index_corruption: None,
                 recovery_claim_failures: AtomicUsize::new(0),
                 attempts: AtomicUsize::new(0),
                 projection_repairs: AtomicUsize::new(0),
@@ -7766,9 +7791,24 @@ mod tests {
             if consume_failure(&self.load_user_intent_control_delta_failures) {
                 return Err("load failed".into());
             }
-            self.inner
+            let mut delta = self
+                .inner
                 .load_user_intent_control_delta(user_id, run_id, after_event_idx, limit)
-                .await
+                .await?;
+            if let (Some(delta), Some((position, index))) =
+                (delta.as_mut(), self.control_delta_index_corruption.as_ref())
+            {
+                let event = delta.events[*position].as_object_mut().unwrap();
+                match index {
+                    Some(index) => {
+                        event.insert("index".into(), index.clone());
+                    }
+                    None => {
+                        event.remove("index");
+                    }
+                }
+            }
+            Ok(delta)
         }
 
         async fn update_run_status(
@@ -11061,6 +11101,59 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn user_intent_poll_rejects_unidentified_pages_without_partial_delivery() {
+        for index in [
+            None,
+            Some(serde_json::json!("9")),
+            Some(serde_json::json!(-1)),
+            Some(serde_json::json!(9.5)),
+            Some(serde_json::json!(u64::MAX)),
+        ] {
+            for position in [0, 1] {
+                for event_type in ["user_intent", "user_intent_applied"] {
+                    let mut store = FlakyBatchTransitionStore::new(
+                        0,
+                        BatchTransitionFailureMode::FailBeforeStoreWrite,
+                    );
+                    store.control_delta_index_corruption = Some((position, index.clone()));
+                    let engine = RunEngine::new(Arc::new(store));
+                    engine
+                        .start_run("run-input", "user-1", "sess-input")
+                        .await
+                        .unwrap();
+                    let events = [7, 9].map(|index| {
+                        serde_json::json!({
+                            "index": index,
+                            "event_type": event_type,
+                            "data": {
+                                "event_index": index,
+                                "intent_id": format!("intent-{index}"),
+                                "delivery": "guide_current_run",
+                                "input": {"content": "continue"}
+                            }
+                        })
+                    });
+                    engine
+                        .append_events_batch("user-1", "sess-input", "run-input", &events)
+                        .await
+                        .unwrap();
+                    let poll = engine.poll_user_intents("user-1", "run-input", 5).await;
+                    assert_eq!(poll.next_cursor, 5, "{event_type}, {position}, {index:?}");
+                    assert!(poll.inputs.is_empty(), "no valid prefix may be delivered");
+                    assert!(
+                        poll.issues.is_empty(),
+                        "missing identity cannot label an issue"
+                    );
+                    assert_eq!(
+                        poll.error.as_deref(),
+                        Some("user-intent control page contains an invalid durable event index")
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

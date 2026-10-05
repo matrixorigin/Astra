@@ -287,24 +287,6 @@ filter.
 
 ---
 
-## Replay
-
-### POST /sessions/{session_id}/replay
-
-Reserved for durable replay reconstruction. For an owned session this route
-currently returns HTTP 501 with an explicit unavailable detail; it does not
-create a replay identity or execute any provider, tool, or external call.
-Missing or foreign sessions return HTTP 404 without revealing ownership.
-
-### GET /sessions/{session_id}/replay/compare
-
-Reserved for durable replay reconstruction. For an owned session this route
-currently returns HTTP 501 with an explicit unavailable detail; it does not
-return replay or comparison counts. Missing or foreign sessions return HTTP
-404 without revealing ownership.
-
----
-
 ## Skills
 
 ### GET /skills

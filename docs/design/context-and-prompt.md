@@ -197,3 +197,8 @@ remain live. A replacement must reduce the full estimated context, including its
 summary and reference. Artifact storage must succeed before the canonical rewrite;
 a failure or cancellation preserves the original history. The selected host must
 provide a durable session artifact writer and an admitted introspect reader.
+
+The unused local output-style registry, environment selector and custom style
+file loader are retired. Prompt overrides and admitted profile instructions
+retain their existing owners; request assembly does not infer a style from
+process-local placeholder state.

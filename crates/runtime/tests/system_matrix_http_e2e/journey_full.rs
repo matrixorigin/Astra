@@ -1184,33 +1184,6 @@ pub async fn run_product_matrix_full_journey(
         "context trace event should persist available tool count"
     );
 
-    let replay_cmp_path = format!("/sessions/{session_id}/replay/compare");
-    let (st_rcmp, rcmp_j) = get_json(app, &replay_cmp_path, Some(auth_header), &[]).await;
-    assert_eq!(
-        st_rcmp,
-        StatusCode::NOT_IMPLEMENTED,
-        "replay compare must remain unavailable: {rcmp_j}"
-    );
-    assert!(
-        rcmp_j["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("replay") && detail.contains("unavailable")),
-        "replay compare should explain the unavailable capability: {rcmp_j}"
-    );
-    let replay_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events \
-         WHERE session_id = ? AND user_id = ? AND event_type = 'replay'",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(pool)
-    .await
-    .expect("replay rows after unavailable compare");
-    assert_eq!(
-        replay_rows, 0,
-        "compare guardrail must not write replay rows"
-    );
-
     cleanup_session_data(&ctx.shared_pool, &user_id, &session_id).await;
     cleanup_edge_registry(pool, &user_id, &edge_agent_id).await;
 

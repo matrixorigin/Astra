@@ -1,6 +1,5 @@
 use crate::cli::project_instructions::format_project_instructions;
 use crate::cli::session::session_state::SessionState;
-use astra_runtime::prompts;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FinalizedInput {
@@ -11,17 +10,12 @@ pub(crate) struct FinalizedInput {
     /// Dynamic text from external session sources. Internal runtime state
     /// uses required/typed lanes and must not be projected here.
     pub(crate) runtime_volatile_texts: Vec<String>,
-    /// Producer-owned names for built-in system skills active on this turn.
-    /// The payload builder projects these into `edge_profile.active_skills`;
-    /// it must never rediscover them by parsing prompt text.
-    pub(crate) active_system_skill_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedInput {
     pub(crate) user_message: String,
     pub(crate) runtime_required_texts: Vec<String>,
-    pub(crate) active_system_skill_names: Vec<String>,
 }
 
 impl PreparedInput {
@@ -29,7 +23,6 @@ impl PreparedInput {
         Self {
             user_message: user_message.into(),
             runtime_required_texts: Vec::new(),
-            active_system_skill_names: Vec::new(),
         }
     }
 }
@@ -71,15 +64,10 @@ pub(crate) async fn finalize_effective_line(
         user_intent,
         runtime_required_texts,
         runtime_volatile_texts,
-        active_system_skill_names: prepared.active_system_skill_names,
     }
 }
 
-pub(crate) fn prepare_input(
-    line: &str,
-    state: &SessionState,
-    ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
-) -> PreparedInput {
+pub(crate) fn prepare_input(line: &str, state: &SessionState) -> PreparedInput {
     let mut runtime_required_texts = Vec::new();
 
     if let Some(project_instructions) = state.project_instructions.as_ref() {
@@ -90,45 +78,9 @@ pub(crate) fn prepare_input(
         runtime_required_texts.push(diagnostics_context.clone());
     }
 
-    if !state.active_system_skills.is_empty() {
-        runtime_required_texts.push(prompts::build_skill_instructions(
-            &state.active_system_skills,
-        ));
-    }
-
-    if let Some(skill_dev) = state.skill_dev.as_ref() {
-        let skill_md = skill_dev.dir.join("SKILL.md");
-        match std::fs::read_to_string(&skill_md) {
-            Ok(source) if !source.trim().is_empty() => {
-                runtime_required_texts.push(prompts::build_skill_dev_context(
-                    &skill_dev.name,
-                    &skill_md.display().to_string(),
-                    &source,
-                ));
-            }
-            Ok(_) => {
-                ui.show_warning(&format!(
-                    "  ⚠ SKILL.md is empty at {}, dev context skipped",
-                    skill_md.display()
-                ));
-            }
-            Err(_) => {
-                ui.show_warning(&format!(
-                    "  ⚠ SKILL.md not found at {}, dev context skipped",
-                    skill_md.display()
-                ));
-            }
-        }
-    }
-
     PreparedInput {
         user_message: line.to_string(),
         runtime_required_texts,
-        active_system_skill_names: state
-            .active_system_skills
-            .iter()
-            .map(|skill| skill.name.clone())
-            .collect(),
     }
 }
 
@@ -138,8 +90,7 @@ mod tests {
         PreparedInput, clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line,
         prepare_input,
     };
-    use crate::cli::session::session_state::{ContinuationAnchor, SessionState, SkillDevState};
-    use astra_runtime::prompts;
+    use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
 
     #[test]
     fn build_effective_line_does_not_phrase_match_short_continue() {
@@ -151,7 +102,7 @@ mod tests {
             ..SessionState::default()
         };
 
-        let prepared = prepare_input("继续", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
+        let prepared = prepare_input("继续", &state);
         assert!(prepared.runtime_required_texts.is_empty());
         assert_eq!(prepared.user_message, "继续");
     }
@@ -165,7 +116,7 @@ mod tests {
             ..SessionState::default()
         };
 
-        let prepared = prepare_input("修复?", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
+        let prepared = prepare_input("修复?", &state);
         assert_eq!(prepared.user_message, "修复?");
         assert!(prepared.runtime_required_texts.is_empty());
     }
@@ -179,11 +130,7 @@ mod tests {
             ..SessionState::default()
         };
 
-        let prepared = prepare_input(
-            "修一下输入法问题",
-            &state,
-            &mut crate::cli::ui_adapter::LineUiAdapter,
-        );
+        let prepared = prepare_input("修一下输入法问题", &state);
         assert_eq!(prepared.user_message, "修一下输入法问题");
         assert!(prepared.runtime_required_texts.is_empty());
     }
@@ -212,187 +159,13 @@ mod tests {
     }
 
     #[test]
-    fn build_effective_line_skill_dev_reads_from_disk() {
-        let tmp = tempfile::tempdir().unwrap();
-        let skill_dir = tmp.path().join("test-skill");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: test-skill\n---\n# Test\nDo stuff.",
-        )
-        .unwrap();
-
-        let state = SessionState {
-            skill_dev: Some(SkillDevState {
-                name: "test-skill".to_string(),
-                dir: skill_dir,
-            }),
-            ..SessionState::default()
-        };
-
-        let prepared = prepare_input(
-            "improve this skill",
-            &state,
-            &mut crate::cli::ui_adapter::LineUiAdapter,
-        );
-        assert_eq!(prepared.user_message, "improve this skill");
-        assert_eq!(prepared.runtime_required_texts.len(), 1);
-        assert!(prepared.runtime_required_texts[0].contains("[SKILL DEV: test-skill]"));
-        assert!(prepared.runtime_required_texts[0].contains("Do stuff."));
-    }
-
-    #[test]
-    fn build_effective_line_skill_dev_picks_up_external_edits() {
-        const OLD_BODY: &str = "skill body version one";
-        const NEW_BODY: &str = "skill body version two rewritten";
-        let tmp = tempfile::tempdir().unwrap();
-        let skill_dir = tmp.path().join("evolving");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            format!("---\nname: evolving\n---\n{OLD_BODY}"),
-        )
-        .unwrap();
-
-        let state = SessionState {
-            skill_dev: Some(SkillDevState {
-                name: "evolving".to_string(),
-                dir: skill_dir.clone(),
-            }),
-            ..SessionState::default()
-        };
-
-        let turn1 = prepare_input("check", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
-        assert!(turn1.runtime_required_texts[0].contains(OLD_BODY));
-
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            format!("---\nname: evolving\n---\n{NEW_BODY}"),
-        )
-        .unwrap();
-
-        let turn2 = prepare_input(
-            "check again",
-            &state,
-            &mut crate::cli::ui_adapter::LineUiAdapter,
-        );
-        assert!(
-            !turn2.runtime_required_texts[0].contains(OLD_BODY),
-            "should not contain old skill body"
-        );
-        assert!(
-            turn2.runtime_required_texts[0].contains(NEW_BODY),
-            "should contain new content"
-        );
-    }
-
-    #[test]
-    fn build_effective_line_skill_dev_missing_file_falls_through() {
-        let state = SessionState {
-            skill_dev: Some(SkillDevState {
-                name: "ghost".to_string(),
-                dir: std::path::PathBuf::from("/nonexistent/path/ghost"),
-            }),
-            ..SessionState::default()
-        };
-
-        let prepared = prepare_input("hello", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
-        assert_eq!(prepared, PreparedInput::user_only("hello"));
-    }
-
-    #[test]
-    fn build_effective_line_skill_dev_empty_file_falls_through() {
-        let tmp = tempfile::tempdir().unwrap();
-        let skill_dir = tmp.path().join("empty-skill");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(skill_dir.join("SKILL.md"), "").unwrap();
-
-        let state = SessionState {
-            skill_dev: Some(SkillDevState {
-                name: "empty-skill".to_string(),
-                dir: skill_dir,
-            }),
-            ..SessionState::default()
-        };
-
-        let prepared = prepare_input("hello", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
-        assert_eq!(prepared, PreparedInput::user_only("hello"));
-    }
-
-    #[test]
-    fn build_effective_line_skill_dev_shows_actual_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let skill_dir = tmp.path().join("custom-loc");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: custom-loc\n---\nBody",
-        )
-        .unwrap();
-
-        let state = SessionState {
-            skill_dev: Some(SkillDevState {
-                name: "custom-loc".to_string(),
-                dir: skill_dir.clone(),
-            }),
-            ..SessionState::default()
-        };
-
-        let prepared = prepare_input("x", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
-        let expected_path = skill_dir.join("SKILL.md").display().to_string();
-        assert!(
-            prepared.runtime_required_texts[0].contains(&expected_path),
-            "should contain actual path: {expected_path}"
-        );
-    }
-
-    #[test]
-    fn build_effective_line_skill_dev_combines_with_system_skills_and_anchor() {
-        let tmp = tempfile::tempdir().unwrap();
-        let skill_dir = tmp.path().join("combo");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: combo\n---\nCombo skill",
-        )
-        .unwrap();
-
-        let state = SessionState {
-            skill_dev: Some(SkillDevState {
-                name: "combo".to_string(),
-                dir: skill_dir,
-            }),
-            active_system_skills: vec![prompts::builtin_concise_skill()],
-            continuation_anchor: Some(ContinuationAnchor::rendered_for_test(
-                "Previous task: fix auth",
-            )),
-            ..SessionState::default()
-        };
-
-        let prepared = prepare_input(
-            "continue",
-            &state,
-            &mut crate::cli::ui_adapter::LineUiAdapter,
-        );
-        assert_eq!(prepared.user_message, "continue");
-        assert_eq!(prepared.active_system_skill_names, vec!["concise"]);
-        assert_eq!(prepared.runtime_required_texts.len(), 2);
-        assert!(prepared.runtime_required_texts[0].contains("Concise"));
-        assert!(prepared.runtime_required_texts[1].contains("[SKILL DEV: combo]"));
-    }
-
-    #[test]
     fn explain_artifact_context_is_not_injected_from_a_client_local_store() {
         let session_id = "9a5c2f6e-0f88-44db-a7a4-5e89c1d2f304";
         let state = SessionState {
             session_id: Some(session_id.to_string()),
             ..SessionState::default()
         };
-        let prepared = prepare_input(
-            "analyze the previous explain",
-            &state,
-            &mut crate::cli::ui_adapter::LineUiAdapter,
-        );
+        let prepared = prepare_input("analyze the previous explain", &state);
         assert!(prepared.runtime_required_texts.is_empty());
     }
 

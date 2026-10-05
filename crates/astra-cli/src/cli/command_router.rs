@@ -2369,31 +2369,6 @@ async fn execute_cli_command_impl(
             Ok(exit_code)
         }
 
-        Some(Command::Replay(args)) => {
-            let session_id = validated_cli_session_arg(&args.session_id)?;
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let replay_body = api
-                .post_session_replay_json(
-                    &token,
-                    session_id,
-                    &serde_json::json!({
-                        "sandbox_name": args.sandbox_name,
-                        "mock_mode": args.mock_mode
-                    }),
-                )
-                .await
-                .map_err(map_thin_err)?;
-            print_json_or_raw(&replay_body);
-            if args.compare {
-                let compare_body = api
-                    .get_session_replay_compare_text(&token, session_id)
-                    .await
-                    .map_err(map_thin_err)?;
-                print_json_or_raw(&compare_body);
-            }
-            Ok(ExitCode::Success)
-        }
-
         Some(Command::Session(SessionCmd::Judge(args))) => {
             if args.message.trim().is_empty() {
                 return Err("judgment message must not be empty".to_string());

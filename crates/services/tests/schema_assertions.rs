@@ -111,6 +111,11 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         !existing.contains("auth_memoria_identities"),
         "fresh bootstrap must not create the obsolete Memoria identity table"
     );
+    let model_columns = column_names(&pool, &schema, "infra_llm_models").await;
+    assert!(model_columns.contains(&"thinking_probe_json".into()));
+    for retired in ["thinking_capability", "thinking_probe_error"] {
+        assert!(!model_columns.iter().any(|column| column == retired));
+    }
     let proposal_columns = column_names(&pool, &schema, "work_proposals").await;
     for expected in [
         "proposal_kind",

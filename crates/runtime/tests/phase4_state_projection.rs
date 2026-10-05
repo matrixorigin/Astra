@@ -177,11 +177,10 @@ async fn index_columns(pool: &astra_core::SharedPool, table: &str, key: &str) ->
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_36_delegation_projection_and_retry_supersede_are_transactional() {
+async fn l2_36_delegation_projection_is_transactional() {
     let pool = setup_pool().await;
     let (session_id, user_id, root_run_id) = ids();
     let child_run_id = format!("child-{root_run_id}");
-    let retry_run_id = format!("retry-{root_run_id}");
     insert_session(&pool, &session_id, &user_id).await;
     insert_run(
         &pool,
@@ -229,18 +228,12 @@ async fn l2_36_delegation_projection_and_retry_supersede_are_transactional() {
         })
         .await
         .unwrap();
-    store
-        .create_retry_run_and_supersede(&user_id, &child_run_id, &retry_run_id, "subtree")
-        .await
-        .unwrap();
-
     let row = sqlx::query(
         "SELECT
             (SELECT COUNT(*) FROM session_delegations WHERE child_run_id = ? AND user_id = ?) AS delegation_count,
             (SELECT COUNT(*) FROM session_state_items
              WHERE session_id = ? AND user_id = ? AND category = 'delegation_state') AS state_count,
-            (SELECT status FROM agent_runs WHERE run_id = ? AND user_id = ?) AS old_status,
-            (SELECT retry_scope FROM agent_runs WHERE run_id = ? AND user_id = ?) AS retry_scope",
+            (SELECT retry_scope FROM session_delegations WHERE child_run_id = ? AND user_id = ?) AS retry_scope",
     )
     .bind(&child_run_id)
     .bind(&user_id)
@@ -248,17 +241,11 @@ async fn l2_36_delegation_projection_and_retry_supersede_are_transactional() {
     .bind(&user_id)
     .bind(&child_run_id)
     .bind(&user_id)
-    .bind(&retry_run_id)
-    .bind(&user_id)
     .fetch_one(pool.get())
     .await
     .unwrap();
     assert_eq!(row.try_get::<i64, _>("delegation_count").unwrap(), 1);
     assert_eq!(row.try_get::<i64, _>("state_count").unwrap(), 1);
-    assert_eq!(
-        row.try_get::<String, _>("old_status").unwrap(),
-        "superseded"
-    );
     assert_eq!(row.try_get::<String, _>("retry_scope").unwrap(), "subtree");
     let plan = explain_analyze_text(
         &pool,
@@ -306,51 +293,6 @@ async fn l2_36_delegation_projection_and_retry_supersede_are_transactional() {
         ["user_id", "session_id", "created_at", "event_id"],
         "state-event history index must stay owner/session ordered with event_id tie-breaker"
     );
-}
-
-#[tokio::test]
-#[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn create_retry_run_and_supersede_rejects_wrong_owner_without_mutation() {
-    let pool = setup_pool().await;
-    let (session_id, user_id, run_id) = ids();
-    let retry_run_id = format!("retry-{run_id}");
-    let wrong_user_id = format!("wrong-{user_id}");
-    insert_session(&pool, &session_id, &user_id).await;
-    insert_run(
-        &pool,
-        &session_id,
-        &user_id,
-        &run_id,
-        None,
-        &run_id,
-        &run_id,
-        0,
-        "failed",
-    )
-    .await;
-
-    let err = DatabaseStateProjectionStore::new(pool.clone())
-        .create_retry_run_and_supersede(&wrong_user_id, &run_id, &retry_run_id, "node")
-        .await
-        .expect_err("wrong owner must not supersede or retry another owner's run");
-    assert!(
-        err.to_string().contains("load_old_retry_run"),
-        "wrong-owner retry should fail at owner-bound old-run load: {err}"
-    );
-
-    let row = sqlx::query(
-        "SELECT
-            (SELECT status FROM agent_runs WHERE user_id = ? AND run_id = ?) AS old_status,
-            (SELECT COUNT(*) FROM agent_runs WHERE run_id = ?) AS retry_count",
-    )
-    .bind(&user_id)
-    .bind(&run_id)
-    .bind(&retry_run_id)
-    .fetch_one(pool.get())
-    .await
-    .unwrap();
-    assert_eq!(row.try_get::<String, _>("old_status").unwrap(), "failed");
-    assert_eq!(row.try_get::<i64, _>("retry_count").unwrap(), 0);
 }
 
 #[tokio::test]

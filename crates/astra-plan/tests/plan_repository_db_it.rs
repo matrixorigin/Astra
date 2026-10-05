@@ -152,6 +152,59 @@ fn make_state_with_subtasks(owner: &str, goal: &str, ids: &[&str]) -> PlanModeSt
 
 matrixone_db_test! {
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn record_step_run_rejects_missing_or_foreign_parent_without_writes() {
+    let (repo, pool) = setup_repo().await;
+    let prefix = format!("pit-parent-{}", Uuid::new_v4().simple());
+    let missing_plan = format!("{prefix}-missing");
+    let foreign_plan = format!("{prefix}-foreign");
+    let caller = format!("u-caller-{}", Uuid::new_v4().simple());
+    let owner = format!("u-owner-{}", Uuid::new_v4().simple());
+    let session = format!("sit-parent-{}", Uuid::new_v4().simple());
+    ensure_session(&pool, &session, &owner).await;
+    let mut state = make_state_with_subtasks(&owner, "owned plan", &["s1"]);
+    repo.save(&owner, &foreign_plan, &mut state, None).await.unwrap();
+    repo.record_step_run(&owner, NewStepRun {
+        plan_id: &foreign_plan,
+        subtask_id: "s1",
+        attempt: 1,
+        status: TaskStatus::InProgress,
+        session_id: &session,
+        request_id: "original-owner-run",
+    }).await.unwrap();
+    let before_plan = serde_json::to_value(repo.load(&owner, &foreign_plan).await.unwrap()).unwrap();
+    let before_runs = serde_json::to_value(repo.list_step_runs(&owner, &foreign_plan, None, 10).await.unwrap()).unwrap();
+
+    for plan_id in [&missing_plan, &foreign_plan] {
+        let err = repo.record_step_run(&caller, NewStepRun {
+            plan_id,
+            subtask_id: "s1",
+            attempt: 2,
+            status: TaskStatus::InProgress,
+            session_id: &session,
+            request_id: "rejected-caller-run",
+        }).await.expect_err("a missing owned parent must reject the write");
+        assert!(matches!(err, PlanLoadError::NotFound(_)));
+    }
+    let (caller_rows,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM plan_step_runs WHERE user_id = ? AND plan_id IN (?, ?)",
+    ).bind(&caller).bind(&missing_plan).bind(&foreign_plan)
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(caller_rows, 0, "rejection must not leave orphan or cross-owner rows");
+    assert_eq!(
+        serde_json::to_value(repo.load(&owner, &foreign_plan).await.unwrap()).unwrap(),
+        before_plan,
+    );
+    assert_eq!(
+        serde_json::to_value(repo.list_step_runs(&owner, &foreign_plan, None, 10).await.unwrap()).unwrap(),
+        before_runs,
+    );
+    cleanup_plans(&pool, &prefix).await;
+    cleanup_session(&pool, &session, &owner).await;
+}
+}
+
+matrixone_db_test! {
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn save_load_roundtrip_persists_goal_owner_and_subtasks() {
     let (repo, pool) = setup_repo().await;
     let user = format!("u-{}", Uuid::new_v4().simple());

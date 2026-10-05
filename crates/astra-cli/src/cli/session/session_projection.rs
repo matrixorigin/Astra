@@ -723,11 +723,7 @@ mod tests {
             "Latest user input: now explain borrowing\nLatest assistant summary:\nBorrowing lets you reference data"
                 .to_string(),
         ));
-        let effective = prepare_input(
-            "continue",
-            &state,
-            &mut crate::cli::ui_adapter::LineUiAdapter,
-        );
+        let effective = prepare_input("continue", &state);
         assert_eq!(effective.user_message, "continue");
         assert!(effective.runtime_required_texts.is_empty());
 

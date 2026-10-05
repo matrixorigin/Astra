@@ -147,14 +147,6 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             harness_routes(state.clone()),
         )
         .route(
-            "/sessions/{session_id}/replay",
-            post(crate::service_handlers::replay::replay_session_handler),
-        )
-        .route(
-            "/sessions/{session_id}/replay/compare",
-            get(crate::service_handlers::replay::compare_replay_handler),
-        )
-        .route(
             "/sessions/{session_id}/audit/summary",
             get(audit_handlers::audit_summary_handler),
         )

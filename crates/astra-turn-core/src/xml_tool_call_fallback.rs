@@ -81,42 +81,6 @@ pub fn parse_xml_tool_calls(text: &str) -> Option<Vec<Value>> {
     Some(calls)
 }
 
-/// Strip successfully-parsed `<invoke>` blocks from text, returning the
-/// remaining content (trimmed).  Unparseable fragments are kept.
-pub fn strip_parsed_invocations(text: &str) -> String {
-    if let Some(stripped) = strip_parsed_dsml_tool_call_blocks(text) {
-        return stripped;
-    }
-    if !text.contains("<invoke") {
-        return text.to_string();
-    }
-
-    let mut result = text.to_string();
-    let mut search_from = 0;
-
-    while let Some(start) = result[search_from..].find("<invoke") {
-        let abs_start = search_from + start;
-        let block_end = if let Some(close) = result[abs_start..].find("</invoke>") {
-            abs_start + close + "</invoke>".len()
-        } else if let Some(close) = result[abs_start..].find("/>") {
-            abs_start + close + "/>".len()
-        } else {
-            search_from = abs_start + 1;
-            continue;
-        };
-
-        let block = &result[abs_start..block_end];
-        if parse_single_invoke(block).is_some() {
-            result.replace_range(abs_start..block_end, "");
-            // don't advance search_from — next block may now start at same position
-        } else {
-            search_from = block_end;
-        }
-    }
-
-    result.trim().to_string()
-}
-
 fn normalize_dsml_tool_call_markup(text: &str) -> String {
     let mut normalized = text.to_string();
     for tag in ["tool_calls", "invoke", "parameter"] {
@@ -130,34 +94,6 @@ fn normalize_dsml_tool_call_markup(text: &str) -> String {
             .into_owned();
     }
     normalized
-}
-
-fn strip_parsed_dsml_tool_call_blocks(text: &str) -> Option<String> {
-    let mut result = text.to_string();
-    let mut changed = false;
-    let open = dsml_tool_calls_open_regex();
-    let close = dsml_tool_calls_close_regex();
-
-    let mut search_from = 0;
-
-    while let Some(open_match) = open.find(&result[search_from..]) {
-        let abs_start = search_from + open_match.start();
-        let body_start = search_from + open_match.end();
-        let Some(close_match) = close.find(&result[body_start..]) else {
-            search_from = body_start;
-            continue;
-        };
-        let block_end = body_start + close_match.end();
-        let block = &result[abs_start..block_end];
-        if parse_xml_tool_calls(block).is_some() {
-            result.replace_range(abs_start..block_end, "");
-            changed = true;
-        } else {
-            search_from = block_end;
-        }
-    }
-
-    changed.then(|| result.trim().to_string())
 }
 
 fn dsml_tag_regex(tag: &str, closing: bool) -> Regex {
@@ -301,67 +237,6 @@ pub fn filter_dsml_tool_call_markup_for_display(text: &str) -> String {
 
 // ─── <tool_call> Fallback ────────────────────────────────────────────────────
 
-/// Try to extract tool calls from `<tool_call>` blocks in `text`.
-///
-/// Models sometimes emit corrupted function-call syntax such as:
-/// - `<tool_call>bash)(echo hello)</tool_call>`
-/// - `<tool_call>grep}{pattern: "x"}</tool_call>`
-/// - `<tool_call>read_file({"path":"a.rs"})</tool_call>`
-///
-/// We extract the tool name (first word-like token after `<tool_call>`) and
-/// attempt to recover arguments from the remainder.
-pub fn parse_tool_call_tags(text: &str) -> Option<Vec<Value>> {
-    if !text.contains("<tool_call>") {
-        return None;
-    }
-
-    let mut calls = Vec::new();
-    let mut tag_bytes: usize = 0;
-    let mut search_from = 0;
-
-    while let Some(start) = text[search_from..].find("<tool_call>") {
-        let abs_start = search_from + start;
-        let content_start = abs_start + "<tool_call>".len();
-
-        // Find end: explicit </tool_call> or next <tool_call> or end-of-text
-        let block_end = text[content_start..]
-            .find("</tool_call>")
-            .map(|i| content_start + i + "</tool_call>".len())
-            .or_else(|| {
-                text[content_start..]
-                    .find("<tool_call>")
-                    .map(|i| content_start + i)
-            })
-            .unwrap_or(text.len());
-
-        let inner = text[content_start..block_end]
-            .trim_end_matches("</tool_call>")
-            .replace('\0', ""); // strip null bytes
-
-        if let Some(tc) = parse_single_tool_call_tag(inner.trim()) {
-            tag_bytes += block_end - abs_start;
-            calls.push(tc);
-        }
-        search_from = block_end;
-    }
-
-    if calls.is_empty() {
-        return None;
-    }
-
-    // False-positive guard: reject if prose dominates the text.
-    let total = text.trim().len();
-    if total > 0 {
-        let non_tag = total.saturating_sub(tag_bytes);
-        let ratio = non_tag as f64 / total as f64;
-        if ratio > MAX_NON_XML_RATIO {
-            return None;
-        }
-    }
-
-    Some(calls)
-}
-
 /// Parse the inner content of a `<tool_call>…</tool_call>` block.
 ///
 /// Handles patterns like:
@@ -484,43 +359,6 @@ fn extract_balanced_braces(s: &str) -> Option<&str> {
         }
     }
     None
-}
-
-/// Strip successfully-parsed `<tool_call>` blocks from text.
-pub fn strip_parsed_tool_call_tags(text: &str) -> String {
-    if !text.contains("<tool_call>") {
-        return text.to_string();
-    }
-
-    let mut result = text.to_string();
-    let mut search_from = 0;
-
-    while let Some(start) = result[search_from..].find("<tool_call>") {
-        let abs_start = search_from + start;
-        let content_start = abs_start + "<tool_call>".len();
-
-        let block_end = result[content_start..]
-            .find("</tool_call>")
-            .map(|i| content_start + i + "</tool_call>".len())
-            .or_else(|| {
-                result[content_start..]
-                    .find("<tool_call>")
-                    .map(|i| content_start + i)
-            })
-            .unwrap_or(result.len());
-
-        let inner = result[content_start..block_end]
-            .trim_end_matches("</tool_call>")
-            .replace('\0', "");
-
-        if parse_single_tool_call_tag(inner.trim()).is_some() {
-            result.replace_range(abs_start..block_end, "");
-        } else {
-            search_from = block_end;
-        }
-    }
-
-    result.trim().to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1112,7 +950,7 @@ mod tests {
             "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}tool_calls>",
         );
 
-        assert_eq!(strip_parsed_invocations(dsml), "Web review complete.");
+        assert_eq!(strip_degraded_tool_calls(dsml), "Web review complete.");
     }
 
     #[test]
@@ -1129,7 +967,7 @@ mod tests {
 
         let calls = parse_xml_tool_calls(dsml).unwrap();
         assert_eq!(calls[0]["function"]["name"], "agent");
-        assert_eq!(strip_parsed_invocations(dsml), "Done.");
+        assert_eq!(strip_degraded_tool_calls(dsml), "Done.");
     }
 
     #[test]
@@ -1224,21 +1062,20 @@ As you can see, the name attribute specifies the tool."#;
     }
 
     #[test]
-    fn strip_parsed_invocations_removes_valid_blocks() {
-        let xml = r#"Let me check.
+    fn strip_degraded_calls_preserves_explanatory_trailing_prose() {
+        let text = r#"Let me check.
 <invoke name="read_file">
 <parameter name="path">a.rs</parameter>
 </invoke>
 Done."#;
-        let remaining = strip_parsed_invocations(xml);
-        assert_eq!(remaining, "Let me check.\n\nDone.");
-        assert!(!remaining.contains("<invoke"));
+        assert!(parse_degraded_tool_calls(text).is_none());
+        assert_eq!(strip_degraded_tool_calls(text), text);
     }
 
     #[test]
     fn strip_preserves_unparseable_fragments() {
         let text = "some text <invoke broken";
-        let remaining = strip_parsed_invocations(text);
+        let remaining = strip_degraded_tool_calls(text);
         assert_eq!(remaining, text);
     }
 
@@ -1272,7 +1109,7 @@ Done."#;
             "success_rate|failure|penalty|decay|expire|outdated|bad|quality"
         );
 
-        let remaining = strip_parsed_invocations(xml);
+        let remaining = strip_degraded_tool_calls(xml);
         assert!(remaining.is_empty());
     }
 
@@ -1291,7 +1128,7 @@ Done."#;
     #[test]
     fn tool_call_tag_bash_parenthesized() {
         let text = r#"<tool_call>bash)(echo hello)</tool_call>"#;
-        let calls = parse_tool_call_tags(text).unwrap();
+        let calls = parse_degraded_tool_calls(text).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "bash");
         let args: serde_json::Map<String, Value> =
@@ -1303,7 +1140,7 @@ Done."#;
     #[test]
     fn tool_call_tag_json_args() {
         let text = r#"<tool_call>grep}{"pattern": "TODO", "path": "src"}</tool_call>"#;
-        let calls = parse_tool_call_tags(text).unwrap();
+        let calls = parse_degraded_tool_calls(text).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "grep");
         let args: serde_json::Map<String, Value> =
@@ -1315,7 +1152,7 @@ Done."#;
     #[test]
     fn tool_call_tag_function_call_style() {
         let text = r#"<tool_call>read_file({"path":"a.rs"})</tool_call>"#;
-        let calls = parse_tool_call_tags(text).unwrap();
+        let calls = parse_degraded_tool_calls(text).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "read_file");
         let args: serde_json::Map<String, Value> =
@@ -1327,7 +1164,7 @@ Done."#;
     fn tool_call_tag_with_null_bytes() {
         // Real-world pattern: tool call followed by binary garbage
         let text = "<tool_call>bash)(ls)\0\0\0\0</tool_call>";
-        let calls = parse_tool_call_tags(text).unwrap();
+        let calls = parse_degraded_tool_calls(text).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "bash");
     }
@@ -1336,35 +1173,39 @@ Done."#;
     fn tool_call_tag_no_closing_tag() {
         // Some models don't emit closing tag
         let text = "<tool_call>bash)(echo hi)";
-        let calls = parse_tool_call_tags(text).unwrap();
+        let calls = parse_degraded_tool_calls(text).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "bash");
     }
 
     #[test]
     fn tool_call_tag_returns_none_for_no_tags() {
-        assert!(parse_tool_call_tags("just normal text").is_none());
-        assert!(parse_tool_call_tags("").is_none());
+        assert!(parse_degraded_tool_calls("just normal text").is_none());
+        assert!(parse_degraded_tool_calls("").is_none());
     }
 
     #[test]
     fn tool_call_tag_rejects_prose_with_tag() {
         let text = "The model emitted <tool_call>bash)(echo hello)</tool_call> which is a known degradation pattern that we handle.";
-        assert!(parse_tool_call_tags(text).is_none());
+        assert!(parse_degraded_tool_calls(text).is_none());
     }
 
     #[test]
     fn tool_call_tag_strip_removes_parsed() {
         let text = "Let me try.\n<tool_call>bash)(echo hi)</tool_call>\nDone.";
-        let remaining = strip_parsed_tool_call_tags(text);
-        assert!(!remaining.contains("<tool_call>"));
+        assert!(parse_degraded_tool_calls(text).is_none());
+        assert_eq!(strip_degraded_tool_calls(text), text);
+
+        let call = "<tool_call>bash)(echo hi)</tool_call>";
+        assert_eq!(parse_degraded_tool_calls(call).unwrap().len(), 1);
+        assert!(strip_degraded_tool_calls(call).is_empty());
     }
 
     #[test]
     fn tool_call_real_session_pattern_bash() {
         // Exact pattern from session 3bc7fc43
         let text = r#"<tool_call>bash)(git log -1 --format="%H%n%an%n%ae%n%s%n%b" HEAD)"#;
-        let calls = parse_tool_call_tags(text).unwrap();
+        let calls = parse_degraded_tool_calls(text).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "bash");
         let args: serde_json::Map<String, Value> =
@@ -1376,7 +1217,7 @@ Done."#;
     fn tool_call_real_session_pattern_mcp() {
         // Exact pattern from session 3bc7fc43 (with null bytes stripped)
         let text = "<tool_call>mcp__git_log}{\"per_page\": 1, \"format\": \"fuller\"}}</tool_call>";
-        let calls = parse_tool_call_tags(text).unwrap();
+        let calls = parse_degraded_tool_calls(text).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "mcp__git_log");
         let args: serde_json::Map<String, Value> =

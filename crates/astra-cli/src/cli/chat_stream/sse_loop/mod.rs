@@ -584,7 +584,6 @@ pub(crate) async fn stream_chat_sse(
         message: p.message,
         user_intent: p.user_intent,
         input_runtime_required_texts: p.input_runtime_required_texts,
-        input_active_system_skills: p.input_active_system_skills,
         input_runtime_volatile_texts: p.input_runtime_volatile_texts,
         semantic_query_override: p.semantic_query_override,
         history: p.history,
@@ -795,7 +794,6 @@ pub(crate) async fn stream_chat_sse(
             executor: None,
             quality_tracker: p.skill_quality_tracker.clone(),
             quality_tracker_baseline: p.skill_quality_tracker.clone(),
-            improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
             execution: astra_runtime::turn::agentic_loop::host::SkillExecutionState {
                 discovered: discovered_skills,
                 ..Default::default()
@@ -897,8 +895,6 @@ pub(crate) async fn stream_chat_sse(
             None, p.provider,
         ),
         approval_overrides: initial_approval_overrides,
-        confidence_trend: Default::default(),
-        last_confidence_diagnosis: None,
         session_turn: current_session_turn,
         canonical_turn_chain_id: Some(parent_turn_run_id.clone()),
         root_user_query_event_id: Some(

@@ -288,9 +288,6 @@ astra login
 astra chat "分析 src/main.rs"
   → Cloud /chat/stream ×1（同一 admission 内含 N 个 model rounds/callbacks，包括本地 read_file）
 astra session list          → GET /sessions
-Replay routes are reserved; an owned session currently receives HTTP 501
-from POST /sessions/{id}/replay and GET /sessions/{id}/replay/compare
-(foreign or missing sessions receive HTTP 404).
 ```
 
 **验收：** 全程无 `--local`；`~/.astra/credentials.json` 有效；审计链完整。

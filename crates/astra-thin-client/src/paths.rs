@@ -246,16 +246,6 @@ pub fn session_artifacts(id: &str) -> String {
     format!("/sessions/{id}/artifacts")
 }
 
-#[inline]
-pub fn session_replay(id: &str) -> String {
-    format!("/sessions/{id}/replay")
-}
-
-#[inline]
-pub fn session_replay_compare(id: &str) -> String {
-    format!("/sessions/{id}/replay/compare")
-}
-
 /// Returns `None` if `artifact_kind` contains path-unsafe characters.
 #[inline]
 pub fn session_artifact_latest(session_id: &str, artifact_kind: &str) -> Option<String> {
@@ -582,16 +572,6 @@ mod tests {
     #[test]
     fn session_artifacts_path() {
         assert_eq!(session_artifacts("s1"), "/sessions/s1/artifacts");
-    }
-
-    #[test]
-    fn session_replay_path() {
-        assert_eq!(session_replay("s1"), "/sessions/s1/replay");
-    }
-
-    #[test]
-    fn session_replay_compare_path() {
-        assert_eq!(session_replay_compare("s1"), "/sessions/s1/replay/compare");
     }
 
     #[test]

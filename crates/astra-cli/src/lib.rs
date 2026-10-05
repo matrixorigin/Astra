@@ -96,7 +96,7 @@ pub(crate) use crate::cli::stream::streaming_types::{
 };
 
 // Session state
-pub(crate) use cli::session::session_state::{ExplainMode, SessionState, SkillDevState};
+pub(crate) use cli::session::session_state::{ExplainMode, SessionState};
 
 // Cloud sync
 pub(crate) use cli::cloud_sync::post_auth_cloud_resync;

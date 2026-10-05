@@ -1177,7 +1177,7 @@ test-managed-runtime:
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::builder_runtime_surface_follows_orchestrator_read_only_binding
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::server_loop_host::tests::tool_call_start_projects_request_scoped_mcp_route_metadata
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-runtime --lib server::tool_transport_metadata::tests::server_sandbox_reports_sandbox_ready
-	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib orchestrator_managed_executes_through_sandbox_resident_agent_transport
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib sandbox_resident_agent_route_is_explicitly_unavailable
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib orchestrator_managed_without_sandbox_resident_agent_transport_does_not_reroute_to_local
 	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib request_scoped_mcp_tools_bypass_edge_transport
 

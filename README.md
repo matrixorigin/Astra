@@ -59,7 +59,7 @@ optimization tradeoffs; it does not establish whole-agent cost savings.
 
 | What did the model receive? | What changed, and what next? | Where does it run? |
 | --- | --- | --- |
-| `EXPLAIN ANALYZE` shows context-source estimates, request-budget estimates, provider usage, execution timing, and which boundaries were not measured. `Self` exposes goals, budgets, and tool health. ContextPipe cut tokens 31% against append-only context. | Every attempt, config change, and checkpoint is versioned. Rewind a session, diff two runs, replay against the record, and continue durable Work with a new constraint. | A User Runner executes admitted tool calls in your repositories and networks. The Server coordinates; it never gets ambient access to your machine. |
+| `EXPLAIN ANALYZE` shows context-source estimates, request-budget estimates, provider usage, execution timing, and which boundaries were not measured. `Self` exposes goals, budgets, and tool health. ContextPipe cut tokens 31% against append-only context. | Every attempt, config change, and checkpoint is versioned. Inspect recorded turns, diff two runs, replay recorded run events, and continue durable Work with a new constraint. | A User Runner executes admitted tool calls in your repositories and networks. The Server coordinates; it never gets ambient access to your machine. |
 | **Understand what happened.** | **Know what changed and what still needs verification.** | **Keep code and credentials where they are.** |
 
 ```bash

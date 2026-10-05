@@ -17,7 +17,6 @@ pub mod command_router;
 pub mod command_usage;
 pub mod config_manager;
 pub mod context_dump;
-pub mod context_references;
 pub mod diagnostic_log;
 pub mod diff_presenter;
 pub mod edge_lifecycle;

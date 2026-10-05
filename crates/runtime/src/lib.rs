@@ -173,7 +173,6 @@ pub use astra_services::{
         UnconfiguredEdgeRegistryService,
     },
     reflect::{DatabaseReflectService, ReflectReport, ReflectService, UnconfiguredReflectService},
-    replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService},
     runs::{
         CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
         RunListRecord, RunStatusRecord,
@@ -282,16 +281,10 @@ pub use astra_turn_core::{
     },
 };
 pub use turn::cloud::{
-    analytics::{
-        CompactionEvent, CompactionEventType, MICRO_COMPACT_STUB, MessageRange,
-        PartialCompactRequest, PartialCompactResult, TurnCountCompactConfig, TurnCountTrigger,
-        apply_micro_compact, compact_partial, evaluate_turn_count_trigger,
-    },
     compaction::{CompactBoundary, CompactCircuitBreaker, CompactResult, CompactTrigger},
     memoria_compact::{
         HttpMemoriaPort, MemoriaCompactConfig, MemoriaCompactParams, MemoriaMemory, MemoriaPort,
-        claude_code_session_memory_path, compact_with_memoria, memoria_compact_retrieve_query,
-        sanitize_path_for_claude_projects,
+        compact_with_memoria, memoria_compact_retrieve_query,
     },
 };
 

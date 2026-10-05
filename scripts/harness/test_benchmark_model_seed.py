@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import http.server
+import threading
 import json
 import os
 import sys
@@ -46,6 +48,42 @@ class _Opener:
 
 
 class BenchmarkModelSeedTests(unittest.TestCase):
+    def test_owned_api_never_redirects_authorization(self):
+        received = []
+        class Target(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+            do_POST = do_GET
+            def log_message(self, *_):
+                pass
+        target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Target)
+        class Source(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{target.server_port}/target")
+                self.end_headers()
+            do_POST = do_GET
+            def log_message(self, *_):
+                pass
+        source = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Source)
+        threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in (target, source)]
+        for thread in threads:
+            thread.start()
+        try:
+            for method in ("GET", "POST"):
+                with self.subTest(method=method), self.assertRaisesRegex(seed.SeedError, "HTTP 302"):
+                    seed._request_json(seed.owned_api_opener(), f"http://127.0.0.1:{source.server_port}/models/exact",
+                                       "test-secret-sentinel", None, 200, "model state", method=method, timeout=2)
+            self.assertEqual(received, [], "redirect target must receive no request or token")
+        finally:
+            for server, thread in zip((target, source), threads):
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def fixture(self, root: Path, selector: str = "selected(thinking:high)"):
         config = root / "config.json"
         config.write_text(

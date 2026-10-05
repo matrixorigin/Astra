@@ -11755,6 +11755,158 @@ fn db_backed_test_service(
     .with_model_service(Arc::new(ActiveTestModelService::default()))
 }
 
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn transcript_prompt_hydration_preserves_lineage_budget_and_owner_on_matrixone() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let suffix = Uuid::new_v4();
+    let user_id = format!("transcript-owner-{suffix}");
+    let session_id = format!("transcript-session-{suffix}");
+    let root_run_id = format!("transcript-root-{suffix}");
+    let child_run_id = format!("transcript-child-{suffix}");
+    crate::server::run::insert_active_run_session_fixture(&pool, &user_id, &session_id).await;
+    for (run_id, parent, depth, status) in [
+        (&root_run_id, None, 0, "cancelled"),
+        (&child_run_id, Some(root_run_id.as_str()), 1, "completed"),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(run_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(parent)
+        .bind(&root_run_id)
+        .bind(parent.map_or_else(|| run_id.to_string(), |parent| format!("{parent}/{run_id}")))
+        .bind(depth)
+        .bind(status)
+        .execute(pool.get())
+        .await
+        .expect("insert exact-owner run lineage");
+    }
+    let mut items = (1..=90)
+        .map(|seq| {
+            (
+                seq,
+                Some(root_run_id.as_str()),
+                "user",
+                format!("root-{seq:02}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    items.push((
+        905,
+        Some(child_run_id.as_str()),
+        "assistant",
+        "child-output-must-not-be-prompt-history".into(),
+    ));
+    items.push((91, None, "system", "session-note".into()));
+    items.extend(
+        (0..astra_services::session_restore::MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS).map(|offset| {
+            (
+                1_000 + offset,
+                Some(root_run_id.as_str()),
+                "tool",
+                format!("tool-tail-{offset}"),
+            )
+        }),
+    );
+    let mut insert = sqlx::QueryBuilder::new(
+        "INSERT INTO session_transcript_items
+         (session_id, item_seq, user_id, run_id, role, content, content_hash, created_at) ",
+    );
+    insert.push_values(&items, |mut row, (seq, run_id, role, content)| {
+        row.push_bind(&session_id)
+            .push_bind(seq)
+            .push_bind(&user_id)
+            .push_bind(run_id)
+            .push_bind(role)
+            .push_bind(content)
+            .push_bind(format!("fixture:{seq}"))
+            .push("NOW(6)");
+    });
+    insert
+        .build()
+        .execute(pool.get())
+        .await
+        .expect("insert bounded transcript fixture");
+
+    // Verify the storage quota before the prompt sanitizer applies its own
+    // final history bound; neither bound is a substitute for the other.
+    let rows = sqlx::query(PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL)
+        .bind(&session_id)
+        .bind(&user_id)
+        .bind(astra_services::session_restore::MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS)
+        .fetch_all(pool.get())
+        .await
+        .expect("load provider-safe durable transcript rows");
+    let service = db_backed_test_service(&pool, "transcript-reader");
+    let messages = service
+        .restore_transcript_prompt_messages(&user_id, &session_id, &root_run_id, "test")
+        .await;
+    let foreign = service
+        .restore_transcript_prompt_messages(
+            &format!("foreign-{suffix}"),
+            &session_id,
+            &root_run_id,
+            "test",
+        )
+        .await;
+    for table in ["session_transcript_items", "agent_runs"] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+        ))
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(pool.get())
+        .await
+        .expect("cleanup exact-owner transcript fixture");
+    }
+    crate::server::run::cleanup_run_session_fixture(&pool, &user_id, &session_id).await;
+
+    assert_eq!(
+        rows.len(),
+        astra_services::session_restore::MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS as usize
+    );
+    assert_eq!(rows.first().unwrap().get::<String, _>("content"), "root-12");
+    assert_eq!(
+        rows.last().unwrap().get::<String, _>("content"),
+        "session-note"
+    );
+    assert!(rows.iter().all(|row| {
+        let content = row.get::<String, _>("content");
+        content != "child-output-must-not-be-prompt-history" && !content.starts_with("tool-tail-")
+    }));
+    assert_eq!(
+        messages.len(),
+        40,
+        "the actual prompt sanitizer bounds hydrated history"
+    );
+    assert_eq!(messages.first().unwrap()["content"], "root-53");
+    assert_eq!(messages.last().unwrap()["content"], "session-note");
+    assert!(messages.iter().any(|message| {
+        message["role"] == "system"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("cancelled before completion"))
+    }));
+    assert!(
+        messages.iter().all(|message| {
+            message["content"].as_str() != Some("child-output-must-not-be-prompt-history")
+                && !message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.starts_with("tool-tail-"))
+        }),
+        "child output and bare tool rows are not main prompt history"
+    );
+    assert!(
+        foreign.is_empty(),
+        "another owner cannot hydrate this session's transcript"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires disposable MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn db_run_start_generation_controls_survive_a_fresh_reader() {
@@ -24065,6 +24217,216 @@ async fn approval_projection_uses_exact_lookup_without_hydrating_large_run_histo
         (0, 0, 1),
         "projection must use the indexed interaction fact and never load the 34k-event run"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1; provider is localhost fixture"]
+async fn stream_chat_plan_tools_refresh_host_prompt_and_gate() {
+    use crate::server::provider_test_support::{ProviderGateway, ProviderResponse, ProviderScript};
+    use astra_plan::PlanRepository;
+
+    let pool = setup_lifecycle_run_db_it().await;
+    let owner = format!("stream-plan-owner-{}", Uuid::new_v4());
+    let session = format!("stream-plan-session-{}", Uuid::new_v4());
+    let goal = "verify live stream plan authorization";
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let observation_path = directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(&session)
+        .join("proof.txt");
+    let tool_response = |id: &str, name: &str, args: Value| {
+        ProviderResponse::OpenAi(json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "",
+                "tool_calls": [{"id": id, "type": "function", "function": {
+                    "name": name, "arguments": args.to_string()
+                }}]}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 42, "completion_tokens": 7, "total_tokens": 49}
+        }))
+    };
+    let invoke = |id: &str, name: &str, arguments: Value| {
+        tool_response(
+            id,
+            "invoke_tool",
+            json!({"name": name, "arguments": arguments}),
+        )
+    };
+    let gateway = ProviderGateway::start(vec![ProviderScript::new(
+        "stream plan journey",
+        |request| request.path == "/v1/chat/completions"
+            && request.body["model"] == "test-model" && request.body["stream"] == true,
+        vec![
+            tool_response("select-plan", "tool_search", json!({"query": "select:enter_plan_mode,exit_plan_mode,write_file,read_file"})),
+            invoke("enter-plan", "enter_plan_mode", json!({"goal": goal})),
+            invoke("blocked-write", "write_file", json!({"path": "proof.txt", "content": "approved"})),
+            invoke("exit-plan", "exit_plan_mode", json!({"plan": "1. Verify the stream\n2. Write proof", "approved": true})),
+            invoke("approved-write", "write_file", json!({"path": "proof.txt", "content": "approved"})),
+            invoke("verify-write", "read_file", json!({"path": observation_path})),
+            ProviderResponse::OpenAi(json!({"choices": [{"index": 0, "message": {
+                "role": "assistant", "content": "Verified proof.txt contains approved."
+            }, "finish_reason": "stop"}], "usage": {"prompt_tokens": 42, "completion_tokens": 7, "total_tokens": 49}})),
+        ],
+    )]).await;
+    let service = db_backed_test_service(&pool, "stream-plan-test")
+        .with_fixture_workspace_provider(directory.clone(), "stream-plan-executor")
+        .with_model_service(Arc::new(ActiveTestModelService::new(format!(
+            "{}/v1",
+            gateway.base_url
+        ))));
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &session).await;
+    let mut request = test_request("Draft a plan, get approval, then write proof.txt.");
+    request.session_id = Some(session.clone());
+    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
+        display_name: None,
+        root: None,
+        source: None,
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+    });
+    request.execution_policy.turn_intent =
+        astra_services::runs::TurnIntentExecutionPolicy::FixedDefault;
+    request.execution_policy.skill_auto_route =
+        astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+    let mut stream = ok(service.stream_chat(owner.clone(), request).await);
+    let mut rx = stream.event_rx.take().unwrap();
+    let workspace = service.provision_server_workspace(&session).unwrap();
+    let repository = astra_plan::CloudPlanRepository::new(pool.get().clone());
+    let mut active_plan = None;
+    let events =
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                if event["type"] == "approval_required" {
+                    let tool = event["tool"].as_str().unwrap();
+                    let request_id = event["request_id"].as_str().unwrap().to_owned();
+                    if tool == "exit_plan_mode" {
+                        assert!(
+                            !workspace.join("proof.txt").exists(),
+                            "plan write must be blocked before approval"
+                        );
+                        assert_eq!(
+                            gateway.requests.lock().await.len(),
+                            4,
+                            "approval must hold the same stream before the next model call"
+                        );
+                        active_plan = repository
+                            .active_plan_for_session(&owner, &session)
+                            .await
+                            .unwrap();
+                        assert!(active_plan.is_some());
+                    } else {
+                        assert_eq!(tool, "write_file", "unexpected approval: {event:?}");
+                    }
+                    ok(service.resolve_run_interaction(
+                    stream.run_id.clone(), owner.clone(), session.clone(), request_id.clone(),
+                    astra_services::runs::DurableRunInteractionKind::Approval,
+                    json!({"request_id": request_id, "outcome": "approved", "decision": "allow",
+                        "reason": null, "tool": tool, "approval_kind": "standard"}),
+                ).await);
+                }
+                events.push(event);
+            }
+            events
+        })
+        .await
+        .expect("real stream must settle after plan approval");
+    assert!(
+        service
+            .drain_background_tasks(Duration::from_secs(10))
+            .await
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "run_finished" || event["event_type"] == "run_finished"),
+        "{events:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("proof.txt")).unwrap(),
+        "approved\n"
+    );
+    assert_eq!(
+        repository
+            .active_plan_for_session(&owner, &session)
+            .await
+            .unwrap(),
+        None
+    );
+    let requests = gateway.requests.lock().await;
+    let entered = requests[2].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["tool_call_id"] == "enter-plan")
+        .expect("enter-plan receipt")["content"]
+        .to_string();
+    assert!(entered.contains("Entered plan mode"), "{entered}");
+    // Only system/user runtime context proves the host slot was refreshed:
+    // historical tool receipts also contain the goal and would mask this bug.
+    let runtime_context = |index: usize| {
+        requests[index].body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "system" || message["role"] == "user")
+            .map(|message| message["content"].as_str().expect("runtime context text"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        runtime_context(2).contains("Resume context: ## Active Plan")
+            && runtime_context(2).contains(&format!("[plan-resume] goal=\"{goal}\"")),
+        "{}",
+        runtime_context(2)
+    );
+    assert!(
+        !runtime_context(4).contains("[plan-resume]")
+            && !runtime_context(4).contains("## Active Plan"),
+        "{}",
+        runtime_context(4)
+    );
+    let blocked = requests[3].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["tool_call_id"] == "blocked-write")
+        .unwrap()["content"]
+        .to_string();
+    assert!(
+        blocked.contains("Error: Permission denied for tool 'write_file'")
+            && blocked.contains("blocked while plan mode is active"),
+        "{blocked}"
+    );
+    let observed = requests[6].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["tool_call_id"] == "verify-write")
+        .expect("post-write observation receipt")["content"]
+        .as_str()
+        .unwrap();
+    assert!(observed.contains("approved"), "{observed}");
+    drop(requests);
+    gateway.assert_complete();
+    let durable = service
+        .run_engine
+        .load_run(&owner, &stream.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        durable.status, STATUS_COMPLETED,
+        "{:?}",
+        durable.error_message
+    );
+
+    repository
+        .delete(&owner, &active_plan.expect("reviewed plan"))
+        .await
+        .unwrap();
+    cleanup_lifecycle_run_fixture(&pool, &owner, &stream.run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session).await;
 }
 
 #[tokio::test(flavor = "current_thread")]

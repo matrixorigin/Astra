@@ -253,26 +253,6 @@ pub async fn memoria_correct(
     .await
 }
 
-pub async fn memoria_governance_fire_and_forget() {
-    let _ = memoria_proxy_request(
-        astra_tools::memoria::HttpMethod::Post,
-        "/memory/governance",
-        Duration::from_secs(10),
-        Some(&json!({ "force": false })),
-    )
-    .await;
-}
-
-pub async fn memoria_consolidate_fire_and_forget() {
-    let _ = memoria_proxy_request(
-        astra_tools::memoria::HttpMethod::Post,
-        "/memory/consolidate",
-        Duration::from_secs(15),
-        Some(&json!({ "force": false })),
-    )
-    .await;
-}
-
 impl ToolExecutor {
     fn memoria_record_service_failure(&self) {
         self.memoria_circuit.record_service_failure();
@@ -640,12 +620,12 @@ pub async fn memoria_retrieve_lessons(
     Ok(project_retrieved_lessons(memories, top_k))
 }
 
-/// Store extracted lessons in Memoria as L3 durable memory.
+/// Store extracted lessons with their declared memory category and trust tier.
 ///
 /// Best-effort and loss-tolerant: lessons are sent one-by-one through the
 /// server proxy, but a failure on one lesson must not drop the rest.
 pub async fn memoria_store_lessons_fire_and_forget(
-    lessons: Vec<astra_runtime::learning::synthesizer::ExtractedLesson>,
+    lessons: Vec<astra_runtime::learning::lesson::ExtractedLesson>,
     session_id: Option<String>,
 ) {
     if lessons.is_empty() {
@@ -741,7 +721,42 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn session_end_lesson_store_continues_after_first_failure() {
+    async fn finalization_without_attached_memory_authority_does_not_use_global_credentials() {
+        assert!(crate::cli::native_auth::active().is_none());
+        let server = MockServer::start().await;
+        let _api = EnvGuard::set("ASTRA_API_URL", &server.uri());
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "default-account-token");
+        for endpoint in ["/memory/governance", "/memory/consolidate"] {
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .and(header("authorization", "Bearer default-account-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .mount(&server)
+                .await;
+        }
+        for session_id in [Some("selected-profile-session".to_string()), None] {
+            let mut state = crate::cli::session::session_state::SessionState {
+                session_id,
+                ingestion_user_id: Some("selected-profile-account".to_string()),
+                ..Default::default()
+            };
+            assert!(state.session_memory_port.is_none());
+            crate::cli::session::session_cleanup::finalize_session_with_budget(
+                &mut state,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("local finalization does not require optional remote maintenance");
+            assert!(
+                server.received_requests().await.unwrap().is_empty(),
+                "unbound session maintenance must not use the default account's credentials"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lesson_store_continues_after_first_failure() {
         let server = MockServer::start().await;
         let _api = EnvGuard::set("ASTRA_API_URL", &server.uri());
         let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "test-token");
@@ -763,17 +778,17 @@ mod tests {
 
         memoria_store_lessons_fire_and_forget(
             vec![
-                astra_runtime::learning::synthesizer::ExtractedLesson {
+                astra_runtime::learning::lesson::ExtractedLesson {
                     memory_type: "working",
                     content: "lesson one".into(),
                     trust_tier: "T4",
                 },
-                astra_runtime::learning::synthesizer::ExtractedLesson {
+                astra_runtime::learning::lesson::ExtractedLesson {
                     memory_type: "working",
                     content: "lesson two".into(),
                     trust_tier: "T4",
                 },
-                astra_runtime::learning::synthesizer::ExtractedLesson {
+                astra_runtime::learning::lesson::ExtractedLesson {
                     memory_type: "working",
                     content: "lesson three".into(),
                     trust_tier: "T4",

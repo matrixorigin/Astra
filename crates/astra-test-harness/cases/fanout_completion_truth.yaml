@@ -100,6 +100,11 @@ criteria:
     name: agent
     min: 0
     max: 0
+    # The prompt prohibits extra child spawns. `agent(wait)` is the supported
+    # observation boundary and does not launch or replace a slot.
+    document: arguments
+    path: /action
+    equals: spawn
   # Child slots and their raw results are execution topology, not durable
   # user deliverables. Starting Work here duplicates lifecycle state around
   # the canonical fanout group and is a product-contract failure even when

@@ -142,9 +142,6 @@ pub(super) fn build_core_state(
         DatabaseMarketplaceStatsService::new(settings.matrixone.clone())
             .with_pool(shared_pool.clone()),
     ))
-    .with_replay_service(Arc::new(
-        DatabaseReplayService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
     .with_session_audit_service(Arc::new(
         DatabaseSessionAuditService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))

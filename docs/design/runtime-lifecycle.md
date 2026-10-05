@@ -34,11 +34,15 @@ A session is the continuity boundary for user-visible conversation, context, mem
 
 A session may span Web, CLI, Edge, and multiple devices. Surface changes do not create a new backbone.
 
+Each CLI SSE invocation publishes its server-verified session and run identity
+before terminal output, including resumed sessions. A previously installed
+session id does not bind a new stream observer or authorize timeout cleanup.
+
 CLI session exit commits the local journal end and workspace boundary before
 optional remote maintenance. A failed local write remains observable and
 retryable; an ambiguous sync result is retried against the journal rather than
-an independent process-wide completion flag. Remote governance and lesson
-maintenance share one bounded deadline, including authentication transitions.
+an independent process-wide completion flag. Remote governance and consolidation
+share one bounded deadline, including authentication transitions.
 Canonical continuation, owner/cursor/root checks and the execution lease remain
 the recovery authority. The CLI has no manual history-edit/checkpoint frontend.
 Startup retention maintenance runs on a blocking worker with a captured owner
@@ -83,6 +87,12 @@ A turn is the user/agent interaction unit used for context, prompt, trace, and t
 When a current request supplies an empty `message` and a nonempty `user_intent`,
 the intent is its human prompt. Initial conversation history and the task profile
 use that same effective input. A nonempty `message` remains the prompt text.
+
+Queued run intents use persisted event indices, including gaps, rather than
+positions within a filtered control page. A page with a missing or invalid
+durable index is rejected in full: no intent is delivered and its cursor stays
+unchanged. Malformed intent content with a valid identity remains individually
+diagnosable.
 
 ### Bounded continuation and completion
 
@@ -451,6 +461,12 @@ Blocked by default unless explicitly approved:
 - write-shaped MCP calls.
 
 A denial must explain policy and continuation options. It must not pretend the tool does not exist.
+
+Server root executors share the host’s plan authoring and resume-context handles
+through the same construction path for Run and SSE entrypoints. Entering plan
+mode refreshes the next provider request and the host permission gate. Trusted
+approval clears the complete plan hint, including its multiline guidance, while
+other turn-start facts remain fixed. Model tool arguments cannot approve a plan.
 
 ## Cancellation
 

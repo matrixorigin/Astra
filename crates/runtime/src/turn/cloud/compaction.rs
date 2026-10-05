@@ -936,6 +936,9 @@ fn extract_discovered_tools(messages: &[Value]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_turn_core::microcompact::{
+        CompactStrategy, compact_tool_results_adaptive_with_persistence_protected_prefix,
+    };
     use serde_json::json;
     use std::collections::HashSet;
 
@@ -1446,6 +1449,20 @@ mod tests {
         msgs
     }
 
+    fn owned_tool_history(messages: &[Value]) -> Vec<Value> {
+        let mut history = messages.to_vec();
+        for message in &mut history {
+            if message.get("role").and_then(Value::as_str) == Some("tool") {
+                astra_turn_core::tool_result_storage::mark_tool_result_run_id(
+                    message,
+                    Some("run-micro-scenario"),
+                )
+                .expect("scenario tool result must have an execution owner");
+            }
+        }
+        history
+    }
+
     /// Scenario 1: Micro-compact alone reduces token count significantly
     /// before the heavier tiered compaction even runs.
     #[test]
@@ -1460,44 +1477,79 @@ mod tests {
             })
             .sum();
 
-        // Turn-count trigger: 25 tool results, threshold=8, keep=3 → clear 22
-        let tc = super::super::analytics::TurnCountCompactConfig::default();
-        let trigger = super::super::analytics::evaluate_turn_count_trigger(&msgs, &tc).unwrap();
-        assert!(
-            trigger.tool_ids_to_clear.len() >= 20,
-            "should clear most old tool results"
-        );
-
-        let (compacted, cleared) =
-            super::super::analytics::apply_micro_compact(&msgs, &trigger.tool_ids_to_clear);
-        assert!(cleared >= 20);
-
-        let post_tokens: usize = compacted
-            .iter()
-            .map(|m| {
-                crate::prompts::estimate_str_tokens(
-                    m.get("content").and_then(Value::as_str).unwrap_or(""),
-                )
-            })
-            .sum();
-
-        let savings_pct = ((original_tokens - post_tokens) as f64 / original_tokens as f64) * 100.0;
-        assert!(
-            savings_pct > 40.0,
-            "micro-compact should save >40% tokens on tool-heavy conversation, got {savings_pct:.1}%"
-        );
-        // Message count unchanged — only content replaced
-        assert_eq!(compacted.len(), msgs.len());
-        // Recent 3 tool results preserved
-        let last_tool = compacted
-            .iter()
-            .rev()
-            .find(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+        for protected_prefix_len in [None, Some(4)] {
+            let dir = tempfile::tempdir().expect("session artifacts");
+            let mut compacted = owned_tool_history(&msgs);
+            let stats = compact_tool_results_adaptive_with_persistence_protected_prefix(
+                &mut compacted,
+                0.3,
+                CompactStrategy::Normalized,
+                Some(dir.path()),
+                protected_prefix_len,
+            );
+            if let Some(len) = protected_prefix_len {
+                assert_eq!(&compacted[..len], &owned_tool_history(&msgs)[..len]);
+            }
+            assert!(stats.results_compacted > 0);
+            assert!(stats.tokens_saved > 0);
+            let artifact_message = compacted
+                .iter()
+                .find(|message| {
+                    astra_turn_core::tool_result_storage::tool_result_artifact_descriptor(message)
+                        .is_some()
+                })
+                .expect("compaction must preserve a recoverable result");
+            let descriptor = astra_turn_core::tool_result_storage::tool_result_artifact_descriptor(
+                artifact_message,
+            )
             .unwrap();
-        assert!(
-            last_tool["content"].as_str().unwrap().contains("file_24"),
-            "most recent tool result should be preserved"
-        );
+            assert_eq!(descriptor.run_id, "run-micro-scenario");
+            assert_eq!(
+                descriptor.call_id,
+                artifact_message["tool_call_id"].as_str().unwrap()
+            );
+            let original = msgs
+                .iter()
+                .find(|message| {
+                    message["role"] == "tool" && message["tool_call_id"] == descriptor.call_id
+                })
+                .unwrap();
+            let recovered = astra_turn_core::tool_result_storage::read_verified_persisted_result(
+                dir.path(),
+                &descriptor,
+                64 * 1024,
+            )
+            .expect("compacted evidence must be recoverable");
+            assert_eq!(recovered, original["content"].as_str().unwrap());
+
+            let post_tokens: usize = compacted
+                .iter()
+                .map(|m| {
+                    crate::prompts::estimate_str_tokens(
+                        m.get("content").and_then(Value::as_str).unwrap_or(""),
+                    )
+                })
+                .sum();
+
+            let savings_pct =
+                ((original_tokens - post_tokens) as f64 / original_tokens as f64) * 100.0;
+            assert!(
+                savings_pct > 40.0,
+                "micro-compact should save >40% tokens on tool-heavy conversation, got {savings_pct:.1}%"
+            );
+            // Message count unchanged — only content replaced
+            assert_eq!(compacted.len(), msgs.len());
+            // The most recent result remains inline under the canonical retention policy
+            let last_tool = compacted
+                .iter()
+                .rev()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+                .unwrap();
+            assert!(
+                last_tool["content"].as_str().unwrap().contains("file_24"),
+                "most recent tool result should be preserved"
+            );
+        }
     }
 
     /// Scenario 2: Tiered compaction after micro-compact further reduces
@@ -1507,10 +1559,16 @@ mod tests {
         let msgs = build_long_conversation(20, 3000);
 
         // Layer 1: micro-compact
-        let tc = super::super::analytics::TurnCountCompactConfig::default();
-        let trigger = super::super::analytics::evaluate_turn_count_trigger(&msgs, &tc).unwrap();
-        let (after_micro, _) =
-            super::super::analytics::apply_micro_compact(&msgs, &trigger.tool_ids_to_clear);
+        let dir = tempfile::tempdir().expect("session artifacts");
+        let mut after_micro = owned_tool_history(&msgs);
+        let stats = compact_tool_results_adaptive_with_persistence_protected_prefix(
+            &mut after_micro,
+            0.3,
+            CompactStrategy::Normalized,
+            Some(dir.path()),
+            None,
+        );
+        assert!(stats.results_compacted > 0);
 
         // Layer 2: tiered compaction (AggressivePrune, keep 4 recent turns)
         let result =
@@ -1570,11 +1628,16 @@ mod tests {
         let budget_chars = budget.effective_input_limit() * 4;
 
         // Step 1: micro-compact
-        let tc = super::super::analytics::TurnCountCompactConfig::default();
-        let trigger = super::super::analytics::evaluate_turn_count_trigger(&msgs, &tc).unwrap();
-        let (after_micro, micro_cleared) =
-            super::super::analytics::apply_micro_compact(&msgs, &trigger.tool_ids_to_clear);
-        assert!(micro_cleared > 0);
+        let dir = tempfile::tempdir().expect("session artifacts");
+        let mut after_micro = owned_tool_history(&msgs);
+        let stats = compact_tool_results_adaptive_with_persistence_protected_prefix(
+            &mut after_micro,
+            0.3,
+            CompactStrategy::Normalized,
+            Some(dir.path()),
+            None,
+        );
+        assert!(stats.results_compacted > 0);
 
         // Step 2: estimate tokens and determine tier
         let est = crate::prompts::estimate_tokens(&after_micro, 0, 0);
@@ -1701,12 +1764,10 @@ mod tests {
         }
     }
 
-    /// Scenario 6: Needle-in-haystack — a critical API key rotation
-    /// instruction buried in turn 3 of a 20-turn conversation must
-    /// survive compaction. Tests that user messages are never dropped
-    /// even when tool results are aggressively pruned.
+    /// Pruning an old user instruction must report a compaction boundary
+    /// where the summary stage can capture omitted constraints.
     #[test]
-    fn scenario_needle_in_haystack_preserves_critical_user_instruction() {
+    fn scenario_reports_boundary_when_old_instruction_is_pruned() {
         let mut msgs = Vec::new();
         // Turns 0-2: setup noise
         for i in 0..3 {
@@ -1747,16 +1808,22 @@ mod tests {
         }
 
         // Micro-compact first
-        let tc = super::super::analytics::TurnCountCompactConfig::default();
-        let trigger = super::super::analytics::evaluate_turn_count_trigger(&msgs, &tc).unwrap();
-        let (after_micro, _) =
-            super::super::analytics::apply_micro_compact(&msgs, &trigger.tool_ids_to_clear);
+        let dir = tempfile::tempdir().expect("session artifacts");
+        let mut after_micro = owned_tool_history(&msgs);
+        let stats = compact_tool_results_adaptive_with_persistence_protected_prefix(
+            &mut after_micro,
+            0.3,
+            CompactStrategy::Normalized,
+            Some(dir.path()),
+            None,
+        );
+        assert!(stats.results_compacted > 0);
 
         // Then aggressive prune (keep 4 recent turns)
         let result =
             compact_tiered_with_result(&after_micro, 5000, 500, CompactionTier::AggressivePrune, 4);
 
-        // THE NEEDLE MUST SURVIVE: user messages are never dropped by tool compaction
+        // An old instruction may be removed by tiered pruning, unlike tool compaction.
         let has_critical = result.messages.iter().any(|m| {
             m.get("content")
                 .and_then(Value::as_str)
@@ -1828,10 +1895,20 @@ mod tests {
         }
 
         // Micro-compact + aggressive prune (keep 6 recent turns)
-        let tc = super::super::analytics::TurnCountCompactConfig::default();
-        let trigger = super::super::analytics::evaluate_turn_count_trigger(&msgs, &tc).unwrap();
-        let (after_micro, _) =
-            super::super::analytics::apply_micro_compact(&msgs, &trigger.tool_ids_to_clear);
+        let dir = tempfile::tempdir().expect("session artifacts");
+        let mut after_micro = owned_tool_history(&msgs);
+        let stats = compact_tool_results_adaptive_with_persistence_protected_prefix(
+            &mut after_micro,
+            0.3,
+            CompactStrategy::Normalized,
+            Some(dir.path()),
+            None,
+        );
+        assert_eq!(
+            stats.results_compacted, 0,
+            "bash evidence must remain inline"
+        );
+        assert_eq!(after_micro, owned_tool_history(&msgs));
         let result =
             compact_tiered_with_result(&after_micro, 5000, 500, CompactionTier::AggressivePrune, 6);
 

@@ -11,13 +11,17 @@ pub fn journal_record_edge_tool_result(
     result: &crate::sse_stream_host::EdgeToolExecResult,
 ) -> ToolCallRecord {
     let args = result.args.to_string();
+    let output = crate::tool_result_sanitize::tool_result_content_for_model_unbounded(
+        &result.tool,
+        &result.output,
+    );
     let mut record = journal_record_executed_tool_call(
         result.tool.clone(),
         astra_tools::tool_result_status::ToolResultStatusKind::from_status_str(&result.status)
             .is_failure(),
         result.duration_ms,
         u32::try_from(args.len()).unwrap_or(u32::MAX),
-        &result.output,
+        &output,
         None,
         None,
         Some(args),

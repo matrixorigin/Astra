@@ -2411,32 +2411,6 @@ pub fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, Str
     Some((client, mem.base_url, key))
 }
 
-/// Fire-and-forget: trigger Memoria governance.
-pub async fn memoria_governance_fire_and_forget() {
-    let Some((client, base, key)) = memoria_oneshot_client(10) else {
-        return;
-    };
-    let _ = client
-        .post(format!("{base}/v1/governance"))
-        .header("Authorization", format!("Bearer {key}"))
-        .json(&json!({"force": false}))
-        .send()
-        .await;
-}
-
-/// Fire-and-forget: trigger Memoria graph consolidation.
-pub async fn memoria_consolidate_fire_and_forget() {
-    let Some((client, base, key)) = memoria_oneshot_client(15) else {
-        return;
-    };
-    let _ = client
-        .post(format!("{base}/v1/consolidate"))
-        .header("Authorization", format!("Bearer {key}"))
-        .json(&json!({"force": false}))
-        .send()
-        .await;
-}
-
 // ── Cloud memory helpers (shared between CLI and server) ────────────────
 
 /// Generic Memoria API request for cloud management operations.

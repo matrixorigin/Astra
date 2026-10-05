@@ -16,15 +16,13 @@ use astra_runtime::{
     tool_registry::ToolRegistry,
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::host::{
-        AgenticLoopHost, AgenticLoopState, ContinuationAuthority, ControlToolRecovery,
-        HostTurnResult, SkillAutoRouteDecision, SkillAutoRouteJudgeContext,
-        TerminalExecutionAuthority, TurnIntentJudgeOutcome, TurnInteractionMode,
-        interaction_scoped_tool_restrictions,
+        AgenticLoopHost, AgenticLoopState, ContinuationAuthority, HostTurnResult,
+        SkillAutoRouteDecision, SkillAutoRouteJudgeContext, TerminalExecutionAuthority,
+        TurnIntentJudgeOutcome, TurnInteractionMode, interaction_scoped_tool_restrictions,
     },
 };
 use astra_turn_core::{
     chat_turn_sse_dispatch::ServerLoopExecutionSummary, compaction_types::CompactionEvent,
-    orchestration::agent_result_wire::render_agent_tool_error, sse_stream_host::EdgeToolExecResult,
     tool::schema::tool_names_from_schemas,
 };
 use async_trait::async_trait;
@@ -34,10 +32,7 @@ use serde_json::Value;
 use crate::{
     ExplainMode,
     cli::permission_manager::{PermissionManager, PermissionMode},
-    cli::stream::stream_render::{
-        RenderPolicy, agent_control_action, agent_control_label, agent_id_from_args,
-        agent_id_from_output, tool_output_event_text,
-    },
+    cli::stream::stream_render::RenderPolicy,
     edge_tools::ToolExecutor,
 };
 
@@ -48,7 +43,6 @@ use crate::cli::chat_stream::sse_loop::refresh_root_permission_context;
 
 use astra_runtime::tool_sandbox::SandboxPolicy;
 
-const AGENT_FANOUT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const TERMINAL_STREAM_EVENT_RESERVE: usize = 3;
 const TERMINAL_STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const TERMINAL_STREAM_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -187,49 +181,6 @@ fn authoritative_provider_surface_report(
     )
 }
 
-fn render_control_tool_recovery_error(message: &str) -> String {
-    let mut value: Value = serde_json::from_str(&render_agent_tool_error(None, message))
-        .unwrap_or_else(|_| serde_json::json!({"status": "failed", "error": message}));
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "recovery".to_string(),
-            serde_json::json!({
-                "attempted": true,
-                "source": "host_state",
-                "outcome": "failed",
-            }),
-        );
-    }
-    value.to_string()
-}
-
-fn recovered_agent_fanout_completion_event(
-    tool_call_id: &str,
-    status: String,
-    duration_ms: u64,
-    output: &str,
-) -> crate::cli::chat_stream::StreamEvent {
-    crate::cli::chat_stream::StreamEvent::ToolCompleted {
-        name: "agent_fanout".to_string(),
-        // The matching ToolStarted event already owns the human label. An
-        // empty replacement cannot overwrite it with recovery plumbing.
-        description: String::new(),
-        status,
-        duration_ms,
-        output_summary: None,
-        output: Some(tool_output_event_text("agent_fanout", output)),
-        tool_use_id: tool_call_id.to_string(),
-        parent_tool_use_id: None,
-        server_terminal: None,
-    }
-}
-
-fn accumulated_control_duration_ms(prior_duration_ms: Option<u64>, recovery_ms: u64) -> u64 {
-    prior_duration_ms
-        .unwrap_or_default()
-        .saturating_add(recovery_ms)
-}
-
 /// RAII guard for the executor's sandbox policy slot.
 ///
 /// On drop, the slot is restored to whatever it held when [`SandboxPolicyGuard::install`]
@@ -313,7 +264,6 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     pub message: &'a str,
     pub user_intent: &'a str,
     pub input_runtime_required_texts: &'a [String],
-    pub input_active_system_skills: &'a [String],
     pub input_runtime_volatile_texts: &'a [String],
     pub semantic_query_override: Option<&'a str>,
     pub history: &'a [(String, String)],
@@ -1215,7 +1165,6 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                     registry: &self.registry,
                     messages: state.messages.as_slice(),
                     runtime_required_texts: self.input_runtime_required_texts,
-                    active_system_skills: self.input_active_system_skills,
                     runtime_volatile_texts: &runtime_volatile_texts,
                     runtime_volatile_injections: &runtime_volatile_injections,
                     ephemeral_prefix: state.skills.listing_message.as_ref(),
@@ -1639,12 +1588,9 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             return;
         }
         self.executor.set_active_session_id(session_id.to_string());
-        // The server resolves the canonical identity before the first
-        // provider request. Forward that fact to the foreground now rather
-        // than relying on a later SSE `session_info`: the edge consumer sees
-        // the same id as already installed and intentionally de-duplicates
-        // it, which otherwise leaves a new TUI Work observer unbound for the
-        // entire first tool round.
+        // Project the completed turn's canonical binding. The SSE consumer
+        // independently publishes its verified identity while the request is
+        // live, including on resume; observers accept repeated identical ids.
         self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::SessionBound(
             session_id.to_string(),
         ));
@@ -1710,185 +1656,6 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         snapshot: &astra_turn_core::introspect::IntrospectSnapshot,
     ) {
         self.executor.update_introspect_snapshot(snapshot.clone());
-    }
-
-    async fn recover_missing_control_tool_result(
-        &mut self,
-        parent_run_id: Option<&str>,
-        tool_call_id: &str,
-        tool_name: &str,
-        args: &Value,
-        prior_duration_ms: Option<u64>,
-    ) -> ControlToolRecovery {
-        if !matches!(tool_name, "agent" | "agent_fanout") {
-            return ControlToolRecovery::Unsupported;
-        }
-        let Some(spawn_context) = self.executor.spawn_context.as_ref() else {
-            tracing::warn!(
-                target: "astra_cli::agentic_loop_host",
-                tool_call_id,
-                "agent_fanout recovery skipped: missing spawn context"
-            );
-            return ControlToolRecovery::Missing;
-        };
-
-        let Some(parent_run_id) = parent_run_id else {
-            tracing::warn!(
-                target: "astra_cli::agentic_loop_host",
-                spawn_context_run_id = %spawn_context.run_id,
-                tool_call_id,
-                "control-tool recovery skipped: missing parent run identity"
-            );
-            return ControlToolRecovery::Missing;
-        };
-        if parent_run_id != spawn_context.run_id {
-            tracing::warn!(
-                target: "astra_cli::agentic_loop_host",
-                parent_run_id,
-                spawn_context_run_id = %spawn_context.run_id,
-                tool_call_id,
-                "control-tool recovery skipped: parent run does not own the active spawn context"
-            );
-            return ControlToolRecovery::Missing;
-        }
-
-        if tool_name == "agent" {
-            let started_at = std::time::Instant::now();
-            let mut execution_args = args.clone();
-            if let Some(object) = execution_args.as_object_mut() {
-                object.insert(
-                    "_tool_call_id".to_string(),
-                    Value::String(tool_call_id.to_string()),
-                );
-            }
-            let action = agent_control_action(args).map(str::to_string);
-            let label = action
-                .as_deref()
-                .map(|action| agent_control_label(args, format!("Agent {action}")));
-            if let (Some(action), Some(label)) = (action.as_deref(), label.as_deref()) {
-                self.try_emit_stream_event(
-                    crate::cli::chat_stream::StreamEvent::AgentControlStarted {
-                        action: action.to_string(),
-                        label: label.to_string(),
-                        tool_use_id: tool_call_id.to_string(),
-                        agent_id: agent_id_from_args(args),
-                        fanout_slot: None,
-                        fanout_title: None,
-                    },
-                );
-                self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::ToolStarted {
-                    name: tool_name.to_string(),
-                    description: label.to_string(),
-                    tool_use_id: tool_call_id.to_string(),
-                    parent_tool_use_id: None,
-                });
-            }
-            let outcome = self
-                .executor
-                .execute_with_metadata(tool_name, &execution_args)
-                .await;
-            let duration_ms = accumulated_control_duration_ms(
-                prior_duration_ms,
-                started_at.elapsed().as_millis() as u64,
-            );
-            let status = if outcome.is_error {
-                "failed"
-            } else {
-                "completed"
-            }
-            .to_string();
-            let event_output = tool_output_event_text(tool_name, &outcome.output);
-            if let (Some(action), Some(label)) = (action.as_deref(), label.as_deref()) {
-                self.try_emit_stream_event(
-                    crate::cli::chat_stream::StreamEvent::AgentControlCompleted {
-                        action: action.to_string(),
-                        label: label.to_string(),
-                        status: status.clone(),
-                        duration_ms,
-                        output: Some(event_output.clone()),
-                        tool_use_id: tool_call_id.to_string(),
-                        agent_id: agent_id_from_output(&outcome.output)
-                            .or_else(|| agent_id_from_args(args)),
-                    },
-                );
-                self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::ToolCompleted {
-                    name: tool_name.to_string(),
-                    description: label.to_string(),
-                    status: status.clone(),
-                    duration_ms,
-                    output_summary: None,
-                    output: Some(event_output),
-                    tool_use_id: tool_call_id.to_string(),
-                    parent_tool_use_id: None,
-                    server_terminal: None,
-                });
-            }
-            return ControlToolRecovery::Recovered(Box::new(EdgeToolExecResult {
-                execution_completion: None,
-                request_id: tool_call_id.to_string(),
-                tool: tool_name.to_string(),
-                args: args.clone(),
-                output: outcome.output,
-                tool_result_fields: None,
-                status,
-                duration_ms,
-            }));
-        }
-
-        let started_at = std::time::Instant::now();
-        let output = match tokio::time::timeout(
-            AGENT_FANOUT_RECOVERY_TIMEOUT,
-            astra_runtime::orchestration::recover_agent_fanout_tool_result(
-                args,
-                Some(tool_call_id),
-                Some(spawn_context),
-            ),
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(_) => render_control_tool_recovery_error(
-                "Cannot recover missing agent_fanout edge result: recovery timed out before the host could render the registered fanout group.",
-            ),
-        };
-        let status = if matches!(
-            astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_receipt_kind(
-                &output,
-            ),
-            Some(
-                astra_turn_core::orchestration::agent_result_wire::AgentFanoutControlReceiptKind::Group
-            )
-        ) {
-            "completed"
-        } else {
-            "failed"
-        }
-        .to_string();
-        let duration_ms = accumulated_control_duration_ms(
-            prior_duration_ms,
-            started_at.elapsed().as_millis() as u64,
-        );
-        // An unusable local fanout result is intentionally not terminalized
-        // on the interactive surface. The registry reconciliation above is
-        // the semantic boundary: publish exactly this result under the
-        // original call identity so the existing live cell closes with the
-        // same truth consumed by the model.
-        self.try_emit_stream_event(recovered_agent_fanout_completion_event(
-            tool_call_id,
-            status.clone(),
-            duration_ms,
-            &output,
-        ));
-        ControlToolRecovery::Recovered(Box::new(EdgeToolExecResult {
-            execution_completion: None,
-            request_id: tool_call_id.to_string(),
-            tool: tool_name.to_string(),
-            args: args.clone(),
-            output,
-            tool_result_fields: None,
-            status,
-            duration_ms,
-        }))
     }
 
     async fn cancel_child_agents(
@@ -2207,15 +1974,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        SandboxPolicyGuard, TERMINAL_STREAM_DRAIN_TIMEOUT, accumulated_control_duration_ms,
-        authoritative_provider_surface_report, child_cancellation_scope,
-        derive_turn_interaction_mode, emit_final_output_ready,
+        SandboxPolicyGuard, TERMINAL_STREAM_DRAIN_TIMEOUT, authoritative_provider_surface_report,
+        child_cancellation_scope, derive_turn_interaction_mode, emit_final_output_ready,
         emit_ordered_control_event_with_backpressure, is_pre_admission_rejection,
         permission_mode_change_audit_event, reconcile_terminal_stream_projection,
-        record_remote_applied_user_intents, recovered_agent_fanout_completion_event,
-        request_allowlist_restriction_names, retain_ordered_stream_event_in_queue,
-        server_terminal_requires_unverified, stream_event_requires_ordered_delivery,
-        user_intent_stream_event,
+        record_remote_applied_user_intents, request_allowlist_restriction_names,
+        retain_ordered_stream_event_in_queue, server_terminal_requires_unverified,
+        stream_event_requires_ordered_delivery, user_intent_stream_event,
     };
 
     #[test]
@@ -2492,60 +2257,6 @@ mod tests {
                     astra_runtime::tool_sandbox::IsolationLevel::Strict
                 );
             }
-        }
-    }
-
-    #[test]
-    fn control_recovery_duration_includes_prior_dispatch_without_overflow() {
-        assert_eq!(accumulated_control_duration_ms(Some(1_100), 1_628), 2_728);
-        assert_eq!(accumulated_control_duration_ms(None, 27), 27);
-        assert_eq!(accumulated_control_duration_ms(Some(u64::MAX), 1), u64::MAX);
-    }
-
-    #[test]
-    fn recovered_fanout_receipt_closes_the_original_interactive_call() {
-        let output = json!({
-            "status": "completed",
-            "group_id": "group-1",
-            "target_count": 2,
-            "work_unit_observation": {
-                "id": "group-1",
-                "kind": "agent_fanout",
-                "status": "completed",
-                "revision": 2,
-                "mode": "current",
-                "wake_policy": "none"
-            }
-        })
-        .to_string();
-        let event = recovered_agent_fanout_completion_event(
-            "call-original",
-            "completed".into(),
-            27,
-            &output,
-        );
-
-        match event {
-            crate::cli::chat_stream::StreamEvent::ToolCompleted {
-                name,
-                description,
-                status,
-                duration_ms,
-                output: Some(rendered),
-                tool_use_id,
-                ..
-            } => {
-                assert_eq!(name, "agent_fanout");
-                assert!(description.is_empty());
-                assert_eq!(status, "completed");
-                assert_eq!(duration_ms, 27);
-                assert_eq!(tool_use_id, "call-original");
-                assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(&rendered).unwrap()["group_id"],
-                    "group-1"
-                );
-            }
-            other => panic!("unexpected event: {other:?}"),
         }
     }
 

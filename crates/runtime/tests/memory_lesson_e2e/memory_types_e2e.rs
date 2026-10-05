@@ -4,7 +4,7 @@
 // 1. Business type → encode → Memoria payload structure
 // 2. Memoria response → decode → category identification
 // 3. Extraction response → parse → encode → batch payload
-// 4. System prompt includes type taxonomy when memory tools present
+// 4. Memory taxonomy prompt generation has independent encoding contracts
 // 5. Quality gate filters extraction output correctly
 
 use astra_prompts::memory_types::{self, MemoryCategory, MemoryPromptMode};
@@ -229,7 +229,7 @@ fn none_mode_prompt_is_empty() {
 
 #[test]
 fn quality_gate_filters_extraction_output() {
-    use astra_runtime::learning::synthesizer::is_high_quality_lesson;
+    use astra_runtime::learning::lesson::is_high_quality_lesson;
 
     // These should PASS the gate (10+ chars, no hedging)
     assert!(is_high_quality_lesson(
@@ -278,22 +278,6 @@ fn v2_tag_names_are_unique() {
 }
 
 // ── 8. Boundary conditions ──────────────────────────────────────────────
-
-#[test]
-fn system_prompt_without_lessons_has_no_lessons_header() {
-    let prompt = astra_runtime::prompts::build_main_system_prompt(&["bash", "memory"], "");
-    assert!(
-        !prompt.contains("📚 Lessons"),
-        "prompt without lesson injection should not render Lessons header"
-    );
-}
-
-#[test]
-fn system_prompt_with_no_tools_still_valid() {
-    let prompt = astra_runtime::prompts::build_main_system_prompt(&[], "");
-    assert!(!prompt.is_empty());
-    assert!(!prompt.contains("Memory Rules"));
-}
 
 // ── 9. Journal event structure ─────────────────────────────────────────
 

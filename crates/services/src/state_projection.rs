@@ -247,25 +247,6 @@ fn decode_user_anchor_memory_item(
     })
 }
 
-fn decode_run_acl_row(
-    row: &impl StateProjectionDbRow,
-    run_id: &str,
-) -> Result<RunAclRow, StateProjectionError> {
-    const OPERATION: &str = "load_run_acl_for_user";
-    Ok(RunAclRow {
-        user_id: state_projection_row_string(row, OPERATION, run_id, "user_id")?,
-        session_id: state_projection_row_string(row, OPERATION, run_id, "session_id")?,
-        root_run_id: state_projection_row_optional_string(row, OPERATION, run_id, "root_run_id")?,
-        ancestor_path: state_projection_row_optional_string(
-            row,
-            OPERATION,
-            run_id,
-            "ancestor_path",
-        )?,
-        depth: state_projection_row_u32(row, OPERATION, run_id, "depth")?,
-    })
-}
-
 fn decode_run_projection_row(
     row: &impl StateProjectionDbRow,
     run_id: &str,
@@ -925,114 +906,6 @@ impl DatabaseStateProjectionStore {
         Ok(())
     }
 
-    pub async fn create_retry_run_and_supersede(
-        &self,
-        user_id: &str,
-        old_run_id: &str,
-        new_run_id: &str,
-        retry_scope: &str,
-    ) -> Result<(), StateProjectionError> {
-        validate_retry_scope(new_run_id, retry_scope)?;
-        let old = self
-            .load_run_acl_for_user(user_id, old_run_id)
-            .await?
-            .ok_or_else(|| StateProjectionError::Database {
-                operation: "load_old_retry_run",
-                entity: old_run_id.to_string(),
-                source: sqlx::Error::RowNotFound,
-            })?;
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| StateProjectionError::Database {
-                operation: "acquire_retry_supersede",
-                entity: old_run_id.to_string(),
-                source,
-            })?;
-        let mut tx = connection
-            .begin()
-            .await
-            .map_err(|source| StateProjectionError::Database {
-                operation: "begin_retry_supersede",
-                entity: old_run_id.to_string(),
-                source,
-            })?;
-        let supersede = sqlx::query(
-            "UPDATE agent_runs
-             SET status = 'superseded', updated_at = NOW(6)
-             WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(user_id)
-        .bind(old_run_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| StateProjectionError::Database {
-            operation: "supersede_old_run",
-            entity: old_run_id.to_string(),
-            source,
-        })?;
-        if supersede.rows_affected() == 0 {
-            return Err(StateProjectionError::Database {
-                operation: "supersede_old_run",
-                entity: old_run_id.to_string(),
-                source: sqlx::Error::RowNotFound,
-            });
-        }
-        let root = old.root_run_id.unwrap_or_else(|| old_run_id.to_string());
-        let parent_path = old.ancestor_path.unwrap_or_else(|| old_run_id.to_string());
-        sqlx::query(
-            "INSERT INTO agent_runs
-             (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
-              retry_of, retry_scope, status, last_event_idx, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', -1, NOW(6), NOW(6))",
-        )
-        .bind(new_run_id)
-        .bind(old.user_id)
-        .bind(old.session_id)
-        .bind(old_run_id)
-        .bind(&root)
-        .bind(format!("{parent_path}/{new_run_id}"))
-        .bind(i64::from(old.depth.saturating_add(1)))
-        .bind(old_run_id)
-        .bind(retry_scope)
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| StateProjectionError::Database {
-            operation: "insert_retry_run",
-            entity: new_run_id.to_string(),
-            source,
-        })?;
-        tx.commit()
-            .await
-            .map_err(|source| StateProjectionError::Database {
-                operation: "commit_retry_supersede",
-                entity: old_run_id.to_string(),
-                source,
-            })?;
-        connection.release();
-        Ok(())
-    }
-
-    async fn load_run_acl_for_user(
-        &self,
-        user_id: &str,
-        run_id: &str,
-    ) -> Result<Option<RunAclRow>, StateProjectionError> {
-        let row = sqlx::query(
-            "SELECT run_id, user_id, session_id, root_run_id, ancestor_path, depth
-             FROM agent_runs WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| StateProjectionError::Database {
-            operation: "load_run_acl_for_user",
-            entity: run_id.to_string(),
-            source,
-        })?;
-        row.map(|row| decode_run_acl_row(&row, run_id)).transpose()
-    }
-
     async fn load_run_projection_for_user(
         &self,
         user_id: &str,
@@ -1063,15 +936,6 @@ impl DatabaseStateProjectionStore {
         row.map(|row| decode_run_projection_row(&row, run_id))
             .transpose()
     }
-}
-
-#[derive(Clone, Debug)]
-struct RunAclRow {
-    user_id: String,
-    session_id: String,
-    root_run_id: Option<String>,
-    ancestor_path: Option<String>,
-    depth: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1443,33 +1307,13 @@ mod tests {
     }
 
     #[test]
-    fn run_acl_and_projection_decode_fail_loudly() {
-        let acl =
-            decode_run_acl_row(&FakeStateProjectionRow::complete(), "run-1").expect("acl decodes");
-        assert_eq!(acl.user_id, "user-1");
-        assert_eq!(acl.session_id, "session-1");
-        assert_eq!(acl.root_run_id.as_deref(), Some("root-run"));
-        assert_eq!(acl.ancestor_path.as_deref(), Some("root-run/run-1"));
-        assert_eq!(acl.depth, 2);
-
-        for column in [
-            "user_id",
-            "session_id",
-            "root_run_id",
-            "ancestor_path",
-            "depth",
-        ] {
-            assert_database_error_mentions(
-                decode_run_acl_row(&FakeStateProjectionRow::fail_on(column), "run-1"),
-                column,
-            );
-        }
+    fn run_projection_decode_fail_loudly() {
         assert_invalid_database_value(
-            decode_run_acl_row(&FakeStateProjectionRow::with_i64("depth", -1), "run-1"),
+            decode_run_projection_row(&FakeStateProjectionRow::with_i64("depth", -1), "run-1"),
             "depth",
         );
         assert_invalid_database_value(
-            decode_run_acl_row(
+            decode_run_projection_row(
                 &FakeStateProjectionRow::with_i64("depth", i64::from(u32::MAX) + 1),
                 "run-1",
             ),

@@ -534,16 +534,6 @@ matrix_test! {
     journey_saas_platform_matrix::run_saas_team_cross_user_isolation
 }
 matrix_test! {
-    e2e_matrix_saas_session_replay_compare_unavailable_guardrail, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §6.1 replay compare guardrail",
-    journey_saas_platform_matrix::run_saas_session_replay_compare_unavailable_guardrail
-}
-matrix_test! {
-    e2e_matrix_saas_session_replay_post_unavailable_guardrail, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §6.1 replay POST guardrail",
-    journey_saas_platform_matrix::run_saas_session_replay_post_unavailable_guardrail
-}
-matrix_test! {
     e2e_matrix_saas_run_projection_smoke, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §4.3 run projection",
     journey_saas_platform_matrix::run_saas_run_projection_smoke

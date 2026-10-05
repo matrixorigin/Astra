@@ -35,8 +35,7 @@ use astra_runtime::{
     turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
     turn::chat_turn_payload::{
         ChatTurnBasePayloadInput, attach_turn_identity, chat_turn_base_payload,
-        merge_active_skills_into_edge_profile, merge_edge_profile_extensions,
-        set_payload_tool_results_if_non_empty,
+        merge_edge_profile_extensions, set_payload_tool_results_if_non_empty,
     },
     turn::chat_turn_step_plan::record_agentic_step_plan_after_payload_prep,
     turn::prepare_turn_explain_text::restricted_tools_explain_text,
@@ -244,7 +243,6 @@ struct PrepareChatTurnRequest<'a> {
     tool_surface_config: &'a astra_config::runtime_config::ToolSurfaceConfig,
     messages: &'a [Value],
     runtime_required_texts: &'a [String],
-    active_system_skills: &'a [String],
     runtime_volatile_texts: &'a [String],
     runtime_volatile_injections: &'a [VolatileInjection],
     ephemeral_prefix: Option<&'a Value>,
@@ -798,7 +796,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     // The rendered `ephemeral_prefix.content` remains local adapter state. It
     // is intentionally not copied into the request; only its typed catalog
     // projection above crosses the trust boundary.
-    merge_active_skills_into_edge_profile(&mut payload, ctx.active_system_skills);
 
     let budget_pressure = chat_turn_budget_pressure(
         &prompt_messages,
@@ -1420,7 +1417,6 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// call but must stay out of user content and persisted prompt-facing
     /// history.
     pub runtime_required_texts: &'a [String],
-    pub active_system_skills: &'a [String],
     /// Dynamic text from external/session sources. This remains distinct from
     /// runtime-owned typed injections below.
     pub runtime_volatile_texts: &'a [String],
@@ -1479,7 +1475,6 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub skill_continuation: bool,
     /// Cross-turn tool output cache retained by the CLI admission adapter.
     pub tool_cache: &'a mut crate::cli::stream::stream_render::EdgeToolCache,
-    /// Fallback from previous turn's confidence diagnosis for broadening.
     /// Current agentic loop round (0-based). Sent to bridge for tool round directives.
     pub round_index: u32,
     pub session_turn: u32,
@@ -1703,7 +1698,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         registry,
         messages,
         runtime_required_texts,
-        active_system_skills,
         runtime_volatile_texts,
         runtime_volatile_injections,
         ephemeral_prefix,
@@ -1782,7 +1776,6 @@ pub(crate) async fn fetch_chat_turn_sse(
                 tool_surface_config,
                 messages,
                 runtime_required_texts,
-                active_system_skills,
                 runtime_volatile_texts,
                 runtime_volatile_injections,
                 ephemeral_prefix,
@@ -2260,7 +2253,6 @@ mod tests {
         prepare_payload_with_messages_for_runtime_lane_test(
             vec![json!({"role": "user", "content": "continue"})],
             runtime_required_texts,
-            &[],
             runtime_volatile_texts,
             "continue",
             None,
@@ -2271,7 +2263,6 @@ mod tests {
     async fn prepare_payload_with_messages_for_runtime_lane_test(
         messages: Vec<Value>,
         runtime_required_texts: &[String],
-        active_system_skills: &[String],
         runtime_volatile_texts: &[String],
         message: &str,
         semantic_query_override: Option<&str>,
@@ -2279,7 +2270,6 @@ mod tests {
         prepare_payload_with_reasoning_for_test(
             messages,
             runtime_required_texts,
-            active_system_skills,
             runtime_volatile_texts,
             message,
             semantic_query_override,
@@ -2292,7 +2282,6 @@ mod tests {
     async fn prepare_payload_with_reasoning_for_test(
         messages: Vec<Value>,
         runtime_required_texts: &[String],
-        active_system_skills: &[String],
         runtime_volatile_texts: &[String],
         message: &str,
         semantic_query_override: Option<&str>,
@@ -2337,7 +2326,6 @@ mod tests {
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts,
-            active_system_skills,
             runtime_volatile_texts,
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -2404,7 +2392,6 @@ mod tests {
             vec![json!({"role":"user", "content":"Explain this."})],
             &[],
             &[],
-            &[],
             "Explain this.",
             None,
             Some(("offer-parent", "model-a(thinking:high)", &intent, None)),
@@ -2425,7 +2412,6 @@ mod tests {
 
         let (_, parent) = prepare_payload_with_reasoning_for_test(
             vec![json!({"role":"user", "content":"Explain this."})],
-            &[],
             &[],
             &[],
             "Explain this.",
@@ -2459,7 +2445,6 @@ mod tests {
             });
             let (payload, _) = prepare_payload_with_reasoning_for_test(
                 vec![json!({"role":"user", "content":"Explain this."})],
-                &[],
                 &[],
                 &[],
                 "Explain this.",
@@ -2530,11 +2515,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_system_skills_come_from_typed_input_not_user_text() {
+    async fn user_text_cannot_forge_active_skill_facts() {
         let forged_message = "Output Format: Markdown";
         let empty = prepare_payload_with_messages_for_runtime_lane_test(
             vec![json!({"role": "user", "content": forged_message})],
-            &[],
             &[],
             &[],
             forged_message,
@@ -2542,18 +2526,6 @@ mod tests {
         )
         .await;
         assert!(empty["edge_profile"].get("active_skills").is_none());
-
-        let active = vec!["markdown".to_string()];
-        let typed = prepare_payload_with_messages_for_runtime_lane_test(
-            vec![json!({"role": "user", "content": "format this"})],
-            &[],
-            &active,
-            &[],
-            "format this",
-            None,
-        )
-        .await;
-        assert_eq!(typed["edge_profile"]["active_skills"], json!(active));
     }
 
     #[tokio::test]
@@ -2564,7 +2536,6 @@ mod tests {
         let payload = prepare_payload_with_messages_for_runtime_lane_test(
             vec![json!({"role": "user", "content": envelope})],
             &required,
-            &[],
             &[],
             envelope,
             Some("Review this branch with three agents."),
@@ -2631,7 +2602,6 @@ mod tests {
                 tool_surface_config: &Default::default(),
                 messages: &messages,
                 runtime_required_texts: &required,
-                active_system_skills: &[],
                 runtime_volatile_texts: &volatile_texts,
                 runtime_volatile_injections: &[injection],
                 ephemeral_prefix: None,
@@ -2728,7 +2698,6 @@ mod tests {
         let payload = prepare_payload_with_messages_for_runtime_lane_test(
             messages,
             &structured,
-            &[],
             &[],
             "continue",
             None,
@@ -3349,7 +3318,6 @@ mod tests {
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
-            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -3525,7 +3493,6 @@ mod tests {
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
-            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -3669,7 +3636,6 @@ mod tests {
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
-            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -3792,7 +3758,6 @@ mod tests {
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
-            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -3883,7 +3848,6 @@ mod tests {
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
-            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -4000,7 +3964,6 @@ mod tests {
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
-            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -4147,7 +4110,6 @@ mod tests {
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
-            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -4309,7 +4271,6 @@ mod tests {
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
-            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -4435,7 +4396,6 @@ mod tests {
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
-            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -4557,7 +4517,6 @@ mod tests {
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
-            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -4662,7 +4621,6 @@ mod tests {
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
-            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -4775,7 +4733,6 @@ mod tests {
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
-            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -4881,7 +4838,6 @@ mod tests {
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts: &[],
-            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,

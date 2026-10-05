@@ -191,7 +191,7 @@ not an interactive fallback dispatcher.
 
 ## Resume flow (startup or `/resume`)
 
-1. `handle_resume_command` → `restore_session_into_state` → `apply_restored_session`
+1. Startup or the native TUI picker calls `restore_session_into_state` → `apply_restored_session`
    repopulates `state.history` / `state.session_id` / `state.runtime_continuity`
    / `state.csl_manager` from the session's CSL or journal on disk.
 2. In the TUI, when `state.session_id` changes, `replay_session_into_widget`

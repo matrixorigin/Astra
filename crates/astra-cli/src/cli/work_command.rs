@@ -671,24 +671,7 @@ mod tests {
         assert!(error.contains("Work identity"));
     }
 
-    #[tokio::test]
-    async fn start_work_uses_one_server_owned_loop_then_refreshes_the_task_graph() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/works"))
-            .and(header("authorization", "Bearer token"))
-            .and(body_partial_json(json!({
-                "goal": "Ship the feature",
-                "criteria": [{
-                    "kind": "human_review",
-                    "criterion_id": "done-when-01",
-                    "statement": "The user accepts the result"
-                }]
-            })))
-            .respond_with(ResponseTemplate::new(201).set_body_json(observation()))
-            .expect(1)
-            .mount(&server)
-            .await;
+    async fn mount_work_turn_fixture(server: &MockServer, stream_body: &str) {
         Mock::given(method("POST"))
             .and(path("/v1/works/work-1/branches/branch-1/attachments"))
             .and(body_string_contains("\"request_id\":\"cli-attach-"))
@@ -696,7 +679,7 @@ mod tests {
                 "attachment_id": "attachment-1"
             })))
             .up_to_n_times(1)
-            .mount(&server)
+            .mount(server)
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/works/work-1/branches/branch-1/turns"))
@@ -704,12 +687,9 @@ mod tests {
                 "attachment_id": "attachment-1",
                 "message": "Ship the feature"
             })))
-            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
-                "data: {\"type\":\"text_delta\",\"content\":\"Working.\"}\n\n",
-                "data: {\"type\":\"run_finished\",\"status\":\"completed\"}\n\n"
-            )))
+            .respond_with(ResponseTemplate::new(200).set_body_string(stream_body))
             .expect(1)
-            .mount(&server)
+            .mount(server)
             .await;
         Mock::given(method("POST"))
             .and(path("/v1/works/work-1/branches/branch-1/attachments"))
@@ -723,7 +703,7 @@ mod tests {
                 }
             })))
             .expect(1)
-            .mount(&server)
+            .mount(server)
             .await;
         Mock::given(method("POST"))
             .and(path(
@@ -743,7 +723,7 @@ mod tests {
                 "outcome": "released"
             })))
             .expect(1)
-            .mount(&server)
+            .mount(server)
             .await;
         for attachment_id in ["attachment-1", "release-observer-1"] {
             Mock::given(method("DELETE"))
@@ -752,9 +732,55 @@ mod tests {
                 )))
                 .respond_with(ResponseTemplate::new(204))
                 .expect(1)
-                .mount(&server)
+                .mount(server)
                 .await;
         }
+    }
+
+    #[tokio::test]
+    async fn work_stream_failures_release_control_before_returning_error() {
+        for event_type in ["error", "run_error"] {
+            let server = MockServer::start().await;
+            let stream_body = format!(
+                "data: {}\n\n",
+                json!({"type": event_type, "message": "provider failed"})
+            );
+            mount_work_turn_fixture(&server, &stream_body).await;
+            let api = ThinClient::new(&server.uri(), None).expect("client");
+            let error = run_work_turn(&api, "token", "work-1", "branch-1", "Ship the feature")
+                .await
+                .expect_err("server failure must not become a successful Work turn");
+            assert!(error.contains("server-reported error"));
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn start_work_uses_one_server_owned_loop_then_refreshes_the_task_graph() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/works"))
+            .and(header("authorization", "Bearer token"))
+            .and(body_partial_json(json!({
+                "goal": "Ship the feature",
+                "criteria": [{
+                    "kind": "human_review",
+                    "criterion_id": "done-when-01",
+                    "statement": "The user accepts the result"
+                }]
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(observation()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_work_turn_fixture(
+            &server,
+            concat!(
+                "data: {\"type\":\"text_delta\",\"content\":\"Working.\"}\n\n",
+                "data: {\"type\":\"run_finished\",\"status\":\"completed\"}\n\n"
+            ),
+        )
+        .await;
         Mock::given(method("GET"))
             .and(path("/v1/works/work-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(observation()))

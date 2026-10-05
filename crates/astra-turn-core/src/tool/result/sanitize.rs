@@ -542,9 +542,8 @@ mod tests {
 
         let out = tool_result_content_for_model("skill", &body);
         assert_eq!(
-            out,
-            body.trim_end(),
-            "skill instructions must not require pagination"
+            out, body,
+            "skill instructions must remain complete without whitespace normalization"
         );
     }
 

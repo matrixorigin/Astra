@@ -33,7 +33,6 @@ pub mod health_ranking;
 pub mod hooks;
 pub mod loader;
 pub mod manifest;
-pub mod pack;
 pub mod providers;
 pub mod quality;
 pub mod traits;
@@ -49,14 +48,12 @@ pub use traits::{SkillError, SkillExecutor, SkillProvider, SkillResolver};
 
 // Runtime skill execution and management
 pub mod executor;
-pub mod improvement;
 
 // Re-export key types
 pub use executor::{
     InlineSkillExecutor, IsolatedSkillExecutor, SkillExecutionRouter, SkillSubRunExecutor,
     SubRunResult,
 };
-pub use improvement::{ImprovementProposal, ImprovementTracker, SkillImprovement, TURN_BATCH_SIZE};
 
 /// Detect inline shell command lines in skill instructions.
 pub fn has_inline_shell(instructions: &str) -> bool {

@@ -41,7 +41,6 @@ pub mod reflect;
 pub(crate) mod registry_payload;
 pub use registry_payload::validate_registered_endpoint_url;
 pub mod delegation_model_requirement;
-pub mod replay;
 pub mod resource_governor;
 pub mod runs;
 pub mod runtime_maintenance;
@@ -286,7 +285,6 @@ pub use prompt_delta::{
 pub use reflect::{
     DatabaseReflectService, ReflectReport, ReflectService, UnconfiguredReflectService,
 };
-pub use replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService};
 pub use runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DatabaseRunStateStore,
     DurableRunListPage, DurableRunRecord, InMemoryRunStateStore, RunContinuationRecord,
@@ -357,10 +355,7 @@ pub use state_projection::{
     DatabaseStateProjectionStore, DelegationProjectionUpsert, StateItemUpsert,
     StateProjectionError, UserAnchorMemoryItem, validate_state_mutation,
 };
-pub use state_sync::{
-    LocalOnlySyncService, MatrixOneSyncService, StateSyncService, SyncDirection, SyncResult,
-    SyncStatus,
-};
+pub use state_sync::MatrixOneSyncService;
 pub use storage::{
     CleanupResult, RetentionPolicy, cleanup_expired_data, database_user_from_row,
     ensure_core_schema, log_session_audit, resolve_active_skill_versions, session_record_from_row,
@@ -380,7 +375,6 @@ pub use turn_intent_judge::{
     WORK_ADMISSION_MAX_UNITS, WORK_ADMISSION_TARGET_TEXT_CHARS, WorkAdmissionActivation,
     WorkAdmissionCapability, WorkAdmissionDecision, WorkAdmissionGraphMutation, WorkAdmissionTask,
     WorkExecutionTopology, parse_work_admission_response, work_admission_judge_messages,
-    work_admission_repair_hints,
 };
 pub use verification::{
     VerificationCriterion, VerificationResult, VerificationRunner, VerifierKind,

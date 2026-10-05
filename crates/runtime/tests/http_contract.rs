@@ -258,13 +258,15 @@ async fn retired_database_mutation_routes_cannot_execute_through_http() {
 }
 
 #[tokio::test]
-async fn retired_trigger_routes_cannot_claim_execution() {
+async fn retired_unimplemented_routes_cannot_claim_execution() {
     let app = build_test_app(true);
     for (method, path) in [
         ("POST", "/triggers"),
         ("GET", "/triggers"),
         ("DELETE", "/triggers/fixture"),
         ("POST", "/triggers/fixture/fire"),
+        ("POST", "/sessions/fixture/replay"),
+        ("GET", "/sessions/fixture/replay/compare"),
     ] {
         for authenticated in [false, true] {
             let mut headers = vec![("content-type", "application/json")];

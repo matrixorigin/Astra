@@ -69,6 +69,16 @@ impl EventSource for UnixInternalEventSource {
     }
 
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
+        // A previous readiness batch may also have contained TTY input and
+        // returned that event first. Drain WINCH without requiring a new edge.
+        if self
+            .signals
+            .pending()
+            .any(|signal| signal == signal_hook::consts::SIGWINCH)
+        {
+            let (width, height) = crate::terminal::size()?;
+            return Ok(Some(InternalEvent::Event(Event::Resize(width, height))));
+        }
         if let Some(event) = self.parser.next() {
             return Ok(Some(event));
         }

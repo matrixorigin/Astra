@@ -4386,7 +4386,7 @@ impl ToolExecutor {
             .await
     }
 
-    /// Synchronous core for `bash` / `powershell` execution. Returns
+    /// Synchronous core for Windows `powershell` execution. Returns
     /// `Some(outcome)` when `name` matches a cancel-aware shell tool, allowing
     /// the caller to invoke this directly inside `tokio::task::spawn_blocking`
     /// without re-entering the runtime via `Handle::block_on`. Returns `None`
@@ -4399,12 +4399,6 @@ impl ToolExecutor {
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Option<ToolExecutionOutcome> {
-        if name == "bash" {
-            let mut outcome = self.bash_outcome_with_cancel(args, invocation, cancel_token);
-            outcome.output = self.finalize_tool_output(outcome.output, name);
-            self.record_output_size(outcome.output.len());
-            return Some(outcome);
-        }
         #[cfg(windows)]
         if name == "powershell" {
             let output =
@@ -4412,8 +4406,9 @@ impl ToolExecutor {
             self.record_output_size(output.len());
             return Some(tool_execution_outcome_from_output(output));
         }
+        let _ = invocation; // PowerShell does not consume invocation metadata.
         #[cfg(not(windows))]
-        let _ = cancel_token; // powershell branch is the only other cancel-aware tool
+        let _ = (name, args, cancel_token);
         None
     }
 
@@ -4904,11 +4899,9 @@ impl ToolExecutor {
             fields: tool_result_fields,
             is_error: source_is_error,
         } = facts;
-        let output = if let Err(error) =
-            crate::tool_safety_guard::ToolSafetyGuard::check_dispatch(name, args)
+        let output = if is_plan_mode_blocked_tool(name, args)
+            && self.plan_mode_authoring_active().await
         {
-            error
-        } else if is_plan_mode_blocked_tool(name, args) && self.plan_mode_authoring_active().await {
             format!(
                 "Error: Tool '{name}' is blocked while plan mode is active. \
                  Use read-only tools to finish the plan, then call \

@@ -14,9 +14,6 @@ use super::tool_execution_binding::{
     ToolExecutionRequest, ToolTransportKind, WorkspaceAuthority, WorkspaceBinding,
     WorkspaceBindingKind,
 };
-use super::tool_external_transport::{
-    ExternalTransport, execute_gateway_relay, execute_sandbox_resident_agent,
-};
 use super::tool_local_transport::{
     ServerLocalToolTransport, ToolTransportResult, execute_local_transport,
 };
@@ -25,7 +22,7 @@ use super::tool_route_selection::ToolExecutionRouteKind;
 use super::tool_route_selection::routing_decision_for_binding;
 use super::tool_transport_errors::{
     capability_denied_result, selected_offer_route_mismatch_result,
-    unsupported_workspace_executor_result,
+    transport_adapter_unavailable_result, unsupported_workspace_executor_result,
 };
 use super::tool_transport_metadata::{
     cancelled_runtime_tool_result, cancelled_runtime_tool_result_for_binding,
@@ -69,8 +66,6 @@ pub struct ToolExecutionServiceBuilder {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
-    gateway_relay_transport: Option<Arc<dyn ExternalTransport>>,
-    sandbox_resident_agent_transport: Option<Arc<dyn ExternalTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
     provider_capabilities: Arc<HashMap<String, HashSet<String>>>,
     disabled_tool_offers: Arc<RwLock<HashSet<String>>>,
@@ -83,8 +78,6 @@ impl Default for ToolExecutionServiceBuilder {
             edge_connection_pool: None,
             edge_dispatch_service: None,
             edge_registry_service: None,
-            gateway_relay_transport: None,
-            sandbox_resident_agent_transport: None,
             tool_registry: astra_runtime_env::ToolRegistry::builtins(),
             provider_capabilities: Arc::new(HashMap::new()),
             disabled_tool_offers: Arc::new(RwLock::new(HashSet::new())),
@@ -127,19 +120,6 @@ impl ToolExecutionServiceBuilder {
         self
     }
 
-    pub fn gateway_relay_transport(mut self, transport: Arc<dyn ExternalTransport>) -> Self {
-        self.gateway_relay_transport = Some(transport);
-        self
-    }
-
-    pub fn sandbox_resident_agent_transport(
-        mut self,
-        transport: Arc<dyn ExternalTransport>,
-    ) -> Self {
-        self.sandbox_resident_agent_transport = Some(transport);
-        self
-    }
-
     pub fn initial_disabled_tool_offers(mut self, tools: &[String]) -> Self {
         let mut set = HashSet::new();
         for t in tools {
@@ -177,8 +157,6 @@ impl ToolExecutionServiceBuilder {
             edge_connection_pool: self.edge_connection_pool,
             edge_dispatch_service: self.edge_dispatch_service,
             edge_registry_service: self.edge_registry_service,
-            gateway_relay_transport: self.gateway_relay_transport,
-            sandbox_resident_agent_transport: self.sandbox_resident_agent_transport,
             tool_registry: self.tool_registry,
             provider_capabilities: self.provider_capabilities,
             disabled_tool_offers: self.disabled_tool_offers,
@@ -192,8 +170,6 @@ pub struct ToolExecutionService {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
-    gateway_relay_transport: Option<Arc<dyn ExternalTransport>>,
-    sandbox_resident_agent_transport: Option<Arc<dyn ExternalTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
     /// Deployment-declared provider capacity. This is distinct from the user
     /// selecting an optional tool and from administrator offer policy.
@@ -940,22 +916,31 @@ impl ToolExecutionService {
             )
             .await
             .into(),
-            ToolExecutionRouteKind::GatewayRelay => execute_gateway_relay(
-                transport_request,
-                &binding,
-                self.gateway_relay_transport.clone(),
-                cancel_token,
-            )
-            .await
-            .into(),
-            ToolExecutionRouteKind::SandboxResidentAgent => execute_sandbox_resident_agent(
-                transport_request,
-                &binding,
-                self.sandbox_resident_agent_transport.clone(),
-                cancel_token,
-            )
-            .await
-            .into(),
+            ToolExecutionRouteKind::GatewayRelay | ToolExecutionRouteKind::SandboxResidentAgent => {
+                let (transport, adapter) = if route == ToolExecutionRouteKind::GatewayRelay {
+                    (ToolTransportKind::GatewayRelay, "gateway relay")
+                } else {
+                    (
+                        ToolTransportKind::SandboxResidentAgent,
+                        "sandbox resident agent",
+                    )
+                };
+                if cancel_token
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled())
+                {
+                    cancelled_runtime_tool_result(&transport_request, &binding, transport, false)
+                        .into()
+                } else {
+                    transport_adapter_unavailable_result(
+                        &transport_request,
+                        &binding,
+                        adapter,
+                        &format!("{adapter} transport is not configured"),
+                    )
+                    .into()
+                }
+            }
             ToolExecutionRouteKind::Unsupported => {
                 unsupported_workspace_executor_result(&transport_request, &binding).into()
             }

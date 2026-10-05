@@ -122,16 +122,10 @@ pub(crate) fn inspect_workbench(state: &SessionState) -> WorkbenchInspection {
             "live manager busy; retry /inspect for a fresh capability snapshot",
         )],
     };
-    mcp_facts.extend([
-        InspectorFact::observed(
-            "Active system skills",
-            state.active_system_skills.len().to_string(),
-        ),
-        InspectorFact::observed(
-            "Deferred tools",
-            state.deferred_tool_activations.len().to_string(),
-        ),
-    ]);
+    mcp_facts.extend([InspectorFact::observed(
+        "Deferred tools",
+        state.deferred_tool_activations.len().to_string(),
+    )]);
     let capability_section = InspectorSection {
         title: "Capability & provider".into(),
         source: "current client configuration and live MCP manager · captured now".into(),

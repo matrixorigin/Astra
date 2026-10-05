@@ -900,7 +900,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
             use crate::tui::context_panel::ContextSnapshot;
             use crate::tui::context_panel::model::{
-                ActiveSkill, RequestContextEvidence, RequestContextScope, SessionSummary,
+                RequestContextEvidence, RequestContextScope, SessionSummary,
             };
 
             // Collect human-readable previews the trace doesn't carry:
@@ -911,18 +911,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             snap.model = ctx.state.model.as_deref();
             (snap.cwd, snap.git_branch) = context_environment_from_footer(&ctx.bottom_pane.footer);
 
-            // Loaded system skills.  Surfaced as a Skills-section
-            // fallback when the trace is silent (common for CLI
-            // sessions where edge_profile.active_skills isn't set).
-            snap.active_skills = ctx
-                .state
-                .active_system_skills
-                .iter()
-                .map(|s| ActiveSkill {
-                    name: s.name.clone(),
-                    description: s.description.clone(),
-                })
-                .collect();
             snap.selected_skills = ctx
                 .state
                 .last_turn_event
@@ -1069,8 +1057,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         // drift / errors / trace / verify / adaptive / switch) used
         // to live here too, but they duplicate functionality that
         // already exists elsewhere (diag tooling, /resume for
-        // switch) and their output is text-only, so they fall
-        // through to the line-mode printer instead.
+        // switch). Unsupported subcommands are rejected by this
+        // native dispatcher; there is no console fallback.
         //
         //   /session                 → session hub (current overview)
         //   /session list            → session picker
@@ -1157,13 +1145,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             let perm = ctx.state.perm_manager.mode().chip_text().to_owned();
             let skills = ctx.state.unified_skill_registry.len();
             let version = env!("CARGO_PKG_VERSION");
-            let pending = ctx
-                .state
-                .skill_improvement_tracker
-                .pending_proposal
-                .as_ref()
-                .map(|p| p.skill_name.clone())
-                .unwrap_or_else(|| "<none>".into());
             let recent_tools = if ctx.state.recent_tools.is_empty() {
                 "<none>".to_string()
             } else {
@@ -1183,7 +1164,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 ("permission", perm),
                 ("skills loaded", skills.to_string()),
                 ("turn", ctx.state.turn.to_string()),
-                ("pending improve", pending),
                 ("recent tools", recent_tools),
                 ("context width", format!("{} cols", ctx.width)),
             ];

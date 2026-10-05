@@ -123,8 +123,6 @@ astra session close <session_id>
 astra session delete <session_id>
 astra session judge --model MODEL --message 'Rubric and evidence' [--timeout-seconds 120]
 
-# Replay (reserved; currently unavailable for owned sessions and returns HTTP 501)
-
 # Models
 astra model list                         # consumes the complete paginated catalog
 astra model show <model_name>

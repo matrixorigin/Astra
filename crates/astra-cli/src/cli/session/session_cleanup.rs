@@ -4,10 +4,9 @@
 //! - Writing session end journal events
 //! - Finalizing workspace state
 //! - Ending observability sessions
-//! - Triggering Memoria governance and consolidation
+//! - Running authenticated session-end governance
 //!
-//! Lessons are extracted from the L1b narrative and tool signals, then
-//! stored in Memoria as L3 durable memory (Session Memory Protocol §6.2).
+//! Signal-derived lessons are checkpointed during turns; exit performs governance.
 
 use astra_services::session_journal;
 use std::time::Duration;
@@ -15,7 +14,6 @@ use tokio::task::JoinSet;
 
 use super::session_guard::ShutdownSignal;
 use crate::cli::session::session_state::SessionState;
-use crate::edge_tools;
 
 /// Why the interactive session is exiting. The TUI uses this reason to decide:
 ///   * whether to print the "Session … saved. To resume: …" hint
@@ -95,56 +93,6 @@ pub(crate) async fn finalize_session_with_budget(
                 tracing::warn!(session_id = %sid, %error, "session-end governance failed");
             }
         });
-    } else {
-        memory_maintenance.spawn(edge_tools::memoria::memoria_governance_fire_and_forget());
-        memory_maintenance.spawn(edge_tools::memoria::memoria_consolidate_fire_and_forget());
-    }
-    // 3c. L3 knowledge backflow: promote tool/stall signal lessons to
-    //     semantic T3 (mid-session copies were working T4).
-    if state.turn > 0 {
-        let summary = match state
-            .observability_session
-            .as_ref()
-            .and_then(|arc| arc.read().ok())
-        {
-            Some(guard) => astra_runtime::learning::extractor::summarise_from_runtime(
-                &state.tool_health_entries,
-                Some(&*guard),
-            ),
-            None => astra_runtime::learning::extractor::summarise_from_runtime(
-                &state.tool_health_entries,
-                None,
-            ),
-        };
-        let signal_lessons = astra_runtime::learning::extractor::extract_lessons(
-            &summary,
-            state.ingestion_user_id.as_deref().unwrap_or("unknown"),
-            "generic",
-            None,
-        );
-        let mut all_lessons: Vec<astra_runtime::learning::synthesizer::ExtractedLesson> =
-            Vec::new();
-        for cl in signal_lessons {
-            if astra_runtime::learning::synthesizer::is_synthesized_lesson_acceptable(&cl.action) {
-                all_lessons.push(astra_runtime::learning::synthesizer::ExtractedLesson {
-                    memory_type: "semantic",
-                    content: format!("💡 LESSON: {}", cl.action),
-                    trust_tier: "T3",
-                });
-            }
-        }
-
-        if !all_lessons.is_empty() {
-            // Persist synthesized lessons. Broad topic deletion is not part of
-            // the authenticated user purge contract: it cannot prove record
-            // ownership or an exact mutation receipt, so cleanup must not
-            // issue it in the background and discard the deterministic error.
-            let session_id = state.session_id.clone();
-            memory_maintenance.spawn(async move {
-                edge_tools::memoria::memoria_store_lessons_fire_and_forget(all_lessons, session_id)
-                    .await;
-            });
-        }
     }
     // Await Memoria maintenance under the shared shutdown budget.
     // A dropped JoinHandle detaches its task, so timeout must explicitly abort

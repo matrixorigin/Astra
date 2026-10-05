@@ -82,6 +82,12 @@ draft -> validated -> published -> activated -> deprecated -> archived
 
 Activation may be scoped by user, workspace, agent, or policy.
 
+CLI skill activation uses the registry-backed `$name` path. The retired console
+built-in markdown/concise switch and its client-only selection state are removed;
+Server and provider skill facts retain their canonical request and trace owners.
+The unused session-local automatic `SKILL.md` rewrite proposal chain is retired.
+Evaluated, approved tuning and activation remain owned by [tuning jobs](tuning-jobs.md).
+
 The operating workflow is:
 
 ```text

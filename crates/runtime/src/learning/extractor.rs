@@ -19,10 +19,8 @@ use astra_services::{LessonKind, NewLesson};
 
 use crate::observability::ObservabilitySession;
 
-/// Minimal session-end signal bundle. The runtime already tracks every
-/// field in `TurnState` / `ImprovementTracker`; this struct is just the
-/// view the extractor needs, so the extractor stays independent of those
-/// concrete types.
+/// Session-end view of observed runtime signals used by lesson extraction.
+/// This bundle keeps the extractor independent of the execution state types.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionSummary {
     /// `tool_name → failure_count` across the session.

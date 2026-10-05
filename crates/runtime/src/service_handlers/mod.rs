@@ -5,5 +5,4 @@ pub mod events;
 pub mod agents;
 pub mod context;
 pub mod marketplace;
-pub mod replay;
 pub mod sandbox;

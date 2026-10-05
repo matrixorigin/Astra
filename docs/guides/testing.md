@@ -127,6 +127,13 @@ own invocations, not another turn's accumulated output. Protocol failures,
 missing terminal identity, and outer harness timeouts cannot be accepted this
 way. An explicitly expected nonzero code suppresses automatic rate-limit retry;
 session identity, durable evidence, and subsystem-health checks still apply.
+Before starting a follow-up, the root must have succeeded or already proved its
+expected negative terminal; a session ID alone does not authorize continuation.
+Journal-dependent negative expectations use the current root run and invocation
+time range and honor the configured subsystem settlement budget. After any turn
+loses lifecycle validity, the harness records its evidence and cost, stops later
+steps, and runs the shared cleanup and teardown. A normal assertion failure or
+an explicitly expected negative terminal does not stop the sequence by itself.
 
 Capability probes distinguish a disabled optional capability from an enabled
 capability without owner credentials. A child allowlist cannot enable a parent
@@ -190,7 +197,11 @@ The inline TUI regression drives the real binary through a controlling PTY and
 xterm.js's headless terminal (including native reflow). It checks repeated
 narrow/wide and short/tall transitions, draft input, rapid resizes with delayed
 cursor replies, one live footer/composer across the entire buffer, and
-preservation of pre-existing and committed startup history. It uses a
+preservation of pre-existing and committed startup history. A held reply also
+outlasts the real cursor-query deadline: paste must remain responsive, no second
+query may overlap the expired request, and releasing its reply must allow a
+fresh resize without damaging history. The initialization cursor getter and
+resize queries share the same reader and outstanding-request ownership. It uses a
 synthetic token and an unavailable loopback endpoint; no model or real account
 is needed. Python 3 and the repository's Node.js version are required.
 

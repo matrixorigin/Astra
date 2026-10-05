@@ -169,8 +169,6 @@ pub(crate) enum Command {
     Health,
     /// Run a one-shot chat request
     Chat(ChatArgs),
-    /// Replay a recorded session
-    Replay(ReplayArgs),
     /// Inspect and manage sessions
     #[command(alias = "sessions")]
     #[command(subcommand)]
@@ -1161,24 +1159,6 @@ pub(crate) struct SkillStatusArgs {
     pub per_group: u32,
 }
 
-#[derive(Args, Debug)]
-#[command(
-    after_help = "Examples:\n  astra replay 550e8400-e29b-41d4-a716-446655440000\n  astra replay 550e8400-e29b-41d4-a716-446655440000 --compare"
-)]
-pub(crate) struct ReplayArgs {
-    /// Session id to replay
-    pub session_id: String,
-    /// Optional sandbox profile
-    #[arg(long)]
-    pub sandbox_name: Option<String>,
-    /// Use mock mode during replay
-    #[arg(long, default_value_t = true)]
-    pub mock_mode: bool,
-    /// Compare replay output against the recorded run
-    #[arg(long)]
-    pub compare: bool,
-}
-
 #[derive(Subcommand, Debug)]
 pub(crate) enum AuditCmd {
     /// List sessions with filters (status, model, since/until)
@@ -1473,15 +1453,16 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     #[test]
-    fn cli_has_no_unbacked_messaging_inspector() {
+    fn cli_has_no_unbacked_messaging_or_session_replay_commands() {
         let mut command = Cli::command();
-        assert!(command.find_subcommand("messaging").is_none());
-        assert!(!command.render_long_help().to_string().contains("messaging"));
-        assert!(Cli::try_parse_from(["astra", "help", "messaging"]).is_err());
-        // Preserve ordinary free-text chat parsing rather than reserving a
-        // retired command name in a compatibility rejection path.
-        let cli = Cli::try_parse_from(["astra", "messaging"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Message(words)) if words == ["messaging"]));
+        for name in ["messaging", "replay"] {
+            assert!(command.find_subcommand(name).is_none());
+            assert!(!command.render_long_help().to_string().contains(name));
+            assert!(Cli::try_parse_from(["astra", "help", name]).is_err());
+            // Retired names remain ordinary free text, not compatibility commands.
+            let cli = Cli::try_parse_from(["astra", name]).unwrap();
+            assert!(matches!(cli.command, Some(Command::Message(words)) if words == [name]));
+        }
     }
 
     #[test]

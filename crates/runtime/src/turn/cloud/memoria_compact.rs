@@ -11,8 +11,6 @@
 //! 4. Optionally store a semantic compaction episode after summary succeeds
 //! ```
 
-use std::path::{Path, PathBuf};
-
 use serde_json::{Value, json};
 
 use super::compaction::CompactResult;
@@ -76,80 +74,6 @@ impl Default for MemoriaCompactParams {
             session_facts: None,
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Compatible session memory paths
-// ---------------------------------------------------------------------------
-
-const CLAUDE_PROJECTS_SANITIZE_MAX_CHARS: usize = 200;
-
-fn djb2_hash_utf16(s: &str) -> i32 {
-    let mut hash: i32 = 0;
-    for unit in s.encode_utf16() {
-        hash = hash
-            .wrapping_shl(5)
-            .wrapping_sub(hash)
-            .wrapping_add(i32::from(unit));
-    }
-    hash
-}
-
-fn abs_hash_to_string_36(h: i32) -> String {
-    let mut n = h.unsigned_abs() as u64;
-    if n == 0 {
-        return "0".to_string();
-    }
-    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let mut buf = Vec::new();
-    while n > 0 {
-        buf.push(DIGITS[(n % 36) as usize]);
-        n /= 36;
-    }
-    buf.reverse();
-    String::from_utf8(buf).unwrap_or_default()
-}
-
-/// Sanitize a working-directory path for use under `CLAUDE_CONFIG_DIR/projects/`,
-/// (alphanumeric → keep, else `-`, length cap + djb2).
-pub fn sanitize_path_for_claude_projects(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    if sanitized.chars().count() <= CLAUDE_PROJECTS_SANITIZE_MAX_CHARS {
-        return sanitized;
-    }
-    let prefix: String = sanitized
-        .chars()
-        .take(CLAUDE_PROJECTS_SANITIZE_MAX_CHARS)
-        .collect();
-    let hash = abs_hash_to_string_36(djb2_hash_utf16(name));
-    format!("{prefix}-{hash}")
-}
-
-fn claude_config_home_dir() -> PathBuf {
-    std::env::var("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".claude")
-        })
-}
-
-/// `{CLAUDE_CONFIG_DIR}/projects/<sanitized cwd>/<session_id>/session-memory/summary.md`
-///
-/// Kept only for external tooling that still looks at the legacy
-/// on-disk layout. The runtime itself no longer reads or writes this
-/// path — session memory lives in Memoria.
-pub fn claude_code_session_memory_path(cwd: &str, session_id: &str) -> PathBuf {
-    claude_config_home_dir()
-        .join("projects")
-        .join(sanitize_path_for_claude_projects(cwd))
-        .join(session_id)
-        .join("session-memory")
-        .join("summary.md")
 }
 
 pub use astra_memoria::{
@@ -2557,14 +2481,6 @@ mod tests {
                 .unwrap_or(false)
         });
         assert!(!has_summary, "tier below threshold should skip summary");
-    }
-
-    #[test]
-    fn sanitize_path_replaces_non_alnum_with_hyphen() {
-        assert_eq!(
-            sanitize_path_for_claude_projects("/home/user/proj"),
-            "-home-user-proj"
-        );
     }
 
     // ──────────────────────────────────────────────────────────

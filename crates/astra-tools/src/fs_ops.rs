@@ -3,6 +3,7 @@
 //! All operations are sandboxed to a workspace root directory. Path traversal
 //! via `..` is normalized before the boundary check to prevent escapes.
 
+use std::borrow::Cow;
 use std::io::{Read, Write};
 #[cfg(test)]
 use std::io::{Seek, SeekFrom};
@@ -1333,96 +1334,49 @@ pub fn prepare_str_replace(
     let original_hash = content_hash(&content);
 
     let count = content.matches(old_str).count();
-    if count == 0 {
+    let (anchor, replacement, match_strategy) = if count == 0 {
         let normalized_quote_count = quote_normalized_match_count(&content, old_str);
         if normalized_quote_count > 1 && !replace_all {
             return Err(ToolResult::error(format!(
                 "Error: old_str found {normalized_quote_count} times in {path_str} after normalizing curly quotes. Make old_str more specific to match exactly once."
             )));
         }
-
-        if let Some(fuzzy_match) = fuzzy_find_replacement(&content, old_str, replace_all) {
-            let replacement = if fuzzy_match.is_quote_normalized() {
-                preserve_quote_style(old_str, fuzzy_match.actual, new_str)
-            } else {
-                new_str.to_string()
-            };
-            let mut new_content = if replace_all {
-                content.replace(fuzzy_match.actual, &replacement)
-            } else {
-                content.replacen(fuzzy_match.actual, &replacement, 1)
-            };
-            if new_content == content {
+        let Some(fuzzy_match) = fuzzy_find_replacement(&content, old_str, replace_all) else {
+            if replace_all && normalized_quote_count > 1 {
                 return Err(ToolResult::error(str_replace_fail(
-                    "the resolved replacement would not change the file.",
-                    "The anchor matched, but the resulting file bytes are identical to the current content.",
-                    "Choose a different new_str or skip this edit; no bytes were changed.",
+                    &format!("Cannot replace_all in {path_str}."),
+                    &format!(
+                        "old_str matches {normalized_quote_count} occurrences after normalizing curly quotes, but the file mixes straight and curly quote forms."
+                    ),
+                    "Either (a) split into multiple targeted str_replace calls with surrounding context to disambiguate, or (b) normalize the file's quote style first, then retry.",
                 )));
             }
-            if !allow_structural_change {
-                validate_structural_edit(
-                    &path,
-                    &content,
-                    &new_content,
-                    fuzzy_match.actual,
-                    new_str,
-                )
-                .map_err(ToolResult::error)?;
-            }
-            new_content = normalize_content_before_write(&path, &new_content);
-            if new_content == content {
-                return Err(ToolResult::error(str_replace_fail(
-                    "the normalized replacement would not change the file.",
-                    "The fuzzy anchor matched, but deterministic newline/format normalization returns the exact original bytes.",
-                    "Choose a replacement that changes the normalized file, or skip this edit; no bytes were changed.",
-                )));
-            }
-            let success_message = if dry_run {
-                unified_diff(&content, &new_content, path_str)
-            } else {
-                format!(
-                    "Successfully replaced text in {} (matched via {})",
-                    path_str, fuzzy_match.strategy
-                )
-            };
-            return Ok(PreparedStrReplace {
-                path,
-                new_content,
-                dry_run,
-                success_message,
-                original_content_hash: Some(original_hash),
-                original_content: content.into_bytes(),
-            });
-        }
-
-        if replace_all && normalized_quote_count > 1 {
+            return Err(ToolResult::error(str_replace_not_found_hint(
+                path_str, &content, old_str,
+            )));
+        };
+        let replacement = if fuzzy_match.is_quote_normalized() {
+            Cow::Owned(preserve_quote_style(old_str, fuzzy_match.actual, new_str))
+        } else {
+            Cow::Borrowed(new_str)
+        };
+        (fuzzy_match.actual, replacement, Some(fuzzy_match.strategy))
+    } else {
+        if count > 1 && !replace_all {
             return Err(ToolResult::error(str_replace_fail(
-                &format!("Cannot replace_all in {path_str}."),
+                &format!("old_str is ambiguous in {path_str}."),
                 &format!(
-                    "old_str matches {normalized_quote_count} occurrences after normalizing curly quotes, but the file mixes straight and curly quote forms."
+                    "old_str matched {count} times; without replace_all=true the target location is undefined."
                 ),
-                "Either (a) split into multiple targeted str_replace calls with surrounding context to disambiguate, or (b) normalize the file's quote style first, then retry.",
+                "Add more surrounding context lines to old_str so it matches exactly once, OR pass replace_all=true if you intend to replace every occurrence.",
             )));
         }
-
-        return Err(ToolResult::error(str_replace_not_found_hint(
-            path_str, &content, old_str,
-        )));
-    }
-    if count > 1 && !replace_all {
-        return Err(ToolResult::error(str_replace_fail(
-            &format!("old_str is ambiguous in {path_str}."),
-            &format!(
-                "old_str matched {count} times; without replace_all=true the target location is undefined."
-            ),
-            "Add more surrounding context lines to old_str so it matches exactly once, OR pass replace_all=true if you intend to replace every occurrence.",
-        )));
-    }
-
+        (old_str, Cow::Borrowed(new_str), None)
+    };
     let mut new_content = if replace_all {
-        content.replace(old_str, new_str)
+        content.replace(anchor, &replacement)
     } else {
-        content.replacen(old_str, new_str, 1)
+        content.replacen(anchor, &replacement, 1)
     };
     if new_content == content {
         return Err(ToolResult::error(str_replace_fail(
@@ -1432,7 +1386,7 @@ pub fn prepare_str_replace(
         )));
     }
     if !allow_structural_change {
-        validate_structural_edit(&path, &content, &new_content, old_str, new_str)
+        validate_structural_edit(&path, &content, &new_content, anchor, new_str)
             .map_err(ToolResult::error)?;
     }
     new_content = normalize_content_before_write(&path, &new_content);
@@ -1445,6 +1399,8 @@ pub fn prepare_str_replace(
     }
     let success_message = if dry_run {
         unified_diff(&content, &new_content, path_str)
+    } else if let Some(strategy) = match_strategy {
+        format!("Successfully replaced text in {path_str} (matched via {strategy})")
     } else if replace_all {
         format!(
             "Successfully replaced text in {} ({count} occurrences)",

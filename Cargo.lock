@@ -629,13 +629,11 @@ dependencies = [
  "async-trait",
  "axum",
  "dirs",
- "flate2",
  "regex",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "sha2",
- "tar",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -694,7 +692,6 @@ dependencies = [
 name = "astra-text-utils"
 version = "0.2.10"
 dependencies = [
- "dirs",
  "regex",
  "serde",
  "serde_json",

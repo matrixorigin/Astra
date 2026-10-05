@@ -712,6 +712,7 @@ print(name, thinking)
   echo "astra harness: model seed result is malformed" >&2
   exit 78
 fi
+export ASTRA_HARNESS_CONTROL_API_URL="http://127.0.0.1:${api_port}"
 export ASTRA_HARNESS_MODEL_BASE="$selected_model_base"
 export ASTRA_HARNESS_MODEL_THINKING="$selected_model_thinking"
 

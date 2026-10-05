@@ -29,6 +29,8 @@ Typed scenario state is retained for execution intent and observation. The
 unconsumed scenario tool/strategy suggestion tables and empty CLI goal-steering
 wrapper are retired; explicit tool admission, resource limits, and shared
 runtime policy evidence retain their existing owners.
+The unused confidence-tier fallback and trend tracker are retired; tool discovery
+and admission do not automatically broaden permissions from confidence scores.
 
 ## Feedback record
 

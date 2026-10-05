@@ -35,8 +35,8 @@ use super::execution_phase::{
 };
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, BudgetWrapupOrigin,
-    CONSECUTIVE_ERROR_BUDGET, ControlToolRecovery, ForegroundFanoutPagination,
-    ToolLedgerAttemptBatch, extract_file_path_from_tool, finalize_and_render, finalize_turn_trace,
+    CONSECUTIVE_ERROR_BUDGET, ForegroundFanoutPagination, ToolLedgerAttemptBatch,
+    extract_file_path_from_tool, finalize_and_render, finalize_turn_trace,
     publish_introspect_snapshot, record_edge_tool_observability, try_write_heavy_checkpoint,
 };
 
@@ -50,9 +50,7 @@ use astra_turn_core::agentic_post_tool_policy::{
 };
 use astra_turn_core::agentic_turn_flow::agentic_round_stall_preflight;
 use astra_turn_core::headless_tool_assembly::HeadlessPreResolvedToolResult;
-use astra_turn_core::orchestration::agent_result_wire::{
-    agent_fanout_control_result_is_usable, agent_fanout_result_has_recoverable_issue,
-};
+use astra_turn_core::orchestration::agent_result_wire::agent_fanout_result_has_recoverable_issue;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::tool_result_semantics::ToolResultStatus;
 
@@ -211,7 +209,7 @@ fn publish_live_snapshot_for_introspection_calls<H: AgenticLoopHost + ?Sized>(
     // tool outcomes.
     let lifecycle_summary = host.turn_start_lifecycle_summary(state);
     let provider = LocalSessionProvider::new(state);
-    let inspection = InspectionService::new(&provider, &provider, &provider);
+    let inspection = InspectionService::new(&provider, &provider);
     publish_introspect_snapshot(host, state, lifecycle_summary, Some(&inspection));
 }
 
@@ -817,122 +815,6 @@ fn observe_foreground_fanout_completion(
         observe(&tool_call_arguments_value(call), &result.content);
     }
     synthesize
-}
-
-fn tool_allows_host_owned_control_recovery(tool_name: &str) -> bool {
-    matches!(tool_name, "agent" | "agent_fanout")
-}
-
-/// A fanout start is complete only when the model receives the group identity
-/// and terminal/active status it needs to observe the launched children.
-///
-/// Transport failures can contain arbitrary non-empty text. Treating any text
-/// as a result strands already-created children outside the model's and UI's
-/// authoritative fanout registry, so validity is determined from the typed
-/// receipt shape instead of error wording or edge status.
-fn control_tool_edge_result_is_usable(tool_name: &str, edge_result: &EdgeToolExecResult) -> bool {
-    match tool_name {
-        "agent_fanout" => agent_fanout_control_result_is_usable(&edge_result.output),
-        _ => !edge_result.output.trim().is_empty(),
-    }
-}
-
-async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
-    host: &mut H,
-    parent_run_id: Option<&str>,
-    tool_calls: &[Value],
-    pre_resolved_results: &mut Vec<HeadlessPreResolvedToolResult>,
-    edge_tool_round: &mut Vec<EdgeToolExecResult>,
-) {
-    for tool_call in tool_calls {
-        let Some(tool_name) = tool_call_name(tool_call) else {
-            continue;
-        };
-        if !tool_allows_host_owned_control_recovery(tool_name) {
-            continue;
-        }
-        let Some(tool_call_id) = tool_call.get("id").and_then(Value::as_str) else {
-            tracing::warn!(
-                target: "astra_runtime::agentic_loop_tool_phase",
-                tool_name,
-                "control-tool recovery skipped: tool call had no id"
-            );
-            continue;
-        };
-        let args = tool_call_arguments_value(tool_call);
-        // `agent_fanout.start` always returns a structured launch receipt. An
-        // edge row with an empty output is therefore just as unusable as a
-        // missing row: the child agents may already be running, but neither
-        // the model nor the UI can learn their group identity from it.
-        //
-        // Keep this narrowly scoped to host-owned control tools. The host can
-        // query the authoritative fanout registry without replaying the start
-        // operation; arbitrary tools must never be retried from this path.
-        let existing_row = edge_tool_round
-            .iter()
-            .position(|edge| edge.request_id == tool_call_id);
-        if existing_row.is_some_and(|index| {
-            control_tool_edge_result_is_usable(tool_name, &edge_tool_round[index])
-        }) {
-            continue;
-        }
-        let recovered = match host
-            .recover_missing_control_tool_result(
-                parent_run_id,
-                tool_call_id,
-                tool_name,
-                &args,
-                existing_row.map(|index| edge_tool_round[index].duration_ms),
-            )
-            .await
-        {
-            ControlToolRecovery::Unsupported => continue,
-            ControlToolRecovery::Missing => {
-                tracing::warn!(
-                    target: "astra_runtime::agentic_loop_tool_phase",
-                    tool_name,
-                    tool_call_id,
-                    "control-tool edge row missing and host could not recover it"
-                );
-                continue;
-            }
-            ControlToolRecovery::Recovered(recovered) => *recovered,
-        };
-        // Host-owned control tools are resolved by the host, not by an edge
-        // executor. Routing the recovered value back through `edge_tool_round`
-        // would subject it to edge capability validation and can reject a
-        // successful control operation after it has already taken effect.
-        // Remove any unusable transport artifact and mark this call resolved
-        // in the same lane used by other upstream interception layers.
-        if let Some(index) = existing_row {
-            edge_tool_round.remove(index);
-        }
-        pre_resolved_results.retain(|result| result.call_id != tool_call_id);
-        let status = match recovered.status.as_str() {
-            "completed" => ToolResultStatus::Completed,
-            "skipped" => ToolResultStatus::Skipped,
-            "failed" => ToolResultStatus::Failed,
-            _ => ToolResultStatus::Failed,
-        };
-        pre_resolved_results.push(HeadlessPreResolvedToolResult::new(
-            tool_call_id,
-            tool_name,
-            recovered.output,
-            status,
-        ));
-        let recovery_kind = if existing_row.is_some() {
-            "replaced unusable control-tool transport output with host-resolved result"
-        } else {
-            "recovered missing control-tool result from host state"
-        };
-        tracing::warn!(
-            target: "astra_runtime::agentic_loop_tool_phase",
-            tool_name,
-            tool_call_id,
-            recovery_kind,
-            "{recovery_kind}"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -2308,7 +2190,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             deferred_activations_by_call_id,
             runtime_control_calls_by_id,
             mut pre_resolved_results,
-            mut edge_tool_round,
+            edge_tool_round,
         } = try_prepare_intercepted_tool_round(
             state,
             &turn_result,
@@ -2320,14 +2202,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         )
         .await?;
         pre_resolved_results.extend(delegation_pre_resolved_results);
-        recover_missing_control_tool_results(
-            host,
-            state.current_run_id.as_deref(),
-            &logical_tool_calls,
-            &mut pre_resolved_results,
-            &mut edge_tool_round,
-        )
-        .await;
         record_edge_tool_selection(state, &edge_tool_round, turn_index);
         let physical_tool_calls = physical_tool_calls.as_slice();
         let all_tool_calls = logical_tool_calls.as_slice();
@@ -2694,7 +2568,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         {
             let lifecycle_summary = host.turn_start_lifecycle_summary(state);
             let provider = LocalSessionProvider::new(state);
-            let inspection = InspectionService::new(&provider, &provider, &provider);
+            let inspection = InspectionService::new(&provider, &provider);
             publish_introspect_snapshot(host, state, lifecycle_summary, Some(&inspection));
         } // provider + inspection dropped — releases immutable borrow of state
 
@@ -5392,160 +5266,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn missing_agent_fanout_edge_row_is_recovered_and_matchable() {
-        let args = json!({
-            "action": "start",
-            "target_count": 1,
-            "slots": [
-                {"description": "Review storage", "prompt": "Review storage changes"}
-            ]
-        });
-        let recovered_output = json!({
-            "status": "completed",
-            "group_id": "run-parent-fanout-1",
-            "target_count": 1,
-            "delivery_contract": "Results are in results[].result.",
-            "results": [{"slot_index": 0, "result": {"status": "completed", "result": "ok"}}],
-            "completed": 1,
-            "instruction": "Fanout target_count is complete. Do not call agent(action='spawn') to add, retry, or replace agents in this turn. Present the collected results; ask the user before starting any additional fanout."
-        })
-        .to_string();
-        let recovered = EdgeToolExecResult {
-            execution_completion: None,
-            request_id: "call-fanout".to_string(),
-            tool: "agent_fanout".to_string(),
-            args: args.clone(),
-            output: recovered_output.clone(),
-            tool_result_fields: None,
-            status: "completed".to_string(),
-            duration_ms: 7,
-        };
-        let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
-            .with_recovered_control_tool_result(
-                "call-fanout",
-                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(Box::new(
-                    recovered,
-                )),
-            );
-        let tool_calls = vec![json!({
-            "id": "call-fanout",
-            "type": "function",
-            "function": {
-                "name": "agent_fanout",
-                "arguments": serde_json::to_string(&args).unwrap(),
-            }
-        })];
-        let mut pre_resolved_results = Vec::new();
-        let mut edge_tool_round = Vec::new();
-
-        recover_missing_control_tool_results(
-            &mut host,
-            Some("run-parent"),
-            &tool_calls,
-            &mut pre_resolved_results,
-            &mut edge_tool_round,
-        )
-        .await;
-
-        assert!(edge_tool_round.is_empty());
-        assert_eq!(
-            pre_resolved_results,
-            vec![HeadlessPreResolvedToolResult::new(
-                "call-fanout",
-                "agent_fanout",
-                recovered_output,
-                ToolResultStatus::Completed,
-            )]
-        );
-        assert_eq!(host.recovered_control_requests.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn unstructured_agent_fanout_edge_output_is_replaced_with_registry_receipt() {
-        let args = json!({
-            "action": "start",
-            "group_id": "review-42",
-            "target_count": 1,
-            "slots": [
-                {"description": "Review storage", "prompt": "Review storage changes"}
-            ]
-        });
-        let recovered_output = json!({
-            "status": "started",
-            "group_id": "review-42",
-            "target_count": 1,
-            "agents": [{"slot_index": 0, "status": "launched"}]
-        })
-        .to_string();
-        let recovered = EdgeToolExecResult {
-            execution_completion: None,
-            request_id: "call-fanout".to_string(),
-            tool: "agent_fanout".to_string(),
-            args: args.clone(),
-            output: recovered_output.clone(),
-            tool_result_fields: None,
-            status: "failed".to_string(),
-            duration_ms: 3,
-        };
-        let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
-            .with_recovered_control_tool_result(
-                "call-fanout",
-                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(Box::new(
-                    recovered,
-                )),
-            );
-        let tool_calls = vec![json!({
-            "id": "call-fanout",
-            "type": "function",
-            "function": {
-                "name": "agent_fanout",
-                "arguments": serde_json::to_string(&args).unwrap(),
-            }
-        })];
-        let mut edge_tool_round = vec![EdgeToolExecResult {
-            execution_completion: None,
-            request_id: "call-fanout".to_string(),
-            tool: "agent_fanout".to_string(),
-            args: args.clone(),
-            output: "transport completed without a structured result".to_string(),
-            tool_result_fields: None,
-            status: "failed".to_string(),
-            duration_ms: 4,
-        }];
-        let mut pre_resolved_results = Vec::new();
-
-        recover_missing_control_tool_results(
-            &mut host,
-            Some("run-parent"),
-            &tool_calls,
-            &mut pre_resolved_results,
-            &mut edge_tool_round,
-        )
-        .await;
-
-        assert!(
-            edge_tool_round.is_empty(),
-            "the unusable transport row is removed"
-        );
-        assert_eq!(
-            pre_resolved_results,
-            vec![HeadlessPreResolvedToolResult::new(
-                "call-fanout",
-                "agent_fanout",
-                recovered_output.clone(),
-                ToolResultStatus::Failed,
-            )]
-        );
-        assert_eq!(host.recovered_control_requests.len(), 1);
-        let receipt: Value = serde_json::from_str(&pre_resolved_results[0].content).unwrap();
-        assert_eq!(receipt["status"], "started");
-        assert_eq!(pre_resolved_results[0].status, ToolResultStatus::Failed);
-        assert_eq!(receipt["group_id"], "review-42");
-    }
-
     #[test]
     fn agent_fanout_start_requires_a_typed_launch_receipt() {
+        use astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_result_is_usable;
         assert!(!agent_fanout_control_result_is_usable(
             "transport completed without a structured result"
         ));
@@ -5555,138 +5278,6 @@ mod tests {
         assert!(agent_fanout_control_result_is_usable(
             r#"{"status":"started","group_id":"review-42"}"#
         ));
-    }
-
-    #[tokio::test]
-    async fn missing_control_tool_recovery_is_keyed_by_tool_call_id_not_args_signature() {
-        let args = json!({
-            "action": "get_results",
-            "group_id": "run-parent-fanout-1"
-        });
-        let first_existing = EdgeToolExecResult {
-            execution_completion: None,
-            request_id: "call-fanout-a".to_string(),
-            tool: "agent_fanout".to_string(),
-            args: args.clone(),
-            output: json!({
-                "status": "completed",
-                "group_id": "run-parent-fanout-1",
-                "marker": "a"
-            })
-            .to_string(),
-            tool_result_fields: None,
-            status: "completed".to_string(),
-            duration_ms: 7,
-        };
-        let recovered_second = EdgeToolExecResult {
-            execution_completion: None,
-            request_id: "call-fanout-b".to_string(),
-            tool: "agent_fanout".to_string(),
-            args: args.clone(),
-            output: json!({
-                "status": "completed",
-                "group_id": "run-parent-fanout-1",
-                "marker": "b"
-            })
-            .to_string(),
-            tool_result_fields: None,
-            status: "completed".to_string(),
-            duration_ms: 0,
-        };
-        let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
-            .with_recovered_control_tool_result(
-                "call-fanout-b",
-                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(Box::new(
-                    recovered_second,
-                )),
-            );
-        let tool_calls = vec![json!({
-            "id": "call-fanout-b",
-            "type": "function",
-            "function": {
-                "name": "agent_fanout",
-                "arguments": serde_json::to_string(&args).unwrap(),
-            }
-        })];
-        let mut pre_resolved_results = Vec::new();
-        let mut edge_tool_round = vec![first_existing];
-
-        recover_missing_control_tool_results(
-            &mut host,
-            Some("run-parent"),
-            &tool_calls,
-            &mut pre_resolved_results,
-            &mut edge_tool_round,
-        )
-        .await;
-
-        assert_eq!(
-            edge_tool_round
-                .iter()
-                .map(|edge| edge.request_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["call-fanout-a"]
-        );
-        assert_eq!(pre_resolved_results.len(), 1);
-        assert_eq!(pre_resolved_results[0].call_id, "call-fanout-b");
-        assert_eq!(
-            serde_json::from_str::<Value>(&pre_resolved_results[0].content).unwrap()["marker"],
-            "b"
-        );
-        assert_eq!(
-            host.recovered_control_requests
-                .iter()
-                .map(|(_, tool_call_id, _, _)| tool_call_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["call-fanout-b"]
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_non_control_tool_row_is_not_recovered_by_host_state() {
-        let recovered = EdgeToolExecResult {
-            execution_completion: None,
-            request_id: "call-fanout".to_string(),
-            tool: "agent_fanout".to_string(),
-            args: json!({"action": "get_results", "group_id": "review"}),
-            output: json!({"status": "completed", "group_id": "review"}).to_string(),
-            tool_result_fields: None,
-            status: "completed".to_string(),
-            duration_ms: 0,
-        };
-        let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
-            .with_recovered_control_tool_result(
-                "call-fanout",
-                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(Box::new(
-                    recovered,
-                )),
-            );
-        let tool_calls = vec![json!({
-            "id": "call-bash",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": serde_json::to_string(&json!({"cmd": "echo hi"})).unwrap(),
-            }
-        })];
-        let mut pre_resolved_results = Vec::new();
-        let mut edge_tool_round = Vec::new();
-
-        recover_missing_control_tool_results(
-            &mut host,
-            Some("run-parent"),
-            &tool_calls,
-            &mut pre_resolved_results,
-            &mut edge_tool_round,
-        )
-        .await;
-
-        assert!(edge_tool_round.is_empty());
-        assert!(pre_resolved_results.is_empty());
-        assert!(
-            host.recovered_control_requests.is_empty(),
-            "ordinary missing tool rows must not consume host-owned control recovery state"
-        );
     }
 
     #[test]
@@ -6356,7 +5947,7 @@ esac
 
         let _policy = RuntimePolicy::default();
         let provider = LocalSessionProvider::new(&state);
-        let inspection = InspectionService::new(&provider, &provider, &provider);
+        let inspection = InspectionService::new(&provider, &provider);
 
         let snapshot =
             build_introspect_snapshot(&state, "lifecycle-first".to_string(), Some(&inspection));
@@ -6377,7 +5968,7 @@ esac
         let state = make_state();
         let _policy = RuntimePolicy::default();
         let provider = LocalSessionProvider::new(&state);
-        let inspection = InspectionService::new(&provider, &provider, &provider);
+        let inspection = InspectionService::new(&provider, &provider);
 
         let snapshot =
             build_introspect_snapshot(&state, "zero-state".to_string(), Some(&inspection));
@@ -6398,7 +5989,7 @@ esac
         let state = make_state();
         let _policy = RuntimePolicy::default();
         let provider = LocalSessionProvider::new(&state);
-        let inspection = InspectionService::new(&provider, &provider, &provider);
+        let inspection = InspectionService::new(&provider, &provider);
 
         let snapshot =
             build_introspect_snapshot(&state, "default-policy".to_string(), Some(&inspection));
@@ -6462,7 +6053,7 @@ esac
 
         let _policy = RuntimePolicy::default();
         let provider = LocalSessionProvider::new(&state);
-        let inspection = InspectionService::new(&provider, &provider, &provider);
+        let inspection = InspectionService::new(&provider, &provider);
 
         let snapshot =
             build_introspect_snapshot(&state, "errors-test".to_string(), Some(&inspection));

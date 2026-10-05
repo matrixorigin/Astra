@@ -34,10 +34,6 @@ serde_yaml_ng.workspace = true
 # TOML for manifest parsing
 toml = { workspace = true }
 
-# Tar/gzip for packing
-flate2 = { workspace = true }
-tar = { workspace = true }
-
 # HTTP types (for database provider error handling)
 axum = { workspace = true }
 

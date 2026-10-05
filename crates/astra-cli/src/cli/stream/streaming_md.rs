@@ -819,8 +819,8 @@ mod tests {
     // Note: <invoke> and <tool_call> are intentionally NOT in SUPPRESSED_TAGS.
     // Stripping them from text would corrupt legitimate content that *discusses*
     // these tags (e.g. code reviews, documentation). Instead, XML tool call
-    // recovery is handled by consume_sse_stream's fallback when tool_calls is
-    // empty (see sse_stream_host.rs).
+    // recovery belongs to the provider response boundary on the Server. Client
+    // display text never authorizes tool execution.
 
     #[test]
     fn strip_does_not_touch_invoke_in_text() {

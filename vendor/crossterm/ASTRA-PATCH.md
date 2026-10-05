@@ -137,3 +137,17 @@ after a bare ESC. A hosted runner can overshoot that ambiguous ESC's 40 ms
 lookahead window; every CPR split boundary is instead covered directly by the
 parser unit test. The PTY assertion still rejects all extra keyboard/paste
 events and reports both the unexpected event and the collected input.
+
+Cursor requests have no nonce. The shared reader therefore retains an outstanding
+DSR across its deadline; a later query returns the missing-reply result until
+that request's late CPR has been consumed. It then issues one fresh DSR. This
+keeps input responsive without attributing an expired reply to new geometry.
+Nonblocking filtered polls inspect all already-ready input while preserving the
+unrelated FIFO. Both Unix backends service zero-timeout reads; the Mio backend
+drains pending WINCH before returning buffered terminal input, even when its
+readiness batch also contained a TTY event.
+
+The xterm reflow journey holds a cursor reply past the actual deadline, verifies
+no overlapping query, accepts paste while the reply is outstanding, then releases
+the expired reply and verifies a fresh resize. Its history, composer, footer and
+scrollback assertions remain unchanged.

@@ -83,63 +83,6 @@ pub(crate) fn cancelled_runtime_tool_result_for_binding(
     }
 }
 
-pub(crate) fn runtime_tool_timeout_result(
-    request: &ToolExecutionRequest,
-    binding: &astra_runtime_env::RunBinding,
-    transport: ToolTransportKind,
-    execution_started: bool,
-    max_execution_secs: f64,
-) -> astra_tools::ToolResult {
-    let mut metadata =
-        delivered_binding_event_fields(&request.workspace, &request.executor, transport);
-    attach_runtime_policy_metadata(&mut metadata, binding);
-    metadata.insert("max_execution_secs".to_string(), json!(max_execution_secs));
-    let message = format!(
-        "Tool '{}' exceeded max_execution_secs {} before completion",
-        request.tool_name,
-        format_timeout_seconds(max_execution_secs)
-    );
-    let error = if execution_started {
-        astra_runtime_env::RuntimeError::after_start(
-            astra_runtime_env::RuntimeErrorKind::ToolTimeout,
-            message.clone(),
-        )
-    } else {
-        astra_runtime_env::RuntimeError::new(
-            astra_runtime_env::RuntimeErrorKind::ToolTimeout,
-            message.clone(),
-        )
-    };
-    attach_runtime_error_metadata(&mut metadata, &error, TOOL_ERROR_KIND_TOOL_TIMEOUT);
-    astra_tools::ToolResult {
-        output: format!("Error: {message}"),
-        metadata: Some(metadata),
-        is_error: true,
-        exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
-    }
-}
-
-pub(crate) fn runtime_execution_timeout_duration(
-    binding: &astra_runtime_env::RunBinding,
-) -> Option<std::time::Duration> {
-    let seconds = binding.policy.resources.max_execution_secs?;
-    if !seconds.is_finite() {
-        return None;
-    }
-    Some(std::time::Duration::from_secs_f64(seconds.max(0.0)))
-}
-
-fn format_timeout_seconds(seconds: f64) -> String {
-    let mut text = format!("{seconds:.3}");
-    while text.contains('.') && text.ends_with('0') {
-        text.pop();
-    }
-    if text.ends_with('.') {
-        text.pop();
-    }
-    text
-}
-
 pub(crate) fn attach_runtime_policy_metadata(
     metadata: &mut Map<String, Value>,
     binding: &astra_runtime_env::RunBinding,
@@ -204,48 +147,6 @@ pub(crate) fn delivered_binding_event_fields(
     delivered_executor.transport = transport;
     delivered_executor.status = ExecutorStatus::Online;
     binding_event_fields(workspace, &delivered_executor)
-}
-
-pub(crate) fn output_limit_exceeded_result(
-    request: &ToolExecutionRequest,
-    binding: &astra_runtime_env::RunBinding,
-    transport: ToolTransportKind,
-    outcome: &astra_runtime_env::RuntimeToolOutcome,
-) -> Option<astra_tools::ToolResult> {
-    let max_output_bytes = binding.policy.resources.max_output_bytes?;
-    let output_bytes = outcome.output.len();
-    if output_bytes <= max_output_bytes {
-        return None;
-    }
-
-    let mut metadata = outcome.metadata.clone();
-    for (key, value) in
-        delivered_binding_event_fields(&request.workspace, &request.executor, transport)
-    {
-        metadata.entry(key).or_insert(value);
-    }
-    attach_runtime_policy_metadata(&mut metadata, binding);
-    metadata.insert("output_bytes".to_string(), json!(output_bytes));
-    metadata.insert("max_output_bytes".to_string(), json!(max_output_bytes));
-    let error = astra_runtime_env::RuntimeError::after_start(
-        astra_runtime_env::RuntimeErrorKind::OutputLimitExceeded,
-        format!(
-            "tool '{}' produced {output_bytes} bytes, exceeding max_output_bytes {max_output_bytes}",
-            request.tool_name
-        ),
-    );
-    let reason = error.kind.to_string();
-    attach_runtime_error_metadata(&mut metadata, &error, &reason);
-
-    Some(astra_tools::ToolResult {
-        output: format!(
-            "Error: output limit exceeded for tool '{}': output was {output_bytes} bytes, limit is {max_output_bytes} bytes",
-            request.tool_name
-        ),
-        metadata: Some(metadata),
-        is_error: true,
-        exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
-    })
 }
 
 pub fn binding_event_fields(

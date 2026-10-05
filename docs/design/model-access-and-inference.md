@@ -1029,16 +1029,25 @@ published using configuration- and previous-observation-matching conditional upd
 rotation cannot publish a result for the replacement configuration. Resolution
 reuses only matching observations, without network probing; explicit checks
 refresh them. Credential/configuration changes invalidate observations. Old
-rows remain usable, and schema migration never makes provider requests. Legacy
-administrator capability values are imported as explicitly marked legacy hints
-when the first new check is inconclusive, not evidence of a verified wire protocol.
+rows remain usable without a reasoning-control capability. Only a snapshot bound
+to the current configuration, protocol and adapter revision supplies capability
+or probe diagnostics. Explicit
+model checks refresh missing or stale observations without probing during resolution.
 A failed/inconclusive check retains a prior capability only for the same bound
 configuration and protocol while recording the latest error separately. Stale
-or malformed snapshots never fall back to an unbound legacy capability column.
+or malformed snapshots provide no capability or diagnostics.
 
 User model responses optionally include `thinking_probe`; a missing or stale
 observation is absent, while an inconclusive check has an error. A thinking
 probe failure does not disable a model whose connectivity check succeeded.
+Connectivity status is also committed only to the checked row and configuration;
+rotation or replacement during either probe returns a conflict requiring a fresh check.
+Administrator credential updates validate the effective replacement configuration
+before a short transaction commits all PATCH fields and observation invalidation together.
+Concurrent row or configuration edits return 409 and require an explicit refresh
+and retry; no partial update or automatic replay is performed. Empty PATCHes
+preserve configuration versions and observations, and supplied quirks replace
+the complete quirks object.
 
 `ASTRA_INTROSPECTION_TOTAL_BUDGET_S` defaults to 8 seconds, capped by the global
 LLM budget, for no-tool introspection provider execution. It uses the existing

@@ -5,7 +5,6 @@ use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::stream_render::{
     RenderPolicy, StreamRenderState, TurnResult, dispatch_turn_event_block,
 };
-use astra_runtime::prompts;
 
 #[test]
 fn generic_explain_payload_does_not_create_explain_analyze_facts() {
@@ -231,32 +230,6 @@ fn compacted_history_skips_empty_user_messages() {
     );
     assert_eq!(messages[1]["role"], "user");
     assert_eq!(messages[2]["role"], "assistant");
-}
-
-#[test]
-fn system_skill_toggle_lifecycle() {
-    let available = prompts::builtin_system_skills();
-    let mut active: Vec<prompts::SystemSkill> = Vec::new();
-
-    // Activate markdown
-    let md = available.iter().find(|s| s.name == "markdown").unwrap();
-    active.push(md.clone());
-    assert_eq!(active.len(), 1);
-
-    // Deactivate markdown
-    active.retain(|s| s.name != "markdown");
-    assert!(active.is_empty());
-
-    // Activate both
-    for s in &available {
-        active.push(s.clone());
-    }
-    assert!(active.len() >= 2);
-
-    // Build instructions
-    let block = prompts::build_skill_instructions(&active);
-    assert!(block.contains("Markdown"));
-    assert!(block.contains("Concise"));
 }
 
 #[test]

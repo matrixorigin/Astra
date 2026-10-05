@@ -71,6 +71,10 @@ Server fallback is allowed only when policy permits it and must be recorded in t
 
 ## Offline and degraded behavior
 
+CLI SSE consumption executes only typed, admitted Server tool requests.
+Assistant text cannot be reinterpreted as a local tool call. Provider-level
+degraded call recovery remains on the Server before dispatch.
+
 | Condition | Behavior |
 | --- | --- |
 | Edge offline | Keep backbone alive, mark provider offline, expose reconnect/fallback options. |

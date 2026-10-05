@@ -1115,10 +1115,9 @@ impl RuntimeToolExecutor {
         )
     }
 
-    /// Public accessor for transport-aware tool execution routing.
-    /// Callers wire edge, gateway relay, and sandbox-resident
-    /// agent transports through this handle instead of through
-    /// `RuntimeToolExecutor` thin-setters.
+    /// Access the canonical transport-aware execution service and its
+    /// current provider policy. Edge transport configuration is supplied
+    /// through the shared service builder.
     pub fn tool_execution_service(&mut self) -> &mut ToolExecutionService {
         &mut self.tool_execution_service
     }

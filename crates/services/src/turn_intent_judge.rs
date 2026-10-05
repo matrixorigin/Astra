@@ -948,74 +948,6 @@ pub fn parse_work_admission_response(
     }
 }
 
-/// Project only the typed semantic boundary that survived a malformed
-/// admission response.  A repair request must not throw away a valid
-/// `required`/`activation` decision merely because a nested graph mutation
-/// had shape drift.  This is deliberately structural: no prose or keyword
-/// matching is used, and contradictory required+parallel candidates are not
-/// treated as authoritative.
-#[must_use]
-pub fn work_admission_repair_hints(raw: &str) -> Option<Value> {
-    let value = serde_json::from_str::<Value>(json_object_payload(raw)).ok()?;
-    let object = value.as_object()?;
-    let lifecycle = object.get("work_lifecycle").and_then(Value::as_str);
-    let activation = object.get("activation").and_then(Value::as_str);
-    let topology = object.get("execution_topology").and_then(Value::as_str);
-
-    let required_boundary = lifecycle == Some("required")
-        && matches!(activation, Some("start" | "defer"))
-        && topology.is_none_or(|value| value == "primary");
-    let not_required_boundary = lifecycle == Some("not_required")
-        && topology.is_some_and(|value| matches!(value, "primary" | "parallel_subruns"));
-    if !required_boundary && !not_required_boundary {
-        return None;
-    }
-
-    let mut hints = serde_json::Map::new();
-    hints.insert(
-        "work_lifecycle".to_string(),
-        Value::String(lifecycle.unwrap_or_default().to_string()),
-    );
-    if required_boundary {
-        hints.insert(
-            "activation".to_string(),
-            Value::String(activation.unwrap_or_default().to_string()),
-        );
-    }
-    if not_required_boundary && let Some(topology) = topology {
-        hints.insert(
-            "execution_topology".to_string(),
-            Value::String(topology.to_string()),
-        );
-    }
-
-    if let Some(value) = object.get("workspace_mutation")
-        && serde_json::from_value::<WorkspaceMutationIntent>(value.clone()).is_ok()
-    {
-        hints.insert("workspace_mutation".to_string(), value.clone());
-    }
-    if let Some(value) = object.get("mutation_completion_scope")
-        && serde_json::from_value::<MutationCompletionScope>(value.clone()).is_ok()
-    {
-        hints.insert("mutation_completion_scope".to_string(), value.clone());
-    }
-    if let Some(value) = object.get("domain")
-        && serde_json::from_value::<TurnIntentDomain>(value.clone()).is_ok()
-    {
-        hints.insert("domain".to_string(), value.clone());
-    }
-    if let Some(value) = object.get("required_capabilities")
-        && let Ok(capabilities) =
-            serde_json::from_value::<Vec<WorkAdmissionCapability>>(value.clone())
-        && capabilities.len() <= 2
-        && capabilities.windows(2).all(|pair| pair[0] != pair[1])
-    {
-        hints.insert("required_capabilities".to_string(), value.clone());
-    }
-
-    Some(Value::Object(hints))
-}
-
 /// A mutating admission must declare the state boundary it promises.  The
 /// runtime deliberately treats an explicit `unknown` scope as fail-closed,
 /// but an omitted scope is a malformed contract rather than an unknown
@@ -2002,11 +1934,6 @@ mod tests {
             panic!("graph validation must use the bounded malformed-response repair path");
         };
         assert!(detail.contains("Work mutation trigger delivery is not guaranteed"));
-
-        let hints = work_admission_repair_hints(&response.to_string())
-            .expect("preserve the explicit lifecycle decision during graph repair");
-        assert_eq!(hints["work_lifecycle"], "required");
-        assert_eq!(hints["activation"], "start");
     }
 
     #[test]
@@ -2057,67 +1984,6 @@ mod tests {
             mutations[1].retirement().unwrap().after_initial_tasks,
             vec![1]
         );
-    }
-
-    #[test]
-    fn repair_hints_keep_only_a_structurally_valid_boundary() {
-        let malformed_required = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"defer","goal":"Prepare the plan","initial_tasks":[{"objective":"A","expected_result":"Evidence A"}],"mutations":[{"target_initial_task":1,"objective":"redirect","expected_result":"later"}]}"#;
-        let hints = work_admission_repair_hints(malformed_required)
-            .expect("valid lifecycle and activation survive nested shape drift");
-        assert_eq!(hints["work_lifecycle"], "required");
-        assert_eq!(hints["activation"], "defer");
-        assert_eq!(hints["workspace_mutation"], "read_only");
-        assert!(hints.get("mutations").is_none());
-
-        let malformed_required_with_primary = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","activation":"start","execution_topology":"primary","goal":"Prepare the plan","initial_tasks":[{"objective":"A","expected_result":"Evidence A"}],"mutations":[{"target_initial_task":1,"objective":"redirect","expected_result":"later"}]}"#;
-        let hints = work_admission_repair_hints(malformed_required_with_primary)
-            .expect("required primary boundary remains repairable");
-        assert_eq!(hints["work_lifecycle"], "required");
-        assert_eq!(hints["activation"], "start");
-        assert!(
-            hints.get("execution_topology").is_none(),
-            "required repair hints must omit the model-owned topology field"
-        );
-
-        let contradictory_required = r#"{"work_lifecycle":"required","activation":"defer","execution_topology":"parallel_subruns"}"#;
-        assert!(
-            work_admission_repair_hints(contradictory_required).is_none(),
-            "required plus parallel is not a repairable typed boundary"
-        );
-
-        let malformed_not_required =
-            r#"{"work_lifecycle":"not_required","execution_topology":"parallel_subruns"}"#;
-        let hints = work_admission_repair_hints(malformed_not_required)
-            .expect("typed fanout boundary survives shape drift");
-        assert_eq!(hints["work_lifecycle"], "not_required");
-        assert_eq!(hints["execution_topology"], "parallel_subruns");
-        assert!(hints.get("activation").is_none());
-
-        let missing_external_domain = r#"{"work_lifecycle":"not_required","workspace_mutation":"must_mutate","mutation_completion_scope":"external","domain":null,"execution_topology":"primary"}"#;
-        let hints = work_admission_repair_hints(missing_external_domain)
-            .expect("the lifecycle boundary remains repairable");
-        assert!(
-            hints.get("domain").is_none(),
-            "repair must not preserve an invalid null owner for external-scope mutation"
-        );
-
-        let missing_mixed_domain = r#"{"work_lifecycle":"not_required","workspace_mutation":"must_mutate","mutation_completion_scope":"mixed","domain":null,"execution_topology":"primary"}"#;
-        let hints = work_admission_repair_hints(missing_mixed_domain)
-            .expect("the mixed boundary remains repairable");
-        assert!(hints.get("domain").is_none());
-
-        let missing_scope_domain = r#"{"work_lifecycle":"not_required","workspace_mutation":"must_mutate","domain":null,"execution_topology":"primary"}"#;
-        let hints = work_admission_repair_hints(missing_scope_domain)
-            .expect("the lifecycle boundary remains repairable");
-        assert!(
-            hints.get("domain").is_none(),
-            "null is never a positive semantic repair hint, even before scope is known"
-        );
-
-        let known_external_domain = r#"{"work_lifecycle":"not_required","workspace_mutation":"must_mutate","mutation_completion_scope":"external","domain":"memory","execution_topology":"primary"}"#;
-        let hints = work_admission_repair_hints(known_external_domain)
-            .expect("a known external owner remains repairable");
-        assert_eq!(hints["domain"], "memory");
     }
 
     #[test]

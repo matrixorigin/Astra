@@ -4,7 +4,6 @@ use crate::cli::command_router::execute_cli_command;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::slash::slash_memory::handle_memory_domain_command;
 use crate::tests::isolate_credentials;
-use astra_runtime::prompts;
 use axum::{Router, routing::get, routing::post};
 
 // ── command_router ────────────────────────────────────────────────────
@@ -62,30 +61,19 @@ async fn execute_cli_health_command_fails_for_unhealthy_service() {
 #[test]
 fn prepare_input_keeps_plain_user_message() {
     let state = SessionState::default();
-    let result = crate::cli::session::session_input::prepare_input(
+    for message in [
         "hello",
-        &state,
-        &mut crate::cli::ui_adapter::LineUiAdapter,
-    );
-    assert_eq!(result.user_message, "hello");
-    assert!(result.runtime_required_texts.is_empty());
-}
-
-#[test]
-fn prepare_input_routes_system_skills_out_of_user_message() {
-    let mut state = SessionState::default();
-    let skills = prompts::builtin_system_skills();
-    if let Some(md) = skills.iter().find(|s| s.name == "markdown") {
-        state.active_system_skills.push(md.clone());
+        "review @url:https://example.com/reference",
+        "explain @README.md",
+        "review @file:src/main.rs:10-20",
+        "review @folder:src",
+        "review @diff",
+        "review @staged",
+    ] {
+        let result = crate::cli::session::session_input::prepare_input(message, &state);
+        assert_eq!(result.user_message, message);
+        assert!(result.runtime_required_texts.is_empty());
     }
-    let result = crate::cli::session::session_input::prepare_input(
-        "hello",
-        &state,
-        &mut crate::cli::ui_adapter::LineUiAdapter,
-    );
-    assert_eq!(result.user_message, "hello");
-    assert_eq!(result.active_system_skill_names, vec!["markdown"]);
-    assert!(result.runtime_required_texts[0].contains("Markdown"));
 }
 
 #[test]

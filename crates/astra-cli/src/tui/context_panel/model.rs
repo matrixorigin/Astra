@@ -668,16 +668,7 @@ pub(crate) struct ContextSnapshot<'a> {
     /// Session + budget state the trace doesn't carry. Populated
     /// by the `/context` dispatch from `SessionState`.
     pub session: Option<SessionSummary>,
-    /// User-activated system skills (from `/skill` or auto-detect).
-    /// These feed the prompt via `edge_profile.active_skills` but
-    /// the trace may not capture them in `skills_injected` when
-    /// the system-prompt breakdown wasn't recorded this turn.
-    /// Surfaced as a Skills-section fallback so users always see
-    /// what skills are loaded.  Read-only display — no prompt
-    /// cache impact.
-    pub active_skills: Vec<ActiveSkill>,
-    /// Skill names actually chosen in the last completed turn.
-    /// Used as a more accurate fallback than `active_skills` when
+    /// Skill names actually chosen in the last completed turn, used when
     /// the trace omitted per-skill injection details.
     pub selected_skills: Vec<String>,
     /// Every turn in this session that fired compaction.  Sourced
@@ -696,15 +687,6 @@ pub(crate) struct VisibleConversationItem {
     pub role: String,
     pub preview: String,
     pub body: String,
-}
-
-/// One loaded system skill surfaced by the snapshot.  Decoupled
-/// from `astra-prompts::SystemSkill` so the context-panel module
-/// doesn't need to import that crate.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ActiveSkill {
-    pub name: String,
-    pub description: String,
 }
 
 impl ContextBreakdown {
@@ -750,27 +732,16 @@ impl ContextBreakdown {
             })
             .collect::<Vec<_>>();
         let retained = turns.len() as u32;
-        let skills = if !snap.selected_skills.is_empty() {
-            snap.selected_skills
-                .iter()
-                .map(|name| SkillItem {
-                    name: name.clone(),
-                    tokens: 0,
-                    description: None,
-                    source: Some("selected".to_string()),
-                })
-                .collect()
-        } else {
-            snap.active_skills
-                .iter()
-                .map(|skill| SkillItem {
-                    name: skill.name.clone(),
-                    tokens: 0,
-                    description: (!skill.description.is_empty()).then(|| skill.description.clone()),
-                    source: Some("loaded".to_string()),
-                })
-                .collect()
-        };
+        let skills = snap
+            .selected_skills
+            .iter()
+            .map(|name| SkillItem {
+                name: name.clone(),
+                tokens: 0,
+                description: None,
+                source: Some("selected".to_string()),
+            })
+            .collect();
 
         Self {
             total_used: 0,
@@ -913,28 +884,6 @@ impl ContextBreakdown {
                     tokens: 0,
                     description: None,
                     source: Some("selected".to_string()),
-                })
-                .collect();
-        }
-        // Last-resort fallback: the trace is silent but the CLI
-        // state knows which system skills are currently loaded
-        // via `/skill` (or auto-detect).  Surface them so users
-        // see *some* signal about what skills shape their turn.
-        // Tokens=0 because the per-skill cost lives inside the
-        // system-prompt total, not in a dedicated line item.
-        if skills.is_empty() && !snap.active_skills.is_empty() {
-            skills = snap
-                .active_skills
-                .iter()
-                .map(|s| SkillItem {
-                    name: s.name.clone(),
-                    tokens: 0,
-                    description: if s.description.is_empty() {
-                        None
-                    } else {
-                        Some(s.description.clone())
-                    },
-                    source: Some("loaded".to_string()),
                 })
                 .collect();
         }

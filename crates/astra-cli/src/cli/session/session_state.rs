@@ -1,7 +1,7 @@
 //! REPL state management.
 //!
 //! This module defines `SessionState`, the central struct that holds all session state
-//! for the CLI REPL. It also includes helper types like `ExplainMode` and `SkillDevState`.
+//! for the CLI REPL. It also includes helper types like `ExplainMode`.
 
 use crate::cli::cli_config::cli_context::CliContext;
 use crate::cli::permission_manager::PermissionManager;
@@ -166,13 +166,6 @@ impl ExplainMode {
 pub(crate) struct ExplainSlashCommand {
     pub(crate) mode: Option<ExplainMode>,
     pub(crate) report_format: Option<ExplainReportFormat>,
-}
-
-/// Active `/skill dev` session — name and directory are always set together.
-#[derive(Clone, Debug)]
-pub(crate) struct SkillDevState {
-    pub name: String,
-    pub dir: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -355,9 +348,6 @@ pub(crate) struct SessionState {
     pub total_cache_creation_tokens: u64,
     /// Complete attributed estimate, or unknown. Current-rate scenarios are separate.
     pub total_session_cost: Option<f64>,
-    /// Cached pricing data for the active model (used by /cost).
-    pub skill_dev: Option<SkillDevState>,
-    pub active_system_skills: Vec<prompts::SystemSkill>,
     /// Runtime configuration loaded from config files + env vars (M3).
     pub runtime_config: astra_config::runtime_config::RuntimeConfig,
     /// Explicit `/explain --format …` choice for this running CLI session.
@@ -436,8 +426,6 @@ pub(crate) struct SessionState {
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// Session-scoped skill quality tracker for learning loop.
     pub skill_quality_tracker: astra_skills::quality::SkillQualityTracker,
-    /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
-    pub skill_improvement_tracker: astra_skills::improvement::ImprovementTracker,
     /// Skills surfaced by `discover_skills` during this CLI session.
     pub discovered_skills: std::collections::HashSet<String>,
     pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
@@ -618,8 +606,6 @@ impl Default for SessionState {
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
             total_session_cost: Some(0.0),
-            skill_dev: None,
-            active_system_skills: Vec::new(),
             // Load RuntimeConfig from config files + env vars, then create
             // ContextBudget using the loaded config (M3 wiring).
             runtime_config: { astra_config::runtime_config::RuntimeConfig::load() },
@@ -654,7 +640,6 @@ impl Default for SessionState {
             workspace_observation_quarantine: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
-            skill_improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
             discovered_skills: std::collections::HashSet::new(),
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),

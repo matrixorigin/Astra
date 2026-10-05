@@ -246,12 +246,34 @@ async fn build_test_router_keeps_representative_domain_routes_registered() {
     .await;
     assert_ne!(marketplace, StatusCode::NOT_FOUND);
 
-    let preferences = request_status(
-        app,
-        request("GET", "/preferences", auth_headers, Body::empty()),
-    )
-    .await;
-    assert_ne!(preferences, StatusCode::NOT_FOUND);
+    for (method, path, body) in [
+        ("GET", "/preferences", ""),
+        ("PUT", "/preferences/explain_mode", r#"{"value":"true"}"#),
+    ] {
+        for (headers, expected) in [
+            (
+                vec![("content-type", "application/json")],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                vec![
+                    ("content-type", "application/json"),
+                    ("authorization", "Bearer test-token"),
+                ],
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            assert_eq!(
+                request_status(
+                    app.clone(),
+                    request(method, path, &headers, Body::from(body))
+                )
+                .await,
+                expected,
+                "preference storage requires authentication and a configured pool"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -263,8 +285,7 @@ async fn legacy_task_plan_and_todo_surfaces_are_not_routable() {
         ("POST", "/tasks"),
         ("POST", "/tasks:rpc"),
         ("POST", "/tasks/task-1/lease/claim"),
-        // The thin client still carries these legacy paths for compatibility
-        // with older servers; they are not capabilities of this runtime.
+        // Retired lifecycle paths must not become runtime capabilities.
         ("GET", "/agent-jobs"),
         ("POST", "/agent-jobs/task-1/lease/claim"),
         ("GET", "/plans"),

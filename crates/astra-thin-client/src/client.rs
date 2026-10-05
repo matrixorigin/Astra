@@ -950,38 +950,6 @@ impl ThinClient {
         Ok((bytes.to_vec(), filename))
     }
 
-    pub async fn post_session_replay_json(
-        &self,
-        token: &str,
-        session_id: &str,
-        body: &Value,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(&paths::session_replay(session_id))?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(self.auth_headers_for(Some(token)).await?)
-            .json(body)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    pub async fn get_session_replay_compare_text(
-        &self,
-        token: &str,
-        session_id: &str,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(&paths::session_replay_compare(session_id))?;
-        let resp = self
-            .http
-            .get(url)
-            .headers(self.auth_headers_for(Some(token)).await?)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
     // ── Skills ───────────────────────────────────────────────────────────────
 
     pub async fn get_skills_query_text(

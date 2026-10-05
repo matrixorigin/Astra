@@ -212,6 +212,10 @@ independent bounded-coverage states; conflicting identities are quarantined
 without discarding unrelated facts. Default text is a compact outcome summary;
 hashes, ranges and internal identities remain diagnostic details.
 
+Runtime tool fallback permitted by source policy uses the populated runtime snapshot.
+The unused `InspectionService` journal-derived summary path is retired; missing runtime evidence
+remains unknown rather than being reconstructed as zero or task progress.
+
 ## Goals
 
 - Give the agent accurate self-awareness without exposing unsafe internals.

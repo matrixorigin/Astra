@@ -14,7 +14,7 @@
 //!
 //! ```json
 //! {
-//!   "schema": "astra.context_dump/v1",
+//!   "schema": "astra.context_dump/v2",
 //!   "captured_at": "2026-05-20T11:13:00Z",
 //!   "session_id": "abc…",
 //!   "turn": 5,
@@ -44,7 +44,7 @@ use serde::Serialize;
 
 use crate::cli::session::session_state::SessionState;
 
-const SCHEMA_VERSION: &str = "astra.context_dump/v1";
+const SCHEMA_VERSION: &str = "astra.context_dump/v2";
 
 /// Wire format for the dump.  All fields use plain owned types so
 /// the file is round-trippable by other tooling (no Rc / Arc).
@@ -65,7 +65,6 @@ pub struct ContextDump {
     pub trace: Option<serde_json::Value>,
     pub chat_history: Vec<ChatTurnDump>,
     pub totals: Totals,
-    pub active_skills: Vec<ActiveSkillDump>,
     pub compressed_turns: Vec<u32>,
 }
 
@@ -83,12 +82,6 @@ pub struct Totals {
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ActiveSkillDump {
-    pub name: String,
-    pub description: String,
 }
 
 /// Write a dump built from live REPL state + pre-collected chat
@@ -143,14 +136,6 @@ fn build_dump_from_repl(state: &SessionState, chat_history: Vec<ChatTurnDump>) -
             cache_read_tokens: state.total_cache_read_tokens,
             cache_creation_tokens: state.total_cache_creation_tokens,
         },
-        active_skills: state
-            .active_system_skills
-            .iter()
-            .map(|s| ActiveSkillDump {
-                name: s.name.clone(),
-                description: s.description.clone(),
-            })
-            .collect(),
         compressed_turns,
     }
 }
@@ -398,7 +383,6 @@ fn build_dump_from_journal(session_id: &str) -> Result<ContextDump, String> {
             cache_read_tokens,
             cache_creation_tokens,
         },
-        active_skills: Vec::new(),
         compressed_turns,
     })
 }
@@ -543,7 +527,9 @@ mod tests {
             cwd: None,
             git_branch: None,
             persistence_error: None,
-            trace: None,
+            trace: Some(
+                serde_json::json!({"system_prompt": {"skills_injected": [{"skill_name":"review", "tokens":42}]}}),
+            ),
             chat_history: vec![ChatTurnDump {
                 role: "user".into(),
                 text: "hi".into(),
@@ -555,13 +541,17 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
             },
-            active_skills: Vec::new(),
             compressed_turns: Vec::new(),
         };
         write_json(&path, &dump).unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(value["schema"], SCHEMA_VERSION);
+        assert_eq!(value["schema"], "astra.context_dump/v2");
+        assert!(value.get("active_skills").is_none());
+        assert_eq!(
+            value["trace"]["system_prompt"]["skills_injected"][0]["skill_name"],
+            "review"
+        );
         assert_eq!(value["turn"], 3);
         assert_eq!(value["chat_history"][0]["role"], "user");
     }
@@ -588,7 +578,6 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
             },
-            active_skills: Vec::new(),
             compressed_turns: Vec::new(),
         };
         assert!(write_json(&nested, &dump).is_ok());

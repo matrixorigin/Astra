@@ -269,7 +269,7 @@ fn bind_working_memory(sources: &ContextSources<'_>) -> String {
 /// Includes typed CWD/Branch header plus fragments that only
 /// change at session boundaries: `system_override` and opt-in
 /// `extra_stable_sections` (environment_static from the bridge / adapter
-/// edge_profile, output style, etc.). Runtime facts whose placement depends on
+/// edge_profile). Runtime facts whose placement depends on
 /// provider cache semantics, including model identity, are injected by the
 /// runtime entrypoint before binding. Turn-volatile content —
 /// self-awareness, tool-dependent guidance, memoria insights — routes

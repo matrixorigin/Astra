@@ -133,19 +133,6 @@ pub fn attach_turn_identity(
     true
 }
 
-/// Project producer-owned system skill identities into `edge_profile.active_skills`.
-pub fn merge_active_skills_into_edge_profile(payload: &mut Value, active_skills: &[String]) {
-    if active_skills.is_empty() {
-        return;
-    }
-    if let Some(root) = payload.as_object_mut()
-        && let Some(ep) = root.get_mut("edge_profile")
-        && let Some(ep_obj) = ep.as_object_mut()
-    {
-        ep_obj.insert("active_skills".to_string(), json!(active_skills));
-    }
-}
-
 /// Deduped registry skill names that affected this `/chat` request: selector-chosen
 /// skills and skills whose instruction bodies were merged successfully.
 pub fn merge_invoked_skills_into_edge_profile(payload: &mut Value, invoked_skills: &[String]) {
@@ -443,32 +430,6 @@ mod tests {
             thinking: crate::thinking_config::ThinkingConfig::ModelDefault,
         });
         assert_eq!(p["thinking"]["mode"], "model_default");
-    }
-
-    #[test]
-    fn merge_active_skills_into_edge_profile_inserts_array() {
-        let mut p = json!({ "edge_profile": {} });
-        merge_active_skills_into_edge_profile(
-            &mut p,
-            &["markdown".to_string(), "concise".to_string()],
-        );
-        assert_eq!(
-            p["edge_profile"]["active_skills"],
-            json!(["markdown", "concise"])
-        );
-    }
-
-    #[test]
-    fn merge_active_skills_no_op_when_empty() {
-        let mut p = json!({ "edge_profile": {} });
-        merge_active_skills_into_edge_profile(&mut p, &[]);
-        assert!(
-            p["edge_profile"]
-                .as_object()
-                .unwrap()
-                .get("active_skills")
-                .is_none()
-        );
     }
 
     #[test]
