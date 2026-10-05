@@ -164,7 +164,10 @@ Memory loading belongs to this domain. Memory storage and lifecycle belong to [m
 The unused source-public grouped memory renderer and collection helpers are
 retired. Runtime prefetch supplies validated, identified compact entries to the
 context binder, which owns scored and budgeted prompt rendering. Tagged memory
-parsing, layered views, storage payloads, and CLI summaries remain supported.
+parsing, layered views, and CLI summaries remain supported. The unused JSON
+payload builders, provenance convenience type, and their source/tier constants
+are also retired; owner-scoped storage/retrieval and HTTP/SDK contracts retain
+their existing entrypoints and provenance enforcement.
 
 ## ForkPrefix
 
