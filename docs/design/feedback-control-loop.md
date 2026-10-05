@@ -17,6 +17,10 @@ execution path; shared turn-evaluation thresholds and telemetry remain intact.
 - Improvement proposals must pass evaluation before activation.
 - Feedback must respect privacy, consent, and deletion.
 
+The retired public learning routes retain no request/response projections or
+trigger defaults. Their absence remains an HTTP contract; real evaluation,
+lesson storage, and feedback admission keep their existing owners.
+
 ## Feedback sources
 
 | Source | Examples |
