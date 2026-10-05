@@ -24860,11 +24860,11 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated MatrixOne: run with ASTRA_TEST_DB_IT=1"]
-    async fn execution_handoff_adoption_preserves_checkpoint_across_owner_generations() {
+    async fn execution_handoff_custody_survives_claims_and_production_recovery() {
         use astra_services::runs::RunStateStore;
         use astra_services::session_context_coordinator::{
-            AcquireWriterAndReserveTurnOutcome, AdoptExecutionTurnRequest,
-            DatabaseSessionContextCoordinator, SessionContextCoordinator,
+            AcquireWriterAndReserveTurnOutcome, DatabaseSessionContextCoordinator,
+            SessionContextCoordinator,
         };
         assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
         let _ = dotenvy::dotenv();
@@ -24956,38 +24956,64 @@ mod tests {
             .unwrap()
             .unwrap();
         coordinator.release_writer(&lease).await.unwrap();
-        for generation in 1..=3 {
+        let authority_sql = "SELECT writer_epoch, active_writer_json, active_reservation_json FROM session_context_heads WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?";
+        let original_authority: (i64, Option<String>, Option<String>) =
+            sqlx::query_as(authority_sql)
+                .bind(&key.isolation_domain)
+                .bind(user)
+                .bind(session)
+                .bind(&key.branch_id)
+                .fetch_one(pool.get())
+                .await
+                .unwrap();
+        for generation in 1..=2 {
             let mut claims = store.claim_recoverable_active_runs(1).await.unwrap();
             assert_eq!(claims.len(), 1);
             let claim = claims.remove(0);
             assert_eq!(claim.run.run_generation, generation);
-            let adopted = coordinator
-                .adopt_claimed_execution_turn(AdoptExecutionTurnRequest {
-                    claim: &claim,
-                    owner_pod_id: "replay-test-owner",
-                    checkpoint_id: &checkpoint.checkpoint_id,
-                    source: &reservation,
-                    actor: &actor,
-                    ttl: Duration::from_secs(60),
-                })
-                .await
-                .unwrap();
-            assert_eq!(adopted.receipt().producer_generation, 0);
             assert_eq!(
-                adopted.checkpoint().checkpoint_json,
-                checkpoint.checkpoint_json
+                claim.run.checkpoint_json.as_deref(),
+                Some(checkpoint.checkpoint_json.as_str())
             );
             assert_eq!(
-                adopted.receipt().turn_reservation.reserved_turn,
-                reservation.reserved_turn
+                engine
+                    .load_latest_checkpoint(user, run_id, Some("execution_handoff"))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                checkpoint
             );
-            assert!(adopted.receipt().writer_lease.writer_epoch > lease.writer_epoch);
-            coordinator
-                .release_writer(&adopted.receipt().writer_lease)
-                .await
-                .unwrap();
         }
+        engine.recover_active_runs().await.unwrap();
         let final_run = store.load_run(user, run_id).await.unwrap().unwrap();
+        assert_eq!(final_run.status, "paused");
+        assert_eq!(final_run.run_generation, 3);
+        let current_authority: (i64, Option<String>, Option<String>) =
+            sqlx::query_as(authority_sql)
+                .bind(&key.isolation_domain)
+                .bind(user)
+                .bind(session)
+                .bind(&key.branch_id)
+                .fetch_one(pool.get())
+                .await
+                .unwrap();
+        assert_eq!(current_authority, original_authority);
+        let recovery = final_run.events.last().unwrap();
+        assert_eq!(recovery["data"]["execution_handoff_preserved"], true);
+        assert_eq!(recovery["data"]["automatic_execution_reconstructed"], false);
+        assert_eq!(
+            recovery["data"]["execution_handoff_recovery"],
+            json!({
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "producer_generation": 0,
+                "claimed_from_generation": 2,
+                "recovered_generation": 3,
+            })
+        );
+        assert_eq!(
+            final_run.checkpoint_json.as_deref(),
+            Some(checkpoint.checkpoint_json.as_str())
+        );
         assert_eq!(
             final_run
                 .events
