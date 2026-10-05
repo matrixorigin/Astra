@@ -1427,6 +1427,14 @@ mod tests {
             executed_tool_calls: 1,
             successful_tool_calls: 1,
             evidence_complete: false,
+            skipped_lines: 2,
+            integrity_errors: 1,
+            settlement_attempts: 3,
+            successful_settlements: 2,
+            rejected_settlements: 1,
+            runtime_rejection_reasons: [("work_settlement_evidence_required".into(), 1)]
+                .into_iter()
+                .collect(),
             ..Default::default()
         });
 
@@ -1434,6 +1442,13 @@ mod tests {
         assert!(out.contains("execution: scope=case_attempts captures=1/2"));
         assert!(out.contains("execution: evidence=incomplete"));
         assert!(out.contains("execution: tools=1 executed=1 success=1"));
+        assert!(
+            out.contains("lower_bound=true skipped_lines=2 dropped_lines=0 integrity_errors=1")
+        );
+        assert!(out.contains("execution: settlements=3 success=2 rejected=1"));
+        assert!(
+            out.contains("execution: runtime_rejections=1 × work_settlement_evidence_required")
+        );
     }
 
     #[test]

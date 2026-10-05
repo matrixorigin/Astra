@@ -140,7 +140,7 @@ In harness pipeline JSON, `cache_hit_ratios: null` and `avg_cache_hit_ratio: nul
 mean unknown coverage; `cache_hit_ratios: []` with a null mean means qualified
 all-zero input (n/a). Valid nonzero groups produce an array and numeric mean.
 `feedback_observations` independently counts valid typed feedback events, replacing
-the misleading `turns_with_feedback` field. Both text reports retain compaction
+the misleading `turns_with_feedback` field. The text report retains compaction
 and alert diagnostics even without feedback. This changes harness report data,
 not runtime wire or database storage. Raw cache-break heuristics and feedback-based
 stable-prefix estimates remain separate diagnostics; canonical mean qualification
