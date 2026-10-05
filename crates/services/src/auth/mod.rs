@@ -66,9 +66,7 @@ pub use external::{
     ExternalProviderPublicRecord, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
     ExternalRuntimeContextResponse, ExternalSessionRecord, HttpExternalProviderClient,
 };
-use external::{
-    encrypt_provider_session_handle, resolve_selected_scope, validate_provider_runtime_context,
-};
+use external::validate_provider_runtime_context;
 use jwt::{JwtTokenClaims, create_jwt_token, decode_jwt_claims, decode_jwt_claims_with_detail};
 pub use provider_request::{ProviderAuthorizedRequest, ProviderRequestDescriptor};
 pub use session::UnconfiguredSessionService;
@@ -1000,16 +998,6 @@ impl DatabaseAuthService {
         self
     }
 
-    #[allow(dead_code)]
-    fn encryptor(&self) -> Result<&FernetTokenEncryptor, (StatusCode, Json<ErrorResponse>)> {
-        self.encryptor.as_ref().ok_or_else(|| {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "External auth session encryption is not configured",
-            )
-        })
-    }
-
     fn external_provider_config(
         &self,
         provider_id: &str,
@@ -1297,121 +1285,6 @@ impl DatabaseAuthService {
         }
     }
 
-    #[allow(dead_code)]
-    fn parse_provider_expires_at(
-        &self,
-        raw: &str,
-    ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-        chrono::DateTime::parse_from_rfc3339(raw)
-            .map(|dt| {
-                dt.with_timezone(&Utc)
-                    .format("%Y-%m-%d %H:%M:%S")
-                    .to_string()
-            })
-            .map_err(|error| {
-                error_response_coded(
-                    StatusCode::BAD_GATEWAY,
-                    format!("external provider session expiry is invalid: {error}"),
-                    "external_provider_response_invalid",
-                )
-            })
-    }
-
-    #[allow(dead_code)]
-    async fn complete_external_auth(
-        &self,
-        provider: &ExternalAuthProviderConfig,
-        requested_scope_id: Option<&str>,
-        response: external::ExternalProviderAuthResponse,
-    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        let selected_scope = resolve_selected_scope(requested_scope_id, &response)?;
-        let encrypted_handle =
-            encrypt_provider_session_handle(self.encryptor()?, &response.provider_session_handle)?;
-        let external_subject = response.external_subject.id.clone();
-        let external_username = response.display_info.username.clone();
-        let external_email = response.display_info.email.clone();
-        let external_display_name = response.display_info.nickname.clone();
-        let pool = self
-            .get_pool()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
-        let now = Utc::now();
-        let external_expires_at = self.parse_provider_expires_at(&response.expires_at)?;
-        let astra_session_id = Uuid::new_v4().to_string();
-
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "external.begin_tx", Some(&pool)))?;
-        let user = self
-            .resolve_verified_provider_identity(&mut tx, &provider.id, &external_subject)
-            .await?;
-        let astra_user_id = user.user_id;
-        query("UPDATE auth_external_identities SET username = ?, email = ?, display_name = ?, updated_at = NOW() WHERE provider_id = ? AND external_subject = ?")
-            .bind(&external_username).bind(&external_email).bind(&external_display_name)
-            .bind(&provider.id).bind(&external_subject).execute(&mut *tx).await
-            .map_err(|e| map_auth_sqlx(e, "external.update_identity", Some(&pool)))?;
-
-        query(
-            "INSERT INTO auth_external_sessions \
-             (external_session_id, provider_id, astra_user_id, external_subject, \
-              provider_scope_id, provider_scope_display_name, encrypted_provider_session_handle, \
-              status, expires_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)",
-        )
-        .bind(&astra_session_id)
-        .bind(&provider.id)
-        .bind(&astra_user_id)
-        .bind(&external_subject)
-        .bind(&selected_scope.id)
-        .bind(&selected_scope.name)
-        .bind(&encrypted_handle)
-        .bind(&external_expires_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "external.insert_session", Some(&pool)))?;
-
-        let access_token = self
-            .create_access_token(
-                &astra_user_id,
-                &external_username,
-                &astra_session_id,
-                "external",
-            )
-            .map_err(internal_error)?;
-        let refresh_token = self
-            .create_refresh_token(&astra_user_id, &astra_session_id, "external")
-            .map_err(internal_error)?;
-        let refresh_token_hash = sha256_hex(&refresh_token);
-        let refresh_expires_at = self.refresh_token_expires_at_string(now);
-
-        query(
-            "INSERT INTO auth_refresh_tokens \
-             (token_id, user_id, session_id, token_hash, expires_at, is_revoked) \
-             VALUES (?, ?, ?, ?, ?, 0)",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&astra_user_id)
-        .bind(&astra_session_id)
-        .bind(&refresh_token_hash)
-        .bind(refresh_expires_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "external.insert_refresh_token", Some(&pool)))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "external.commit_tx", Some(&pool)))?;
-
-        Ok(AuthTokenRecord {
-            user_id: astra_user_id,
-            access_token,
-            refresh_token,
-            token_type: "bearer".to_string(),
-            expires_in: self.access_token_expires_in_seconds(),
-        })
-    }
-
     /// Resolve an [`AuthPrincipal`] from a moi-issued edge-registration token
     /// (`moi-user-token-v1.*`) by verifying it locally with the shared HMAC
     /// key (`auth.edge_token_auth.key`).
@@ -1480,25 +1353,6 @@ impl DatabaseAuthService {
             ),
         })
     }
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-struct ExternalSessionDbRecord {
-    session: ExternalSessionRecord,
-    provider_expires_at: String,
-    encrypted_provider_session_handle: String,
-    external_username: String,
-    external_email: Option<String>,
-    external_display_name: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-struct ExternalSessionRefreshUpdate {
-    encrypted_provider_session_handle: String,
-    provider_scope_id: String,
-    expires_at: String,
 }
 
 fn header_exact(
