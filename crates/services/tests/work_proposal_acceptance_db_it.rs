@@ -517,44 +517,61 @@ async fn sibling_branches_allocate_distinct_successors_from_one_item_revision() 
     .await
     .expect("sibling branch");
 
-    let change = |branch_id: &str, objective: &str, source: &str| WorkGraphChange {
-        owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-        work_id: WorkId::parse(&work_id).expect("work"),
-        branch_id: WorkBranchId::parse(branch_id).expect("branch"),
-        expected_branch_revision: WorkBranchRevision::INITIAL,
-        expected_graph_revision: GraphRevision::INITIAL,
-        items: vec![WorkGraphItemChange::Revised(WorkItemRevisionChange::new(
+    // The explicit sibling fixture needs the proposal admission row that
+    // production branch creation installs alongside work_branches.
+    sqlx::query(
+        "INSERT INTO work_proposal_sequences (owner_id, work_id, branch_id, last_proposal_seq) VALUES (?, ?, ?, 0)",
+    ).bind(&owner_id).bind(&work_id).bind(&sibling_branch)
+        .execute(pool.get()).await.expect("sibling proposal sequence");
+
+    let replan = |branch_id: &str, objective: &str| {
+        let mut plan = proposal(
+            &owner_id,
+            &work_id,
+            branch_id,
+            &common::id("replan"),
+            Vec::new(),
+            Vec::new(),
+        );
+        plan.revisions.push(WorkItemRevisionChange::new(
             WorkItemId::root(),
             WorkItemRevision::INITIAL,
             WorkItemKind::Milestone,
             WorkItemText::parse(objective).expect("objective"),
             WorkItemText::parse("The branch-specific plan is explicit").expect("result"),
             WorkItemDeclarationState::Active,
-        ))],
-        edges: Vec::new(),
-        source_ref: WorkChangeRef::parse(source).expect("source"),
-        reason: Some(
-            astra_services::work::WorkChangeReason::parse("Explore a branch-specific plan")
-                .expect("reason"),
-        ),
+        ));
+        plan
     };
+    let delivery_proposal = repository
+        .propose_plan(replan(&delivery_branch, "Explore the delivery approach"))
+        .await
+        .expect("delivery proposal");
+    let sibling_proposal = repository
+        .propose_plan(replan(&sibling_branch, "Explore the sibling approach"))
+        .await
+        .expect("sibling proposal");
     let (delivery, sibling) = tokio::join!(
-        repository.replace_graph(change(
-            &delivery_branch,
-            "Explore the delivery approach",
-            &common::id("delivery-replan")
+        repository.accept_plan_proposal(common::plan_acceptance(
+            &delivery_proposal,
+            &common::id("accept-delivery")
         )),
-        repository.replace_graph(change(
-            &sibling_branch,
-            "Explore the sibling approach",
-            &common::id("sibling-replan")
-        ))
+        repository.accept_plan_proposal(common::plan_acceptance(
+            &sibling_proposal,
+            &common::id("accept-sibling")
+        )),
     );
-    let delivery = delivery.expect("delivery replan");
-    let sibling = sibling.expect("sibling replan");
+    let delivery = delivery
+        .expect("delivery replan")
+        .resolution
+        .expect("delivery resolution");
+    let sibling = sibling
+        .expect("sibling replan")
+        .resolution
+        .expect("sibling resolution");
     assert_ne!(
-        delivery.parts().current_graph_revision,
-        sibling.parts().current_graph_revision
+        delivery.result_graph_revision,
+        sibling.result_graph_revision
     );
 
     let rows = sqlx::query(
@@ -800,7 +817,7 @@ async fn acceptance_event_conflict_rolls_back_graph_items_branch_and_proposal() 
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn acceptance_racing_direct_graph_change_has_one_complete_winner() {
+async fn competing_proposal_acceptances_have_one_complete_winner() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
     let owner_id = common::id("owner");
@@ -808,7 +825,7 @@ async fn acceptance_racing_direct_graph_change_has_one_complete_winner() {
     let branch_id = common::id("branch");
     let proposal_id = common::id("proposal");
     let proposed_task = common::id("proposed-task");
-    let direct_task = common::id("direct-task");
+    let competing_task = common::id("competing-task");
     repository
         .create_genesis(genesis(&owner_id, &work_id, &branch_id))
         .await
@@ -824,44 +841,55 @@ async fn acceptance_racing_direct_graph_change_has_one_complete_winner() {
         ))
         .await
         .expect("proposal");
-    let direct = WorkGraphChange {
-        owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-        work_id: WorkId::parse(&work_id).expect("work"),
-        branch_id: WorkBranchId::parse(&branch_id).expect("branch"),
-        expected_branch_revision: WorkBranchRevision::INITIAL,
-        expected_graph_revision: GraphRevision::INITIAL,
-        items: vec![WorkGraphItemChange::New(item(&direct_task))],
-        edges: Vec::new(),
-        source_ref: WorkChangeRef::parse(common::id("direct-change")).expect("source"),
-        reason: None,
-    };
-    let (accepted, replaced) = tokio::join!(
+    let competing = repository
+        .propose_plan(proposal(
+            &owner_id,
+            &work_id,
+            &branch_id,
+            &common::id("competing-proposal"),
+            vec![item(&competing_task)],
+            Vec::new(),
+        ))
+        .await
+        .expect("competing proposal");
+    let (accepted, other) = tokio::join!(
         repository.accept_plan_proposal(common::plan_acceptance(
             &proposed,
-            &common::id("root-action")
+            &common::id("accept-first")
         )),
-        repository.replace_graph(direct)
+        repository.accept_plan_proposal(common::plan_acceptance(
+            &competing,
+            &common::id("accept-competing")
+        ))
     );
     let acceptance_won = accepted.is_ok();
-    assert_ne!(
-        acceptance_won,
-        replaced.is_ok(),
-        "the branch CAS must admit exactly one graph writer"
-    );
-    if acceptance_won {
-        assert!(matches!(
-            replaced,
-            Err(WorkRepositoryError::StaleGraphRevision { .. })
-        ));
-    } else {
-        assert!(replaced.is_ok());
-        assert!(matches!(
-            accepted,
-            Err(WorkRepositoryError::InvalidWorkProposalBasis {
-                resource: astra_services::work::WorkProposalBasisResource::BranchRevision
-                    | astra_services::work::WorkProposalBasisResource::GraphRevision
-            }) | Err(WorkRepositoryError::StaleGraphRevision { .. })
-        ));
+    assert_ne!(acceptance_won, other.is_ok(), "exactly one proposal wins");
+    let loser = if acceptance_won { other } else { accepted };
+    assert!(matches!(
+        loser,
+        Err(WorkRepositoryError::InvalidWorkProposalBasis {
+            resource: astra_services::work::WorkProposalBasisResource::BranchRevision
+        })
+    ));
+    for (recorded, won) in [(&proposed, acceptance_won), (&competing, !acceptance_won)] {
+        let stored = repository
+            .load_plan_proposal(
+                &recorded.proposal.owner_id,
+                &recorded.proposal.work_id,
+                &recorded.proposal.proposal_id,
+            )
+            .await
+            .expect("reload proposal")
+            .expect("recorded proposal");
+        assert_eq!(
+            stored.status,
+            if won {
+                WorkProposalStatus::Accepted
+            } else {
+                WorkProposalStatus::Pending
+            }
+        );
+        assert_eq!(stored.resolution.is_some(), won);
     }
     let state = sqlx::query(
         "SELECT p.status, gs.last_revision, b.branch_revision, b.current_graph_revision,
@@ -891,7 +919,7 @@ async fn acceptance_racing_direct_graph_change_has_one_complete_winner() {
     );
     assert_eq!(state.try_get::<i64, _>("graph_count").unwrap(), 2);
     assert_eq!(state.try_get::<i64, _>("item_count").unwrap(), 2);
-    assert_eq!(state.try_get::<i64, _>("last_event_seq").unwrap(), 3);
+    assert_eq!(state.try_get::<i64, _>("last_event_seq").unwrap(), 4);
     assert_eq!(
         state.try_get::<String, _>("status").unwrap(),
         if acceptance_won {
@@ -900,20 +928,26 @@ async fn acceptance_racing_direct_graph_change_has_one_complete_winner() {
             "pending"
         }
     );
-    let winning_item: String =
-        sqlx::query_scalar("SELECT item_id FROM work_items WHERE owner_id = ? AND work_id = ?")
-            .bind(&owner_id)
-            .bind(&work_id)
-            .fetch_one(pool.get())
-            .await
-            .expect("winning item");
+    let persisted_items: Vec<String> = sqlx::query_scalar(
+        "SELECT item_id FROM work_items WHERE owner_id = ? AND work_id = ? ORDER BY item_id",
+    )
+    .bind(&owner_id)
+    .bind(&work_id)
+    .fetch_all(pool.get())
+    .await
+    .expect("materialized items");
     assert_eq!(
-        winning_item,
-        if acceptance_won {
-            proposed_task
-        } else {
-            direct_task
-        }
+        persisted_items
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "root".to_string(),
+            if acceptance_won {
+                proposed_task
+            } else {
+                competing_task
+            },
+        ])
     );
     common::cleanup_work_owner(&pool, &owner_id).await;
 }
