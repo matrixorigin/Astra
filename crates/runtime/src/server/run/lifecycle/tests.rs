@@ -772,9 +772,9 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
         InternalSessionId, NewWorkAttemptSettlement, NewWorkItem, NewWorkItemAttempt,
         OriginalIntentRef, PrimaryWorkAttemptAdvance, PrimaryWorkAttemptCarrierState,
         WorkAttemptExecutionMode, WorkAttemptOutcome, WorkBranchId, WorkBranchRevision,
-        WorkChangeRef, WorkGenesis, WorkGenesisParts, WorkGoal, WorkGraphChange,
-        WorkGraphItemChange, WorkId, WorkItemAttemptId, WorkItemId, WorkItemKind, WorkItemRevision,
-        WorkItemRevisionRef, WorkItemText, WorkOwnerId, WorkRepository,
+        WorkChangeRef, WorkGenesis, WorkGenesisParts, WorkGoal, WorkId, WorkItemAttemptId,
+        WorkItemId, WorkItemKind, WorkItemRevision, WorkItemRevisionRef, WorkItemText, WorkOwnerId,
+        WorkRepository,
     };
 
     let pool = setup_lifecycle_run_db_it().await;
@@ -838,28 +838,53 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
         )
         .await
         .expect("initialize server execution binding");
-    repository
-        .replace_graph(WorkGraphChange {
+    let proposed = repository
+        .propose_plan(astra_services::work::NewWorkPlanProposal {
             owner_id: owner_id.clone(),
             work_id: work_id.clone(),
             branch_id: branch_id.clone(),
             expected_branch_revision: WorkBranchRevision::INITIAL,
             expected_graph_revision: GraphRevision::INITIAL,
-            items: vec![WorkGraphItemChange::New(NewWorkItem {
+            additions: vec![NewWorkItem {
                 item_id: item_id.clone(),
                 kind: WorkItemKind::Task,
                 objective: WorkItemText::parse("Read the current continuation live runtime overview.")
                     .expect("objective"),
                 expected_result: WorkItemText::parse("Report depth, horizon and data coverage without claiming historical completeness.")
                     .expect("expected result"),
-            })],
-            edges: Vec::new(),
+            }],
+            dependencies: Vec::new(),
             source_ref: WorkChangeRef::parse(format!("continuation-change-{}", Uuid::new_v4()))
                 .expect("change ref"),
-            reason: None,
+            proposal_id: astra_services::work::WorkProposalId::parse(format!("continuation-proposal-{}", Uuid::new_v4())).expect("proposal"),
+            expected_work_revision: astra_services::work::WorkRevision::INITIAL,
+            expected_goal_revision: astra_services::work::GoalRevision::INITIAL,
+            expected_criteria_set_revision: astra_services::work::CriterionSetRevision::INITIAL,
+            source_kind: astra_services::work::WorkProposalSourceKind::Model,
+            revisions: Vec::new(),
+            dependency_removals: Vec::new(),
+            reason: astra_services::work::WorkChangeReason::parse("Prepare continuation task").expect("reason"),
         })
         .await
         .expect("replace graph");
+
+    repository
+        .accept_plan_proposal(astra_services::work::WorkPlanProposalAcceptance {
+            owner_id: proposed.proposal.owner_id.clone(),
+            work_id: proposed.proposal.work_id.clone(),
+            branch_id: proposed.proposal.branch_id.clone(),
+            proposal_id: proposed.proposal.proposal_id.clone(),
+            payload_hash: proposed.payload_hash.clone(),
+            expected_work_revision: proposed.proposal.expected_work_revision,
+            expected_goal_revision: proposed.proposal.expected_goal_revision,
+            expected_criteria_set_revision: proposed.proposal.expected_criteria_set_revision,
+            expected_branch_revision: proposed.proposal.expected_branch_revision,
+            expected_graph_revision: proposed.proposal.expected_graph_revision,
+            resolution_ref: WorkChangeRef::parse(format!("accept-continuation-{}", Uuid::new_v4()))
+                .expect("resolution"),
+        })
+        .await
+        .expect("accept continuation plan");
 
     let engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
     engine

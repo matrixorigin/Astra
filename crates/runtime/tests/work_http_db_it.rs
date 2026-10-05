@@ -23,15 +23,15 @@ use astra_services::{
     work::{
         CheckCoverage, CheckEvidenceRef, CheckOutcome, CheckRunId, CheckVerifierKind,
         CriterionCommand, CriterionDefinition, CriterionId, CriterionRevision,
-        CriterionRevisionRef, CriterionSetMemberChange, CriterionSetRevision, CriterionStatement,
+        CriterionRevisionRef, CriterionSetRevision, CriterionStatement,
         DatabaseWorkBranchControlService, DatabaseWorkBranchCreationService,
         DatabaseWorkRepository, ForkCursorRef, GraphRevision, InternalSessionId, NewWorkCheckRun,
-        NewWorkCriteriaProposal, NewWorkCriterion, OriginalIntentRef, WorkBranchBasisChange,
+        NewWorkCriteriaProposal, OriginalIntentRef, WorkBranchBasisChange,
         WorkBranchCreationRequest, WorkBranchId, WorkBranchRevision, WorkBranchSubjectChange,
-        WorkChangeRef, WorkContentHash, WorkCriteriaChange, WorkCriteriaProposalMember,
-        WorkGenesis, WorkGenesisParts, WorkGoal, WorkId, WorkItemAttemptId, WorkItemId,
-        WorkItemRevision, WorkItemRevisionRef, WorkOwnerId, WorkProposalId, WorkProposalSourceKind,
-        WorkRepository, WorkRepositoryError, WorkRevision, WorkSubjectRef,
+        WorkChangeRef, WorkContentHash, WorkCriteriaProposalMember, WorkGenesis, WorkGenesisParts,
+        WorkGoal, WorkId, WorkItemAttemptId, WorkItemId, WorkItemRevision, WorkItemRevisionRef,
+        WorkOwnerId, WorkProposalId, WorkProposalSourceKind, WorkRepository, WorkRepositoryError,
+        WorkRevision, WorkSubjectRef,
     },
 };
 #[cfg(feature = "e2e-hooks")]
@@ -3652,26 +3652,52 @@ async fn work_criteria_route_is_bounded_owner_scoped_and_revision_pinned() {
     assert_eq!(other_status, StatusCode::NOT_FOUND);
     assert_eq!(other["code"], "work_not_found");
 
-    DatabaseWorkRepository::new(pool.clone())
-        .accept_criteria(WorkCriteriaChange {
+    let branch_id = created["overview"]["delivery_branch"]["branch_id"]
+        .as_str()
+        .expect("branch id");
+    let proposed = DatabaseWorkRepository::new(pool.clone())
+        .propose_criteria(NewWorkCriteriaProposal {
             owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
             work_id: WorkId::parse(work_id).expect("work"),
+            branch_id: WorkBranchId::parse(branch_id).expect("branch"),
+            proposal_id: WorkProposalId::parse(id("criteria-proposal")).expect("proposal"),
+            expected_goal_revision: astra_services::work::GoalRevision::INITIAL,
+            expected_branch_revision: WorkBranchRevision::INITIAL,
+            expected_graph_revision: GraphRevision::INITIAL,
             expected_work_revision: WorkRevision::INITIAL,
             expected_criteria_set_revision: CriterionSetRevision::INITIAL,
             members: ["review-complete", "tests-pass"]
                 .into_iter()
-                .map(|criterion_id| {
-                    CriterionSetMemberChange::Existing(CriterionRevisionRef {
-                        criterion_id: CriterionId::parse(criterion_id).expect("criterion"),
-                        revision: CriterionRevision::INITIAL,
-                    })
+                .map(|criterion_id| WorkCriteriaProposalMember::Existing {
+                    criterion_id: CriterionId::parse(criterion_id).expect("criterion"),
+                    revision: CriterionRevision::INITIAL,
                 })
                 .collect(),
             source_ref: WorkChangeRef::parse(id("criteria-change")).expect("source"),
-            reason: None,
+            source_kind: WorkProposalSourceKind::Model,
         })
         .await
         .expect("advance criterion set");
+    let (status, accepted, _) = criteria_proposal_request(
+        app.clone(), &owner_id, "PUT", work_id, branch_id,
+        Some(proposed.proposal.proposal_id.as_str()),
+        Some(serde_json::json!({
+            "request_id": "accept-fixture-criteria",
+            "decision": "accept",
+            "payload_hash": proposed.payload_hash.as_str(),
+            "expected_work_revision": proposed.proposal.expected_work_revision.get(),
+            "expected_goal_revision": proposed.proposal.expected_goal_revision.get(),
+            "expected_criteria_set_revision": proposed.proposal.expected_criteria_set_revision.get(),
+            "expected_branch_revision": proposed.proposal.expected_branch_revision.get(),
+            "expected_graph_revision": proposed.proposal.expected_graph_revision.get(),
+        })),
+    ).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "accepted criterion proposal: {accepted}"
+    );
+
     let (stale_status, stale, _) = get_work_criteria(
         app.clone(),
         &owner_id,
@@ -5453,13 +5479,18 @@ async fn task_graph_route_is_bounded_owner_scoped_and_revision_pinned() {
 
     let criterion_id = id("criterion");
     let repository = DatabaseWorkRepository::new(pool.clone());
-    repository
-        .accept_criteria(WorkCriteriaChange {
+    let proposed = DatabaseWorkRepository::new(pool.clone())
+        .propose_criteria(NewWorkCriteriaProposal {
             owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
             work_id: WorkId::parse(work_id).expect("work"),
+            branch_id: WorkBranchId::parse(branch_id).expect("branch"),
+            proposal_id: WorkProposalId::parse(id("criteria-proposal")).expect("proposal"),
+            expected_goal_revision: astra_services::work::GoalRevision::INITIAL,
+            expected_branch_revision: WorkBranchRevision::INITIAL,
+            expected_graph_revision: GraphRevision::INITIAL,
             expected_work_revision: WorkRevision::INITIAL,
             expected_criteria_set_revision: CriterionSetRevision::INITIAL,
-            members: vec![CriterionSetMemberChange::New(NewWorkCriterion {
+            members: vec![WorkCriteriaProposalMember::New {
                 criterion_id: CriterionId::parse(&criterion_id).expect("criterion"),
                 definition: CriterionDefinition::TestCheck {
                     statement: astra_services::work::CriterionStatement::parse(
@@ -5469,12 +5500,32 @@ async fn task_graph_route_is_bounded_owner_scoped_and_revision_pinned() {
                     command: CriterionCommand::parse("cargo test -p example exact_test")
                         .expect("command"),
                 },
-            })],
+            }],
             source_ref: WorkChangeRef::parse(id("criteria-source")).expect("source"),
-            reason: None,
+            source_kind: WorkProposalSourceKind::Model,
         })
         .await
         .expect("accept typed criterion");
+    let (status, accepted, _) = criteria_proposal_request(
+        app.clone(), &owner_id, "PUT", work_id, branch_id,
+        Some(proposed.proposal.proposal_id.as_str()),
+        Some(serde_json::json!({
+            "request_id": "accept-fixture-criteria",
+            "decision": "accept",
+            "payload_hash": proposed.payload_hash.as_str(),
+            "expected_work_revision": proposed.proposal.expected_work_revision.get(),
+            "expected_goal_revision": proposed.proposal.expected_goal_revision.get(),
+            "expected_criteria_set_revision": proposed.proposal.expected_criteria_set_revision.get(),
+            "expected_branch_revision": proposed.proposal.expected_branch_revision.get(),
+            "expected_graph_revision": proposed.proposal.expected_graph_revision.get(),
+        })),
+    ).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "accepted criterion proposal: {accepted}"
+    );
+
     repository
         .adopt_branch_basis(WorkBranchBasisChange {
             owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
