@@ -54,6 +54,8 @@ index retention and session deletion continue to own checkpoint cleanup.
 Local persistence accepts heavy recovery checkpoints only. Tool completion is
 recorded in the event journal; its cursor remains embedded in the next heavy
 checkpoint. Standalone light files, their reader and pruning have been retired.
+The unused Step Protocol retry-policy APIs have also been retired. Provider retry
+and tool idempotency remain owned by their actual execution paths.
 
 Checkpoint must include enough information to resume safely:
 

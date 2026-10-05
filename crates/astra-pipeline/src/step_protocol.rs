@@ -5,7 +5,7 @@
 //! ```text
 //! ┌─ StepDescriptor ──────────────┐  Scheduling layer (who/when/retry)
 //! │  step_id, task_id, action,    │  Immutable after creation
-//! │  scheduling, retry_policy     │
+//! │  scheduling                  │
 //! ├─ StepExecution ───────────────┤  Runtime layer (cursor/progress)
 //! │  cursor, execution_slots,     │  Mutable during execution
 //! │  result, memory_context       │
@@ -24,7 +24,6 @@
 //! - **IdempotencyCache trait**: pluggable backends (InMemory, MatrixOne).
 //! - **Wait triggers**: `WaitTrigger` (User/Webhook/Timer) with `continuation_token`.
 //! - **DB-first events**: `StepEventStore` trait (in-memory or MatrixOne).
-//! - **Tool-level retry**: `ToolRetryPolicy` per tool classification.
 //! - **Memory governance**: `MemoryGovernanceAction` for retrieval/promotion/purge tracking.
 //! # Hardening additions
 //!
@@ -1106,128 +1105,6 @@ pub enum StepVerdict {
     Complete,
     Failed,
     BudgetExhausted,
-}
-
-// ─── Retry Policy ────────────────────────────────────────────────────────────
-
-/// Default absolute ceiling for automatic retries (step + tool policies, serde default).
-pub const DEFAULT_RETRY_MAX_ATTEMPTS_CEILING: u32 = 5;
-
-/// Step-level retry policy (fallback when tool-level not specified).
-fn default_retry_max_retries() -> u32 {
-    DEFAULT_RETRY_MAX_ATTEMPTS_CEILING
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryPolicy {
-    pub max_attempts: u32,
-    /// Absolute ceiling on step-level retry attempts (defense in depth vs misconfigured `max_attempts`).
-    #[serde(default = "default_retry_max_retries")]
-    pub max_retries: u32,
-    pub backoff_base_ms: u64,
-    pub backoff_max_ms: u64,
-    pub retry_on: Vec<ErrorCategory>,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 3,
-            max_retries: default_retry_max_retries(),
-            backoff_base_ms: 500,
-            backoff_max_ms: 30_000,
-            retry_on: vec![ErrorCategory::Transient, ErrorCategory::Timeout],
-        }
-    }
-}
-
-impl RetryPolicy {
-    /// Compute backoff delay for attempt N (exponential with jitter cap)
-    pub fn backoff_ms(&self, attempt: u32) -> u64 {
-        let delay = self.backoff_base_ms.saturating_mul(1u64 << attempt.min(10));
-        delay.min(self.backoff_max_ms)
-    }
-
-    pub fn should_retry(&self, attempt: u32, category: &ErrorCategory) -> bool {
-        let limit = self.max_attempts.min(self.max_retries.max(1));
-        attempt < limit && self.retry_on.contains(category)
-    }
-}
-
-/// Tool-level retry policy (more granular than step-level).
-/// A single tool failure doesn't force whole-step retry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolRetryPolicy {
-    pub max_attempts: u32,
-    #[serde(default = "default_retry_max_retries")]
-    pub max_retries: u32,
-    pub backoff_base_ms: u64,
-    pub backoff_max_ms: u64,
-}
-
-impl Default for ToolRetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 2,
-            max_retries: default_retry_max_retries(),
-            backoff_base_ms: 300,
-            backoff_max_ms: 5_000,
-        }
-    }
-}
-
-impl ToolRetryPolicy {
-    pub fn backoff_ms(&self, attempt: u32) -> u64 {
-        self.backoff_base_ms
-            .saturating_mul(1u64 << attempt.min(10))
-            .min(self.backoff_max_ms)
-    }
-
-    pub fn should_retry(&self, attempt: u32) -> bool {
-        let limit = self.max_attempts.min(self.max_retries.max(1));
-        attempt < limit
-    }
-}
-
-/// Get tool-level retry policy based on idempotency classification.
-///
-/// `args` is optional because most tools dispatch on name alone; action-sensitive
-/// tools (e.g. `memory`) inspect `args["action"]` to distinguish read vs write.
-pub fn tool_retry_policy(tool_name: &str, args: Option<&serde_json::Value>) -> ToolRetryPolicy {
-    match classify_tool_idempotency(tool_name, args) {
-        // Pure reads: retry aggressively (no side effects)
-        ToolIdempotency::PureRead => ToolRetryPolicy {
-            max_attempts: 3,
-            max_retries: default_retry_max_retries(),
-            backoff_base_ms: 200,
-            backoff_max_ms: 2_000,
-        },
-        // Idempotent writes: retry cautiously
-        ToolIdempotency::IdempotentWrite => ToolRetryPolicy {
-            max_attempts: 2,
-            max_retries: default_retry_max_retries(),
-            backoff_base_ms: 500,
-            backoff_max_ms: 5_000,
-        },
-        // Non-idempotent: do NOT auto-retry (let LLM decide)
-        ToolIdempotency::NonIdempotent => ToolRetryPolicy {
-            max_attempts: 1, // no retry
-            max_retries: 1,
-            backoff_base_ms: 0,
-            backoff_max_ms: 0,
-        },
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ErrorCategory {
-    Transient,
-    Timeout,
-    RateLimit,
-    AuthFailure,
-    InvalidInput,
-    ToolNotFound,
-    InternalError,
 }
 
 // ─── Idempotency ─────────────────────────────────────────────────────────────
@@ -2324,74 +2201,6 @@ mod tests {
                 "Expected NonIdempotent for {tool}"
             );
         }
-    }
-
-    // ── Retry Policy ──
-
-    #[test]
-    fn retry_policy() {
-        let policy = RetryPolicy::default();
-
-        // Exponential backoff
-        let backoff_expected = [(0, 500), (1, 1000), (2, 2000), (3, 4000)];
-        for (attempt, expected_ms) in backoff_expected {
-            assert_eq!(
-                policy.backoff_ms(attempt),
-                expected_ms,
-                "backoff at attempt {attempt}"
-            );
-        }
-
-        // Capped backoff
-        let capped = RetryPolicy {
-            backoff_max_ms: 5000,
-            ..RetryPolicy::default()
-        };
-        assert_eq!(capped.backoff_ms(10), 5000, "backoff capped at max");
-
-        // Should retry logic
-        assert!(policy.should_retry(1, &ErrorCategory::Transient));
-        assert!(policy.should_retry(2, &ErrorCategory::Timeout));
-        assert!(
-            !policy.should_retry(3, &ErrorCategory::Transient),
-            "max_attempts=3"
-        );
-        assert!(
-            !policy.should_retry(1, &ErrorCategory::AuthFailure),
-            "not in retry_on"
-        );
-
-        // max_retries caps retries
-        let limited = RetryPolicy {
-            max_attempts: 100,
-            max_retries: 5,
-            ..RetryPolicy::default()
-        };
-        assert!(limited.should_retry(0, &ErrorCategory::Transient));
-        assert!(limited.should_retry(4, &ErrorCategory::Transient));
-        assert!(
-            !limited.should_retry(5, &ErrorCategory::Transient),
-            "max_retries=5"
-        );
-    }
-
-    // ── Tool Retry Policy ──
-
-    #[test]
-    fn tool_retry_policy_by_tool_type() {
-        // PureRead tools get 3 retries with 200ms base
-        let policy = tool_retry_policy("grep", None);
-        assert_eq!(policy.max_attempts, 3);
-        assert_eq!(policy.backoff_base_ms, 200);
-
-        // IdempotentWrite gets 2 retries with 500ms base
-        let policy = tool_retry_policy("write_file", None);
-        assert_eq!(policy.max_attempts, 2);
-        assert_eq!(policy.backoff_base_ms, 500);
-
-        // NonIdempotent gets 1 attempt (no retry)
-        let policy = tool_retry_policy("bash", None);
-        assert_eq!(policy.max_attempts, 1);
     }
 
     // ── Canonical JSON ──
