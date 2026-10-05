@@ -561,16 +561,6 @@ impl MemoryEntry {
         None // unstructured memory — no tag
     }
 
-    /// Check if this entry belongs to a given namespace.
-    pub fn is_ns(&self, ns: &str) -> bool {
-        self.ns == ns
-    }
-
-    /// Check if this entry has the given status.
-    pub fn is_status(&self, status: &str) -> bool {
-        self.status == status
-    }
-
     /// Format for display in CLI (one-line summary).
     pub fn display_line(&self) -> String {
         let preview_source = self
@@ -588,117 +578,6 @@ impl MemoryEntry {
             .collect();
         format!("[{}/{}] {}", self.ns, self.status, body_preview)
     }
-
-    /// Format for display grouped by status (for tasks).
-    pub fn display_task_line(&self) -> String {
-        let icon = match self.status.as_str() {
-            ST_DONE => "✓",
-            ST_PENDING => "○",
-            _ => "·",
-        };
-        let body_preview: String = self
-            .body
-            .lines()
-            .next()
-            .unwrap_or("")
-            .chars()
-            .take(70)
-            .collect();
-        format!("{icon} {body_preview}")
-    }
-}
-
-/// Filter a list of memory content strings to entries in a given namespace.
-pub fn filter_ns(contents: &[&str], ns: &str) -> Vec<MemoryEntry> {
-    contents
-        .iter()
-        .filter_map(|c| MemoryEntry::parse(c))
-        .filter(|e| e.is_ns(ns))
-        .collect()
-}
-
-/// Filter entries by namespace and status.
-pub fn filter_ns_status(contents: &[&str], ns: &str, status: &str) -> Vec<MemoryEntry> {
-    contents
-        .iter()
-        .filter_map(|c| MemoryEntry::parse(c))
-        .filter(|e| e.is_ns(ns) && e.is_status(status))
-        .collect()
-}
-
-/// Group entries from raw content strings by namespace.
-///
-/// Returns `(structured_entries, unstructured_texts)`.
-/// Unstructured texts are memory strings that don't match any protocol format.
-pub fn partition_memories(contents: &[&str]) -> (Vec<MemoryEntry>, Vec<String>) {
-    let mut structured = Vec::new();
-    let mut unstructured = Vec::new();
-    for c in contents {
-        if let Some(entry) = MemoryEntry::parse(c) {
-            structured.push(entry);
-        } else if !c.trim().is_empty() {
-            unstructured.push(c.to_string());
-        }
-    }
-    (structured, unstructured)
-}
-
-/// Format memory entries for injection into the LLM system prompt.
-///
-/// Groups entries by namespace and formats them readably.
-pub fn format_for_llm(contents: &[&str]) -> String {
-    let (entries, unstructured) = partition_memories(contents);
-    let mut sections: Vec<String> = Vec::new();
-
-    // Group by namespace
-    let namespaces = [
-        (NS_PREF, "Preferences"),
-        (NS_FACT, "Knowledge"),
-        (NS_KNOWLEDGE, "Knowledge"),
-        (NS_PLAN, "Active Plan"),
-        (NS_TASK, "Tasks"),
-        (NS_INSIGHT, "Insights"),
-        (NS_EPISODE, "Recent Context"),
-        (NS_SESSION, "Session State"),
-        (NS_SWAP, "Archived Context"),
-    ];
-
-    for (ns, label) in &namespaces {
-        let ns_entries: Vec<_> = entries.iter().filter(|e| e.is_ns(ns)).collect();
-        if ns_entries.is_empty() {
-            continue;
-        }
-        if *ns == NS_TASK {
-            let lines: Vec<String> = ns_entries.iter().map(|e| e.display_task_line()).collect();
-            sections.push(format!("**{label}:** {}", lines.join(" | ")));
-        } else {
-            let bodies: Vec<String> = ns_entries
-                .iter()
-                .map(|e| {
-                    let preview: String = e
-                        .body
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .chars()
-                        .take(100)
-                        .collect();
-                    preview
-                })
-                .collect();
-            sections.push(format!("**{label}:** {}", bodies.join(" | ")));
-        }
-    }
-
-    if !unstructured.is_empty() {
-        let previews: Vec<String> = unstructured
-            .iter()
-            .map(|s| s.chars().take(100).collect::<String>())
-            .collect();
-        sections.push(format!("**Context:** {}", previews.join(" | ")));
-    }
-
-    sections.join("\n")
 }
 
 #[cfg(test)]
@@ -843,20 +722,6 @@ mod tests {
         assert_eq!(e.memory_type(), "working");
     }
 
-    #[test]
-    fn memory_entry_is_ns() {
-        let e = MemoryEntry::new("plan", "active", "x");
-        assert!(e.is_ns("plan"));
-        assert!(!e.is_ns("task"));
-    }
-
-    #[test]
-    fn memory_entry_is_status() {
-        let e = MemoryEntry::new("task", "done", "x");
-        assert!(e.is_status("done"));
-        assert!(!e.is_status("pending"));
-    }
-
     // ──────────────────────────────────────────────────────────
     // to_store_payload / to_store_payload_with_meta
     // ──────────────────────────────────────────────────────────
@@ -943,7 +808,7 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────
-    // display_line / display_task_line
+    // display_line
     // ──────────────────────────────────────────────────────────
 
     #[test]
@@ -968,117 +833,6 @@ mod tests {
             e.display_line(),
             "[session/active] Abstract session summary"
         );
-    }
-
-    #[test]
-    fn display_task_line_done_icon() {
-        let e = MemoryEntry::new("task", "done", "Fix bug");
-        assert!(e.display_task_line().starts_with("✓"));
-    }
-
-    #[test]
-    fn display_task_line_pending_icon() {
-        let e = MemoryEntry::new("task", "pending", "Review code");
-        assert!(e.display_task_line().starts_with("○"));
-    }
-
-    #[test]
-    fn display_task_line_other_icon() {
-        let e = MemoryEntry::new("task", "active", "In progress");
-        assert!(e.display_task_line().starts_with("·"));
-    }
-
-    // ──────────────────────────────────────────────────────────
-    // filter_ns / filter_ns_status
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn filter_ns_returns_matching() {
-        let contents = vec![
-            "[@task/pending] Task A",
-            "[@fact/semantic] Fact B",
-            "[@task/done] Task C",
-            "plain text",
-        ];
-        let result = filter_ns(&contents, "task");
-        assert_eq!(result.len(), 2);
-        assert!(result[0].body.contains("Task A"));
-        assert!(result[1].body.contains("Task C"));
-    }
-
-    #[test]
-    fn filter_ns_empty_input() {
-        let result = filter_ns(&[], "task");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn filter_ns_status_matches() {
-        let contents = vec!["[@task/pending] A", "[@task/done] B", "[@task/pending] C"];
-        let result = filter_ns_status(&contents, "task", "pending");
-        assert_eq!(result.len(), 2);
-    }
-
-    // ──────────────────────────────────────────────────────────
-    // partition_memories
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn partition_memories_splits_correctly() {
-        let contents = vec![
-            "[@task/pending] do thing",
-            "unstructured note",
-            "[@fact/semantic] know stuff",
-            "   ", // whitespace-only → dropped
-        ];
-        let (structured, unstructured) = partition_memories(&contents);
-        assert_eq!(structured.len(), 2);
-        assert_eq!(unstructured.len(), 1);
-        assert_eq!(unstructured[0], "unstructured note");
-    }
-
-    #[test]
-    fn partition_memories_empty() {
-        let (s, u) = partition_memories(&[]);
-        assert!(s.is_empty());
-        assert!(u.is_empty());
-    }
-
-    // ──────────────────────────────────────────────────────────
-    // format_for_llm
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn format_for_llm_groups_by_namespace() {
-        let contents = vec![
-            "[@task/pending] Review PR",
-            "[@task/done] Write tests",
-            "[@fact/semantic] User prefers Rust",
-        ];
-        let result = format_for_llm(&contents);
-        assert!(result.contains("**Knowledge:**"));
-        assert!(result.contains("**Tasks:**"));
-    }
-
-    #[test]
-    fn format_for_llm_includes_unstructured() {
-        let contents = vec!["plain note"];
-        let result = format_for_llm(&contents);
-        assert!(result.contains("**Context:**"));
-        assert!(result.contains("plain note"));
-    }
-
-    #[test]
-    fn format_for_llm_empty() {
-        assert!(format_for_llm(&[]).is_empty());
-    }
-
-    #[test]
-    fn format_for_llm_tasks_use_icons() {
-        let contents = vec!["[@task/done] Fixed it", "[@task/pending] Todo"];
-        let result = format_for_llm(&contents);
-        assert!(result.contains("✓"));
-        assert!(result.contains("○"));
     }
 
     // ──────────────────────────────────────────────────────────
