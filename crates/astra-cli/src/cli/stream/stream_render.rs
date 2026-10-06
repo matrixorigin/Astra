@@ -8193,7 +8193,6 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
     let blocking_outcome = tokio::task::spawn_blocking(move || {
         let invocation_for_blocking = astra_tools::tool_engine::ToolInvocationMetadata {
             admission_deadline: invocation.admission_deadline,
-            task_resolution_authority: None,
             run_id: run_id_for_blocking.as_deref(),
             turn_chain_id: turn_chain_id_for_blocking.as_deref(),
             tool_call_id: tool_call_id_for_blocking.as_deref(),

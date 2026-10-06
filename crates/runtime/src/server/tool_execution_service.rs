@@ -182,34 +182,6 @@ pub struct ToolExecutionService {
 }
 
 impl ToolExecutionService {
-    /// Read existing durable Edge authority; this never creates or completes a
-    /// second invocation. Callers must check authenticated ownership first.
-    pub(crate) async fn edge_completion_result(
-        &self,
-        reference: &astra_turn_types::task_resolution::EdgeDispatchCompletionRef,
-    ) -> Result<astra_thin_client::ToolResultRequest, String> {
-        let service = self
-            .edge_dispatch_service
-            .as_ref()
-            .ok_or("edge evidence authority unavailable")?;
-        let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
-            &reference.identity.user_id,
-            &reference.identity.session_id,
-            &reference.identity.run_id,
-            &reference.identity.turn_chain_id,
-            &reference.identity.invocation_id,
-        );
-        let json = service
-            .wait_result(&identity, std::time::Duration::ZERO)
-            .await?
-            .ok_or("durable edge evidence missing")?;
-        let result = canonical_edge_completion(&identity, &reference.edge_agent_id, &json)?;
-        if result.result_hash != reference.result_hash {
-            return Err("edge evidence does not match retained completion hash".into());
-        }
-        Ok(result)
-    }
-
     pub fn builder() -> ToolExecutionServiceBuilder {
         ToolExecutionServiceBuilder::default()
     }

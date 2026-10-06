@@ -254,79 +254,35 @@ Argument proof follows the tool's option/operand boundary: a TypeScript `@file`
 is opaque only when parsed as a top-level response-file argument, not when a
 known value-taking option consumes it as an ordinary path or package name.
 
-At completion, an unresolved failure with a later-round observation candidate,
-or the existing repeated-failure signal, permits one evidence-linked
-`submit_task_resolution` proposal through the existing `invoke_tool` carrier
-when the task has a real execution contract. The completion path first
-projects the retained failures into terminally relevant obligations: possible
-bound-workspace mutation, a recognized validation command, declared external
-state, unfinished child/fanout execution, or an invocation that cannot be
-rejoined to durable authority. Ordinary diagnostic probes remain in the full
-ledger and final explanation, but do not turn the answer into
-`ExecutionIncomplete` merely because a later observation exists. This keeps
-the rule semantic rather than tied to one command name. For a failed opaque
-executable, read-only task intent alone does not prove no effect: the diagnostic
-exception requires an executor-owned unchanged-workspace receipt. Missing or
-weak observation remains an unresolved completion risk. An exploratory profile
-may report a failed known observation or validation, but cannot erase a failed
-opaque execution with unproven effects. If the runtime cannot classify a failed
-invocation because its authority is missing, it fails closed
-and retains the strict path. The full schema is supplied only in that
-boundary's hint, not added to resident tools. The proposal identifies the
-verification target, failed and later evidence calls,
-`supported`/`partial`/`unknown`, rationale, and remaining gaps. This is a model
-assessment, not a verification receipt.
-The wire contract bounds the target and each gap to 256 characters, rationale to
-1024 characters, and each evidence list to 32 call IDs; runtime validation uses
-the same character-count limits as the provider schema.
-Candidate existence does not establish semantic relevance. Same-round sibling
-results are not later evidence, and exact-operation recovery needs no proposal.
-The transient hint supplies bounded, source-owned execution IDs and typed
-status from the retained policy window, so the Agent can reference evidence
-without inventing identities or performing discovery. Submission transport and
-evidence validation have distinct feedback; neither replaces final coverage.
-Scheduling pressure may decrease after healthy progress; once this bounded
-assessment starts, final coverage is checked against the remaining failure facts,
-not the scheduling stage or whether the proposal tool itself returned success.
+Tool failures are execution facts, not automatically unmet task obligations.
+Return their typed outcome and diagnostic to the model through the normal tool
+result path. A failed exploratory command, repeated failure, later observation,
+or missing recovery assessment must not itself reserve a model round, require
+a submission tool, or replace the final answer with a request to continue.
+Runtime policy may advise the model using the existing bounded evidence window;
+that advice does not grant execution or terminal authority.
 
-If the provider schema rejects this submission before dispatch, the runtime
-records that typed pre-dispatch stage separately from an executed tool failure.
-The same reconciliation boundary may receive one argument correction; that
-budget survives checkpoint recovery and cannot be reopened by handler failures,
-unknown tools, a different boundary, or another invalid submission.
+The model must distinguish observed conclusions from unavailable evidence and
+failed required checks. A cleanly completed conversation can deliver a report
+with explicit limitations; it is not a receipt that every command succeeded or
+that every requested effect was verified. Raw failures remain in journals,
+trace and usage accounting even when another approach answers the question.
 
-Admission binds the call to the current run, turn chain, Work subject and user
-intent. The model supplies only the interpretation; the handler binds scope and
-boundary from current invocation authority. Model-supplied control fields are
-rejected, not silently overridden. Acceptance resolves exact, authority-tagged completion references in the
-existing owner-scoped invocation ledger or Edge dispatch store. Edge references
-bind the selected executor and canonical result hash, and are attached by the
-Server only after durable acceptance; local-only delivery grants no such proof.
-Durable result bodies use lossless text storage: database JSON normalization
-must not change the numeric representation covered by the accepted hash.
-With a configured durable Edge owner, direct tool delivery admits and claims the
-dispatch after guarded run admission and before publishing the request. Existing
-in-flight or terminal dispatches are observed, not re-executed. A durable
-admission failure must not silently downgrade to local-only delivery; an
-ambiguous outcome remains unknown. Explicit local-only hosts can still execute
-through guarded callback delivery without gaining durable assessment authority.
-HTTP callback replay compares original callback content, not the Server's added
-provenance, and never upgrades or overwrites the first delivered reference.
-Task-level resolution requires coverage of all current terminally relevant
-unresolved failures and must not reuse stale workspace evidence after a later
-writer. Advisory failures remain observable evidence and are not silently
-dropped from the journal or answer context. Missing, ambiguous, foreign, or
-unavailable evidence remains unresolved.
-The bounded policy window retains original references across checkpoint recovery;
-local display text and absence from a recovered suffix are not authority.
-Edge workspace evidence without a retained trustworthy ordering relative to a
-known writer remains unresolved after recovery. This does not expand the
-authority of deterministic invocation-backed verification contracts.
+Concrete execution obligations keep their existing owners: permissions and
+provider admission, canonical Work settlement, explicit verification hooks,
+workspace/external-effect receipts, unsettled execution ownership, and child
+completion/reply obligations. None can be discharged by assistant prose or an
+unrelated successful tool. Their interruption status is separate from useful
+partial assistant output; runtime diagnostics must not overwrite that output.
 
-Raw execution failures remain in accounting even when another approach satisfies
-the task. Explicit deterministic checks and canonical Work settlement keep their
-own authority. A rejected submission or unavailable capability produces an honest
-partial/unknown report, not another unrestricted execution loop.
+Durable Edge completion references bind the authenticated invocation identity,
+selected executor and accepted result hash. Local-only delivery grants no such
+proof. Result bodies retain lossless text so normalization cannot change the
+accepted hash. Durable admission failure must not downgrade to local delivery;
+in-flight or terminal dispatches are observed rather than re-executed. Callback
+replay compares original content without replacing the first accepted reference.
+These facts serve journals, recovery and deterministic verification, not a
+second model-assessment ledger.
 
 ## Tasks
 

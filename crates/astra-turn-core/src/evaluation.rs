@@ -18,8 +18,6 @@ use crate::orchestration::agent_result_wire::{
 use astra_services::session_journal::{JournalEvent, ToolCallRecord};
 use serde_json::{Value, json};
 
-pub mod task_resolution;
-
 /// Signals detected during evaluation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalSignal {
@@ -1696,10 +1694,6 @@ pub struct ToolEvaluationFact {
     /// policy window. Absence never authorizes a guessed recovery reference.
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     execution_completion: Option<astra_turn_types::task_resolution::ToolExecutionEvidenceRef>,
-    /// Runtime-owned workspace observer classification. Kept with the fact so
-    /// recovery need not infer scope from a tool name or a command preview.
-    workspace_observation_candidate: bool,
-    assessment_observation_candidate: bool,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     operation_identity: Option<EvaluationIdentity>,
     /// False when the outcome key used only a preview or other partial evidence.
@@ -1873,10 +1867,6 @@ impl ToolEvaluationFact {
         Self {
             tool_name: record.name.clone(),
             execution_completion: record.execution_completion.clone(),
-            workspace_observation_candidate: false,
-            assessment_observation_candidate: task_resolution::is_assessment_observation_candidate(
-                record,
-            ),
             operation_identity: operation_identity_key(record)
                 .map(|key| EvaluationIdentity::new(b"operation", &key)),
             operation_identity_complete: !args.trim().is_empty(),
@@ -1923,20 +1913,6 @@ impl ToolEvaluationFact {
         &self,
     ) -> Option<&astra_turn_types::task_resolution::ToolExecutionEvidenceRef> {
         self.execution_completion.as_ref()
-    }
-
-    pub fn with_workspace_observation_candidate(mut self, observed: bool) -> Self {
-        self.workspace_observation_candidate = observed;
-        self
-    }
-
-    /// This is an observation-scope fact, not a successful verifier receipt.
-    pub fn is_workspace_observation_candidate(&self) -> bool {
-        self.workspace_observation_candidate
-    }
-
-    pub fn is_assessment_observation_candidate(&self) -> bool {
-        self.assessment_observation_candidate
     }
 
     fn outcome_key(&self, index: usize) -> EvaluationOutcomeKey {

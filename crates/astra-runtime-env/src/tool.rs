@@ -463,7 +463,6 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         control_plane("introspect", ToolLoadPolicy::AlwaysLoad),
         control_plane("model_catalog", ToolLoadPolicy::Deferred),
         control_plane("reflect", ToolLoadPolicy::Deferred),
-        control_plane("submit_task_resolution", ToolLoadPolicy::Deferred),
         // Required questions stay resident; optional status notifications use
         // the same deferred activation path as other utility operations.
         control_plane("notify", ToolLoadPolicy::Deferred),

@@ -675,27 +675,6 @@ pub const SERVER_RUN_SCRIPT_RPC_TOOL_NAMES: &[&str] = &[
     "bash",
 ];
 
-pub fn submit_task_resolution_schema() -> Value {
-    json!({
-        "type": "function", "function": {
-            "name": "submit_task_resolution",
-            "description": "Submit an evidence-linked model assessment only when the runtime requests reconciliation. Name exact failed and later supporting call IDs for the same verification target; retain unknowns and remaining gaps. Keep verification_target within 256 characters, rationale within 1024 characters, and each remaining gap within 256 characters. For a supported conclusion, remaining_gaps must be empty. Submission is not verification success and never replaces required checks.",
-            "parameters": {
-                "type": "object", "additionalProperties": false,
-                "required": ["verification_target", "failed_call_ids", "evidence_call_ids", "conclusion", "rationale", "remaining_gaps"],
-                "properties": {
-                    "verification_target": {"type": "string", "maxLength": 256},
-                    "failed_call_ids": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "string", "maxLength": 256}},
-                    "evidence_call_ids": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 256}},
-                    "conclusion": {"type": "string", "enum": ["supported", "partial", "unknown"]},
-                    "rationale": {"type": "string", "maxLength": 1024},
-                    "remaining_gaps": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 256}}
-                }
-            }
-        }
-    })
-}
-
 fn start_work_schema() -> Value {
     let tasks = "Known acceptance units incl. dependents; no report subtasks.";
     let prerequisites = "1-based output prerequisites; no order/text edges. Omit if independent.";
@@ -1399,7 +1378,6 @@ fn fanout_reasoning_schema() -> Value {
 
 fn all_tool_schemas_core() -> Vec<Value> {
     heap_schema_vec![
-        submit_task_resolution_schema(),
         start_work_schema(),
         run_next_work_item_schema(),
         settle_work_item_schema(),

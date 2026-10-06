@@ -7268,9 +7268,9 @@ mod tests {
                     "result_full": r#"{"fanout":{"terminal":3},"provenance":{"all_slots_delivered":true}}"#
                 }, {
                     "tool_call_id": "schema-rejected-call",
-                    "name": "submit_task_resolution",
+                    "name": "write_file",
                     "ok": false,
-                    "args_full": r#"{"remaining_gaps":["invalid"]}"#,
+                    "args_full": r#"{"path":42}"#,
                     "result_full": r#"{"error_kind":"tool_invalid_args"}"#,
                     "error_kind": "tool_invalid_args",
                     "disposition": "rejected",
@@ -7306,7 +7306,7 @@ mod tests {
                 allow_missing: false,
             },
             Criterion::JournalToolJson {
-                name: "submit_task_resolution".into(),
+                name: "write_file".into(),
                 document: JournalToolDocument::RuntimeMetadata,
                 path: "/pre_dispatch_rejection".into(),
                 equals: serde_json::json!("provider_schema_validation"),
@@ -7339,7 +7339,7 @@ mod tests {
 
         let wrong_stage = evaluate_deterministic_with_session(
             &[Criterion::JournalToolJson {
-                name: "submit_task_resolution".into(),
+                name: "write_file".into(),
                 document: JournalToolDocument::RuntimeMetadata,
                 path: "/pre_dispatch_rejection".into(),
                 equals: serde_json::json!("handler_error"),

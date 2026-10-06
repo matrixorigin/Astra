@@ -80,8 +80,6 @@ impl<'a> HeadlessToolCallViews<'a> {
 
 /// Typed execution context for one headless tool round.
 pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
-    pub task_resolution_authority:
-        Option<&'a astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     /// Internal agentic step index (0-based) for cache and loop accounting.
     pub turn_index: usize,
     /// User-visible session turn currently in progress (1-based).
@@ -287,7 +285,6 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
     action_fence: Option<&dyn HeadlessActionFence>,
 ) -> HeadlessRoundOutcome {
     let HeadlessToolRoundCtx {
-        task_resolution_authority,
         turn_index,
         session_turn,
         quiet,
@@ -446,7 +443,6 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             current_turn_chain_id,
             durable_dispatch_admission,
             delegation_model_admissions,
-            task_resolution_authority,
             tool_calls: logical_tool_calls,
             deferred_activations_by_call_id,
             runtime_control_calls_by_id,

@@ -4627,7 +4627,6 @@ mod context_cache_contract_tests {
         crate::turn::agentic_loop::execution_phase::advance_completion_action_window_after_tool_round_from_record_index(
             &mut state,
             records_before,
-            None,
         );
         let window = state
             .hooks

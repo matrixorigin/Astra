@@ -6,7 +6,7 @@ description: |
 prompt: |
   只做只读代码审查，不要运行测试、shell 命令、探针，不要修改或创建任何文件。
   请通过 read_file 阅读下面源码，并简要解释两点：
-  1. `submit_task_resolution` 参数 schema 校验失败后，什么事实才能证明调用
+  1. 工具参数 schema 校验失败后，什么事实才能证明调用
      在 dispatch 前被拒绝？
   2. `worktree` 的 `exit_action=remove, discard_changes=true` 为什么仍然需要
      用户的显式批准？

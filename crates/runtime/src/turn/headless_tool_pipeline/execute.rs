@@ -53,9 +53,6 @@ pub(crate) async fn execute_tool_pure(
     delegation_model_admission: Option<
         &crate::turn::agentic_loop::host::PreparedDelegationModelAdmission,
     >,
-    task_resolution_authority: Option<
-        &astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority,
-    >,
     resolved_provider_policy: Option<
         &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
     >,
@@ -89,7 +86,6 @@ pub(crate) async fn execute_tool_pure(
                             permission_grant,
                             durable_dispatch_admission,
                             delegation_model_admission,
-                            task_resolution_authority,
                             runtime_control_kind,
                         )
                         .await;
@@ -648,7 +644,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx.current_turn_chain_id,
             self.ctx.durable_dispatch_admission,
             delegation_model_admission,
-            self.ctx.task_resolution_authority,
             resolved_provider_policy.as_ref(),
             permission_grant.as_ref(),
             self.ctx.session_turn,

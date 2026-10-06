@@ -395,8 +395,6 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub delegation_model_admissions: Option<
         &'a HashMap<String, crate::turn::agentic_loop::host::PreparedDelegationModelAdmission>,
     >,
-    pub task_resolution_authority:
-        Option<&'a astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     pub tool_calls: &'a [Value],
     /// Schema-addressed deferred selection proof for a specific provider call.
     /// It bypasses only wire-schema visibility; every execution policy below
@@ -1087,7 +1085,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let turn_chain_id = self.ctx.current_turn_chain_id;
         let durable_dispatch_admission = self.ctx.durable_dispatch_admission;
         let delegation_model_admissions = self.ctx.delegation_model_admissions;
-        let task_resolution_authority = self.ctx.task_resolution_authority;
         let runtime_control_calls = self.ctx.runtime_control_calls_by_id;
         let session_turn = self.ctx.session_turn;
         let edge_round_present = !self.ctx.edge_tool_round.is_empty();
@@ -1138,7 +1135,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     turn_chain_id,
                     durable_dispatch_admission,
                     delegation_model_admission,
-                    task_resolution_authority,
                     provider_policy.as_ref(),
                     permission_grant.as_ref(),
                     session_turn,
@@ -1533,7 +1529,6 @@ mod tests {
                         .then_some(self.turn_chain_id.as_str()),
                     durable_dispatch_admission: None,
                     delegation_model_admissions: None,
-                    task_resolution_authority: None,
                     tool_calls: &self.tool_calls,
                     deferred_activations_by_call_id: &self.deferred_activations_by_call_id,
                     runtime_control_calls_by_id: &self.runtime_control_calls_by_id,
@@ -3705,33 +3700,31 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and MatrixOne"]
     async fn runtime_route_rejection_keeps_runtime_terminal_owner() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let _ = dotenvy::dotenv();
+        let mut settings = astra_core::config::MatrixOneSettings::from_env();
+        settings.db_pool_max_connections = 1;
+        settings.db_pool_min_connections = 0;
+        let pool = astra_core::SharedPool::new(&settings).await.unwrap();
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round.clear();
+        let call_id = "call-work-scheduler-rejected";
         harness.tool_calls = vec![json!({
-            "id": "call-task-resolution-rejected",
+            "id": call_id,
             "type": "function",
-            "function": {
-                "name": "submit_task_resolution",
-                "arguments": serde_json::to_string(&json!({
-                    "verification_target": "artifact",
-                    "failed_call_ids": ["failed-call"],
-                    "evidence_call_ids": [],
-                    "conclusion": "unknown",
-                    "rationale": "No active authority",
-                    "remaining_gaps": ["verify artifact"]
-                }))
-                .unwrap()
-            }
+            "function": {"name": "run_next_work_item", "arguments": "{}"}
         })];
         harness.runtime_control_calls_by_id.insert(
-            "call-task-resolution-rejected".to_string(),
-            RuntimeControlInvocationKind::OutcomeReconciliation,
+            call_id.to_string(),
+            RuntimeControlInvocationKind::WorkScheduler,
         );
         begin_recorded_turn(&mut harness, 1);
 
         let workspace = tempfile::tempdir().unwrap();
-        let executor = server_executor_for_test_workspace(workspace.path(), "test-session");
+        let mut executor = server_executor_for_test_workspace(workspace.path(), "test-session");
+        executor.set_context_manifest_pool(pool.clone());
         let shared_ids = {
             let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
             pipeline
@@ -3739,24 +3732,25 @@ mod tests {
                 .await;
             pipeline.into_round_outcome().shared_loop_terminal_call_ids
         };
-
         assert!(
-            !shared_ids.contains("call-task-resolution-rejected"),
-            "a handler rejection after runtime route establishment must not mint a shared-loop terminal"
+            !shared_ids.contains(call_id),
+            "a routed handler rejection must not mint a second terminal owner"
         );
         let record = harness.tool_call_records.last().expect("rejection record");
-        assert_eq!(
-            record.effective_disposition(),
-            astra_services::session_journal::ToolCallDisposition::Rejected
-        );
         assert!(
             record
                 .result_full
                 .as_deref()
-                .is_some_and(|result| result.contains("No active reconciliation authority")),
-            "the valid call must reach the runtime handler before rejection: {record:?}"
+                .is_some_and(|result| { result.contains("work_not_bound") }),
+            "valid input must reach the Work handler before rejection: {record:?}"
+        );
+        assert_eq!(
+            record.effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Rejected,
+            "handler rejection must preserve its execution fact: {record:?}"
         );
         assert!(!record.was_executed());
+        pool.close().await;
     }
 
     #[tokio::test]

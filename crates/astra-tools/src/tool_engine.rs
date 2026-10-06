@@ -62,8 +62,6 @@ pub struct ToolInvocationMetadata<'a> {
     /// Caller-selected admission cutoff, retained only for this invocation.
     /// Leaf handlers check it after waits; they do not choose budget phases.
     pub admission_deadline: Option<std::time::Instant>,
-    pub task_resolution_authority:
-        Option<&'a astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     pub run_id: Option<&'a str>,
     pub turn_chain_id: Option<&'a str>,
     pub tool_call_id: Option<&'a str>,
@@ -445,7 +443,6 @@ mod tests {
                 &args,
                 ToolInvocationMetadata {
                     admission_deadline: None,
-                    task_resolution_authority: None,
                     run_id: Some("run-1"),
                     turn_chain_id: Some("turn-1"),
                     tool_call_id: Some("call-1"),

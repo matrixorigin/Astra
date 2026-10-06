@@ -7195,21 +7195,9 @@ impl ServerAgenticLoopHost {
         state: &AgenticLoopState,
         mut admission: crate::turn::agentic_loop::host::ToolCallAdmission,
     ) -> crate::turn::agentic_loop::host::ToolCallAdmission {
-        let runtime_control_kind = if matches!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .as_ref()
-                .map(|window| &window.action),
-            Some(crate::turn::agentic_loop::host::CompletionAction::OutcomeReconciliation { .. })
-        ) {
-            Some(astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::OutcomeReconciliation)
-        } else if self.work_lifecycle_is_active(state) {
-            Some(astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::WorkSettlement)
-        } else {
-            None
-        };
+        let runtime_control_kind = self.work_lifecycle_is_active(state).then_some(
+            astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::WorkSettlement,
+        );
         if let Some(kind) = runtime_control_kind {
             for invocation in &mut admission.admitted {
                 if let Ok(Some(runtime_control)) = astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::runtime_control_from_carrier(
@@ -16557,19 +16545,7 @@ impl ServerAgenticLoopHost {
         // target only after the provider response, from typed selection
         // evidence and the current catalog digest; normal admission and
         // execution still apply to that target.
-        let reconciliation_active = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .is_some_and(|window| {
-                matches!(
-                    window.action,
-                    crate::turn::agentic_loop::host::CompletionAction::OutcomeReconciliation { .. }
-                )
-            })
-            && !restricted_tools.contains("submit_task_resolution");
-        if !tools.is_empty() || reconciliation_active {
+        if !tools.is_empty() {
             // Keep the stable resident schemas contiguous. The carrier is
             // part of that stable prefix; dynamic schemas remain after it so
             // their per-turn churn cannot move the cache breakpoint.
@@ -16695,25 +16671,6 @@ impl ServerAgenticLoopHost {
             self.resolved_context_window,
             state,
         );
-        if state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .is_some_and(|window| {
-                matches!(
-                    window.action,
-                    crate::turn::agentic_loop::host::CompletionAction::OutcomeReconciliation { .. }
-                )
-            })
-            && current_deferred_tool_schemas
-                .iter()
-                .any(|schema| tool_schema_name(schema) == Some("submit_task_resolution"))
-        {
-            // A runtime-required transition does not depend on tool_search;
-            // its exact contract is carried by the completion-action hint.
-            activatable_deferred_tool_names.insert("submit_task_resolution".into());
-        }
         if state.hooks.completion_settlement.work_settlement_only {
             activatable_deferred_tool_names.retain(|name| name == "settle_work_item");
         }
@@ -29523,17 +29480,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_resolution_mixed_authorities_survive_executor_recreation() {
+    async fn handoff_preserves_mixed_completion_authorities_and_validates_identity() {
         use astra_services::session_journal::ToolCallRecord;
-        use astra_turn_types::task_resolution::{
-            TaskResolutionAssessment, TaskResolutionConclusion,
-        };
         use astra_turn_types::{
             DurableToolReference, ToolInvocationCompletionRef, ToolInvocationDecision,
             ToolInvocationFingerprint, ToolInvocationIdentity, ToolInvocationResultPayload,
             ToolInvocationTerminalOutcome,
         };
-        let workspace = tempfile::tempdir().unwrap();
         let ledger = crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new(None);
         let identity =
             ToolInvocationIdentity::new("user1", "sess1", "run1", "chain", "failed").unwrap();
@@ -29684,78 +29637,6 @@ mod tests {
         let unknown: Vec<HistoricalToolCallContinuation> = serde_json::from_value(wire).unwrap();
         assert!(unknown[0].completion.is_none());
         assert!(unknown[0].record.execution_completion.is_none());
-        // Exercise the reconstructed continuation, not the original live
-        // records: ordinary record serde deliberately drops authority.
-        let records = decoded
-            .into_iter()
-            .map(|entry| {
-                let mut record = entry.record;
-                record.execution_completion = entry.completion;
-                record
-            })
-            .collect::<Vec<_>>();
-        let assessment = TaskResolutionAssessment {
-            scope: "intent".into(),
-            boundary_id: "boundary".into(),
-            verification_target: "requested target".into(),
-            failed_call_ids: vec!["failed".into()],
-            evidence_call_ids: vec!["later".into()],
-            conclusion: TaskResolutionConclusion::Supported,
-            rationale: "Later direct observation supports target.".into(),
-            remaining_gaps: vec![],
-        };
-        let canonical = serde_json::to_string(&edge_result).unwrap();
-        let shared = Arc::new(StaticWaitResultEdgeDispatch {
-            result_json: Some(canonical.clone()),
-        });
-        for _ in 0..2 {
-            let mut executor = runtime_tool_executor_with_agent_context(workspace.path())
-                .with_tool_execution_service(
-                    crate::server::tool_execution_service::ToolExecutionService::builder()
-                        .edge_dispatch_service(shared.clone())
-                        .build(),
-                );
-            executor.set_invocation_ledger(ledger.clone());
-            assert_eq!(
-                executor
-                    .validate_task_resolution_evidence(
-                        &assessment,
-                        "intent",
-                        "boundary",
-                        "run1",
-                        "chain",
-                        &records
-                    )
-                    .await,
-                Ok(())
-            );
-        }
-        let mut tampered = edge_result.clone();
-        tampered.output = "different observation".into();
-        for result_json in [None, Some(serde_json::to_string(&tampered).unwrap())] {
-            let mut executor = runtime_tool_executor_with_agent_context(workspace.path())
-                .with_tool_execution_service(
-                    crate::server::tool_execution_service::ToolExecutionService::builder()
-                        .edge_dispatch_service(Arc::new(StaticWaitResultEdgeDispatch {
-                            result_json,
-                        }))
-                        .build(),
-                );
-            executor.set_invocation_ledger(ledger.clone());
-            assert!(
-                executor
-                    .validate_task_resolution_evidence(
-                        &assessment,
-                        "intent",
-                        "boundary",
-                        "run1",
-                        "chain",
-                        &records
-                    )
-                    .await
-                    .is_err()
-            );
-        }
     }
 
     fn sample_edge_tools() -> Vec<Value> {
@@ -45971,58 +45852,6 @@ mod tests {
         let result: Value = serde_json::from_str(&rejected.result).expect("structured rejection");
         assert_eq!(result["error_kind"], "work_settlement_only");
         assert_eq!(result["retryable"], true);
-    }
-
-    #[test]
-    fn task_resolution_carrier_requires_window_and_keeps_resident_schemas() {
-        let mut host = test_host_builder("user", "session")
-            .with_edge_tools(sample_edge_tools())
-            .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .build();
-        let mut state = create_test_state();
-        let before = host.visible_turn_tools(&mut state);
-        let carrier = json!({
-            "id": "assessment", "type": "function", "function": {
-                "name": "invoke_tool",
-                "arguments": json!({"name": "submit_task_resolution", "arguments": {"boundary_id": "boundary"}}).to_string()
-            }
-        });
-        let admitted = |state: &AgenticLoopState, host: &ServerAgenticLoopHost| {
-            host.canonicalize_tool_admission_for_state(
-                state,
-                crate::turn::agentic::tool_interception::admit_tool_calls(
-                    std::slice::from_ref(&carrier),
-                    Some("tool_calls"),
-                ),
-            )
-        };
-        assert!(admitted(&state, &host).admitted.is_empty());
-        state.hooks.completion_settlement.completion_action_window =
-            Some(astra_turn_types::CompletionActionWindow {
-                action: crate::turn::agentic_loop::host::CompletionAction::OutcomeReconciliation {
-                    boundary_id: "boundary".into(),
-                },
-                attempts_remaining: 1,
-                mismatch_corrections_remaining: 1,
-                consumed: false,
-                matched: false,
-            });
-        let after = host.visible_turn_tools(&mut state);
-        assert_eq!(
-            before, after,
-            "reconciliation must not insert the target schema into tools[]"
-        );
-        let active = admitted(&state, &host);
-        assert_eq!(active.admitted.len(), 1);
-        assert_eq!(active.admitted[0].runtime_control_kind(), Some(
-            astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::OutcomeReconciliation));
-        assert_eq!(active.admitted[0].physical_provider_call(), &carrier);
-        assert_eq!(
-            astra_turn_core::tool::args::shape::tool_call_name(
-                active.admitted[0].logical_target_call()
-            ),
-            Some("submit_task_resolution")
-        );
     }
 
     #[test]

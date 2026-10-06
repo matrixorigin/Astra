@@ -15,6 +15,8 @@ debug_log: true
 criteria:
   - type: exit_code
     code: 0
+  - type: final_state
+    expect: completed
   - type: journal_tool_outcome_count
     name: bash
     ok: false
@@ -25,18 +27,15 @@ criteria:
     document: error
     path: ""
     contains: "command not found"
-  - type: journal_tool_outcome_count
-    name: submit_task_resolution
-    ok: true
-    min: 1
-    max: 1
-  - type: journal_tool_json
-    name: submit_task_resolution
-    document: result
-    path: /conclusion
-    equals: supported
   - type: turn_rounds_between
     min: 3
     max: 10
   - type: text_not_contains
     needle: unresolved_tool_outcomes
+  - type: hard_judger
+    threshold: 0.9
+    question: |
+      Does the durable tool evidence show exactly one unavailable-reader probe,
+      followed by a successful file read of README.md? Does the final answer
+      quote its exact observed first line and identify the approach that worked?
+      A guessed line, a different file, or a generic progress message fails.
