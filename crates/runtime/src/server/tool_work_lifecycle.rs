@@ -3199,7 +3199,6 @@ mod tests {
                 expected_control_epoch: None,
                 command_timeout_cap_ms: None,
                 delegation_model_admission: None,
-                task_resolution_authority: None,
             },
         )
         .await;
@@ -3217,7 +3216,6 @@ mod tests {
                 expected_control_epoch: None,
                 command_timeout_cap_ms: None,
                 delegation_model_admission: None,
-                task_resolution_authority: None,
             },
         )
         .await;
@@ -3241,7 +3239,6 @@ mod tests {
                 expected_control_epoch: None,
                 command_timeout_cap_ms: None,
                 delegation_model_admission: None,
-                task_resolution_authority: None,
             },
         )
         .await;
@@ -3294,7 +3291,6 @@ mod tests {
                 expected_control_epoch: None,
                 command_timeout_cap_ms: None,
                 delegation_model_admission: None,
-                task_resolution_authority: None,
             },
         )
         .await;
@@ -3394,7 +3390,6 @@ mod tests {
                 expected_control_epoch: None,
                 command_timeout_cap_ms: None,
                 delegation_model_admission: None,
-                task_resolution_authority: None,
             },
         )
         .await;
@@ -3448,7 +3443,6 @@ mod tests {
                 expected_control_epoch: None,
                 command_timeout_cap_ms: None,
                 delegation_model_admission: None,
-                task_resolution_authority: None,
             },
         )
         .await;
@@ -3506,7 +3500,6 @@ mod tests {
                 expected_control_epoch: None,
                 command_timeout_cap_ms: None,
                 delegation_model_admission: None,
-                task_resolution_authority: None,
             },
         )
         .await;
@@ -3537,7 +3530,6 @@ mod tests {
                 expected_control_epoch: None,
                 command_timeout_cap_ms: None,
                 delegation_model_admission: None,
-                task_resolution_authority: None,
             },
         )
         .await;
@@ -3661,7 +3653,6 @@ mod tests {
                     expected_control_epoch: None,
                     command_timeout_cap_ms: None,
                     delegation_model_admission: None,
-                    task_resolution_authority: None,
                 },
             )
             .await;
@@ -3775,7 +3766,6 @@ mod tests {
                 expected_control_epoch: None,
                 command_timeout_cap_ms: None,
                 delegation_model_admission: None,
-                task_resolution_authority: None,
             },
         )
         .await;

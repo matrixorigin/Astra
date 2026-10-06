@@ -2357,17 +2357,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                         expected_owner_generation: state.current_run_owner_generation,
                     },
                 );
-            let task_resolution_authority = state.hooks.completion_settlement.completion_action_window
-            .as_ref().filter(|window| window.consumed && window.matched)
-            .and_then(|window| {
-                let super::host::CompletionAction::OutcomeReconciliation { boundary_id } = &window.action else { return None; };
-                let [call] = all_tool_calls else { return None; };
-                let id = call.get("id").and_then(Value::as_str)?;
-                super::execution_phase::completion_action_match_label(state, &window.action, call)?;
-                astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority::for_admitted_call(boundary_id, id)
-            });
             let headless_outcome = super::super::agentic::headless_round::run_agentic_headless_tool_round_with_action_fence(HeadlessToolRoundCtx {
-            task_resolution_authority: task_resolution_authority.as_ref(),
             turn_index,
             session_turn: session_turn_number(state),
             quiet: headless_quiet,
@@ -2797,18 +2787,9 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             state,
             round_records_start,
         );
-        let reconciliation_boundary =
-            super::execution_phase::task_resolution_boundary_id(host, state);
-        super::execution_phase::accept_task_resolution_after_tool_round(
-            state,
-            evo_records_before,
-            reconciliation_boundary.as_deref(),
-        )
-        .await;
         super::execution_phase::advance_completion_action_window_after_tool_round_from_record_index(
             state,
             evo_records_before,
-            reconciliation_boundary.as_deref(),
         );
 
         // Admission and server preflight are one causal boundary. The latter can

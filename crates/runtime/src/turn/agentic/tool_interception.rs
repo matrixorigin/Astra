@@ -591,21 +591,6 @@ pub(crate) fn effective_runtime_allowed_tools(state: &AgenticLoopState) -> Optio
 }
 
 pub(crate) fn runtime_allows_tool(state: &AgenticLoopState, tool_name: &str) -> bool {
-    if tool_name == "submit_task_resolution"
-        && !state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .is_some_and(|window| {
-                matches!(
-                    window.action,
-                    super::super::agentic_loop::host::CompletionAction::OutcomeReconciliation { .. }
-                )
-            })
-    {
-        return false;
-    }
     if !optional_tool_is_enabled(state, tool_name) {
         return false;
     }

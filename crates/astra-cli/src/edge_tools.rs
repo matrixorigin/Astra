@@ -6779,7 +6779,6 @@ pub(crate) mod tests {
         fn invocation(tool_call_id: &str) -> astra_tools::tool_engine::ToolInvocationMetadata<'_> {
             astra_tools::tool_engine::ToolInvocationMetadata {
                 admission_deadline: None,
-                task_resolution_authority: None,
                 run_id: Some("run-convergence"),
                 turn_chain_id: Some("turn-convergence"),
                 tool_call_id: Some(tool_call_id),
@@ -6969,7 +6968,6 @@ pub(crate) mod tests {
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
-                    task_resolution_authority: None,
                     run_id: Some("run-external-noop"),
                     turn_chain_id: Some("turn-external-noop"),
                     tool_call_id: Some("call-external-noop"),

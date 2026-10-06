@@ -1,4 +1,4 @@
-//! Provider-neutral model assessments retained separately from execution facts.
+//! References to the existing execution authorities used by journals and verification.
 
 use serde::{Deserialize, Serialize};
 
@@ -50,69 +50,4 @@ impl From<crate::ToolInvocationCompletionRef> for ToolExecutionEvidenceRef {
     fn from(reference: crate::ToolInvocationCompletionRef) -> Self {
         Self::Invocation(Box::new(reference))
     }
-}
-
-/// Request-local authority minted only by shared completion-action admission.
-/// Deliberately not serializable/deserializable as provider arguments.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskResolutionSubmissionAuthority {
-    boundary_id: String,
-    logical_call_id: String,
-}
-
-impl TaskResolutionSubmissionAuthority {
-    pub fn for_admitted_call(boundary_id: &str, logical_call_id: &str) -> Option<Self> {
-        if boundary_id.trim().is_empty() || logical_call_id.trim().is_empty() {
-            return None;
-        }
-        Some(Self {
-            boundary_id: boundary_id.into(),
-            logical_call_id: logical_call_id.into(),
-        })
-    }
-
-    pub fn boundary_id(&self) -> &str {
-        &self.boundary_id
-    }
-
-    pub fn for_call(&self, logical_call_id: &str) -> Option<&Self> {
-        (self.logical_call_id == logical_call_id).then_some(self)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskResolutionConclusion {
-    Supported,
-    Partial,
-    Unknown,
-}
-
-/// Model-authored interpretation only. Execution scope and reconciliation
-/// boundary belong to the runtime and cannot be supplied by the model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskResolutionProposal {
-    pub verification_target: String,
-    pub failed_call_ids: Vec<String>,
-    pub evidence_call_ids: Vec<String>,
-    pub conclusion: TaskResolutionConclusion,
-    pub rationale: String,
-    pub remaining_gaps: Vec<String>,
-}
-
-/// A model interpretation, never an execution receipt. The runtime checks scope
-/// and boundary against its own state. Target and rationale describe the claim;
-/// neither grants evidence identity, execution authority or verification success.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskResolutionAssessment {
-    pub scope: String,
-    pub boundary_id: String,
-    pub verification_target: String,
-    pub failed_call_ids: Vec<String>,
-    pub evidence_call_ids: Vec<String>,
-    pub conclusion: TaskResolutionConclusion,
-    pub rationale: String,
-    pub remaining_gaps: Vec<String>,
 }

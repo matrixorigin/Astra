@@ -5106,12 +5106,12 @@ mod tests {
             )
         };
         let reconciliation = settlement(
-            "submit the bounded assessment now",
-            "outcome_reconciliation_required.v1",
+            "report the specific unmet obligation",
+            "completion_settlement.v2",
         );
         let assessed = settlement(
-            "report the accepted assessment accurately",
-            "task_resolution_assessed.v1",
+            "report the preserved partial answer",
+            "test_settlement_observation.v1",
         );
 
         assert!(!message_text(&baseline[0]).contains("completion_settlement.v2"));
@@ -5132,7 +5132,7 @@ mod tests {
             .iter()
             .position(|message| {
                 message.get("role").and_then(Value::as_str) == Some("user")
-                    && message_text(message).contains("outcome_reconciliation_required.v1")
+                    && message_text(message).contains("completion_settlement.v2")
             })
             .expect("required completion settlement facts remain provider-visible");
         assert!(settlement_index > 0);
@@ -5150,7 +5150,7 @@ mod tests {
         );
         let provider_instruction = message_text(&reconciliation[0]);
         assert!(provider_instruction.contains("boundary_instruction"));
-        assert!(!provider_instruction.contains("submit the bounded assessment now"));
+        assert!(!provider_instruction.contains("report the specific unmet obligation"));
         assert_eq!(
             reconciliation[0], assessed[0],
             "stage-specific guidance must stay in runtime context facts"
@@ -5166,12 +5166,12 @@ mod tests {
         );
         let provider_facts = message_text(&reconciliation[settlement_index]);
         assert!(provider_facts.contains("boundary_instruction"));
-        assert!(provider_facts.contains("submit the bounded assessment now"));
-        assert!(!provider_facts.contains("task_resolution_assessed.v1"));
+        assert!(provider_facts.contains("report the specific unmet obligation"));
+        assert!(!provider_facts.contains("test_settlement_observation.v1"));
         assert!(assessed.iter().any(|message| {
             message["role"] == "user"
-                && message_text(message).contains("task_resolution_assessed.v1")
-                && message_text(message).contains("report the accepted assessment accurately")
+                && message_text(message).contains("test_settlement_observation.v1")
+                && message_text(message).contains("report the preserved partial answer")
         }));
     }
 

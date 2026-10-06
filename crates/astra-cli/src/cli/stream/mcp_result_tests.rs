@@ -183,7 +183,6 @@ async fn callback_through_pipeline(
         astra_pipeline::step_recorder::StepRecorder::new("test-user", "mcp-session", "test-task");
     recorder.begin_turn(1);
     run_agentic_headless_tool_round(HeadlessToolRoundCtx {
-        task_resolution_authority: None,
         turn_index: 0,
         session_turn: 1,
         quiet: true,
