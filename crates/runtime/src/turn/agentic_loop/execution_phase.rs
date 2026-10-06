@@ -19478,10 +19478,8 @@ mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete)
         );
-        assert_eq!(
-            state.final_text,
-            state.interruption.as_ref().unwrap().user_message
-        );
+        assert_eq!(state.final_text, "Still done.");
+        assert_eq!(host.rendered_final_text, vec!["Still done.".to_string()]);
         assert!(
             state
                 .interruption

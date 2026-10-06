@@ -244,7 +244,7 @@ bar = { path = "local/bar" }
                                         capture_output=True, text=True)
                 if missing:
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("failed to load source", result.stderr)
+                    self.assertIn(str(root / missing), result.stderr)
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
 

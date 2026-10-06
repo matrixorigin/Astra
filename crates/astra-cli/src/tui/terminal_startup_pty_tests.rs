@@ -573,6 +573,11 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                 }
                 "resize_reply" | "resize_fragmented" | "resize_timeout" | "resize_missed"
                 | "resize_invalid" => {
+                    if case == "resize_missed" {
+                        // Let the idle reader consume an unchanged watchdog
+                        // tick before resizing without a SIGWINCH wake.
+                        std::thread::sleep(Duration::from_millis(150));
+                    }
                     let size = Winsize {
                         ws_row: 20,
                         ws_col: 60,
