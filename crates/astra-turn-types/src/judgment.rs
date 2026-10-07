@@ -39,6 +39,10 @@ pub enum JudgmentQuestion {
     Choice {
         instructions: String,
         criteria: BTreeMap<String, JudgmentCriterion>,
+        /// Local consumer policy, stripped from the provider-native request.
+        /// Missing or invalid observational answers abstain; required answers
+        /// retain the strict identity, value and provenance contract.
+        optional: bool,
     },
     Score {
         instructions: String,
@@ -181,6 +185,7 @@ impl JudgmentRequest {
                 JudgmentQuestion::Choice {
                     instructions,
                     criteria,
+                    ..
                 } => {
                     validate_instructions(instructions)?;
                     if criteria.is_empty() || criteria.len() > 255 {
@@ -214,21 +219,32 @@ impl JudgmentRequest {
     }
 }
 
+impl JudgmentQuestion {
+    fn is_optional(&self) -> bool {
+        matches!(self, Self::Choice { optional: true, .. })
+    }
+}
+
 impl JudgmentResponse {
     pub fn validate_for(&self, request: &JudgmentRequest) -> Result<(), &'static str> {
         request.validate()?;
         if self.schema_version != JUDGMENT_SCHEMA_VERSION
             || self.model.trim().is_empty()
-            || !self.answers.keys().eq(request.questions.keys())
+            || self
+                .answers
+                .keys()
+                .any(|id| !request.questions.contains_key(id))
         {
             return Err("judgment answer identity mismatch");
         }
 
         for (id, question) in &request.questions {
-            let answer = self
-                .answers
-                .get(id)
-                .ok_or("judgment answer identity mismatch")?;
+            let Some(answer) = self.answers.get(id) else {
+                if question.is_optional() {
+                    continue;
+                }
+                return Err("judgment answer identity mismatch");
+            };
             match (question, answer) {
                 (JudgmentQuestion::Noul { .. }, JudgmentAnswer::Noul { noul }) => {
                     if !is_probability(*noul) {
@@ -681,15 +697,56 @@ pub fn normalize_judgment_response(
     let provenance = provenance.ok_or(JudgmentCodecError::Invalid(
         "missing execution judgment provenance",
     ))?;
-    let value = parse_unique_judgment_json(raw.as_bytes())?;
+    let mut value = parse_unique_judgment_json(raw.as_bytes())?;
+    let raw_answers = value
+        .get_mut("answers")
+        .and_then(Value::as_object_mut)
+        .ok_or(JudgmentCodecError::Invalid(
+            "judgment requires an answers object",
+        ))?;
+    if raw_answers
+        .keys()
+        .any(|id| !request.questions.contains_key(id))
+    {
+        return Err(JudgmentCodecError::Invalid(
+            "judgment answer identity mismatch",
+        ));
+    }
+    for (id, question) in request
+        .questions
+        .iter()
+        .filter(|(_, question)| question.is_optional())
+    {
+        let Some(raw_answer) = raw_answers.get(id) else {
+            continue;
+        };
+        let valid = serde_json::from_value::<JudgmentAnswer>(raw_answer.clone())
+            .ok()
+            .is_some_and(|answer| {
+                let single = JudgmentResponse {
+                    schema_version: JUDGMENT_SCHEMA_VERSION,
+                    model: model_identity.to_string(),
+                    answers: BTreeMap::from([(id.clone(), answer)]),
+                };
+                let contract = JudgmentRequest {
+                    schema_version: JUDGMENT_SCHEMA_VERSION,
+                    state: json!({}),
+                    questions: BTreeMap::from([(id.clone(), question.clone())]),
+                };
+                // Discrete nullable fields must be explicit, including null.
+                (provenance != JudgmentResponseProvenance::DiscreteDecision
+                    || serde_json::from_value::<DiscreteJudgmentAnswer>(raw_answer.clone()).is_ok())
+                    && single
+                        .validate_for_provenance(&contract, provenance)
+                        .is_ok()
+            });
+        if !valid {
+            raw_answers.remove(id);
+        }
+    }
     let mut response = match provenance {
         JudgmentResponseProvenance::DiscreteDecision => {
             let decisions: DiscreteJudgmentResponse = serde_json::from_value(value)?;
-            if !decisions.answers.keys().eq(request.questions.keys()) {
-                return Err(JudgmentCodecError::Invalid(
-                    "judgment answer identity mismatch",
-                ));
-            }
             let mut answers = BTreeMap::new();
             for (id, decision) in decisions.answers {
                 let answer = match decision {
@@ -759,6 +816,7 @@ mod tests {
                 (
                     "route".into(),
                     JudgmentQuestion::Choice {
+                        optional: false,
                         instructions: "Which route fits?".into(),
                         criteria: BTreeMap::from([
                             ("code".into(), json!("Source code work")),
@@ -786,6 +844,106 @@ mod tests {
         provenance: JudgmentResponseProvenance,
     ) -> Result<NormalizedJudgmentResponse, JudgmentCodecError> {
         normalize_judgment_response(&request(), raw, "actual-model", Some(provenance))
+    }
+
+    #[test]
+    fn optional_choice_abstains_at_the_shared_codec_without_relaxing_required_answers() {
+        let mut contract = request();
+        contract.questions.remove("progress");
+        let JudgmentQuestion::Choice { optional, .. } =
+            contract.questions.get_mut("route").unwrap()
+        else {
+            unreachable!()
+        };
+        *optional = true;
+        for provenance in [
+            JudgmentResponseProvenance::ProviderProbability,
+            JudgmentResponseProvenance::DiscreteDecision,
+        ] {
+            let required = match provenance {
+                JudgmentResponseProvenance::ProviderProbability => {
+                    json!({"type":"noul", "noul":0.9})
+                }
+                JudgmentResponseProvenance::DiscreteDecision => {
+                    json!({"type":"discrete_noul", "decision":"yes"})
+                }
+            };
+            for observation in [
+                None,
+                Some(Value::Null),
+                Some(
+                    json!({"type":"choice", "choice":"code", "probabilities":{"code":0.4,"docs":0.6},"confidence":1.0}),
+                ),
+                Some(json!({"type":"discrete_choice"})),
+                Some(json!({"type":"noul", "noul":1.0})),
+                Some(json!({"type":"discrete_choice", "option":"not-declared"})),
+            ] {
+                let mut wire = json!({"answers":{"noul":required}});
+                if provenance == JudgmentResponseProvenance::ProviderProbability {
+                    wire["schema_version"] = json!(JUDGMENT_SCHEMA_VERSION);
+                    wire["model"] = json!("native-provider");
+                }
+                if let Some(observation) = observation {
+                    wire["answers"]["route"] = observation;
+                }
+                let normalized = normalize_judgment_response(
+                    &contract,
+                    &wire.to_string(),
+                    "actual",
+                    Some(provenance),
+                )
+                .unwrap();
+                assert_eq!(
+                    normalized.response.answers.len(),
+                    1,
+                    "invalid optional answer must be omitted, not replaced by invented probabilities"
+                );
+                assert!(normalized.response.answers.contains_key("noul"));
+                wire["answers"]["unknown"] = Value::Null;
+                assert!(
+                    normalize_judgment_response(
+                        &contract,
+                        &wire.to_string(),
+                        "actual",
+                        Some(provenance)
+                    )
+                    .is_err()
+                );
+                wire["answers"].as_object_mut().unwrap().remove("unknown");
+                wire["answers"].as_object_mut().unwrap().remove("noul");
+                assert!(
+                    normalize_judgment_response(
+                        &contract,
+                        &wire.to_string(),
+                        "actual",
+                        Some(provenance)
+                    )
+                    .is_err()
+                );
+                let JudgmentQuestion::Choice { optional, .. } =
+                    contract.questions.get_mut("route").unwrap()
+                else {
+                    unreachable!()
+                };
+                *optional = false;
+                wire["answers"]["noul"] = required.clone();
+                assert!(
+                    normalize_judgment_response(
+                        &contract,
+                        &wire.to_string(),
+                        "actual",
+                        Some(provenance)
+                    )
+                    .is_err()
+                );
+                let JudgmentQuestion::Choice { optional, .. } =
+                    contract.questions.get_mut("route").unwrap()
+                else {
+                    unreachable!()
+                };
+                *optional = true;
+            }
+        }
     }
 
     #[test]
@@ -956,6 +1114,7 @@ mod tests {
         with_choice.questions.insert(
             "route".into(),
             JudgmentQuestion::Choice {
+                optional: false,
                 instructions: "Choose".into(),
                 criteria: BTreeMap::from([
                     ("a-long-option-name".into(), json!("Long description")),

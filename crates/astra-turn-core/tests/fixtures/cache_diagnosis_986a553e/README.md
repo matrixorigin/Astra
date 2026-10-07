@@ -36,10 +36,11 @@ message indices — are preserved verbatim.
 Loading this fixture through `evaluate_all` should trigger:
 
 - `cache_read_collapsed` — cache_read=7680 at t4 r0 → 0 at t4 r1
-- `volatile_in_cached_prefix` — MiniMax strict-history tool-loop
-  round with volatile content at msg[7] on round >0
 
 And specifically should NOT trigger:
+
+- `volatile_in_cached_prefix` — CurrentUserOnly admits required runtime context;
+  preserved text patterns do not identify optional versus required producers
 
 - `cc_marker_frozen` — MiniMax has no cache_control markers
 - `tool_marker_not_on_tail` — same reason (no tool cc index)

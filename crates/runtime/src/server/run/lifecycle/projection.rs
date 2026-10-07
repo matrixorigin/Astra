@@ -667,3 +667,333 @@ mod tests {
         );
     }
 }
+
+use super::spawn_observed;
+use super::{
+    AttachedStreamDelivery, DURABLE_LIVE_BATCH_FLUSH_INTERVAL, DurableLiveFanoutControl,
+    DurableToolTerminalTracker, PendingDurableLiveEvents, deliver_live_fanout_event,
+    flush_durable_live_events, flush_host_event_gap_recovery, process_ordered_live_fanout_event,
+    publish_live_persistence_failure, record_unforwarded_host_event,
+    record_unforwarded_host_event_tail,
+};
+
+impl super::AgenticRunLifecycleService {
+    pub(super) fn prepare_stream_delivery(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        run_state: &mut super::RunState,
+        host: &mut server_loop_host::ServerAgenticLoopHost,
+        event_channel: (mpsc::Sender<Value>, mpsc::Receiver<Value>),
+    ) -> (super::OwnedStreamDelivery, mpsc::Receiver<Value>) {
+        let user_id = user_id.to_owned();
+        let session_id = session_id.to_owned();
+        let run_id = run_id.to_owned();
+        // Network observer delivery is bounded. Internal producers are
+        // drained independently below so browser backpressure cannot drop an
+        // approval or permanently detach later host progress.
+        const SSE_CHANNEL_CAPACITY: usize = 512;
+        let (client_event_tx, event_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
+        let (event_tx, mut fanout_rx) = event_channel;
+        let (fanout_control_tx, mut fanout_control_rx) =
+            mpsc::channel::<DurableLiveFanoutControl>(1);
+        let durable_tool_terminals = DurableToolTerminalTracker::default();
+        let fanout_durable_tool_terminals = durable_tool_terminals.clone();
+        let (agent_live_gap_tracker, mut agent_live_gap_rx) = WorkSurfaceAgentLiveGapTracker::new();
+        let (live_tx, _) = broadcast::channel::<Value>(SSE_CHANNEL_CAPACITY);
+        let live_tx_for_fanout = live_tx.clone();
+        let mut client_event_tx_for_fanout = AttachedStreamDelivery::new(client_event_tx.clone());
+        let fanout_runs = self.runs_handle();
+        let fanout_run_engine = self.run_engine.clone();
+        let fanout_user_id = user_id.clone();
+        let fanout_session_id = session_id.clone();
+        let fanout_run_id = run_id.clone();
+        let fanout_gap_tracker = agent_live_gap_tracker.clone();
+        let _ = spawn_observed(
+            async move {
+                let mut gap_watch_open = true;
+                let mut control_open = true;
+                let mut pending = PendingDurableLiveEvents::default();
+                let flush_deadline = tokio::time::sleep(DURABLE_LIVE_BATCH_FLUSH_INTERVAL);
+                tokio::pin!(flush_deadline);
+                loop {
+                    tokio::select! {
+                        event = fanout_rx.recv() => {
+                            let Some(event) = event else {
+                                if let Err(error) = flush_durable_live_events(
+                                    &mut pending,
+                                    &fanout_run_engine,
+                                    &fanout_runs,
+                                    &fanout_user_id,
+                                    &fanout_session_id,
+                                    &fanout_run_id,
+                                    &live_tx_for_fanout,
+                                    &mut client_event_tx_for_fanout,
+                                    &fanout_durable_tool_terminals,
+                                ).await {
+                                    publish_live_persistence_failure(
+                                        &fanout_runs,
+                                        &live_tx_for_fanout,
+                                        &mut client_event_tx_for_fanout,
+                                        &fanout_user_id,
+                                        &fanout_run_id,
+                                        "live_event_persistence_failed",
+                                        "live run event could not be recorded durably",
+                                        &error,
+                                    ).await;
+                                }
+                                for gap in fanout_gap_tracker.drain() {
+                                    let event = agent_live_gap_to_work_surface_sse(gap);
+                                    deliver_live_fanout_event(
+                                        &live_tx_for_fanout,
+                                        &mut client_event_tx_for_fanout,
+                                        &fanout_run_id,
+                                        event,
+                                    )
+                                    .await;
+                                }
+                                break;
+                            };
+                            let starts_new_batch = pending.is_empty();
+                            if let Err(error) = process_ordered_live_fanout_event(
+                                event,
+                                &mut pending,
+                                &fanout_run_engine,
+                                &fanout_runs,
+                                &fanout_user_id,
+                                &fanout_session_id,
+                                &fanout_run_id,
+                                &live_tx_for_fanout,
+                                &mut client_event_tx_for_fanout,
+                                &fanout_durable_tool_terminals,
+                            ).await {
+                                publish_live_persistence_failure(
+                                    &fanout_runs,
+                                    &live_tx_for_fanout,
+                                    &mut client_event_tx_for_fanout,
+                                    &fanout_user_id,
+                                    &fanout_run_id,
+                                    error.code,
+                                    error.message,
+                                    &error.detail,
+                                ).await;
+                                break;
+                            }
+                            if starts_new_batch && !pending.is_empty() {
+                                flush_deadline.as_mut().reset(
+                                    tokio::time::Instant::now() + DURABLE_LIVE_BATCH_FLUSH_INTERVAL,
+                                );
+                            }
+                        }
+                        control = fanout_control_rx.recv(), if control_open => {
+                            let Some(DurableLiveFanoutControl::Flush { ack }) = control else {
+                                control_open = false;
+                                continue;
+                            };
+                            let mut result = Ok(());
+                            while let Ok(event) = fanout_rx.try_recv() {
+                                if let Err(error) = process_ordered_live_fanout_event(
+                                    event,
+                                    &mut pending,
+                                    &fanout_run_engine,
+                                    &fanout_runs,
+                                    &fanout_user_id,
+                                    &fanout_session_id,
+                                    &fanout_run_id,
+                                    &live_tx_for_fanout,
+                                    &mut client_event_tx_for_fanout,
+                                    &fanout_durable_tool_terminals,
+                                ).await {
+                                    publish_live_persistence_failure(
+                                        &fanout_runs,
+                                        &live_tx_for_fanout,
+                                        &mut client_event_tx_for_fanout,
+                                        &fanout_user_id,
+                                        &fanout_run_id,
+                                        error.code,
+                                        error.message,
+                                        &error.detail,
+                                    ).await;
+                                    result = Err(error.detail);
+                                    break;
+                                }
+                            }
+                            if result.is_ok() {
+                                result = flush_durable_live_events(
+                                    &mut pending,
+                                    &fanout_run_engine,
+                                    &fanout_runs,
+                                    &fanout_user_id,
+                                    &fanout_session_id,
+                                    &fanout_run_id,
+                                    &live_tx_for_fanout,
+                                    &mut client_event_tx_for_fanout,
+                                    &fanout_durable_tool_terminals,
+                                ).await;
+                                if let Err(error) = &result {
+                                    publish_live_persistence_failure(
+                                        &fanout_runs,
+                                        &live_tx_for_fanout,
+                                        &mut client_event_tx_for_fanout,
+                                        &fanout_user_id,
+                                        &fanout_run_id,
+                                        "live_event_persistence_failed",
+                                        "live run event could not be recorded durably",
+                                        error,
+                                    ).await;
+                                }
+                            }
+                            let failed = result.is_err();
+                            let _ = ack.send(result);
+                            if failed {
+                                break;
+                            }
+                        }
+                        _ = &mut flush_deadline, if !pending.is_empty() => {
+                            if let Err(error) = flush_durable_live_events(
+                                &mut pending,
+                                &fanout_run_engine,
+                                &fanout_runs,
+                                &fanout_user_id,
+                                &fanout_session_id,
+                                &fanout_run_id,
+                                &live_tx_for_fanout,
+                                &mut client_event_tx_for_fanout,
+                                &fanout_durable_tool_terminals,
+                            ).await {
+                                publish_live_persistence_failure(
+                                    &fanout_runs,
+                                    &live_tx_for_fanout,
+                                    &mut client_event_tx_for_fanout,
+                                    &fanout_user_id,
+                                    &fanout_run_id,
+                                    "live_event_persistence_failed",
+                                    "live run event could not be recorded durably",
+                                    &error,
+                                ).await;
+                                break;
+                            }
+                        }
+                        changed = agent_live_gap_rx.changed(), if gap_watch_open => {
+                            if changed.is_err() {
+                                gap_watch_open = false;
+                                continue;
+                            }
+                            for gap in fanout_gap_tracker.drain() {
+                                let event = agent_live_gap_to_work_surface_sse(gap);
+                                if let Err(error) = flush_durable_live_events(
+                                    &mut pending,
+                                    &fanout_run_engine,
+                                    &fanout_runs,
+                                    &fanout_user_id,
+                                    &fanout_session_id,
+                                    &fanout_run_id,
+                                    &live_tx_for_fanout,
+                                    &mut client_event_tx_for_fanout,
+                                    &fanout_durable_tool_terminals,
+                                ).await {
+                                    publish_live_persistence_failure(
+                                        &fanout_runs,
+                                        &live_tx_for_fanout,
+                                        &mut client_event_tx_for_fanout,
+                                        &fanout_user_id,
+                                        &fanout_run_id,
+                                        "live_event_persistence_failed",
+                                        "live run event could not be recorded durably",
+                                        &error,
+                                    ).await;
+                                    break;
+                                }
+                                deliver_live_fanout_event(
+                                    &live_tx_for_fanout,
+                                    &mut client_event_tx_for_fanout,
+                                    &fanout_run_id,
+                                    event,
+                                ).await;
+                            }
+                        }
+                    }
+                }
+            },
+            "sse_fanout",
+        );
+        let progress_bridge =
+            self.spawn_agent_progress_stream_bridge(run_id.clone(), event_tx.clone());
+
+        run_state.live_tx = Some(live_tx.clone());
+        run_state.attached_event_tx = Some(client_event_tx.downgrade());
+
+        const HOST_EVENT_CHANNEL_CAPACITY: usize = 256;
+        let (host_event_tx, mut host_event_rx) =
+            mpsc::channel::<Value>(HOST_EVENT_CHANNEL_CAPACITY);
+        let host_event_gap = server_loop_host::HostEventGapTracker::default();
+        let bridge_gap = host_event_gap.clone();
+        let host_event_bridge_tx = event_tx.clone();
+        let host_event_server_run_id = run_id.clone();
+        let host_event_bridge = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    event = host_event_rx.recv() => {
+                        let Some(event) = event else { break; };
+                        if !flush_host_event_gap_recovery(
+                            &host_event_bridge_tx,
+                            &bridge_gap,
+                            &host_event_server_run_id,
+                        )
+                        .await
+                        {
+                            record_unforwarded_host_event_tail(&mut host_event_rx, &bridge_gap);
+                            return;
+                        }
+                        let explain_event_id = (event.get("type").and_then(Value::as_str)
+                            == Some("explain_analyze"))
+                            .then(|| event.get("event_id").and_then(Value::as_str))
+                            .flatten()
+                            .map(str::to_owned);
+                        if let Err(error) = host_event_bridge_tx.send(event).await {
+                            record_unforwarded_host_event(&bridge_gap, error.0);
+                            record_unforwarded_host_event_tail(&mut host_event_rx, &bridge_gap);
+                            return;
+                        }
+                        if let Some(event_id) = explain_event_id {
+                            bridge_gap.acknowledge_explain_analyze_delivery(&event_id);
+                        }
+                    }
+                    _ = bridge_gap.notified() => {
+                        if !flush_host_event_gap_recovery(
+                            &host_event_bridge_tx,
+                            &bridge_gap,
+                            &host_event_server_run_id,
+                        )
+                        .await
+                        {
+                            record_unforwarded_host_event_tail(&mut host_event_rx, &bridge_gap);
+                            return;
+                        }
+                    }
+                }
+            }
+            let _ = flush_host_event_gap_recovery(
+                &host_event_bridge_tx,
+                &bridge_gap,
+                &host_event_server_run_id,
+            )
+            .await;
+        });
+        host.set_event_tx_with_gap(host_event_tx, host_event_gap.clone());
+
+        (
+            super::OwnedStreamDelivery {
+                event_tx,
+                fanout_control_tx,
+                durable_tool_terminals,
+                host_event_bridge,
+                host_event_gap,
+                progress_bridge,
+                agent_live_gap_tracker,
+            },
+            event_rx,
+        )
+    }
+}

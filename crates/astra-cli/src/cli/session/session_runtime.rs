@@ -297,12 +297,6 @@ pub(crate) struct ServerModelSelection {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct AdmittedServerModel {
-    pub model: ServerModelSelection,
-    pub thinking: astra_turn_core::thinking_config::ThinkingConfig,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ServerDefaultModel {
     Selected(ServerModelSelection),
     NoModels,
@@ -820,103 +814,6 @@ pub(crate) fn resolve_server_model_selection_from_catalog(
     Err(format!(
         "model '{model}' is not an active Server Offering in the authoritative catalog"
     ))
-}
-
-/// Resolve and admit a bounded batch of Offering IDs or exact configured-name
-/// selectors. Discovery and authorization stay on Server so a fanout does not
-/// need a catalog GET followed by a separate admission request.
-pub(crate) async fn admit_server_model_slots(
-    api: &astra_thin_client::ThinClient,
-    token: &str,
-    request: astra_server_types::ModelAdmissionRequestV1,
-) -> Result<Vec<AdmittedServerModel>, String> {
-    if request.slots.is_empty() {
-        return Ok(Vec::new());
-    }
-    for slot in &request.slots {
-        slot.selector.validate().map_err(str::to_string)?;
-    }
-    let body = serde_json::to_value(&request).map_err(|error| error.to_string())?;
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        api.post_bearer_path_json_text(token, astra_thin_client::paths::MODEL_ACCESS_ADMIT, &body),
-    )
-    .await
-    .map_err(|_| "model admission timed out before child launch".to_string())?
-    .map_err(|error| error.to_string())?;
-    let response: astra_server_types::ModelAdmissionResponseV1 = serde_json::from_str(&response)
-        .map_err(|error| format!("invalid model admission response: {error}"))?;
-    if response.slots.len() != request.slots.len() {
-        return Err("model admission response has incomplete slot coverage".to_string());
-    }
-    request
-        .slots
-        .iter()
-        .zip(response.slots)
-        .map(|(requested, admitted)| {
-            let selector_matches = match &requested.selector {
-                astra_turn_types::ModelSelector::OfferingId { offering_id } => {
-                    admitted.offering_id == *offering_id
-                }
-                astra_turn_types::ModelSelector::ConfiguredName { model_name, .. } => {
-                    admitted.model_name.eq_ignore_ascii_case(model_name)
-                }
-            };
-            let expected_reasoning = requested
-                .inherited_reasoning
-                .as_ref()
-                .filter(|inherited| inherited.offering_id == admitted.offering_id)
-                .map(|inherited| &inherited.reasoning)
-                .unwrap_or(&requested.reasoning);
-            if !selector_matches
-                || admitted.max_output_tokens != requested.max_output_tokens
-                || &admitted.reasoning != expected_reasoning
-                || admitted.model_name.trim().is_empty()
-                || admitted.context_window == Some(0)
-            {
-                return Err(
-                    "model admission response does not match the requested slot".to_string()
-                );
-            }
-            let reasoning = serde_json::from_value::<
-                astra_turn_core::orchestration_spawn_tool::ReasoningSelection,
-            >(admitted.reasoning)
-            .map_err(|error| format!("invalid admitted reasoning response: {error}"))?
-            .config();
-            Ok(AdmittedServerModel {
-                model: ServerModelSelection {
-                    pricing: None,
-                    name: admitted.model_name,
-                    context_window: admitted.context_window,
-                    offering_id: admitted.offering_id,
-                },
-                thinking: reasoning,
-            })
-        })
-        .collect()
-}
-
-pub(crate) async fn resolve_server_offering_selection(
-    api: &astra_thin_client::ThinClient,
-    token: &str,
-    offering_id: &str,
-) -> Result<ServerModelSelection, String> {
-    let request = astra_server_types::ModelAdmissionRequestV1 {
-        slots: vec![astra_server_types::ModelAdmissionSlotV1 {
-            selector: astra_turn_types::ModelSelector::OfferingId {
-                offering_id: offering_id.to_string(),
-            },
-            max_output_tokens: None,
-            reasoning: serde_json::json!({ "mode": "model_default" }),
-            inherited_reasoning: None,
-        }],
-    };
-    admit_server_model_slots(api, token, request)
-        .await?
-        .into_iter()
-        .next()
-        .map(|admitted| admitted.model)
-        .ok_or_else(|| "model admission returned no selected Offering".to_string())
 }
 
 /// Resolve the Server-governed default Offering when the user did not choose
@@ -2565,14 +2462,13 @@ mod tests {
     use super::{
         ACCESS_TOKEN_REFRESH_SKEW_SECS, BannerTextStyle, ModelCatalogError, RestoredSessionState,
         ServerDefaultModel, SilentRefreshError, access_token_needs_refresh,
-        admit_server_model_slots, applied_user_intents_from_turn_metadata, banner_session_display,
-        banner_welcome_text, create_pipeline_modules, current_access_token, current_git_root,
+        applied_user_intents_from_turn_metadata, banner_session_display, banner_welcome_text,
+        create_pipeline_modules, current_access_token, current_git_root,
         default_model_selection_from_access, ensure_state_default_model,
         fetch_server_model_catalog, fresh_access_token, git_root_from, initialize_session_state,
         load_server_model_access, model_default_invalid_reason_message,
         model_selection_for_name_from_catalog, pending_recovery_status_line,
-        resolve_server_default_model, resolve_server_model_selection,
-        resolve_server_offering_selection, restore_history_from_journal,
+        resolve_server_default_model, resolve_server_model_selection, restore_history_from_journal,
         restore_session_state_from_journal, restored_journal_state,
         should_keep_credentials_on_refresh_error, style_banner_text,
     };
@@ -2875,97 +2771,6 @@ mod tests {
         .expect("active Offering");
         assert_eq!(selection.offering_id, "offer-deepseek-pro");
         assert_eq!(selection.context_window, Some(1_000_000));
-    }
-
-    #[tokio::test]
-    async fn exact_offering_admission_requests_only_the_selected_slots() {
-        let mock = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/model-access/admit"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "slots": [
-                    {"offering_id":"offer-a","reasoning":{"mode":"model_default"},"model_name":"model-a","context_window":8192},
-                    {"offering_id":"offer-b","reasoning":{"mode":"model_default"},"model_name":"model-b","context_window":128000}
-                ]
-            })))
-            .expect(1)
-            .mount(&mock)
-            .await;
-        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
-        let request = astra_server_types::ModelAdmissionRequestV1 {
-            slots: ["offer-a", "offer-b"]
-                .into_iter()
-                .map(|offering_id| astra_server_types::ModelAdmissionSlotV1 {
-                    selector: astra_turn_types::ModelSelector::OfferingId {
-                        offering_id: offering_id.to_string(),
-                    },
-                    max_output_tokens: None,
-                    reasoning: serde_json::json!({ "mode": "model_default" }),
-                    inherited_reasoning: None,
-                })
-                .collect(),
-        };
-
-        let admitted = admit_server_model_slots(&api, "token", request)
-            .await
-            .expect("exact batch admission");
-        assert_eq!(admitted.len(), 2);
-        assert_eq!(admitted[0].model.offering_id, "offer-a");
-        assert_eq!(admitted[0].model.name, "model-a");
-        assert_eq!(admitted[1].model.offering_id, "offer-b");
-        assert_eq!(admitted[1].model.context_window, Some(128_000));
-
-        let requests = mock.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].method, "POST");
-        assert_eq!(requests[0].url.path(), "/model-access/admit");
-        assert_eq!(
-            requests[0].body_json::<serde_json::Value>().unwrap()["slots"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|slot| slot["selector"].clone())
-                .collect::<Vec<_>>(),
-            [
-                serde_json::json!({"kind":"offering_id", "offering_id":"offer-a"}),
-                serde_json::json!({"kind":"offering_id", "offering_id":"offer-b"}),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn exact_offering_resolution_uses_admission_without_catalog_scan() {
-        let mock = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/model-access/admit"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "slots": [{
-                    "offering_id":"offer-exact",
-                    "reasoning":{"mode":"model_default"},
-                    "model_name":"resolved-model",
-                    "context_window":64000
-                }]
-            })))
-            .expect(1)
-            .mount(&mock)
-            .await;
-        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
-
-        let selection = resolve_server_offering_selection(&api, "token", "offer-exact")
-            .await
-            .expect("exact Offering admission");
-        assert_eq!(selection.offering_id, "offer-exact");
-        assert_eq!(selection.name, "resolved-model");
-        assert_eq!(selection.context_window, Some(64_000));
-
-        let requests = mock.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].method, "POST");
-        assert_eq!(requests[0].url.path(), "/model-access/admit");
-        assert_eq!(
-            requests[0].body_json::<serde_json::Value>().unwrap()["slots"][0]["selector"],
-            serde_json::json!({"kind":"offering_id", "offering_id":"offer-exact"})
-        );
     }
 
     #[tokio::test]
@@ -3328,6 +3133,7 @@ mod tests {
     #[test]
     fn restore_history_empty_for_unknown_session() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
         let history = restore_history_from_journal("nonexistent-session-xyz-123").unwrap();
         assert!(history.is_empty());
     }
@@ -3336,6 +3142,7 @@ mod tests {
     #[test]
     fn restore_history_from_journal_roundtrip() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
         let sid = format!("test-restore-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -3376,6 +3183,7 @@ mod tests {
     #[test]
     fn restore_history_preserves_applied_user_intents_as_ordered_events() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
         let sid = format!("test-restore-deferred-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -3414,6 +3222,7 @@ mod tests {
     #[test]
     fn restore_history_preserves_duplicate_deferred_user_events() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
         let sid = format!("test-restore-deferred-dup-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -3490,6 +3299,7 @@ mod tests {
     #[test]
     fn restore_history_skips_non_turn_events() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
         let sid = format!("test-skip-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -3528,6 +3338,7 @@ mod tests {
     #[test]
     fn restore_session_state_recovers_turn_tools_and_tokens() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
         let sid = format!("test-state-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -3591,6 +3402,7 @@ mod tests {
     #[test]
     fn restore_session_state_uses_latest_session_segment() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
         let sid = format!("test-segment-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -3666,6 +3478,7 @@ mod tests {
     #[test]
     fn restore_session_state_keeps_recorded_turn_after_stray_session_start() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
         let sid = format!("test-stray-start-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -3740,6 +3553,7 @@ mod tests {
     #[test]
     fn restore_session_state_from_journal_surfaces_unreadable_journal() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
         let sid = format!("test-unreadable-{}", uuid::Uuid::new_v4());
         std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
 
@@ -3752,6 +3566,7 @@ mod tests {
     #[test]
     fn restored_journal_state_tracks_existence_and_last_turn_event() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
         let sid = format!("test-restore-journal-state-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
 
@@ -3812,6 +3627,7 @@ mod tests {
     #[serial_test::serial]
     fn restore_turn_error_advances_cursor_usage_and_guidance_without_partial_success() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
         let sid = format!("restore-turn-error-{}", uuid::Uuid::new_v4());
         let writer = astra_services::session_journal::JournalWriter::new(&sid).unwrap();
         let mut event = astra_services::session_journal::JournalEvent::turn_error(
@@ -3903,12 +3719,12 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn initialized_profile_identity_survives_fresh_session_rebind() {
+        let (tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
         let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
             "default", None,
         )
         .unwrap();
-        let (tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let _credentials = isolate_credentials();
         let _root = EnvGuard::set("ASTRA_LOCAL_STATE_ROOT", tmp.path().to_str().unwrap());
         let hub = astra_runtime::observability::ObservabilityHub::with_storage(
             tmp.path().join("observability"),
@@ -4161,6 +3977,7 @@ mod tests {
     #[test]
     fn pending_recovery_status_line_surfaces_persistence_degradation() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
         let sid = format!("pending-recovery-{}", uuid::Uuid::new_v4());
         let mut workspace =
             astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
@@ -4399,6 +4216,7 @@ mod tests {
     #[test]
     fn pending_recovery_status_line_surfaces_workspace_unreadable() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
         let sid = format!("pending-recovery-corrupt-{}", uuid::Uuid::new_v4());
         let workspace_dir = astra_services::session_workspace::workspace_dir_for(&sid);
         std::fs::create_dir_all(&workspace_dir).unwrap();

@@ -40,6 +40,21 @@ pub fn create_snapshot_for_db_sql(name: &str, db: &str) -> String {
     )
 }
 
+/// Restore one database from its snapshot within the explicitly selected account.
+pub fn restore_database_from_snapshot_sql(name: &str, account: &str, db: &str) -> String {
+    format!(
+        "RESTORE ACCOUNT {} DATABASE {} FROM SNAPSHOT {}",
+        quote_mysql_identifier(account),
+        quote_mysql_identifier(db),
+        quote_mysql_identifier(name)
+    )
+}
+
+/// Remove a snapshot after its restore has completed.
+pub fn drop_snapshot_sql(name: &str) -> String {
+    format!("DROP SNAPSHOT IF EXISTS {}", quote_mysql_identifier(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,6 +73,15 @@ mod tests {
             create_snapshot_for_db_sql("sp`1", "astra`runtime"),
             "CREATE SNAPSHOT `sp``1` FOR DATABASE `astra``runtime`"
         );
+    }
+
+    #[test]
+    fn restore_and_drop_escape_every_identifier() {
+        assert_eq!(
+            restore_database_from_snapshot_sql("sp`1", "tenant`a", "db`1"),
+            "RESTORE ACCOUNT `tenant``a` DATABASE `db``1` FROM SNAPSHOT `sp``1`"
+        );
+        assert_eq!(drop_snapshot_sql("sp`1"), "DROP SNAPSHOT IF EXISTS `sp``1`");
     }
 
     #[test]

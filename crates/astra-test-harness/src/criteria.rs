@@ -193,7 +193,9 @@ pub enum Criterion {
     /// also accept an exact terminal get_result read by that owning parent.
     /// Uses existing journal identities and trace hashes, not run storage.
     SessionChildResultAdopted {
-        expected_result: String,
+        /// When omitted, prove the complete staged result was adopted unchanged.
+        #[serde(default)]
+        expected_result: Option<String>,
         /// Restrict the originating spawn, e.g. to the required model or slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spawn_match: Option<SessionEventFieldMatch>,
@@ -401,7 +403,9 @@ pub enum Criterion {
     /// LLM judger whose result is a required product assertion rather than
     /// advisory quality feedback. Use this when a remote side effect has no
     /// deterministic receipt in the chat envelope (for example a memory
-    /// purge) and a failed judgement must fail the case.
+    /// purge) and a failed judgement must fail the case. The built-in backend
+    /// asks directly whether the evidence meets this criterion at its threshold;
+    /// it returns a verdict rather than an advisory quality grade.
     HardJudger {
         question: String,
         #[serde(default = "default_judger_threshold")]
@@ -1530,22 +1534,39 @@ fn session_event_ids_match_tool_result(
 
 fn child_result_adoption_proven(
     session: &SessionCapture,
-    expected_result: &str,
+    expected_result: Option<&str>,
     spawn_match: Option<&SessionEventFieldMatch>,
     allow_get_result: bool,
 ) -> bool {
-    let expected_hash = format!("{:x}", Sha256::digest(expected_result.as_bytes()));
+    let expected_hash =
+        expected_result.map(|result| format!("{:x}", Sha256::digest(result.as_bytes())));
     let calls = allow_get_result.then(|| session.journal_tool_calls());
     let events = &session.events;
+    if expected_result.is_none()
+        && (spawn_match.is_none()
+            || events
+                .iter()
+                .filter(|event| {
+                    event.event_type == "agent_spawned"
+                        && spawn_match.is_some_and(|predicate| {
+                            event.raw.pointer(&predicate.path) == Some(&predicate.equals)
+                        })
+                })
+                .count()
+                != 1)
+    {
+        return false;
+    }
     events
         .iter()
-        .filter(|event| {
+        .enumerate()
+        .filter(|(_, event)| {
             event.event_type == "agent_spawned"
                 && spawn_match.is_none_or(|predicate| {
                     event.raw.pointer(&predicate.path) == Some(&predicate.equals)
                 })
         })
-        .any(|spawn| {
+        .any(|(spawn_index, spawn)| {
             let Some(child_run_id) = spawn
                 .raw
                 .pointer("/metadata/run_id")
@@ -1570,7 +1591,7 @@ fn child_result_adoption_proven(
             if child_run_id.is_empty() || child_agent_id.is_empty() || parent_run_id.is_empty() {
                 return false;
             }
-            let terminated = events.iter().any(|event| {
+            let terminated = events.iter().position(|event| {
                 event.event_type == "agent_terminated"
                     && event
                         .raw
@@ -1588,7 +1609,10 @@ fn child_result_adoption_proven(
                         .and_then(serde_json::Value::as_str)
                         == Some("completed")
             });
-            if !terminated {
+            if terminated.is_none()
+                || (expected_result.is_none()
+                    && terminated.is_none_or(|index| index <= spawn_index))
+            {
                 return false;
             }
             if calls.as_ref().is_some_and(|calls| {
@@ -1599,19 +1623,89 @@ fn child_result_adoption_proven(
                     let Some(result) = call.result.as_ref() else {
                         return false;
                     };
-                    call.name == "agent"
-                        && call.ok == Some(true)
-                        && call.run_id.as_deref() == Some(parent_run_id)
-                        && arguments.get("action").and_then(serde_json::Value::as_str)
-                            == Some("get_result")
+                    if call.ok != Some(true) || call.run_id.as_deref() != Some(parent_run_id) {
+                        return false;
+                    }
+                    let action = arguments.get("action").and_then(serde_json::Value::as_str);
+                    let result = if call.name == "agent"
+                        && action == Some("get_result")
                         && arguments
                             .get("agent_id")
                             .and_then(serde_json::Value::as_str)
                             == Some(child_agent_id)
-                        && result
-                            .get("result_family")
+                    {
+                        result
+                    } else if call.name == "agent_fanout" && action == Some("get_results") {
+                        let Some(group_id) = spawn
+                            .raw
+                            .pointer("/metadata/fanout_slot/group_id")
                             .and_then(serde_json::Value::as_str)
-                            == Some("child_result")
+                            .filter(|id| !id.is_empty())
+                        else {
+                            return false;
+                        };
+                        if arguments
+                            .get("group_id")
+                            .and_then(serde_json::Value::as_str)
+                            != Some(group_id)
+                            || result.get("group_id").and_then(serde_json::Value::as_str)
+                                != Some(group_id)
+                            || result
+                                .pointer("/fanout/parent_run_id")
+                                .and_then(serde_json::Value::as_str)
+                                != Some(parent_run_id)
+                        {
+                            return false;
+                        }
+                        let Some(slot) = result
+                            .get("results")
+                            .and_then(serde_json::Value::as_array)
+                            .and_then(|slots| {
+                                slots.iter().find(|slot| {
+                                    slot.get("agent_id").and_then(serde_json::Value::as_str)
+                                        == Some(child_agent_id)
+                                        && slot.get("run_id").and_then(serde_json::Value::as_str)
+                                            == Some(child_run_id)
+                                })
+                            })
+                        else {
+                            return false;
+                        };
+                        let Some(body) = slot.get("result") else {
+                            return false;
+                        };
+                        let Some(bytes) = body
+                            .get("result")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|body| body.len() as u64)
+                        else {
+                            return false;
+                        };
+                        if slot
+                            .get("result_truncated")
+                            .and_then(serde_json::Value::as_bool)
+                            != Some(false)
+                            || slot
+                                .get("result_start_offset")
+                                .and_then(serde_json::Value::as_u64)
+                                != Some(0)
+                            || slot
+                                .get("result_end_offset")
+                                .and_then(serde_json::Value::as_u64)
+                                != Some(bytes)
+                            || slot.get("result_bytes").and_then(serde_json::Value::as_u64)
+                                != Some(bytes)
+                        {
+                            return false;
+                        }
+                        body
+                    } else {
+                        return false;
+                    };
+                    result
+                        .get("result_family")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("child_result")
                         && result.get("status").and_then(serde_json::Value::as_str)
                             == Some("completed")
                         && result
@@ -1622,8 +1716,35 @@ fn child_result_adoption_proven(
                             == Some(child_agent_id)
                         && result.get("run_id").and_then(serde_json::Value::as_str)
                             == Some(child_run_id)
-                        && result.get("result").and_then(serde_json::Value::as_str)
-                            == Some(expected_result)
+                        && result
+                            .get("result")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|result| {
+                                !result.is_empty()
+                                    && expected_result.is_none_or(|expected| result == expected)
+                            })
+                        && (expected_result.is_some()
+                            || call.round.is_some_and(|round| {
+                                events.iter().any(|event| {
+                                    event.event_type == "trace_span"
+                                        && event
+                                            .raw
+                                            .pointer("/metadata/attrs/outcome")
+                                            .and_then(serde_json::Value::as_str)
+                                            == Some("finalization_accepted")
+                                        && event
+                                            .raw
+                                            .pointer("/metadata/attrs/parent_run_id")
+                                            .and_then(serde_json::Value::as_str)
+                                            == Some(parent_run_id)
+                                        && event
+                                            .raw
+                                            .pointer("/metadata/attrs/round_index")
+                                            .and_then(serde_json::Value::as_str)
+                                            .and_then(|value| value.parse::<u32>().ok())
+                                            .is_some_and(|final_round| final_round > round)
+                                })
+                            }))
                 })
             }) {
                 return true;
@@ -1651,6 +1772,53 @@ fn child_result_adoption_proven(
                         .pointer("/metadata/attrs/children")
                         .and_then(serde_json::Value::as_str)
                         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+                    let staged_hash = expected_hash.clone().or_else(|| {
+                        events[..adoption_index].iter().enumerate().rev().find_map(
+                            |(staged_index, event)| {
+                                if terminated.is_none_or(|index| index >= staged_index)
+                                    || event.event_type != "trace_span"
+                                    || event
+                                        .raw
+                                        .pointer("/metadata/attrs/outcome")
+                                        .and_then(serde_json::Value::as_str)
+                                        != Some("results_staged")
+                                    || event
+                                        .raw
+                                        .pointer("/metadata/attrs/parent_run_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        != Some(parent_run_id)
+                                {
+                                    return None;
+                                }
+                                let children: serde_json::Value = serde_json::from_str(
+                                    event.raw.pointer("/metadata/attrs/children")?.as_str()?,
+                                )
+                                .ok()?;
+                                children.as_array()?.iter().find_map(|child| {
+                                    if child.get("run_id").and_then(serde_json::Value::as_str)
+                                        != Some(child_run_id)
+                                        || child.get("agent_id").and_then(serde_json::Value::as_str)
+                                            != Some(child_agent_id)
+                                        || child.get("status").and_then(serde_json::Value::as_str)
+                                            != Some("completed")
+                                        || child
+                                            .get("result_truncated")
+                                            .and_then(serde_json::Value::as_bool)
+                                            != Some(false)
+                                    {
+                                        return None;
+                                    }
+                                    let hash = child.get("result_sha256")?.as_str()?;
+                                    (hash.len() == 64
+                                        && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                                    .then(|| hash.to_string())
+                                })
+                            },
+                        )
+                    });
+                    let Some(staged_hash) = staged_hash else {
+                        return false;
+                    };
                     let matched_child = children
                         .as_ref()
                         .and_then(serde_json::Value::as_array)
@@ -1665,7 +1833,7 @@ fn child_result_adoption_proven(
                                     && child
                                         .get("result_sha256")
                                         .and_then(serde_json::Value::as_str)
-                                        == Some(expected_hash.as_str())
+                                        == Some(staged_hash.as_str())
                                     && child
                                         .get("result_truncated")
                                         .and_then(serde_json::Value::as_bool)
@@ -2249,7 +2417,7 @@ fn evaluate_one_with_primary_cache(
             };
             let passed = child_result_adoption_proven(
                 session,
-                expected_result,
+                expected_result.as_deref(),
                 spawn_match.as_ref(),
                 *allow_get_result,
             );
@@ -2258,10 +2426,11 @@ fn evaluate_one_with_primary_cache(
                 severity: CriterionSeverity::Hard,
                 passed,
                 detail: if !passed
+                    && expected_result.is_some()
                     && (1..=4096).contains(&outcome.text.len())
                     && child_result_adoption_proven(
                         session,
-                        &outcome.text,
+                        Some(&outcome.text),
                         spawn_match.as_ref(),
                         *allow_get_result,
                     ) {
@@ -2272,7 +2441,7 @@ fn evaluate_one_with_primary_cache(
                         } else {
                             ""
                         },
-                        Sha256::digest(expected_result.as_bytes()),
+                        Sha256::digest(expected_result.as_deref().unwrap_or_default().as_bytes()),
                         Sha256::digest(outcome.text.as_bytes()),
                     )
                 } else if *allow_get_result {
@@ -4893,9 +5062,17 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             spawn_match,
             ..
         } => {
-            if expected_result.is_empty() || expected_result.len() > 4_096 {
+            if expected_result
+                .as_ref()
+                .is_some_and(|result| result.is_empty() || result.len() > 4_096)
+            {
                 return Err(
                     "SessionChildResultAdopted.expected_result must be 1..=4096 bytes".into(),
+                );
+            }
+            if expected_result.is_none() && spawn_match.is_none() {
+                return Err(
+                    "SessionChildResultAdopted requires expected_result or spawn_match".into(),
                 );
             }
             if let Some(predicate) = spawn_match {
@@ -5919,6 +6096,160 @@ mod tests {
     }
 
     #[test]
+    fn variable_child_result_requires_unique_slot_and_complete_ordered_handoff() {
+        let hash = format!("{:x}", Sha256::digest(b"variable review findings"));
+        let children = serde_json::json!([{
+            "agent_id": "child-agent", "run_id": "child-run", "status": "completed",
+            "result_sha256": hash, "result_truncated": false
+        }])
+        .to_string();
+        let session = mk_session(&[
+            (
+                "agent_spawned",
+                serde_json::json!({"metadata": {
+                    "run_id": "child-run", "agent_id": "child-agent", "parent_run_id": "parent-run",
+                    "fanout_slot": {"slot_index": 0}
+                }}),
+            ),
+            (
+                "agent_terminated",
+                serde_json::json!({"metadata": {
+                    "run_id": "child-run", "agent_id": "child-agent", "status": "completed"
+                }}),
+            ),
+            (
+                "trace_span",
+                serde_json::json!({"metadata": {"attrs": {
+                    "parent_run_id": "parent-run", "outcome": "results_staged", "children": children
+                }}}),
+            ),
+            (
+                "trace_span",
+                serde_json::json!({"metadata": {"attrs": {
+                    "parent_run_id": "parent-run", "outcome": "results_adopted", "children": children
+                }}}),
+            ),
+            (
+                "trace_span",
+                serde_json::json!({"metadata": {"attrs": {
+                    "parent_run_id": "parent-run", "outcome": "finalization_accepted"
+                }}}),
+            ),
+        ]);
+        let criterion: Criterion = serde_yaml_ng::from_str(
+            "type: session_child_result_adopted\nspawn_match:\n  path: /metadata/fanout_slot/slot_index\n  equals: 0\n"
+        ).unwrap();
+        validate_criterion(&criterion).unwrap();
+        let check = |capture: &SessionCapture| {
+            evaluate_one(&criterion, &outcome_with_tools(&[]), Some(capture)).passed
+        };
+        assert!(check(&session));
+        let mut wrong = session.clone();
+        wrong.events.remove(2);
+        assert!(!check(&wrong), "adoption alone is insufficient");
+        let mut wrong = session.clone();
+        wrong.events.push(wrong.events[0].clone());
+        assert!(!check(&wrong), "duplicate slot identity is ambiguous");
+        for index in [2, 3] {
+            for (field, value) in [
+                ("result_sha256", serde_json::json!("wrong")),
+                ("result_truncated", serde_json::json!(true)),
+                ("run_id", serde_json::json!("other-child")),
+                ("agent_id", serde_json::json!("other-agent")),
+            ] {
+                let mut wrong = session.clone();
+                let mut children: serde_json::Value = serde_json::from_str(
+                    wrong.events[index].raw["metadata"]["attrs"]["children"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                children[0][field] = value;
+                wrong.events[index].raw["metadata"]["attrs"]["children"] =
+                    serde_json::json!(children.to_string());
+                assert!(!check(&wrong), "{index} {field}");
+            }
+            let mut wrong = session.clone();
+            wrong.events[index].raw["metadata"]["attrs"]["parent_run_id"] =
+                serde_json::json!("other-parent");
+            assert!(!check(&wrong));
+        }
+        let retrieved: Criterion = serde_yaml_ng::from_str(
+            "type: session_child_result_adopted\nallow_get_result: true\nspawn_match:\n  path: /metadata/fanout_slot/slot_index\n  equals: 0\n"
+        ).unwrap();
+        let mut foreground = mk_session(&[
+            ("agent_spawned", session.events[0].raw.clone()),
+            ("agent_terminated", session.events[1].raw.clone()),
+            (
+                "llm_round",
+                serde_json::json!({
+                    "turn": 1, "round": 2, "producer_scope": {"run_id": "parent-run"}, "tool_calls": [{
+                        "name": "agent", "tool_call_id": "read-full-child", "ok": true, "round": 2,
+                        "args_full": serde_json::json!({"action":"get_result", "agent_id":"child-agent"}).to_string(),
+                        "result_full": serde_json::json!({"result_family":"child_result", "status":"completed", "incomplete":false,
+                            "agent_id":"child-agent", "run_id":"child-run", "result":"complete variable findings"}).to_string()
+                    }]
+                }),
+            ),
+            (
+                "trace_span",
+                serde_json::json!({"metadata":{"attrs":{
+                    "parent_run_id":"parent-run", "outcome":"finalization_accepted", "round_index":"3"
+                }}}),
+            ),
+        ]);
+        let check_retrieved = |capture: &SessionCapture| {
+            evaluate_one(&retrieved, &outcome_with_tools(&[]), Some(capture)).passed
+        };
+        assert!(check_retrieved(&foreground));
+        let mut aggregate = foreground.clone();
+        aggregate.events[0].raw["metadata"]["fanout_slot"]["group_id"] =
+            serde_json::json!("review-group");
+        let call = &mut aggregate.events[2].raw["tool_calls"][0];
+        let body: serde_json::Value =
+            serde_json::from_str(call["result_full"].as_str().unwrap()).unwrap();
+        let bytes = body["result"].as_str().unwrap().len();
+        let slot = serde_json::json!({"agent_id":"child-agent", "run_id":"child-run", "result":body,
+            "result_start_offset":0, "result_end_offset":bytes, "result_bytes":bytes, "result_truncated":false});
+        call["name"] = serde_json::json!("agent_fanout");
+        call["args_full"] = serde_json::json!(
+            serde_json::json!({"action":"get_results", "group_id":"review-group"}).to_string()
+        );
+        let response = serde_json::json!({"group_id":"review-group", "fanout":{"parent_run_id":"parent-run"}, "results":[slot]});
+        call["result_full"] = serde_json::json!(response.to_string());
+        assert!(check_retrieved(&aggregate));
+        for (field, value) in [
+            ("result_truncated", serde_json::json!(true)),
+            ("result_start_offset", serde_json::json!(1)),
+            ("result_end_offset", serde_json::json!(bytes - 1)),
+            ("run_id", serde_json::json!("other-child")),
+        ] {
+            let mut wrong = aggregate.clone();
+            let mut response = response.clone();
+            response["results"][0][field] = value;
+            wrong.events[2].raw["tool_calls"][0]["result_full"] =
+                serde_json::json!(response.to_string());
+            assert!(!check_retrieved(&wrong), "partial or wrong slot {field}");
+        }
+
+        foreground.events[3].raw["metadata"]["attrs"]["round_index"] = serde_json::json!("2");
+        assert!(
+            !check_retrieved(&foreground),
+            "retrieval must precede parent finalization"
+        );
+        foreground.events.pop();
+        assert!(
+            !check_retrieved(&foreground),
+            "retrieval alone cannot authorize parent completion"
+        );
+        for pair in [(0, 1), (1, 2), (2, 3), (3, 4)] {
+            let mut wrong = session.clone();
+            wrong.events.swap(pair.0, pair.1);
+            assert!(!check(&wrong), "handoff order {pair:?}");
+        }
+    }
+
+    #[test]
     fn adopted_child_result_requires_exact_child_parent_hash_and_order() {
         let result = "ASTRA-CHILD-ANSWERED-JSON";
         let hash = format!("{:x}", Sha256::digest(result.as_bytes()));
@@ -5955,7 +6286,7 @@ mod tests {
             ),
         ]);
         let criterion = Criterion::SessionChildResultAdopted {
-            expected_result: result.into(),
+            expected_result: Some(result.into()),
             spawn_match: None,
             allow_get_result: false,
         };
@@ -5977,12 +6308,12 @@ mod tests {
         );
         assert!(!child_result_adoption_proven(
             &session,
-            "OTHER-RESULT",
+            Some("OTHER-RESULT"),
             None,
             false
         ));
         let mismatch = Criterion::SessionChildResultAdopted {
-            expected_result: "OTHER-RESULT".into(),
+            expected_result: Some("OTHER-RESULT".into()),
             spawn_match: None,
             allow_get_result: false,
         };
@@ -6000,7 +6331,7 @@ mod tests {
         };
         assert!(!child_result_adoption_proven(
             &session,
-            result,
+            Some(result),
             Some(&model_match),
             false
         ));
@@ -6010,7 +6341,7 @@ mod tests {
         });
         assert!(child_result_adoption_proven(
             &model_bound,
-            result,
+            Some(result),
             Some(&model_match),
             false
         ));
@@ -6018,7 +6349,7 @@ mod tests {
             serde_json::json!("other-model");
         assert!(!child_result_adoption_proven(
             &model_bound,
-            result,
+            Some(result),
             Some(&model_match),
             false
         ));
@@ -6167,7 +6498,7 @@ mod tests {
         );
         assert!(!check(&healthy), "adoption-only default remains strict");
         let foreground_mismatch = Criterion::SessionChildResultAdopted {
-            expected_result: "OTHER-RESULT".into(),
+            expected_result: Some("OTHER-RESULT".into()),
             spawn_match: None,
             allow_get_result: true,
         };
@@ -6249,8 +6580,11 @@ mod tests {
             else {
                 unreachable!()
             };
+            let expected_result = expected_result
+                .as_deref()
+                .expect("shipped exact-result case");
             let mut parent_marker = outcome.clone();
-            parent_marker.text = expected_result.clone();
+            parent_marker.text = expected_result.to_string();
             let journey_check = |capture: &SessionCapture| {
                 evaluate_deterministic_with_session(
                     std::slice::from_ref(witness),

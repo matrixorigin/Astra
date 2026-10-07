@@ -115,7 +115,6 @@ pub(crate) mod tests {
     pub(crate) use super::test_utils::test_temp_dir;
     pub(crate) use super::test_utils::wait_until;
 
-    pub(crate) use crate::cli::slash::slash_session::resolve_journal_target_session;
     pub(crate) use astra_services::session_journal;
     use axum::{Router, routing::get};
 

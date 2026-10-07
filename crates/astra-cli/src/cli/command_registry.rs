@@ -10,8 +10,6 @@
 //! menus, main.rs) should query this registry rather than maintaining their
 //! own static arrays.
 
-use crate::cli::command_usage;
-
 /// Task-oriented groups for the TUI command browser and grouped popup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandGroup {
@@ -772,84 +770,6 @@ pub fn resolve_command_meta(input: &str) -> Option<&'static CommandMeta> {
     COMMANDS.iter().find(|m| m.name == name)
 }
 
-/// Suggest commands similar to the input (for typo correction / fuzzy matching).
-pub fn suggest_commands(input: &str, limit: usize) -> Vec<&'static str> {
-    let mut scored: Vec<(usize, usize, &'static str)> = COMMANDS
-        .iter()
-        .map(|m| {
-            (
-                suggestion_score(m.name, input).saturating_add(command_usage::usage_boost(m.name)),
-                m.name.len(),
-                m.name,
-            )
-        })
-        .filter(|(score, _, _)| *score > 0)
-        .collect();
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2.cmp(b.2))
-    });
-    scored
-        .into_iter()
-        .take(limit)
-        .map(|(_, _, cmd)| cmd)
-        .collect()
-}
-
-fn suggestion_score(command: &str, query: &str) -> usize {
-    let cmd_lower = command.trim_start_matches('/').to_ascii_lowercase();
-    let query_lower = query.trim_start_matches('/').to_ascii_lowercase();
-    if query_lower.is_empty() {
-        return 0;
-    }
-    if cmd_lower == query_lower {
-        return 20_000;
-    }
-    if cmd_lower.starts_with(&query_lower) {
-        return 10_000 + (100_usize.saturating_sub(cmd_lower.len().min(100)));
-    }
-    if cmd_lower.contains(&query_lower) {
-        return 5_000 + (100_usize.saturating_sub(cmd_lower.len().min(100)));
-    }
-
-    let mut query_chars = query_lower.chars().peekable();
-    let mut consecutive = 0usize;
-    let mut score = 0usize;
-    for ch in cmd_lower.chars() {
-        if query_chars.peek() == Some(&ch) {
-            query_chars.next();
-            consecutive += 1;
-            score += consecutive;
-        } else {
-            consecutive = 0;
-        }
-    }
-
-    if query_chars.peek().is_none() {
-        1_000 + score + (100_usize.saturating_sub(cmd_lower.len().min(100)))
-    } else {
-        0
-    }
-}
-
-/// Get completion candidates for a command prefix.
-/// Returns (name, description) tuples sorted appropriately.
-pub fn completion_candidates(prefix: &str) -> Vec<(&'static str, &'static str)> {
-    let mut rows: Vec<(&'static str, &'static str)> = COMMANDS
-        .iter()
-        .filter(|m| m.name.starts_with(prefix))
-        .map(|m| (m.name, m.description))
-        .collect();
-    // Prefer the user's frequent commands, then stable command-name order.
-    rows.sort_by(|(a_name, _), (b_name, _)| {
-        let a_usage = command_usage::usage_count(a_name);
-        let b_usage = command_usage::usage_count(b_name);
-        b_usage.cmp(&a_usage).then_with(|| a_name.cmp(b_name))
-    });
-    rows
-}
-
 /// Registered commands that have a complete native workbench interaction.
 ///
 /// This is deliberately separate from `COMMANDS`: the registry also serves
@@ -874,36 +794,6 @@ pub fn commands_by_group(group: CommandGroup) -> impl Iterator<Item = &'static C
     tui_commands().filter(move |command| command.group == group)
 }
 
-/// Fuzzy completion candidates: returns matches scored by quality (best first).
-/// Falls back gracefully — prefix > contains > subsequence.
-pub fn fuzzy_completion_candidates(
-    partial: &str,
-    score_fn: impl Fn(&str, &str) -> Option<usize>,
-) -> Vec<(&'static str, &'static str)> {
-    let mut scored: Vec<(usize, u32, &'static str, &'static str)> = COMMANDS
-        .iter()
-        .filter_map(|m| {
-            score_fn(m.name, partial).map(|s| {
-                (
-                    s.saturating_add(command_usage::usage_boost(m.name)),
-                    command_usage::usage_count(m.name),
-                    m.name,
-                    m.description,
-                )
-            })
-        })
-        .collect();
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| b.1.cmp(&a.1))
-            .then_with(|| a.2.cmp(b.2))
-    });
-    scored
-        .into_iter()
-        .map(|(_, _, name, desc)| (name, desc))
-        .collect()
-}
-
 /// Get argument hint for a command (e.g., "/model" → "<name>").
 pub fn get_arg_hint(command: &str) -> Option<&'static str> {
     COMMANDS
@@ -917,11 +807,9 @@ pub fn get_arg_hint(command: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMANDS, CommandGroup, TuiCommandRoute, completion_candidates,
-        fuzzy_completion_candidates, get_arg_hint, resolve_command, resolve_command_meta,
-        subcommand_completions, suggest_commands, tui_commands,
+        COMMANDS, CommandGroup, TuiCommandRoute, get_arg_hint, resolve_command,
+        resolve_command_meta, subcommand_completions, tui_commands,
     };
-    use crate::cli::command_usage;
 
     #[test]
     fn all_commands_start_with_slash() {
@@ -1131,42 +1019,6 @@ mod tests {
     }
 
     #[test]
-    fn suggest_finds_similar() {
-        // Test prefix match - "/hel" should match "/help"
-        let suggestions = suggest_commands("/hel", 5);
-        assert!(
-            suggestions.contains(&"/help"),
-            "suggestions should include /help for prefix /hel"
-        );
-    }
-
-    #[test]
-    fn suggest_finds_fuzzy_typo() {
-        let suggestions = suggest_commands("/hlp", 5);
-        assert!(
-            suggestions.contains(&"/help"),
-            "suggestions should include /help for typo /hlp"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn completion_candidates_prioritize_frequently_used_commands() {
-        let dir = tempfile::tempdir().unwrap();
-        command_usage::set_test_dir(dir.path());
-        command_usage::reset_for_tests();
-        for _ in 0..6 {
-            command_usage::record_command_use("/session").unwrap();
-        }
-
-        let rows = completion_candidates("/");
-        assert_eq!(rows.first().map(|row| row.0), Some("/session"));
-
-        command_usage::clear_test_dir();
-        command_usage::reset_for_tests();
-    }
-
-    #[test]
     fn get_arg_hint_from_registry() {
         // Commands with arg_hint defined in registry
         assert_eq!(get_arg_hint("/model"), Some("[info | clear | <name>]"));
@@ -1180,19 +1032,6 @@ mod tests {
         // Command without arg_hint should return None
         assert!(get_arg_hint("/clear").is_none());
         assert!(get_arg_hint("/nonexistent").is_none());
-    }
-
-    #[test]
-    fn fuzzy_completion_candidates_find_canonical_commands() {
-        let rows = fuzzy_completion_candidates("/modl", |tok, partial| {
-            if tok == "/model" && partial == "/modl" {
-                Some(1)
-            } else {
-                None
-            }
-        });
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, "/model");
     }
 
     // ── resolve_command_meta / TUI delivery tests ────────────────────────

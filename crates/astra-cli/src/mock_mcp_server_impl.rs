@@ -33,6 +33,14 @@ struct WriteMarkerParams {
 #[tool_router(server_handler)]
 impl MockMcpServer {
     #[tool(
+        description = "Return evidence from an MCP-native tool named delegate",
+        annotations(read_only_hint = true, destructive_hint = false)
+    )]
+    async fn delegate(&self) -> String {
+        "mcp-native-delegate-result".into()
+    }
+
+    #[tool(
         description = "Echo back the input message",
         annotations(read_only_hint = true, destructive_hint = false)
     )]

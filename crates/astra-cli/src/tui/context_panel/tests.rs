@@ -460,7 +460,6 @@ fn prompt_signals_flip_matches_trace_flags() {
     };
     t.system_prompt.guidance_signals = PromptGuidanceSignals {
         parallel_batching_nudge: true,
-        ..PromptGuidanceSignals::default()
     };
     let b = ContextBreakdown::from_trace(&t);
     let names: Vec<&str> = b.prompt_signals.iter().map(|s| s.name).collect();

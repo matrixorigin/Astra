@@ -14,42 +14,74 @@ use super::lifecycle::{
 /// observability session, and persist to journal. Called from every exit path
 /// in the agentic loop so `/context breakdown` always reflects the latest turn.
 pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
-    // ── Update L1a SessionFacts from this turn's tool call records ──
     update_session_facts_from_turn(state);
-
     let Some(collector) = state.telemetry.turn_trace_collector.take() else {
         return;
     };
-    if let Some(ref session_id) = state.current_session_id {
+    let session_turn = session_turn_number(state);
+    finalize_session_turn_trace(TurnTraceFinalizationInput {
+        collector,
+        session_id: state.current_session_id.as_deref(),
+        session_turn,
+        max_turn_input_tokens: state.max_turn_input_tokens,
+        last_measured_prompt_tokens: state.last_measured_prompt_tokens,
+        context_compression_triggered: state.context_compression_triggered,
+        first_budget_pressure: &mut state.telemetry.first_budget_pressure,
+        pending_context_assembly_trace: &mut state.telemetry.pending_context_assembly_trace,
+        observability_session: state.telemetry.observability_session.clone(),
+        persistence: state.telemetry.context_trace_persistence.clone(),
+    })
+    .await;
+}
+
+/// Inputs shared by loop execution and remote stream settlement.
+pub struct TurnTraceFinalizationInput<'a> {
+    pub collector: astra_turn_core::turn_trace_collector::TurnTraceCollector,
+    pub session_id: Option<&'a str>,
+    pub session_turn: u32,
+    pub max_turn_input_tokens: u64,
+    pub last_measured_prompt_tokens: Option<u64>,
+    pub context_compression_triggered: bool,
+    pub first_budget_pressure: &'a mut f64,
+    pub pending_context_assembly_trace: &'a mut Option<(u32, serde_json::Value)>,
+    pub observability_session:
+        Option<std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
+    pub persistence: Option<super::host::ContextTracePersistenceContext>,
+}
+
+/// Settle measured context evidence without execution-loop state.
+pub async fn finalize_session_turn_trace(input: TurnTraceFinalizationInput<'_>) {
+    let collector = input.collector;
+    if let Some(session_id) = input.session_id {
         collector.set_session_id(session_id);
     }
-    let session_turn = session_turn_number(state);
+    let session_turn = input.session_turn;
     collector.set_turn_id(format!("turn-{session_turn}"));
-    let measured = state.last_measured_prompt_tokens.unwrap_or(0);
-    let max = state.max_turn_input_tokens;
+    let measured = input.last_measured_prompt_tokens.unwrap_or(0);
+    let max = input.max_turn_input_tokens;
     let budget_pressure = if max > 0 {
         measured as f64 / max as f64
     } else {
-        state.telemetry.first_budget_pressure
+        *input.first_budget_pressure
     };
     // Update peak pressure so the turn/eval journal events record the actual
     // final pressure, not the stale initial value from the first payload prep.
-    if budget_pressure > state.telemetry.first_budget_pressure {
-        state.telemetry.first_budget_pressure = budget_pressure;
+    if budget_pressure > *input.first_budget_pressure {
+        *input.first_budget_pressure = budget_pressure;
     }
     collector.record_token_budget(astra_turn_core::context_assembly_trace::TokenBudgetTrace {
         max_tokens: max as u32,
         total_used: measured as u32,
-        usage_source: state
+        usage_source: input
             .last_measured_prompt_tokens
             .map(|_| astra_turn_types::ContextWindowUsageSource::ProviderReported)
             .unwrap_or(astra_turn_types::ContextWindowUsageSource::Estimated),
         budget_pressure,
-        compression_triggered: state.context_compression_triggered,
+        compression_triggered: input.context_compression_triggered,
         ..Default::default()
     });
     let trace = collector.finalize();
-    if let Some(ref session) = state.telemetry.observability_session {
+    if let Some(ref session) = input.observability_session {
         let mut guard = astra_core::sync_poison::recover_rwlock_write(session);
         crate::observability::on_context_assembled(&mut guard, trace.clone());
     }
@@ -58,18 +90,22 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
         // An outer turn can issue multiple LLM requests. The latest request
         // is the only honest answer to "what context is active now?"; keeping
         // the first one made long tool turns look artificially small.
-        state.telemetry.pending_context_assembly_trace =
-            Some((session_turn, trace.to_json_value()));
+        *input.pending_context_assembly_trace = Some((session_turn, trace.to_json_value()));
     }
-    persist_latest_context_trace_signal(state).await;
+    persist_latest_context_trace_signal(
+        input.session_id,
+        input.persistence,
+        input.observability_session,
+    )
+    .await;
 }
 
-async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
-    let (session_id, persistence, session) = match (
-        state.current_session_id.as_deref(),
-        state.telemetry.context_trace_persistence.clone(),
-        state.telemetry.observability_session.clone(),
-    ) {
+async fn persist_latest_context_trace_signal(
+    session_id: Option<&str>,
+    persistence: Option<super::host::ContextTracePersistenceContext>,
+    session: Option<std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
+) {
+    let (session_id, persistence, session) = match (session_id, persistence, session) {
         (Some(session_id), Some(persistence), Some(session)) if !session_id.is_empty() => {
             (session_id.to_string(), persistence, session)
         }
@@ -218,12 +254,12 @@ async fn persist_context_trace_to_workspace_if_present(
 }
 
 fn persist_remote_composite_snapshot_index_blocking(
-    state: &AgenticLoopState,
+    persistence: Option<&super::host::ContextTracePersistenceContext>,
     session_id: &str,
     index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
     source: &str,
 ) {
-    let Some(persistence) = state.telemetry.context_trace_persistence.clone() else {
+    let Some(persistence) = persistence.cloned() else {
         return;
     };
     let session_id = session_id.to_string();
@@ -256,20 +292,13 @@ fn persist_remote_composite_snapshot_index_blocking(
     }
 }
 
-fn checkpoint_blocked_tools(restricted_tools: &std::collections::HashSet<String>) -> Vec<String> {
-    let mut blocked_tools: Vec<String> = restricted_tools.iter().cloned().collect();
-    blocked_tools.sort();
-    blocked_tools.dedup();
-    blocked_tools
-}
-
 /// Best-effort heavy checkpoint write.
 ///
 /// Several early-exit paths in the agentic loop (for example text-only
 /// responses and explicit stop-hook boundaries) skip the main post-tool-policy checkpoint.
 /// This helper ensures those paths still persist the accumulated messages so that
 /// `/debug` turn inspection and session recovery have accurate per-iteration state.
-fn same_recovery_state(left: &StepCheckpoint, right: &StepCheckpoint) -> bool {
+pub fn same_recovery_state(left: &StepCheckpoint, right: &StepCheckpoint) -> bool {
     let (StepCheckpoint::Heavy(left), StepCheckpoint::Heavy(right)) = (left, right) else {
         return false;
     };
@@ -298,76 +327,26 @@ fn same_recovery_state(left: &StepCheckpoint, right: &StepCheckpoint) -> bool {
 pub(crate) fn build_current_heavy_checkpoint(
     state: &mut AgenticLoopState,
 ) -> Option<astra_pipeline::step_protocol::HeavyCheckpoint> {
-    // Serialize the interruption record (if any) for checkpoint persistence.
-    let interruption_json = state.interruption.as_ref().map(|ir| ir.to_json());
-
-    // Serialize approval overrides (if any) for session continuity.
-    let approval_overrides_json = state
-        .approval_overrides
-        .as_ref()
-        .and_then(|ao| ao.to_json());
-
-    let checkpoint_blocked_tools = checkpoint_blocked_tools(&state.restricted_tools);
-    let checkpoint_messages =
-        astra_turn_core::runtime_scaffolding::sanitize_recoverable_runtime_messages(
-            state.messages.clone(),
-        );
-    astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::FinalizationCheckpointClone,
-        &checkpoint_messages,
-    );
-    let context_input_headroom_tokens = match (
-        state.max_turn_input_tokens,
-        state.last_measured_prompt_tokens,
-    ) {
-        (limit, Some(measured)) if limit > 0 => limit.saturating_sub(measured),
-        // Do not turn a missing measurement into an apparently full budget.
-        // Zero is the legacy checkpoint sentinel for an unavailable diagnostic.
-        _ => 0,
-    };
-    let mut heavy = state
-        .step_recorder
-        .build_heavy_checkpoint_with_interruption(
-            &checkpoint_messages,
-            context_input_headroom_tokens,
-            state.remaining_turns as u32,
-            &checkpoint_blocked_tools,
-            &state.recent_tools,
-            interruption_json,
-            approval_overrides_json,
-            state.consecutive_context_window_errors,
-        )?;
+    let mut heavy = astra_turn_core::turn_checkpoint::build_turn_continuity_checkpoint(
+        astra_turn_core::turn_checkpoint::TurnCheckpointInput {
+            step_recorder: &state.step_recorder,
+            messages: &state.messages,
+            max_turn_input_tokens: state.max_turn_input_tokens,
+            last_measured_prompt_tokens: state.last_measured_prompt_tokens,
+            remaining_turns: state.remaining_turns as u32,
+            restricted_tools: &state.restricted_tools,
+            recent_tools: &state.recent_tools,
+            interruption: state.interruption.as_ref(),
+            approval_overrides: state.approval_overrides.as_ref(),
+            consecutive_context_window_errors: state.consecutive_context_window_errors,
+            deferred_tool_activations: &mut state.deferred_tool_activations,
+            pipeline_session: state.pipeline_session.as_ref(),
+            workspace_observation_quarantine: state.stall.workspace_observation_quarantine.as_ref(),
+        },
+    )?;
     heavy.run_execution_budget = state.run_execution_budget_snapshot();
     heavy.run_execution_control = state.run_execution_control_snapshot();
-    // Carrier authority is deliberately reconstructed only from paired
-    // tool_search evidence with a schema digest. Name-only selection state is
-    // neither prompt continuity nor execution authority in this protocol.
-    state.deferred_tool_activations =
-        astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
-            &checkpoint_messages,
-            std::mem::take(&mut state.deferred_tool_activations),
-        );
-    heavy.deferred_tool_activations = state.deferred_tool_activations.clone();
-    // Persist compaction effectiveness state for enriched resume guidance.
     heavy.compaction_state = Some(state.compaction_effectiveness.to_json());
-    // Persist context pipeline state for warm-start on resume (includes emergent context).
-    if let Some(ref sess) = state.pipeline_session {
-        heavy.pipeline_state = match serde_json::to_value(sess.snapshot_full_state()) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                astra_core::agent_warn!(
-                    "checkpoint",
-                    "pipeline_state serialize failed (NaN cache ratio / bad histogram?); \
-                     resume will start cold — cache hit rate, feedback history, latches lost: {e}"
-                );
-                None
-            }
-        };
-    }
-    // Carry transport-neutral ownership uncertainty through a heavy
-    // checkpoint.  The next process must not infer safety from a trimmed
-    // local record window or from prose-only conversation state.
-    heavy.workspace_observation_quarantine = state.stall.workspace_observation_quarantine.clone();
     Some(heavy)
 }
 
@@ -421,41 +400,66 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     }
 
     let turn = session_turn_number(state);
-    let snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), turn)
-        .label(format!("checkpoint-t{turn}"))
-        .workspace_state(sid.clone())
-        .build();
+    if let Some((cp, snapshot)) = commit_session_continuity_checkpoint(
+        user_id,
+        sid,
+        turn,
+        cp,
+        state.telemetry.context_trace_persistence.as_ref(),
+    ) {
+        state.last_composite_snapshot = Some(snapshot);
+        state.stall.last_heavy_checkpoint = Some(cp);
+    }
+}
+
+/// Publish a root session checkpoint through the existing atomic transaction.
+/// Callers own root eligibility and unchanged-state checks. Their cached pointer
+/// must advance only after this function returns a committed checkpoint.
+pub fn commit_session_continuity_checkpoint(
+    user_id: &str,
+    session_id: &str,
+    turn: u32,
+    cp: StepCheckpoint,
+    persistence: Option<&super::host::ContextTracePersistenceContext>,
+) -> Option<(
+    StepCheckpoint,
+    astra_core::composite_snapshot::CompositeSnapshot,
+)> {
+    let snapshot =
+        astra_core::composite_snapshot::CompositeSnapshotBuilder::new(session_id.to_owned(), turn)
+            .label(format!("checkpoint-t{turn}"))
+            .workspace_state(session_id.to_owned())
+            .build();
     let (_ckpt_num, snapshot, index) =
-        match step_checkpoint::commit_composite_checkpoint(user_id, sid, &cp, snapshot) {
+        match step_checkpoint::commit_composite_checkpoint(user_id, session_id, &cp, snapshot) {
             Ok(committed) => committed,
             Err(error) => {
                 astra_core::agent_warn!(
                     "checkpoint",
-                    "Failed to atomically publish session checkpoint for {sid}: {error}"
+                    "Failed to atomically publish session checkpoint for {session_id}: {error}"
                 );
                 // The cross-process transaction did not publish a partial index.
                 // Leave local caches untouched so the next boundary retries.
-                return;
+                return None;
             }
         };
     persist_remote_composite_snapshot_index_blocking(
-        state,
-        sid,
+        persistence,
+        session_id,
         &index,
         "persist remote composite snapshot index",
     );
 
-    state.last_composite_snapshot = Some(snapshot);
-    state.stall.last_heavy_checkpoint = Some(cp);
+    Some((cp, snapshot))
 }
 
 /// Producer-scoped cleanup that also runs when the loop future is cancelled.
-struct UnattributedRecallRunBoundary {
+pub struct UnattributedRecallRunBoundary {
     scope: Option<(String, String)>,
 }
 
 impl UnattributedRecallRunBoundary {
-    fn new(scope: Option<(String, String)>) -> Self {
+    pub fn new(scope: Option<(String, String)>) -> Self {
         Self { scope }
     }
 
@@ -486,7 +490,7 @@ impl Drop for UnattributedRecallRunBoundary {
     }
 }
 
-fn journal_writer_for_owner(
+pub fn journal_writer_for_owner(
     user_id: Option<&str>,
     session_id: &str,
 ) -> std::io::Result<astra_services::session_journal::JournalWriter> {
@@ -560,9 +564,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     host.on_turn_terminal(state, &result).await;
 
     // Ensure SessionEnd fires even on error returns that skip finalize_and_render.
-    #[cfg(feature = "harness")]
-    if !input_wait_continuation && !state.harness.session_ended {
-        state.harness.session_ended = true;
+    if !input_wait_continuation {
         super::super::harness_adapter::harness_at!(
             &state.harness,
             astra_harness::HookPoint::SessionEnd,
@@ -698,16 +700,6 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     // ── Harness: SessionEnd (observe only, fire at most once) ──
     // Fire after terminal text/interruption normalization so snapshots expose
     // the real final state instead of a pre-finalization empty/completed shell.
-    #[cfg(feature = "harness")]
-    if !state.harness.session_ended {
-        state.harness.session_ended = true;
-        super::super::harness_adapter::harness_at!(
-            &state.harness,
-            astra_harness::HookPoint::SessionEnd,
-            state
-        );
-    }
-    #[cfg(not(feature = "harness"))]
     super::super::harness_adapter::harness_at!(
         &state.harness,
         astra_harness::HookPoint::SessionEnd,
@@ -718,109 +710,23 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
 }
 
 fn materialize_terminal_text_message(state: &mut AgenticLoopState) {
-    let final_text = state.final_text.trim();
-    if final_text.is_empty() {
-        return;
-    }
-    let current_turn_start = state
-        .messages
-        .iter()
-        .rposition(astra_turn_types::is_human_user_message)
-        .unwrap_or(0);
-    let already_materialized = state.messages[current_turn_start..]
-        .iter()
-        .rev()
-        .find(|message| {
-            message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
-        })
-        .is_some_and(|message| match state.final_text_model_item_id.as_deref() {
-            Some(id) => astra_turn_types::model_item_id(message) == Some(id),
-            None => {
-                astra_turn_types::model_item_id(message).is_none()
-                    && astra_turn_core::prompt_facing::extract_text_content(message)
-                        .is_some_and(|content| content.trim() == final_text)
-            }
-        });
-    if !already_materialized {
-        let mut message = serde_json::json!({
-            "role": "assistant",
-            "content": state.final_text.clone(),
-        });
-        astra_turn_types::mark_model_message(
-            &mut message,
+    if let Some(message) =
+        astra_turn_core::agentic_turn_ingest::terminal_assistant_message_to_append(
+            &state.messages,
+            &state.final_text,
             state.final_text_model_item_id.as_deref(),
-        );
+        )
+    {
         state.push_prompt_history_message(message);
     }
 }
 
 fn update_working_memory_for_turn_settlement(state: &mut AgenticLoopState) {
-    let interruption = state.interruption.clone();
-    let Some(session) = state.pipeline_session.as_mut() else {
-        return;
-    };
-    let memory = session.working_memory_mut();
-
-    // Rebuild blocker pressure from current settlement state instead of
-    // accumulating old outages/nudges across turns.
-    memory.clear_blockers();
-
-    let Some(interruption) = interruption.as_ref() else {
-        memory.clear_next_action();
-        return;
-    };
-
-    if interruption_requires_intervention(interruption) {
-        memory.clear_next_action();
-        memory.push_blocker(format!(
-            "{}: {}",
-            interruption.kind.label(),
-            bounded_working_memory_line(&interruption.user_message)
-        ));
-        return;
+    if let Some(session) = state.pipeline_session.as_mut() {
+        session
+            .working_memory_mut()
+            .apply_turn_settlement(state.interruption.as_ref());
     }
-
-    if matches!(
-        interruption.kind,
-        astra_turn_core::interruption::InterruptionKind::UserCancelled
-    ) {
-        memory.clear_next_action();
-        return;
-    }
-
-    if interruption.kind.is_resumable() {
-        memory.set_next_action(format!(
-            "If the user asks to continue, resume after {}: {}",
-            interruption.kind.label(),
-            bounded_working_memory_line(&interruption.user_message)
-        ));
-    } else {
-        memory.clear_next_action();
-    }
-}
-
-fn interruption_requires_intervention(
-    interruption: &astra_turn_core::interruption::InterruptionRecord,
-) -> bool {
-    matches!(
-        &interruption.resume_action,
-        astra_turn_core::interruption::ResumeAction::RequiresIntervention { .. }
-            | astra_turn_core::interruption::ResumeAction::StartNewSession
-    ) || !interruption.kind.is_resumable()
-}
-
-fn bounded_working_memory_line(raw: &str) -> String {
-    const MAX_CHARS: usize = 512;
-    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= MAX_CHARS {
-        return normalized;
-    }
-    let mut out = normalized
-        .chars()
-        .take(MAX_CHARS.saturating_sub(3))
-        .collect::<String>();
-    out.push_str("...");
-    out
 }
 
 fn settlement_interruption_summary(
@@ -1216,28 +1122,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_materialization_uses_model_identity_not_equal_text() {
-        let mut state = make_state();
-        state.messages = vec![
-            serde_json::json!({"role":"user", "content":"answer"}),
-            serde_json::json!({"role":"assistant", "content":"same", "model_item_id":"accepted-A"}),
-        ];
-        state.final_text = "same".into();
-        state.final_text_model_item_id = Some("resume-B".into());
-        materialize_terminal_text_message(&mut state);
-        materialize_terminal_text_message(&mut state);
-        assert_eq!(state.messages.len(), 3);
-        assert_eq!(
-            astra_turn_types::model_item_id(&state.messages[1]),
-            Some("accepted-A")
-        );
-        assert_eq!(
-            astra_turn_types::model_item_id(&state.messages[2]),
-            Some("resume-B")
-        );
-    }
-
-    #[test]
     fn deferred_candidate_keeps_origin_when_a_later_attempt_is_current() {
         let mut state = make_state();
         state.current_model_item_id = Some("partial-P".into());
@@ -1262,6 +1146,7 @@ mod tests {
             "content": "perform the typed operation"
         })];
         state.final_text = "Operation completed.".to_string();
+        state.begin_run_transcript_capture(std::iter::empty());
 
         materialize_terminal_text_message(&mut state);
         materialize_terminal_text_message(&mut state);
@@ -1269,36 +1154,11 @@ mod tests {
         assert_eq!(state.messages.len(), 2);
         assert_eq!(state.messages[1]["role"], "assistant");
         assert_eq!(state.messages[1]["content"], "Operation completed.");
-    }
-
-    #[test]
-    fn existing_model_answer_is_not_duplicated_during_finalization() {
-        let mut state = make_state();
-        state.messages = vec![
-            serde_json::json!({"role": "user", "content": "answer"}),
-            serde_json::json!({"role": "assistant", "content": "Done."}),
-        ];
-        state.final_text = "Done.".to_string();
-
-        materialize_terminal_text_message(&mut state);
-
-        assert_eq!(state.messages.len(), 2);
-    }
-
-    #[test]
-    fn earlier_equal_assistant_text_does_not_hide_the_actual_terminal_answer() {
-        let mut state = make_state();
-        state.messages = vec![
-            serde_json::json!({"role": "user", "content": "compare both stages"}),
-            serde_json::json!({"role": "assistant", "content": "Done."}),
-            serde_json::json!({"role": "assistant", "content": "Intermediate update."}),
-        ];
-        state.final_text = "Done.".to_string();
-
-        materialize_terminal_text_message(&mut state);
-
-        assert_eq!(state.messages.len(), 4);
-        assert_eq!(state.messages.last().unwrap()["content"], "Done.");
+        assert_eq!(
+            state.take_run_transcript_capture(),
+            vec![state.messages[1].clone()]
+        );
+        assert!(state.take_run_transcript_capture().is_empty());
     }
 
     #[test]

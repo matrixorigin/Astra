@@ -1,4 +1,4 @@
-//! Phase 13 TDD: observability, cascade responder, audit trail, session facts.
+//! Phase 13 TDD: observability, cascade responder, audit trail.
 
 use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::context_feedback::ContextFeedback;
@@ -132,25 +132,4 @@ fn drain_clears_pending_audits() {
 
     let second = sess.drain_pending_audits();
     assert!(second.is_empty());
-}
-
-// ── 13.7: SessionFacts pipeline extension ───────────────────────────────────
-
-#[test]
-fn session_facts_pipeline_fields_from_stats() {
-    use astra_turn_core::pipeline_session::PipelineSessionMetrics;
-
-    let mut stats = PipelineStats::default();
-    for i in 1..=5 {
-        let fb = ContextFeedback::from_usage(0, 800, 200, 300 + i * 50, false);
-        stats.record("model", "repl", &fb);
-    }
-    stats.record_compaction(1000);
-    stats.record_compaction(2000);
-
-    let metrics = PipelineSessionMetrics::from_stats(&stats);
-
-    assert!(metrics.avg_cache_hit_ratio > 0.5);
-    assert_eq!(metrics.total_compactions, 2);
-    assert_eq!(metrics.turns_executed, 5);
 }

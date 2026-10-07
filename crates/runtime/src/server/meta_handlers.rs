@@ -788,7 +788,7 @@ mod tests {
         let cooldown = crate::turn::model_cooldown::rate_limit_cooldown();
         cooldown.reset_for_tests();
         cooldown.with("metrics-model", |rl| {
-            rl.record_429(None, false);
+            rl.record_429(None);
         });
 
         let response = metrics_handler(State(state)).await.into_response();

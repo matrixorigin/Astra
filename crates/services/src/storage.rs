@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-05-v97";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-07-v99";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -156,7 +156,6 @@ const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
     checkpoint_json LONGTEXT NULL,
     error_code VARCHAR(128) NULL,
     error_message TEXT NULL,
-    retry_count INT NOT NULL DEFAULT 0,
     total_prompt_tokens BIGINT NOT NULL DEFAULT 0,
     total_completion_tokens BIGINT NOT NULL DEFAULT 0,
     total_tool_calls BIGINT NOT NULL DEFAULT 0,
@@ -242,7 +241,6 @@ const AGENT_RUNS_PRESERVED_COLUMNS: &[&str] = &[
     "checkpoint_json",
     "error_code",
     "error_message",
-    "retry_count",
     "total_prompt_tokens",
     "total_completion_tokens",
     "total_tool_calls",
@@ -1620,56 +1618,6 @@ where
         out.entry(child_event_id).or_default().push(parent_event_id);
     }
     Ok(out)
-}
-
-pub async fn delete_agent_event_edges_for_owned_event_ids<'e, E>(
-    executor: E,
-    owned_event_ids: &[(String, String)],
-) -> Result<u64, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = MySql>,
-{
-    let owned_event_ids: Vec<(String, String)> = owned_event_ids
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    if owned_event_ids.is_empty() {
-        return Ok(0);
-    }
-
-    let mut builder = QueryBuilder::<MySql>::new(
-        "DELETE FROM agent_event_edges WHERE (user_id, child_event_id) IN (",
-    );
-    {
-        let mut child_keys = builder.separated(", ");
-        for (user_id, event_id) in &owned_event_ids {
-            child_keys
-                .push_unseparated("(")
-                .push_bind(user_id)
-                .push_unseparated(", ")
-                .push_bind(event_id)
-                .push_unseparated(")");
-        }
-        child_keys.push_unseparated(")");
-    }
-    builder.push(" OR (user_id, parent_event_id) IN (");
-    {
-        let mut parent_keys = builder.separated(", ");
-        for (user_id, event_id) in &owned_event_ids {
-            parent_keys
-                .push_unseparated("(")
-                .push_bind(user_id)
-                .push_unseparated(", ")
-                .push_bind(event_id)
-                .push_unseparated(")");
-        }
-        parent_keys.push_unseparated(")");
-    }
-
-    let result = builder.build().execute(executor).await?;
-    Ok(result.rows_affected())
 }
 
 /// When `ASTRA_AUTO_CREATE_DATABASE=1`, connect to `bootstrap_catalog` and
@@ -5127,62 +5075,6 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
-        "tool_result_projection_decisions",
-        "CREATE TABLE IF NOT EXISTS tool_result_projection_decisions (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            freeze_key_sha256 CHAR(64) NOT NULL,
-            decision_sha256 CHAR(64) NOT NULL,
-            decision_json LONGTEXT NOT NULL,
-            decision_bytes BIGINT NOT NULL,
-            canonical_message_sha256 CHAR(64) NOT NULL,
-            source_sha256 CHAR(64) NOT NULL,
-            source_bytes BIGINT NOT NULL,
-            rendered_body_sha256 CHAR(64) NOT NULL,
-            rendered_body_bytes BIGINT NOT NULL,
-            producer_run_id VARCHAR(64) NOT NULL,
-            producer_call_id VARCHAR(255) NOT NULL,
-            first_admitted_attempt_id VARCHAR(64) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, session_id, freeze_key_sha256),
-            INDEX idx_tool_result_projection_decisions_attempt
-                (user_id, first_admitted_attempt_id),
-            CONSTRAINT chk_tool_result_projection_decision_bounds
-                CHECK (decision_bytes > 0 AND source_bytes > 0 AND rendered_body_bytes > 0)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
-        "tool_result_projection_receipts",
-        "CREATE TABLE IF NOT EXISTS tool_result_projection_receipts (
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            attempt_id VARCHAR(64) NOT NULL,
-            freeze_key_sha256 CHAR(64) NOT NULL,
-            decision_sha256 CHAR(64) NOT NULL,
-            provider_wire_sha256 CHAR(64) NOT NULL,
-            receipt_sha256 CHAR(64) NOT NULL,
-            receipt_json TEXT NOT NULL,
-            receipt_bytes BIGINT NOT NULL,
-            wire_state VARCHAR(32) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, attempt_id, freeze_key_sha256),
-            INDEX idx_tool_result_projection_receipts_session
-                (user_id, session_id, attempt_id),
-            CONSTRAINT chk_tool_result_projection_receipt_bounds
-                CHECK (receipt_bytes > 0),
-            CONSTRAINT chk_tool_result_projection_receipt_state
-                CHECK (wire_state IN ('included', 'partially_included', 'omitted', 'unknown'))
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    core_schema_create!(
-        pool,
         "inference_canonical_transition_heads",
         "CREATE TABLE IF NOT EXISTS inference_canonical_transition_heads (
             user_id VARCHAR(128) NOT NULL,
@@ -8270,6 +8162,7 @@ mod tests {
             );
         }
         for retired in [
+            "retry_count",
             "selected_model_json",
             "selected_model_name",
             "selected_model_gateway",

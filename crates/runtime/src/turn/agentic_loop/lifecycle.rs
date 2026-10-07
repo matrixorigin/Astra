@@ -20,9 +20,7 @@ use crate::orchestration::{
     project_agent_tool_budget_record, render_agent_tool_budget_unfinished_detail,
     summarize_agent_tool_budget_result,
 };
-use astra_config::user_profile::{
-    Scenario, TurnIntent, WorkLifecycleIntent, WorkspaceMutationIntent,
-};
+use astra_config::user_profile::{TurnIntent, WorkLifecycleIntent};
 use astra_services::SessionArtifactStore;
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::interruption::{
@@ -564,6 +562,7 @@ fn apply_judged_turn_intent_to_observability(
     state: &AgenticLoopState,
     intent: &TurnIntent,
     record_feedback: bool,
+    user_message: &str,
 ) {
     if let Some(session) = &state.telemetry.observability_session {
         let mut session = astra_core::sync_poison::recover_rwlock_write(session);
@@ -574,12 +573,7 @@ fn apply_judged_turn_intent_to_observability(
                 feedback.kind == astra_turn_types::UserFeedbackKind::Correction
             });
         if record_feedback && is_correction && session.record_user_correction() {
-            let correction = if state.user_intent.trim().is_empty() {
-                state.message.as_str()
-            } else {
-                state.user_intent.as_str()
-            };
-            session.record_correction_excerpt(correction);
+            session.record_correction_excerpt(user_message);
         }
     }
 
@@ -634,6 +628,31 @@ fn apply_judged_turn_intent_to_observability(
         signal = signal.with_context("session_id", serde_json::json!(session_id));
     }
     hub.record_feedback(signal);
+}
+
+/// Apply observations exactly once to their frozen canonical human source.
+/// Work admission and capability decisions remain owned by the Server boundary.
+pub(crate) fn apply_current_user_turn_semantics(
+    state: &mut AgenticLoopState,
+    intent: &TurnIntent,
+) -> bool {
+    if !record_current_user_turn_semantics(state, intent) {
+        return false;
+    }
+    let user_message = state
+        .telemetry
+        .turn_intent_context
+        .as_ref()
+        .and_then(|context| context.source.as_ref())
+        .expect("recorded semantics require a canonical source")
+        .message_text
+        .clone();
+    apply_judged_turn_intent_to_observability(state, intent, true, &user_message);
+    if intent.reanchors_current_objective() {
+        apply_structured_user_reanchor(state, intent.objective_relation, &user_message);
+    }
+    apply_structured_user_feedback(state, intent, &user_message);
+    true
 }
 
 /// Persist new semantics and return whether objective/feedback effects may be applied.
@@ -716,71 +735,6 @@ pub(crate) fn record_current_user_turn_semantics(
         tracing::warn!("canonical turn-semantics owner was not a user message");
     }
     recorded && record_feedback
-}
-
-fn allowed_requested_scenario(intent: &TurnIntent) -> Option<Scenario> {
-    intent
-        .requested_scenario
-        .filter(|scenario| intent.allows_scenario(*scenario))
-}
-
-fn task_profile_from_judged_turn_intent(
-    intent: &TurnIntent,
-) -> Option<astra_turn_core::chat_turn_heuristics::TaskExecutionProfile> {
-    let scenario = allowed_requested_scenario(intent);
-    let has_control_signal = scenario.is_some()
-        || intent.workspace_mutation != WorkspaceMutationIntent::Unknown
-        || intent.browser_verification_required;
-    if !has_control_signal {
-        return None;
-    }
-
-    let mutates_workspace = intent.requires_workspace_mutation();
-    let exploratory_task = matches!(
-        scenario,
-        Some(
-            Scenario::CodeReview | Scenario::Debugging | Scenario::Exploration | Scenario::Testing
-        )
-    );
-    let complexity = if matches!(scenario, Some(Scenario::Refactoring | Scenario::DevOps)) {
-        astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex
-    } else {
-        astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard
-    };
-    Some(
-        astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
-            mutates_workspace,
-            exploratory_task,
-            complexity,
-        ),
-    )
-}
-
-fn apply_judged_turn_intent_to_runtime_profile(state: &mut AgenticLoopState, intent: &TurnIntent) {
-    state.turn_intent = Some(intent.clone());
-    let Some(profile) = task_profile_from_judged_turn_intent(intent) else {
-        return;
-    };
-    let previous_profile = state.task_profile;
-    let previous_budget = state.agentic_turn_budget;
-    let budget_followed_previous_profile = previous_budget == previous_profile.agentic_turn_budget;
-    state.task_profile = profile;
-    if budget_followed_previous_profile {
-        state.agentic_turn_budget = profile.agentic_turn_budget;
-        if state.max_turns == previous_budget.initial_turns {
-            let new_initial = profile.agentic_turn_budget.initial_turns;
-            if new_initial >= previous_budget.initial_turns {
-                let extra = new_initial - previous_budget.initial_turns;
-                state.max_turns = new_initial;
-                state.remaining_turns = state.remaining_turns.saturating_add(extra);
-            } else {
-                let reduction = previous_budget.initial_turns - new_initial;
-                state.max_turns = new_initial;
-                state.remaining_turns = state.remaining_turns.saturating_sub(reduction);
-            }
-        }
-    }
-    state.turn_guard.set_task_profile(profile);
 }
 
 fn auto_route_tool_call_id(skill_name: &str) -> String {
@@ -3471,8 +3425,9 @@ pub(crate) fn configure_loop_host<H: AgenticLoopHost>(host: &mut H, state: &Agen
 fn apply_structured_user_reanchor(
     state: &mut AgenticLoopState,
     relation: astra_turn_types::ObjectiveRelation,
+    user_message: &str,
 ) -> bool {
-    if state.message.trim().is_empty() {
+    if user_message.trim().is_empty() {
         return false;
     }
 
@@ -3485,10 +3440,10 @@ fn apply_structured_user_reanchor(
         match relation {
             astra_turn_types::ObjectiveRelation::Replace => session
                 .working_memory_mut()
-                .apply_objective_replacement(&state.message),
+                .apply_objective_replacement(user_message),
             astra_turn_types::ObjectiveRelation::Correct => session
                 .working_memory_mut()
-                .apply_user_correction(&state.message),
+                .apply_user_correction(user_message),
             astra_turn_types::ObjectiveRelation::Unknown
             | astra_turn_types::ObjectiveRelation::Acknowledge
             | astra_turn_types::ObjectiveRelation::Continue
@@ -3498,7 +3453,11 @@ fn apply_structured_user_reanchor(
     true
 }
 
-fn apply_structured_user_feedback(state: &mut AgenticLoopState, intent: &TurnIntent) -> bool {
+fn apply_structured_user_feedback(
+    state: &mut AgenticLoopState,
+    intent: &TurnIntent,
+    user_message: &str,
+) -> bool {
     let Some(feedback) = intent.feedback else {
         return false;
     };
@@ -3514,7 +3473,7 @@ fn apply_structured_user_feedback(state: &mut AgenticLoopState, intent: &TurnInt
     };
     session
         .working_memory_mut()
-        .apply_user_feedback(feedback, &state.message);
+        .apply_user_feedback(feedback, user_message);
     true
 }
 
@@ -3950,7 +3909,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
     reserve_budget_settlement_boundary(state);
 
-    match state.rate_limit_cooldown.check_request(false) {
+    match state.rate_limit_cooldown.check_request() {
         astra_turn_core::rate_limit_cooldown::RateLimitAction::Proceed => {}
         astra_turn_core::rate_limit_cooldown::RateLimitAction::WaitAndRetry { delay_ms } => {
             if !quiet {
@@ -3963,15 +3922,6 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 );
             }
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        }
-        astra_turn_core::rate_limit_cooldown::RateLimitAction::UseFallback { .. } => {
-            if !quiet {
-                host.emit_headless_line(
-                    HeadlessStderrStyle::Yellow,
-                    "⏳ Rate limit cooldown — waiting 5s (no fallback model)…".into(),
-                );
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
         }
         astra_turn_core::rate_limit_cooldown::RateLimitAction::Reject {
             reason,
@@ -4097,9 +4047,11 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         }
         crate::turn::agentic::turn_intent::capture_turn_intent_context(state);
         let outcome = host.judge_turn_intent(state).await;
-        // This is emitted before an unavailable admission can terminate the
-        // turn, so a slow or unavailable decision remains visible.
-        if let Some(phase_outcome) = outcome.terminal_phase_outcome() {
+        // Asynchronous hosts publish receipts from their actual task owner.
+        // A baseline or unavailable dispatch is not another timed task.
+        if !host.owns_semantic_admission_timing()
+            && let Some(phase_outcome) = outcome.terminal_phase_outcome()
+        {
             complete_turn_phase(
                 host,
                 state,
@@ -4116,37 +4068,13 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 // The host publishes the eventual decision; pending is not failure.
                 state.turn_intent = None;
             }
-            TurnIntentJudgeOutcome::Intent(intent) => {
-                let record_feedback = record_current_user_turn_semantics(state, &intent);
-                apply_judged_turn_intent_to_observability(state, &intent, record_feedback);
-                apply_judged_turn_intent_to_runtime_profile(state, &intent);
-                if record_feedback && intent.reanchors_current_objective() {
-                    apply_structured_user_reanchor(state, intent.objective_relation);
-                }
-                if record_feedback {
-                    apply_structured_user_feedback(state, &intent);
-                }
-            }
             TurnIntentJudgeOutcome::FixedDefault => {
                 // The baseline profile is a text-independent fixed default. Do not
                 // retain or synthesize judge-owned semantics without a typed LLM
                 // result.
                 state.turn_intent = None;
             }
-            TurnIntentJudgeOutcome::Delegated => {
-                // A transport adapter (for example the CLI Server bridge)
-                // records the phase locally but leaves the semantic decision
-                // to the authoritative Server turn. Do not label this as a
-                // fixed default or manufacture local intent.
-                state.turn_intent = None;
-            }
             TurnIntentJudgeOutcome::Unavailable => {
-                if host.requires_turn_intent_decision() {
-                    return Err(
-                        "semantic task admission is temporarily unavailable; primary execution was not started, so retrying cannot bypass the canonical Work lifecycle"
-                            .to_string().into(),
-                    );
-                }
                 tracing::debug!(
                     "turn intent judge unavailable; preserving current runtime profile"
                 );
@@ -4482,7 +4410,7 @@ mod tests {
                 working_dir: None,
                 depends_on: Vec::new(),
                 timeout_secs: None,
-                cache_key: None,
+
                 authoritative: true,
             });
             state.max_turns = 50;
@@ -4552,20 +4480,16 @@ mod tests {
             working_dir: Some("/workspace".into()),
             depends_on: Vec::new(),
             timeout_secs: Some(30),
-            cache_key: None,
+
             authoritative: true,
         };
         state.hooks.stop_hooks = vec![hook.clone()];
-        state.hooks.stop_hook_runs = 2;
-        state.hooks.teammate_idle_hooks = vec![hook.clone()];
-        state.hooks.teammate_idle_hook_runs = 1;
-        let expected_control = astra_pipeline::step_protocol::RunExecutionControl::V3 {
+        state.hooks.declarations.stop = vec![hook.clone()];
+        let expected_control = astra_pipeline::step_protocol::RunExecutionControl::V4 {
             completion_settlement: state.hooks.completion_settlement.clone(),
             hook_obligations: astra_turn_types::StopHookObligations {
-                stop_hooks: vec![hook.clone()],
-                stop_hook_runs: 2,
-                teammate_idle_hooks: vec![hook],
-                teammate_idle_hook_runs: 1,
+                declarations: state.hooks.declarations.clone(),
+                phase: state.hooks.phase,
             },
             reply_obligations: state
                 .messaging
@@ -5163,7 +5087,7 @@ mod tests {
             working_dir: None,
             depends_on: Vec::new(),
             timeout_secs: None,
-            cache_key: None,
+
             authoritative: true,
         }
     }
@@ -6380,18 +6304,20 @@ mod tests {
             }
         });
         assert!(
-            super::super::execution_phase::completion_action_matches_tool_call(
+            super::super::execution_phase::completion_action_match_label(
                 &state,
                 &super::super::host::CompletionAction::RequiredExternalEffect,
                 &first_mutation,
             )
+            .is_some()
         );
         assert!(
-            !super::super::execution_phase::completion_action_matches_tool_call(
+            !super::super::execution_phase::completion_action_match_label(
                 &state,
                 &super::super::host::CompletionAction::RequiredExternalEffect,
                 &replay,
             )
+            .is_some()
         );
         let admitted = super::super::execution_phase::apply_completion_action_admission(
             &mut state,
@@ -6483,18 +6409,20 @@ mod tests {
             }
         });
         assert!(
-            super::super::execution_phase::completion_action_matches_tool_call(
+            super::super::execution_phase::completion_action_match_label(
                 &state,
                 &super::super::host::CompletionAction::RequiredExternalEffect,
                 &same_roots,
             )
+            .is_some()
         );
         assert!(
-            !super::super::execution_phase::completion_action_matches_tool_call(
+            !super::super::execution_phase::completion_action_match_label(
                 &state,
                 &super::super::host::CompletionAction::RequiredExternalEffect,
                 &other_roots,
             )
+            .is_some()
         );
         let admitted = super::super::execution_phase::apply_completion_action_admission(
             &mut state,
@@ -7902,46 +7830,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_turn_iteration_applies_host_judged_turn_intent() {
-        let intent = TurnIntent::default()
-            .with_requested_scenario(Scenario::CodeReview)
-            .with_objective_relation(astra_turn_types::ObjectiveRelation::Replace)
-            .with_workspace_mutation(WorkspaceMutationIntent::ReadOnly);
-        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub);
-        state.telemetry.observability_session = Some(session.clone());
-        state.message = "please inspect the current changes".into();
-        state.user_intent = state.message.clone();
-        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
-
-        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
-            .await
-            .expect("turn should prepare");
-
-        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
-        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-        assert_eq!(guard.profile.current_scenario, Some(Scenario::CodeReview));
-        assert!(!state.task_profile.mutates_workspace);
-        assert!(state.task_profile.exploratory_task);
-        assert_eq!(
-            astra_turn_types::user_turn_semantics(&state.messages[0])
-                .expect("valid semantics")
-                .map(|semantics| semantics.objective_relation),
-            Some(astra_turn_types::ObjectiveRelation::Replace)
-        );
-        assert_eq!(
-            state
-                .turn_intent
-                .as_ref()
-                .map(|intent| intent.workspace_mutation),
-            Some(WorkspaceMutationIntent::ReadOnly)
-        );
-    }
-
-    #[tokio::test]
     async fn unavailable_turn_intent_judge_does_not_manufacture_objective_semantics() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
@@ -7961,60 +7849,27 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn required_semantic_admission_never_silently_starts_primary_execution() {
-        let mut host = MockHost::new(Vec::new()).with_required_turn_intent_decision();
-        let mut state = make_state();
-        state.message = "complete two independently verifiable outcomes".into();
-        state.user_intent = state.message.clone();
-        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
-
-        let error = match prepare_turn_iteration(&mut host, &mut state, 0).await {
-            Ok(_) => {
-                panic!(
-                    "a required semantic boundary must fail closed when its judge is unavailable"
-                )
-            }
-            Err(error) => error,
-        };
-
-        assert!(
-            error
-                .to_string()
-                .contains("semantic task admission is temporarily unavailable")
-        );
-        assert_eq!(
-            host.turn_count(),
-            0,
-            "the host must not call the primary model after losing the only semantic admission authority"
-        );
-    }
-
-    #[tokio::test]
-    async fn repeated_prepare_keeps_semantics_on_the_submitted_turn_owner() {
+    #[test]
+    fn repeated_semantic_effects_keep_the_submitted_turn_owner() {
         let intent = TurnIntent::default()
             .with_objective_relation(astra_turn_types::ObjectiveRelation::Refine);
-        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
         let mut state = make_state();
         state.session_turn = 4;
         state.message = "also verify the database path".into();
         state.user_intent = state.message.clone();
         state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
 
-        prepare_turn_iteration(&mut host, &mut state, 0)
-            .await
-            .expect("first round should prepare");
-        host.turn_intent = Some(
-            TurnIntent::default()
-                .with_objective_relation(astra_turn_types::ObjectiveRelation::Replace),
-        );
+        assert!(apply_current_user_turn_semantics(&mut state, &intent));
+        let later_intent = TurnIntent::default()
+            .with_objective_relation(astra_turn_types::ObjectiveRelation::Replace);
         state.messages.push(json!({
             "role": "user",
             "content": "guidance accepted while the run is active"
         }));
-        prepare_turn_iteration(&mut host, &mut state, 1)
-            .await
-            .expect("second round should prepare");
+        assert!(!apply_current_user_turn_semantics(
+            &mut state,
+            &later_intent
+        ));
 
         assert!(
             astra_turn_types::user_turn_semantics(&state.messages[0])
@@ -8027,17 +7882,16 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            state
-                .turn_intent
-                .as_ref()
-                .map(|intent| intent.objective_relation),
+            astra_turn_types::user_turn_semantics(&state.messages[0])
+                .unwrap()
+                .map(|semantics| semantics.objective_relation),
             Some(astra_turn_types::ObjectiveRelation::Refine),
             "later model rounds must not re-judge or overwrite user-turn semantics"
         );
     }
 
-    #[tokio::test]
-    async fn prepare_turn_persists_assessment_with_prior_response_reference_once() {
+    #[test]
+    fn canonical_effects_persist_assessment_with_prior_response_reference_once() {
         use astra_turn_types::{
             AssessmentConfidence, FeedbackResponseRelation, ResponseSatisfaction, TaskDifficulty,
             TurnAssessment,
@@ -8067,10 +7921,7 @@ mod tests {
         state
             .messages
             .push(json!({"role":"assistant","content":"later response"}));
-        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent.clone());
-        prepare_turn_iteration(&mut host, &mut state, 0)
-            .await
-            .unwrap();
+        assert!(apply_current_user_turn_semantics(&mut state, &intent));
         let recorded = astra_turn_types::user_turn_semantics(&state.messages[2])
             .unwrap()
             .unwrap();
@@ -8341,33 +8192,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_turn_iteration_applies_must_mutate_intent_to_runtime_profile() {
-        let intent = TurnIntent::default()
-            .with_requested_scenario(Scenario::Implementation)
-            .with_workspace_mutation(WorkspaceMutationIntent::MustMutate);
-        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
-        let mut state = make_state();
-        state.message = "fix the bug".into();
-        state.user_intent = state.message.clone();
-        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
-
-        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
-            .await
-            .expect("turn should prepare");
-
-        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
-        assert!(state.task_profile.mutates_workspace);
-        assert!(state.task_profile.verification_required);
-        assert_eq!(
-            state
-                .turn_intent
-                .as_ref()
-                .map(|intent| intent.workspace_mutation),
-            Some(WorkspaceMutationIntent::MustMutate)
-        );
-    }
-
-    #[tokio::test]
     async fn prepare_turn_iteration_preserves_profile_when_judge_unavailable() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
@@ -8409,26 +8233,6 @@ mod tests {
                 .map(|intent| intent.workspace_mutation),
             Some(WorkspaceMutationIntent::MustMutate)
         );
-    }
-
-    #[tokio::test]
-    async fn prepare_turn_iteration_does_not_mutate_for_read_only_question_about_implementation() {
-        let intent = TurnIntent::default()
-            .with_requested_scenario(Scenario::QuickAnswer)
-            .with_workspace_mutation(WorkspaceMutationIntent::ReadOnly);
-        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
-        let mut state = make_state();
-        state.message = "当前的实现，能够想起来吗？".into();
-        state.user_intent = state.message.clone();
-        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
-
-        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
-            .await
-            .expect("turn should prepare");
-
-        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
-        assert!(!state.task_profile.mutates_workspace);
-        assert!(!state.task_profile.verification_required);
     }
 
     #[test]
@@ -9251,6 +9055,15 @@ mod tests {
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
         state.message = "No, that's wrong; use the server-side executor.".into();
+        state.messages = vec![json!({"role": "user", "content": state.message})];
+        crate::turn::agentic::turn_intent::capture_turn_intent_context(&mut state);
+        // The last fragment and cumulative instruction are not the frozen
+        // canonical human source of this judgment.
+        state.message = "uncaptured last fragment".into();
+        state.user_intent = "obsolete cumulative instruction".into();
+        let hub = make_hub();
+        state.telemetry.observability_hub = Some(Arc::clone(&hub));
+        state.restricted_tools.insert("bash".into());
         {
             let memory = state
                 .pipeline_session
@@ -9262,10 +9075,9 @@ mod tests {
             memory.set_next_action("retry stale path");
         }
 
-        assert!(apply_structured_user_reanchor(
-            &mut state,
-            astra_turn_types::ObjectiveRelation::Correct,
-        ));
+        let intent = TurnIntent::default()
+            .with_objective_relation(astra_turn_types::ObjectiveRelation::Correct);
+        assert!(apply_current_user_turn_semantics(&mut state, &intent));
 
         let rendered = state
             .pipeline_session
@@ -9280,6 +9092,22 @@ mod tests {
             rendered.contains("Latest user correction overrides conflicting prior working memory")
         );
         assert!(rendered.contains("server-side executor"));
+        assert!(!rendered.contains("uncaptured last fragment"));
+        assert!(!rendered.contains("obsolete cumulative instruction"));
+        assert!(state.restricted_tools.contains("bash"));
+        let feedback_count = hub.recent_feedback_signals().len();
+        assert_eq!(feedback_count, 1);
+        assert!(!apply_current_user_turn_semantics(&mut state, &intent));
+        assert_eq!(hub.recent_feedback_signals().len(), feedback_count);
+        assert_eq!(
+            state
+                .pipeline_session
+                .as_ref()
+                .unwrap()
+                .working_memory()
+                .render_prompt_section(),
+            rendered,
+        );
     }
 
     #[tokio::test]
@@ -9346,6 +9174,7 @@ mod tests {
         assert!(apply_structured_user_reanchor(
             &mut state,
             astra_turn_types::ObjectiveRelation::Correct,
+            "correct the stale approach",
         ));
 
         assert_eq!(state.turn_guard.nudge_count, 0);
@@ -9362,15 +9191,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepare_turn_fills_assessment_without_replaying_feedback() {
+    #[test]
+    fn canonical_effects_fill_assessment_without_replaying_feedback() {
         let intent = TurnIntent::default()
             .with_objective_relation(astra_turn_types::ObjectiveRelation::Correct)
             .with_feedback(astra_turn_types::UserFeedback {
                 kind: astra_turn_types::UserFeedbackKind::Correction,
                 target: astra_turn_types::UserFeedbackTarget::Approach,
             });
-        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent.clone());
         let mut state = make_state();
         let hub = make_hub();
         state.telemetry.observability_hub = Some(Arc::clone(&hub));
@@ -9378,21 +9206,20 @@ mod tests {
         state.message = "repair it".into();
         state.user_intent = state.message.clone();
         state.messages = vec![json!({"role":"user","content":state.message})];
-        prepare_turn_iteration(&mut host, &mut state, 0)
-            .await
-            .unwrap();
+        assert!(apply_current_user_turn_semantics(&mut state, &intent));
         let assessment = astra_turn_types::TurnAssessment {
             difficulty: astra_turn_types::TaskDifficulty::Easy,
             ..Default::default()
         };
-        host = host.with_turn_intent(TurnIntent {
+        let assessed_intent = TurnIntent {
             assessment: Some(assessment),
             ..intent
-        });
+        };
         state.turn_guard.nudge_count = 2;
-        prepare_turn_iteration(&mut host, &mut state, 0)
-            .await
-            .unwrap();
+        assert!(!apply_current_user_turn_semantics(
+            &mut state,
+            &assessed_intent
+        ));
         assert_eq!(
             state.turn_guard.nudge_count, 2,
             "assessment must not reanchor again"
@@ -9404,15 +9231,14 @@ mod tests {
         assert_eq!(recorded.assessment, Some(assessment));
     }
 
-    #[tokio::test]
-    async fn prepare_turn_applies_structured_reanchor_from_judge() {
+    #[test]
+    fn canonical_effects_apply_structured_reanchor_once() {
         let intent = TurnIntent::default()
             .with_objective_relation(astra_turn_types::ObjectiveRelation::Correct)
             .with_feedback(astra_turn_types::UserFeedback {
                 kind: astra_turn_types::UserFeedbackKind::Correction,
                 target: astra_turn_types::UserFeedbackTarget::Approach,
             });
-        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
         let mut state = make_state();
         state.current_run_id = Some("feedback-source-run".into());
         let hub = make_hub();
@@ -9434,15 +9260,9 @@ mod tests {
             .working_memory_mut()
             .set_next_action("stale path");
 
-        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
-            .await
-            .expect("turn should prepare");
-        let repeated = prepare_turn_iteration(&mut host, &mut state, 1)
-            .await
-            .expect("same corrected user turn should remain preparable");
+        assert!(apply_current_user_turn_semantics(&mut state, &intent));
+        assert!(!apply_current_user_turn_semantics(&mut state, &intent));
 
-        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
-        assert!(matches!(repeated, PreparedTurnIteration::Ready(_)));
         assert_eq!(state.turn_guard.nudge_count, 0);
         assert_eq!(state.restricted_tools, HashSet::from(["bash".to_string()]));
         let signals = hub.recent_feedback_signals();
@@ -9495,15 +9315,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prepare_turn_retains_typed_requirement_for_the_next_model_boundary() {
+    #[test]
+    fn canonical_effects_retain_typed_requirement_for_next_model_boundary() {
         let intent = TurnIntent::default()
             .with_objective_relation(astra_turn_types::ObjectiveRelation::Refine)
             .with_feedback(astra_turn_types::UserFeedback {
                 kind: astra_turn_types::UserFeedbackKind::Requirement,
                 target: astra_turn_types::UserFeedbackTarget::Verification,
             });
-        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
         let mut state = make_state();
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
@@ -9512,9 +9331,7 @@ mod tests {
         state.user_intent = state.message.clone();
         state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
 
-        prepare_turn_iteration(&mut host, &mut state, 0)
-            .await
-            .expect("turn should prepare");
+        assert!(apply_current_user_turn_semantics(&mut state, &intent));
 
         let rendered = state
             .pipeline_session
@@ -9535,7 +9352,7 @@ mod tests {
         state.telemetry.observability_hub = Some(Arc::clone(&hub));
         assert!(state.telemetry.observability_session.is_none());
 
-        apply_judged_turn_intent_to_observability(&state, &intent, true);
+        apply_judged_turn_intent_to_observability(&state, &intent, true, &state.message);
 
         assert!(
             hub.recent_feedback_signals().iter().any(|signal| {
@@ -9555,6 +9372,7 @@ mod tests {
             &TurnIntent::default()
                 .with_objective_relation(astra_turn_types::ObjectiveRelation::Continue),
             true,
+            &state.message,
         );
         assert!(hub.recent_feedback_signals().is_empty());
         apply_judged_turn_intent_to_observability(
@@ -9562,6 +9380,7 @@ mod tests {
             &TurnIntent::default()
                 .with_objective_relation(astra_turn_types::ObjectiveRelation::Replace),
             true,
+            &state.message,
         );
         assert!(hub.recent_feedback_signals().is_empty());
 
@@ -9570,6 +9389,7 @@ mod tests {
             &TurnIntent::default()
                 .with_objective_relation(astra_turn_types::ObjectiveRelation::Acknowledge),
             true,
+            &state.message,
         );
         assert!(
             hub.recent_feedback_signals()

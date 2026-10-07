@@ -546,7 +546,6 @@ mod tests {
                     api_key: "server-secret".into(),
                     base_url: "https://models.example/v1".into(),
                     provider: provider.into(),
-                    fallback_chain: Vec::new(),
                     tags: Vec::new(),
                     request_body_overrides: None,
                     fixed_temperature: None,

@@ -1276,6 +1276,11 @@ pub struct SubRunConfig {
     /// runs fresh, same behavior as pre-fork-prefix.
     pub inherited_prefix: Option<crate::orchestration::InheritedChildPrefix>,
     /// UI/runtime execution binding metadata inherited by this sub-run.
+    /// Trusted parent admission facts, never caller execution metadata.
+    pub execution_contract: Option<(
+        crate::server::tool_transport::ExecutionBindingSnapshot,
+        astra_turn_types::StopHookObligations,
+    )>,
     pub execution_metadata: Option<serde_json::Value>,
     /// Existing parent execution/routing chain. Admitted profile ancestry
     /// lives in `profile_authority`; runtime instance IDs are not profile IDs.
@@ -2845,11 +2850,11 @@ impl DelegationEngine {
         }
         request
             .context
-            .remove(crate::turn::agentic::delegate_interception::FORWARD_HEADERS_CONTEXT_KEY);
+            .remove(crate::server::delegation::FORWARD_HEADERS_CONTEXT_KEY);
         Self::ensure_source_in_delegation_chain(&mut request, source_agent_id);
         let enabled_tools = parse_request_allowlist_from_context(
             &mut request.context,
-            crate::turn::agentic::delegate_interception::REQUEST_ENABLED_TOOLS_CONTEXT_KEY,
+            crate::server::delegation::REQUEST_ENABLED_TOOLS_CONTEXT_KEY,
         )?;
         // Server request admission materializes an omitted optional-tool
         // allowlist as `Some(empty)`. A local CLI has no server capability
@@ -2859,16 +2864,16 @@ impl DelegationEngine {
         let mut request_constraints = RequestConstraints::new(
             parse_request_allowlist_from_context(
                 &mut request.context,
-                crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY,
+                crate::server::delegation::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY,
             )?,
             enabled_tools,
             parse_request_allowlist_from_context(
                 &mut request.context,
-                crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_SKILLS_CONTEXT_KEY,
+                crate::server::delegation::REQUEST_ALLOWED_SKILLS_CONTEXT_KEY,
             )?,
             parse_request_skill_sources_from_context(
                 &mut request.context,
-                crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY,
+                crate::server::delegation::REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY,
             )?,
         );
         if let Some(value) = request
@@ -2893,6 +2898,16 @@ impl DelegationEngine {
             .run_engine
             .require_delegation_parent(&request.user_id, &session_id, &request.parent_run_id)
             .await?;
+        let mut execution_contract =
+            crate::server::run::binding_resolution::durable_run_execution_contract(&parent_run)?;
+        execution_contract.1.phase =
+            if astra_turn_core::stop_hooks_yaml::is_plan_subtask_from_delegation_context(
+                &request.context,
+            ) {
+                astra_turn_types::CompletionCheckPhase::TaskCompleted
+            } else {
+                astra_turn_types::CompletionCheckPhase::Stop
+            };
         let admitted_agent_profiles =
             crate::server::run::engine::durable_run_agent_profiles(&parent_run, &request.user_id)?;
         let parent_profile_authority = crate::server::run::engine::durable_run_profile_authority(
@@ -3054,6 +3069,7 @@ impl DelegationEngine {
                         &request_constraints,
                         admitted_agent_profiles.as_ref(),
                         &parent_profile_authority,
+                        &execution_contract,
                         child_recursion_depth,
                         interaction_mode,
                         *timeout_sec,
@@ -3078,6 +3094,7 @@ impl DelegationEngine {
                         &request_constraints,
                         admitted_agent_profiles.as_ref(),
                         &parent_profile_authority,
+                        &execution_contract,
                         child_recursion_depth,
                         interaction_mode,
                         *timeout_sec,
@@ -3104,6 +3121,7 @@ impl DelegationEngine {
                         &request_constraints,
                         admitted_agent_profiles.as_ref(),
                         &parent_profile_authority,
+                        &execution_contract,
                         child_recursion_depth,
                         interaction_mode,
                         *timeout_sec,
@@ -3476,6 +3494,10 @@ impl DelegationEngine {
         request_constraints: &RequestConstraints,
         admitted_agent_profiles: Option<&Arc<astra_services::runs::AgentProfileSnapshot>>,
         parent_profile_authority: &ParentProfileAuthority,
+        execution_contract: &(
+            crate::server::tool_transport::ExecutionBindingSnapshot,
+            astra_turn_types::StopHookObligations,
+        ),
         child_recursion_depth: u8,
         interaction_mode: RequestedTurnInteractionMode,
         timeout_sec: u64,
@@ -3742,6 +3764,7 @@ impl DelegationEngine {
                 )
             });
             configs.push(SubRunConfig {
+                execution_contract: Some(execution_contract.clone()),
                 profile_authority,
                 max_output_tokens: None,
                 run_id: sub_run_id,
@@ -3887,6 +3910,10 @@ impl DelegationEngine {
         request_constraints: &RequestConstraints,
         admitted_agent_profiles: Option<&Arc<astra_services::runs::AgentProfileSnapshot>>,
         parent_profile_authority: &ParentProfileAuthority,
+        execution_contract: &(
+            crate::server::tool_transport::ExecutionBindingSnapshot,
+            astra_turn_types::StopHookObligations,
+        ),
         child_recursion_depth: u8,
         interaction_mode: RequestedTurnInteractionMode,
         timeout_sec: u64,
@@ -4170,6 +4197,7 @@ impl DelegationEngine {
                 team_prompts::wrap_task_with_coordination(&coordination_prompt, &request.task);
 
             let config = SubRunConfig {
+                execution_contract: Some(execution_contract.clone()),
                 profile_authority,
                 max_output_tokens: None,
                 run_id: sub_run_id.clone(),
@@ -4268,6 +4296,10 @@ impl DelegationEngine {
         request_constraints: &RequestConstraints,
         admitted_agent_profiles: Option<&Arc<astra_services::runs::AgentProfileSnapshot>>,
         parent_profile_authority: &ParentProfileAuthority,
+        execution_contract: &(
+            crate::server::tool_transport::ExecutionBindingSnapshot,
+            astra_turn_types::StopHookObligations,
+        ),
         child_recursion_depth: u8,
         interaction_mode: RequestedTurnInteractionMode,
         timeout_sec: u64,
@@ -4554,6 +4586,7 @@ impl DelegationEngine {
             });
 
             let config = SubRunConfig {
+                execution_contract: Some(execution_contract.clone()),
                 profile_authority: profile_authority.clone(),
                 max_output_tokens: None,
                 run_id: run_id.clone(),
@@ -5069,6 +5102,9 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
+            .unwrap();
+        persist_parent_contract_fixture(run_engine, request)
             .await
             .unwrap();
     }
@@ -5807,6 +5843,40 @@ mod tests {
                     &request.session_id,
                 )
                 .await?;
+        }
+        persist_parent_contract_fixture(&engine.run_engine, request).await
+    }
+
+    async fn persist_parent_contract_fixture(
+        run_engine: &RunEngine,
+        request: &DelegationRequest,
+    ) -> Result<(), String> {
+        let parent = run_engine
+            .load_run(&request.user_id, &request.parent_run_id)
+            .await?
+            .ok_or("test parent is missing")?;
+        let snapshot = crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+            crate::server::tool_transport::WorkspaceBinding::none(),
+            crate::server::tool_transport::ExecutorBinding::server_control_plane(),
+        );
+        let events = crate::server::run::binding_resolution::binding_snapshot_events(
+            &request.parent_run_id,
+            &request.session_id,
+            &snapshot,
+            &Default::default(),
+        );
+        if !run_engine
+            .append_events_if_current_generation_and_status(
+                &request.user_id,
+                &request.session_id,
+                &request.parent_run_id,
+                parent.run_generation,
+                &[STATUS_RUNNING],
+                &events,
+            )
+            .await?
+        {
+            return Err("test parent binding was not admitted".into());
         }
         Ok(())
     }
@@ -6744,13 +6814,11 @@ mod tests {
             let mut request = fan_out_request(vec!["coder"]);
             request.pattern = pattern;
             request.context.insert(
-                crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY
-                    .into(),
+                crate::server::delegation::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY.into(),
                 serde_json::json!(["read_file", "bash"]),
             );
             request.context.insert(
-                crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_SKILLS_CONTEXT_KEY
-                    .into(),
+                crate::server::delegation::REQUEST_ALLOWED_SKILLS_CONTEXT_KEY.into(),
                 serde_json::json!(["analysis", "other"]),
             );
             request.execution_metadata = Some(serde_json::json!({
@@ -6817,6 +6885,9 @@ mod tests {
                     );
                 }
             }
+            persist_parent_contract_fixture(&run_engine, &request)
+                .await
+                .unwrap();
             let result = engine
                 .execute(request.clone(), "opaque-parent-instance", None)
                 .await
@@ -7330,7 +7401,11 @@ mod tests {
                     .await
             })
         };
-        let child_run_id = started_rx.recv().await.expect("child starts");
+        let child_run_id =
+            tokio::time::timeout(std::time::Duration::from_secs(5), started_rx.recv())
+                .await
+                .expect("child admission did not reach the executor")
+                .expect("child starts");
         parent_cancel.cancel();
 
         let result = execution
@@ -7889,9 +7964,9 @@ mod tests {
         impl SubRunExecutor for ForwardHeadersCheckExecutor {
             async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
                 let has_auth = config.forward_headers.contains_key("authorization");
-                let has_context_key = config.context.contains_key(
-                    crate::turn::agentic::delegate_interception::FORWARD_HEADERS_CONTEXT_KEY,
-                );
+                let has_context_key = config
+                    .context
+                    .contains_key(crate::server::delegation::FORWARD_HEADERS_CONTEXT_KEY);
                 Ok((
                     AgentResult {
                         agent_id: config.agent_profile.agent_id,
@@ -8193,9 +8268,9 @@ mod tests {
         impl SubRunExecutor for ForwardHeadersCheckExecutor {
             async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
                 let has_auth = config.forward_headers.contains_key("authorization");
-                let has_context_key = config.context.contains_key(
-                    crate::turn::agentic::delegate_interception::FORWARD_HEADERS_CONTEXT_KEY,
-                );
+                let has_context_key = config
+                    .context
+                    .contains_key(crate::server::delegation::FORWARD_HEADERS_CONTEXT_KEY);
                 Ok((
                     AgentResult {
                         agent_id: config.agent_profile.agent_id,
@@ -8236,8 +8311,7 @@ mod tests {
             depth: 0,
             delegation_chain: Vec::new(),
             context: HashMap::from([(
-                crate::turn::agentic::delegate_interception::FORWARD_HEADERS_CONTEXT_KEY
-                    .to_string(),
+                crate::server::delegation::FORWARD_HEADERS_CONTEXT_KEY.to_string(),
                 serde_json::json!({"authorization": "Bearer evil", "x-workspace-id": "ws-001"}),
             )]),
             execution_metadata: None,
@@ -8254,7 +8328,7 @@ mod tests {
 
     #[test]
     fn parse_request_allowlist_from_context_normalizes_and_dedupes() {
-        let key = crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY;
+        let key = crate::server::delegation::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY;
         let mut context = HashMap::from([(
             key.to_string(),
             serde_json::json!([" Bash ", "bash", "READ_FILE"]),
@@ -8274,7 +8348,7 @@ mod tests {
 
     #[test]
     fn optional_tool_context_distinguishes_unmanaged_cli_from_explicit_disable() {
-        let key = crate::turn::agentic::delegate_interception::REQUEST_ENABLED_TOOLS_CONTEXT_KEY;
+        let key = crate::server::delegation::REQUEST_ENABLED_TOOLS_CONTEXT_KEY;
         let mut local_cli_context = HashMap::new();
         assert_eq!(
             parse_request_allowlist_from_context(&mut local_cli_context, key)
@@ -8293,7 +8367,7 @@ mod tests {
 
     #[test]
     fn parse_request_allowlist_from_context_rejects_non_array_value() {
-        let key = crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY;
+        let key = crate::server::delegation::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY;
         let mut context = HashMap::from([(key.to_string(), serde_json::json!("bash"))]);
 
         let err = parse_request_allowlist_from_context(&mut context, key)
@@ -8303,7 +8377,7 @@ mod tests {
 
     #[test]
     fn parse_request_allowlist_from_context_rejects_non_string_or_empty_entries() {
-        let key = crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY;
+        let key = crate::server::delegation::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY;
         let mut non_string_context =
             HashMap::from([(key.to_string(), serde_json::json!(["bash", 42]))]);
         let err = parse_request_allowlist_from_context(&mut non_string_context, key)
@@ -8319,8 +8393,7 @@ mod tests {
 
     #[test]
     fn parse_request_skill_sources_from_context_normalizes_and_parses() {
-        let key =
-            crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY;
+        let key = crate::server::delegation::REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY;
         let mut context = HashMap::from([(
             key.to_string(),
             serde_json::json!([" Database ", "database", "MCP"]),
@@ -8343,8 +8416,7 @@ mod tests {
 
     #[test]
     fn parse_request_skill_sources_from_context_rejects_unknown_source() {
-        let key =
-            crate::turn::agentic::delegate_interception::REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY;
+        let key = crate::server::delegation::REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY;
         let mut context = HashMap::from([(key.to_string(), serde_json::json!(["dynamic"]))]);
 
         let err = parse_request_skill_sources_from_context(&mut context, key)
@@ -8592,7 +8664,7 @@ mod tests {
             .start_run("parent-live", "user-1", "session-live")
             .await
             .unwrap();
-        engine
+        let execution_authority = engine
             .start_run_ext(
                 "sub-waiting",
                 "user-1",
@@ -8618,10 +8690,11 @@ mod tests {
         tracker.register_pause_flag("sub-waiting").await;
         assert!(
             engine
-                .persist_delegation_outcome_status(
+                .persist_delegation_outcome_status_if_current_owner(
                     "user-1",
                     "session-live",
                     "sub-waiting",
+                    execution_authority.owner_generation,
                     STATUS_WAITING,
                     Some("user_input"),
                     None,
@@ -8652,16 +8725,17 @@ mod tests {
             ("stale-after-cancel", STATUS_CANCELLED),
         ] {
             let (_, engine, _) = setup();
-            engine
+            let execution_authority = engine
                 .start_run(run_id, "user-1", "session-1")
                 .await
                 .unwrap();
             if durable_status == STATUS_CANCELLED {
                 engine
-                    .persist_delegation_outcome_status(
+                    .persist_delegation_outcome_status_if_current_owner(
                         "user-1",
                         "session-1",
                         run_id,
+                        execution_authority.owner_generation,
                         durable_status,
                         None,
                         Some("control-plane"),
@@ -8669,17 +8743,20 @@ mod tests {
                     .await
                     .unwrap();
             } else {
-                engine
-                    .persist_status(
-                        "user-1",
-                        "session-1",
-                        run_id,
-                        durable_status,
-                        Some("control-plane"),
-                        None,
-                    )
-                    .await
-                    .unwrap();
+                assert!(
+                    engine
+                        .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                            user_id: "user-1",
+                            expected_session_id: "session-1",
+                            run_id,
+                            status: durable_status,
+                            waiting_for: Some("control-plane"),
+                            error_message: None,
+                            expected_statuses: &["running"],
+                        })
+                        .await
+                        .unwrap()
+                );
             }
 
             let authoritative = reconcile_agent_result_with_durable_authority(
@@ -8941,16 +9018,17 @@ mod tests {
     async fn identical_terminal_replay_preserves_richer_agent_result() {
         let (_, engine, _) = setup();
         let run_id = "completed-result-replay";
-        engine
+        let execution_authority = engine
             .start_run(run_id, "user-1", "session-1")
             .await
             .unwrap();
         assert!(
             engine
-                .persist_delegation_outcome_status(
+                .persist_delegation_outcome_status_if_current_owner(
                     "user-1",
                     "session-1",
                     run_id,
+                    execution_authority.owner_generation,
                     STATUS_COMPLETED,
                     None,
                     None,
@@ -9480,37 +9558,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_and_read_retry_count() {
-        let store = Arc::new(InMemoryRunStateStore::new());
-        let engine = RunEngine::new(store.clone());
-
-        engine.start_run("run-1", "u1", "s1").await.unwrap();
-        assert_eq!(
-            store
-                .load_run("u1", "run-1")
-                .await
-                .unwrap()
-                .unwrap()
-                .retry_count,
-            0
-        );
-
-        engine
-            .persist_retry_count("u1", "s1", "run-1", 2)
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .load_run("u1", "run-1")
-                .await
-                .unwrap()
-                .unwrap()
-                .retry_count,
-            2
-        );
-    }
-
-    #[tokio::test]
     async fn load_from_run_records_rebuilds_tracker() {
         use astra_services::runs::DurableRunRecord;
 
@@ -9537,7 +9584,6 @@ mod tests {
                 checkpoint_json: None,
                 error_code: None,
                 error_message: None,
-                retry_count: 0,
                 total_prompt_tokens: 0,
                 total_completion_tokens: 0,
                 total_tool_calls: 0,
@@ -9575,7 +9621,6 @@ mod tests {
                 checkpoint_json: None,
                 error_code: None,
                 error_message: None,
-                retry_count: 1,
                 total_prompt_tokens: 0,
                 total_completion_tokens: 0,
                 total_tool_calls: 0,
@@ -9613,7 +9658,6 @@ mod tests {
                 checkpoint_json: None,
                 error_code: None,
                 error_message: None,
-                retry_count: 0,
                 total_prompt_tokens: 0,
                 total_completion_tokens: 0,
                 total_tool_calls: 0,
@@ -9652,7 +9696,6 @@ mod tests {
                 checkpoint_json: None,
                 error_code: None,
                 error_message: None,
-                retry_count: 0,
                 total_prompt_tokens: 0,
                 total_completion_tokens: 0,
                 total_tool_calls: 0,
@@ -10123,6 +10166,9 @@ mod tests {
             .await
             .expect("persist Auto parent");
 
+        persist_parent_contract_fixture(&run_engine, &request)
+            .await
+            .unwrap();
         let result = bind_test_engine(&engine)
             .execute(request, "orch", None)
             .await
@@ -10943,10 +10989,20 @@ mod tests {
         assert_eq!(result.status, STATUS_COMPLETED);
 
         let reread = engine.start_run("reread", "u", "s").await.unwrap();
-        engine
-            .persist_status("u", "s", "reread", STATUS_COMPLETED, None, None)
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "u",
+                    expected_session_id: "s",
+                    run_id: "reread",
+                    status: STATUS_COMPLETED,
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         let mailbox = router.register(mailbox_for("reread"), None).await.unwrap();
         let reread_retirement =
             MailboxRetirement::from_mailbox(&router_option, Some(&mailbox)).unwrap();
@@ -11036,10 +11092,20 @@ mod tests {
         let mut deadline = Some(tokio::time::Instant::now());
         for run_id in ["first", "second"] {
             let authority = engine.start_run(run_id, "u", "s").await.unwrap();
-            engine
-                .persist_status("u", "s", run_id, STATUS_COMPLETED, None, None)
-                .await
-                .unwrap();
+            assert!(
+                engine
+                    .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                        user_id: "u",
+                        expected_session_id: "s",
+                        run_id,
+                        status: STATUS_COMPLETED,
+                        waiting_for: None,
+                        error_message: None,
+                        expected_statuses: &["running"],
+                    })
+                    .await
+                    .unwrap()
+            );
             let mailbox = router
                 .register(
                     astra_messaging::types::AgentAddress::new(run_id, "worker"),

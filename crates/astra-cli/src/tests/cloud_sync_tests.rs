@@ -6,7 +6,6 @@ use crate::cli::cloud_sync::{
     self, CloudPullResult, append_cloud_pull_sync_journal,
     append_cloud_pull_sync_journal_for_immediate_drain, cloud_pull_warrants_sync_marker,
     should_append_cloud_pull_journal, try_cloud_pull, try_cloud_pull_preferences,
-    try_cloud_push_preferences,
 };
 use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::cli::session::session_state::SessionState;
@@ -647,15 +646,4 @@ async fn try_cloud_pull_preferences_is_noop_without_matrixone() {
     // Should not panic (was the original bug)
     let keys = try_cloud_pull_preferences(&mut state).await;
     assert!(keys.is_empty());
-}
-
-#[serial_test::serial]
-#[tokio::test]
-async fn try_cloud_push_preferences_is_noop_without_matrixone() {
-    unsafe {
-        std::env::remove_var("MATRIXONE_HOST");
-    }
-    let state = SessionState::default();
-    // Should not panic (was the original bug)
-    try_cloud_push_preferences(&state).await;
 }

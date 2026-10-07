@@ -16,6 +16,11 @@ pub(super) async fn build_runtime_wiring(
     let run_engine = crate::server::run::engine::RunEngine::new(run_store)
         .with_projection_store(Arc::clone(&state_projection_store))
         .with_metrics_registry(state.metrics_registry());
+    let selected_workspace_provider = run_engine.execution_owner_pod_id().map(|owner| {
+        crate::server::run::workspace_provisioning::ServerWorkspaceProvisioner::from_env(
+            owner.to_owned(),
+        )
+    });
     let profile_registry = Arc::new(default_agent_profile_registry());
     let progress_broadcaster = Arc::new(crate::orchestration::ProgressBroadcaster::default());
     let delegation_tracker = Arc::new(
@@ -57,6 +62,10 @@ pub(super) async fn build_runtime_wiring(
             state.edge_callback_ledger.clone(),
         )
         .with_run_engine(run_engine.clone())
+        .with_workspace_capacity(
+            selected_workspace_provider.clone(),
+            Some(Arc::clone(&workspace_record_store)),
+        )
         .with_trace_ingestion(matrix_rt.clone_ingestion_sender())
         .with_model_service(Some(state.model_service.clone()))
         .with_pool(shared_pool.clone())
@@ -124,6 +133,7 @@ pub(super) async fn build_runtime_wiring(
     .with_edge_dispatch_service(state.execution.edge_dispatch_service.clone())
     .with_edge_registry_service(state.execution.edge_registry_service.clone())
     .with_workspace_record_store(workspace_record_store)
+    .with_selected_workspace_provider(selected_workspace_provider)
     .with_resource_governor(resource_governor.clone())
     .with_skill_service(state.skill_service.clone())
     .with_model_service(state.model_service.clone())

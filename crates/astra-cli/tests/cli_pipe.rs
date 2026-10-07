@@ -194,27 +194,7 @@ async fn active_stream_closed_after_run_binding_cancels_exact_server_run() {
                 let model_count_for_route = model_count_for_route.clone();
                 async move {
                     model_count_for_route.fetch_add(1, Ordering::SeqCst);
-                    axum::Json(serde_json::json!({
-                    "items": [{
-                        "offering_id": "pipe-offering",
-                        "access_id": "pipe-access",
-                        "access_kind": "self_hosted",
-                        "access_label": "Pipe E2E",
-                        "execution_placement": "server",
-                        "name": "mock-model",
-                        "provider": "mock",
-                        "description": null,
-                        "is_active": true,
-                        "context_window": 128000,
-                        "max_completion_tokens": null,
-                        "architecture": null,
-                        "thinking_capability": null
-                    }],
-                    "next_cursor": null,
-                    "limit": 50,
-                    "total": 1,
-                    "catalog_revision": "sha256:pipe-e2e"
-                    }))
+                    pipe_model_catalog()
                 }
             }),
         )
@@ -474,4 +454,237 @@ fn closed_child_stdin_sigpipe_probe() {
         .write_all(b"glob candidate\n")
         .expect_err("closed child stdin must report EPIPE");
     assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+}
+
+fn pipe_model_catalog() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+    "items": [{
+        "offering_id": "pipe-offering",
+        "access_id": "pipe-access",
+        "access_kind": "self_hosted",
+        "access_label": "Pipe E2E",
+        "execution_placement": "server",
+        "name": "mock-model",
+        "provider": "mock",
+        "description": null,
+        "is_active": true,
+        "context_window": 128000,
+        "max_completion_tokens": null,
+        "architecture": null,
+        "thinking_capability": null
+    }],
+    "next_cursor": null,
+    "limit": 50,
+    "total": 1,
+    "catalog_revision": "sha256:pipe-e2e"
+    }))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
+    use axum::{
+        Router,
+        routing::{get, post},
+    };
+    use serde_json::{Value, json};
+    use std::process::Stdio;
+
+    const SESSION: &str = "395d819b-81a7-4cc0-9aa8-3666ec1ac194";
+    for admitted in [true, false] {
+        let app = Router::new()
+            .route("/agents/edge", post(|| async { axum::Json(json!({"ok": true})) }))
+            .route("/skills", get(|| async { axum::Json(json!({
+                "skills": [], "total": 0, "limit": 100, "next_cursor": null
+            })) }))
+            .route("/models", get(|| async { pipe_model_catalog() }))
+            .route("/chat/stream", post(move || async move {
+                let mut events = Vec::new();
+                events.push(if admitted {
+                    json!({"type": "session_info", "session_id": SESSION, "run_id": "failure-root"})
+                } else {
+                    json!({"type": "session_info", "session_id": SESSION})
+                });
+                // A descendant event is never authority to bind or replace the root.
+                events.push(json!({"type": "run_started", "run_id": "failure-child", "parent_run_id": "failure-root"}));
+                if admitted {
+                    events.push(json!({"type": "text_delta", "content": "Observed partial output"}));
+                    events.push(json!({"type": "usage", "input_tokens": 10, "output_tokens": 5}));
+                }
+                events.push(json!({"type": "error", "message": "LLM payment required (402)", "error_code": "payment_required"}));
+                if admitted {
+                    events.push(json!({"type": "run_finished", "run_id": "failure-root", "status": "failed", "owner_generation": 1, "error_kind": "payment_required", "error": "LLM payment required (402)"}));
+                }
+                let body = events.into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>() + "data: [DONE]\n\n";
+                ([
+                    ("content-type", "text/event-stream"),
+                    (astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER, astra_server_types::AGENT_INTERACTION_API_MAJOR),
+                ], body)
+            }))
+            .route("/chat/runs/{run_id}", get(|| async { axum::Json(json!({
+                "status": "failed", "accounting": {
+                    "prompt_tokens": 10, "completion_tokens": 5,
+                    "cache_read_tokens": 0, "cache_creation_tokens": 0, "tool_call_count": 0
+                }
+            })) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for mode in ["chat-json", "print-json", "stream-json"] {
+            let home = tempfile::tempdir().unwrap();
+            let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"));
+            command.args([
+                "--api-url",
+                &base_url,
+                "--profile",
+                "pipe-e2e",
+                "--model",
+                "mock-model",
+                "--bare",
+                "--no-instructions",
+            ]);
+            if mode == "chat-json" {
+                command.args([
+                    "chat",
+                    "--no-resume",
+                    "--json",
+                    "-m",
+                    "exercise hard failure",
+                ]);
+            } else {
+                command.args([
+                    "--print",
+                    "--output-format",
+                    if mode == "print-json" {
+                        "json"
+                    } else {
+                        "stream-json"
+                    },
+                    "exercise hard failure",
+                ]);
+            }
+            command
+                .current_dir(home.path())
+                .env("HOME", home.path())
+                .env("ASTRA_LOCAL_STATE_ROOT", home.path().join(".astra"))
+                .env("XDG_CONFIG_HOME", home.path().join(".config"))
+                .env("XDG_CACHE_HOME", home.path().join(".cache"))
+                .env("XDG_DATA_HOME", home.path().join(".local/share"))
+                .env("ASTRA_ACCESS_TOKEN", "pipe-e2e-token")
+                .env("ASTRA_API_URL", &base_url)
+                .env("NO_COLOR", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+                .await
+                .unwrap()
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(
+                    if !admitted && mode == "stream-json" {
+                        "without a bridge run_id"
+                    } else {
+                        "402"
+                    }
+                ),
+                "{mode}, admitted={admitted}: stdout={stdout}; stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "{mode}, admitted={admitted}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: Value = if mode == "stream-json" {
+                let records = stdout
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .collect::<Vec<_>>();
+                let results = records
+                    .iter()
+                    .filter(|record| record["type"] == "result")
+                    .collect::<Vec<_>>();
+                assert_eq!(results.len(), 1);
+                assert!(
+                    results[0]["result"].get("run_id").is_none(),
+                    "Server identity belongs to the exchange, not the CLI execution envelope"
+                );
+                if admitted {
+                    assert!(records.iter().any(|record| record["type"] == "sse_event"
+                        && record["event"]["type"] == "session_info"
+                        && record["event"]["run_id"] == "failure-root"));
+                } else {
+                    assert!(
+                        records
+                            .iter()
+                            .all(|record| record["server_run_id"].is_null())
+                    );
+                }
+                results[0]["result"].clone()
+            } else {
+                let result: Value = serde_json::from_str(&stdout).unwrap();
+                assert_eq!(
+                    result["run_id"],
+                    if admitted {
+                        json!("failure-root")
+                    } else {
+                        Value::Null
+                    },
+                    "{mode}, admitted={admitted}: {stdout}"
+                );
+                result
+            };
+            assert_eq!(result["final_state"], "failed");
+            assert_eq!(result["exit_code"], 3);
+            assert_eq!(result["error_kind"], "api_error");
+            assert_eq!(result["success"], false);
+            assert_eq!(result["completion_disposition"], "failed");
+            assert_eq!(result["server_terminal_unverified"], true);
+            assert_eq!(result["tool_record_coverage"], "partial");
+            assert_eq!(result["error_code"], "payment_required");
+            assert!(result["error"].as_str().unwrap().contains(
+                if !admitted && mode == "stream-json" {
+                    "without a bridge run_id"
+                } else {
+                    "402"
+                }
+            ));
+            assert_eq!(
+                result["text"], "",
+                "durable failure tombstones uncompleted output"
+            );
+            if admitted {
+                assert_eq!(result["session_id"], SESSION);
+                assert_eq!(result["fresh_prompt_tokens"], 10);
+                assert_eq!(result["completion_tokens"], 5);
+                assert_no_completed_turn(home.path().join(".astra/sessions"), SESSION);
+            }
+        }
+        server.abort();
+    }
+}
+
+fn assert_no_completed_turn(directory: std::path::PathBuf, session_id: &str) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            assert_no_completed_turn(path, session_id);
+        } else if path.file_name().and_then(|name| name.to_str())
+            == Some(&format!("{session_id}.jsonl"))
+        {
+            for line in std::fs::read_to_string(path).unwrap().lines() {
+                let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert_ne!(
+                    event["type"], "turn",
+                    "a hard failure must not commit a completed turn"
+                );
+            }
+        }
+    }
 }

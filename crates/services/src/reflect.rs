@@ -81,11 +81,6 @@ pub struct ReflectReport {
     pub judgment_usage: Option<JudgmentUsageSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_judgments: Option<crate::semantic_judgment_observation::SemanticJudgmentView>,
-    /// Evaluation and provider-wire application facts for large tool-result
-    /// selection. Recommendations alone never count as application.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_result_judgments:
-        Option<crate::tool_result_selection_observation::ToolResultJudgmentView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<ObservationView>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -2483,7 +2478,7 @@ impl ReflectService for DatabaseReflectService {
             request.depth,
             astra_core::ObservationDepth::Diagnostic | astra_core::ObservationDepth::Forensic
         );
-        let (physical_capture, mut semantic_judgments, tool_result_judgments) = tokio::join!(
+        let (physical_capture, mut semantic_judgments) = tokio::join!(
             async {
                 let Some(shared_pool) = self.pool.as_ref() else {
                     return Err(
@@ -2545,42 +2540,6 @@ impl ReflectService for DatabaseReflectService {
                 } else {
                     None
                 }
-            },
-            async {
-                if !crate::tool_result_selection_observation::historical_tool_result_judgment_facet_enabled(
-                    request.facet,
-                ) {
-                    return None;
-                }
-                if matches!(
-                    request.source_policy,
-                    astra_core::SourcePolicy::LiveOnly | astra_core::SourcePolicy::LocalOnly
-                ) {
-                    return Some(crate::tool_result_selection_observation::ToolResultJudgmentView::unavailable(
-                        crate::tool_result_selection_observation::ToolResultJudgmentCoverage::SourceExcluded,
-                    ));
-                }
-                let Some(shared_pool) = self.pool.as_ref() else {
-                    return Some(crate::tool_result_selection_observation::ToolResultJudgmentView::unavailable(
-                        crate::tool_result_selection_observation::ToolResultJudgmentCoverage::SourceUnavailable,
-                    ));
-                };
-                Some(match tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    crate::tool_result_selection_observation::load_tool_result_judgment_view(
-                        shared_pool,
-                        user_id,
-                        session_id,
-                        512,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(view)) => view,
-                    _ => crate::tool_result_selection_observation::ToolResultJudgmentView::unavailable(
-                        crate::tool_result_selection_observation::ToolResultJudgmentCoverage::SourceUnavailable,
-                    ),
-                })
             },
         );
 
@@ -2800,10 +2759,6 @@ impl ReflectService for DatabaseReflectService {
             summary.push(' ');
             summary.push_str(&semantics.render_compact());
         }
-        if let Some(judgments) = &tool_result_judgments {
-            summary.push(' ');
-            summary.push_str(&judgments.render_compact());
-        }
         if let Some(llm_latency_summary) = llm_latency_summary {
             summary.push(' ');
             summary.push_str(&llm_latency_summary.render());
@@ -2869,41 +2824,6 @@ impl ReflectService for DatabaseReflectService {
                     .into(),
             );
         }
-        if let Some(judgments) = &tool_result_judgments {
-            use crate::tool_result_selection_observation::ToolResultJudgmentCoverage as Coverage;
-            let missing = matches!(
-                judgments.evaluation_coverage,
-                Coverage::NotObserved | Coverage::SourceUnavailable | Coverage::SourceExcluded
-            ) && matches!(
-                judgments.application_coverage,
-                Coverage::NotObserved | Coverage::SourceUnavailable | Coverage::SourceExcluded
-            );
-            let partial = matches!(
-                judgments.evaluation_coverage,
-                Coverage::CaptureIncomplete | Coverage::CaptureTruncated
-            ) || matches!(
-                judgments.application_coverage,
-                Coverage::CaptureIncomplete | Coverage::CaptureTruncated
-            );
-            view.data_coverage.providers.insert(
-                "tool_result_judgment".into(),
-                astra_core::ObservationProviderCoverage {
-                    status: if missing {
-                        "missing"
-                    } else if partial {
-                        "partial"
-                    } else {
-                        "fresh"
-                    }
-                    .into(),
-                    freshness_ms: None,
-                    reason: Some(format!(
-                        "evaluation={:?};application={:?};recommendation_not_adoption",
-                        judgments.evaluation_coverage, judgments.application_coverage
-                    )),
-                },
-            );
-        }
         let data_coverage = view.data_coverage.clone();
 
         Ok(ReflectReport {
@@ -2921,7 +2841,6 @@ impl ReflectService for DatabaseReflectService {
             model_requests,
             judgment_usage: Some(judgment_usage),
             semantic_judgments,
-            tool_result_judgments,
             view: Some(view),
             summary,
             observations,
@@ -3385,7 +3304,6 @@ mod tests {
             }),
             composition: Default::default(),
             wire_composition: ModelRequestWireComposition::default(),
-            tool_result_projections: Vec::new(),
             cache: ModelRequestCache {
                 cache_read_share: Some(950.0 / 1050.0),
                 invalidation_reasons: vec!["tool_schemas_changed".into()],
@@ -5090,7 +5008,6 @@ mod tests {
             model_requests: ModelRequestCapture::default(),
             judgment_usage: None,
             semantic_judgments: None,
-            tool_result_judgments: None,
             view: Some(ObservationView {
                 topic: "overview".into(),
                 facet: "overview".into(),

@@ -743,10 +743,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
         }).or_else(|| {
             execution.edge_terminal_authority.then(|| {
-                self.ctx.edge_tool_round.iter().enumerate()
-                    .find(|(index, edge)| edge.assistant_tool_call_id(*index) == execution.id
+                self.ctx.edge_tool_round.iter()
+                    .find(|edge| edge.tool_call_id() == Some(execution.id.as_str())
                         && edge.tool_name() == execution.name)
-                    .and_then(|(_, edge)| edge.execution_completion()).cloned()
+                    .and_then(|edge| edge.execution_completion()).cloned()
             }).flatten()
         });
         let finalized = finalized.result;

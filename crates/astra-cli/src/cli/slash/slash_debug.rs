@@ -120,7 +120,9 @@ fn inspect_debug_source(
             "  {} checkpoints available — inspecting latest segment.",
             checkpoints.len().to_string().green()
         );
-        if let Some(view) = build_turn_messages_view(checkpoints.len(), checkpoints) {
+        if let Some(view) =
+            build_turn_messages_view(owner, session_id, checkpoints.len(), checkpoints)
+        {
             let stub = TurnSummary {
                 journal_turn: None,
                 user_input: view
@@ -191,7 +193,7 @@ fn inspect_debug_source(
             continue;
         }
 
-        let view = build_turn_messages_view(turn_n, checkpoints);
+        let view = build_turn_messages_view(owner, session_id, turn_n, checkpoints);
         if view.is_none() {
             eprintln!(
                 "  {}",
@@ -252,28 +254,18 @@ fn checkpoint_numeric_prefix(path: &Path) -> Option<u32> {
     path.file_name()?.to_str()?.split_once('-')?.0.parse().ok()
 }
 
-fn load_messages_from_heavy_path(path: &Path) -> Option<Vec<serde_json::Value>> {
-    let content = std::fs::read_to_string(path).ok()?;
-    crate::cli::history_work::record_existing_buffer(
-        astra_core::history_work::HistoryWorkSite::CliDebugCheckpointRead,
-        content.as_bytes(),
-        0,
-    );
-    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
-    crate::cli::history_work::record_existing_buffer(
-        astra_core::history_work::HistoryWorkSite::CliDebugCheckpointDeserialization,
-        content.as_bytes(),
-        0,
-    );
-    v.get("Heavy")
-        .and_then(|h| h.get("messages"))
-        .and_then(|m| m.as_array())
-        .map(|messages| {
-            crate::cli::history_work::clone_json_history(
-                astra_core::history_work::HistoryWorkSite::CliDebugCheckpointHistoryClone,
-                messages,
-            )
-        })
+fn load_messages_from_heavy_path(
+    owner: &astra_services::OwnerScope,
+    session_id: &str,
+    path: &Path,
+) -> Option<Vec<serde_json::Value>> {
+    astra_pipeline::step_checkpoint::read_heavy_checkpoint(
+        owner.id(),
+        session_id,
+        checkpoint_numeric_prefix(path)?,
+    )
+    .ok()?
+    .map(|checkpoint| checkpoint.messages)
 }
 
 fn message_delta(
@@ -296,7 +288,12 @@ fn message_delta(
     )
 }
 
-fn build_turn_messages_view(turn_n: usize, checkpoints: &[PathBuf]) -> Option<TurnMessagesView> {
+fn build_turn_messages_view(
+    owner: &astra_services::OwnerScope,
+    session_id: &str,
+    turn_n: usize,
+    checkpoints: &[PathBuf],
+) -> Option<TurnMessagesView> {
     if checkpoints.is_empty() {
         return None;
     }
@@ -315,10 +312,10 @@ fn build_turn_messages_view(turn_n: usize, checkpoints: &[PathBuf]) -> Option<Tu
         turn_n - 1
     };
     let after_path = checkpoints.get(after_idx)?.clone();
-    let full = load_messages_from_heavy_path(&after_path)?;
+    let full = load_messages_from_heavy_path(owner, session_id, &after_path)?;
     let (before_path, before_msgs) = if after_idx > 0 {
         let bp = checkpoints[after_idx - 1].clone();
-        let bm = load_messages_from_heavy_path(&bp).unwrap_or_default();
+        let bm = load_messages_from_heavy_path(owner, session_id, &bp)?;
         (Some(bp), bm)
     } else {
         (None, Vec::new())
@@ -1114,8 +1111,8 @@ mod tests {
         use astra_services::session_journal::JournalEvent;
         let _home = crate::test_utils::HomeGuard::temp();
         let _root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
-        let _credentials = crate::tests::isolate_credentials();
         let (_directory, _sessions) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::tests::isolate_credentials();
         let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
             "default",
             Some("debug-account"),
@@ -1350,27 +1347,62 @@ mod tests {
 
     // ── Heavy checkpoint loading & deltas ───────────────────────────────
 
-    #[test]
-    fn load_messages_from_heavy_path_parses() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("000001-heavy.json");
-        std::fs::write(
-            &path,
-            r#"{"Heavy":{"light":{},"messages":[{"role":"user","content":"test"}]}}"#,
+    fn write_debug_checkpoint(
+        owner: &astra_services::OwnerScope,
+        session: &str,
+        number: u32,
+        messages: &[serde_json::Value],
+    ) -> PathBuf {
+        let mut recorder =
+            astra_pipeline::step_recorder::StepRecorder::new(owner.id(), session, "debug-task");
+        recorder.begin_turn(number);
+        let heavy = recorder
+            .build_heavy_checkpoint(messages, 100, 10, &[], &[])
+            .unwrap();
+        astra_pipeline::step_checkpoint::write_step_checkpoint(
+            owner.id(),
+            session,
+            number,
+            &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
         )
-        .unwrap();
-        let msgs = load_messages_from_heavy_path(&path).unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0]["role"], "user");
-        assert_eq!(msgs[0]["content"], "test");
+        .unwrap()
     }
 
     #[test]
-    fn load_messages_from_heavy_path_malformed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("000001-heavy.json");
+    #[serial_test::serial]
+    fn heavy_messages_require_current_owner_and_session_envelope() {
+        let (_directory, _sessions) = crate::tests::isolated_sessions_dir();
+        let owner = astra_services::OwnerScope::user("debug-owner").unwrap();
+        let path = write_debug_checkpoint(
+            &owner,
+            "debug-session",
+            1,
+            &[json!({"role":"user","content":"test"})],
+        );
+        assert_eq!(
+            load_messages_from_heavy_path(&owner, "debug-session", &path).unwrap(),
+            vec![json!({"role":"user","content":"test"})]
+        );
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for field in [
+            "user_id",
+            "session_id",
+            "layout_version",
+            "artifact_kind",
+            "schema_version",
+        ] {
+            let mut invalid = original.clone();
+            invalid[field] = if field == "schema_version" {
+                json!(0)
+            } else {
+                json!("foreign")
+            };
+            std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(load_messages_from_heavy_path(&owner, "debug-session", &path).is_none());
+        }
         std::fs::write(&path, "not json").unwrap();
-        assert!(load_messages_from_heavy_path(&path).is_none());
+        assert!(load_messages_from_heavy_path(&owner, "debug-session", &path).is_none());
     }
 
     #[test]
@@ -1407,39 +1439,21 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn build_turn_messages_view_second_turn_is_delta_only() {
-        let dir = tempfile::tempdir().unwrap();
+        let (_directory, _sessions) = crate::tests::isolated_sessions_dir();
+        let owner = astra_services::OwnerScope::user("debug-owner").unwrap();
         let m0 = vec![json!({"role":"user","content":"hi"})];
-        let m1 = vec![
-            json!({"role":"user","content":"hi"}),
-            json!({"role":"assistant","content":"yo"}),
-        ];
-        let cp = dir.path().join("step_checkpoints");
-        std::fs::create_dir_all(&cp).unwrap();
-        let p0 = cp.join("000001-heavy.json");
-        let p1 = cp.join("000002-heavy.json");
-        std::fs::write(
-            &p0,
-            format!(
-                r#"{{"Heavy":{{"light":{{}},"messages":{}}}}}"#,
-                serde_json::to_string(&m0).unwrap()
-            ),
-        )
-        .unwrap();
-        std::fs::write(
-            &p1,
-            format!(
-                r#"{{"Heavy":{{"light":{{}},"messages":{}}}}}"#,
-                serde_json::to_string(&m1).unwrap()
-            ),
-        )
-        .unwrap();
-        let cps = list_heavy_checkpoints(dir.path());
-        assert_eq!(cps.len(), 2);
-        let v = build_turn_messages_view(2, &cps).expect("view");
-        assert_eq!(v.delta.len(), 1);
-        assert_eq!(v.full.len(), 2);
+        let m1 = vec![m0[0].clone(), json!({"role":"assistant","content":"yo"})];
+        let p0 = write_debug_checkpoint(&owner, "debug-session", 1, &m0);
+        let p1 = write_debug_checkpoint(&owner, "debug-session", 2, &m1);
+        let cps = vec![p0.clone(), p1];
+        let v = build_turn_messages_view(&owner, "debug-session", 2, &cps).expect("view");
+        assert_eq!(v.delta, vec![m1[1].clone()]);
+        assert_eq!(v.full, m1);
         assert_eq!(v.warning, None);
+        std::fs::write(p0, "not json").unwrap();
+        assert!(build_turn_messages_view(&owner, "debug-session", 2, &cps).is_none());
     }
 
     #[test]

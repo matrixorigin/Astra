@@ -3,13 +3,15 @@
 
 The provider credential is read from a local YAML file and the Astra access
 token is read from the process environment.  Neither secret is accepted on the
-command line or included in diagnostics.
+command line or included in diagnostics. Declared prices require both rates
+and explicit USD/per_token units, matching the model administration contract.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import urllib.error
@@ -63,14 +65,14 @@ def selected_model_name(config: Path) -> tuple[str, str | None]:
 
 
 def _required_string(entry: dict[str, Any], field: str, model_name: str) -> str:
-    value = entry.get(field)
+    value = entry.pop(field, None)
     if not isinstance(value, str) or not value.strip():
         raise SeedError(f"selected model {model_name!r} requires non-empty {field}")
     return value.strip()
 
 
 def _optional_string(entry: dict[str, Any], field: str, model_name: str) -> str | None:
-    value = entry.get(field)
+    value = entry.pop(field, None)
     if value is None:
         return None
     if not isinstance(value, str) or not value.strip():
@@ -81,7 +83,7 @@ def _optional_string(entry: dict[str, Any], field: str, model_name: str) -> str 
 def _optional_string_list(
     entry: dict[str, Any], field: str, model_name: str
 ) -> list[str] | None:
-    value = entry.get(field)
+    value = entry.pop(field, None)
     if value is None:
         return None
     if not isinstance(value, list) or not all(
@@ -92,19 +94,25 @@ def _optional_string_list(
 
 
 def _positive_integer(entry: dict[str, Any], field: str, model_name: str) -> int:
-    value = entry.get(field)
+    value = entry.pop(field, None)
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise SeedError(f"selected model {model_name!r} requires positive {field}")
     return value
 
 
 def _optional_number(entry: dict[str, Any], field: str, model_name: str) -> float | None:
-    value = entry.get(field)
+    value = entry.pop(field, None)
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         raise SeedError(f"selected model {model_name!r} has invalid {field}")
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        raise SeedError(f"selected model {model_name!r} has invalid {field}") from None
+    if not math.isfinite(number):
+        raise SeedError(f"selected model {model_name!r} has invalid {field}")
+    return number
 
 
 def _selected_entry(document: Any, model_name: str) -> dict[str, Any]:
@@ -124,6 +132,11 @@ def _selected_entry(document: Any, model_name: str) -> dict[str, Any]:
 
 
 def model_create_payload(entry: dict[str, Any], model_name: str) -> dict[str, Any]:
+    entry = dict(entry)
+    if _required_string(entry, "name", model_name) != model_name:
+        raise SeedError("selected model identity does not match its definition")
+    if "judgment_default" in entry and not isinstance(entry.pop("judgment_default"), bool):
+        raise SeedError("model.judgment_default must be true or false")
     payload: dict[str, Any] = {
         "name": model_name,
         "provider": _required_string(entry, "provider", model_name),
@@ -135,7 +148,7 @@ def model_create_payload(entry: dict[str, Any], model_name: str) -> dict[str, An
         value = _optional_string(entry, field, model_name)
         if value is not None:
             payload[field] = value
-    if entry.get("max_completion_tokens") is not None:
+    if "max_completion_tokens" in entry:
         payload["max_completion_tokens"] = _positive_integer(
             entry, "max_completion_tokens", model_name
         )
@@ -149,18 +162,27 @@ def model_create_payload(entry: dict[str, Any], model_name: str) -> dict[str, An
         if value is not None:
             payload[field] = value
 
+    price_declared = any(
+        field in entry
+        for field in ("pricing_prompt", "pricing_completion", "pricing_currency", "pricing_unit")
+    )
     prompt_price = _optional_number(entry, "pricing_prompt", model_name)
     completion_price = _optional_number(entry, "pricing_completion", model_name)
-    if prompt_price is not None or completion_price is not None:
+    currency = entry.pop("pricing_currency", None)
+    unit = entry.pop("pricing_unit", None)
+    if price_declared:
+        if prompt_price is None or completion_price is None:
+            raise SeedError("pricing requires both pricing_prompt and pricing_completion")
+        if currency != "USD" or unit != "per_token":
+            raise SeedError("pricing requires pricing_currency: USD and pricing_unit: per_token")
         payload["pricing"] = {
-            "prompt": prompt_price or 0.0,
-            "completion": completion_price or 0.0,
+            "currency": "USD",
+            "unit": "per_token",
+            "prompt": prompt_price,
+            "completion": completion_price,
         }
 
     quirks: dict[str, Any] = {}
-    fallback_chain = _optional_string_list(entry, "fallback_chain", model_name)
-    if fallback_chain is not None:
-        quirks["fallback_chain"] = fallback_chain
     wire_model_name = _optional_string(entry, "wire_model_name", model_name)
     if wire_model_name is not None:
         quirks["wire_model_name"] = wire_model_name
@@ -168,17 +190,37 @@ def model_create_payload(entry: dict[str, Any], model_name: str) -> dict[str, An
         "prompt_cache_capability",
         "request_body_overrides",
         "probe_headers",
+        "request_headers",
     ):
-        value = entry.get(field)
+        value = entry.pop(field, None)
         if value is not None:
             if not isinstance(value, dict):
                 raise SeedError(f"selected model {model_name!r} has invalid {field}")
             quirks[field] = value
+    for field in (
+        "preserve_reasoning_content", "no_parallel_tool_calls", "tool_choice_required",
+        "strict_tool_call_ids", "no_system_message", "system_as_user_prefix",
+    ):
+        if field in entry:
+            value = entry.pop(field)
+            if not isinstance(value, bool):
+                raise SeedError(f"selected model {model_name!r} has invalid {field}")
+            quirks[field] = value
+    if "fixed_temperature" in entry:
+        value = _optional_number(entry, "fixed_temperature", model_name)
+        if value is not None:
+            quirks["fixed_temperature"] = value
+    thinking_protocol = _optional_string(entry, "thinking_protocol", model_name)
+    if thinking_protocol is not None:
+        quirks["thinking_protocol"] = thinking_protocol
     probe_endpoint = _optional_string(entry, "probe_endpoint", model_name)
     if probe_endpoint is not None:
         quirks["probe_endpoint"] = probe_endpoint
     if quirks:
         payload["quirks"] = quirks
+    if entry:
+        fields = ", ".join(sorted(str(key) for key in entry))
+        raise SeedError(f"selected model has unknown fields: {fields}")
     return payload
 
 

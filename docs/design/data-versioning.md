@@ -79,3 +79,27 @@ Versioning must respect deletion:
 - C4 debug data expires by TTL;
 - C5 learning artifacts must preserve lineage for deletion propagation;
 - audit facts may retain metadata according to policy without retaining raw private payloads.
+
+## Execution-local database rollback
+
+CLI and Server use the same SQL statement scanner, snapshot journal and rollback
+planner. Quoted SQL and comments do not create statement boundaries. Mutating
+statements, including `LOAD` and writes after a read statement, capture a snapshot
+before execution; destructive-operation admission remains a separate check.
+Connection selection and credentials remain on the selected execution adapter.
+
+Capture, journal recording, query execution and rollback serialize on the existing
+execution-local journal. A successful restore marks affected later snapshots for
+cleanup only. Failed cleanup retains those records and retries `DROP`, never a
+second `RESTORE`. Rollback results expose `restore_completed` so database recovery
+is distinguishable from unfinished cleanup. This journal is execution-local and
+does not promise recovery across a process restart.
+
+## Event lineage
+
+Lineage queries return owner-scoped persisted events and their canonical parent
+relationships. They do not read process-local session files or synthesize a
+contribution score from changed snapshot references. The former optional
+`contribution_score` response field is retired; state-reference changes alone
+do not establish an event's causal contribution. Checkpoint and snapshot
+persistence retain their existing recovery responsibilities.

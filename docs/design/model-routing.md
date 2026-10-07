@@ -43,6 +43,20 @@ trace_event_id
 
 Provider, endpoint, credential, execution placement, and billing owner are resolved Server-side from the selected Offering. A routing policy cannot invent or override them.
 
+Server inference requires admitted Offering material before using a cached
+request configuration. Legacy model-name fallback metadata does not authorize
+a route change. Rate-limit waits and physical retries retain the admitted route;
+a different Offering must pass model admission before execution.
+The shared cooldown interface records errors and wait/reject decisions only;
+it does not select another model or maintain fallback state and counters.
+
+Managed model quirks use a strict schema. Unknown controls, including the retired
+model-name `fallback_chain`, are rejected instead of silently stored. Explicit
+`request_body_overrides` remain the provider-extension boundary. CLI YAML imports
+validate every model before sending the first write or connectivity check. A
+quirks update replaces the complete object and remains subject to the existing
+configuration concurrency fence.
+
 ## Execution attribution
 
 Routing evaluation must join selection evidence to actual inference execution.

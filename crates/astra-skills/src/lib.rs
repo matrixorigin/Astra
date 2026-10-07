@@ -29,7 +29,6 @@
 pub mod activation;
 pub mod arguments;
 pub mod composition;
-pub mod health_ranking;
 pub mod hooks;
 pub mod loader;
 pub mod manifest;

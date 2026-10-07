@@ -46,6 +46,49 @@ pub struct WorkingMemoryState {
 }
 
 impl WorkingMemoryState {
+    /// Replace transient blocker/resume state from the authoritative turn outcome.
+    pub fn apply_turn_settlement(
+        &mut self,
+        interruption: Option<&crate::interruption::InterruptionRecord>,
+    ) {
+        // Rebuild blocker pressure from current settlement state instead of
+        // accumulating old outages/nudges across turns.
+        self.clear_blockers();
+
+        let Some(interruption) = interruption else {
+            self.clear_next_action();
+            return;
+        };
+
+        if interruption_requires_intervention(interruption) {
+            self.clear_next_action();
+            self.push_blocker(format!(
+                "{}: {}",
+                interruption.kind.label(),
+                bounded_working_memory_line(&interruption.user_message)
+            ));
+            return;
+        }
+
+        if matches!(
+            interruption.kind,
+            crate::interruption::InterruptionKind::UserCancelled
+        ) {
+            self.clear_next_action();
+            return;
+        }
+
+        if interruption.kind.is_resumable() {
+            self.set_next_action(format!(
+                "If the user asks to continue, resume after {}: {}",
+                interruption.kind.label(),
+                bounded_working_memory_line(&interruption.user_message)
+            ));
+        } else {
+            self.clear_next_action();
+        }
+    }
+
     /// Construct with custom caps. Default construction (`Default::default()`)
     /// uses [`WorkingMemoryConfig::default`].
     #[must_use]
@@ -212,6 +255,30 @@ fn compact_line(raw: &str, max_chars: usize) -> String {
     let mut out = normalized
         .chars()
         .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn interruption_requires_intervention(
+    interruption: &crate::interruption::InterruptionRecord,
+) -> bool {
+    matches!(
+        &interruption.resume_action,
+        crate::interruption::ResumeAction::RequiresIntervention { .. }
+            | crate::interruption::ResumeAction::StartNewSession
+    ) || !interruption.kind.is_resumable()
+}
+
+fn bounded_working_memory_line(raw: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_CHARS {
+        return normalized;
+    }
+    let mut out = normalized
+        .chars()
+        .take(MAX_CHARS.saturating_sub(3))
         .collect::<String>();
     out.push_str("...");
     out

@@ -1,15 +1,11 @@
-//! Turn execution profiles, session error classification, and memory repo extraction.
+//! Turn execution profiles and session error classification.
 //!
 //! Natural-language turn intent is deliberately not inferred here. Strong
 //! runtime behavior must be driven by structured judge output or concrete
 //! tool/workspace evidence, not keyword lists over user text.
 
-use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use std::sync::LazyLock;
 use std::time::Duration;
-
-use regex::Regex;
 
 const DEFAULT_STALL_WINDOW: usize = 3;
 const DEFAULT_EXPLORATION_ROUND_WINDOW: usize = 5;
@@ -279,56 +275,6 @@ pub fn is_session_not_found_error(error: &str) -> bool {
     error.to_lowercase().contains("session not found")
 }
 
-/// Extract `owner/repo` patterns from memory text.
-pub fn extract_repos_from_memory(text: &str) -> Vec<String> {
-    static GITHUB_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)github\.com/([a-zA-Z0-9][\w-]{0,38})/([a-zA-Z0-9][\w.-]{0,99})")
-            .expect("github url regex")
-    });
-
-    static BARE_REPO_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b([a-zA-Z0-9][\w-]{0,38})/([a-zA-Z0-9][\w.-]{0,99})\b")
-            .expect("repo regex")
-    });
-
-    let mut repos = Vec::new();
-    let mut seen = HashSet::new();
-
-    let mut add = |owner: &str, repo: &str| {
-        let full = format!("{owner}/{repo}");
-        let key = full.to_lowercase();
-        if seen.insert(key) {
-            repos.push(full);
-        }
-    };
-
-    for cap in GITHUB_URL_RE.captures_iter(text) {
-        add(&cap[1], &cap[2]);
-    }
-
-    for cap in BARE_REPO_RE.captures_iter(text) {
-        let owner = &cap[1];
-        let repo = &cap[2];
-        if [
-            "http", "https", "ftp", "ssh", "git", "usr", "etc", "var", "tmp", "home",
-        ]
-        .contains(&owner.to_lowercase().as_str())
-        {
-            continue;
-        }
-        if owner.contains('.') {
-            continue;
-        }
-        let match_start = cap.get(0).expect("group 0 always exists").start();
-        if text[..match_start].ends_with('@') {
-            continue;
-        }
-        add(owner, repo);
-    }
-
-    repos
-}
-
 // ── Shared prompt text normalization ───────────────────────────────────────
 //
 /// Trim trailing punctuation, ellipsis markers, and Chinese tone particles
@@ -504,63 +450,6 @@ mod tests {
         assert!(is_session_not_found_error("error: SESSION NOT FOUND"));
         assert!(!is_session_not_found_error("authentication failed"));
         assert!(!is_session_not_found_error(""));
-    }
-
-    #[test]
-    fn extract_repos_explicit_owner_repo() {
-        let text = "user follows matrixorigin/Memoria and wants to track their projects";
-        let repos = extract_repos_from_memory(text);
-        assert_eq!(repos, vec!["matrixorigin/Memoria"]);
-    }
-
-    #[test]
-    fn extract_repos_multiple() {
-        let text = "tracks matrixorigin/Memoria and also watches rust-lang/rust";
-        let repos = extract_repos_from_memory(text);
-        assert_eq!(repos.len(), 2);
-        assert!(repos.contains(&"matrixorigin/Memoria".to_string()));
-        assert!(repos.contains(&"rust-lang/rust".to_string()));
-    }
-
-    #[test]
-    fn extract_repos_dedup() {
-        let text = "matrixorigin/Memoria and MATRIXORIGIN/memoria again";
-        let repos = extract_repos_from_memory(text);
-        assert_eq!(repos.len(), 1, "should deduplicate case-insensitively");
-    }
-
-    #[test]
-    fn extract_repos_skips_tag_namespaces() {
-        let text = "[@pref/active] user follows matrixorigin/Memoria";
-        let repos = extract_repos_from_memory(text);
-        assert_eq!(repos, vec!["matrixorigin/Memoria"]);
-        assert!(
-            !repos.iter().any(|r| r.contains("pref")),
-            "should not extract @pref/active as a repo"
-        );
-    }
-
-    #[test]
-    fn extract_repos_skips_protocols() {
-        let text = "see https://github.com/matrixorigin/Memoria for details";
-        let repos = extract_repos_from_memory(text);
-        assert!(repos.iter().any(|r| r == "matrixorigin/Memoria"));
-        assert!(!repos.iter().any(|r| r.to_lowercase().contains("http")));
-    }
-
-    #[test]
-    fn extract_repos_empty_for_no_repos() {
-        let text = "user prefers concise responses and dark mode";
-        let repos = extract_repos_from_memory(text);
-        assert!(repos.is_empty());
-    }
-
-    #[test]
-    fn extract_repos_handles_hyphen() {
-        let text = "watching my-org/my-project and also some-user/cool-lib";
-        let repos = extract_repos_from_memory(text);
-        assert!(repos.iter().any(|r| r == "my-org/my-project"));
-        assert!(repos.iter().any(|r| r == "some-user/cool-lib"));
     }
 
     // ── trim_trailing_punctuation ────────────────────────────────────────

@@ -1,12 +1,10 @@
 //! Dump the full LLM request payload on error for post-mortem debugging.
 //!
-//! Two outputs:
-//! 1. **Local file**: `~/.astra/sessions/<session_id>/llm_error_<ts>.json`
-//!    — immediate access for the user / CLI developer.
-//! 2. **Cloud event**: `event_type = "llm_request_dump"` in `agent_events`
-//!    — queryable via `/events/session/{session_id}` for support staff.
+//! Server persists an owner-scoped remote JSON artifact for request failures.
+//! Request content and Unicode-safe error previews share the existing artifact
+//! store; this module does not write to host-local session directories.
 
-use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore, SessionArtifactStore};
+use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore};
 use serde_json::{Value, json};
 
 const ERROR_PREVIEW_MAX_CHARS: usize = 200;
@@ -78,34 +76,6 @@ impl LlmRequestDump {
         }
     }
 
-    /// Write to local file under the session directory.
-    /// Returns the path on success.
-    pub fn write_local(&self) -> Option<String> {
-        let dir = astra_services::local_session_artifact_store()
-            .session_dir(&self.session_id)
-            .ok()?;
-        std::fs::create_dir_all(&dir).ok()?;
-        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-        let path = dir.join(format!("llm_error_{ts}.json"));
-        let content = match serde_json::to_string_pretty(&self.to_json()) {
-            Ok(content) => content,
-            Err(error) => {
-                astra_core::history_work::record_serialization_failure(
-                    astra_core::history_work::HistoryWorkSite::RequestDumpSerialization,
-                    &error,
-                );
-                return None;
-            }
-        };
-        if astra_core::history_work::instrumentation_enabled() {
-            astra_core::history_work::record_bytes(
-                astra_core::history_work::HistoryWorkSite::RequestDumpSerialization,
-                u64::try_from(content.len()).unwrap_or(u64::MAX),
-            );
-        }
-        std::fs::write(&path, content).ok()?;
-        Some(path.display().to_string())
-    }
     pub async fn persist_remote(
         &self,
         user_id: &str,
@@ -161,7 +131,6 @@ pub fn build_llm_request_dump(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_services::session_journal::JournalDirGuard;
 
     #[test]
     fn truncate_chars_keeps_short_strings() {
@@ -225,27 +194,5 @@ mod tests {
         assert_eq!(record.artifact_kind, "llm_request_dump");
         assert_eq!(record.round, Some(2));
         assert_eq!(record.metadata.as_ref().unwrap()["model"], "kimi-k2.5");
-    }
-
-    #[test]
-    fn write_local_uses_session_artifact_root_override() {
-        let temp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(temp.path());
-        let dump = build_llm_request_dump(
-            "sess-1",
-            Some("test-agent"),
-            "kimi-k2.5",
-            "moonshot",
-            "LLM error 400",
-            &[json!({"role": "user", "content": "hi"})],
-            &[],
-            0,
-            Some(1024),
-        );
-        let path = dump.write_local().expect("dump path");
-        let session_dir = astra_services::local_session_artifact_store()
-            .session_dir("sess-1")
-            .expect("session dir");
-        assert!(path.starts_with(&*session_dir.to_string_lossy()), "{path}");
     }
 }

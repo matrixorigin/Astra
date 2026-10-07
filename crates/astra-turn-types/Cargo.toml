@@ -7,6 +7,7 @@ publish = false
 description = "Core turn types for astra runtime"
 
 [dependencies]
+astra-core.workspace = true
 # Canonical source of the memory-protocol layer constants
 # (ABSTRACT_MIN/MAX_CHARS, LAYER_SEP_*). Re-exported through this
 # crate so callers can use either `astra_turn_types::memory_structure`

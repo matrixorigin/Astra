@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::guardrails::error_recovery::{ErrorCategory, build_recovery_message_with_evidence};
 use crate::guardrails::turn_guard::TurnGuard;
-use crate::headless_tool_assembly::{HeadlessRoundToolIdx, headless_timeout_aborted_tool_names};
+use crate::headless_tool_assembly::headless_timeout_aborted_tool_names;
 use crate::result_quality::ResultQuality;
 use astra_pipeline::step_protocol::{
     CachedToolResult, IdempotencyKey, InMemoryIdempotencyCache, epoch_ms,
@@ -168,10 +168,9 @@ impl HeadlessStepDeadline {
     #[must_use]
     pub fn step_timeout_abort(
         &self,
-        indices: &[HeadlessRoundToolIdx],
+        indices: &[usize],
         completed_tool_results_len: usize,
         server_tool_calls: &[Value],
-        synthetic_tool_name: impl FnMut(usize) -> String,
     ) -> Option<(usize, Vec<String>)> {
         if !self.is_past_deadline() {
             return None;
@@ -181,7 +180,6 @@ impl HeadlessStepDeadline {
             indices,
             completed_tool_results_len,
             server_tool_calls,
-            synthetic_tool_name,
         );
         Some((aborted_count, aborted_tools))
     }
@@ -713,12 +711,11 @@ mod tests {
     #[test]
     fn step_timeout_abort_none_under_long_budget() {
         let d = HeadlessStepDeadline::from_scheduling_timeout_ms(60_000);
-        let indices = vec![HeadlessRoundToolIdx::ServerToolCall(0)];
+        let indices = vec![0];
         let r = d.step_timeout_abort(
             &indices,
             0,
             &[json!({"id":"call-x","type":"function","function":{"name":"x","arguments":"{}"}})],
-            |_| "y".into(),
         );
         assert!(r.is_none());
     }
@@ -727,14 +724,14 @@ mod tests {
     fn step_timeout_abort_fires_after_zero_budget_and_delay() {
         let d = HeadlessStepDeadline::from_scheduling_timeout_ms(0);
         std::thread::sleep(Duration::from_millis(15));
-        let indices = vec![HeadlessRoundToolIdx::ServerToolCall(0)];
+        let indices = vec![0];
         let server = vec![json!({
             "id": "call-read",
             "type": "function",
             "function": {"name":"read_file","arguments":"{}"}
         })];
         let r = d
-            .step_timeout_abort(&indices, 0, &server, |_| "edge".into())
+            .step_timeout_abort(&indices, 0, &server)
             .expect("deadline should elapse");
         assert_eq!(r.0, 1);
         assert_eq!(r.1, vec!["read_file".to_string()]);

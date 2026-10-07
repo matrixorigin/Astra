@@ -846,6 +846,11 @@ token budget. Explicit effort and budget requests are rejected when unsupported,
 never silently converted to a toggle. An unsuffixed model preserves its default;
 `(thinking:on)` and `(thinking:off)` retain explicit intent across surfaces.
 
+The unconnected per-turn complexity dampener (`TurnComplexitySignals`,
+`scale_for_turn`, and `capped_at`) is retired from the source API; requested
+thinking controls, Offering admission and provider emission keep their existing
+contracts.
+
 ### Resolved generation policy
 
 Model admission resolves the call-level generation behavior before provider
@@ -1319,9 +1324,17 @@ object keys before conversion into a map. The model identity is the existing
 adapter's execution identity, not a guarantee that every upstream provider
 exposes a resolved model version.
 
+Choice questions declare their local `optional` answer policy explicitly.
+Required answers retain strict identity, distribution and execution-provenance
+validation. Missing or invalid optional observations are omitted by the shared
+codec, without invented probabilities; unknown IDs, duplicate JSON and invalid
+response envelopes still fail. TypeSafe requests strip this local policy and
+send the provider's existing Choice schema. Its adapter retains only the local
+question contract across I/O, rather than copying user evidence for validation.
+
 These response facts do not add a ledger, query or persistence projection.
-Malformed judgments use the consumer's existing failure/baseline behavior;
-they are not semantic abstentions authorizing another clarification request.
+Malformed required judgments use the consumer's existing failure/baseline
+behavior; they do not authorize another clarification request.
 
 This contract intentionally replaces the former `selected_model` and raw
 model/provider/gateway request shapes. There is no dual interpretation or
@@ -1641,3 +1654,20 @@ Cover Web, CLI + Server, Server Only, and Edge + Server:
 - No client can select an endpoint, credential, or placement directly.
 - Refresh, reconnect, process crash, credential rotation, and Server failover preserve truthful run state.
 - Online tests validate multi-tenant isolation and actual TaaS/MatrixOne contracts.
+
+Cache-break diagnosis consumes dispatched provider-attempt receipts with exact
+request and attempt identity. Missing cache evidence remains unknown; planned
+prompt snapshots and normalized zero cache-read counts cannot substitute for
+physical-attempt evidence. Runtime feedback still owns section accounting,
+truncation recovery and turn statistics. The unused source-only cache compression
+hint and warm-cache rollout diagnostic APIs are retired; compression and rollout
+policy remain at their active owners.
+Cache checkpoints persist structural and usage-bearing baselines independently.
+Restoration does not seed a missing usage baseline from structural-only evidence.
+
+The source-only `record_turn` and default-source shortcuts are retired. Callers
+submit explicit physical request/attempt identities to the receipt API. Planned
+system, tool, and cache-marker hashes remain diagnostic metadata; they never
+substitute for provider-final identities in structural break classification.
+Protocol changes are attributed separately; protocol-native marker changes are
+represented by the exact component identity that contains those markers.

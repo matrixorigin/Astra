@@ -914,7 +914,7 @@ fn show_help() {
     eprintln!();
     eprintln!(
         "  {}",
-        "Spawned agents come from `agent(action='spawn', ...)`; delegations come from the delegate tool.".dim()
+        "Spawned agents come from `agent(action='spawn', ...)`; delegations come from the Run delegation API.".dim()
     );
     eprintln!(
         "  {}",

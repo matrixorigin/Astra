@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CompletionAction, ContinuationAuthority,
+    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CompletionAction,
     DIRECT_CHILD_RESULT_SCHEMA, HostTurnResult, RejectedToolCall, RunControlProvider,
-    TerminalExecutionAuthority, ToolCallAdmission, TurnPhaseKind, TurnPhaseOutcome,
-    UserIntentState, WORK_SETTLEMENT_CONTRACT_FAILURE_TEXT, complete_turn_phase,
+    ToolCallAdmission, TurnPhaseKind, TurnPhaseOutcome, UserIntentState,
+    WORK_SETTLEMENT_CONTRACT_FAILURE_TEXT, complete_turn_phase,
     context_manifest_identity_from_result, finalize_and_render, finalize_turn_trace,
     try_write_heavy_checkpoint,
 };
@@ -307,18 +307,6 @@ pub(crate) async fn fence_direct_child_finalization<H: AgenticLoopHost>(
     }
 }
 
-/// Wait at a proposed final answer or an explicit agent question; ordinary
-/// tool/model work stays concurrent until one of those synchronization edges.
-/// Return the synchronization outcome without collapsing a recoverable pause
-/// into permission to synthesize or finalize.
-pub(crate) async fn await_direct_children_before_completion<H: AgenticLoopHost>(
-    host: &mut H,
-    state: &mut AgenticLoopState,
-    continuation: ContinuationAuthority,
-) -> Result<RuntimeActivityOutcome, astra_core::ClassifiedError> {
-    await_runtime_activity(host, state, continuation, None).await
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeActivityOutcome {
     InputReady,
@@ -371,7 +359,6 @@ fn paused_direct_child_outcome<H: AgenticLoopHost>(
 pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
-    continuation: ContinuationAuthority,
     observation_request: Option<&astra_tools::agent_tool_contract::AgentWaitReceipt>,
 ) -> Result<RuntimeActivityOutcome, astra_core::ClassifiedError> {
     let owner = host.direct_child_completion_owner(state);
@@ -404,8 +391,7 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
         }
         _ = std::future::ready(()) => {}
     }
-    if continuation == ContinuationAuthority::Runtime
-        && remaining.is_none_or(|remaining| !remaining.is_zero())
+    if remaining.is_none_or(|remaining| !remaining.is_zero())
         && let Some(outcome) =
             paused_direct_child_outcome(host, state, owner.as_deref(), started, observation_request)
     {
@@ -419,9 +405,7 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
             .agentic_turn_budget
             .hard_turn_limit
             .is_some_and(|limit| state.llm_rounds_completed as usize >= limit.get());
-    let outcome = if continuation != ContinuationAuthority::Runtime {
-        "remote_owner_unsettled"
-    } else if no_synthesis_budget {
+    let outcome = if no_synthesis_budget {
         "synthesis_budget_exhausted"
     } else {
         let children = serde_json::json!(
@@ -3406,10 +3390,10 @@ fn record_direct_llm_error_state(
 ) {
     match error.kind {
         astra_core::ErrorKind::RateLimit if !is_llm_provider_admission_error(error) => {
-            state.rate_limit_cooldown.record_429(None, false);
+            state.rate_limit_cooldown.record_429(None);
         }
         astra_core::ErrorKind::ServerError => {
-            state.rate_limit_cooldown.record_529(None, false);
+            state.rate_limit_cooldown.record_529(None);
         }
         _ => {}
     }
@@ -4219,6 +4203,19 @@ fn apply_acknowledged_user_intents<H: AgenticLoopHost>(
             "role": "user",
             "content": combined,
         }));
+        // Freeze the exact acknowledged canonical message, including every
+        // input in this batch. The prior turn's frozen source and the last
+        // individual input cannot own observations of this combined message.
+        state.telemetry.turn_intent_context = Some(
+            crate::turn::agentic::turn_intent::build_turn_intent_judge_context(
+                &state.messages,
+                &combined,
+                &combined,
+                state.current_session_turn_number(),
+                &state.recent_tools,
+                &state.skills.execution.invoked,
+            ),
+        );
         state.message = model_guidance
             .last()
             .map(|input| input.content.clone())
@@ -4307,45 +4304,6 @@ fn record_superseded_llm_round(
     turn_result: &HostTurnResult,
     turn_start: Instant,
 ) {
-    if let Some(summary) = turn_result.accum.server_execution_summary.as_ref() {
-        let is_new = state.fold_server_execution_summary_and_refresh_rounds(
-            turn_result.accum.run_id.as_deref(),
-            summary,
-            turn_result.accum.accounted_usage(),
-        );
-        if !is_new {
-            return;
-        }
-        state.last_request_usage = turn_result.accum.current_request_usage;
-        state.last_measured_prompt_tokens = turn_result.accum.measured_request_input_tokens();
-        if state.telemetry.first_ttft_ms.is_none() {
-            state.telemetry.first_ttft_ms = turn_result.ttft_ms;
-        }
-        state.total_prompt = state
-            .total_prompt
-            .saturating_add(turn_result.accum.prompt_tokens);
-        state.total_completion = state
-            .total_completion
-            .saturating_add(turn_result.accum.completion_tokens);
-        state.total_cache_read = state
-            .total_cache_read
-            .saturating_add(turn_result.accum.cache_read_tokens);
-        state.total_cache_creation = state
-            .total_cache_creation
-            .saturating_add(turn_result.accum.cache_creation_tokens);
-        state.total_tool_calls = state
-            .total_tool_calls
-            .saturating_add(summary.tool_calls_count);
-        state.total_observation_tool_calls = state
-            .total_observation_tool_calls
-            .saturating_add(summary.observation_tool_calls_count);
-        state.step_recorder.record_tokens(
-            turn_result.accum.prompt_tokens,
-            turn_result.accum.completion_tokens,
-        );
-        state.has_any_usage |= turn_result.accum.has_usage;
-        return;
-    }
     if state.telemetry.first_ttft_ms.is_none() {
         state.telemetry.first_ttft_ms = turn_result.ttft_ms;
     }
@@ -4393,15 +4351,6 @@ fn record_observed_llm_round(
     finish_reason: Option<&str>,
     tool_call_names: Vec<String>,
 ) {
-    // A remote Server terminal closes an already-executed model loop. Its
-    // physical rounds are persisted by the owning Server and its aggregate
-    // usage is carried separately for accounting. Recording the thin-client
-    // wait as another LLM round fabricates round=0, attributes the whole run
-    // duration to one model request, and double-counts tokens in session
-    // explain/harness projections.
-    if turn_result.accum.server_execution_summary.is_some() {
-        return;
-    }
     let agentic_step = current_agentic_step(state);
     let run_id = state.current_run_id.clone();
     let duration_ms = turn_start.elapsed().as_millis() as u64;
@@ -4464,8 +4413,7 @@ pub(crate) enum TurnExecutionControl {
     Return(AgenticLoopOutcome),
 }
 
-fn apply_terminal_control_stream_snapshot<H: AgenticLoopHost>(
-    host: &mut H,
+fn apply_terminal_control_stream_snapshot(
     state: &mut AgenticLoopState,
     snap: &AgenticTurnStreamSnapshot<'_>,
     control_outcome: crate::turn::terminal_control::TerminalControlOutcome,
@@ -4475,7 +4423,6 @@ fn apply_terminal_control_stream_snapshot<H: AgenticLoopHost>(
     }
     if let Some(session_id) = snap.session_id.as_ref() {
         state.current_session_id = Some(session_id.clone());
-        host.on_session_bound(session_id);
     }
     if let Some(run_id) = snap.run_id.as_deref() {
         state.current_run_id = Some(run_id.to_string());
@@ -4489,24 +4436,9 @@ fn apply_terminal_control_stream_snapshot<H: AgenticLoopHost>(
     state.total_completion += snap.completion_tokens;
     state.total_cache_read += snap.cache_read_tokens;
     state.total_cache_creation += snap.cache_creation_tokens;
-    if snap.server_execution_summary.is_none() {
-        state.add_qualified_usage(snap.qualified_usage);
-    }
-    if let Some(summary) = snap.server_execution_summary {
-        let is_new = state.fold_server_execution_summary_and_refresh_rounds(
-            snap.run_id.as_deref(),
-            summary,
-            snap.qualified_usage,
-        );
-        if is_new {
-            state.total_tool_calls = state
-                .total_tool_calls
-                .saturating_add(summary.tool_calls_count);
-            state.total_observation_tool_calls = state
-                .total_observation_tool_calls
-                .saturating_add(summary.observation_tool_calls_count);
-        }
-    }
+
+    state.add_qualified_usage(snap.qualified_usage);
+
     state
         .step_recorder
         .record_tokens(snap.prompt_tokens, snap.completion_tokens);
@@ -4635,9 +4567,8 @@ async fn persist_context_manifest_for_llm_call(
     if turn_result.is_none() && state.last_llm_context_manifest_trace.is_none() {
         return;
     }
-    // The host chooses the authority boundary: remote clients require the
-    // response pair, while a Server host may use its already-admitted state
-    // identity for a provider transport error with no accumulator.
+    // Provider transport errors may have no accumulator; retain the identity
+    // of the already-admitted execution.
     let Some((session_id, run_id)) = identity else {
         return;
     };
@@ -4759,66 +4690,25 @@ pub(crate) fn record_context_compactions<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
     observations: &[astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation],
 ) {
-    if observations.is_empty() {
-        return;
-    }
-
     for observation in observations {
-        if !observation.is_consistent() {
-            tracing::warn!(
-                target: "astra_runtime::compaction",
-                observation_id = %observation.id,
-                kind = %observation.kind,
-                "ignoring inconsistent context compaction observation"
-            );
+        let Some(event) = observation.record_projection(
+            state.max_turn_input_tokens,
+            &mut state.step_recorder,
+            state.pipeline_session.as_mut(),
+        ) else {
             continue;
-        }
-        let tokens_freed = observation.tokens_before - observation.tokens_after;
-        let compacted_messages = observation
-            .messages_before
-            .saturating_sub(observation.messages_after)
-            .min(u64::from(u32::MAX)) as u32;
-        let pressure = if state.max_turn_input_tokens > 0 {
-            (observation.tokens_before as f64 / state.max_turn_input_tokens as f64).min(1.0)
-        } else {
-            0.0
         };
         state.context_compression_triggered = true;
         state.compact_tier_applied = state.compact_tier_applied.max(observation.tier);
         state
             .compaction_effectiveness
-            .record_compaction(tokens_freed);
+            .record_compaction(observation.tokens_saved);
         if observation.effectiveness
             == astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Insufficient
         {
             state.compaction_effectiveness.mark_insufficient();
         }
-        state.step_recorder.record_compaction_with_kind(
-            &observation.kind.to_string(),
-            compacted_messages,
-            tokens_freed,
-            pressure,
-        );
-        if let Some(ref mut sess) = state.pipeline_session {
-            sess.record_compaction_audit(
-                &observation.kind.to_string(),
-                compacted_messages,
-                tokens_freed.min(u64::from(u32::MAX)) as u32,
-            );
-            sess.stats.record_compaction(tokens_freed);
-        }
-        host.on_compaction(CompactionEvent::new(
-            observation.kind,
-            pressure,
-            tokens_freed,
-            observation.tokens_before,
-            state.max_turn_input_tokens,
-            compacted_messages as usize,
-            observation
-                .messages_after
-                .min(u64::try_from(usize::MAX).unwrap_or(u64::MAX)) as usize,
-            Vec::new(),
-        ));
+        host.on_compaction(event);
     }
 }
 
@@ -4914,8 +4804,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             }
         }
 
-        let mut guidance =
-            crate::prompts::tool_round_guidance(&state.messages, state.llm_rounds_completed);
+        let mut guidance = crate::prompts::tool_round_guidance_trace(&state.messages).0;
         if !state.suppress_execution_slice_guidance() {
             let slice_guidance = crate::prompts::execution_slice_guidance(
                 state.remaining_turns,
@@ -5199,34 +5088,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             llm_wall_start.elapsed().as_millis() as u64,
         );
     }
-    // A server host may return a typed control-plane transition (for example,
-    // the synthetic `start_work` admission) without crossing a provider
-    // boundary.  Keep it in the ordinary ingest path so the lifecycle and
-    // task board receive durable evidence, but do not let it seed provider
-    // prompt-cache accounting or a model-call context manifest.
-    let control_plane_boundary = match turn_result.as_ref() {
-        Ok(result) => host.consume_control_plane_turn(result),
-        Err(_) => super::host::ControlPlaneTurnBoundary::Ordinary,
-    };
-    let providerless_control_plane_turn = matches!(
-        control_plane_boundary,
-        super::host::ControlPlaneTurnBoundary::Providerless
-    );
     // `text_only` applies to one successful model boundary. Keep it through
     // the admission/tool phase when a provider nevertheless returns tools so
     // a retry cannot execute them. A safely recoverable provider failure keeps
     // the same authority until the bounded recovery decision below; every
     // other error clears it.
-    let retain_text_only_for_tool_admission = turn_result.as_ref().is_ok_and(|result| {
-        result.accum.has_tool_calls
-            || !result.accum.tool_calls.is_empty()
-            || !result.edge_tool_round.is_empty()
-            || result
-                .accum
-                .server_execution_summary
-                .as_ref()
-                .is_some_and(|summary| summary.tool_calls_count > 0)
-    });
+    let retain_text_only_for_tool_admission = turn_result
+        .as_ref()
+        .is_ok_and(|result| result.accum.has_tool_calls || !result.accum.tool_calls.is_empty());
     let provider_recovery_pending = turn_result.as_ref().is_err_and(|error| {
         matches!(
             error.kind,
@@ -5273,22 +5142,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             format!("model_inference_{turn_index}"),
         );
     }
-    let locally_executed_provider_round = should_record_local_provider_round(
-        control_plane_boundary,
+    state.record_local_usage_coverage(
         turn_result
             .as_ref()
-            .ok()
-            .and_then(|result| result.accum.server_execution_summary.as_ref())
-            .is_some(),
+            .is_ok_and(|result| result.accum.has_usage),
     );
-    if locally_executed_provider_round {
-        state.record_local_usage_coverage(
-            turn_result
-                .as_ref()
-                .is_ok_and(|result| result.accum.has_usage),
-        );
-        state.record_local_llm_round();
-    }
+    state.record_local_llm_round();
     // Capture finish_reason before the match consumes turn_result.
     // Used by textless-stop retry (loop level) and ensure_terminal_text
     // (finalization level) to distinguish true silence from forced truncation
@@ -5313,7 +5172,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     {
         state.last_llm_context_manifest_trace = Some(trace);
     }
-    if !providerless_control_plane_turn && let Some(message_tokens) = manifest_message_tokens {
+    if let Some(message_tokens) = manifest_message_tokens {
         let manifest_identity = host.context_manifest_identity(state, turn_result.as_ref().ok());
         persist_context_manifest_for_llm_call(
             state,
@@ -5338,9 +5197,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 .map(|injection| injection.payload.clone())
                 .collect();
             for payload in &delivered_children {
-                let outcome = if providerless_control_plane_turn
-                    || turn_result.accum.error_message.is_some()
-                {
+                let outcome = if turn_result.accum.error_message.is_some() {
                     "result_delivery_deferred"
                 } else {
                     "results_adopted"
@@ -5355,10 +5212,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     None,
                 );
             }
-            // A providerless control-plane result or a provider response that
-            // carries an embedded error did not produce an assistant decision.
+            // A provider response carrying an embedded error did not produce
+            // an assistant decision.
             // Keep the exact leased authorities for the next real attempt.
-            if providerless_control_plane_turn || turn_result.accum.error_message.is_some() {
+            if turn_result.accum.error_message.is_some() {
                 state.restore_volatile_attempt_lease();
             } else {
                 state.commit_volatile_attempt_lease();
@@ -5425,15 +5282,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             return Err(error);
         }
     };
-    let continuation_authority = host.continuation_authority(&turn_result);
-    // The remote loop owns input reconciliation and continuation. A local
-    // action fence must not reopen an already-admitted Server execution.
-    let action_fence = match continuation_authority {
-        ContinuationAuthority::Runtime => {
-            inject_polled_user_intents_before_action(host, state).await
-        }
-        ContinuationAuthority::RemoteServer => Ok(false),
-    };
+    // Reconcile newly accepted input before granting this response action authority.
+    let action_fence = inject_polled_user_intents_before_action(host, state).await;
     if action_fence.as_ref().is_ok_and(|applied| *applied) || action_fence.is_err() {
         // Physical usage and round evidence remain true even though the
         // response no longer has conversational or execution authority.
@@ -5464,25 +5314,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         state.step_recorder.end_turn(false);
         return Ok(TurnExecutionControl::ContinueLoop);
     }
-    if providerless_control_plane_turn {
-        state.current_model_item_id = None;
-        turn_result.accum.model_item_id = None;
-    } else if continuation_authority == ContinuationAuthority::RemoteServer {
-        // One remote loop can contain several physical responses. Its accepted
-        // identity is authoritative; the local request UUID is not a substitute.
-        state.current_model_item_id = turn_result.accum.model_item_id.clone();
-    }
-    if continuation_authority == ContinuationAuthority::RemoteServer
-        && (turn_result.accum.has_tool_calls || !turn_result.accum.tool_calls.is_empty())
-        && turn_result.accum.error_message.is_none()
-    {
-        // Reject through ingest, which preserves identity and physical usage
-        // before handling the failure. These calls never gain local authority.
-        turn_result.error_kind = Some(astra_core::ErrorKind::ContractViolation);
-        turn_result.accum.error_kind = turn_result.error_kind;
-        turn_result.accum.error_message =
-            Some("remote Server returned pending client continuation work".into());
-    }
+
     let collapsed_observation_calls =
         collapse_batched_observation_fanout(&mut turn_result.accum.tool_calls);
     if collapsed_observation_calls > 0 {
@@ -5498,126 +5330,61 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if let Some(ref mut sess) = state.pipeline_session {
         sess.recovery.reset_on_success();
     }
-    let mut snap = agentic_turn_stream_snapshot_with_kind(
+    let snap = agentic_turn_stream_snapshot_with_kind(
         &turn_result.accum,
         turn_result.ttft_ms,
         turn_result.error_kind,
     );
-    if continuation_authority == ContinuationAuthority::RemoteServer {
-        // Raw requested work is neither local authority nor an execution
-        // count. Keep it in the observed response for trace, but ingest only
-        // the Server's execution summary and physical usage.
-        snap.tool_calls = &[];
-    }
+
     state.last_request_usage = turn_result.accum.current_request_usage;
     update_turn_trace_collector(state, &turn_result);
 
     if let Some(control_outcome) = host.take_terminal_control_outcome()
         && turn_result.accum.error_message.is_none()
     {
-        state.set_terminal_execution_authority(match continuation_authority {
-            ContinuationAuthority::RemoteServer => TerminalExecutionAuthority::RemoteServer,
-            ContinuationAuthority::Runtime => TerminalExecutionAuthority::EdgeLedger,
-        });
         return Ok(TurnExecutionControl::Return(
-            apply_terminal_control_stream_snapshot(host, state, &snap, control_outcome),
+            apply_terminal_control_stream_snapshot(state, &snap, control_outcome),
         ));
     }
 
-    // Edge callbacks completed while a Remote Server admission stream was
-    // open are observations of Server-owned work, not pending local work.
-    // Excluding them from ingest is what prevents a client-side continuation
-    // without discarding their rendered/protocol evidence.
-    let edge_len = match continuation_authority {
-        ContinuationAuthority::Runtime => turn_result.edge_tool_round.len(),
-        ContinuationAuthority::RemoteServer => 0,
-    };
     let tool_record_floor = state.stall.tool_call_records.len();
     let transcript_append_start = state.messages.len();
-    if snap.server_execution_summary.is_none() {
-        state.add_qualified_usage(snap.qualified_usage);
-    }
-    let ingest_outcome = ingest_agentic_turn_stream(
-        &snap,
-        edge_len,
-        |i| turn_result.edge_tool_round[i].tool.clone(),
-        &state.message,
-        &state.recent_tools,
-        prep.quiet,
-        AgenticTurnIngestMut {
-            model_item_id: turn_result
-                .accum
-                .model_item_id
-                .as_deref()
-                .or(state.current_model_item_id.as_deref()),
-            final_text_model_item_id: &mut state.final_text_model_item_id,
-            first_ttft_ms: &mut state.telemetry.first_ttft_ms,
-            current_session_id: &mut state.current_session_id,
-            current_run_id: &mut state.current_run_id,
-            final_text: &mut state.final_text,
-            last_finish_reason: &mut state.last_finish_reason,
-            total_prompt: &mut state.total_prompt,
-            total_completion: &mut state.total_completion,
-            total_cache_read: &mut state.total_cache_read,
-            total_cache_creation: &mut state.total_cache_creation,
-            total_tool_calls: &mut state.total_tool_calls,
-            total_observation_tool_calls: &mut state.total_observation_tool_calls,
-            step_recorder: &mut state.step_recorder,
-            all_tools_used: &mut state.telemetry.all_tools_used,
-            has_any_usage: &mut state.has_any_usage,
-            messages: &mut state.messages,
-            last_measured_prompt_tokens: &mut state.last_measured_prompt_tokens,
-            consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
-        },
-    );
-    // A failed remote stream can still contain completed local callbacks.
-    // Retain audit facts before Fatal skips the tool phase, without granting
-    // local continuation or adding to the Server's aggregate usage/counts.
-    if continuation_authority == ContinuationAuthority::RemoteServer {
-        let mut observed_ids = state
-            .stall
-            .tool_call_records
-            .iter()
-            .filter_map(|record| record.tool_call_id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        for result in &turn_result.edge_tool_round {
-            if observed_ids.insert(result.request_id.clone()) {
-                state.stall.tool_call_records.push(
-                    astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(result),
-                );
-            }
-        }
-    }
+
+    state.add_qualified_usage(snap.qualified_usage);
+
+    let ingest_state = AgenticTurnIngestMut {
+        model_item_id: turn_result
+            .accum
+            .model_item_id
+            .as_deref()
+            .or(state.current_model_item_id.as_deref()),
+        final_text_model_item_id: &mut state.final_text_model_item_id,
+        first_ttft_ms: &mut state.telemetry.first_ttft_ms,
+        current_session_id: &mut state.current_session_id,
+        current_run_id: &mut state.current_run_id,
+        final_text: &mut state.final_text,
+        last_finish_reason: &mut state.last_finish_reason,
+        total_prompt: &mut state.total_prompt,
+        total_completion: &mut state.total_completion,
+        total_cache_read: &mut state.total_cache_read,
+        total_cache_creation: &mut state.total_cache_creation,
+        total_tool_calls: &mut state.total_tool_calls,
+        total_observation_tool_calls: &mut state.total_observation_tool_calls,
+        step_recorder: &mut state.step_recorder,
+        all_tools_used: &mut state.telemetry.all_tools_used,
+        has_any_usage: &mut state.has_any_usage,
+        messages: &mut state.messages,
+        last_measured_prompt_tokens: &mut state.last_measured_prompt_tokens,
+        consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
+    };
+    let ingest_outcome = ingest_agentic_turn_stream(&snap, &state.message, ingest_state);
     // Apply weak/partial quarantine on the same boundary as newly ingested
     // records, and checkpoint the first transition immediately.
     if let Some(records) = state.stall.tool_call_records.get(tool_record_floor..) {
         let records = records.to_vec();
         apply_workspace_observation_quarantine_transition(state, &records);
     }
-    // A Server-owned summary is an aggregate for one physical server run,
-    // while `ingest_agentic_turn_stream` has already added that run's counts
-    // to the local totals.  Fold the typed summary by run identity and
-    // replace the just-added raw contribution with the deduplicated aggregate
-    // so a repeated terminal frame cannot inflate the logical-turn result.
-    if let Some(summary) = snap.server_execution_summary {
-        let is_new = state.fold_server_execution_summary_and_refresh_rounds(
-            snap.run_id.as_deref(),
-            summary,
-            snap.qualified_usage,
-        );
-        state.total_tool_calls = state
-            .total_tool_calls
-            .saturating_sub(summary.tool_calls_count)
-            .saturating_add(if is_new { summary.tool_calls_count } else { 0 });
-        state.total_observation_tool_calls = state
-            .total_observation_tool_calls
-            .saturating_sub(summary.observation_tool_calls_count)
-            .saturating_add(if is_new {
-                summary.observation_tool_calls_count
-            } else {
-                0
-            });
-    }
+
     // Preserve settlement text at the observation boundary, before the
     // ingest control is consumed.  This covers both server tool calls and
     // edge-tool rounds, and lets a later compliant text-only retry replace a
@@ -5627,7 +5394,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     capture_deferred_candidate_text(state, &turn_result);
     state.record_appended_prompt_history_from(transcript_append_start);
     if let Some(session_id) = state.current_session_id.as_deref() {
-        host.on_session_bound(session_id);
         if let Some(buffer) = state.turn_event_buffer.as_mut()
             && let Err(error) = buffer.bind_session_id(session_id)
         {
@@ -5652,194 +5418,163 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // can still move by-value into the control-flow mapper below.
     let ingest_is_fatal = matches!(ingest_outcome, AgenticTurnIngestOutcome::Fatal(_));
     if !ingest_is_fatal {
-        if !providerless_control_plane_turn {
-            let turn = session_turn_number(state);
-            let session_id = state.current_session_id.clone();
-            let run_id = state.current_run_id.clone();
-            let model_id = state.current_model_identity().map(str::to_string);
-            let identity = session_id
-                .as_deref()
-                .zip(run_id.as_deref())
-                .zip(model_id.as_deref())
-                .filter(|((session_id, run_id), model_id)| {
-                    !session_id.trim().is_empty()
-                        && !run_id.trim().is_empty()
-                        && !model_id.trim().is_empty()
-                        && !state.self_agent_id.trim().is_empty()
-                })
-                .map(|((session_id, run_id), model_id)| {
-                    astra_turn_core::context_feedback::RuntimeFeedbackIdentity {
-                        session_id: session_id.to_string(),
-                        run_id: run_id.to_string(),
-                        agent_id: state.self_agent_id.clone(),
-                        model_id: model_id.to_string(),
-                        topology: host.runtime_feedback_topology(),
-                        request: state
-                            .last_llm_context_manifest_trace
-                            .as_ref()
-                            .and_then(|trace| trace.get("request_identity"))
-                            .cloned()
-                            .and_then(|value| serde_json::from_value(value).ok()),
-                    }
-                });
-            // A logical response may contain multiple physical provider
-            // attempts (for example one bounded output-cap retry).  The
-            // aggregate belongs in run accounting, while context pressure
-            // and cache decisions must use only the final physical request.
-            // Missing physical evidence stays unknown. A retry/run subtotal
-            // cannot measure the current request's context or cache rate.
-            let request_usage = turn_result.accum.current_request_usage.map(|usage| {
-                astra_turn_core::token_accounting::TokenAccounting::from_fields(
-                    usage.fresh_input_tokens,
-                    usage.cache_read_tokens,
-                    usage.cache_creation_tokens,
-                    usage.output_tokens,
-                )
+        let turn = session_turn_number(state);
+        let session_id = state.current_session_id.clone();
+        let run_id = state.current_run_id.clone();
+        let model_id = state.current_model_identity().map(str::to_string);
+        let identity = session_id
+            .as_deref()
+            .zip(run_id.as_deref())
+            .zip(model_id.as_deref())
+            .filter(|((session_id, run_id), model_id)| {
+                !session_id.trim().is_empty()
+                    && !run_id.trim().is_empty()
+                    && !model_id.trim().is_empty()
+                    && !state.self_agent_id.trim().is_empty()
+            })
+            .map(|((session_id, run_id), model_id)| {
+                astra_turn_core::context_feedback::RuntimeFeedbackIdentity {
+                    session_id: session_id.to_string(),
+                    run_id: run_id.to_string(),
+                    agent_id: state.self_agent_id.clone(),
+                    model_id: model_id.to_string(),
+                    topology: host.runtime_feedback_topology(),
+                    request: state
+                        .last_llm_context_manifest_trace
+                        .as_ref()
+                        .and_then(|trace| trace.get("request_identity"))
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok()),
+                }
             });
-            let run_usage = runtime_feedback_run_usage(state, &turn_result.accum);
-            let server_execution_summary = turn_result.accum.server_execution_summary.as_ref();
-            let forwarded_runtime_feedback = server_execution_summary.and_then(|summary| {
-                authoritative_server_runtime_feedback(
-                    summary,
-                    session_id.as_deref(),
-                    run_id.as_deref(),
-                    model_id.as_deref(),
-                    turn,
-                )
-            });
-            let server_owned_feedback = server_execution_summary.is_some();
-            if server_owned_feedback && forwarded_runtime_feedback.is_none() {
+        // A logical response may contain multiple physical provider
+        // attempts (for example one bounded output-cap retry).  The
+        // aggregate belongs in run accounting, while context pressure
+        // and cache decisions must use only the final physical request.
+        // Missing physical evidence stays unknown. A retry/run subtotal
+        // cannot measure the current request's context or cache rate.
+        let request_usage = turn_result.accum.current_request_usage.map(|usage| {
+            astra_turn_core::token_accounting::TokenAccounting::from_fields(
+                usage.fresh_input_tokens,
+                usage.cache_read_tokens,
+                usage.cache_creation_tokens,
+                usage.output_tokens,
+            )
+        });
+        let run_usage = runtime_feedback_run_usage(state, &turn_result.accum);
+        let mut runtime_feedback = {
+            identity.map(|identity| {
+                let wire_budget = state
+                    .last_llm_context_manifest_trace
+                    .as_ref()
+                    .and_then(|trace| trace.pointer("/wire/budget"));
+                let model_context_window_tokens = state
+                    .last_llm_context_manifest_trace
+                    .as_ref()
+                    .and_then(|trace| trace.get("model_context_window_tokens"))
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|value| *value > 0);
+                let estimated_input_tokens = wire_budget
+                    .and_then(|budget| budget.get("estimated_input_tokens"))
+                    .and_then(serde_json::Value::as_u64);
+                let estimated_cache_eligible_tokens = prompt_cache_eligible_tokens_from_manifest(
+                    state.last_llm_context_manifest_trace.as_ref(),
+                );
+                let effective_input_limit_tokens = wire_budget
+                    .and_then(|budget| budget.get("effective_input_limit"))
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|value| *value > 0)
+                    .or_else(|| {
+                        (state.max_turn_input_tokens > 0).then_some(state.max_turn_input_tokens)
+                    });
+                let token_pressure = estimated_input_tokens
+                    .zip(effective_input_limit_tokens)
+                    .map(|(estimated, limit)| estimated as f64 / limit as f64);
+                let prompt_cache_identity = prompt_cache_identity_from_manifest(
+                    state.last_llm_context_manifest_trace.as_ref(),
+                );
+                let absolute_round_ceiling = state
+                    .agentic_turn_budget
+                    .hard_turn_limit
+                    .map(|limit| u32::try_from(limit.get()).unwrap_or(u32::MAX));
+                astra_turn_core::context_feedback::RuntimeFeedbackFrame {
+                    schema_version:
+                        astra_turn_core::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
+                    identity,
+                    progress: astra_turn_core::context_feedback::RuntimeFeedbackProgress {
+                        session_turn: turn,
+                        agentic_round_index: llm_attempt_index,
+                        llm_rounds_completed: state.llm_rounds_completed,
+                        slice_round_limit: u32::try_from(state.max_turns).unwrap_or(u32::MAX),
+                        slice_rounds_remaining: u32::try_from(state.remaining_turns)
+                            .unwrap_or(u32::MAX),
+                        absolute_round_ceiling,
+                    },
+                    context: astra_turn_core::context_feedback::RuntimeContextFeedback {
+                        prompt_cache_identity,
+                        model_context_window_tokens,
+                        effective_input_limit_tokens,
+                        estimated_input_tokens,
+                        estimated_cache_eligible_tokens,
+                        token_pressure,
+                        compaction_tier: state.compact_tier_applied,
+                    },
+                    request_usage,
+                    run_usage,
+                    was_truncated: state.last_finish_reason.as_deref() == Some("length"),
+                    cache_break_detected: None,
+                    policy_feedback: state.stall.active_policy_feedback.clone(),
+                }
+            })
+        };
+        if let (Some(pipeline_sess), Some(frame)) =
+            (&mut state.pipeline_session, runtime_feedback.as_mut())
+        {
+            let accepted = pipeline_sess.record_runtime_feedback("agentic_loop", frame, None);
+            if !accepted {
                 tracing::warn!(
                     target: "astra_runtime::agentic_loop",
-                    session_id = session_id.as_deref().unwrap_or("<unknown>"),
-                    run_id = run_id.as_deref().unwrap_or("<unknown>"),
-                    "Server-owned terminal runtime feedback did not match the admitted invocation"
+                    session_id = %frame.identity.session_id,
+                    run_id = %frame.identity.run_id,
+                    session_turn = frame.progress.session_turn,
+                    llm_rounds_completed = frame.progress.llm_rounds_completed,
+                    "rejecting invalid or out-of-order runtime feedback frame"
                 );
             }
-            let mut runtime_feedback = if server_owned_feedback {
-                forwarded_runtime_feedback
-            } else {
-                identity.map(|identity| {
-                    let wire_budget = state
-                        .last_llm_context_manifest_trace
-                        .as_ref()
-                        .and_then(|trace| trace.pointer("/wire/budget"));
-                    let model_context_window_tokens = state
-                        .last_llm_context_manifest_trace
-                        .as_ref()
-                        .and_then(|trace| trace.get("model_context_window_tokens"))
-                        .and_then(serde_json::Value::as_u64)
-                        .filter(|value| *value > 0);
-                    let estimated_input_tokens = wire_budget
-                        .and_then(|budget| budget.get("estimated_input_tokens"))
-                        .and_then(serde_json::Value::as_u64);
-                    let estimated_cache_eligible_tokens =
-                        prompt_cache_eligible_tokens_from_manifest(
-                            state.last_llm_context_manifest_trace.as_ref(),
-                        );
-                    let effective_input_limit_tokens = wire_budget
-                        .and_then(|budget| budget.get("effective_input_limit"))
-                        .and_then(serde_json::Value::as_u64)
-                        .filter(|value| *value > 0)
-                        .or_else(|| {
-                            (state.max_turn_input_tokens > 0).then_some(state.max_turn_input_tokens)
-                        });
-                    let token_pressure = estimated_input_tokens
-                        .zip(effective_input_limit_tokens)
-                        .map(|(estimated, limit)| estimated as f64 / limit as f64);
-                    let prompt_cache_identity = prompt_cache_identity_from_manifest(
-                        state.last_llm_context_manifest_trace.as_ref(),
-                    );
-                    let absolute_round_ceiling = state
-                        .agentic_turn_budget
-                        .hard_turn_limit
-                        .map(|limit| u32::try_from(limit.get()).unwrap_or(u32::MAX));
-                    astra_turn_core::context_feedback::RuntimeFeedbackFrame {
-                        schema_version:
-                            astra_turn_core::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
-                        identity,
-                        progress: astra_turn_core::context_feedback::RuntimeFeedbackProgress {
-                            session_turn: turn,
-                            agentic_round_index: llm_attempt_index,
-                            llm_rounds_completed: turn_result
-                                .accum
-                                .server_execution_summary
-                                .as_ref()
-                                .map_or(state.llm_rounds_completed, |summary| summary.llm_rounds),
-                            slice_round_limit: u32::try_from(state.max_turns).unwrap_or(u32::MAX),
-                            slice_rounds_remaining: u32::try_from(state.remaining_turns)
-                                .unwrap_or(u32::MAX),
-                            absolute_round_ceiling,
-                        },
-                        context: astra_turn_core::context_feedback::RuntimeContextFeedback {
-                            prompt_cache_identity,
-                            model_context_window_tokens,
-                            effective_input_limit_tokens,
-                            estimated_input_tokens,
-                            estimated_cache_eligible_tokens,
-                            token_pressure,
-                            compaction_tier: state.compact_tier_applied,
-                        },
-                        request_usage,
-                        run_usage,
-                        was_truncated: state.last_finish_reason.as_deref() == Some("length"),
-                        cache_break_detected: None,
-                        policy_feedback: state.stall.active_policy_feedback.clone(),
+
+            if accepted {
+                host.publish_runtime_feedback(frame);
+                let feedback = frame.request_usage.map(|tokens| {
+                    astra_turn_core::context_feedback::ContextFeedback {
+                        tokens,
+                        cache_hit_ratio: tokens.cache_hit_ratio(),
+                        was_truncated: frame.was_truncated,
+                        cache_break_detected: frame.cache_break_detected.clone(),
                     }
-                })
-            };
-            if let (Some(pipeline_sess), Some(frame)) =
-                (&mut state.pipeline_session, runtime_feedback.as_mut())
-            {
-                let accepted = if server_owned_feedback {
-                    pipeline_sess.accept_authoritative_runtime_feedback(frame)
-                } else {
-                    pipeline_sess.record_runtime_feedback("agentic_loop", frame, None)
-                };
-                if !accepted {
-                    tracing::warn!(
-                        target: "astra_runtime::agentic_loop",
-                        session_id = %frame.identity.session_id,
-                        run_id = %frame.identity.run_id,
-                        session_turn = frame.progress.session_turn,
-                        llm_rounds_completed = frame.progress.llm_rounds_completed,
-                        "rejecting invalid or out-of-order runtime feedback frame"
-                    );
-                }
+                });
 
-                if accepted {
-                    host.publish_runtime_feedback(frame);
-                    let feedback = frame.request_usage.map(|tokens| {
-                        astra_turn_core::context_feedback::ContextFeedback {
-                            tokens,
-                            cache_hit_ratio: tokens.cache_hit_ratio(),
-                            was_truncated: frame.was_truncated,
-                            cache_break_detected: frame.cache_break_detected.clone(),
-                        }
-                    });
+                // Emit pipeline journal events for observability and cloud sync
+                if let Some(ref mut buf) = state.turn_event_buffer {
+                    // Per-turn feedback event
+                    let feedback_evt =
+                        astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
+                            frame,
+                        );
+                    if let Ok(payload) = serde_json::to_value(&feedback_evt) {
+                        buf.record(
+                            astra_services::session_journal::JournalEvent::pipeline_feedback(
+                                session_id.as_deref(),
+                                turn,
+                                payload,
+                            )
+                            .with_producer_scope(run_id.as_deref()),
+                        );
+                    }
 
-                    // Emit pipeline journal events for observability and cloud sync
-                    if let Some(ref mut buf) = state.turn_event_buffer {
-                        // Per-turn feedback event
-                        let feedback_evt =
-                            astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
-                                frame,
-                            );
-                        if let Ok(payload) = serde_json::to_value(&feedback_evt) {
+                    // Drain and emit compaction audit events
+                    for audit in pipeline_sess.drain_pending_audits() {
+                        if let Ok(payload) = serde_json::to_value(&audit) {
                             buf.record(
-                                astra_services::session_journal::JournalEvent::pipeline_feedback(
-                                    session_id.as_deref(),
-                                    turn,
-                                    payload,
-                                )
-                                .with_producer_scope(run_id.as_deref()),
-                            );
-                        }
-
-                        // Drain and emit compaction audit events
-                        for audit in pipeline_sess.drain_pending_audits() {
-                            if let Ok(payload) = serde_json::to_value(&audit) {
-                                buf.record(
                                 astra_services::session_journal::JournalEvent::pipeline_compaction_audit(
                                     session_id.as_deref(),
                                     turn,
@@ -5847,106 +5582,83 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                                 )
                                 .with_producer_scope(run_id.as_deref()),
                             );
-                            }
                         }
+                    }
 
-                        // Evaluate trace alerts and emit them to the journal.
-                        let alerts = feedback.as_ref().map_or_else(Vec::new, |feedback| {
-                            astra_turn_core::trace_alert::evaluate_alerts(
+                    // Evaluate trace alerts and emit them to the journal.
+                    let alerts = feedback.as_ref().map_or_else(Vec::new, |feedback| {
+                        astra_turn_core::trace_alert::evaluate_alerts(
+                            turn,
+                            feedback,
+                            &pipeline_sess.stats,
+                            &pipeline_sess.recovery,
+                        )
+                    });
+                    // Best-effort webhook dispatch: dispatcher is initialized once
+                    // per process via a global OnceLock, reusing reqwest::Client's
+                    // connection pool + TLS session cache across turns. Dispatch
+                    // runs async so it never blocks turn execution.
+                    if !alerts.is_empty() {
+                        if let Some(session_id_str) =
+                            alert_dispatch_session_id(session_id.as_deref())
+                        {
+                            if let Some(dispatcher) = global_alert_dispatcher() {
+                                let alerts_to_send = alerts.clone();
+                                let dispatcher = dispatcher.clone();
+                                tokio::spawn(async move {
+                                    dispatcher.dispatch(&session_id_str, &alerts_to_send).await;
+                                });
+                            }
+                        } else {
+                            tracing::warn!(
+                                target: "astra_runtime::agentic_loop",
                                 turn,
-                                feedback,
-                                &pipeline_sess.stats,
-                                &pipeline_sess.recovery,
-                            )
-                        });
-                        // Best-effort webhook dispatch: dispatcher is initialized once
-                        // per process via a global OnceLock, reusing reqwest::Client's
-                        // connection pool + TLS session cache across turns. Dispatch
-                        // runs async so it never blocks turn execution.
-                        if !alerts.is_empty() {
-                            if let Some(session_id_str) =
-                                alert_dispatch_session_id(session_id.as_deref())
-                            {
-                                if let Some(dispatcher) = global_alert_dispatcher() {
-                                    let alerts_to_send = alerts.clone();
-                                    let dispatcher = dispatcher.clone();
-                                    tokio::spawn(async move {
-                                        dispatcher.dispatch(&session_id_str, &alerts_to_send).await;
-                                    });
-                                }
-                            } else {
-                                tracing::warn!(
-                                    target: "astra_runtime::agentic_loop",
-                                    turn,
-                                    "skipping alert webhook dispatch without session_id"
-                                );
-                            }
+                                "skipping alert webhook dispatch without session_id"
+                            );
                         }
+                    }
 
-                        for alert in &alerts {
-                            let alert_evt =
-                                astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(
-                                    alert,
-                                );
-                            if let Ok(payload) = serde_json::to_value(&alert_evt) {
-                                buf.record(
-                                    astra_services::session_journal::JournalEvent::pipeline_alert(
-                                        session_id.as_deref(),
-                                        turn,
-                                        payload,
-                                    )
-                                    .with_producer_scope(run_id.as_deref()),
-                                );
-                            }
+                    for alert in &alerts {
+                        let alert_evt =
+                            astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(
+                                alert,
+                            );
+                        if let Ok(payload) = serde_json::to_value(&alert_evt) {
+                            buf.record(
+                                astra_services::session_journal::JournalEvent::pipeline_alert(
+                                    session_id.as_deref(),
+                                    turn,
+                                    payload,
+                                )
+                                .with_producer_scope(run_id.as_deref()),
+                            );
                         }
                     }
                 }
-            } else if state.pipeline_session.is_some() {
-                tracing::warn!(
-                    target: "astra_runtime::agentic_loop",
-                    turn,
-                    "skipping model-scoped pipeline feedback without resolved model identity"
-                );
             }
-        } else {
-            tracing::debug!(
+        } else if state.pipeline_session.is_some() {
+            tracing::warn!(
                 target: "astra_runtime::agentic_loop",
-                "skipping provider feedback for host-owned control-plane turn"
+                turn,
+                "skipping model-scoped pipeline feedback without resolved model identity"
             );
         }
+
         host.on_turn_completed(state);
     }
 
     let iteration_control = map_ingest_outcome_to_iteration_control(ingest_outcome);
-    if continuation_authority == ContinuationAuthority::RemoteServer
-        && !matches!(
-            iteration_control,
-            AgenticIngestIterationControl::BreakLoop | AgenticIngestIterationControl::Fatal(_)
-        )
-    {
-        return Err(astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::ContractViolation,
-            "remote Server declared terminal continuation ownership while returning pending client continuation work",
-        ));
-    }
-
     match iteration_control {
         AgenticIngestIterationControl::Fatal(e) => {
-            // A fatal edge-owned boundary is allowed to supersede an earlier
-            // remote summary.  The summary remains useful accounting, but it
-            // cannot hide the ledger that actually terminated this turn.
-            if continuation_authority == ContinuationAuthority::Runtime {
-                state.set_terminal_execution_authority(TerminalExecutionAuthority::EdgeLedger);
-            }
             use astra_core::ErrorKind;
 
             let is_rate_limit = matches!(e.kind, ErrorKind::RateLimit);
 
             if is_rate_limit {
-                state.rate_limit_cooldown.record_429(None, false);
+                state.rate_limit_cooldown.record_429(None);
             }
             if matches!(e.kind, ErrorKind::ServerError) {
-                state.rate_limit_cooldown.record_529(None, false);
+                state.rate_limit_cooldown.record_529(None);
             }
 
             if is_rate_limit && state.total_tool_calls > 0 {
@@ -6015,8 +5727,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     state.compaction_effectiveness.mark_insufficient();
                 }
             }
-            if continuation_authority == ContinuationAuthority::Runtime
-                && is_context_overflow
+            if is_context_overflow
                 && state.consecutive_context_window_errors
                     <= super::super::compaction_replay::MAX_COMPACT_RETRIES
             {
@@ -6195,9 +5906,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             // empty provider responses inside the runtime instead of exposing
             // an internal `empty_completion` reason and asking the user to
             // manually drive a continuation.
-            if continuation_authority == ContinuationAuthority::Runtime
-                && should_retry_textless_response(state, &turn_result)
-            {
+            if should_retry_textless_response(state, &turn_result) {
                 begin_textless_response_retry(state);
                 record_early_exit_llm_round(
                     state,
@@ -6208,14 +5917,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 state.step_recorder.end_turn(false);
                 try_write_heavy_checkpoint(state);
                 return Ok(TurnExecutionControl::ContinueLoop);
-            }
-
-            // The response has crossed the final edge-owned boundary.  If a
-            // prior server run contributed aggregate evidence, keep that
-            // accounting/coverage fact but let this terminal edge ledger own
-            // exit status and unresolved-failure interpretation.
-            if continuation_authority == ContinuationAuthority::Runtime {
-                state.set_terminal_execution_authority(TerminalExecutionAuthority::EdgeLedger);
             }
 
             // An authoritative interruption is a terminal boundary for this
@@ -6265,27 +5966,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     Some("direct_child_completion_wait"),
                 );
                 state.step_recorder.end_turn(false);
-                if continuation_authority == ContinuationAuthority::Runtime {
-                    finalize_turn_trace(state).await;
-                    return Ok(TurnExecutionControl::WaitForInput);
-                }
-                let child_barrier =
-                    await_direct_children_before_completion(host, state, continuation_authority)
-                        .await;
-                if matches!(
-                    &child_barrier,
-                    Ok(RuntimeActivityOutcome::ExecutionPaused(_))
-                ) {
-                    finalize_turn_trace(state).await;
-                }
-                try_write_heavy_checkpoint(state);
-                return child_barrier.map(|outcome| match outcome {
-                    RuntimeActivityOutcome::ExecutionPaused(reason) => {
-                        TurnExecutionControl::Return(AgenticLoopOutcome::Waiting(reason))
-                    }
-                    RuntimeActivityOutcome::InputReady => TurnExecutionControl::ContinueLoop,
-                    _ => TurnExecutionControl::Return(AgenticLoopOutcome::Completed),
-                });
+                finalize_turn_trace(state).await;
+                return Ok(TurnExecutionControl::WaitForInput);
             }
 
             let user_intent_settlement_fence = commit_user_intent_settlement_fence(state).await?;
@@ -6298,12 +5980,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             // If authoritative guidance or another semantic runtime input
             // arrived, this response is intermediate and the same run makes
             // another normally accounted decision.
-            // Remote execution has already reconciled its input boundary.
-            // Leave late local input unobserved for its owner instead of
-            // draining it to authorize a second Server admission.
-            if continuation_authority == ContinuationAuthority::Runtime
-                && inject_polled_user_intents_before_settlement(host, state).await?
-            {
+            if inject_polled_user_intents_before_settlement(host, state).await? {
                 record_early_exit_llm_round(
                     state,
                     &turn_result,
@@ -6604,15 +6281,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             record_early_exit_llm_round(state, &turn_result, prep.turn_start_time, Some("stop"));
             state.step_recorder.end_turn(true);
 
-            if turn_result.accum.server_execution_summary.is_none() {
-                observe_turn_end_without_tools(
-                    state,
-                    turn_index,
-                    prep.turn_start_time,
-                    turn_result.ttft_ms,
-                    turn_result_tokens_consumed(&turn_result),
-                );
-            }
+            observe_turn_end_without_tools(
+                state,
+                turn_index,
+                prep.turn_start_time,
+                turn_result.ttft_ms,
+                turn_result_tokens_consumed(&turn_result),
+            );
+
             finalize_and_render(host, state).await;
             return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
         }
@@ -6647,17 +6323,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             turn_result,
         },
     )))
-}
-
-fn should_record_local_provider_round(
-    boundary: super::host::ControlPlaneTurnBoundary,
-    has_remote_execution_summary: bool,
-) -> bool {
-    !has_remote_execution_summary
-        && !matches!(
-            boundary,
-            super::host::ControlPlaneTurnBoundary::Providerless
-        )
 }
 
 /// Preserve the latest mixed provider response before any bounded text-only
@@ -6697,14 +6362,8 @@ pub(crate) fn capture_deferred_candidate_text(
     {
         return;
     }
-    let has_tool_work = !turn_result.accum.tool_calls.is_empty()
-        || turn_result.accum.has_tool_calls
-        || turn_result
-            .accum
-            .server_execution_summary
-            .as_ref()
-            .is_some_and(|summary| summary.tool_calls_count > 0)
-        || !turn_result.edge_tool_round.is_empty();
+    let has_tool_work =
+        !turn_result.accum.tool_calls.is_empty() || turn_result.accum.has_tool_calls;
     let deferred = &mut state.hooks.completion_settlement.deferred_candidate_text;
     if has_tool_work && deferred.is_some() {
         // The first substantive mixed response is the most complete
@@ -6795,25 +6454,6 @@ fn canonicalize_composite_observation_args(call: &mut serde_json::Value, tool_na
     function["arguments"] = serde_json::Value::String(
         serde_json::to_string(&args).expect("observation arguments must serialize"),
     );
-}
-
-fn authoritative_server_runtime_feedback(
-    summary: &astra_turn_core::chat_turn_sse_dispatch::ServerLoopExecutionSummary,
-    session_id: Option<&str>,
-    run_id: Option<&str>,
-    model_id: Option<&str>,
-    session_turn: u32,
-) -> Option<astra_turn_core::context_feedback::RuntimeFeedbackFrame> {
-    summary.runtime_feedback.clone().filter(|frame| {
-        session_id == Some(frame.identity.session_id.as_str())
-            && run_id == Some(frame.identity.run_id.as_str())
-            && model_id == Some(frame.identity.model_id.as_str())
-            && frame.progress.session_turn == session_turn
-            // Completed summaries are parser-validated at exact equality.
-            // Interrupted summaries may include one failed provider attempt
-            // beyond the last successfully ingested feedback frame.
-            && frame.progress.llm_rounds_completed <= summary.llm_rounds
-    })
 }
 
 fn prompt_cache_identity_from_manifest(
@@ -7736,12 +7376,22 @@ pub(crate) fn apply_workspace_observation_quarantine_transition(
     if state.stall.workspace_observation_quarantine.is_some() {
         return false;
     }
-    let Some(record) = records.iter().find(|record| {
-        record_has_weak_workspace_mutation_receipt(record)
-            || record_has_trusted_partial_workspace_mutation_receipt(record)
-    }) else {
+    let Some(quarantine) = workspace_observation_quarantine_from_records(records) else {
         return false;
     };
+    state.stall.workspace_observation_quarantine = Some(quarantine);
+    try_write_heavy_checkpoint(state);
+    true
+}
+
+/// Derive transport quarantine without borrowing an execution loop.
+pub fn workspace_observation_quarantine_from_records(
+    records: &[astra_services::session_journal::ToolCallRecord],
+) -> Option<astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1> {
+    let record = records.iter().find(|record| {
+        record_has_weak_workspace_mutation_receipt(record)
+            || record_has_trusted_partial_workspace_mutation_receipt(record)
+    })?;
     let source_tool_call_id = record.tool_call_id.clone();
     let quarantine = if record_has_trusted_partial_workspace_mutation_receipt(record) {
         astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1::partial_workspace_mutation(
@@ -7752,9 +7402,7 @@ pub(crate) fn apply_workspace_observation_quarantine_transition(
             source_tool_call_id,
         )
     };
-    state.stall.workspace_observation_quarantine = Some(quarantine);
-    try_write_heavy_checkpoint(state);
-    true
+    Some(quarantine)
 }
 
 /// Restrict the positive shape to the bound workspace for global completion
@@ -8198,18 +7846,6 @@ fn has_successful_terminal_task_action(state: &AgenticLoopState) -> bool {
             && record.ok
             && tool_is_terminal_completion_task_action(record.name.trim())
     })
-}
-
-/// Match a raw canonical provider tool call against a typed completion action.
-/// This is used by both the server admission path and the local execution
-/// path, so a model-visible action frame cannot drift from executable
-/// authority.
-pub(crate) fn completion_action_matches_tool_call(
-    state: &AgenticLoopState,
-    action: &CompletionAction,
-    call: &serde_json::Value,
-) -> bool {
-    completion_action_match_label(state, action, call).is_some()
 }
 
 /// Project a bounded, provider-neutral explanation of the active completion
@@ -8692,14 +8328,12 @@ fn tool_is_terminal_completion_task_action(name: &str) -> bool {
     // execution topology: the next boundary is text-only, so a child, fanout,
     // Work graph, or planning transition could not be observed and settled.
     // Derive built-in control-plane status from the canonical registry rather
-    // than maintaining another incomplete list. Agent topologies and the
-    // runtime-owned `delegate` surface are explicitly excluded because they
-    // are not classified uniformly by that registry. Unknown admitted
+    // than maintaining another incomplete list. Agent topologies are
+    // explicitly excluded because they are not classified uniformly by that
+    // registry. Unknown admitted
     // MCP/task tools may still be valid external
     // actions and continue through ordinary admission and safety policy.
-    if matches!(name, "agent" | "agent_fanout")
-        || name == super::super::agentic::delegate_interception::DELEGATE_TOOL_NAME
-    {
+    if matches!(name, "agent" | "agent_fanout") {
         return false;
     }
     let registry = astra_runtime_env::ToolRegistry::builtins();
@@ -9314,32 +8948,11 @@ fn record_tool_selection(
     turn_result: &HostTurnResult,
     turn_index: usize,
 ) {
-    let mut selected_tools = Vec::new();
-    if !turn_result.edge_tool_round.is_empty() {
-        astra_core::canonical_names::append_unique_names(
-            &mut selected_tools,
-            turn_result
-                .edge_tool_round
-                .iter()
-                .map(|result| result.tool.as_str()),
-        );
-    } else if let Some(summary) = turn_result.accum.server_execution_summary.as_ref() {
-        astra_core::canonical_names::append_unique_names(
-            &mut selected_tools,
-            summary.tools_used.iter().map(String::as_str),
-        );
-    }
-
-    // A provider tool round can arrive before the async callback ledger has
-    // resolved. Do not freeze an empty trace: the tool phase will record the
-    // authoritative callback rows once they are available.
-    let provider_requested_tools =
-        turn_result.accum.has_tool_calls || !turn_result.accum.tool_calls.is_empty();
-    if selected_tools.is_empty() && provider_requested_tools {
+    // Selection is recorded after admission resolves exact callback rows.
+    if turn_result.accum.has_tool_calls || !turn_result.accum.tool_calls.is_empty() {
         return;
     }
-
-    record_tool_surface_if_unset(state, selected_tools, turn_index);
+    record_tool_surface_if_unset(state, Vec::new(), turn_index);
 }
 
 fn record_tool_surface_if_unset(
@@ -9404,7 +9017,7 @@ mod tests {
         run_agentic_loop_with_host,
     };
     use crate::turn::run_control::{RunStatusProvider, UserIntentPoll, UserIntentProvider};
-    use astra_turn_core::chat_turn_sse_dispatch::{ChatTurnSseAccum, ServerLoopExecutionSummary};
+    use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 
     #[tokio::test]
     async fn semantic_child_message_wakes_parent_without_completing_child() {
@@ -9726,12 +9339,7 @@ mod tests {
                     state.cancellation.token = Some(Arc::new(token));
                     let outcome = tokio::time::timeout(
                         Duration::from_millis(200),
-                        await_runtime_activity(
-                            &mut host,
-                            &mut state,
-                            ContinuationAuthority::Runtime,
-                            observation.as_ref(),
-                        ),
+                        await_runtime_activity(&mut host, &mut state, observation.as_ref()),
                     )
                     .await
                     .expect("a paused dependency must not consume the observation timeout");
@@ -9817,13 +9425,8 @@ mod tests {
                 state.cancellation.token = Some(Arc::clone(&cancellation));
                 let observation = observation.clone();
                 let task = tokio::spawn(async move {
-                    let outcome = await_runtime_activity(
-                        &mut host,
-                        &mut state,
-                        ContinuationAuthority::Runtime,
-                        observation.as_ref(),
-                    )
-                    .await;
+                    let outcome =
+                        await_runtime_activity(&mut host, &mut state, observation.as_ref()).await;
                     (host, state, outcome)
                 });
                 tokio::time::timeout(Duration::from_secs(1), started.notified())
@@ -9900,12 +9503,7 @@ mod tests {
         let mut state = make_state();
         state.current_run_id = Some("parent-run".into());
         let task = tokio::spawn(async move {
-            let outcome = await_direct_children_before_completion(
-                &mut host,
-                &mut state,
-                ContinuationAuthority::Runtime,
-            )
-            .await;
+            let outcome = await_runtime_activity(&mut host, &mut state, None).await;
             (host, state, outcome)
         });
         wait_started.notified().await;
@@ -9961,14 +9559,10 @@ mod tests {
             }
             let mut state = make_state();
             state.current_run_id = Some("parent-run".into());
-            let task = tokio::spawn(async move {
-                await_direct_children_before_completion(
-                    &mut host,
-                    &mut state,
-                    ContinuationAuthority::Runtime,
-                )
-                .await
-            });
+            let task =
+                tokio::spawn(
+                    async move { await_runtime_activity(&mut host, &mut state, None).await },
+                );
             wait_started.notified().await;
             tokio::time::advance(Duration::from_secs(302)).await;
             tokio::task::yield_now().await;
@@ -10017,7 +9611,6 @@ mod tests {
             await_runtime_activity(
                 &mut host,
                 &mut state,
-                ContinuationAuthority::Runtime,
                 Some(&astra_tools::agent_tool_contract::AgentWaitReceipt {
                     parent_run_id: "parent-run".into(),
                     tool_call_id: "wait-call".into(),
@@ -10065,12 +9658,7 @@ mod tests {
         state.run_control = Some(provider.clone());
         state.user_intents.wake = Some(wake_rx);
         let task = tokio::spawn(async move {
-            let outcome = await_direct_children_before_completion(
-                &mut host,
-                &mut state,
-                ContinuationAuthority::Runtime,
-            )
-            .await;
+            let outcome = await_runtime_activity(&mut host, &mut state, None).await;
             (host, state, outcome)
         });
         tokio::time::timeout(Duration::from_secs(2), wait_started.notified())
@@ -10405,12 +9993,7 @@ mod tests {
         host.child_wait_started = Some(Arc::clone(&wait_started));
         let mut state = make_state();
         let task = tokio::spawn(async move {
-            let result = await_direct_children_before_completion(
-                &mut host,
-                &mut state,
-                ContinuationAuthority::Runtime,
-            )
-            .await;
+            let result = await_runtime_activity(&mut host, &mut state, None).await;
             (state, result)
         });
         tokio::time::timeout(Duration::from_secs(2), wait_started.notified())
@@ -10853,9 +10436,17 @@ mod tests {
             };
             10
         ];
-        let mut host = MockHost::new(Vec::new())
-            .with_valid_tools(&["read_file"])
-            .with_stop_after_success_completion("read_file", Some("must not replace incomplete"));
+        let mut host = MockHost::new(vec![edge_tool_result(
+            vec![make_edge_tool(
+                "read_file",
+                "preserved policy-boundary result",
+            )],
+            11,
+            3,
+            None,
+        )])
+        .with_valid_tools(&["read_file"])
+        .with_stop_after_success_completion("read_file", Some("must not replace incomplete"));
         let subject = host.runtime_policy_subject(&state);
         crate::turn::runtime_policy::evaluate_tool_boundary(
             &mut state.stall.runtime_policy_evaluation,
@@ -10871,6 +10462,7 @@ mod tests {
             state.remaining_turns,
             state.charged_iterations,
         );
+        let turn_result = host.execute_turn(&mut state).await.unwrap();
         let outcome = super::super::tool_phase::execute_tool_phase(
             &mut host,
             &mut state,
@@ -10881,15 +10473,7 @@ mod tests {
             },
             TurnExecutionPhase {
                 llm_wall_start: Instant::now(),
-                turn_result: edge_tool_result(
-                    vec![make_edge_tool(
-                        "read_file",
-                        "preserved policy-boundary result",
-                    )],
-                    11,
-                    3,
-                    None,
-                ),
+                turn_result,
             },
         )
         .await
@@ -10935,17 +10519,17 @@ mod tests {
             state.remaining_turns,
             state.charged_iterations,
         );
-        let mut host = MockHost::new(Vec::new())
-            .with_valid_tools(&["read_file"])
-            .with_stop_after_success_completion("read_file", Some("must not replace incomplete"));
-        // The edge result has already arrived. A changed contract discovered
-        // at this boundary must preserve the result before ending execution.
-        let turn_result = edge_tool_result(
+        let mut host = MockHost::new(vec![edge_tool_result(
             vec![make_edge_tool("read_file", "preserved tool result")],
             11,
             3,
             None,
-        );
+        )])
+        .with_valid_tools(&["read_file"])
+        .with_stop_after_success_completion("read_file", Some("must not replace incomplete"));
+        // Delivery happens through admission. A changed contract discovered
+        // after execution must preserve its receipt before ending the turn.
+        let turn_result = host.execute_turn(&mut state).await.unwrap();
         let outcome = super::super::tool_phase::execute_tool_phase(
             &mut host,
             &mut state,
@@ -10991,8 +10575,8 @@ mod tests {
             state.stall.tool_call_records
         );
         assert!(
-            host.executed_messages.is_empty(),
-            "no follow-up provider request"
+            host.executed_messages.len() == 1,
+            "only the original provider request; no follow-up request"
         );
         assert_eq!(host.rendered_final_text.last(), Some(&state.final_text));
     }
@@ -11263,26 +10847,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_round_accounting_uses_explicit_boundary_provenance() {
-        assert!(should_record_local_provider_round(
-            super::super::host::ControlPlaneTurnBoundary::Ordinary,
-            false,
-        ));
-        assert!(should_record_local_provider_round(
-            super::super::host::ControlPlaneTurnBoundary::ProviderBacked,
-            false,
-        ));
-        assert!(!should_record_local_provider_round(
-            super::super::host::ControlPlaneTurnBoundary::Providerless,
-            false,
-        ));
-        assert!(!should_record_local_provider_round(
-            super::super::host::ControlPlaneTurnBoundary::ProviderBacked,
-            true,
-        ));
-    }
-
-    #[test]
     fn settlement_candidate_keeps_first_mixed_response_until_text_only_retry() {
         let mut state = make_state();
         state.budget_wrapup_injected = true;
@@ -11297,7 +10861,7 @@ mod tests {
                 ..ChatTurnSseAccum::default()
             },
             ttft_ms: None,
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         };
         capture_deferred_candidate_text(&mut state, &mixed);
@@ -11320,7 +10884,7 @@ mod tests {
                 ..ChatTurnSseAccum::default()
             },
             ttft_ms: None,
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         };
         capture_deferred_candidate_text(&mut state, &later_mixed);
@@ -11341,7 +10905,7 @@ mod tests {
                 ..ChatTurnSseAccum::default()
             },
             ttft_ms: None,
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         };
         capture_deferred_candidate_text(&mut state, &compliant_retry);
@@ -11365,7 +10929,7 @@ mod tests {
                 ..ChatTurnSseAccum::default()
             },
             ttft_ms: None,
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         };
         capture_latest_provider_text(&mut state, &first);
@@ -11384,7 +10948,7 @@ mod tests {
                 ..ChatTurnSseAccum::default()
             },
             ttft_ms: None,
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         };
         capture_latest_provider_text(&mut state, &second);
@@ -12412,21 +11976,18 @@ mod tests {
             }
         });
         let pending_action = CompletionAction::PostMutationObservation;
-        assert!(completion_action_matches_tool_call(
-            &pending_text_stop,
-            &pending_action,
-            &exact_read,
-        ));
-        assert!(!completion_action_matches_tool_call(
-            &pending_text_stop,
-            &pending_action,
-            &ranged_read,
-        ));
-        assert!(!completion_action_matches_tool_call(
-            &pending_text_stop,
-            &pending_action,
-            &shell_read,
-        ));
+        assert!(
+            completion_action_match_label(&pending_text_stop, &pending_action, &exact_read,)
+                .is_some()
+        );
+        assert!(
+            !completion_action_match_label(&pending_text_stop, &pending_action, &ranged_read,)
+                .is_some()
+        );
+        assert!(
+            !completion_action_match_label(&pending_text_stop, &pending_action, &shell_read,)
+                .is_some()
+        );
         let pending_hint = completion_action_hint_for_state(&pending_text_stop, &pending_action);
         assert_eq!(pending_hint["latest_known_stable_target"], "answer.txt");
         assert_eq!(
@@ -12798,7 +12359,7 @@ mod tests {
             working_dir: None,
             depends_on: Vec::new(),
             timeout_secs: None,
-            cache_key: None,
+
             authoritative: true,
         }
     }
@@ -14198,16 +13759,22 @@ mod tests {
                     "arguments": r#"{"command":"moi upload"}"#
                 }
             });
-            assert!(completion_action_matches_tool_call(
-                &state,
-                &CompletionAction::RequiredExternalEffect,
-                &first_mutation,
-            ));
-            assert!(!completion_action_matches_tool_call(
-                &state,
-                &CompletionAction::RequiredExternalEffect,
-                &replay,
-            ));
+            assert!(
+                completion_action_match_label(
+                    &state,
+                    &CompletionAction::RequiredExternalEffect,
+                    &first_mutation,
+                )
+                .is_some()
+            );
+            assert!(
+                !completion_action_match_label(
+                    &state,
+                    &CompletionAction::RequiredExternalEffect,
+                    &replay,
+                )
+                .is_some()
+            );
         }
     }
 
@@ -14519,16 +14086,22 @@ mod tests {
                 "arguments": r#"{"command":"upload","external_state_paths":["/var/lib/other"]}"#
             }
         });
-        assert!(completion_action_matches_tool_call(
-            &state,
-            &CompletionAction::RequiredExternalEffect,
-            &same_roots,
-        ));
-        assert!(!completion_action_matches_tool_call(
-            &state,
-            &CompletionAction::RequiredExternalEffect,
-            &other_roots,
-        ));
+        assert!(
+            completion_action_match_label(
+                &state,
+                &CompletionAction::RequiredExternalEffect,
+                &same_roots,
+            )
+            .is_some()
+        );
+        assert!(
+            !completion_action_match_label(
+                &state,
+                &CompletionAction::RequiredExternalEffect,
+                &other_roots,
+            )
+            .is_some()
+        );
         let omitted = serde_json::json!({
             "id": "file-retry",
             "type": "function",
@@ -14664,7 +14237,7 @@ mod tests {
                         ..ChatTurnSseAccum::default()
                     },
                     ttft_ms: None,
-                    edge_tool_round: Vec::new(),
+
                     error_kind: None,
                 },
             },
@@ -15032,11 +14605,14 @@ mod tests {
                 "arguments": "{\"action\":\"remember\",\"content\":\"fact\"}"
             }
         });
-        assert!(!completion_action_matches_tool_call(
-            &state,
-            &CompletionAction::RequiredExternalEffect,
-            &memory,
-        ));
+        assert!(
+            !completion_action_match_label(
+                &state,
+                &CompletionAction::RequiredExternalEffect,
+                &memory,
+            )
+            .is_some()
+        );
         let hint =
             completion_action_hint_for_state(&state, &CompletionAction::RequiredExternalEffect);
         assert!(
@@ -15182,7 +14758,7 @@ mod tests {
             call("bash", r#"{"command":"printf x > out.txt"}"#),
         ] {
             assert!(
-                completion_action_matches_tool_call(&ordinary, &action, &candidate),
+                completion_action_match_label(&ordinary, &action, &candidate).is_some(),
                 "ordinary mutation windows must retain the existing writer surface: {candidate}"
             );
         }
@@ -15191,11 +14767,14 @@ mod tests {
             .hooks
             .completion_settlement
             .workspace_mutation_retries = 1;
-        assert!(completion_action_matches_tool_call(
-            &ordinary,
-            &action,
-            &call("write_file", r#"{"path":"out.txt","content":"complete\n"}"#,),
-        ));
+        assert!(
+            completion_action_match_label(
+                &ordinary,
+                &action,
+                &call("write_file", r#"{"path":"out.txt","content":"complete\n"}"#,),
+            )
+            .is_some()
+        );
         for candidate in [
             call("apply_patch", r#"{"patch":"*** Begin Patch"}"#),
             call("bash", r#"{"command":"printf x > out.txt"}"#),
@@ -15203,7 +14782,7 @@ mod tests {
             call("write_file", r#"{"path":"out.txt"}"#),
         ] {
             assert!(
-                !completion_action_matches_tool_call(&ordinary, &action, &candidate),
+                !completion_action_match_label(&ordinary, &action, &candidate).is_some(),
                 "opaque recovery accepts only a complete-state typed writer: {candidate}"
             );
         }
@@ -15220,19 +14799,25 @@ mod tests {
             })
         };
 
-        assert!(completion_action_matches_tool_call(
-            &state,
-            &action,
-            &call(
-                "write_file",
-                r#"{"path":"/workspace/out.txt","content":"answer"}"#
-            ),
-        ));
-        assert!(completion_action_matches_tool_call(
-            &state,
-            &action,
-            &call("read_file", r#"{"path":"/workspace/input.txt"}"#),
-        ));
+        assert!(
+            completion_action_match_label(
+                &state,
+                &action,
+                &call(
+                    "write_file",
+                    r#"{"path":"/workspace/out.txt","content":"answer"}"#
+                ),
+            )
+            .is_some()
+        );
+        assert!(
+            completion_action_match_label(
+                &state,
+                &action,
+                &call("read_file", r#"{"path":"/workspace/input.txt"}"#),
+            )
+            .is_some()
+        );
         for control in [
             "introspect",
             "ask_user",
@@ -15244,10 +14829,9 @@ mod tests {
             "settle_work_item",
             "inspect_work_plan",
             "propose_work_plan",
-            "delegate",
         ] {
             assert!(
-                !completion_action_matches_tool_call(&state, &action, &call(control, "{}")),
+                !completion_action_match_label(&state, &action, &call(control, "{}")).is_some(),
                 "control={control}"
             );
         }
@@ -15274,7 +14858,7 @@ mod tests {
                 "function": {"name": name, "arguments": arguments}
             });
             assert!(
-                !completion_action_matches_tool_call(&state, &action, &call),
+                !completion_action_match_label(&state, &action, &call).is_some(),
                 "{name} must not consume the final task-action boundary: {arguments}"
             );
         }
@@ -15572,16 +15156,22 @@ mod tests {
             }
         });
 
-        assert!(completion_action_matches_tool_call(
-            &state,
-            &CompletionAction::CanonicalWorkValidation,
-            &canonical,
-        ));
-        assert!(!completion_action_matches_tool_call(
-            &state,
-            &CompletionAction::CanonicalWorkValidation,
-            &probe,
-        ));
+        assert!(
+            completion_action_match_label(
+                &state,
+                &CompletionAction::CanonicalWorkValidation,
+                &canonical,
+            )
+            .is_some()
+        );
+        assert!(
+            !completion_action_match_label(
+                &state,
+                &CompletionAction::CanonicalWorkValidation,
+                &probe,
+            )
+            .is_some()
+        );
         let hint = completion_action_hint(&CompletionAction::CanonicalWorkValidation);
         assert_eq!(hint["reason_code"], "work_validation_stale_or_failed");
         assert_eq!(hint["accepted_action_family"], "canonical_work_validation");
@@ -15622,16 +15212,22 @@ mod tests {
             }
         });
 
-        assert!(completion_action_matches_tool_call(
-            &state,
-            &CompletionAction::CanonicalWorkValidation,
-            &same_operation,
-        ));
-        assert!(!completion_action_matches_tool_call(
-            &state,
-            &CompletionAction::CanonicalWorkValidation,
-            &different_operation,
-        ));
+        assert!(
+            completion_action_match_label(
+                &state,
+                &CompletionAction::CanonicalWorkValidation,
+                &same_operation,
+            )
+            .is_some()
+        );
+        assert!(
+            !completion_action_match_label(
+                &state,
+                &CompletionAction::CanonicalWorkValidation,
+                &different_operation,
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -15688,16 +15284,22 @@ mod tests {
             "type": "function",
             "function": {"name": "bash", "arguments": serde_json::json!({"command": narrowed}).to_string()}
         });
-        assert!(completion_action_matches_tool_call(
-            &state,
-            &CompletionAction::CanonicalWorkValidation,
-            &exact_retry,
-        ));
-        assert!(!completion_action_matches_tool_call(
-            &state,
-            &CompletionAction::CanonicalWorkValidation,
-            &narrowed_retry,
-        ));
+        assert!(
+            completion_action_match_label(
+                &state,
+                &CompletionAction::CanonicalWorkValidation,
+                &exact_retry,
+            )
+            .is_some()
+        );
+        assert!(
+            !completion_action_match_label(
+                &state,
+                &CompletionAction::CanonicalWorkValidation,
+                &narrowed_retry,
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -15749,11 +15351,14 @@ mod tests {
                 "arguments": r#"{"command":"cargo check"}"#
             }
         });
-        assert!(completion_action_matches_tool_call(
-            &state,
-            &CompletionAction::CanonicalWorkValidation,
-            &next_attempt_validator,
-        ));
+        assert!(
+            completion_action_match_label(
+                &state,
+                &CompletionAction::CanonicalWorkValidation,
+                &next_attempt_validator,
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -17248,16 +16853,22 @@ mod tests {
                 "function": {"name": "bash", "arguments": serde_json::json!({"command": command}).to_string()}
             })
         };
-        assert!(!completion_action_matches_tool_call(
-            &state,
-            &CompletionAction::CanonicalWorkValidation,
-            &call("tsc --noEmit --help --outDir --help false")
-        ));
-        assert!(completion_action_matches_tool_call(
-            &state,
-            &CompletionAction::CanonicalWorkValidation,
-            &call("tsc --noEmit")
-        ));
+        assert!(
+            !completion_action_match_label(
+                &state,
+                &CompletionAction::CanonicalWorkValidation,
+                &call("tsc --noEmit --help --outDir --help false")
+            )
+            .is_some()
+        );
+        assert!(
+            completion_action_match_label(
+                &state,
+                &CompletionAction::CanonicalWorkValidation,
+                &call("tsc --noEmit")
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -17344,16 +16955,22 @@ mod tests {
                 "function": {"name": "bash", "arguments": serde_json::json!({"command": command}).to_string()}
             })
         };
-        assert!(!completion_action_matches_tool_call(
-            &state,
-            &CompletionAction::CanonicalWorkValidation,
-            &call(ambiguous)
-        ));
-        assert!(completion_action_matches_tool_call(
-            &state,
-            &CompletionAction::CanonicalWorkValidation,
-            &call("tsc --noEmit")
-        ));
+        assert!(
+            !completion_action_match_label(
+                &state,
+                &CompletionAction::CanonicalWorkValidation,
+                &call(ambiguous)
+            )
+            .is_some()
+        );
+        assert!(
+            completion_action_match_label(
+                &state,
+                &CompletionAction::CanonicalWorkValidation,
+                &call("tsc --noEmit")
+            )
+            .is_some()
+        );
         state
             .stall
             .tool_call_records
@@ -18495,10 +18112,8 @@ mod tests {
             "type": "function",
             "function": {"name": "read_file", "arguments": "{}"}
         });
-        assert!(completion_action_matches_tool_call(
-            &state, &action, &verify
-        ));
-        assert!(!completion_action_matches_tool_call(&state, &action, &read));
+        assert!(completion_action_match_label(&state, &action, &verify).is_some());
+        assert!(!completion_action_match_label(&state, &action, &read).is_some());
     }
 
     #[test]
@@ -18521,11 +18136,7 @@ mod tests {
             })
         };
 
-        assert!(!completion_action_matches_tool_call(
-            &state,
-            &action,
-            &call("echo ok")
-        ));
+        assert!(!completion_action_match_label(&state, &action, &call("echo ok")).is_some());
         for command in [
             "git --version status",
             "cat --version",
@@ -18544,25 +18155,30 @@ mod tests {
             "cat /workspace/source > /workspace/output",
         ] {
             assert!(
-                !completion_action_matches_tool_call(&state, &action, &call(command)),
+                !completion_action_match_label(&state, &action, &call(command)).is_some(),
                 "metadata/option-only reader must not consume the completion action: {command}"
             );
         }
-        assert!(!completion_action_matches_tool_call(
-            &state,
-            &action,
-            &call("cat /workspace/missing || true")
-        ));
-        assert!(!completion_action_matches_tool_call(
-            &state,
-            &action,
-            &call("cat /workspace/missing; echo ok")
-        ));
-        assert!(completion_action_matches_tool_call(
-            &state,
-            &action,
-            &call("cat /workspace/result && true")
-        ));
+        assert!(
+            !completion_action_match_label(
+                &state,
+                &action,
+                &call("cat /workspace/missing || true")
+            )
+            .is_some()
+        );
+        assert!(
+            !completion_action_match_label(
+                &state,
+                &action,
+                &call("cat /workspace/missing; echo ok")
+            )
+            .is_some()
+        );
+        assert!(
+            completion_action_match_label(&state, &action, &call("cat /workspace/result && true"))
+                .is_some()
+        );
         for command in [
             "grep -n pattern /workspace/result",
             "grep -e pattern /workspace/result",
@@ -18575,7 +18191,7 @@ mod tests {
             "[ -f /workspace/result ]",
         ] {
             assert!(
-                completion_action_matches_tool_call(&state, &action, &call(command)),
+                completion_action_match_label(&state, &action, &call(command)).is_some(),
                 "valid reader must match the completion action: {command}"
             );
         }
@@ -18591,7 +18207,7 @@ mod tests {
             "cargo test | touch /workspace/out",
         ] {
             assert!(
-                !completion_action_matches_tool_call(&state, &action, &call(command)),
+                !completion_action_match_label(&state, &action, &call(command)).is_some(),
                 "stdin-only pipelines must not consume a workspace observation action: {command}"
             );
         }
@@ -18604,20 +18220,17 @@ mod tests {
             "cargo test -v",
         ] {
             assert!(
-                completion_action_matches_tool_call(&state, &action, &call(command)),
+                completion_action_match_label(&state, &action, &call(command)).is_some(),
                 "a reader may inherit evidence from an earlier workspace-producing stage: {command}"
             );
         }
-        assert!(completion_action_matches_tool_call(
-            &state,
-            &action,
-            &call("[ -f /workspace/result ] | cat")
-        ));
-        assert!(!completion_action_matches_tool_call(
-            &state,
-            &action,
-            &call("cat /tmp/unrelated")
-        ));
+        assert!(
+            completion_action_match_label(&state, &action, &call("[ -f /workspace/result ] | cat"))
+                .is_some()
+        );
+        assert!(
+            !completion_action_match_label(&state, &action, &call("cat /tmp/unrelated")).is_some()
+        );
     }
 
     #[test]
@@ -19759,145 +19372,43 @@ mod tests {
         }
     }
 
-    fn server_feedback_frame() -> astra_turn_core::context_feedback::RuntimeFeedbackFrame {
-        serde_json::from_value(serde_json::json!({
-            "schema_version": astra_turn_core::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
-            "identity": {
-                "session_id": "session-1",
-                "run_id": "run-1",
-                "agent_id": "agent-1",
-                "model_id": "deepseek-v4-flash",
-                "topology": "server_only"
-            },
-            "progress": {
-                "session_turn": 4,
-                "agentic_round_index": 2,
-                "llm_rounds_completed": 3,
-                "slice_round_limit": 60,
-                "slice_rounds_remaining": 57
-            },
-            "context": {
-                "model_context_window_tokens": 1000000,
-                "effective_input_limit_tokens": 800000,
-                "estimated_input_tokens": 840000,
-                "token_pressure": 1.05,
-                "compaction_tier": "compact_history"
-            },
-            "request_usage": {
-                "prompt": 100,
-                "cache_read": 200,
-                "cache_creation": 0,
-                "completion": 20
-            },
-            "run_usage": {
-                "prompt": 300,
-                "cache_read": 600,
-                "cache_creation": 0,
-                "completion": 60
-            },
-            "was_truncated": false,
-            "policy_feedback": {
-                "state": "evaluated",
-                "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
-            "recovery": null,
-                "revision": 2,
-                "evaluated_at_round": 2,
-                "subject": {
-                    "kind": "work_item",
-                    "attempt_id": "attempt-1",
-                    "item_id": "item-1",
-                    "item_revision": 1,
-                    "objective": "Inspect one bounded target",
-                    "expected_result": "One verified result"
-                },
-                "entries": [{
-                    "signal": "read_coverage_overlap",
-                    "stage": "observe",
-                    "observed_at_round": 2,
-                    "evidence_count": 3,
-                    "recommendation": "review_read_coverage"
-                }]
-            }
-        }))
-        .expect("valid server feedback frame")
-    }
-
-    fn server_summary_tool_receipt(
-        attempted: u32,
-    ) -> astra_turn_core::tool_ledger_receipt::ToolLedgerReceipt {
-        astra_turn_core::tool_ledger_receipt::ToolLedgerReceipt::new(
-            "run-1",
-            1,
-            attempted,
-            attempted,
-            0,
-            astra_turn_core::tool_ledger_receipt::ToolLedgerResultClassCounts {
-                succeeded: attempted,
-                ..Default::default()
-            },
-            u64::from(attempted),
-            astra_turn_core::tool_ledger_receipt::EMPTY_TOOL_LEDGER_ROOT,
-            true,
-        )
-    }
-
     #[test]
-    fn remote_server_feedback_is_exact_and_bound_to_terminal_progress() {
-        let frame = server_feedback_frame();
-        let summary = ServerLoopExecutionSummary {
-            tool_calls_count: 0,
-            observation_tool_calls_count: 0,
-            tools_used: Vec::new(),
-            llm_rounds: 3,
-            tool_ledger_receipt: server_summary_tool_receipt(0),
-            token_usage_coverage: None,
-            runtime_feedback: Some(frame.clone()),
-        };
-        assert_eq!(
-            authoritative_server_runtime_feedback(
-                &summary,
-                Some("session-1"),
-                Some("run-1"),
-                Some("deepseek-v4-flash"),
-                4,
-            ),
-            Some(frame.clone())
-        );
+    fn policy_advisories_do_not_open_an_acceptance_tool_boundary() {
+        let mut state = make_state();
+        state.task_profile.mutates_workspace = true;
+        state.final_text = "The requested API is fully fixed.".into();
+        let max_turns = state.max_turns;
+        let remaining_turns = state.remaining_turns;
+        state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
+            "state": "evaluated",
+            "schema_version": astra_turn_core::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
+            "revision": 3,
+            "evaluated_at_round": 8,
+            "subject": {"kind": "run"},
+            "entries": [{
+                "signal": "round_activity",
+                "stage": "observe",
+                "observed_at_round": 8,
+                "evidence_count": 8,
+                "recommendation": "review_task_progress"
+            }]
+        }))
+        .expect("valid policy feedback");
 
-        let mut terminal_includes_failed_attempt = summary.clone();
-        terminal_includes_failed_attempt.llm_rounds = 4;
-        assert_eq!(
-            authoritative_server_runtime_feedback(
-                &terminal_includes_failed_attempt,
-                Some("session-1"),
-                Some("run-1"),
-                Some("deepseek-v4-flash"),
-                4,
-            ),
-            Some(frame.clone())
-        );
-        let mut impossible_future_feedback = summary.clone();
-        impossible_future_feedback.llm_rounds = 2;
-        assert!(
-            authoritative_server_runtime_feedback(
-                &impossible_future_feedback,
-                Some("session-1"),
-                Some("run-1"),
-                Some("deepseek-v4-flash"),
-                4,
-            )
-            .is_none()
-        );
-        assert!(
-            authoritative_server_runtime_feedback(
-                &summary,
-                Some("session-1"),
-                Some("run-1"),
-                Some("deepseek-v4-flash"),
-                5,
-            )
-            .is_none()
-        );
+        // Runtime-policy signals are alerts.  Without a caller-declared
+        // verification contract they must not create an actionful retry or
+        // project a text-only boundary while ordinary budget remains.
+        assert!(!state.hooks.completion_settlement.text_only);
+        assert_eq!(state.max_turns, max_turns);
+        assert_eq!(state.remaining_turns, remaining_turns);
+        assert!(state.volatile_pending.iter().all(|entry| {
+            entry
+                .payload
+                .get("schema")
+                .and_then(serde_json::Value::as_str)
+                != Some("acceptance_reconciliation_required.v1")
+        }));
     }
 
     fn structured_mutating_profile() -> astra_turn_core::chat_turn_heuristics::TaskExecutionProfile
@@ -19935,45 +19446,6 @@ mod tests {
     fn install_tool_trace_collector(state: &mut AgenticLoopState) {
         state.telemetry.turn_trace_collector = Some(
             crate::turn::turn_trace_collector::TurnTraceCollector::new("turn-1", "session-1"),
-        );
-    }
-
-    #[test]
-    fn record_tool_selection_uses_remote_server_summary_when_edge_round_is_empty() {
-        let mut state = make_state();
-        install_tool_trace_collector(&mut state);
-        let turn_result = HostTurnResult {
-            accum: ChatTurnSseAccum {
-                server_execution_summary: Some(ServerLoopExecutionSummary {
-                    tool_calls_count: 1,
-                    observation_tool_calls_count: 0,
-                    tools_used: vec!["read_file".to_string()],
-                    llm_rounds: 1,
-                    tool_ledger_receipt: server_summary_tool_receipt(1),
-                    token_usage_coverage: None,
-                    runtime_feedback: None,
-                }),
-                ..ChatTurnSseAccum::default()
-            },
-            ttft_ms: None,
-            edge_tool_round: Vec::new(),
-            error_kind: None,
-        };
-
-        record_tool_selection(&mut state, &turn_result, 0);
-
-        assert_eq!(recorded_tool_names(&state), vec!["read_file"]);
-        assert_eq!(
-            state
-                .telemetry
-                .turn_trace_collector
-                .as_ref()
-                .expect("collector")
-                .finalize()
-                .tools
-                .tools_available,
-            1,
-            "availability must remain coherent with the authoritative summary"
         );
     }
 
@@ -20019,78 +19491,15 @@ mod tests {
     }
 
     #[test]
-    fn remote_server_terminal_does_not_fabricate_an_outer_llm_round() {
-        let mut state = make_state();
-        state.turn_event_buffer = Some(TurnEventBuffer::begin_turn(Some("session-1"), 1));
-        let turn_result = HostTurnResult {
-            accum: ChatTurnSseAccum {
-                has_usage: true,
-                usage_is_run_total: true,
-                prompt_tokens: 12_000,
-                cache_read_tokens: 400_000,
-                completion_tokens: 2_000,
-                server_execution_summary: Some(ServerLoopExecutionSummary {
-                    tool_calls_count: 4,
-                    observation_tool_calls_count: 0,
-                    tools_used: vec!["read_file".to_string()],
-                    llm_rounds: 7,
-                    tool_ledger_receipt: server_summary_tool_receipt(4),
-                    token_usage_coverage: None,
-                    runtime_feedback: None,
-                }),
-                ..ChatTurnSseAccum::default()
-            },
-            ttft_ms: Some(900),
-            edge_tool_round: Vec::new(),
-            error_kind: None,
-        };
-
-        record_early_exit_llm_round(
-            &mut state,
-            &turn_result,
-            Instant::now() - Duration::from_secs(30),
-            Some("stop"),
-        );
-
-        assert!(state.recent_rounds.is_empty());
-        assert_eq!(
-            state
-                .turn_event_buffer
-                .as_ref()
-                .expect("turn event buffer")
-                .len(),
-            0,
-            "the Server's physical rounds remain the sole llm_round evidence"
-        );
-    }
-
-    #[test]
-    fn record_tool_selection_preserves_local_edge_precedence_and_unique_names() {
+    fn record_edge_tool_selection_records_unique_callback_names() {
         let mut state = make_state();
         install_tool_trace_collector(&mut state);
-        let turn_result = HostTurnResult {
-            accum: ChatTurnSseAccum {
-                server_execution_summary: Some(ServerLoopExecutionSummary {
-                    tool_calls_count: 1,
-                    observation_tool_calls_count: 0,
-                    tools_used: vec!["remote_only".to_string()],
-                    llm_rounds: 1,
-                    tool_ledger_receipt: server_summary_tool_receipt(1),
-                    token_usage_coverage: None,
-                    runtime_feedback: None,
-                }),
-                ..ChatTurnSseAccum::default()
-            },
-            ttft_ms: None,
-            edge_tool_round: vec![
-                make_edge_tool(" read_file ", "ok"),
-                make_edge_tool("read_file", "ok"),
-                make_edge_tool(" bash ", "ok"),
-            ],
-            error_kind: None,
-        };
-
-        record_tool_selection(&mut state, &turn_result, 0);
+        let callbacks = vec![
+            make_edge_tool(" read_file ", "ok"),
+            make_edge_tool("read_file", "ok"),
+            make_edge_tool(" bash ", "ok"),
+        ];
+        record_edge_tool_selection(&mut state, &callbacks, 0);
 
         assert_eq!(recorded_tool_names(&state), vec!["read_file", "bash"]);
         assert_eq!(
@@ -20122,7 +19531,7 @@ mod tests {
                 ..ChatTurnSseAccum::default()
             },
             ttft_ms: None,
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         };
 
@@ -20140,35 +19549,17 @@ mod tests {
     }
 
     #[test]
-    fn record_tool_selection_does_not_infer_names_from_missing_or_zero_tool_summary() {
-        for summary in [
-            None,
-            Some(ServerLoopExecutionSummary {
-                tool_calls_count: 0,
-                observation_tool_calls_count: 0,
-                tools_used: Vec::new(),
-                llm_rounds: 1,
-                tool_ledger_receipt: server_summary_tool_receipt(0),
-                token_usage_coverage: None,
-                runtime_feedback: None,
-            }),
-        ] {
-            let mut state = make_state();
-            install_tool_trace_collector(&mut state);
-            let turn_result = HostTurnResult {
-                accum: ChatTurnSseAccum {
-                    server_execution_summary: summary,
-                    ..ChatTurnSseAccum::default()
-                },
-                ttft_ms: None,
-                edge_tool_round: Vec::new(),
-                error_kind: None,
-            };
+    fn record_tool_selection_does_not_infer_names_without_tool_evidence() {
+        let mut state = make_state();
+        install_tool_trace_collector(&mut state);
+        let turn_result = HostTurnResult {
+            accum: ChatTurnSseAccum::default(),
+            ttft_ms: None,
 
-            record_tool_selection(&mut state, &turn_result, 0);
-
-            assert!(recorded_tool_names(&state).is_empty());
-        }
+            error_kind: None,
+        };
+        record_tool_selection(&mut state, &turn_result, 0);
+        assert!(recorded_tool_names(&state).is_empty());
     }
 
     #[test]
@@ -20634,7 +20025,7 @@ mod tests {
         let rejected = HostTurnResult {
             accum: ChatTurnSseAccum::default(),
             ttft_ms: None,
-            edge_tool_round: Vec::new(),
+
             error_kind: Some(astra_core::ErrorKind::InvalidRequest),
         };
         assert_eq!(
@@ -20921,10 +20312,10 @@ mod tests {
                 ..ChatTurnSseAccum::default()
             },
             ttft_ms: Some(1),
-            edge_tool_round: Vec::new(),
+
             error_kind: Some(astra_core::ErrorKind::RateLimit),
         };
-        let mut host = MockHost::new(vec![error_result]);
+        let mut host = MockHost::new(vec![error_result.into()]);
 
         let _ = execute_turn_and_ingest_phase(
             &mut host,
@@ -24099,17 +23490,11 @@ mod tests {
     fn ingest_usage_gate_snapshot(
         state: &mut AgenticLoopState,
         snap: &AgenticTurnStreamSnapshot<'_>,
-        quiet: bool,
     ) -> AgenticTurnIngestOutcome {
         let message = state.message.clone();
-        let recent_tools = state.recent_tools.clone();
         ingest_agentic_turn_stream(
             snap,
-            0,
-            |_| unreachable!("usage gate has no edge tools"),
             &message,
-            &recent_tools,
-            quiet,
             AgenticTurnIngestMut {
                 model_item_id: None,
                 final_text_model_item_id: &mut state.final_text_model_item_id,
@@ -24138,7 +23523,6 @@ mod tests {
         usage: Option<crate::turn::token_usage::TokenUsage>,
         physical: Option<astra_turn_types::RequestTokenUsage>,
         terminal: TypedTerminalGateCase,
-        quiet: bool,
     ) -> UsageGateObservation {
         let usage = usage.unwrap_or_default();
         let error_kind = match terminal {
@@ -24174,10 +23558,7 @@ mod tests {
 
         let execution = match terminal {
             TypedTerminalGateCase::TerminalControl => {
-                let mut host = MockHost::new(Vec::new()).with_quiet(quiet);
-                assert_eq!(host.is_quiet(), quiet);
                 let outcome = apply_terminal_control_stream_snapshot(
-                    &mut host,
                     &mut state,
                     &snap,
                     crate::turn::terminal_control::TerminalControlOutcome::Requested(
@@ -24195,7 +23576,7 @@ mod tests {
                 UsageGateExecution::Delegated
             }
             TypedTerminalGateCase::Inference(status) => {
-                let outcome = ingest_usage_gate_snapshot(&mut state, &snap, quiet);
+                let outcome = ingest_usage_gate_snapshot(&mut state, &snap);
                 match (status, outcome) {
                     (
                         astra_services::InferenceTerminalStatus::Succeeded,
@@ -24221,7 +23602,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_usage_terminal_quiet_cross_product_preserves_typed_telemetry() {
+    fn provider_usage_terminal_cross_product_preserves_typed_telemetry() {
         use crate::turn::token_usage::parse_usage;
         use astra_services::InferenceTerminalStatus;
 
@@ -24265,48 +23646,42 @@ mod tests {
                 .total_input_tokens();
 
             for terminal in terminal_cases {
-                let rendered = exercise_usage_gate(extracted, physical, terminal, false);
-                let quiet = exercise_usage_gate(extracted, physical, terminal, true);
+                let observed = exercise_usage_gate(extracted, physical, terminal);
 
                 assert_eq!(
-                    rendered, quiet,
-                    "quiet changed typed telemetry or terminal state: {} / {terminal:?}",
-                    provider.name
-                );
-                assert_eq!(
-                    rendered.telemetry.fresh_input_tokens, expected.input_tokens,
+                    observed.telemetry.fresh_input_tokens, expected.input_tokens,
                     "fresh input: {} / {terminal:?}",
                     provider.name
                 );
                 assert_eq!(
-                    rendered.telemetry.cache_read_tokens, expected.cached_input_tokens,
+                    observed.telemetry.cache_read_tokens, expected.cached_input_tokens,
                     "cache read: {} / {terminal:?}",
                     provider.name
                 );
                 assert_eq!(
-                    rendered.telemetry.cache_creation_tokens, expected.cache_creation_tokens,
+                    observed.telemetry.cache_creation_tokens, expected.cache_creation_tokens,
                     "cache create: {} / {terminal:?}",
                     provider.name
                 );
                 assert_eq!(
-                    rendered.telemetry.output_tokens, expected.output_tokens,
+                    observed.telemetry.output_tokens, expected.output_tokens,
                     "output: {} / {terminal:?}",
                     provider.name
                 );
                 assert_eq!(
-                    rendered.telemetry.total_input_tokens(),
+                    observed.telemetry.total_input_tokens(),
                     expected_total_input,
                     "fresh + read + create: {} / {terminal:?}",
                     provider.name
                 );
-                assert_eq!(rendered.telemetry.has_any_usage, extracted.is_some());
-                assert_eq!(rendered.telemetry.first_ttft_ms, Some(17));
+                assert_eq!(observed.telemetry.has_any_usage, extracted.is_some());
+                assert_eq!(observed.telemetry.first_ttft_ms, Some(17));
                 assert_eq!(
-                    rendered.telemetry.current_session_id.as_deref(),
+                    observed.telemetry.current_session_id.as_deref(),
                     Some("typed-usage-session")
                 );
                 assert_eq!(
-                    rendered.telemetry.current_run_id.as_deref(),
+                    observed.telemetry.current_run_id.as_deref(),
                     Some("typed-usage-run")
                 );
 
@@ -24325,11 +23700,11 @@ mod tests {
                         unreachable!("cancelled is outside this exit-gate matrix")
                     }
                 };
-                assert_eq!(rendered.execution, expected_execution);
+                assert_eq!(observed.execution, expected_execution);
 
                 let expected_calibration = physical.map(|_| expected_total_input);
                 assert_eq!(
-                    rendered.telemetry.last_measured_prompt_tokens, expected_calibration,
+                    observed.telemetry.last_measured_prompt_tokens, expected_calibration,
                     "prompt calibration: {} / {terminal:?}",
                     provider.name
                 );
@@ -24864,22 +24239,34 @@ mod tests {
 
     #[tokio::test]
     async fn provider_progress_is_emitted_only_for_real_host_calls_and_is_always_paired() {
-        let mut success_state = make_state();
-        let mut success_progress = attach_llm_progress_receiver(&mut success_state);
-        let mut success_host = MockHost::new(vec![text_result("done", 3, 2, Some(7))]);
-        execute_turn_and_ingest_phase(
-            &mut success_host,
-            &mut success_state,
-            4,
-            TurnIterationPrep {
-                quiet: true,
-                turn_start_time: Instant::now(),
-            },
-        )
-        .await
-        .expect("successful host boundary");
-        assert_eq!(success_host.turn_count(), 1);
-        assert_one_paired_llm_progress(&mut success_progress, 4, Some(7));
+        let mut work_carrier = text_result("", 3, 2, Some(7));
+        work_carrier.response.accum.has_tool_calls = true;
+        work_carrier.response.accum.tool_calls = vec![serde_json::json!({
+            "id": "work-establishment", "type": "function",
+            "function": {"name": "start_work", "arguments": "{}"}
+        })];
+        for response in [text_result("done", 3, 2, Some(7)), work_carrier] {
+            let mut success_state = make_state();
+            let mut success_progress = attach_llm_progress_receiver(&mut success_state);
+            let mut success_host = MockHost::new(vec![response]);
+            execute_turn_and_ingest_phase(
+                &mut success_host,
+                &mut success_state,
+                4,
+                TurnIterationPrep {
+                    quiet: true,
+                    turn_start_time: Instant::now(),
+                },
+            )
+            .await
+            .expect("successful host boundary");
+            assert_eq!(success_host.turn_count(), 1);
+            assert_one_paired_llm_progress(&mut success_progress, 4, Some(7));
+            assert_eq!(success_state.llm_rounds_completed, 1);
+            assert_eq!(success_state.telemetry.local_usage_attempts, 1);
+            assert_eq!(success_state.telemetry.local_usage_provider_reported, 1);
+            assert!(success_state.current_model_item_id.is_some());
+        }
 
         let mut error_state = make_state();
         let mut error_progress = attach_llm_progress_receiver(&mut error_state);
@@ -24900,6 +24287,9 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(error_host.turn_count(), 1);
         assert_one_paired_llm_progress(&mut error_progress, 9, None);
+        assert_eq!(error_state.llm_rounds_completed, 1);
+        assert_eq!(error_state.telemetry.local_usage_attempts, 1);
+        assert_eq!(error_state.telemetry.local_usage_unavailable, 1);
     }
 
     #[tokio::test]
@@ -25288,48 +24678,6 @@ mod tests {
         assert_eq!(state.last_measured_prompt_tokens, Some(100_000));
         assert_eq!(state.total_prompt, 10_000);
         assert_eq!(state.total_cache_read, 90_000);
-    }
-
-    #[test]
-    fn superseded_remote_summary_keeps_deduplicated_accounting_without_actions() {
-        let mut state = make_state();
-        state.current_run_id = Some("parent-run".into());
-        let mut result = text_result("stale remote answer", 240, 20, Some(9));
-        result.accum.qualified_usage = Some(
-            astra_turn_types::CanonicalTokenUsage::new(Some(240), Some(80), None, Some(20))
-                .unwrap(),
-        );
-        result.accum.run_id = Some("remote-run".into());
-        result.accum.cache_read_tokens = 80;
-        result.accum.server_execution_summary = Some(ServerLoopExecutionSummary {
-            llm_rounds: 2,
-            tool_calls_count: 3,
-            observation_tool_calls_count: 1,
-            tools_used: vec!["read_file".into(), "bash".into()],
-            ..Default::default()
-        });
-
-        record_superseded_llm_round(&mut state, &result, Instant::now());
-        record_superseded_llm_round(&mut state, &result, Instant::now());
-
-        assert_eq!(state.llm_rounds_completed, 2);
-        assert_eq!(state.total_tool_calls, 3);
-        assert_eq!(state.total_observation_tool_calls, 1);
-        assert_eq!(state.total_prompt, 240);
-        assert_eq!(state.qualified_usage, result.accum.qualified_usage);
-        assert_eq!(state.total_completion, 20);
-        assert_eq!(state.total_cache_read, 80);
-        assert!(state.has_any_usage);
-        assert!(state.messages.is_empty());
-        assert!(state.stall.tool_call_records.is_empty());
-        result.accum.run_id = None;
-        record_superseded_llm_round(&mut state, &result, Instant::now());
-        record_superseded_llm_round(&mut state, &result, Instant::now());
-        assert_eq!(state.qualified_usage.unwrap().input_tokens(), None);
-        assert_eq!(
-            state.total_prompt, 240,
-            "anonymous summaries cannot add numeric counts"
-        );
     }
 
     #[tokio::test]
@@ -25912,6 +25260,25 @@ mod tests {
     #[tokio::test]
     async fn user_intent_records_multiple_inputs_without_consecutive_user_messages() {
         let mut state = make_state();
+        state.messages = vec![
+            serde_json::json!({"role":"user", "content":"first queued input\n\nsecond queued input"}),
+            serde_json::json!({"role":"assistant", "content":"older response"}),
+            serde_json::json!({"role":"user", "content":"test query"}),
+            serde_json::json!({"role":"assistant", "content":"prior response"}),
+        ];
+        crate::turn::agentic::turn_intent::capture_turn_intent_context(&mut state);
+        assert_eq!(
+            state
+                .telemetry
+                .turn_intent_context
+                .as_ref()
+                .unwrap()
+                .source
+                .as_ref()
+                .unwrap()
+                .message_index,
+            2,
+        );
         state.current_run_id = Some("run-queued-many".into());
         state.context_manifest_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![UserIntentPoll {
@@ -25947,6 +25314,40 @@ mod tests {
         assert_eq!(state.user_intents.user_intent_cursor(), 3);
         assert_eq!(*provider.released.lock().await, vec![1, 2]);
         assert_eq!(state.message, "second queued input");
+        let context = state.telemetry.turn_intent_context.as_ref().unwrap();
+        assert_eq!(context.message, "first queued input\n\nsecond queued input");
+        let source = context.source.as_ref().unwrap();
+        assert_eq!(source.message_index, 4);
+        assert_eq!(source.message_text, context.message);
+        assert_eq!(
+            context.prior_assistant_message.as_deref(),
+            Some("prior response")
+        );
+        assert_eq!(
+            source.feedback_response,
+            Some(
+                astra_turn_types::FeedbackResponseReference::from_canonical_prefix(
+                    state.messages[..4].to_vec(),
+                )
+            ),
+        );
+        let intent = astra_config::user_profile::TurnIntent {
+            assessment: Some(astra_turn_types::TurnAssessment::default()),
+            ..Default::default()
+        };
+        assert!(super::super::lifecycle::record_current_user_turn_semantics(
+            &mut state, &intent
+        ));
+        assert!(
+            astra_turn_types::user_turn_semantics(&state.messages[4])
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            astra_turn_types::user_turn_semantics(&state.messages[2])
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             state.user_intents.applied_user_intents(),
             &[
@@ -26005,12 +25406,19 @@ mod tests {
                 error: None,
             },
             UserIntentPoll {
-                next_cursor: 2,
-                snapshot_has_more: false,
-                snapshot_page_fact_count: 0,
-                inputs: Vec::new(),
-                issues: Vec::new(),
-                error: None,
+                next_cursor: 3,
+                inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "runtime-update".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 2,
+                    input: crate::turn::run_control::runtime_notification_input("child completed"),
+                }],
+                ..Default::default()
+            },
+            UserIntentPoll {
+                next_cursor: 3,
+                ..Default::default()
             },
         ]));
         state.run_control = Some(provider.clone());
@@ -26019,13 +25427,24 @@ mod tests {
         inject_polled_user_intents(&mut host, &mut state)
             .await
             .unwrap();
-        inject_polled_user_intents(&mut host, &mut state)
-            .await
-            .unwrap();
+        let frozen = state.telemetry.turn_intent_context.clone().unwrap();
+        for _ in 0..2 {
+            inject_polled_user_intents_before_action(&mut host, &mut state)
+                .await
+                .unwrap();
+            let context = state.telemetry.turn_intent_context.as_ref().unwrap();
+            assert_eq!(context.message, frozen.message);
+            let source = context.source.as_ref().unwrap();
+            let frozen_source = frozen.source.as_ref().unwrap();
+            assert_eq!(source.message_index, frozen_source.message_index);
+            assert_eq!(source.message_text, frozen_source.message_text);
+            assert_eq!(source.feedback_response, frozen_source.feedback_response);
+        }
 
         assert_eq!(host.user_intent_context_indices, vec![1]);
-        assert_eq!(state.user_intents.user_intent_cursor(), 2);
-        assert_eq!(*provider.released.lock().await, vec![1]);
+        assert_eq!(state.user_intents.user_intent_cursor(), 3);
+        assert_eq!(*provider.released.lock().await, vec![1, 2]);
+        assert_eq!(provider.poll_call_count().await, 3);
         assert_eq!(host.user_intent_applied_indices, vec![1]);
         assert_eq!(
             state
@@ -26156,6 +25575,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn user_intent_retries_release_without_reinjecting_after_ack_failure() {
         let mut state = make_state();
+        state.messages = vec![serde_json::json!({"role":"user", "content":"test query"})];
+        crate::turn::agentic::turn_intent::capture_turn_intent_context(&mut state);
         state.current_run_id = Some("run-release-retry".into());
         state.context_manifest_user_id = Some("user-deferred".into());
         let pending_poll = || UserIntentPoll {
@@ -26191,6 +25612,11 @@ mod tests {
             .await
             .unwrap();
 
+        let context = state.telemetry.turn_intent_context.as_ref().unwrap();
+        assert_eq!(context.message, "test query");
+        let source = context.source.as_ref().unwrap();
+        assert_eq!(source.message_index, 0);
+        assert_eq!(source.message_text, "test query");
         assert!(
             host.user_intent_context_indices.is_empty(),
             "uncommitted guidance must not become model-visible"
@@ -26238,6 +25664,11 @@ mod tests {
             4,
             "pending release acknowledgement retries after its backoff"
         );
+        let context = state.telemetry.turn_intent_context.as_ref().unwrap();
+        assert_eq!(context.message, "inject once");
+        let source = context.source.as_ref().unwrap();
+        assert_eq!(source.message_index, state.messages.len() - 1);
+        assert_eq!(source.message_text, "inject once");
         assert_eq!(*provider.released.lock().await, vec![1]);
         assert_eq!(host.user_intent_applied_indices, vec![1]);
         assert_eq!(
@@ -26703,18 +26134,21 @@ mod tests {
             .messages
             .push(serde_json::json!({"role": "user", "content": "retry me"}));
 
-        let mut host = MockHost::new(vec![HostTurnResult {
-            accum: ChatTurnSseAccum {
-                error_message: Some("rate limit exceeded".to_string()),
-                has_usage: true,
-                prompt_tokens: 12,
-                completion_tokens: 0,
-                ..ChatTurnSseAccum::default()
-            },
-            ttft_ms: None,
-            edge_tool_round: Vec::new(),
-            error_kind: None,
-        }]);
+        let mut host = MockHost::new(vec![
+            HostTurnResult {
+                accum: ChatTurnSseAccum {
+                    error_message: Some("rate limit exceeded".to_string()),
+                    has_usage: true,
+                    prompt_tokens: 12,
+                    completion_tokens: 0,
+                    ..ChatTurnSseAccum::default()
+                },
+                ttft_ms: None,
+
+                error_kind: None,
+            }
+            .into(),
+        ]);
         let prep = TurnIterationPrep {
             quiet: true,
             turn_start_time: Instant::now(),

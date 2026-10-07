@@ -423,10 +423,6 @@ pub(crate) struct SessionState {
     /// Tool replay guard rebuilt from step events on resume.
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
-    /// Session-scoped skill quality tracker for learning loop.
-    pub skill_quality_tracker: astra_skills::quality::SkillQualityTracker,
-    /// Skills surfaced by `discover_skills` during this CLI session.
-    pub discovered_skills: std::collections::HashSet<String>,
     pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
     /// Shared team persistence service (in-memory or API-backed).
     /// Used for execution history and snapshot persistence.
@@ -554,8 +550,6 @@ pub(crate) struct SessionState {
     // ── Harness (observation + verification layer) ──
     #[cfg(feature = "harness")]
     pub harness_sink: std::sync::Arc<astra_harness::InMemorySnapshotSink>,
-    #[cfg(feature = "harness")]
-    pub harness_trace: std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>,
 }
 
 impl Default for SessionState {
@@ -636,8 +630,6 @@ impl Default for SessionState {
             runtime_consecutive_context_window_errors: 0,
             workspace_observation_quarantine: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
-            skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
-            discovered_skills: std::collections::HashSet::new(),
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),
             )),
@@ -685,10 +677,6 @@ impl Default for SessionState {
             bash_detach_slot: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "harness")]
             harness_sink: astra_harness::InMemorySnapshotSink::arc(),
-            #[cfg(feature = "harness")]
-            harness_trace: std::sync::Arc::new(std::sync::RwLock::new(
-                astra_harness::SessionTrace::new(None),
-            )),
         }
     }
 }
@@ -833,7 +821,6 @@ impl SessionState {
     pub fn reset_for_session_restore(&mut self) {
         self.reset_for_new_session();
         self.clear_session_id();
-        self.discovered_skills.clear();
     }
 
     /// Clear the shared background-task projection before rebinding the session.
@@ -1205,7 +1192,6 @@ mod default_tests {
                 schema_digest: "sha256:write-file".into(),
                 descriptor: None,
             }],
-            discovered_skills: ["skill-b".to_string()].into_iter().collect(),
             plan_mode_sync_error: Some("sync".into()),
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
@@ -1220,7 +1206,6 @@ mod default_tests {
         assert!(state.history.is_empty());
         assert!(state.recent_tools.is_empty());
         assert!(state.deferred_tool_activations.is_empty());
-        assert!(state.discovered_skills.is_empty());
         assert!(state.plan_mode_sync_error.is_none());
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());

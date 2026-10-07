@@ -11,7 +11,8 @@ use astra_services::tool_invocation_ledger::{
     ToolInvocationPreparationProbe,
 };
 use astra_services::{
-    DatabaseSessionContextCoordinator, SessionExecutionBindingStateV1, SessionExecutionBindingV1,
+    BeginSessionExecutionSwitchV1, DatabaseSessionContextCoordinator,
+    SessionExecutionBindingStateV1, SessionExecutionBindingV1,
 };
 use astra_turn_types::{
     DispatchCertainty, DurableToolReference, SessionKeyV1, ToolInvocationCompletionSource,
@@ -672,8 +673,30 @@ async fn dispatch_fails_closed_when_the_work_provider_generation_is_stale() {
     let prefix = Uuid::new_v4().simple().to_string();
     let invocation = identity(&prefix, "stale-provider-generation");
     cleanup(&pool, &invocation).await;
-    let binding =
+    let mut binding =
         SessionExecutionBindingV1::server_work_default(format!("work:{prefix}:branch:main"));
+    binding.physical_workspace_id = Some(
+        SessionExecutionBindingV1::edge_materialization_physical_identity(
+            "source",
+            "/workspace/source",
+        ),
+    );
+    binding.workspace = astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+        display_name: None,
+        root: Some("/workspace/source".into()),
+        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+            path: "/workspace/source".into(),
+        }),
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+    };
+    binding.executor = astra_services::runs::ExecutorBindingRequest {
+        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+        executor_id: Some("source-edge".into()),
+        display_name: None,
+        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
+        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+    };
     sqlx::query(
         "INSERT INTO session_execution_bindings \
          (isolation_domain, owner_user_id, session_id, branch_id, generation, binding_json) \
@@ -701,12 +724,46 @@ async fn dispatch_fails_closed_when_the_work_provider_generation_is_stale() {
         &invocation.session_id,
         "main",
     );
+    let actor = astra_turn_types::ActorContextV1::owner_user(
+        &invocation.user_id,
+        "dispatch-generation-db-it",
+        astra_turn_types::ActorKindV1::Server,
+        astra_turn_types::SessionSurfaceV1::Server,
+        None,
+        astra_turn_types::AuthorityEpochsV1::default(),
+    );
+    let attachment = common::controller_attachment(&shared, &key, actor).await;
     let mut switching = binding.clone();
     switching.generation = 2;
     switching.state = SessionExecutionBindingStateV1::Switching;
+    switching.executor.executor_id = Some("target-edge".into());
+    switching.physical_workspace_id = Some(
+        SessionExecutionBindingV1::edge_materialization_physical_identity(
+            "target",
+            "/workspace/target",
+        ),
+    );
+    switching.workspace.root = Some("/workspace/target".into());
+    switching.workspace.source = Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+        path: "/workspace/target".into(),
+    });
     assert!(matches!(
         coordinator
-            .compare_and_swap_execution_binding(&key, 1, &switching)
+            .begin_execution_switch(
+                &key,
+                &BeginSessionExecutionSwitchV1 {
+                    request_id: "blocked-provider-switch".into(),
+                    operation_id: "blocked-provider-operation".into(),
+                    controller_attachment_id: attachment.attachment_id,
+                    expected_generation: 1,
+                    target: switching,
+                    source_evidence: json!({
+                        "schema_version": 1, "root": "/workspace/source", "head": "head",
+                        "tree": "tree", "object_format": "sha1", "reference": "main",
+                        "repository": "repo", "clean": true,
+                    }),
+                }
+            )
             .await,
         Err(astra_services::SessionContextCoordinatorError::ExecutionBindingBusy)
     ));
@@ -729,6 +786,8 @@ async fn dispatch_fails_closed_when_the_work_provider_generation_is_stale() {
         .await
         .expect("the exact ready provider generation may dispatch");
     assert_eq!(dispatched.state, ToolInvocationState::Dispatched);
+    sqlx::query("DELETE FROM session_attachments WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'")
+        .bind(&invocation.user_id).bind(&invocation.session_id).execute(&pool).await.unwrap();
     cleanup(&pool, &invocation).await;
 }
 

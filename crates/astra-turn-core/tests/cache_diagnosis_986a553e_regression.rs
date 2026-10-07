@@ -1,39 +1,16 @@
 //! Regression fixture for **session 986a553e**
 //! (`986a553e-b0e5-4570-bcd2-a47a11c41a15`, 2026-05-08).
 //!
-//! Captured AFTER the d0640d3d rolling-breakpoint + deferred-tool surface fixes
-//! landed. Exposes the *next* cache regression: MiniMax's OpenAI-
-//! compatible prompt cache is strict-history (any mid-history byte
-//! change invalidates), and astra was injecting volatile content
-//! (`## Self-Awareness` + live turn/token counters) into a synthetic
-//! user-role preamble that re-rendered every round.
+//! Captured after the rolling-breakpoint and deferred-tool surface fixes.
+//! The measured cache read drops from 7680 at t4 r0 to zero at t4 r1..r6.
+//! That collapse must remain visible through `cache_read_collapsed`.
 //!
-//! Observable on this fixture:
-//!   t4 r0 cache_read = 7680     ← healthy first round
-//!   t4 r1..r6  cache_read = 0   ← collapsed: 6 consecutive rounds wasted
-//!
-//! ## What must fire
-//!
-//! Two rules should surface:
-//!   - `cache_read_collapsed`        — 7680 → 0 drop is >50%
-//!   - `volatile_in_cached_prefix`   — MiniMax tool-loop round >0 with
-//!     Self-Awareness in history
-//!
-//! ## What must stay silent
-//!
-//! OpenAI-compat providers have neither cache_control markers nor
-//! tool-schema cache boundaries, so these rules cannot fire here:
-//!   - `cc_marker_frozen`
-//!   - `tool_marker_not_on_tail`
-//!   - `cache_creation_waste`        (cache_creation is always 0 here)
-//!
-//! ## Fixture integrity
-//!
-//! The scrub preserves the first ~200 chars past each volatile marker
-//! so the runtime's `contains_volatile_pattern` still triggers. If a
-//! future change to the pattern list or the scrubber stops preserving
-//! the marker, this test will fire loudly (the rule goes silent) and
-//! tell the operator to regenerate the fixture.
+//! The request also contains volatile text patterns, preserved by the scrubber.
+//! Its CurrentUserOnly capability permits required runtime context, but these
+//! captures do not identify required versus optional producers. Text patterns
+//! alone cannot prove a delivery violation or authorize suppressing context.
+//! Marker and creation-waste rules remain silent because this path has no
+//! cache_control markers and reports no cache creation.
 
 use std::path::{Path, PathBuf};
 
@@ -103,50 +80,25 @@ fn fixture_loads_9_captures() {
     );
 }
 
-/// **Regression net: volatile-in-prefix on MiniMax tool loops.**
-///
-/// These pathologies must keep triggering. If any goes silent on this
-/// fixture, a real bug is slipping through.
+/// Keep the measured regression without inferring an unsupported cause.
 #[test]
-fn session_986a553e_triggers_minimax_tool_loop_rules() {
+fn session_986a553e_reports_cache_collapse_without_inventing_delivery_violation() {
     let rs = load_fixture_rounds();
     let findings: Vec<CacheFinding> = evaluate_all(&rs);
     let ids: Vec<&str> = findings.iter().map(|f| f.rule_id).collect();
-
-    // Must fire.
-    for rule in ["cache_read_collapsed", "volatile_in_cached_prefix"] {
-        assert!(
-            ids.contains(&rule),
-            "{rule} must fire on 986a553e fixture, got {ids:?}. \
-             full findings:\n{findings:#?}",
-        );
-    }
-
-    // Must NOT fire (no cc markers / no tool markers on MiniMax path).
+    assert!(
+        ids.contains(&"cache_read_collapsed"),
+        "measured 7680-to-zero collapse must remain visible: {findings:#?}",
+    );
     for rule in [
+        "volatile_in_cached_prefix",
         "cc_marker_frozen",
         "tool_marker_not_on_tail",
         "cache_creation_waste",
     ] {
         assert!(
             !ids.contains(&rule),
-            "{rule} must stay silent on 986a553e (MiniMax OpenAI-compat has no markers), \
-             got {ids:?}. full findings:\n{findings:#?}",
+            "fixture lacks evidence for {rule}: {findings:#?}",
         );
     }
-
-    // Narrative spot-check: the volatile finding must identify MiniMax
-    // specifically so a future provider-mapping regression (sending
-    // MiniMax back to OpenAI TailSuffix) doesn't silently change the
-    // finding's wording.
-    let volatile = findings
-        .iter()
-        .find(|f| f.rule_id == "volatile_in_cached_prefix")
-        .unwrap();
-    assert!(
-        volatile.narrative.to_lowercase().contains("minimax")
-            || volatile.narrative.contains("strict-history"),
-        "volatile finding must name MiniMax or strict-history: got {}",
-        volatile.narrative,
-    );
 }

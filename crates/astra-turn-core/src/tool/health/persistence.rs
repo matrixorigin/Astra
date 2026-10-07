@@ -9,7 +9,7 @@
 //! # Design
 //!
 //! - One file per profile (user isolation).
-//! - Merge-on-load (timestamp wins) — safe for concurrent sessions.
+//! - Load persisted snapshots; the tracker preserves historical entries when exporting.
 //! - Atomic write (write to tmp, rename) — no corruption on crash.
 //! - Unknown JSON keys are ignored.
 
@@ -157,116 +157,6 @@ pub fn save_synced_tool_health(profile: &str, entries: &[ToolHealthEntry]) -> Re
     )
 }
 
-/// Merge two sets of tool health entries using timestamp-based conflict
-/// resolution.
-///
-/// - For entries present in both local and cloud: most-recently-updated wins
-///   (by `last_updated_epoch`). Tie on epoch → higher `total_calls` wins.
-///   Full tie → local wins.
-/// - Cloud-only entries are always added.
-/// - Local-only entries are always kept.
-///
-/// Per-signature `recent_outcomes` rings are additively merged so no history
-/// is lost regardless of which side wins on totals.
-///
-/// Returns `(merged, cloud_wins, cloud_only_added)`.
-pub fn merge_tool_health(
-    local: &[ToolHealthEntry],
-    cloud: &[ToolHealthEntry],
-) -> (Vec<ToolHealthEntry>, usize, usize) {
-    use std::collections::HashMap;
-
-    let mut by_name: HashMap<String, ToolHealthEntry> = HashMap::new();
-    for entry in local {
-        by_name.insert(entry.name.clone(), entry.clone());
-    }
-
-    let mut cloud_wins = 0usize;
-    let mut cloud_only = 0usize;
-
-    for cloud_entry in cloud {
-        match by_name.get(&cloud_entry.name) {
-            Some(local_entry) => {
-                let use_cloud = if cloud_entry.last_updated_epoch != local_entry.last_updated_epoch
-                {
-                    cloud_entry.last_updated_epoch > local_entry.last_updated_epoch
-                } else if cloud_entry.total_calls != local_entry.total_calls {
-                    cloud_entry.total_calls > local_entry.total_calls
-                } else {
-                    false
-                };
-                let mut merged_entry = if use_cloud {
-                    cloud_entry.clone()
-                } else {
-                    local_entry.clone()
-                };
-                merged_entry.recent_outcomes = merge_recent_outcomes(
-                    &local_entry.recent_outcomes,
-                    &cloud_entry.recent_outcomes,
-                );
-                by_name.insert(cloud_entry.name.clone(), merged_entry);
-                if use_cloud {
-                    cloud_wins += 1;
-                }
-            }
-            None => {
-                by_name.insert(cloud_entry.name.clone(), cloud_entry.clone());
-                cloud_only += 1;
-            }
-        }
-    }
-
-    let mut merged: Vec<ToolHealthEntry> = by_name
-        .values()
-        .map(super::validated_health_entry)
-        .collect();
-    merged.sort_by(|a, b| a.name.cmp(&b.name));
-    (merged, cloud_wins, cloud_only)
-}
-
-fn merge_recent_outcomes(
-    local: &[astra_pipeline::ToolOutcomeCacheEntry],
-    cloud: &[astra_pipeline::ToolOutcomeCacheEntry],
-) -> Vec<astra_pipeline::ToolOutcomeCacheEntry> {
-    use std::collections::HashMap;
-
-    let mut by_signature: HashMap<
-        astra_pipeline::ToolHealthIdentity,
-        Vec<astra_pipeline::ToolOutcome>,
-    > = HashMap::new();
-    for source in [local, cloud] {
-        for entry in source {
-            by_signature
-                .entry(entry.identity.clone())
-                .or_default()
-                .extend(entry.outcomes.iter().cloned());
-        }
-    }
-
-    let mut merged: Vec<_> = by_signature
-        .into_iter()
-        .filter_map(|(identity, mut outcomes)| {
-            outcomes.sort_by_key(|outcome| {
-                (
-                    outcome.at_epoch,
-                    outcome.result_hash,
-                    outcome.latency_ms,
-                    outcome.success,
-                )
-            });
-            outcomes.dedup();
-            if outcomes.len() > astra_pipeline::TOOL_OUTCOME_RING_CAPACITY {
-                let overflow = outcomes.len() - astra_pipeline::TOOL_OUTCOME_RING_CAPACITY;
-                outcomes.drain(..overflow);
-            }
-            (!outcomes.is_empty())
-                .then_some(astra_pipeline::ToolOutcomeCacheEntry { identity, outcomes })
-        })
-        .collect();
-    merged.sort_by(|left, right| left.identity.cmp(&right.identity));
-    merged
-}
-
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -327,45 +217,6 @@ mod tests {
         let loaded: LearningSnapshot = serde_json::from_str(snapshot).unwrap();
         assert_eq!(loaded.tool_health.len(), 1);
         assert_eq!(loaded.tool_health[0].name, "bash");
-    }
-
-    #[test]
-    fn merge_tool_health_cloud_newer_wins() {
-        let local = vec![sample_health("bash", 5, 1, 100)];
-        let cloud = vec![sample_health("bash", 10, 3, 200)];
-        let (merged, cloud_wins, cloud_only) = merge_tool_health(&local, &cloud);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].total_calls, 10, "cloud (newer epoch) should win");
-        assert_eq!(cloud_wins, 1);
-        assert_eq!(cloud_only, 0);
-    }
-
-    #[test]
-    fn merge_tool_health_local_newer_wins() {
-        let local = vec![sample_health("bash", 10, 3, 200)];
-        let cloud = vec![sample_health("bash", 5, 1, 100)];
-        let (merged, cloud_wins, _) = merge_tool_health(&local, &cloud);
-        assert_eq!(merged[0].total_calls, 10);
-        assert_eq!(cloud_wins, 0);
-    }
-
-    #[test]
-    fn merge_tool_health_cloud_only_added() {
-        let local = vec![sample_health("bash", 5, 1, 100)];
-        let cloud = vec![sample_health("read_file", 3, 0, 150)];
-        let (merged, _, cloud_only) = merge_tool_health(&local, &cloud);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(cloud_only, 1);
-    }
-
-    #[test]
-    fn merge_tool_health_tie_local_wins() {
-        let mut local = sample_health("bash", 7, 2, 100);
-        local.failure_rate = 0.25;
-        let cloud = sample_health("bash", 7, 2, 100);
-        let (merged, cloud_wins, _) = merge_tool_health(&[local.clone()], &[cloud]);
-        assert_eq!(merged[0].failure_rate, 0.25);
-        assert_eq!(cloud_wins, 0);
     }
 
     #[test]

@@ -3674,14 +3674,24 @@ mod tests {
             handoff_events.first().map(|event| event.record.state),
             Some(SessionHandoffStateV1::Active)
         );
-        let authority_events = authority_reader
-            .list_authority_events(&key, 100)
-            .await
-            .expect("list typed authority events");
-        assert!(
-            authority_events
-                .iter()
-                .any(|event| event.outcome == "stale_fenced"),
+        let rejected_old_writer: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_context_authority_events
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ?
+               AND operation_kind = 'reserve_turn' AND outcome = 'stale_fenced'
+               AND lease_id = ? AND expected_root = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .bind(&source_lease.lease_id)
+        .bind(&cursor.canonical_root_hash)
+        .fetch_one(pool.get())
+        .await
+        .expect("count exact old-writer reservation rejection");
+        assert_eq!(
+            rejected_old_writer, 1,
             "the rejected old-writer reservation must remain causally queryable"
         );
         cleanup(&pool, &key).await;

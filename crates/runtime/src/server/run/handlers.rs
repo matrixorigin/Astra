@@ -1827,17 +1827,20 @@ mod tests {
             )
             .await
             .expect("persist run_finished");
-        engine
-            .persist_status(
-                "u1",
-                "session-http",
-                "run-durable-http",
-                astra_core::STATUS_COMPLETED,
-                None,
-                None,
-            )
-            .await
-            .expect("mark completed");
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "u1",
+                    expected_session_id: "session-http",
+                    run_id: "run-durable-http",
+                    status: astra_core::STATUS_COMPLETED,
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .expect("mark completed")
+        );
 
         let lifecycle = AgenticRunLifecycleService::new(
             test_matrixone(),
@@ -1920,17 +1923,20 @@ mod tests {
             )
             .await
             .expect("persist run_finished");
-        engine
-            .persist_status(
-                "provider-user-1",
-                "session-provider-stream",
-                "run-provider-stream",
-                astra_core::STATUS_COMPLETED,
-                None,
-                None,
-            )
-            .await
-            .expect("mark completed");
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "provider-user-1",
+                    expected_session_id: "session-provider-stream",
+                    run_id: "run-provider-stream",
+                    status: astra_core::STATUS_COMPLETED,
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .expect("mark completed")
+        );
 
         let lifecycle = AgenticRunLifecycleService::new(
             test_matrixone(),
@@ -2014,7 +2020,7 @@ mod tests {
                 .with_owner_pod_id("stream-replay-http-it-pod"),
         );
         let engine = RunEngine::new(store);
-        engine
+        let authority = engine
             .start_run(&run_id, user_id, &session_id)
             .await
             .expect("start durable DB run");
@@ -2055,11 +2061,12 @@ mod tests {
             }),
         ];
         let transitioned = engine
-            .transition_status_with_events_if_current(
+            .transition_status_with_events_if_current_owner(
                 user_id,
                 &session_id,
                 &run_id,
                 &[astra_core::STATUS_RUNNING],
+                authority.owner_generation,
                 astra_core::STATUS_COMPLETED,
                 None,
                 None,
@@ -2180,7 +2187,7 @@ mod tests {
         use astra_services::runs::InMemoryRunStateStore;
 
         let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-        engine
+        let authority = engine
             .start_run("run-projection-http", "u1", "session-projection")
             .await
             .expect("start durable run");
@@ -2248,7 +2255,15 @@ mod tests {
             .await
             .expect("persist run finished");
         engine
-            .persist_usage("u1", "session-projection", "run-projection-http", 5, 2, 0)
+            .persist_usage_if_current_owner(
+                "u1",
+                "session-projection",
+                "run-projection-http",
+                authority.owner_generation,
+                5,
+                2,
+                0,
+            )
             .await
             .expect("persist usage");
         engine
@@ -2260,17 +2275,20 @@ mod tests {
             )
             .await
             .expect("persist checkpoint");
-        engine
-            .persist_status(
-                "u1",
-                "session-projection",
-                "run-projection-http",
-                astra_core::STATUS_FAILED,
-                None,
-                Some("boom"),
-            )
-            .await
-            .expect("mark failed");
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "u1",
+                    expected_session_id: "session-projection",
+                    run_id: "run-projection-http",
+                    status: astra_core::STATUS_FAILED,
+                    waiting_for: None,
+                    error_message: Some("boom"),
+                    expected_statuses: &["running"],
+                })
+                .await
+                .expect("mark failed")
+        );
 
         let lifecycle = AgenticRunLifecycleService::new(
             test_matrixone(),
@@ -2381,16 +2399,17 @@ mod tests {
         use astra_services::runs::InMemoryRunStateStore;
 
         let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-        engine
+        let authority = engine
             .start_run("run-projection-repair-http", "u1", "session-projection")
             .await
             .expect("start durable run");
         engine
-            .transition_status_with_events_if_current(
+            .transition_status_with_events_if_current_owner(
                 "u1",
                 "session-projection",
                 "run-projection-repair-http",
                 &[astra_core::STATUS_RUNNING],
+                authority.owner_generation,
                 astra_core::STATUS_FAILED,
                 None,
                 Some("boom"),
@@ -2480,7 +2499,7 @@ mod tests {
                 .with_owner_pod_id("projection-repair-http-it-pod"),
         );
         let engine = RunEngine::new(store);
-        engine
+        let authority = engine
             .start_run(&run_id, user_id, &session_id)
             .await
             .expect("start durable DB run");
@@ -2495,11 +2514,12 @@ mod tests {
             .expect("save checkpoint before terminal transition");
         assert!(checkpoint_saved);
         let transitioned = engine
-            .transition_status_with_events_if_current(
+            .transition_status_with_events_if_current_owner(
                 user_id,
                 &session_id,
                 &run_id,
                 &[astra_core::STATUS_RUNNING],
+                authority.owner_generation,
                 astra_core::STATUS_FAILED,
                 None,
                 Some("boom"),

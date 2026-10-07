@@ -511,7 +511,7 @@ function isCoverageGapList(value: unknown): value is ExplainAnalyzeCoverageGapV1
 const contextSourceKinds = new Set([
   "identity", "self_model", "project_context", "deferred_tools", "available_skills",
   "memory", "working_memory", "history", "constraints", "skills", "runtime_identity",
-  "runtime_volatile", "emergent_skills", "emergent_memory", "emergent_summary",
+  "runtime_volatile",
 ]);
 const budgetFields = ["estimated_input_tokens", "estimated_system_tokens", "tool_schema_tokens",
   "requested_output_tokens", "reserved_protocol_tokens", "effective_input_limit_tokens",
@@ -627,7 +627,6 @@ const contextSourceLabels: Record<string, string> = {
   deferred_tools: "Deferred tools", available_skills: "Skill catalog", memory: "Retrieved memory",
   working_memory: "Working memory", history: "Conversation history", constraints: "Response constraints",
   skills: "Active skills", runtime_identity: "Runtime context", runtime_volatile: "Turn instructions",
-  emergent_skills: "Discovered skills", emergent_memory: "Prefetched memory", emergent_summary: "Tool summaries",
 };
 
 /** Shared readable projection; assembly estimates never enter billed token totals. */

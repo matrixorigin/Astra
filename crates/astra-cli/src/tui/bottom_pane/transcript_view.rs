@@ -932,7 +932,7 @@ impl BottomPaneView for TranscriptView {
         // Helper: advance `y` by 1 with saturating add. Without this,
         // a child Rect placed near `u16::MAX` (deeply nested overlay /
         // tiled layout edge) would wrap to 0 and start drawing rows at
-        // the top of the buffer. Same fix as C-TUI-1 in task_detail_view.
+        // the top of the buffer.
         let next_y = |y: u16| y.saturating_add(1).min(bottom);
 
         // Title

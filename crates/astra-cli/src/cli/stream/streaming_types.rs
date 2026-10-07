@@ -397,7 +397,7 @@ impl OutputTransportFailure {
     }
 }
 
-/// Partial data rescued from `AgenticLoopState` when a turn fails.
+/// Partial stream and local callback facts retained when a turn fails.
 /// Enables enriched error logging, failure learning, and post-mortem analysis.
 #[derive(Debug, Default)]
 pub(crate) struct PartialTurnData {

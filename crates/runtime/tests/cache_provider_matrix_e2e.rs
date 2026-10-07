@@ -989,7 +989,8 @@ async fn optional_revisions_distinguish_current_user_only_from_tail_suffix() {
             },
             vec![
                 response(case, "First wire boundary.", None),
-                response(case, "Second wire boundary.", None),
+                response(case, "Repeated wire boundary.", None),
+                response(case, "Changed wire boundary.", None),
             ],
         )])
         .await;
@@ -1004,8 +1005,21 @@ async fn optional_revisions_distinguish_current_user_only_from_tail_suffix() {
             case.cache_capability,
         )
         .build();
-        for revision in ["advisory-first-918", "advisory-second-624"] {
+        let first_round = state.current_round_index + 1;
+        for (offset, revision) in [
+            "advisory-first-918",
+            "advisory-first-918",
+            "advisory-second-624",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            state.current_round_index = first_round + u32::try_from(offset).unwrap();
             state.push_volatile(VolatileKind::BehaviorAdvisory, revision);
+            assert_eq!(
+                state.volatile_pending.last().unwrap().round_index,
+                state.current_round_index,
+            );
             let response = host.execute_turn(&mut state).await.unwrap();
             assert!(response.accum.error_message.is_none());
             state.commit_volatile_attempt_lease();
@@ -1015,13 +1029,17 @@ async fn optional_revisions_distinguish_current_user_only_from_tail_suffix() {
             state.messages, canonical,
             "wire boundaries do not ingest invented responses"
         );
-        assert_eq!(ledger.attempt_count(), 2);
+        assert_eq!(ledger.attempt_count(), 3);
         ledger.assert_quiescent();
         gateway.assert_complete();
         let requests = gateway.requests.lock().await;
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         let a = requests[0].body["messages"].as_array().unwrap();
-        let b = requests[1].body["messages"].as_array().unwrap();
+        assert_eq!(
+            requests[0].body["messages"], requests[1].body["messages"],
+            "identical advisory evidence stays byte stable across model rounds",
+        );
+        let b = requests[2].body["messages"].as_array().unwrap();
         let index = a
             .iter()
             .position(|message| message.to_string().contains("advisory-first-918"))
@@ -1066,7 +1084,7 @@ async fn optional_revisions_distinguish_current_user_only_from_tail_suffix() {
         );
         assert_native_pair(
             case,
-            &requests[1].body,
+            &requests[2].body,
             "prefix-read",
             "actual prefix evidence",
         );
@@ -1077,7 +1095,7 @@ async fn optional_revisions_distinguish_current_user_only_from_tail_suffix() {
             "actual completed tool history remains byte stable"
         );
         assert!(b[index].to_string().contains("advisory-second-624"));
-        assert!(!requests[1].body.to_string().contains("advisory-first-918"));
+        assert!(!requests[2].body.to_string().contains("advisory-first-918"));
         assert_eq!(
             a.iter().zip(b).position(|(left, right)| left != right),
             Some(index)

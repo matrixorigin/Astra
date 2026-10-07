@@ -817,6 +817,7 @@ dependencies = [
 name = "astra-turn-types"
 version = "0.2.10"
 dependencies = [
+ "astra-core",
  "astra-prompts",
  "regex",
  "serde",

@@ -1673,6 +1673,11 @@ pub(crate) fn ledger_unavailable_result(
         ),
         ("invocation_identity".to_string(), json!(identity)),
         ("side_effects_maybe".to_string(), Value::Bool(false)),
+        ("execution_started".to_string(), Value::Bool(false)),
+        (
+            "disposition".to_string(),
+            Value::String("rejected".to_string()),
+        ),
         ("retryable".to_string(), Value::Bool(true)),
         ("resumable".to_string(), Value::Bool(true)),
     ]));

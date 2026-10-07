@@ -586,11 +586,10 @@ fn coding_discipline_section() -> &'static str {
 /// summarize; requiring a turn-end summary creates implicit convergence pressure.
 fn turn_discipline_section() -> &'static str {
     "\n## Turn Discipline\n\
-     - **Progress is optional**: briefly announce substantial work when compatible with the requested output format. Don't narrate every step.\n\
+     - Announce substantial progress only when compatible with the requested output format.\n\
      - **Summarize changes and verification only when requested format permits**; do not append a summary to a constrained answer.\n\
-     - **Stop when the requested outcome is complete**: no optional questions, permission requests, or next-turn/action instructions; ask only for decisions blocking this request.\n\
-     - **No externalized reasoning**: keep deliberation in <think>.\n\
-     - **Converge**: low-yield turns should narrow the read path.\n"
+     - **Finish within constraints**: report blocked work truthfully; chosen restrictions are not missing permission. Do not reopen them or request another turn unless asked. Ask only necessary, permitted questions. Required safety/approval still applies. Stop after the requested answer.\n\
+     - **No externalized reasoning**: keep deliberation in <think>.\n"
 }
 
 /// Plan execution guidance. Pure static.
@@ -826,7 +825,7 @@ fn self_diagnosis_section(tool_names: &[&str]) -> String {
         s.push_str("- Current state: select `introspect` with `tool_search(query=\"select:introspect\")` only if listed; otherwise claims are conversation-only.\n");
     }
     if has_reflect {
-        s.push_str("- For session-level prior execution, use resident `reflect` directly with one concrete question (overview/summary/session); it is session-scoped, has no exact run/turn selector, and does not require live `introspect`. For one exact historical run, use Server Explain with its explicit run selector instead. Do not present session aggregates as facts about one run. Select advanced fields (depth=diagnostic|forensic) only for a gap or requested audit. Wait duration is not child runtime.\n");
+        s.push_str("- For session-level prior execution, use resident `reflect` with one concrete question: topic=overview facet=overview (summary/session) combines tools, errors, trace and coverage. Reuse it; follow up only for an unanswered fact or reported omission. A directly requested facet needs no overview first. Reflect is session-scoped, has no exact run/turn selector, and does not require live `introspect`. For one exact historical run, use Server Explain. Do not present session aggregates as facts about one run. Select depth=diagnostic|forensic only for a gap or requested audit; audit depth does not require facet fanout. Wait duration is not child runtime.\n");
     } else if can_activate {
         s.push_str("- Prior execution: select `reflect` with `tool_search(query=\"select:reflect\")` only if listed; it is session-scoped and has no live prerequisite. For an exact run, use Server Explain, never session aggregates; if unavailable, say so.\n");
     }
@@ -941,8 +940,8 @@ pub fn trailing_single_tool_round_streak(messages: &[serde_json::Value]) -> usiz
 }
 
 /// Inject a corrective batching nudge once the model has produced a streak of
-/// single-tool rounds. Symmetric counterpart to [`parallel_execution_feedback`]
-/// (positive reinforcement on multi-tool rounds).
+/// single-tool rounds. Positive execution feedback belongs to the typed tool
+/// outcome lane, which knows which calls actually executed.
 pub fn parallel_batching_nudge_directive(messages: &[serde_json::Value]) -> String {
     let streak = trailing_single_tool_round_streak(messages);
     if streak < PARALLEL_BATCHING_NUDGE_THRESHOLD {
@@ -970,19 +969,6 @@ pub fn parallel_batching_nudge_directive(messages: &[serde_json::Value]) -> Stri
 /// content.
 fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool {
     astra_turn_types::is_runtime_owned_message(message)
-}
-
-fn trailing_tool_result_count(messages: &[serde_json::Value]) -> usize {
-    messages
-        .iter()
-        .rev()
-        .skip_while(|message| is_trailing_runtime_scaffolding_message(message))
-        .take_while(|message| message.get("role").and_then(|r| r.as_str()) == Some("tool"))
-        .count()
-}
-
-pub fn tool_round_guidance(messages: &[serde_json::Value], round_index: u32) -> String {
-    tool_round_guidance_trace(messages, round_index).0
 }
 
 /// Give the model a bounded execution horizon while there is still enough
@@ -1036,48 +1022,15 @@ pub fn execution_slice_guidance(
 
 pub fn tool_round_guidance_trace(
     messages: &[serde_json::Value],
-    round_index: u32,
 ) -> (String, PromptGuidanceSignals) {
-    let trailing_tool_count = trailing_tool_result_count(messages);
-    let parallel_feedback = trailing_tool_count > 1;
-    let single_tool_streak = trailing_single_tool_round_streak(messages);
-    let parallel_batching_nudge = single_tool_streak >= PARALLEL_BATCHING_NUDGE_THRESHOLD;
-
-    // Only emit parallel-batching nudge and positive feedback.
-    // Tool-round pressure is handled by the circuit breaker.
-    let _ = round_index;
+    let parallel_batching_nudge =
+        trailing_single_tool_round_streak(messages) >= PARALLEL_BATCHING_NUDGE_THRESHOLD;
     (
-        format!(
-            "{}{}",
-            parallel_batching_nudge_directive(messages),
-            parallel_execution_feedback(messages)
-        ),
+        parallel_batching_nudge_directive(messages),
         PromptGuidanceSignals {
-            parallel_feedback,
             parallel_batching_nudge,
         },
     )
-}
-
-/// Parallel execution feedback — injected into dynamic prompt when the previous
-/// round had multiple tool results, indicating the LLM successfully batched.
-///
-/// Generic mechanism: counts tool-role messages in conversation history, returns
-/// positive reinforcement hint when batching detected. Returns empty string for
-/// round 0 or when ≤1 tool result in previous round.
-pub fn parallel_execution_feedback(messages: &[serde_json::Value]) -> String {
-    if messages.is_empty() {
-        return String::new();
-    }
-    let tool_count = trailing_tool_result_count(messages);
-    if tool_count > 1 {
-        format!(
-            "\n\n✓ Previous round: {tool_count} tools executed in parallel — excellent. \
-             Keep batching independent operations."
-        )
-    } else {
-        String::new()
-    }
 }
 
 /// Injected into conversation when the agent repeats the same tool calls.
@@ -1245,9 +1198,10 @@ mod tests {
         assert!(contains("Build/test output"));
 
         // Turn completion must not manufacture another user decision.
-        assert!(contains("Stop when the requested outcome is complete"));
-        assert!(contains("no optional questions, permission requests"));
-        assert!(contains("decisions blocking this request"));
+        assert!(contains("Finish within constraints"));
+        assert!(contains("chosen restrictions are not missing permission"));
+        assert!(contains("necessary, permitted questions"));
+        assert!(contains("Required safety/approval still applies"));
 
         // Error recovery
         assert!(contains("Tool Error Recovery"));
@@ -1495,7 +1449,10 @@ mod tests {
         assert!(contains(
             "never permits fabricated success or hiding a failure"
         ));
-        assert!(turn_discipline_section().contains("next-turn/action instructions"));
+        assert!(
+            turn_discipline_section()
+                .contains("Do not reopen them or request another turn unless asked")
+        );
         assert!(!SYSTEM_PROMPT_BASE.contains("state the answer, then the reasoning"));
         assert!(
             !turn_discipline_section().contains("before your first tool call, write ONE sentence")
@@ -1617,7 +1574,8 @@ mod tests {
         assert!(p_both.contains("Use ordinary `introspect` for current runtime state"));
         assert!(p_both.contains("explicit Server Explain selector"));
         assert!(p_both.contains("one concrete question"));
-        assert!(p_both.contains("overview/summary/session"));
+        assert!(p_both.contains("topic=overview facet=overview"));
+        assert!(p_both.contains("follow up only for an unanswered fact or reported omission"));
         assert!(p_both.contains("facet=overview (summary/current_turn defaults)"));
         assert!(!p_both.contains("facet=overview depth=diagnostic"));
         assert!(p_both.contains("only for a concrete gap or requested audit"));
@@ -1741,67 +1699,6 @@ mod tests {
     // ── Consolidated tool round + budget tests ───────────────────
 
     #[test]
-    fn test_tool_round_guidance() {
-        // Parallel feedback is the only late-round guidance that remains here;
-        // stall intervention lives in the circuit breaker.
-        let messages = vec![
-            serde_json::json!({"role": "user", "content": "inspect the repo"}),
-            serde_json::json!({"role": "tool", "content": "Cargo.toml"}),
-            serde_json::json!({"role": "tool", "content": "README.md"}),
-        ];
-        let guidance = tool_round_guidance(&messages, 0);
-        assert!(!guidance.contains("Tool Round Warning"));
-        assert!(!guidance.contains("Synthesize Or Batch Now"));
-        assert!(guidance.contains("2 tools executed in parallel"));
-
-        // trace returns matching signals
-        let (guidance2, signals2) = tool_round_guidance_trace(&messages, 0);
-        assert!(!guidance2.contains("Tool Round Warning"));
-        assert!(!guidance2.contains("Synthesize Or Batch Now"));
-        assert!(guidance2.contains("2 tools executed in parallel"));
-        assert!(signals2.parallel_feedback);
-
-        // Ignores trailing runtime attention manifest
-        let msgs4 = vec![
-            serde_json::json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c1"}]}),
-            serde_json::json!({"role": "tool", "content": "a"}),
-            serde_json::json!({"role": "tool", "content": "b"}),
-            astra_turn_types::runtime_owned_message(
-                "system",
-                "first arbitrary runtime payload",
-                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
-            ),
-            astra_turn_types::runtime_owned_message(
-                "system",
-                "second arbitrary runtime payload",
-                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
-            ),
-            astra_turn_types::runtime_owned_message(
-                "user",
-                "third arbitrary runtime payload",
-                astra_turn_types::RuntimeMessageDelivery::RequiredContext,
-            ),
-        ];
-        let (g4, s4) = tool_round_guidance_trace(&msgs4, 0);
-        assert!(!g4.contains("Synthesize Or Batch Now"));
-        assert!(g4.contains("2 tools executed in parallel"));
-        assert!(s4.parallel_feedback);
-
-        // Includes batching nudge when parallel tools present
-        let batch_msgs = vec![
-            serde_json::json!({"role": "assistant", "content": null, "tool_calls": [
-                {"id": "c1", "function": {"name": "read_file"}},
-                {"id": "c2", "function": {"name": "grep"}},
-            ]}),
-            serde_json::json!({"role": "tool", "content": "file content"}),
-            serde_json::json!({"role": "tool", "content": "grep match"}),
-        ];
-        let (g_batch, s_batch) = tool_round_guidance_trace(&batch_msgs, 0);
-        assert!(g_batch.contains("2 tools executed in parallel"));
-        assert!(s_batch.parallel_feedback);
-    }
-
-    #[test]
     fn batching_nudge_survives_runtime_context_between_single_tool_rounds() {
         let mut messages = Vec::new();
         for index in 0..PARALLEL_BATCHING_NUDGE_THRESHOLD {
@@ -1824,7 +1721,7 @@ mod tests {
             ));
         }
 
-        let (guidance, signals) = tool_round_guidance_trace(&messages, 0);
+        let (guidance, signals) = tool_round_guidance_trace(&messages);
         assert!(signals.parallel_batching_nudge);
         assert!(guidance.contains("For the next round, group"));
         assert!(guidance.contains("Keep a call sequential"));

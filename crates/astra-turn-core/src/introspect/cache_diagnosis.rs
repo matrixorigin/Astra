@@ -738,32 +738,10 @@ fn rule_volatile_in_cached_prefix(rounds: &[RoundSnapshot]) -> Option<CacheFindi
                 triggered_on: vec![(sample.turn, sample.round)],
             })
         }
-        VolatilePlacement::CurrentUserOnly => {
-            // MiniMax-style strict history: volatile injection must be
-            // skipped on EVERY round. A round-0-only injection still
-            // makes msg[1] bytes differ vs round 1+, so cache misses
-            // anyway — see `VolatilePlacement::CurrentUserOnly` docs.
-            // Any sample with volatile content is a violation.
-            Some(CacheFinding {
-                rule_id: "volatile_in_cached_prefix",
-                severity: Severity::Critical,
-                narrative: format!(
-                    "{prov} ({model}) uses strict-history prompt cache; \
-                     volatile content at msg[{vol_idx}] on round {round} \
-                     invalidates the turn's cache — strict-history \
-                     providers cannot tolerate volatile bytes anywhere in \
-                     the history, including round 0.",
-                    prov = sample.provider,
-                    model = sample.model,
-                    round = sample.round,
-                ),
-                actionable_fix: "Suppress volatile-content injection entirely for this \
-                     provider. See \
-                     `CacheCapability::should_inject_volatile_on_round`."
-                    .into(),
-                triggered_on: vec![(sample.turn, sample.round)],
-            })
-        }
+        // Pattern matches do not identify required versus optional runtime
+        // context, or the current human boundary. Both delivery policies admit
+        // required context here, so presence alone cannot prove a violation.
+        VolatilePlacement::CurrentUserOnly => None,
         // Append-only required controls become durable conversation frames;
         // their consumed historical positions are intentionally not the tail.
         // This legacy snapshot rule has no lifetime/provenance facts with
@@ -1535,58 +1513,28 @@ mod tests {
     // ── Rule 5: volatile_in_cached_prefix ──────────────────────────────
 
     #[test]
-    fn volatile_rule_fires_on_minimax_tool_loop_round() {
-        // Session 986a553e fingerprint: MiniMax tool-loop round 1+ with
-        // `## Self-Awareness` injected at a mid-history user message.
-        let mut sample = snap_with_volatile(
-            4,
-            1,
-            "openai",
-            "MiniMax-M2.7",
-            /* msg_cc */ &[],
-            /* volatile */ &[7],
-            /* message_count */ 11,
-        );
-        sample.cache_capability = Some(crate::cache_placement::CacheCapability {
-            protocol: crate::cache_placement::CacheProtocol::StrictHistoryMatch,
-            volatile_placement: crate::cache_placement::VolatilePlacement::CurrentUserOnly,
-            volatile_delivery: crate::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
-            reuse_scope: None,
-        });
-        let rs = vec![sample];
-        let findings = evaluate_all(&rs);
-        let f = findings
-            .iter()
-            .find(|f| f.rule_id == "volatile_in_cached_prefix")
-            .expect("rule must fire on MiniMax tool-loop round >0");
-        assert_eq!(f.severity, Severity::Critical);
-        assert!(
-            f.narrative.contains("strict-history"),
-            "narrative must explain why: {}",
-            f.narrative,
-        );
-    }
-
-    #[test]
-    fn volatile_rule_fires_on_minimax_round_zero_too() {
-        // Updated contract (see CurrentUserOnly docs): even round 0
-        // volatile injection on MiniMax is a cache-miss trigger,
-        // because round 1+ won't have it and bytes at msg[1] differ.
-        let mut sample = snap_with_volatile(4, 0, "openai", "MiniMax-M2.7", &[], &[7], 8);
-        sample.cache_capability = Some(crate::cache_placement::CacheCapability {
-            protocol: crate::cache_placement::CacheProtocol::StrictHistoryMatch,
-            volatile_placement: crate::cache_placement::VolatilePlacement::CurrentUserOnly,
-            volatile_delivery: crate::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
-            reuse_scope: None,
-        });
-        let rs = vec![sample];
-        let findings = evaluate_all(&rs);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.rule_id == "volatile_in_cached_prefix"),
-            "rule must fire even on round 0 for strict-history providers; got {findings:?}",
-        );
+    fn current_user_placement_does_not_infer_a_violation_from_volatile_patterns() {
+        use crate::cache_placement::{
+            CacheCapability, CacheProtocol, VolatileDeliveryPolicy, VolatilePlacement,
+        };
+        for delivery in [
+            VolatileDeliveryPolicy::All,
+            VolatileDeliveryPolicy::RequiredOnly,
+        ] {
+            for round in [0, 1] {
+                let mut sample = snap_with_volatile(4, round, "openai", "model", &[], &[7], 11);
+                sample.cache_capability = Some(CacheCapability {
+                    protocol: CacheProtocol::StrictHistoryMatch,
+                    volatile_placement: VolatilePlacement::CurrentUserOnly,
+                    volatile_delivery: delivery,
+                    reuse_scope: None,
+                });
+                assert!(
+                    rule_volatile_in_cached_prefix(&[sample]).is_none(),
+                    "{delivery:?} on round {round} admits required context; patterns alone are insufficient",
+                );
+            }
+        }
     }
 
     #[test]

@@ -13,7 +13,6 @@ use serde_json::Value;
 
 use crate::pipeline_config::PipelineConfig;
 use crate::pipeline_session::{PipelineSession, PipelineSessionSnapshot};
-use crate::pipeline_stats::PipelineStats;
 
 /// Outcome of attempting to parse `HeavyCheckpoint.pipeline_state`.
 #[derive(Debug)]
@@ -58,7 +57,7 @@ pub fn parse_pipeline_state(value: Option<&Value>) -> RestoreOutcome {
 /// - Corrupt payload → fresh session + `tracing::warn!` (operators see why
 ///   warm-start data was lost; they can investigate the on-disk blob)
 /// - Valid snapshot → `PipelineSession::from_snapshot(config, snapshot, fallback_date)`
-///   (retains stats / latches / emergent / recovery-escalation counters and
+///   (retains stats / latches / recovery-escalation counters and
 ///   uses `fallback_date` when restoring legacy checkpoints that predate
 ///   `session_current_date`)
 ///
@@ -101,20 +100,11 @@ pub fn restore_or_new_with_current_date(
     }
 }
 
-/// Serialize PipelineStats to JSON bytes for persistence (standalone).
-pub fn serialize_stats(stats: &PipelineStats) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(stats)
-}
-
-/// Deserialize PipelineStats from JSON bytes (standalone).
-pub fn deserialize_stats(bytes: &[u8]) -> Result<PipelineStats, serde_json::Error> {
-    serde_json::from_slice(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::context_feedback::ContextFeedback;
+    use crate::pipeline_stats::PipelineStats;
     use crate::recovery_state::RecoveryState;
     use crate::section_types::CacheScope;
     use crate::session_latches::SessionLatches;
@@ -163,7 +153,6 @@ mod tests {
                 stats: stats.clone(),
                 latches: latches.clone(),
                 recovery,
-                emergent: Default::default(),
                 working_memory: Default::default(),
                 cache_detector_state: Default::default(),
                 pending_prompt_snapshot: None,
@@ -195,7 +184,6 @@ mod tests {
             "stats": "not-a-struct",
             "latches": {},
             "recovery": {},
-            "emergent": {}
         });
         let out = parse_pipeline_state(Some(&corrupt));
         assert!(
@@ -210,7 +198,6 @@ mod tests {
             "stats": PipelineStats::default(),
             "latches": SessionLatches::default(),
             "recovery": RecoveryState::default(),
-            "emergent": crate::emergent_context::EmergentContext::default()
         });
 
         match parse_pipeline_state(Some(&legacy)) {
@@ -266,7 +253,6 @@ mod tests {
             "stats": PipelineStats::default(),
             "latches": SessionLatches::default(),
             "recovery": RecoveryState::default(),
-            "emergent": crate::emergent_context::EmergentContext::default()
         });
         let sess = restore_or_new_with_current_date(
             PipelineConfig::default(),
@@ -289,7 +275,6 @@ mod tests {
                 stats: stats.clone(),
                 latches: SessionLatches::default(),
                 recovery: RecoveryState::default(),
-                emergent: Default::default(),
                 working_memory: Default::default(),
                 cache_detector_state: Default::default(),
                 pending_prompt_snapshot: None,
@@ -317,24 +302,5 @@ mod tests {
             rendered.contains("run focused core tests"),
             "next action must survive pipeline snapshot restore"
         );
-    }
-
-    // ── Stats standalone serialization ──
-
-    #[test]
-    fn roundtrip_stats() {
-        let mut stats = PipelineStats::default();
-        let feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
-        stats.record("m", "q", &feedback);
-        let bytes = serialize_stats(&stats).unwrap();
-        let restored = deserialize_stats(&bytes).unwrap();
-        assert_eq!(restored.turns_executed, 1);
-        assert!((restored.avg_cache_hit_ratio - stats.avg_cache_hit_ratio).abs() < 1e-9);
-    }
-
-    #[test]
-    fn deserialize_stats_rejects_garbage() {
-        let result = deserialize_stats(b"not json");
-        assert!(result.is_err());
     }
 }

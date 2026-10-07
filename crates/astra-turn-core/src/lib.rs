@@ -16,6 +16,7 @@ pub mod action_compensation;
 pub mod active_conversation;
 pub mod activity;
 pub mod agent_live_event;
+pub mod database_snapshots;
 
 pub mod agentic;
 pub mod alert_dispatcher;
@@ -39,7 +40,6 @@ pub mod context;
 pub mod conversation_log;
 pub mod edge_ledger;
 pub mod edge_prompt_context;
-pub mod emergent_context;
 pub mod error_recovery;
 pub mod evaluation;
 pub mod execution_state;
@@ -83,6 +83,7 @@ pub mod stall;
 pub mod state;
 pub mod stop_hooks;
 pub mod sync_utils;
+pub mod turn_checkpoint;
 pub use sync_utils::{
     rwlock_check_contains_or_default, rwlock_read_clone_or_default, rwlock_write_reset_on_poison,
 };
@@ -98,7 +99,6 @@ pub mod turn_metrics;
 pub mod working_memory;
 pub mod xml_tool_call_fallback;
 
-pub mod circuit_breaker;
 pub mod contracts;
 pub mod rate_limit_cooldown;
 pub mod sse_events;

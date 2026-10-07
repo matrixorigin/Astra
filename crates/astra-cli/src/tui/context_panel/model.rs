@@ -1143,11 +1143,6 @@ fn build_prompt_signals(trace: &ContextAssemblyTrace) -> Vec<SignalItem> {
             "Self-awareness nudge (remind model of its own constraints)",
         ),
         guide(
-            gs.parallel_feedback,
-            "parallel_feedback",
-            "Parallel-execution feedback attached",
-        ),
-        guide(
             gs.parallel_batching_nudge,
             "parallel_batching_nudge",
             "Recent rounds each ran one tool — nudge toward parallel batches",

@@ -1795,11 +1795,11 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn login_account_change_closes_old_owner_session_before_rebinding() {
+        let (_sessions_dir, _journal_guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _token_guard = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
         let _home = crate::test_utils::HomeGuard::temp();
         let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
-        let (_sessions_dir, _journal_guard) = crate::tests::isolated_sessions_dir();
         let _identity_guard =
             crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
                 "default", None,

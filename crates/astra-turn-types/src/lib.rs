@@ -68,8 +68,6 @@ pub mod task_resolution;
 pub mod token_estimate;
 mod tool_idempotency;
 mod tool_invocation;
-mod tool_result_projection;
-mod tool_result_selection_observation;
 mod turn_provenance;
 mod user_intent;
 mod verification_frontier;
@@ -228,7 +226,11 @@ pub use session_handoff::{
     SessionHandoffValidationError, SessionPlacementV1, WorkspaceHandoffEvidenceV1,
     valid_transition,
 };
-pub use stop_hooks::{StopHook, StopHookObligations};
+pub use stop_hooks::{
+    CompletionCheckDeclarations, CompletionCheckPhase, MAX_COMPLETION_CHECKS,
+    MAX_COMPLETION_DECLARATION_BYTES, StopHook, StopHookObligations, build_execution_layers,
+    validate_completion_check_declarations,
+};
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{
     DispatchCertainty, DurableToolReference, TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION,
@@ -243,14 +245,6 @@ pub use tool_invocation::{
     ToolInvocationResultPayload, ToolInvocationState, ToolInvocationTerminalOutcome,
     canonical_public_arguments_hash, canonical_public_tool_arguments,
 };
-pub use tool_result_projection::{
-    TOOL_RESULT_PROJECTION_POLICY_VERSION, TOOL_RESULT_PROJECTION_RENDERER_VERSION,
-    ToolResultProjectionBindingV1, ToolResultProjectionDecisionV1,
-    ToolResultProjectionDispositionV1, ToolResultProjectionFallbackV1, ToolResultProjectionRangeV1,
-    ToolResultProjectionReceiptV1, ToolResultProjectionWireStateV1,
-    tool_result_projection_freeze_key,
-};
-pub use tool_result_selection_observation::*;
 pub use turn_provenance::{
     MODEL_ITEM_ID_FIELD, TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
     TurnMessageProvenanceError, TurnMessageProvenanceV1, clear_turn_message_provenance,

@@ -15,6 +15,61 @@ This document defines the target lifecycle contract. Current code can be evaluat
 - Cancel, delete, archive, pause, blocked, and resume must have explicit transitions.
 - Recovery correctness depends on durable state, checkpoints, transcript, and events.
 
+## Source API retirement
+
+The unused `LoopDispatcher` source API is retired; production hosts invoke the
+canonical agentic loop directly. CLI source APIs for the old registry completion
+algorithms, command-usage cache, table/not-found renderers, Git snapshot helper
+and disconnected session-end preference push are also retired. Their dedicated
+self-tests did not provide a product entrypoint. The current TUI menu,
+journal projection, error formatting and preference pull/outbox paths remain
+the owners of those supported interactions.
+
+CLI admission publishes capability, workspace and model-selection facts;
+Server owns model-round preparation and continuation. The former client
+model-request constructor, tool-result continuation parameters and their source
+APIs are retired. CLI retains callback delivery, permission filtering, health
+statistics and recovery projections. Its continuity checkpoint records zero
+local remaining rounds rather than guessing a Server allowance; authoritative
+execution budgets and interruption details remain Server-owned.
+
+The unused in-memory session-state delta accumulator is also retired. Session
+lineage, canonical journal append/replay and cloud synchronization retain their
+existing owners; no parallel mutation log is provided. The unused
+`find_stale_sessions` scanner and `StaleSessionInfo` source APIs are retired;
+startup maintenance still uses the owner-scoped maintenance entrypoint.
+
+Tool-result persistence stores one immutable document per run, call and document
+kind. Typed journal descriptors bind recovery to exact bytes; a display envelope
+alone does not authorize materialization. The former run-less persistence,
+call-id-only readers and URI generator are retired source APIs. There is no
+mutable call-id replica or fallback read; existing descriptor reads, atomic
+publication and same-byte retry remain the supported path.
+
+Retired storage APIs are `maybe_persist_tool_result`,
+`persist_tool_result_with_replacement`, `maybe_persist_tool_result_unconditional`,
+`maybe_persist_tool_result_with_descriptor`, `read_persisted_result`,
+`read_persisted_result_window`, and `session_tool_result_artifact_uri`.
+
+Tool-stream ingestion uses provider requests or the authoritative Server summary
+for tool counts and names. The former Edge-result count and name-closure inputs
+are retired source API parameters. Completion-action constraints are checked
+before dispatch. Interception preserves the provider batch order and rejects
+dispositions without a corresponding provider request instead of reconstructing
+requests from admission outcomes.
+
+Host turn responses carry the provider observation, timing and error only.
+Tool callbacks enter through admitted invocations and match exact provider
+request IDs. Tool-round indices, assistant messages and stall signatures come
+from those provider requests; callbacks do not create additional tool slots or
+replacement identities. A callback without a request ID cannot establish
+execution custody or recovery evidence.
+
+A successful executor-owned verify-mode v2 receipt proves that the bound
+workspace did not change. Parallel verification calls carrying that receipt do
+not invalidate each other's evidence. Opaque commands, failed or malformed
+receipts, and a concurrent writer retain the freshness barrier.
+
 ## State hierarchy
 
 ```text
@@ -53,6 +108,11 @@ there is no separate CLI recorder summary or profiling history. Checkpoint file
 numbers are allocated from the persisted session timeline at publication.
 Startup retention maintenance runs on a blocking worker with a captured owner
 path and protects the explicit resume target, including compressed journals.
+
+Run state/event transitions and delegation outcomes use the execution owner's
+captured generation. The obsolete unowned CAS/delegation source APIs and the
+test-only alternate approval submission protocol are retired; tests use the
+same fenced transition and atomic batch registration as production.
 
 ## Run
 
@@ -99,6 +159,11 @@ positions within a filtered control page. A page with a missing or invalid
 durable index is rejected in full: no intent is delivered and its cursor stays
 unchanged. Malformed intent content with a valid identity remains individually
 diagnosable.
+
+After durable acknowledgement, a guidance batch freezes semantic evidence on
+its exact combined canonical user message and preceding response. An earlier
+turn's source or the batch's last individual input cannot own its observations.
+Failed acknowledgements and replay without new guidance retain the prior source.
 
 ### Bounded continuation and completion
 
@@ -577,3 +642,40 @@ Runtime lifecycle migration should proceed in stages:
 | Buffered completion exists | Finalize without resuming execution when safe. |
 
 The legacy webhook and schedule trigger APIs are retired. They did not admit a Run: webhook firing only returned `fired: true`, and stored cron expressions had no scheduler consumer. Executed work uses the existing Run admission and lifecycle boundaries.
+
+Run control submits zero, one, or multiple supplied events through the same
+atomic status-and-event batch store boundary. The store owns status CAS, typed
+cancellation authority, interaction closure, guidance return, Work outbox and
+commit-outcome recovery. Session-guarded resume still performs its blocking-run
+and open-settlement checks in its dedicated atomic store operation.
+
+The shared model boundary always records the provider attempt, including a
+Work lifecycle carrier substituted after a real provider response. The unused
+`ControlPlaneTurnBoundary` source API and its providerless path are retired;
+there is no separate no-provider accounting mode. Embedded provider errors
+still restore leased volatile authority, while successful responses commit it.
+Manifest owner and request-identity validation remain unchanged.
+
+The Server semantic task owns both Work classification and optional observations
+of the latest canonical human message. Full admission observes both in one
+request; an already-bound or ordinary continuation uses three observational
+questions without manufacturing a Work decision. Observation-only requests obey
+the existing optional auxiliary capacity policy: disabled, boundary-only, and
+capacity-aware mode with provider admission enabled suppress them. Necessary
+Work admission retains its own boundary policy. Judgment effects settle before
+provider context construction. Only the first successful canonical source marker
+applies feedback or changes WorkingMemory, using the frozen message text; hard
+capability restrictions survive re-anchoring. The same task owner handles deadline,
+cancellation, usage and phase receipts. Observation failures never change Work
+admission status, capabilities or graph ownership.
+
+Semantic effects are published by the Server-owned pending task through the
+canonical message marker. The unused synchronous Intent/Delegated judge outcomes,
+optional-intent wrapper, mandatory-sidecar opt-in, and separate scenario/profile
+projection are retired. Work control still uses its existing admission and owner
+fences; lifecycle phase outcomes retain their independent meaning.
+
+Server semantic phase facts are emitted only by actual pending tasks. Work and
+user observation use distinct purpose slots within a model round; these slots
+are not provider retries. A skipped dispatch does not create a synthetic timed
+admission. Cancellation and completion use the same slot as task startup.

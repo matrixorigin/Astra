@@ -112,24 +112,6 @@ fn product_capability_model_probes_resolve_to_shipped_cases() {
 // text_rejects_hallucinated_file_claim removed — merged into anti_hallucination_two_vectors
 
 #[test]
-fn fork_prefix_spawn_inherits_uses_canonical_agent_not_delegate() {
-    let case = Case::from_path(&shipped_cases_dir().join("fork_prefix_spawn_inherits.yaml"))
-        .expect("load case");
-    let requires_delegate = case.criteria.iter().any(|c| {
-        matches!(c, astra_test_harness::criteria::Criterion::ToolCalled { name } if name == "delegate")
-    });
-    let requires_agent = case.criteria.iter().any(|c| {
-        matches!(c, astra_test_harness::criteria::Criterion::ToolCalled { name } if name == "agent")
-    });
-    assert!(
-        requires_agent && !requires_delegate,
-        "fork_prefix_spawn_inherits must not require tool_called: delegate. \
-         The delegate tool is not available in `astra chat` — it only exists \
-         in the server-side DelegationEngine. Use canonical agent spawn instead."
-    );
-}
-
-#[test]
 fn shipped_case_criteria_round_trip_through_real_serde() {
     // Criterion's Serde definition is the only variant vocabulary. A second
     // string whitelist inevitably rejects the next legitimate variant (as it

@@ -1169,6 +1169,8 @@ impl AgentProfileSnapshot {
 
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
+    /// Completion declarations; these never grant tool execution permission.
+    pub completion_checks: Option<astra_turn_types::CompletionCheckDeclarations>,
     /// Server authentication provenance; no transport may supply this field.
     /// This is not a continuation grant or current execution authorization.
     pub execution_authentication: Option<crate::auth::ExecutionAuthenticationProvenance>,
@@ -1272,6 +1274,7 @@ impl std::fmt::Debug for RedactedForwardHeadersDebug<'_> {
 impl std::fmt::Debug for ChatRequestData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChatRequestData")
+            .field("completion_checks", &self.completion_checks)
             .field("message", &self.message)
             .field("user_intent", &self.user_intent)
             .field("parts", &self.parts)
@@ -1795,8 +1798,6 @@ pub struct DurableRunRecord {
     pub checkpoint_json: Option<String>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
-    /// Number of verification-gate retry attempts.
-    pub retry_count: u32,
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
     pub total_tool_calls: u32,
@@ -3566,7 +3567,7 @@ pub struct DurableRunDisplayProjectionRecord {
 const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, root_run_id, \
      ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
      owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, checkpoint_version, \
-     checkpoint_json, error_code, error_message, retry_count, total_prompt_tokens, \
+     checkpoint_json, error_code, error_message, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
      runtime_profile, start_request_fingerprint, work_id, \
@@ -3578,7 +3579,7 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
 const AGENT_RUN_RECOVERY_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, root_run_id, \
      ancestor_path, depth, delegation_id, agent_id, retry_of, retry_scope, status, waiting_for, \
      owner_pod_id, owner_lease_expires_at, cancellation_requested_at, run_generation, last_event_idx, checkpoint_version, \
-     CAST(NULL AS CHAR) AS checkpoint_json, error_code, error_message, retry_count, total_prompt_tokens, \
+     CAST(NULL AS CHAR) AS checkpoint_json, error_code, error_message, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
      runtime_profile, start_request_fingerprint, work_id, \
@@ -5560,44 +5561,6 @@ pub trait RunStateStore: Send + Sync {
         )
     }
 
-    /// Update run status and optional fields.
-    async fn update_run_status(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
-    ) -> Result<bool, String>;
-
-    /// Update run status only if the current status is one of `expected_statuses`.
-    ///
-    /// This is the compare-and-set primitive used by control-plane races where
-    /// a stale load must not overwrite a newer pause/cancel/terminal status.
-    async fn update_run_status_if_current(
-        &self,
-        request: RunStatusCasRequest<'_>,
-    ) -> Result<bool, String>;
-
-    /// Atomically update run status and append one durable event if the current
-    /// status is one of `expected_statuses`.
-    ///
-    /// This is the control-plane transition primitive for pause/resume/cancel:
-    /// status and its audit event must commit together or not at all.
-    #[allow(clippy::too_many_arguments)]
-    async fn update_run_status_with_event_if_current(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_statuses: &[&str],
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
-        event: serde_json::Value,
-    ) -> Result<bool, String>;
-
     /// Atomically update run status and append one durable event only when no
     /// other run in the same user/session currently blocks execution.
     ///
@@ -5706,17 +5669,6 @@ pub trait RunStateStore: Send + Sync {
                 .to_string(),
         )
     }
-
-    /// Update token/tool counts.
-    async fn update_run_usage(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        tool_calls: u32,
-    ) -> Result<bool, String>;
 
     /// Update the semantic run aggregate only while the exact execution
     /// generation still owns that run. Physical provider accounting is
@@ -6114,15 +6066,6 @@ pub trait RunStateStore: Send + Sync {
         user_id: &str,
         delegation_id: &str,
     ) -> Result<Vec<DurableRunRecord>, String>;
-
-    /// Update the retry count for a run (verification gate retries).
-    async fn update_retry_count(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        retry_count: u32,
-    ) -> Result<bool, String>;
 }
 
 /// In-memory run state store for tests and single-process deployments.
@@ -8887,251 +8830,6 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(AtomicRunInteractionBatchRegistration::Registered)
     }
 
-    async fn update_run_status(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
-    ) -> Result<bool, String> {
-        if status == STATUS_CANCELLED {
-            return Err(
-                "cancelled status mutation requires a typed run_finished event".to_string(),
-            );
-        }
-        let terminal_error_code = terminal_error_code_from_message(status, error_message);
-        let updated = {
-            let action_fence = self.action_fence_for(user_id, run_id);
-            let _action_fence = action_fence.lock_owned().await;
-            let cancellation_requests = self.cancellation_requests.read().await;
-            let mut slots = self.execution_slots.write().await;
-            let mut runs = self.runs.write().await;
-            let lineage_markers = in_memory_lineage_cancellation_markers(
-                &runs,
-                &cancellation_requests,
-                user_id,
-                run_id,
-            )?;
-            if let Some(run) = runs.get(run_id)
-                && run.user_id == user_id
-                && run.session_id == expected_session_id
-                && !lineage_markers.any()
-            {
-                reconcile_in_memory_execution_slot_for_session(
-                    &mut slots,
-                    &runs,
-                    user_id,
-                    &run.session_id,
-                    durable_run_status_blocks_session(status, waiting_for),
-                )?;
-            }
-            if let Some(run) = runs.get_mut(run_id) {
-                if run.user_id != user_id
-                    || run.session_id != expected_session_id
-                    || lineage_markers.any()
-                {
-                    None
-                } else {
-                    apply_in_memory_status_transition(
-                        &mut slots,
-                        run,
-                        status,
-                        waiting_for,
-                        error_message,
-                        terminal_error_code.as_deref(),
-                    )?;
-                    Some(run.clone())
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(run) = updated {
-            self.sync_projection(&run, None, None).await;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    async fn update_run_status_if_current(
-        &self,
-        request: RunStatusCasRequest<'_>,
-    ) -> Result<bool, String> {
-        let RunStatusCasRequest {
-            user_id,
-            expected_session_id,
-            run_id,
-            expected_statuses,
-            status,
-            waiting_for,
-            error_message,
-        } = request;
-        if expected_statuses.is_empty() {
-            return Ok(false);
-        }
-        if status == STATUS_CANCELLED {
-            return Err(
-                "cancelled status CAS requires a typed run_finished event; use an event-bearing transition"
-                    .to_string(),
-            );
-        }
-        let terminal_error_code = terminal_error_code_from_message(status, error_message);
-        let updated = {
-            let action_fence = self.action_fence_for(user_id, run_id);
-            let _action_fence = action_fence.lock_owned().await;
-            // Hold the read guard through the in-memory commit so a root
-            // marker writer linearizes wholly before or after this child CAS.
-            let cancellation_requests = self.cancellation_requests.read().await;
-            let mut slots = self.execution_slots.write().await;
-            let mut runs = self.runs.write().await;
-            let lineage_markers = in_memory_lineage_cancellation_markers(
-                &runs,
-                &cancellation_requests,
-                user_id,
-                run_id,
-            )?;
-            let admitted_session_id = runs
-                .get(run_id)
-                .filter(|run| {
-                    run.user_id == user_id
-                        && run.session_id == expected_session_id
-                        && expected_statuses.contains(&run.status.as_str())
-                        && !lineage_markers.any()
-                })
-                .map(|run| run.session_id.clone());
-            if let Some(session_id) = admitted_session_id.as_deref() {
-                reconcile_in_memory_execution_slot_for_session(
-                    &mut slots,
-                    &runs,
-                    user_id,
-                    session_id,
-                    durable_run_status_blocks_session(status, waiting_for),
-                )?;
-            }
-            if admitted_session_id.is_some() {
-                if let Some(run) = runs.get_mut(run_id) {
-                    apply_in_memory_status_transition(
-                        &mut slots,
-                        run,
-                        status,
-                        waiting_for,
-                        error_message,
-                        terminal_error_code.as_deref(),
-                    )?;
-                    Some(run.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(run) = updated {
-            self.sync_projection(&run, None, None).await;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    async fn update_run_status_with_event_if_current(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_statuses: &[&str],
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
-        event: serde_json::Value,
-    ) -> Result<bool, String> {
-        if expected_statuses.is_empty() {
-            return Ok(false);
-        }
-        let terminal_origin = cancelled_terminal_origin(status, std::slice::from_ref(&event))?;
-        let terminal_error_code = terminal_error_code_from_transition(
-            status,
-            error_message,
-            std::slice::from_ref(&event),
-        );
-        let updated = {
-            let action_fence = self.action_fence_for(user_id, run_id);
-            let _action_fence = action_fence.lock_owned().await;
-            // Keep this guard through the mutation: a root marker writer then
-            // linearizes entirely before or after the child transition.
-            let cancellation_requests = self.cancellation_requests.read().await;
-            let mut slots = self.execution_slots.write().await;
-            let mut runs = self.runs.write().await;
-            let lineage_markers = in_memory_lineage_cancellation_markers(
-                &runs,
-                &cancellation_requests,
-                user_id,
-                run_id,
-            )?;
-            let admitted_session_id = runs
-                .get(run_id)
-                .filter(|run| {
-                    run.user_id == user_id
-                        && run.session_id == expected_session_id
-                        && expected_statuses.contains(&run.status.as_str())
-                        && cancellation_markers_admit_transition(terminal_origin, lineage_markers)
-                })
-                .map(|run| run.session_id.clone());
-            if let Some(session_id) = admitted_session_id.as_deref() {
-                reconcile_in_memory_execution_slot_for_session(
-                    &mut slots,
-                    &runs,
-                    user_id,
-                    session_id,
-                    durable_run_status_blocks_session(status, waiting_for),
-                )?;
-            }
-            if admitted_session_id.is_some() {
-                if let Some(run) = runs.get_mut(run_id) {
-                    let new_events =
-                        new_idempotent_events(&run.events, std::slice::from_ref(&event));
-                    if new_events.is_empty()
-                        && !in_memory_transition_changes_state(
-                            run,
-                            status,
-                            waiting_for,
-                            error_message,
-                        )
-                    {
-                        return Ok(false);
-                    }
-                    let latest_event_type = new_events.last().map(extract_event_type);
-                    apply_in_memory_status_transition(
-                        &mut slots,
-                        run,
-                        status,
-                        waiting_for,
-                        error_message,
-                        terminal_error_code.as_deref(),
-                    )?;
-                    if !new_events.is_empty() {
-                        run.events.extend(new_events);
-                        run.last_event_idx = run.events.len() as i64 - 1;
-                    }
-                    Some((run.clone(), latest_event_type))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if let Some((run, latest_event_type)) = updated {
-            self.sync_projection(&run, latest_event_type, None).await;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
     async fn update_run_status_with_event_if_current_unless_session_blocked(
         &self,
         request: GuardedRunStatusTransitionRequest<'_>,
@@ -9265,41 +8963,6 @@ impl RunStateStore for InMemoryRunStateStore {
         )
         .await
         .map(|commit| commit.applied)
-    }
-
-    async fn update_run_usage(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        tool_calls: u32,
-    ) -> Result<bool, String> {
-        let updated = {
-            let action_fence = self.action_fence_for(user_id, run_id);
-            let _action_fence = action_fence.lock_owned().await;
-            let mut runs = self.runs.write().await;
-            if let Some(run) = runs.get_mut(run_id) {
-                if run.user_id != user_id || run.session_id != expected_session_id {
-                    None
-                } else {
-                    run.total_prompt_tokens = prompt_tokens;
-                    run.total_completion_tokens = completion_tokens;
-                    run.total_tool_calls = tool_calls;
-                    run.updated_at = chrono::Utc::now().to_rfc3339();
-                    Some(run.clone())
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(run) = updated {
-            self.sync_projection(&run, None, None).await;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 
     async fn append_events_if_current_generation_and_status(
@@ -9464,9 +9127,9 @@ impl RunStateStore for InMemoryRunStateStore {
             completion_tokens,
             tool_calls,
         } = request;
+        let action_fence = self.action_fence_for(user_id, run_id);
+        let _action_fence = action_fence.lock_owned().await;
         let updated = {
-            let action_fence = self.action_fence_for(user_id, run_id);
-            let _action_fence = action_fence.lock_owned().await;
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
                 if run.user_id != user_id
@@ -9475,9 +9138,10 @@ impl RunStateStore for InMemoryRunStateStore {
                 {
                     None
                 } else {
-                    run.total_prompt_tokens = prompt_tokens;
-                    run.total_completion_tokens = completion_tokens;
-                    run.total_tool_calls = tool_calls;
+                    run.total_prompt_tokens = run.total_prompt_tokens.max(prompt_tokens);
+                    run.total_completion_tokens =
+                        run.total_completion_tokens.max(completion_tokens);
+                    run.total_tool_calls = run.total_tool_calls.max(tool_calls);
                     run.updated_at = chrono::Utc::now().to_rfc3339();
                     Some(run.clone())
                 }
@@ -10756,28 +10420,6 @@ impl RunStateStore for InMemoryRunStateStore {
             .filter(|r| r.user_id == user_id && r.delegation_id.as_deref() == Some(delegation_id))
             .cloned()
             .collect())
-    }
-
-    async fn update_retry_count(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        retry_count: u32,
-    ) -> Result<bool, String> {
-        let action_fence = self.action_fence_for(user_id, run_id);
-        let _action_fence = action_fence.lock_owned().await;
-        let mut runs = self.runs.write().await;
-        if let Some(run) = runs.get_mut(run_id) {
-            if run.user_id != user_id || run.session_id != expected_session_id {
-                return Ok(false);
-            }
-            run.retry_count = retry_count;
-            run.updated_at = chrono::Utc::now().to_rfc3339();
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 }
 
@@ -14485,7 +14127,7 @@ impl DatabaseRunStateStore {
              (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
               delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
               owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx,
-              checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
+              checkpoint_version, checkpoint_json, error_code, error_message,
               total_prompt_tokens, total_completion_tokens, total_tool_calls,
               agent_binding_id, agent_binding_name, agent_binding_schema_version,
               model_offering_id, resolved_model_name,
@@ -14493,7 +14135,7 @@ impl DatabaseRunStateStore {
               work_id, work_branch_id, work_graph_revision,
               work_item_id, work_item_revision, work_item_attempt_id,
               created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
             null_shape.iter().copied(),
         );
         sqlx::query(&insert_sql)
@@ -14518,7 +14160,6 @@ impl DatabaseRunStateStore {
             .bind(&record.checkpoint_json)
             .bind(&record.error_code)
             .bind(&record.error_message)
-            .bind(record.retry_count as i64)
             .bind(record.total_prompt_tokens as i64)
             .bind(record.total_completion_tokens as i64)
             .bind(record.total_tool_calls as i64)
@@ -18697,513 +18338,6 @@ impl RunStateStore for DatabaseRunStateStore {
             .collect()
     }
 
-    async fn update_run_status(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
-    ) -> Result<bool, String> {
-        let terminal_error_code = terminal_error_code_from_message(status, error_message);
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| db_error("update_run_status_acquire", run_id, source).to_string())?;
-        let mut tx = connection
-            .begin()
-            .await
-            .map_err(|source| db_error("update_run_status_begin", run_id, source).to_string())?;
-        // Load run metadata inside the transaction so the slot ownership
-        // check sees the same row version as the UPDATE, closing the TOCTOU
-        // window where a concurrent agent_id flip could misattribute the slot.
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            tx.rollback().await.map_err(|source| {
-                db_error("update_run_status_rollback_missing", run_id, source).to_string()
-            })?;
-            connection.release();
-            return Ok(false);
-        };
-        if let Err(error) = ensure_terminal_status_immutable(&run, status) {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "update_run_status_rollback_terminal_conflict",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Err(error);
-        }
-        let interaction_closure_rows = self
-            .terminal_interaction_closure_rows_tx(&mut tx, &run, status, run.last_event_idx + 1)
-            .await
-            .map_err(|error| error.to_string())?;
-        let next_last_event_idx = interaction_closure_rows
-            .last()
-            .map_or(run.last_event_idx, |event| event.event_idx);
-        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
-        query.push_bind(status);
-        query.push(", waiting_for = ");
-        query.push_bind(waiting_for);
-        if let Some(error_message) = error_message {
-            query.push(", error_message = ");
-            query.push_bind(error_message);
-        }
-        if let Some(error_code) = terminal_error_code.as_deref() {
-            query.push(", error_code = ");
-            query.push_bind(error_code);
-        }
-        query.push(", last_event_idx = ");
-        query.push_bind(next_last_event_idx);
-        query.push(", updated_at = NOW(6) WHERE user_id = ");
-        query.push_bind(user_id);
-        query.push(" AND session_id = ");
-        query.push_bind(&run.session_id);
-        query.push(" AND run_id = ");
-        query.push_bind(run_id);
-        query.push(" AND last_event_idx = ");
-        query.push_bind(run.last_event_idx);
-        if status != STATUS_CANCELLED {
-            query.push(" AND cancellation_requested_at IS NULL");
-        }
-        let result = query
-            .build()
-            .execute(&mut *tx)
-            .await
-            .map_err(|source| db_error("update_run_status", run_id, source).to_string())?;
-        if result.rows_affected() == 0 {
-            tx.rollback().await.map_err(|source| {
-                db_error("update_run_status_rollback_conflict", run_id, source).to_string()
-            })?;
-            connection.release();
-            return Ok(false);
-        }
-        Self::insert_run_event_rows_tx(
-            &mut tx,
-            run_id,
-            &interaction_closure_rows,
-            "update_run_status_insert_interaction_closures",
-        )
-        .await?;
-        if !self
-            .sync_session_execution_slot_after_status_tx(&mut tx, &run, status, waiting_for)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            tx.rollback().await.map_err(|source| {
-                db_error("update_run_status_rollback_slot_blocked", run_id, source).to_string()
-            })?;
-            connection.release();
-            return Ok(false);
-        }
-        enqueue_work_terminal_event_for_run(&mut tx, &run, status).await?;
-        tx.commit()
-            .await
-            .map_err(|source| db_error("update_run_status_commit", run_id, source).to_string())?;
-        connection.release();
-        if result.rows_affected() > 0
-            && let Err(error) = self
-                .sync_projection_for_user(user_id, expected_session_id, run_id)
-                .await
-        {
-            tracing::warn!(
-                user_id,
-                run_id,
-                error = %error,
-                "run status committed but display projection refresh failed"
-            );
-        }
-        Ok(true)
-    }
-
-    async fn update_run_status_if_current(
-        &self,
-        request: RunStatusCasRequest<'_>,
-    ) -> Result<bool, String> {
-        let RunStatusCasRequest {
-            user_id,
-            expected_session_id,
-            run_id,
-            expected_statuses,
-            status,
-            waiting_for,
-            error_message,
-        } = request;
-        if expected_statuses.is_empty() {
-            return Ok(false);
-        }
-        if status == STATUS_CANCELLED {
-            return Err(
-                "cancelled status CAS requires a typed run_finished event; use an event-bearing transition"
-                    .to_string(),
-            );
-        }
-        let terminal_origin = None;
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| {
-                db_error("update_run_status_if_current_acquire", run_id, source).to_string()
-            })?;
-        let mut tx = connection.begin().await.map_err(|source| {
-            db_error("update_run_status_if_current_begin", run_id, source).to_string()
-        })?;
-        // Load run metadata inside the transaction so the slot ownership
-        // check sees the same row version as the UPDATE, closing the TOCTOU
-        // window where a concurrent agent_id flip could misattribute the slot.
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "update_run_status_if_current_rollback_missing",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(false);
-        };
-        if expected_statuses.contains(&run.status.as_str())
-            && let Err(error) = ensure_terminal_status_immutable(&run, status)
-        {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "update_run_status_if_current_rollback_terminal_conflict",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Err(error);
-        }
-        let lineage_markers = lock_durable_lineage_cancellation_markers_tx(&mut tx, &run).await?;
-        if !cancellation_markers_admit_transition(terminal_origin, lineage_markers) {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "transition_run_status_with_events_rollback_cancellation_authority",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(false);
-        }
-        let interaction_closure_rows = self
-            .terminal_interaction_closure_rows_tx(&mut tx, &run, status, run.last_event_idx + 1)
-            .await
-            .map_err(|error| error.to_string())?;
-        let next_last_event_idx = interaction_closure_rows
-            .last()
-            .map_or(run.last_event_idx, |event| event.event_idx);
-        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
-        query.push_bind(status);
-        query.push(", waiting_for = ");
-        query.push_bind(waiting_for);
-        if let Some(error_message) = error_message {
-            query.push(", error_message = ");
-            query.push_bind(error_message);
-        }
-        let terminal_error_code = terminal_error_code_from_message(status, error_message);
-        if let Some(error_code) = terminal_error_code.as_deref() {
-            query.push(", error_code = ");
-            query.push_bind(error_code);
-        }
-        query.push(", last_event_idx = ");
-        query.push_bind(next_last_event_idx);
-        query.push(", updated_at = NOW(6) WHERE user_id = ");
-        query.push_bind(user_id);
-        query.push(" AND session_id = ");
-        query.push_bind(&run.session_id);
-        query.push(" AND run_id = ");
-        query.push_bind(run_id);
-        query.push(" AND last_event_idx = ");
-        query.push_bind(run.last_event_idx);
-        query.push(" AND status IN (");
-        let mut separated = query.separated(", ");
-        for expected in expected_statuses {
-            separated.push_bind(*expected);
-        }
-        separated.push_unseparated(")");
-        if status != STATUS_CANCELLED {
-            query.push(" AND cancellation_requested_at IS NULL");
-        }
-        let result = query.build().execute(&mut *tx).await.map_err(|source| {
-            db_error("update_run_status_if_current", run_id, source).to_string()
-        })?;
-        if result.rows_affected() == 0 {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "update_run_status_if_current_rollback_conflict",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(false);
-        }
-        Self::insert_run_event_rows_tx(
-            &mut tx,
-            run_id,
-            &interaction_closure_rows,
-            "update_run_status_if_current_insert_interaction_closures",
-        )
-        .await?;
-        if !self
-            .sync_session_execution_slot_after_status_tx(&mut tx, &run, status, waiting_for)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "update_run_status_if_current_rollback_slot_blocked",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(false);
-        }
-        enqueue_work_terminal_event_for_run(&mut tx, &run, status).await?;
-        tx.commit().await.map_err(|source| {
-            db_error("update_run_status_if_current_commit", run_id, source).to_string()
-        })?;
-        connection.release();
-        if result.rows_affected() > 0
-            && let Err(error) = self
-                .sync_projection_for_user(user_id, expected_session_id, run_id)
-                .await
-        {
-            tracing::warn!(
-                user_id,
-                run_id,
-                error = %error,
-                "run status CAS committed but display projection refresh failed"
-            );
-        }
-        Ok(true)
-    }
-
-    async fn update_run_status_with_event_if_current(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_statuses: &[&str],
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
-        event: serde_json::Value,
-    ) -> Result<bool, String> {
-        if expected_statuses.is_empty() {
-            return Ok(false);
-        }
-        let terminal_origin = cancelled_terminal_origin(status, std::slice::from_ref(&event))?;
-        let terminal_error_code = terminal_error_code_from_transition(
-            status,
-            error_message,
-            std::slice::from_ref(&event),
-        );
-
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| {
-                db_error("transition_run_status_with_event_acquire", run_id, source).to_string()
-            })?;
-        let mut tx = connection.begin().await.map_err(|source| {
-            db_error("transition_run_status_with_event_begin", run_id, source).to_string()
-        })?;
-
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "transition_run_status_with_event_rollback_missing",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(false);
-        };
-        if expected_statuses.contains(&run.status.as_str())
-            && let Err(error) = ensure_terminal_status_immutable(&run, status)
-        {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "transition_run_status_with_event_rollback_terminal_conflict",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Err(error);
-        }
-        let lineage_markers = lock_durable_lineage_cancellation_markers_tx(&mut tx, &run).await?;
-        if !cancellation_markers_admit_transition(terminal_origin, lineage_markers) {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "transition_run_status_with_event_rollback_cancellation_authority",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(false);
-        }
-        let session_id = run.session_id.clone();
-        let agent_id = run.agent_id.clone();
-        let last_event_idx = run.last_event_idx;
-        let interaction_closure_rows = self
-            .terminal_interaction_closure_rows_tx(&mut tx, &run, status, last_event_idx + 1)
-            .await
-            .map_err(|error| error.to_string())?;
-        let event_idx = last_event_idx + 1 + interaction_closure_rows.len() as i64;
-
-        let event_row = match build_run_event_insert_row(
-            user_id,
-            run_id,
-            &session_id,
-            agent_id.as_deref(),
-            event_idx,
-            &self.owner_pod_id,
-            &event,
-        ) {
-            Ok(row) => row,
-            Err(error) => {
-                tx.rollback().await.map_err(|source| {
-                    db_error(
-                        "transition_run_status_with_event_rollback_prepare_event",
-                        run_id,
-                        source,
-                    )
-                    .to_string()
-                })?;
-                connection.release();
-                return Err(error.to_string());
-            }
-        };
-
-        let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
-        update.push_bind(status);
-        update.push(", waiting_for = ");
-        update.push_bind(waiting_for);
-        if let Some(error_message) = error_message {
-            update.push(", error_message = ");
-            update.push_bind(error_message);
-        }
-        if let Some(error_code) = terminal_error_code.as_deref() {
-            update.push(", error_code = ");
-            update.push_bind(error_code);
-        }
-        update.push(", last_event_idx = ");
-        update.push_bind(event_idx);
-        update.push(", updated_at = NOW(6) WHERE user_id = ");
-        update.push_bind(user_id);
-        update.push(" AND session_id = ");
-        update.push_bind(expected_session_id);
-        update.push(" AND run_id = ");
-        update.push_bind(run_id);
-        update.push(" AND last_event_idx = ");
-        update.push_bind(last_event_idx);
-        update.push(" AND status IN (");
-        let mut separated = update.separated(", ");
-        for expected in expected_statuses {
-            separated.push_bind(*expected);
-        }
-        separated.push_unseparated(")");
-        if terminal_origin != Some(DurableCancellationOrigin::User) {
-            update.push(" AND cancellation_requested_at IS NULL");
-        }
-
-        let update_result = update.build().execute(&mut *tx).await.map_err(|source| {
-            db_error("transition_run_status_with_event_update", run_id, source).to_string()
-        })?;
-        if update_result.rows_affected() == 0 {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "transition_run_status_with_event_rollback_conflict",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(false);
-        }
-        if !self
-            .sync_session_execution_slot_after_status_tx(&mut tx, &run, status, waiting_for)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            tx.rollback().await.map_err(|source| {
-                db_error(
-                    "transition_run_status_with_event_rollback_slot_blocked",
-                    run_id,
-                    source,
-                )
-                .to_string()
-            })?;
-            connection.release();
-            return Ok(false);
-        }
-        enqueue_work_terminal_event_for_run(&mut tx, &run, status).await?;
-
-        Self::insert_run_event_rows_tx(
-            &mut tx,
-            run_id,
-            &interaction_closure_rows,
-            "transition_run_status_with_event_insert_interaction_closures",
-        )
-        .await?;
-
-        let insert_result = Self::insert_run_event_rows_tx(
-            &mut tx,
-            run_id,
-            std::slice::from_ref(&event_row),
-            "transition_run_status_with_event_insert_event",
-        )
-        .await;
-        if let Err(mut detail) = insert_result {
-            match tx.rollback().await {
-                Ok(()) => connection.release(),
-                Err(rollback_error) => {
-                    detail.push_str(&format!(
-                        "; rollback after insert failure also failed: {rollback_error}"
-                    ));
-                }
-            }
-            return Err(detail);
-        }
-
-        tx.commit().await.map_err(|source| {
-            db_error("transition_run_status_with_event_commit", run_id, source).to_string()
-        })?;
-        connection.release();
-
-        self.repair_run_projection_after_status_for_user(user_id, expected_session_id, run_id)
-            .await;
-        Ok(true)
-    }
-
     async fn update_run_status_with_event_if_current_unless_session_blocked(
         &self,
         request: GuardedRunStatusTransitionRequest<'_>,
@@ -19524,81 +18658,6 @@ impl RunStateStore for DatabaseRunStateStore {
         )
         .await
         .map(|commit| commit.applied)
-    }
-
-    async fn update_run_usage(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        tool_calls: u32,
-    ) -> Result<bool, String> {
-        let result = sqlx::query(
-            "UPDATE agent_runs
-             SET updated_at = IF(
-                   CAST(? AS SIGNED) > total_prompt_tokens
-                   OR CAST(? AS SIGNED) > total_completion_tokens
-                   OR CAST(? AS SIGNED) > total_tool_calls,
-                   NOW(6), updated_at),
-                 total_prompt_tokens = IF(CAST(? AS SIGNED) > total_prompt_tokens, CAST(? AS SIGNED), total_prompt_tokens),
-                 total_completion_tokens = IF(CAST(? AS SIGNED) > total_completion_tokens, CAST(? AS SIGNED), total_completion_tokens),
-                 total_tool_calls = IF(CAST(? AS SIGNED) > total_tool_calls, CAST(? AS SIGNED), total_tool_calls)
-             WHERE user_id = ? AND session_id = ? AND run_id = ?",
-        )
-        .bind(prompt_tokens as i64)
-        .bind(completion_tokens as i64)
-        .bind(tool_calls as i64)
-        .bind(prompt_tokens as i64)
-        .bind(prompt_tokens as i64)
-        .bind(completion_tokens as i64)
-        .bind(completion_tokens as i64)
-        .bind(tool_calls as i64)
-        .bind(tool_calls as i64)
-        .bind(user_id)
-        .bind(expected_session_id)
-        .bind(run_id)
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| db_error("update_run_usage", run_id, source).to_string())?;
-        if result.rows_affected() > 0 {
-            match self
-                .patch_run_projection_usage_for_user(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    prompt_tokens,
-                    completion_tokens,
-                    tool_calls,
-                )
-                .await
-            {
-                Ok(0) => {
-                    if let Err(error) = self
-                        .sync_projection_for_user(user_id, expected_session_id, run_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            user_id,
-                            run_id,
-                            error = %error,
-                            "run usage committed but display projection repair failed"
-                        );
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        user_id,
-                        run_id,
-                        error = %error,
-                        "run usage committed but display projection usage patch failed"
-                    );
-                }
-            }
-        }
-        Ok(result.rows_affected() > 0)
     }
 
     async fn append_events_if_current_generation_and_status(
@@ -23596,32 +22655,6 @@ impl RunStateStore for DatabaseRunStateStore {
             .collect::<DbStoreResult<Vec<_>>>()
             .map_err(|e| e.to_string())
     }
-
-    async fn update_retry_count(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        retry_count: u32,
-    ) -> Result<bool, String> {
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| db_error("update_retry_count_prepare", run_id, source).to_string())?;
-        let result = sqlx::query(
-            "UPDATE agent_runs
-             SET retry_count = ?, updated_at = NOW(6)
-             WHERE user_id = ? AND session_id = ? AND run_id = ?",
-        )
-        .bind(retry_count as i64)
-        .bind(user_id)
-        .bind(expected_session_id)
-        .bind(run_id)
-        .execute(connection.connection_mut())
-        .await
-        .map_err(|source| db_error("update_retry_count", run_id, source).to_string())?;
-        connection.release();
-        Ok(result.rows_affected() > 0)
-    }
 }
 
 impl DatabaseRunStateStore {
@@ -24719,7 +23752,7 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
         checkpoint_json: run_row_optional_string(row, operation, table, "checkpoint_json")?,
         error_code: run_row_optional_string(row, operation, table, "error_code")?,
         error_message: run_row_optional_string(row, operation, table, "error_message")?,
-        retry_count: run_row_u32(row, operation, table, "retry_count")?,
+
         total_prompt_tokens: run_row_u64(row, operation, table, "total_prompt_tokens")?,
         total_completion_tokens: run_row_u64(row, operation, table, "total_completion_tokens")?,
         total_tool_calls: run_row_u32(row, operation, table, "total_tool_calls")?,
@@ -26244,6 +25277,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         let is_explain_analyze = client_type == "explain_analyze";
         let is_runtime_feedback = client_type == "runtime_feedback";
         let is_stream_gap = client_type == "stream_gap";
+        let is_execution_binding = matches!(client_type, "workspace_bound" | "executor_bound");
         if is_external {
             return if client_type == "artifact_publication" {
                 project_artifact_publication(event)
@@ -26257,6 +25291,8 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 project_runtime_feedback(event)
             } else if is_stream_gap {
                 project_stream_gap(event)
+            } else if is_execution_binding {
+                project_execution_binding(event)
             } else {
                 event
             };
@@ -26288,6 +25324,14 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             | "reasoning_done"
     );
     let mut projected = match event_type {
+        "workspace_bound" | "executor_bound" => {
+            let mut wire = serde_json::Value::Object(data);
+            wire["type"] = event_type.into();
+            if let Some(index) = event.get("index") {
+                wire["index"] = index.clone();
+            }
+            project_execution_binding(wire)
+        }
         "text_delta" => serde_json::json!({
             "type": "text_delta",
             "content": data.get("chunk").cloned().unwrap_or(serde_json::Value::String(String::new())),
@@ -26796,6 +25840,29 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         projected["model_item_id"] = id;
     }
     projected
+}
+
+/// Binding receipts expose routing facts, never internal completion contracts.
+fn project_execution_binding(event: serde_json::Value) -> serde_json::Value {
+    let Some(source) = event.as_object() else {
+        return serde_json::Value::Null;
+    };
+    let mut out = serde_json::Map::new();
+    for key in [
+        "type",
+        "run_id",
+        "session_id",
+        "workspace",
+        "executor",
+        "transport",
+        "capacity_provider_coverage",
+        "route",
+        "fallback_policy",
+        "index",
+    ] {
+        insert_if_present(&mut out, source, key);
+    }
+    serde_json::Value::Object(out)
 }
 
 /// The live Work board is a bounded, versioned protocol receipt. Project its
@@ -27898,7 +26965,7 @@ mod tests {
             checkpoint_json: None,
             error_code: None,
             error_message: None,
-            retry_count: 0,
+
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,
@@ -27914,6 +26981,87 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    #[tokio::test]
+    async fn owned_usage_preserves_monotonic_totals_and_rejects_wrong_authority() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("owned-usage"))
+            .await
+            .unwrap();
+        for (user, session, generation, prompt, completion, tools, accepted) in [
+            ("u1", "s1", 0, 21, 13, 5, true),
+            ("u1", "s1", 0, 3, 2, 1, true),
+            ("u1", "s1", 0, 22, 1, 2, true),
+            ("u2", "s1", 0, 99, 99, 99, false),
+            ("u1", "s2", 0, 99, 99, 99, false),
+            ("u1", "s1", 1, 99, 99, 99, false),
+        ] {
+            assert_eq!(
+                store
+                    .update_run_usage_if_current_owner(RunUsageOwnerUpdateRequest {
+                        user_id: user,
+                        expected_session_id: session,
+                        run_id: "owned-usage",
+                        expected_owner_generation: generation,
+                        prompt_tokens: prompt,
+                        completion_tokens: completion,
+                        tool_calls: tools,
+                    })
+                    .await
+                    .unwrap(),
+                accepted
+            );
+        }
+        // A blocked projection write must retain the existing action fence.
+        let projection_guard = store.projections.write().await;
+        let mut update = Box::pin(store.update_run_usage_if_current_owner(
+            RunUsageOwnerUpdateRequest {
+                user_id: "u1",
+                expected_session_id: "s1",
+                run_id: "owned-usage",
+                expected_owner_generation: 0,
+                prompt_tokens: 22,
+                completion_tokens: 13,
+                tool_calls: 5,
+            },
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(update.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(
+            store
+                .action_fence_for("u1", "owned-usage")
+                .try_lock()
+                .is_err()
+        );
+        drop(projection_guard);
+        assert!(update.await.unwrap());
+        let run = store.load_run("u1", "owned-usage").await.unwrap().unwrap();
+        assert_eq!(
+            (
+                run.total_prompt_tokens,
+                run.total_completion_tokens,
+                run.total_tool_calls
+            ),
+            (22, 13, 5)
+        );
+        let projection = store
+            .load_run_projection("u1", "owned-usage")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                projection.total_prompt_tokens,
+                projection.total_completion_tokens,
+                projection.total_tool_calls
+            ),
+            (22, 13, 5)
+        );
     }
 
     #[tokio::test]
@@ -28548,15 +27696,16 @@ mod tests {
         );
         assert!(
             !store
-                .update_run_status_with_event_if_current(
+                .update_run_status_with_events_if_current(
                     "u1",
                     "s1",
                     "cancel-child",
                     &[STATUS_RUNNING],
+                    None,
                     STATUS_CANCELLED,
                     None,
                     None,
-                    runtime_terminal,
+                    &[runtime_terminal]
                 )
                 .await
                 .unwrap()
@@ -28564,15 +27713,16 @@ mod tests {
         let user_terminal = orphaned_run_cancellation_terminal_event("cancel-child", 0);
         assert!(
             store
-                .update_run_status_with_event_if_current(
+                .update_run_status_with_events_if_current(
                     "u1",
                     "s1",
                     "cancel-child",
                     &[STATUS_RUNNING],
+                    None,
                     STATUS_CANCELLED,
                     None,
                     None,
-                    user_terminal,
+                    &[user_terminal]
                 )
                 .await
                 .unwrap()
@@ -29102,7 +28252,6 @@ mod tests {
                 "depth" => 2,
                 "run_generation" => 3,
                 "last_event_idx" => 4,
-                "retry_count" => 1,
                 "total_prompt_tokens" => 100,
                 "total_completion_tokens" => 25,
                 "total_tool_calls" => 6,
@@ -29406,7 +28555,17 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .update_run_status(user, session, run_id, STATUS_PAUSED, None, None)
+                .update_run_status_with_events_if_current(
+                    user,
+                    session,
+                    run_id,
+                    &[STATUS_RUNNING],
+                    Some(generation),
+                    STATUS_PAUSED,
+                    None,
+                    None,
+                    &[],
+                )
                 .await
                 .unwrap()
         );
@@ -30631,7 +29790,6 @@ mod tests {
         assert_eq!(record.status, STATUS_RUNNING);
         assert_eq!(record.run_generation, 3);
         assert_eq!(record.last_event_idx, 4);
-        assert_eq!(record.retry_count, 1);
         assert_eq!(record.total_prompt_tokens, 100);
         assert_eq!(record.total_completion_tokens, 25);
         assert_eq!(record.total_tool_calls, 6);
@@ -30676,7 +29834,6 @@ mod tests {
             "checkpoint_json",
             "error_code",
             "error_message",
-            "retry_count",
             "total_prompt_tokens",
             "total_completion_tokens",
             "total_tool_calls",
@@ -30708,7 +29865,6 @@ mod tests {
         for column in [
             "depth",
             "run_generation",
-            "retry_count",
             "total_prompt_tokens",
             "total_completion_tokens",
             "total_tool_calls",
@@ -31445,15 +30601,17 @@ mod tests {
 
         assert!(
             store
-                .update_run_status_if_current(RunStatusCasRequest {
-                    user_id: "u1",
-                    expected_session_id: "s1",
-                    run_id: "slot-owner",
-                    expected_statuses: &[STATUS_RUNNING],
-                    status: STATUS_PAUSED,
-                    waiting_for: None,
-                    error_message: None,
-                })
+                .update_run_status_with_events_if_current(
+                    "u1",
+                    "s1",
+                    "slot-owner",
+                    &[STATUS_RUNNING],
+                    None,
+                    STATUS_PAUSED,
+                    None,
+                    None,
+                    &[]
+                )
                 .await
                 .unwrap()
         );
@@ -31464,15 +30622,17 @@ mod tests {
 
         assert!(
             store
-                .update_run_status_if_current(RunStatusCasRequest {
-                    user_id: "u1",
-                    expected_session_id: "s1",
-                    run_id: "fresh-after-paused-none",
-                    expected_statuses: &[STATUS_RUNNING],
-                    status: STATUS_COMPLETED,
-                    waiting_for: None,
-                    error_message: None,
-                },)
+                .update_run_status_with_events_if_current(
+                    "u1",
+                    "s1",
+                    "fresh-after-paused-none",
+                    &[STATUS_RUNNING],
+                    None,
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                    &[]
+                )
                 .await
                 .unwrap()
         );
@@ -31491,15 +30651,17 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .update_run_status_if_current(RunStatusCasRequest {
-                    user_id: "u1",
-                    expected_session_id: "s1",
-                    run_id: "slot-owner",
-                    expected_statuses: &[STATUS_RUNNING],
-                    status: STATUS_WAITING,
-                    waiting_for: Some("tool_result"),
-                    error_message: None,
-                },)
+                .update_run_status_with_events_if_current(
+                    "u1",
+                    "s1",
+                    "slot-owner",
+                    &[STATUS_RUNNING],
+                    None,
+                    STATUS_WAITING,
+                    Some("tool_result"),
+                    None,
+                    &[]
+                )
                 .await
                 .unwrap()
         );
@@ -32259,15 +31421,17 @@ mod tests {
             .expect("insert terminal fixture");
         assert!(
             store
-                .update_run_status_if_current(RunStatusCasRequest {
-                    user_id: &user_id,
-                    expected_session_id: &session_id,
-                    run_id: &run_id,
-                    expected_statuses: &[STATUS_RUNNING],
-                    status: STATUS_DELEGATED,
-                    waiting_for: None,
-                    error_message: None,
-                },)
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    &[STATUS_RUNNING],
+                    None,
+                    STATUS_DELEGATED,
+                    None,
+                    None,
+                    &[]
+                )
                 .await
                 .expect("settle fixture as delegated")
         );
@@ -32280,35 +31444,32 @@ mod tests {
         };
         assert_terminal_conflict(
             store
-                .update_run_status(&user_id, &session_id, &run_id, STATUS_RUNNING, None, None)
-                .await
-                .expect_err("unguarded transition must not resurrect a terminal run"),
-        );
-        assert_terminal_conflict(
-            store
-                .update_run_status_if_current(RunStatusCasRequest {
-                    user_id: &user_id,
-                    expected_session_id: &session_id,
-                    run_id: &run_id,
-                    expected_statuses: &[STATUS_DELEGATED],
-                    status: STATUS_RUNNING,
-                    waiting_for: None,
-                    error_message: None,
-                })
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    &[STATUS_DELEGATED],
+                    None,
+                    STATUS_RUNNING,
+                    None,
+                    None,
+                    &[],
+                )
                 .await
                 .expect_err("CAS transition must not resurrect a terminal run"),
         );
         assert_terminal_conflict(
             store
-                .update_run_status_with_event_if_current(
+                .update_run_status_with_events_if_current(
                     &user_id,
                     &session_id,
                     &run_id,
                     &[STATUS_DELEGATED],
+                    None,
                     STATUS_RUNNING,
                     None,
                     None,
-                    make_event("run_resumed", json!({})),
+                    &[make_event("run_resumed", json!({}))],
                 )
                 .await
                 .expect_err("event transition must not resurrect a terminal run"),
@@ -35552,15 +34713,16 @@ mod tests {
                 "cancel" => {
                     assert!(
                         store
-                            .update_run_status_with_event_if_current(
+                            .update_run_status_with_events_if_current(
                                 &user_id,
                                 &session_id,
                                 &run_id,
                                 &[STATUS_RUNNING],
+                                None,
                                 STATUS_CANCELLED,
                                 None,
                                 None,
-                                json!({
+                                &[json!({
                                     "event_type": "run_finished",
                                     "idempotency_key": format!("{run_id}:cancelled"),
                                     "data": {
@@ -35568,7 +34730,7 @@ mod tests {
                                         "cancelled": true,
                                         "cancellation_origin": "runtime",
                                     },
-                                }),
+                                })]
                             )
                             .await
                             .expect("cancel queued approval run")
@@ -35827,15 +34989,16 @@ mod tests {
         ));
         assert!(
             store
-                .update_run_status_with_event_if_current(
+                .update_run_status_with_events_if_current(
                     &user_id,
                     &terminal_session,
                     &terminal_run,
                     &[STATUS_RUNNING],
+                    None,
                     STATUS_CANCELLED,
                     None,
                     None,
-                    json!({
+                    &[json!({
                         "event_type": "run_finished",
                         "idempotency_key": format!("terminal-closure:{terminal_run}"),
                         "data": {
@@ -35843,7 +35006,7 @@ mod tests {
                             "cancelled": true,
                             "cancellation_origin": "runtime",
                         }
-                    }),
+                    })]
                 )
                 .await
                 .expect("terminal closure transition")
@@ -36133,15 +35296,16 @@ mod tests {
             };
             assert!(
                 store
-                    .update_run_status_with_event_if_current(
+                    .update_run_status_with_events_if_current(
                         &user_id,
                         &session_id,
                         &run_id,
                         &[STATUS_RUNNING],
+                        None,
                         status,
                         None,
                         None,
-                        terminal_event,
+                        &[terminal_event]
                     )
                     .await
                     .expect("commit terminal interaction closure"),
@@ -36275,6 +35439,10 @@ mod tests {
         let mut run = durable_run_record(&run_id);
         run.user_id = user_id.clone();
         run.session_id = session_id.clone();
+        let offering_id = Uuid::new_v4().to_string();
+        run.model_offering_id = Some(offering_id.clone());
+        run.resolved_model_name = Some("projection-model".into());
+        run.runtime_profile = Some("projection-profile".into());
         store.insert_run(run).await.expect("insert projection run");
 
         store
@@ -36288,7 +35456,15 @@ mod tests {
             .expect("append event metadata projection patch");
         assert!(
             store
-                .update_run_usage(&user_id, &session_id, &run_id, 21, 13, 5)
+                .update_run_usage_if_current_owner(RunUsageOwnerUpdateRequest {
+                    user_id: &user_id,
+                    expected_session_id: &session_id,
+                    run_id: &run_id,
+                    prompt_tokens: 21,
+                    completion_tokens: 13,
+                    tool_calls: 5,
+                    expected_owner_generation: 0
+                })
                 .await
                 .expect("publish usage projection patch")
         );
@@ -36298,6 +35474,18 @@ mod tests {
             .await
             .expect("load authoritative run")
             .expect("authoritative run exists");
+        assert_eq!(
+            authoritative.model_offering_id.as_deref(),
+            Some(offering_id.as_str())
+        );
+        assert_eq!(
+            authoritative.resolved_model_name.as_deref(),
+            Some("projection-model")
+        );
+        assert_eq!(
+            authoritative.runtime_profile.as_deref(),
+            Some("projection-profile")
+        );
         let locally_patched = store
             .load_run_projection(&user_id, &run_id)
             .await
@@ -36468,12 +35656,28 @@ mod tests {
 
         assert!(
             store
-                .update_run_usage(&user_id, &session_id, &run_id, 21, 13, 5)
+                .update_run_usage_if_current_owner(RunUsageOwnerUpdateRequest {
+                    user_id: &user_id,
+                    expected_session_id: &session_id,
+                    run_id: &run_id,
+                    prompt_tokens: 21,
+                    completion_tokens: 13,
+                    tool_calls: 5,
+                    expected_owner_generation: 0
+                })
                 .await
                 .expect("publish monotonic usage")
         );
         let _ = store
-            .update_run_usage(&user_id, &session_id, &run_id, 3, 2, 1)
+            .update_run_usage_if_current_owner(RunUsageOwnerUpdateRequest {
+                user_id: &user_id,
+                expected_session_id: &session_id,
+                run_id: &run_id,
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                tool_calls: 1,
+                expected_owner_generation: 0,
+            })
             .await
             .expect("stale usage is a resolved no-op");
         let authoritative = store
@@ -38344,13 +37548,16 @@ mod tests {
             .unwrap();
 
         store
-            .update_run_status(
+            .update_run_status_with_events_if_current(
                 &user_id,
                 &session_id,
                 &root_id,
+                &["running"],
+                None,
                 STATUS_PAUSED,
                 Some("user_resume"),
                 None,
+                &[],
             )
             .await
             .unwrap();
@@ -39462,6 +38669,43 @@ mod tests {
     }
 
     #[test]
+    fn execution_binding_live_and_replay_hide_internal_completion_contract() {
+        for kind in ["workspace_bound", "executor_bound"] {
+            let data = json!({
+                "run_id": "run", "session_id": "session",
+                "workspace": {"kind": "none"},
+                "executor": {"kind": "server_local", "executor_id": "server-control-plane"},
+                "transport": "server_local",
+                "capacity_provider_coverage": [{"provider": "server", "status": "ready"}],
+                "route": "server_local", "fallback_policy": "deny", "index": 7,
+                "completion_checks": {"declarations": {"stop": [], "task_completed": []}, "phase": "stop"},
+                "idempotency_key": "private-key",
+                "runtime": {"runtime_id": "private-runtime"},
+            });
+            let mut live = data.clone();
+            live["type"] = kind.into();
+            let live = transform_run_event_for_client(live);
+            let replay = transform_run_event_for_client(
+                json!({"event_type": kind, "index": 7, "data": data}),
+            );
+            assert_eq!(live, replay);
+            assert_eq!(live["run_id"], "run");
+            assert_eq!(live["workspace"]["kind"], "none");
+            assert_eq!(live["executor"]["executor_id"], "server-control-plane");
+            assert_eq!(
+                live["capacity_provider_coverage"].as_array().unwrap().len(),
+                1
+            );
+            assert_eq!(live["route"], "server_local");
+            assert_eq!(live["fallback_policy"], "deny");
+            assert_eq!(live["index"], 7);
+            assert!(live.get("completion_checks").is_none());
+            assert!(live.get("idempotency_key").is_none());
+            assert!(live.get("runtime").is_none());
+        }
+    }
+
+    #[test]
     fn event_transform_to_client_surface_covers_all_event_types() {
         type EventTransformCase<'a> = (&'a str, serde_json::Value, &'a dyn Fn(&serde_json::Value));
         let cases: Vec<EventTransformCase<'_>> = vec![
@@ -40111,6 +39355,7 @@ mod tests {
         forward_headers.insert("__astra_connection_tokens".to_string(), "x-hop".to_string());
 
         let request = ChatRequestData {
+            completion_checks: None,
             agent_profile_selection: None,
             admitted_agent_profiles: None,
             model_catalog_reader: None,
@@ -40322,6 +39567,7 @@ mod tests {
     #[test]
     fn chat_request_data_debug_redacts_runtime_auth_value() {
         let request = ChatRequestData {
+            completion_checks: None,
             agent_profile_selection: None,
             admitted_agent_profiles: None,
             model_catalog_reader: None,
@@ -40449,6 +39695,7 @@ mod tests {
             .create_run(
                 "u1".to_string(),
                 ChatRequestData {
+                    completion_checks: None,
                     agent_profile_selection: None,
                     admitted_agent_profiles: None,
                     model_catalog_reader: None,
@@ -40550,7 +39797,7 @@ mod tests {
                     checkpoint_json: None,
                     error_code: None,
                     error_message: None,
-                    retry_count: 0,
+
                     total_prompt_tokens: 0,
                     total_completion_tokens: 0,
                     total_tool_calls: 0,
@@ -41423,15 +40670,17 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .update_run_status_if_current(RunStatusCasRequest {
-                    user_id: "u1",
-                    expected_session_id: "s1",
-                    run_id: "action-projection-race",
-                    expected_statuses: &[STATUS_RUNNING],
-                    status: STATUS_PAUSED,
-                    waiting_for: None,
-                    error_message: None,
-                },)
+                .update_run_status_with_events_if_current(
+                    "u1",
+                    "s1",
+                    "action-projection-race",
+                    &[STATUS_RUNNING],
+                    None,
+                    STATUS_PAUSED,
+                    None,
+                    None,
+                    &[]
+                )
                 .await
                 .unwrap()
         );
@@ -41875,15 +41124,16 @@ mod tests {
         ));
         assert!(
             store
-                .update_run_status_with_event_if_current(
+                .update_run_status_with_events_if_current(
                     "u1",
                     "s1",
                     "approval-terminal-close",
                     &[STATUS_RUNNING],
+                    None,
                     STATUS_CANCELLED,
                     None,
                     None,
-                    json!({
+                    &[json!({
                         "event_type": "run_finished",
                         "idempotency_key": "terminal-close:run-finished",
                         "data": {
@@ -41891,7 +41141,7 @@ mod tests {
                             "cancelled": true,
                             "cancellation_origin": "runtime"
                         }
-                    }),
+                    })]
                 )
                 .await
                 .unwrap()
@@ -41996,19 +41246,20 @@ mod tests {
             };
             assert!(
                 store
-                    .update_run_status_with_event_if_current(
+                    .update_run_status_with_events_if_current(
                         "u1",
                         "s1",
                         &run_id,
                         &[STATUS_RUNNING],
+                        None,
                         status,
                         None,
                         None,
-                        json!({
+                        &[json!({
                             "event_type": "run_finished",
                             "idempotency_key": format!("terminal-interactions:{status}"),
                             "data": terminal_data,
-                        }),
+                        })]
                     )
                     .await
                     .unwrap()
@@ -42812,15 +42063,16 @@ mod tests {
                 "cancel" => {
                     assert!(
                         store
-                            .update_run_status_with_event_if_current(
+                            .update_run_status_with_events_if_current(
                                 "u1",
                                 "s1",
                                 &run_id,
                                 &[STATUS_RUNNING],
+                                None,
                                 STATUS_CANCELLED,
                                 None,
                                 None,
-                                json!({
+                                &[json!({
                                     "event_type": "run_finished",
                                     "idempotency_key": format!("{run_id}:cancelled"),
                                     "data": {
@@ -42828,7 +42080,7 @@ mod tests {
                                         "cancelled": true,
                                         "cancellation_origin": "runtime",
                                     },
-                                }),
+                                })]
                             )
                             .await
                             .unwrap()
@@ -43327,15 +42579,16 @@ mod tests {
             .unwrap();
 
         let updated = store
-            .update_run_status_with_event_if_current(
+            .update_run_status_with_events_if_current(
                 "u1",
                 "s1",
                 "transition-commit",
                 &[STATUS_RUNNING],
+                None,
                 STATUS_PAUSED,
                 Some("user_resume"),
                 None,
-                make_event("run_paused", json!({})),
+                &[make_event("run_paused", json!({}))],
             )
             .await
             .unwrap();
@@ -43370,22 +42623,23 @@ mod tests {
             .unwrap();
 
         let updated = store
-            .update_run_status_with_event_if_current(
+            .update_run_status_with_events_if_current(
                 "u1",
                 "s1",
                 "transition-conflict",
                 &[STATUS_PAUSED],
+                None,
                 STATUS_CANCELLED,
                 None,
                 None,
-                make_event(
+                &[make_event(
                     "run_finished",
                     json!({
                         "status": STATUS_CANCELLED,
                         "cancelled": true,
                         "cancellation_origin": "runtime"
                     }),
-                ),
+                )],
             )
             .await
             .unwrap();
@@ -43411,22 +42665,23 @@ mod tests {
             .unwrap();
 
         let updated = store
-            .update_run_status_with_event_if_current(
+            .update_run_status_with_events_if_current(
                 "u2",
                 "s1",
                 "transition-owner",
                 &[STATUS_RUNNING],
+                None,
                 STATUS_CANCELLED,
                 None,
                 None,
-                make_event(
+                &[make_event(
                     "run_finished",
                     json!({
                         "status": STATUS_CANCELLED,
                         "cancelled": true,
                         "cancellation_origin": "runtime"
                     }),
-                ),
+                )],
             )
             .await
             .unwrap();
@@ -44203,15 +43458,16 @@ mod tests {
             .await
             .unwrap();
         store
-            .update_run_status_with_event_if_current(
+            .update_run_status_with_events_if_current(
                 "u1",
                 "s1",
                 "terminal-checkpoint",
                 &[STATUS_RUNNING],
+                None,
                 STATUS_FAILED,
                 None,
                 Some("boom"),
-                make_event("run_error", json!({"error": "boom"})),
+                &[make_event("run_error", json!({"error": "boom"}))],
             )
             .await
             .unwrap();
@@ -44306,6 +43562,26 @@ mod tests {
             .await
             .unwrap();
 
+        // A status-only CAS acknowledges the existing state, without inventing an event.
+        for _ in 0..2 {
+            assert!(
+                store
+                    .update_run_status_with_events_if_current(
+                        "u1",
+                        "s1",
+                        "transition-empty-batch",
+                        &[STATUS_RUNNING],
+                        None,
+                        STATUS_RUNNING,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+
         let updated = store
             .update_run_status_with_events_if_current(
                 "u1",
@@ -44342,17 +43618,19 @@ mod tests {
             .unwrap();
 
         let updated = store
-            .update_run_status_if_current(RunStatusCasRequest {
-                user_id: "u1",
-                expected_session_id: "s1",
-                run_id: "transition-message-code",
-                expected_statuses: &[STATUS_RUNNING],
-                status: STATUS_FAILED,
-                waiting_for: None,
-                error_message: Some(
+            .update_run_status_with_events_if_current(
+                "u1",
+                "s1",
+                "transition-message-code",
+                &[STATUS_RUNNING],
+                None,
+                STATUS_FAILED,
+                None,
+                Some(
                     "database operation failed: error communicating with database: unexpected EOF",
                 ),
-            })
+                &[],
+            )
             .await
             .unwrap();
 
@@ -44373,7 +43651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_direct_status_update_classifies_error_message_without_events() {
+    async fn failed_status_cas_classifies_error_message_without_events() {
         let store = InMemoryRunStateStore::new();
         store
             .insert_run(durable_run_record("direct-message-code"))
@@ -44381,13 +43659,16 @@ mod tests {
             .unwrap();
 
         let updated = store
-            .update_run_status(
+            .update_run_status_with_events_if_current(
                 "u1",
                 "s1",
                 "direct-message-code",
+                &["running"],
+                None,
                 STATUS_FAILED,
                 None,
                 Some("[stream_transport] stream body closed"),
+                &[],
             )
             .await
             .unwrap();
@@ -44560,6 +43841,30 @@ mod tests {
         record.ancestor_path = Some(run_id.clone());
         store.insert_run(record).await.expect("insert run");
 
+        let before = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+        for _ in 0..2 {
+            assert!(
+                store
+                    .update_run_status_with_events_if_current(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        &[STATUS_RUNNING],
+                        None,
+                        STATUS_RUNNING,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+        let unchanged = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+        assert_eq!(unchanged.status, STATUS_RUNNING);
+        assert_eq!(unchanged.last_event_idx, before.last_event_idx);
+        assert_eq!(unchanged.events, before.events);
+
         let saved_checkpoint = store
             .save_checkpoint(RunCheckpointWriteRequest { user_id: &user_id, expected_session_id: &session_id, run_id: &run_id, checkpoint_json: r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"db-it"}"#, authority: CheckpointWriteAuthority::ControlPlane })
             .await
@@ -44610,7 +43915,15 @@ mod tests {
         assert!(!stale_update);
 
         store
-            .update_run_usage(&user_id, &session_id, &run_id, 10, 4, 2)
+            .update_run_usage_if_current_owner(RunUsageOwnerUpdateRequest {
+                user_id: &user_id,
+                expected_session_id: &session_id,
+                run_id: &run_id,
+                prompt_tokens: 10,
+                completion_tokens: 4,
+                tool_calls: 2,
+                expected_owner_generation: 0,
+            })
             .await
             .expect("update usage");
         let usage_projection = store
@@ -44711,7 +44024,15 @@ mod tests {
             .await
             .unwrap();
         store
-            .update_run_usage("u1", "s1", "projection-repair", 10, 4, 2)
+            .update_run_usage_if_current_owner(RunUsageOwnerUpdateRequest {
+                user_id: "u1",
+                expected_session_id: "s1",
+                run_id: "projection-repair",
+                prompt_tokens: 10,
+                completion_tokens: 4,
+                tool_calls: 2,
+                expected_owner_generation: 0,
+            })
             .await
             .unwrap();
 
@@ -44786,27 +44107,31 @@ mod tests {
 
         assert!(
             !store
-                .update_run_status("u2", "s1", "owner-bound", "completed", None, None)
+                .update_run_status_with_events_if_current(
+                    "u2",
+                    "s1",
+                    "owner-bound",
+                    &["running"],
+                    None,
+                    "completed",
+                    None,
+                    None,
+                    &[]
+                )
                 .await
                 .unwrap()
         );
         assert!(
             !store
-                .update_run_status_if_current(RunStatusCasRequest {
+                .update_run_usage_if_current_owner(RunUsageOwnerUpdateRequest {
                     user_id: "u2",
                     expected_session_id: "s1",
                     run_id: "owner-bound",
-                    expected_statuses: &["running"],
-                    status: "completed",
-                    waiting_for: None,
-                    error_message: None,
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    tool_calls: 1,
+                    expected_owner_generation: 0
                 })
-                .await
-                .unwrap()
-        );
-        assert!(
-            !store
-                .update_run_usage("u2", "s1", "owner-bound", 10, 5, 1)
                 .await
                 .unwrap()
         );
@@ -44815,12 +44140,6 @@ mod tests {
                 .save_checkpoint(RunCheckpointWriteRequest { user_id: "u2", expected_session_id: "s1", run_id: "owner-bound", checkpoint_json: r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"wrong-owner"}"#, authority: CheckpointWriteAuthority::ControlPlane })
                 .await
                 .unwrap().is_some()
-        );
-        assert!(
-            !store
-                .update_retry_count("u2", "s1", "owner-bound", 3)
-                .await
-                .unwrap()
         );
         assert!(
             store
@@ -44846,7 +44165,6 @@ mod tests {
         assert_eq!(loaded.total_prompt_tokens, 0);
         assert_eq!(loaded.total_completion_tokens, 0);
         assert_eq!(loaded.total_tool_calls, 0);
-        assert_eq!(loaded.retry_count, 0);
         assert_eq!(loaded.last_event_idx, -1);
         assert!(loaded.events.is_empty());
         assert!(loaded.checkpoint_json.is_none());
@@ -45242,15 +44560,16 @@ mod tests {
         ));
         assert!(
             store
-                .update_run_status_with_event_if_current(
+                .update_run_status_with_events_if_current(
                     "u1",
                     "s2",
                     "intent-apply-ack-lost-terminal",
                     &[STATUS_RUNNING],
+                    None,
                     STATUS_CANCELLED,
                     None,
                     None,
-                    json!({
+                    &[json!({
                         "event_type": "run_finished",
                         "idempotency_key": "intent-apply-ack-lost-terminal:cancelled",
                         "data": {
@@ -45258,7 +44577,7 @@ mod tests {
                             "cancelled": true,
                             "cancellation_origin": "runtime",
                         },
-                    }),
+                    })]
                 )
                 .await
                 .unwrap()
@@ -45293,10 +44612,35 @@ mod tests {
                 })
                 .await
                 .unwrap(),
-            AtomicRunUserIntentApply::Inactive {
-                status: STATUS_CANCELLED.to_string()
-            }
+            AtomicRunUserIntentApply::RunTerminalReturned
         );
+        let terminal = store
+            .load_run("u1", "intent-apply-ack-lost-terminal")
+            .await
+            .unwrap()
+            .unwrap();
+        let returned: Vec<_> = terminal
+            .events
+            .iter()
+            .filter(|event| {
+                event.get("event_type").and_then(serde_json::Value::as_str)
+                    == Some("user_intent_returned")
+            })
+            .collect();
+        assert_eq!(returned.len(), 1);
+        assert_eq!(
+            returned[0]
+                .pointer("/data/intent_id")
+                .and_then(serde_json::Value::as_str),
+            Some("intent-fresh-after-terminal")
+        );
+        assert_eq!(
+            returned[0]
+                .pointer("/data/event_index")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(terminal.status, STATUS_CANCELLED);
     }
 
     #[tokio::test]

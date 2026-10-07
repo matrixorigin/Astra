@@ -38,7 +38,7 @@ const ADMIN_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "model update",
-        "Update model fields  (e.g. model update <name> --quirks '{\"fallback_chain\":[\"gpt-4o-mini\"]}')",
+        "Update model fields  (e.g. model update <name> --quirks '{\"fixed_temperature\":0.7}')",
     ),
     (
         "user grant-role",

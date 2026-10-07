@@ -766,6 +766,10 @@ must satisfy one suite:
 
 The first-child fork-cache estimate telemetry prototype is retired: its sink
 configuration, event/probe APIs and stderr criterion were never connected to
-production execution. Prefix capture and required-prefix admission remain.
+production execution. The Server child executor starts from its admitted task
+and rejects explicit parent-prefix inheritance requests, including optional
+requests, before preparing any child. Process-local capture or resolver success
+is not proof of authorized, durable child context or actual provider-prefix reuse.
+Canonical session forks remain a separate owner/cursor/manifest boundary.
 Provider cache facts continue to come from canonical request usage, trace and
 Explain; child admission and result adoption do not prove a provider cache hit.

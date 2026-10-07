@@ -4084,4 +4084,57 @@ mod tests {
             "disabled policy must not emit marker"
         );
     }
+    #[test]
+    fn circuit_breaker_config_uses_runtime_config_defaults() {
+        let cfg = super::circuit_breaker_config_from_tool_policy(
+            &astra_config::runtime_config::ToolPolicyConfig::default(),
+        );
+
+        assert_eq!(cfg.stall_threshold, 6);
+        assert_eq!(cfg.repetition_threshold, 3);
+        assert_eq!(cfg.read_only_stall_threshold, 12);
+        // `0` in user config means "use default", NOT the BreakerConfig sentinel "unbounded".
+        assert_eq!(cfg.max_introspect_emissions, 3);
+        assert_eq!(cfg.half_open_patience, 2);
+        assert_eq!(cfg.absolute_max_rounds, 1000);
+    }
+
+    #[test]
+    fn circuit_breaker_config_uses_runtime_config_overrides_with_floors() {
+        let tool_policy = astra_config::runtime_config::ToolPolicyConfig {
+            circuit_breaker_stall_threshold: 1,
+            circuit_breaker_repetition_threshold: 7,
+            circuit_breaker_read_only_stall_threshold: 2,
+            // user=0 → effective_*() returns default (3); floor is 1
+            circuit_breaker_max_introspect_emissions: 0,
+            circuit_breaker_half_open_patience: 5,
+            circuit_breaker_absolute_max_rounds: 10,
+            ..Default::default()
+        };
+
+        let cfg = super::circuit_breaker_config_from_tool_policy(&tool_policy);
+
+        // stall: resolve(1, 6, 3) = max(1, 3) = 3 (floored)
+        assert_eq!(cfg.stall_threshold, 3);
+        // repetition: resolve(7, 3, 2) = max(7, 2) = 7
+        assert_eq!(cfg.repetition_threshold, 7);
+        // read_only: resolve(2, 12, 4) = max(2, 4) = 4 (floored)
+        assert_eq!(cfg.read_only_stall_threshold, 4);
+        // introspect: resolve(0, 3, 1) = 3 (default)
+        assert_eq!(cfg.max_introspect_emissions, 3);
+        assert_eq!(cfg.half_open_patience, 5);
+        // absolute: resolve(10, 200, 20) = max(10, 20) = 20 (floored)
+        assert_eq!(cfg.absolute_max_rounds, 20);
+    }
+
+    #[test]
+    fn circuit_breaker_config_introspect_floor_is_one() {
+        // user supplies explicit value=1 (at the floor) — should pass through unchanged
+        let tool_policy = astra_config::runtime_config::ToolPolicyConfig {
+            circuit_breaker_max_introspect_emissions: 1,
+            ..Default::default()
+        };
+        let cfg = super::circuit_breaker_config_from_tool_policy(&tool_policy);
+        assert_eq!(cfg.max_introspect_emissions, 1);
+    }
 }

@@ -123,7 +123,6 @@ impl ModelService for StaticTestModelService {
                 api_key: "test-key".to_string(),
                 base_url: "http://127.0.0.1:1".to_string(),
                 provider: "mock".to_string(),
-                fallback_chain: Vec::new(),
                 tags: Vec::new(),
                 request_body_overrides: None,
                 fixed_temperature: None,

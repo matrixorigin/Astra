@@ -1153,6 +1153,7 @@ async fn auto_recovery_retains_source_bound_child_model_requirement() {
         .expect("fixture Work decision")
         .decision;
     first.apply_classified_work_admission(ClassifiedWorkAdmission {
+        user_turn_semantics: None,
         decision: admission,
         delegation_model_requirement: Some(astra_services::WorkAdmissionTruth::Yes),
         source: Some(source.clone()),

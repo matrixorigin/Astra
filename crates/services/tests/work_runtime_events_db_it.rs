@@ -37,7 +37,7 @@ fn work_run(
         checkpoint_json: None,
         error_code: None,
         error_message: None,
-        retry_count: 0,
+
         total_prompt_tokens: 0,
         total_completion_tokens: 0,
         total_tool_calls: 0,
@@ -156,7 +156,17 @@ async fn root_run_terminal_fact_is_atomic_bounded_idempotent_and_projected() {
 
     assert!(
         store
-            .update_run_status(&owner_id, &session_id, &first_run_id, "failed", None, None,)
+            .update_run_status_with_events_if_current(
+                &owner_id,
+                &session_id,
+                &first_run_id,
+                &["failed"],
+                None,
+                "failed",
+                None,
+                None,
+                &[]
+            )
             .await
             .expect("idempotent terminal status replay")
     );
@@ -191,13 +201,16 @@ async fn root_run_terminal_fact_is_atomic_bounded_idempotent_and_projected() {
     .expect("simulate a projector lagging beyond the bounded ring");
     assert!(
         store
-            .update_run_status(
+            .update_run_status_with_events_if_current(
                 &owner_id,
                 &session_id,
                 &overflow_run_id,
+                &["running"],
+                None,
                 "completed",
                 None,
                 None,
+                &[]
             )
             .await
             .expect("terminal fact must survive projection overflow")

@@ -8,7 +8,6 @@ description: |
 prompt: |
   Call `agent` exactly once with:
     action: "spawn"
-    name: "small-budget-child"
     description: "Verify bounded child output"
     prompt: "Reply with the exact text: small-budget-ok. Do not use tools."
     max_output_tokens: 256

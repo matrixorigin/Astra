@@ -831,7 +831,7 @@ fn item_run(
         checkpoint_json: None,
         error_code: None,
         error_message: None,
-        retry_count: 0,
+
         total_prompt_tokens: 0,
         total_completion_tokens: 0,
         total_tool_calls: 0,
@@ -1000,13 +1000,16 @@ async fn terminal_fallback_settlement_is_atomic_and_never_overwrites_an_explicit
         .expect("explicit settlement while the run is active");
 
     run_store
-        .update_run_status(
+        .update_run_status_with_events_if_current(
             &owner_id,
             &session_id,
             &explicit_run_id,
+            &["running"],
+            None,
             "completed",
             None,
             None,
+            &[],
         )
         .await
         .expect("finish explicit run through the durable store");
@@ -1031,13 +1034,16 @@ async fn terminal_fallback_settlement_is_atomic_and_never_overwrites_an_explicit
         Err(WorkAttemptSettlementError::RunNotTerminal)
     ));
     run_store
-        .update_run_status(
+        .update_run_status_with_events_if_current(
             &owner_id,
             &session_id,
             &fallback_run_id,
+            &["running"],
+            None,
             "failed",
             None,
             None,
+            &[],
         )
         .await
         .expect("finish fallback run through the durable store");

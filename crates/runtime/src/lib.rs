@@ -281,7 +281,7 @@ pub use astra_turn_core::{
     },
 };
 pub use turn::cloud::{
-    compaction::{CompactBoundary, CompactCircuitBreaker, CompactResult, CompactTrigger},
+    compaction::{CompactBoundary, CompactResult, CompactTrigger},
     memoria_compact::{
         HttpMemoriaPort, MemoriaCompactConfig, MemoriaCompactParams, MemoriaMemory, MemoriaPort,
         compact_with_memoria, memoria_compact_retrieve_query,

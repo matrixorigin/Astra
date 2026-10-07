@@ -72,9 +72,9 @@ pub fn detect_language(path: &Path) -> Option<Language> {
     let ext = path.extension()?.to_str()?;
     match ext {
         "rs" => Some(Language::Rust),
-        "py" => Some(Language::Python),
-        "ts" | "tsx" => Some(Language::TypeScript),
-        "js" | "jsx" => Some(Language::JavaScript),
+        "py" | "pyi" => Some(Language::Python),
+        "ts" | "tsx" | "mts" => Some(Language::TypeScript),
+        "js" | "jsx" | "mjs" => Some(Language::JavaScript),
         "go" => Some(Language::Go),
         "java" => Some(Language::Java),
         "c" | "h" => Some(Language::C),

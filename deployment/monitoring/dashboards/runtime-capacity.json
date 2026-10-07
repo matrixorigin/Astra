@@ -150,10 +150,6 @@
           {
             "expr": "rate(astra_llm_provider_rate_limit_cooldowns_total[5m])",
             "legendFormat": "{{model}} cooldowns"
-          },
-          {
-            "expr": "rate(astra_llm_provider_rate_limit_fallbacks_total[5m])",
-            "legendFormat": "{{model}} fallbacks"
           }
         ]
       },

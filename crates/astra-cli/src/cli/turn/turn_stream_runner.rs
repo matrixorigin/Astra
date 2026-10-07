@@ -179,8 +179,7 @@ fn build_turn_stream_params<'a>(
         ask_user_request_tx: state.tui_ask_user_request_tx.clone(),
         plan_review_request_tx: state.tui_plan_review_request_tx.clone(),
         mcp_manager: Some(state.mcp_manager.clone()),
-        skill_quality_tracker: &mut state.skill_quality_tracker,
-        discovered_skills: Some(&mut state.discovered_skills),
+
         agent_spawner: state.agent_spawner.clone(),
         root_agent_id: Some("main"),
         observability_hub: prepared.observability_hub.clone(),
@@ -209,8 +208,7 @@ fn build_turn_stream_params<'a>(
         append_system_prompt: prepared.append_system_prompt.clone(),
         #[cfg(feature = "harness")]
         harness_sink: Some(state.harness_sink.clone()),
-        #[cfg(feature = "harness")]
-        harness_trace: Some(state.harness_trace.clone()),
+
         #[cfg(feature = "harness")]
         benchmark_profile: None,
     }

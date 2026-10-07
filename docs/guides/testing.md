@@ -68,14 +68,23 @@ use an explicit `null`. Omitting the Choice/Score field is malformed, not an
 implicit abstention.
 TypeSafe returns provider-native judgment values. The CLI returns normalized
 answers and execution-owned provenance; answer shape or model-name text cannot
-select the decoder. The harness requires one determined rubric category (fully
-yes, substantially yes, partial, or no), then maps it to 1.0, 0.7, 0.4, or 0.0.
-Judgment values are never scores; unknown, conflicting, and malformed rubric
-judgments fail without format repair. Rubric wire IDs are descriptive strings
-(`rubric_fully_yes`, `rubric_substantially_yes`, `rubric_partial`,
-`rubric_no`), not numeric indices. Missing, extra, duplicate, and wrongly typed
-answers remain invalid, not coerced. Criterion thresholds and quorum
-aggregation remain unchanged. Each judgment and quorum vote creates its own
+select the decoder. Required `hard_judger` assertions ask one
+`criterion_accepted` Noul question: does the evidence meet the criterion's own
+rules at its declared threshold? A determined answer is a verdict, not a
+numeric grade, and is not compared to that threshold again. Native Noul values
+at or below 0.2 mean no, at or above 0.8 mean yes; the middle range and explicit
+unknown answers are inconclusive. Quality `judger` criteria retain the four
+rubric categories mapped to 1.0, 0.7, 0.4, or 0.0; external command judgers
+retain their numeric score protocol and threshold comparison. Provider
+probabilities are never evaluation scores. Missing, extra, duplicate, wrongly
+typed, uncertain, and conflicting answers fail without format repair.
+
+Quorum keeps numeric aggregation for grades. Acceptance verdicts use strict
+majority for median (a tie is inconclusive), all votes for min, and any vote
+for max; mean is invalid for verdicts because averaging already-thresholded
+answers cannot recover the original grade mean. Required judgments fail if
+any vote is missing or errors, rather than discarding that vote. Mixed grades
+and verdicts are invalid. Each judgment and quorum vote creates its own
 session; its real usage is separate from the measured agent session. The CLI
 closes the evaluation session after a completed response or client-error rejection.
 Uncertain gateway and transport failures retain the session identity for diagnosis without

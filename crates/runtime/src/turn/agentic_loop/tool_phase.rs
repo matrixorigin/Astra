@@ -17,9 +17,6 @@ use crate::server::tool_transport::{
 use astra_services::runs::ToolOutputBatchItem;
 use astra_services::session_journal::ToolCallRecord;
 
-use super::super::agentic::delegate_interception::{
-    DelegationInterceptionResult, intercept_delegations, tool_call_arguments_value, tool_call_name,
-};
 use super::super::agentic::headless_round::{
     HeadlessRoundTerminal, HeadlessStderrStyle, HeadlessToolRoundCtx,
     run_agentic_headless_tool_round,
@@ -39,6 +36,7 @@ use super::host::{
     extract_file_path_from_tool, finalize_and_render, finalize_turn_trace,
     publish_introspect_snapshot, record_edge_tool_observability, try_write_heavy_checkpoint,
 };
+use astra_turn_core::tool_call_shape::{tool_call_arguments_value, tool_call_name};
 
 use super::lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
 use crate::turn::inspection_service::InspectionService;
@@ -1808,8 +1806,9 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
     Box::pin(async move {
         let TurnExecutionPhase {
             llm_wall_start,
-            mut turn_result,
+            turn_result,
         } = phase;
+        let mut edge_tool_round = Vec::new();
 
         // ── Text-only boundary enforcement ───────────────────────────────
         // If the runtime already projected a text-only boundary (budget wrapup,
@@ -1831,20 +1830,12 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         // two cases apart across tool-phase re-entries within the same turn. A
         // text-only boundary that was not created by a token/round wrapup uses
         // the same bounded protocol: one repair response, then incomplete.
-        // The model can ask for tool execution via two channels: server-side
-        // `accum.tool_calls` and edge-side `edge_tool_round`. The wrap-up
-        // promise covers BOTH, so check both.
-        let provider_reported_tool_calls = turn_result.accum.has_tool_calls
-            || turn_result
-                .accum
-                .server_execution_summary
-                .as_ref()
-                .is_some_and(|summary| summary.tool_calls_count > 0);
+        // Reject provider requests before admission, whether reported by the
+        // stream flag or carried in its canonical tool-call vector.
+        let provider_reported_tool_calls = turn_result.accum.has_tool_calls;
         let post_wrapup_tool_calls_present = (state.budget_wrapup_injected
             || state.hooks.completion_settlement.text_only)
-            && (provider_reported_tool_calls
-                || !turn_result.accum.tool_calls.is_empty()
-                || !turn_result.edge_tool_round.is_empty());
+            && (provider_reported_tool_calls || !turn_result.accum.tool_calls.is_empty());
         if post_wrapup_tool_calls_present {
             let finish_reason = state.last_finish_reason.clone();
             let records_start = state.stall.tool_call_records.len();
@@ -1864,17 +1855,8 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 tool_records,
             );
             capture_deferred_candidate_text(state, &turn_result);
-            let observed_count =
-                turn_result.accum.tool_calls.len() + turn_result.edge_tool_round.len();
-            let summary_count = turn_result
-                .accum
-                .server_execution_summary
-                .as_ref()
-                .map(|summary| summary.tool_calls_count as usize)
-                .unwrap_or_default();
-            let dropped_count = observed_count
-                .max(summary_count)
-                .max(usize::from(provider_reported_tool_calls));
+            let observed_count = turn_result.accum.tool_calls.len();
+            let dropped_count = observed_count.max(usize::from(provider_reported_tool_calls));
             state.budget_wrapup_ignored_rounds =
                 state.budget_wrapup_ignored_rounds.saturating_add(1);
             if state.budget_wrapup_ignored_rounds == 1 {
@@ -2017,91 +1999,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         )
         .map_err(|error| format!("tool admission contract violation: {error}"))?;
 
-        // Edge callbacks may already have executed while the stream was open.
-        // Correlate their typed tool/argument receipt with the same action frame.
-        // This transport cannot pre-admit a callback, so retain every executed
-        // result as audit evidence; an unmatched result consumes the window and
-        // forces a truthful incomplete terminal state instead of being silently
-        // dropped from the ledger.
-        if turn_result.accum.tool_calls.is_empty()
-            && let Some(action) = state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .as_ref()
-                .filter(|window| !window.consumed)
-                .map(|window| window.action.clone())
-            && !turn_result.edge_tool_round.is_empty()
-        {
-            let mut retained = Vec::with_capacity(turn_result.edge_tool_round.len());
-            let mut matched = false;
-            let mut unmatched = false;
-            let explicit_labels = match &action {
-                super::host::CompletionAction::ExplicitVerification { missing_labels } => {
-                    Some(missing_labels.clone())
-                }
-                _ => None,
-            };
-            let mut matched_labels = Vec::new();
-            for edge in turn_result.edge_tool_round.drain(..) {
-                let call = serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": edge.tool,
-                        "arguments": edge.args.to_string(),
-                    }
-                });
-                let label =
-                    super::execution_phase::completion_action_match_label(state, &action, &call);
-                let is_match = if let Some(required_labels) = explicit_labels.as_ref() {
-                    label.as_ref().is_some_and(|label| {
-                        required_labels.iter().any(|required| required == label)
-                            && !matched_labels.iter().any(|seen| seen == label)
-                    })
-                } else {
-                    !matched
-                        && super::execution_phase::completion_action_matches_tool_call(
-                            state, &action, &call,
-                        )
-                };
-                if is_match {
-                    matched = true;
-                    if let Some(label) = label {
-                        matched_labels.push(label);
-                    }
-                    retained.push(edge);
-                } else {
-                    unmatched = true;
-                    state.push_volatile_payload(
-                        super::host::VolatileKind::BudgetAdvisory,
-                        serde_json::json!({
-                            "schema": "completion_settlement.v2",
-                            "signal": "unmatched_completion_action_executed",
-                            "tool": call["function"]["name"],
-                            "execution_authority": "post_execution_transport",
-                            "terminal_effect": "execution_incomplete",
-                        }),
-                    );
-                    retained.push(edge);
-                }
-            }
-            turn_result.edge_tool_round = retained;
-            if let Some(window) = state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .as_mut()
-            {
-                window.consumed = true;
-                window.attempts_remaining = 0;
-                window.matched = if let Some(required_labels) = explicit_labels.as_ref() {
-                    matched && !unmatched && matched_labels.len() == required_labels.len()
-                } else {
-                    matched && !unmatched
-                };
-            }
-            state.hooks.completion_settlement.text_only = true;
-        }
         let mut admitted_tool_calls = admission.admitted;
         let mut admitted_logical_calls = admitted_tool_calls
             .iter()
@@ -2142,7 +2039,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                 &admitted_logical_calls,
                 &delivered.results,
             );
-            turn_result.edge_tool_round.extend(delivered.results);
+            edge_tool_round.extend(delivered.results);
         }
 
         // Rejection is still a model attempt. Omitting this lane produces an
@@ -2160,7 +2057,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
         agentic_round_stall_preflight(
             turn_index,
             &attempted_logical_calls,
-            &turn_result.edge_tool_round,
             &mut state.stall.turn_sigs,
             &mut state.stall.events,
             &mut state.turn_guard,
@@ -2168,22 +2064,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
 
         let valid_tool_names = host.valid_tool_names().clone();
         let deferred_tool_names = host.deferred_tool_names();
-        // Start before delegation interception as both delegation settlement and
-        // ordinary pre-resolved admission records belong to this provider round.
         let round_records_start = state.stall.tool_call_records.len();
-        let DelegationInterceptionResult {
-            effective_tool_calls,
-            pre_resolved_results: delegation_pre_resolved_results,
-            intercepted_any: delegation_intercepted,
-        } = intercept_delegations(
-            host,
-            state,
-            &admitted_logical_calls,
-            prep.quiet,
-            &valid_tool_names,
-        )
-        .await;
-
         // Capture records produced by interception/admission as part of the same
         // causal LLM round. Previously the round snapshot started *after* this
         // phase, so policy-rejected requests appeared in the transcript but were
@@ -2193,19 +2074,17 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             logical_tool_calls,
             deferred_activations_by_call_id,
             runtime_control_calls_by_id,
-            mut pre_resolved_results,
+            pre_resolved_results,
             edge_tool_round,
         } = try_prepare_intercepted_tool_round(
             state,
             &turn_result,
+            edge_tool_round,
             &admitted_tool_calls,
-            &effective_tool_calls,
+            &admitted_logical_calls,
             admission.rejected,
-            delegation_intercepted,
-            &valid_tool_names,
         )
         .await?;
-        pre_resolved_results.extend(delegation_pre_resolved_results);
         record_edge_tool_selection(state, &edge_tool_round, turn_index);
         let physical_tool_calls = physical_tool_calls.as_slice();
         let all_tool_calls = logical_tool_calls.as_slice();
@@ -4487,7 +4366,7 @@ mod tests {
                 ..Default::default()
             },
             ttft_ms: Some(4),
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         };
         let rejected = ToolCallRecord {

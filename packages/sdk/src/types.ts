@@ -402,8 +402,7 @@ export type ExplainAnalyzeUsageV1 = {
 export type ExplainAnalyzeContextSourceKindV1 =
   | "identity" | "self_model" | "project_context" | "deferred_tools"
   | "available_skills" | "memory" | "working_memory" | "history" | "constraints"
-  | "skills" | "runtime_identity" | "runtime_volatile" | "emergent_skills"
-  | "emergent_memory" | "emergent_summary";
+  | "skills" | "runtime_identity" | "runtime_volatile";
 
 export type ExplainAnalyzeContextBudgetV1 = {
   basis: "pre_provider_estimate";
@@ -1238,8 +1237,24 @@ export type WorkBinding = {
   branchId: string;
 };
 
+/** Verification obligations, executed through ordinary tool admission. */
+export type CompletionCheckDeclarations = {
+  stop: CompletionCheck[];
+  task_completed: CompletionCheck[];
+};
+
+export type CompletionCheck = {
+  label: string;
+  command: string;
+  working_dir: string | null;
+  depends_on: string[];
+  timeout_secs: number | null;
+  authoritative: boolean;
+};
+
 export type ChatRequest = {
   message: string;
+  completionChecks?: CompletionCheckDeclarations;
   parts?: unknown[];
   attachments?: unknown[];
   sessionId?: string;

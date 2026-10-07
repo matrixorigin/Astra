@@ -10,8 +10,6 @@ use serde_json::{Value, json};
 pub(crate) const MAX_RUN_CHAIN_STEPS: usize = 16;
 pub(crate) const MAX_RUN_CHAIN_MUTATING_STEPS: usize = 8;
 pub(crate) use astra_turn_core::safety_middleware::check_sql_safety;
-#[cfg(test)]
-pub(crate) use astra_turn_core::safety_middleware::strip_sql_comments;
 
 pub(crate) struct ToolSafetyGuard;
 

@@ -8,109 +8,15 @@
 //!
 //! Enhanced features (D-3):
 //! - `depends_on`: declare dependencies between hooks for ordered execution
-//! - `timeout`: per-hook timeout override
-//! - `cache_key`: skip hooks whose inputs haven't changed since last pass
+//! - `timeout`: per-hook timeout hint
 //! - Topological layering: hooks at the same depth can run in parallel
-
-use std::collections::{HashMap, VecDeque};
 
 pub use astra_turn_types::StopHook;
 
-/// Cached result from a previous stop-hook execution.
-#[derive(Debug, Clone)]
-pub struct CachedHookResult {
-    pub passed: bool,
-    pub cache_key: String,
-}
-
-/// A cache for stop hook results, enabling skip-on-pass behaviour.
-#[derive(Debug, Default)]
-pub struct StopHookCache {
-    entries: HashMap<String, CachedHookResult>,
-}
-
-impl StopHookCache {
-    pub fn record(&mut self, key: &str, passed: bool) {
-        self.entries.insert(
-            key.to_string(),
-            CachedHookResult {
-                passed,
-                cache_key: key.to_string(),
-            },
-        );
-    }
-
-    pub fn should_skip(&self, key: &str) -> bool {
-        self.entries.get(key).is_some_and(|r| r.passed)
-    }
-}
-
-/// Topological sort of hooks into layers. Hooks in the same layer can execute
-/// in parallel; layers themselves execute sequentially.
-///
-/// Returns `None` if there is a dependency cycle.
-pub fn build_execution_layers(hooks: &[StopHook]) -> Option<Vec<Vec<usize>>> {
-    let n = hooks.len();
-    let label_to_idx: HashMap<&str, usize> = hooks
-        .iter()
-        .enumerate()
-        .map(|(i, h)| (h.label.as_str(), i))
-        .collect();
-
-    // Build adjacency + in-degree
-    let mut in_degree = vec![0u32; n];
-    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
-
-    for (i, hook) in hooks.iter().enumerate() {
-        for dep_label in &hook.depends_on {
-            if let Some(&dep_idx) = label_to_idx.get(dep_label.as_str()) {
-                dependents[dep_idx].push(i);
-                in_degree[i] += 1;
-            }
-            // Unknown deps are silently ignored (may be from a different config)
-        }
-    }
-
-    // Kahn's algorithm
-    let mut queue: VecDeque<usize> = VecDeque::new();
-    for (i, &deg) in in_degree.iter().enumerate() {
-        if deg == 0 {
-            queue.push_back(i);
-        }
-    }
-
-    let mut layers: Vec<Vec<usize>> = Vec::new();
-    let mut processed = 0usize;
-
-    while !queue.is_empty() {
-        let layer: Vec<usize> = queue.drain(..).collect();
-        for &idx in &layer {
-            processed += 1;
-            for &dep in &dependents[idx] {
-                in_degree[dep] -= 1;
-                if in_degree[dep] == 0 {
-                    queue.push_back(dep);
-                }
-            }
-        }
-        layers.push(layer);
-    }
-
-    if processed == n {
-        Some(layers)
-    } else {
-        None // cycle detected
-    }
-}
-
-/// Filter out hooks that the cache says can be skipped.
-pub fn filter_cached(hooks: &[StopHook], cache: &StopHookCache) -> Vec<StopHook> {
-    hooks
-        .iter()
-        .filter(|h| h.cache_key.as_ref().is_none_or(|k| !cache.should_skip(k)))
-        .cloned()
-        .collect()
-}
+pub use astra_turn_types::{
+    MAX_COMPLETION_CHECKS, MAX_COMPLETION_DECLARATION_BYTES, build_execution_layers,
+    validate_completion_check_declarations,
+};
 
 /// Build a user message that instructs the LLM to run verification commands.
 ///
@@ -197,34 +103,6 @@ pub fn build_stop_hook_prompt(hooks: &[StopHook]) -> Option<serde_json::Value> {
     ))
 }
 
-/// Same as [`build_stop_hook_prompt`], but framed for post-delegation / teammate rounds.
-pub fn build_teammate_idle_hook_prompt(hooks: &[StopHook]) -> Option<serde_json::Value> {
-    if hooks.is_empty() {
-        return None;
-    }
-    let commands: Vec<String> = hooks
-        .iter()
-        .map(|h| {
-            if let Some(dir) = &h.working_dir {
-                format!("- `{}` (in `{dir}`) — {}", h.command, h.label)
-            } else {
-                format!("- `{}` — {}", h.command, h.label)
-            }
-        })
-        .collect();
-    Some(astra_turn_types::runtime_owned_message(
-        "user",
-        format!(
-            "⚠️ TEAMMATE ROUND COMPLETE: Delegated agents have returned. Before continuing, run these checks using the bash tool:\n\
-             {}\n\n\
-             If any check fails, fix the issues and re-run the failing check. \
-             Then proceed with your plan.",
-            commands.join("\n")
-        ),
-        astra_turn_types::RuntimeMessageDelivery::RequiredContext,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,9 +114,74 @@ mod tests {
             working_dir: None,
             depends_on: Vec::new(),
             timeout_secs: None,
-            cache_key: None,
+
             authoritative: false,
         }
+    }
+
+    #[test]
+    fn completion_declarations_reject_ambiguous_dependencies_and_oversized_input() {
+        use astra_turn_types::CompletionCheckDeclarations;
+        let checks = CompletionCheckDeclarations {
+            stop: vec![
+                simple_hook("build", "make build"),
+                simple_hook("test", "make test"),
+            ],
+            task_completed: vec![simple_hook("build", "make child")],
+        };
+        assert!(validate_completion_check_declarations(&checks).is_ok());
+        let mut dependent = checks.clone();
+        dependent.stop[1].depends_on = vec!["build".into()];
+        assert!(validate_completion_check_declarations(&dependent).is_ok());
+        let mut invalid = Vec::new();
+        let mut duplicate = checks.clone();
+        duplicate.stop[1].label = "build".into();
+        invalid.push(duplicate);
+        let mut unknown = checks.clone();
+        unknown.stop[0].depends_on = vec!["missing".into()];
+        invalid.push(unknown);
+        let mut cross_phase = checks.clone();
+        cross_phase.task_completed[0].depends_on = vec!["test".into()];
+        invalid.push(cross_phase);
+        let mut advisory_dependency = checks.clone();
+        advisory_dependency.stop[1].authoritative = true;
+        advisory_dependency.stop[1].depends_on = vec!["build".into()];
+        invalid.push(advisory_dependency);
+        dependent.stop[0].depends_on = vec!["test".into()];
+        invalid.push(dependent);
+        let mut count = checks.clone();
+        count.stop = (0..64)
+            .map(|i| simple_hook(&format!("check-{i}"), "true"))
+            .collect();
+        invalid.push(count);
+        let mut oversized_directory = checks.clone();
+        oversized_directory.stop[0].working_dir = Some("d".repeat(4097));
+        invalid.push(oversized_directory);
+        let mut total = checks.clone();
+        for check in total.stop.iter_mut().chain(&mut total.task_completed) {
+            check.command = "x".repeat(astra_core::MAX_SHELL_COMMAND_BYTES);
+        }
+        invalid.push(total);
+        let mut escaped = checks.clone();
+        escaped.task_completed.clear();
+        for check in &mut escaped.stop {
+            check.command = "\\a".repeat(48_000);
+        }
+        invalid.push(escaped);
+        for declarations in invalid {
+            assert!(validate_completion_check_declarations(&declarations).is_err());
+        }
+
+        let mut boundary = CompletionCheckDeclarations {
+            stop: vec![simple_hook("verify", "true")],
+            task_completed: Vec::new(),
+        };
+        boundary.stop[0].working_dir = Some("/workspace".into());
+        boundary.stop[0].command =
+            "x".repeat(astra_core::MAX_SHELL_COMMAND_BYTES - "/workspace".len() - 7);
+        assert!(validate_completion_check_declarations(&boundary).is_ok());
+        boundary.stop[0].command.push('x');
+        assert!(validate_completion_check_declarations(&boundary).is_err());
     }
 
     #[test]
@@ -254,7 +197,6 @@ mod tests {
             working_dir: Some("/project".into()),
             depends_on: Vec::new(),
             timeout_secs: None,
-            cache_key: None,
             authoritative: false,
         }];
         let msg = build_stop_hook_prompt(&hooks).unwrap();
@@ -280,15 +222,6 @@ mod tests {
     }
 
     #[test]
-    fn teammate_idle_prompt_differs() {
-        let hooks = vec![simple_hook("sync-check", "make verify")];
-        let msg = build_teammate_idle_hook_prompt(&hooks).unwrap();
-        let content = msg["content"].as_str().unwrap();
-        assert!(content.contains("TEAMMATE ROUND"));
-        assert!(content.contains("make verify"));
-    }
-
-    #[test]
     fn dependency_layers_no_deps() {
         let hooks = vec![
             simple_hook("a", "cmd_a"),
@@ -310,7 +243,6 @@ mod tests {
                 working_dir: None,
                 depends_on: vec!["build".into()],
                 timeout_secs: None,
-                cache_key: None,
                 authoritative: false,
             },
             StopHook {
@@ -319,7 +251,6 @@ mod tests {
                 working_dir: None,
                 depends_on: vec!["test".into()],
                 timeout_secs: None,
-                cache_key: None,
                 authoritative: false,
             },
         ];
@@ -341,7 +272,6 @@ mod tests {
                 working_dir: None,
                 depends_on: vec!["build".into()],
                 timeout_secs: None,
-                cache_key: None,
                 authoritative: false,
             },
             StopHook {
@@ -350,7 +280,6 @@ mod tests {
                 working_dir: None,
                 depends_on: vec!["build".into()],
                 timeout_secs: None,
-                cache_key: None,
                 authoritative: false,
             },
             StopHook {
@@ -359,7 +288,6 @@ mod tests {
                 working_dir: None,
                 depends_on: vec!["test".into(), "lint".into()],
                 timeout_secs: None,
-                cache_key: None,
                 authoritative: false,
             },
         ];
@@ -379,7 +307,6 @@ mod tests {
                 working_dir: None,
                 depends_on: vec!["b".into()],
                 timeout_secs: None,
-                cache_key: None,
                 authoritative: false,
             },
             StopHook {
@@ -388,47 +315,10 @@ mod tests {
                 working_dir: None,
                 depends_on: vec!["a".into()],
                 timeout_secs: None,
-                cache_key: None,
                 authoritative: false,
             },
         ];
         assert!(build_execution_layers(&hooks).is_none());
-    }
-
-    #[test]
-    fn cache_skip_passing() {
-        let mut cache = StopHookCache::default();
-        cache.record("check-key", true);
-        assert!(cache.should_skip("check-key"));
-        assert!(!cache.should_skip("unknown"));
-    }
-
-    #[test]
-    fn cache_no_skip_failing() {
-        let mut cache = StopHookCache::default();
-        cache.record("check-key", false);
-        assert!(!cache.should_skip("check-key"));
-    }
-
-    #[test]
-    fn filter_cached_removes_passing() {
-        let mut cache = StopHookCache::default();
-        cache.record("lint-key", true);
-        let hooks = vec![
-            StopHook {
-                label: "lint".into(),
-                command: "make lint".into(),
-                working_dir: None,
-                depends_on: Vec::new(),
-                timeout_secs: None,
-                cache_key: Some("lint-key".into()),
-                authoritative: false,
-            },
-            simple_hook("test", "make test"),
-        ];
-        let filtered = filter_cached(&hooks, &cache);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].label, "test");
     }
 
     #[test]
@@ -441,7 +331,6 @@ mod tests {
                 working_dir: None,
                 depends_on: vec!["build".into()],
                 timeout_secs: Some(60),
-                cache_key: None,
                 authoritative: false,
             },
         ];

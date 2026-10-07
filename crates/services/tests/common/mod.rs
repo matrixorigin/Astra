@@ -224,3 +224,53 @@ pub fn plan_acceptance(
         resolution_ref: WorkChangeRef::parse(resolution_ref).expect("resolution"),
     }
 }
+
+use astra_turn_types::{
+    ActorContextV1, SESSION_ATTACHMENT_SCHEMA_VERSION, SessionAttachmentModeV1,
+    SessionAttachmentV1, SessionKeyV1, SessionPlacementV1,
+};
+use uuid::Uuid;
+
+pub async fn controller_attachment(
+    pool: &astra_core::SharedPool,
+    key: &SessionKeyV1,
+    actor: ActorContextV1,
+) -> SessionAttachmentV1 {
+    let attachment = SessionAttachmentV1 {
+        schema_version: SESSION_ATTACHMENT_SCHEMA_VERSION,
+        attachment_id: Uuid::new_v4().to_string(),
+        attachment_epoch: 1,
+        key: key.clone(),
+        actor,
+        mode: SessionAttachmentModeV1::Controller,
+        placement: SessionPlacementV1::Server,
+        observed_cursor: None,
+        observed_manifest_root: None,
+        workspace: None,
+        attached_at_unix_ms: 1,
+        expires_at_unix_ms: i64::MAX,
+    };
+    sqlx::query(
+        "INSERT INTO session_attachments
+         (isolation_domain, owner_user_id, session_id, branch_id, attachment_id,
+          attachment_epoch, idempotency_hash, request_hash, actor_id, mode,
+          placement, attachment_json, expires_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'controller', 'server', ?, ?)",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .bind(&attachment.attachment_id)
+    .bind(attachment.attachment_epoch as i64)
+    .bind("a".repeat(64))
+    .bind("b".repeat(64))
+    .bind(&attachment.actor.actor_id)
+    .bind(serde_json::to_string(&attachment).expect("encode attachment"))
+    .bind(attachment.expires_at_unix_ms)
+    .execute(pool.get())
+    .await
+    .expect("insert controller attachment");
+
+    attachment
+}

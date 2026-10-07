@@ -1845,10 +1845,20 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             if run == "run-1" {
-                engine
-                    .persist_status("user-a", "session-a", run, "completed", None, None)
-                    .await
-                    .unwrap();
+                assert!(
+                    engine
+                        .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                            user_id: "user-a",
+                            expected_session_id: "session-a",
+                            run_id: run,
+                            status: "completed",
+                            waiting_for: None,
+                            error_message: None,
+                            expected_statuses: &["running"],
+                        })
+                        .await
+                        .unwrap()
+                );
             }
         }
         let store = Arc::new(MemoryStore::default());
@@ -1911,18 +1921,21 @@ pub(crate) mod tests {
         assert!(first.output.contains("Run: run-1"));
         assert!(!first.output.contains("current-root"));
         assert_eq!(fetches.total, 1);
-        // Later admission cannot change this current root's previous selection or handle.
-        engine
-            .persist_status(
-                "user-a",
-                "session-a",
-                "current-root",
-                "completed",
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+        // Advance durable selection after page one; the returned handle remains fixed.
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-a",
+                    expected_session_id: "session-a",
+                    run_id: "current-root",
+                    status: "completed",
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         engine
             .start_run("new-root", "user-a", "session-a")
             .await
@@ -1978,17 +1991,20 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn previous_and_exact_run_return_durable_projection_without_explain_artifact() {
         let (executor, store, engine) = handler_fixture().await;
-        engine
-            .persist_status(
-                "user-a",
-                "session-a",
-                "current-root",
-                "completed",
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-a",
+                    expected_session_id: "session-a",
+                    run_id: "current-root",
+                    status: "completed",
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         engine
             .start_run("plain-run", "user-a", "session-a")
             .await
@@ -2086,10 +2102,20 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        engine
-            .persist_status("user-a", "session-a", "plain-run", "completed", None, None)
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-a",
+                    expected_session_id: "session-a",
+                    run_id: "plain-run",
+                    status: "completed",
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         engine
             .start_run("projection-current-root", "user-a", "session-a")
             .await
@@ -2314,17 +2340,20 @@ pub(crate) mod tests {
             "unavailable",
         ] {
             let (executor, store, engine) = handler_fixture().await;
-            engine
-                .persist_status(
-                    "user-a",
-                    "session-a",
-                    "current-root",
-                    "completed",
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
+            assert!(
+                engine
+                    .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                        user_id: "user-a",
+                        expected_session_id: "session-a",
+                        run_id: "current-root",
+                        status: "completed",
+                        waiting_for: None,
+                        error_message: None,
+                        expected_statuses: &["running"],
+                    })
+                    .await
+                    .unwrap()
+            );
             engine
                 .start_run("new-root", "user-a", "session-a")
                 .await
@@ -2368,10 +2397,20 @@ pub(crate) mod tests {
                     "cancelled"
                 );
             } else {
-                engine
-                    .persist_status("user-a", "session-a", "new-root", "paused", None, None)
-                    .await
-                    .unwrap();
+                assert!(
+                    engine
+                        .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                            user_id: "user-a",
+                            expected_session_id: "session-a",
+                            run_id: "new-root",
+                            status: "paused",
+                            waiting_for: None,
+                            error_message: None,
+                            expected_statuses: &["running"],
+                        })
+                        .await
+                        .unwrap()
+                );
             }
             engine
                 .start_run("capture-current-root", "user-a", "session-a")

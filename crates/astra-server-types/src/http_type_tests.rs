@@ -1475,9 +1475,20 @@ fn work_task_graph_query_is_an_exact_pinned_pagination_contract() {
 
 #[test]
 fn chat_request_into_data_maps_all_fields() {
+    let check = |label: &str, command: &str| {
+        json!({
+            "label": label, "command": command, "working_dir": null,
+            "depends_on": [], "timeout_secs": null, "authoritative": true
+        })
+    };
+    let declarations = json!({
+        "stop": [check("root-check", "make check")],
+        "task_completed": [check("child-check", "make test")]
+    });
     let mut ctx = Map::new();
     ctx.insert("tool".into(), json!("calc"));
     let req = ChatRequest {
+        completion_checks: Some(serde_json::from_value(declarations.clone()).unwrap()),
         message: "hello".into(),
         conversation_authority: None,
         agent_profile_selection: None,
@@ -1551,6 +1562,10 @@ fn chat_request_into_data_maps_all_fields() {
         is_plan_subtask: None,
     };
     let data = chat_request_into_data(req);
+    assert_eq!(
+        serde_json::to_value(data.completion_checks.as_ref().unwrap()).unwrap(),
+        declarations
+    );
     assert_eq!(data.message, "hello");
     assert_eq!(data.user_intent.as_deref(), Some("pure hello"));
     assert_eq!(data.parts, vec![json!({"type": "text", "text": "hello"})]);
@@ -1688,6 +1703,7 @@ fn chat_request_rejects_removed_mcp_binding_ids_field() {
 #[test]
 fn chat_request_into_data_merges_plan_subtask_into_context() {
     let req = ChatRequest {
+        completion_checks: None,
         message: "do step".into(),
         conversation_authority: None,
         agent_profile_selection: None,

@@ -1,9 +1,7 @@
 //! Rate-limit cooldown mechanism.
 //!
 //! When consecutive 429/529 errors occur, the system enters a cooldown period
-//! where it either:
-//! - Falls back to a lower-tier model (if configured)
-//! - Rejects requests immediately until cooldown expires
+//! which rejects requests until cooldown expires.
 //!
 //! This prevents wasting tokens and time on retry loops during rate-limit events.
 
@@ -28,9 +26,6 @@ const SHORT_RETRY_THRESHOLD_MS: u64 = 20 * 1000; // 20 seconds
 
 /// Consecutive 429/529 errors needed to trigger cooldown.
 const CONSECUTIVE_ERROR_THRESHOLD: u64 = 3;
-
-/// Consecutive 529 errors needed to trigger model fallback.
-const MODEL_FALLBACK_THRESHOLD: u64 = 3;
 
 /// Default delay before retrying when the provider returned 429/529 but
 /// **did not include** a `Retry-After` header. Real LLM providers almost
@@ -71,8 +66,6 @@ const METRIC_LLM_PROVIDER_RATE_LIMIT_CONSECUTIVE_ERRORS: &str =
     "astra_llm_provider_rate_limit_consecutive_errors";
 const METRIC_LLM_PROVIDER_RATE_LIMIT_COOLDOWNS_TOTAL: &str =
     "astra_llm_provider_rate_limit_cooldowns_total";
-const METRIC_LLM_PROVIDER_RATE_LIMIT_FALLBACKS_TOTAL: &str =
-    "astra_llm_provider_rate_limit_fallbacks_total";
 const METRIC_LLM_PROVIDER_RATE_LIMIT_STATE: &str = "astra_llm_provider_rate_limit_state";
 const METRIC_LLM_PROVIDER_RATE_LIMIT_COOLDOWN_REMAINING_MS: &str =
     "astra_llm_provider_rate_limit_cooldown_remaining_ms";
@@ -102,14 +95,12 @@ impl CooldownReason {
 pub enum RateLimitState {
     /// Normal operation, no rate limiting.
     Active,
-    /// In cooldown period, requests should use fallback or be rejected.
+    /// In cooldown period, requests are rejected.
     Cooldown {
         /// When cooldown expires (milliseconds since epoch).
         reset_at_ms: u64,
         /// Why we entered cooldown.
         reason: CooldownReason,
-        /// Whether we've triggered model fallback.
-        fallback_triggered: bool,
     },
 }
 
@@ -120,9 +111,7 @@ pub enum RateLimitAction {
     Proceed,
     /// Wait for the specified duration, then retry.
     WaitAndRetry { delay_ms: u64 },
-    /// Use fallback model instead (caller resolves from DB).
-    UseFallback { reason: CooldownReason },
-    /// Reject the request (cooldown active, no fallback available).
+    /// Reject the request while cooldown is active.
     Reject {
         reason: CooldownReason,
         reset_in_ms: u64,
@@ -137,7 +126,6 @@ pub struct RateLimitMetrics {
     pub total_529_errors: u64,
     pub consecutive_errors: u64,
     pub cooldowns_triggered: u64,
-    pub fallbacks_triggered: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,16 +140,13 @@ pub struct PerModelRateLimitMetrics {
 /// Tracks rate-limit state and manages cooldown periods.
 ///
 /// Thread-safe and lock-free for most operations.
-/// Fallback availability is per-request (cloud-managed via DB), not stored here.
 #[derive(Debug)]
 pub struct RateLimitCooldown {
     state: AtomicU8,
     total_429_errors: AtomicU64,
     total_529_errors: AtomicU64,
     consecutive_errors: AtomicU64,
-    consecutive_529_errors: AtomicU64,
     cooldowns_triggered: AtomicU64,
-    fallbacks_triggered: AtomicU64,
     cooldown_info: Mutex<Option<CooldownInfo>>,
 }
 
@@ -169,7 +154,6 @@ pub struct RateLimitCooldown {
 struct CooldownInfo {
     reset_at: Instant,
     reason: CooldownReason,
-    fallback_triggered: bool,
 }
 
 impl RateLimitCooldown {
@@ -180,17 +164,13 @@ impl RateLimitCooldown {
             total_429_errors: AtomicU64::new(0),
             total_529_errors: AtomicU64::new(0),
             consecutive_errors: AtomicU64::new(0),
-            consecutive_529_errors: AtomicU64::new(0),
             cooldowns_triggered: AtomicU64::new(0),
-            fallbacks_triggered: AtomicU64::new(0),
             cooldown_info: Mutex::new(None),
         }
     }
 
     /// Check if we should proceed with a request.
-    ///
-    /// `has_fallback`: whether the caller has a fallback model available (from DB config).
-    pub fn check_request(&self, has_fallback: bool) -> RateLimitAction {
+    pub fn check_request(&self) -> RateLimitAction {
         match self.state.load(Ordering::SeqCst) {
             STATE_ACTIVE => RateLimitAction::Proceed,
             STATE_COOLDOWN => {
@@ -200,13 +180,8 @@ impl RateLimitCooldown {
                         // Cooldown expired — exit inline (already holding lock)
                         self.state.store(STATE_ACTIVE, Ordering::SeqCst);
                         self.consecutive_errors.store(0, Ordering::SeqCst);
-                        self.consecutive_529_errors.store(0, Ordering::SeqCst);
                         *info = None;
                         RateLimitAction::Proceed
-                    } else if has_fallback {
-                        RateLimitAction::UseFallback {
-                            reason: cooldown.reason,
-                        }
                     } else {
                         let reset_in_ms = cooldown
                             .reset_at
@@ -230,46 +205,21 @@ impl RateLimitCooldown {
     /// Record a successful request (resets consecutive error counters).
     pub fn record_success(&self) {
         self.consecutive_errors.store(0, Ordering::SeqCst);
-        self.consecutive_529_errors.store(0, Ordering::SeqCst);
     }
 
     /// Record a rate-limit error (429).
-    ///
-    /// `has_fallback`: whether a fallback model is available (from DB quirks).
-    pub fn record_429(&self, retry_after_ms: Option<u64>, has_fallback: bool) -> RateLimitAction {
+    pub fn record_429(&self, retry_after_ms: Option<u64>) -> RateLimitAction {
         self.total_429_errors.fetch_add(1, Ordering::SeqCst);
         let consecutive = self.consecutive_errors.fetch_add(1, Ordering::SeqCst) + 1;
 
-        self.handle_rate_limit_error(
-            consecutive,
-            retry_after_ms,
-            CooldownReason::RateLimit,
-            has_fallback,
-        )
+        self.handle_rate_limit_error(consecutive, retry_after_ms, CooldownReason::RateLimit)
     }
 
     /// Record a server overload error (529 or 503).
-    ///
-    /// `has_fallback`: whether a fallback model is available (from DB quirks).
-    pub fn record_529(&self, retry_after_ms: Option<u64>, has_fallback: bool) -> RateLimitAction {
+    pub fn record_529(&self, retry_after_ms: Option<u64>) -> RateLimitAction {
         self.total_529_errors.fetch_add(1, Ordering::SeqCst);
         let consecutive = self.consecutive_errors.fetch_add(1, Ordering::SeqCst) + 1;
-        let consecutive_529 = self.consecutive_529_errors.fetch_add(1, Ordering::SeqCst) + 1;
-
-        // Check if we should trigger model fallback (529-specific threshold)
-        if has_fallback && consecutive_529 >= MODEL_FALLBACK_THRESHOLD {
-            self.enter_cooldown_with_fallback(CooldownReason::Overloaded);
-            return RateLimitAction::UseFallback {
-                reason: CooldownReason::Overloaded,
-            };
-        }
-
-        self.handle_rate_limit_error(
-            consecutive,
-            retry_after_ms,
-            CooldownReason::Overloaded,
-            has_fallback,
-        )
+        self.handle_rate_limit_error(consecutive, retry_after_ms, CooldownReason::Overloaded)
     }
 
     /// Handle rate-limit error logic.
@@ -278,17 +228,7 @@ impl RateLimitCooldown {
         consecutive: u64,
         retry_after_ms: Option<u64>,
         reason: CooldownReason,
-        has_fallback: bool,
     ) -> RateLimitAction {
-        // A short provider hint controls *when* to retry the same route, but it
-        // must not suppress the configured route-switch policy forever. Once
-        // the error threshold is reached, transfer control to the fallback
-        // owner before considering another same-route delay.
-        if consecutive >= CONSECUTIVE_ERROR_THRESHOLD && has_fallback {
-            self.enter_cooldown_with_fallback(reason);
-            return RateLimitAction::UseFallback { reason };
-        }
-
         // Short retry-after: just wait and retry
         if let Some(delay) = retry_after_ms
             && delay < SHORT_RETRY_THRESHOLD_MS
@@ -328,27 +268,7 @@ impl RateLimitCooldown {
         let reset_at = Instant::now() + Duration::from_millis(duration_ms);
 
         let mut info = astra_core::sync_poison::recover_mutex_lock(&self.cooldown_info);
-        *info = Some(CooldownInfo {
-            reset_at,
-            reason,
-            fallback_triggered: false,
-        });
-        self.state.store(STATE_COOLDOWN, Ordering::SeqCst);
-    }
-
-    /// Enter cooldown state with model fallback.
-    fn enter_cooldown_with_fallback(&self, reason: CooldownReason) {
-        self.cooldowns_triggered.fetch_add(1, Ordering::SeqCst);
-        self.fallbacks_triggered.fetch_add(1, Ordering::SeqCst);
-
-        let reset_at = Instant::now() + Duration::from_millis(DEFAULT_COOLDOWN_MS);
-
-        let mut info = astra_core::sync_poison::recover_mutex_lock(&self.cooldown_info);
-        *info = Some(CooldownInfo {
-            reset_at,
-            reason,
-            fallback_triggered: true,
-        });
+        *info = Some(CooldownInfo { reset_at, reason });
         self.state.store(STATE_COOLDOWN, Ordering::SeqCst);
     }
 
@@ -359,7 +279,6 @@ impl RateLimitCooldown {
         let mut info = astra_core::sync_poison::recover_mutex_lock(&self.cooldown_info);
         self.state.store(STATE_ACTIVE, Ordering::SeqCst);
         self.consecutive_errors.store(0, Ordering::SeqCst);
-        self.consecutive_529_errors.store(0, Ordering::SeqCst);
         *info = None;
     }
 
@@ -382,7 +301,6 @@ impl RateLimitCooldown {
                     RateLimitState::Cooldown {
                         reset_at_ms,
                         reason: cooldown.reason,
-                        fallback_triggered: cooldown.fallback_triggered,
                     }
                 } else {
                     RateLimitState::Active
@@ -406,7 +324,6 @@ impl RateLimitCooldown {
             total_529_errors: self.total_529_errors.load(Ordering::SeqCst),
             consecutive_errors: self.consecutive_errors.load(Ordering::SeqCst),
             cooldowns_triggered: self.cooldowns_triggered.load(Ordering::SeqCst),
-            fallbacks_triggered: self.fallbacks_triggered.load(Ordering::SeqCst),
         }
     }
 
@@ -436,7 +353,6 @@ impl RateLimitCooldown {
     pub fn reset_for_tests(&self) {
         self.state.store(STATE_ACTIVE, Ordering::SeqCst);
         self.consecutive_errors.store(0, Ordering::SeqCst);
-        self.consecutive_529_errors.store(0, Ordering::SeqCst);
         let mut info = astra_core::sync_poison::recover_mutex_lock(&self.cooldown_info);
         *info = None;
     }
@@ -544,11 +460,6 @@ impl PerModelCooldown {
                 &[("model", model)],
                 metrics.cooldowns_triggered,
             );
-            registry.set_counter_absolute(
-                METRIC_LLM_PROVIDER_RATE_LIMIT_FALLBACKS_TOTAL,
-                &[("model", model)],
-                metrics.fallbacks_triggered,
-            );
             for state in ["active", "cooldown"] {
                 registry.set_gauge(
                     METRIC_LLM_PROVIDER_RATE_LIMIT_STATE,
@@ -584,10 +495,6 @@ fn register_rate_limit_metrics(registry: &MetricsRegistry) {
         METRIC_LLM_PROVIDER_RATE_LIMIT_COOLDOWNS_TOTAL,
         "Provider cooldown entries triggered by model.",
     );
-    registry.register_counter(
-        METRIC_LLM_PROVIDER_RATE_LIMIT_FALLBACKS_TOTAL,
-        "Provider cooldown-triggered model fallback entries by model.",
-    );
     registry.register_gauge(
         METRIC_LLM_PROVIDER_RATE_LIMIT_STATE,
         "Current provider rate-limit state by model; 1 for active state, 0 otherwise.",
@@ -596,69 +503,6 @@ fn register_rate_limit_metrics(registry: &MetricsRegistry) {
         METRIC_LLM_PROVIDER_RATE_LIMIT_COOLDOWN_REMAINING_MS,
         "Remaining provider cooldown duration in milliseconds by model.",
     );
-}
-
-// ── Fallback Chain Resolution ─────────────────────────────────────────────────
-
-/// Outcome of [`try_resolve_fallback`].
-#[derive(Debug)]
-pub enum FallbackOutcome<T> {
-    /// A fallback model was resolved successfully.
-    Resolved(T),
-    /// No fallback chain configured (chain was empty).
-    NoFallbackConfigured,
-    /// All fallback models were exhausted (cooldown or resolution failure).
-    AllExhausted { chain_len: usize },
-}
-
-/// Walk the fallback chain, skip models in cooldown, and resolve the first
-/// available one via the caller-supplied async `resolve` closure.
-///
-/// This is the shared logic behind both `server_loop_host` and
-/// `server_loop` fallback handling — extracted to eliminate duplication.
-pub async fn try_resolve_fallback<T, F, Fut>(
-    cooldown: &PerModelCooldown,
-    chain: &[String],
-    reason: CooldownReason,
-    mut resolve: F,
-) -> FallbackOutcome<T>
-where
-    F: FnMut(String) -> Fut,
-    Fut: std::future::Future<Output = Result<T, String>>,
-{
-    if chain.is_empty() {
-        return FallbackOutcome::NoFallbackConfigured;
-    }
-    for fb_name in chain {
-        // Skip fallback models that are themselves in cooldown.
-        let fb_ok = cooldown.with(fb_name, |c| c.check_request(false));
-        if !matches!(
-            fb_ok,
-            RateLimitAction::Proceed | RateLimitAction::WaitAndRetry { .. }
-        ) {
-            continue;
-        }
-        astra_core::agent_info!(
-            "llm",
-            "rate-limit cooldown: trying fallback model '{}' ({})",
-            fb_name,
-            reason.as_str()
-        );
-        match resolve(fb_name.clone()).await {
-            Ok(resolved) => return FallbackOutcome::Resolved(resolved),
-            Err(e) => {
-                astra_core::agent_warn!(
-                    "llm",
-                    "fallback model '{}' resolution failed: {}",
-                    fb_name,
-                    e
-                );
-            }
-        }
-    }
-    FallbackOutcome::AllExhausted {
-        chain_len: chain.len(),
-    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -671,107 +515,66 @@ mod tests {
     fn starts_active() {
         let rl = RateLimitCooldown::new();
         assert_eq!(rl.state(), RateLimitState::Active);
-        assert_eq!(rl.check_request(false), RateLimitAction::Proceed);
+        assert_eq!(rl.check_request(), RateLimitAction::Proceed);
     }
 
     #[test]
     fn success_resets_counters() {
         let rl = RateLimitCooldown::new();
-        rl.record_429(None, false);
-        rl.record_429(None, false);
+        rl.record_429(None);
+        rl.record_429(None);
         assert_eq!(rl.metrics().consecutive_errors, 2);
 
         rl.record_success();
         assert_eq!(rl.metrics().consecutive_errors, 0);
+
+        for _ in 0..3 {
+            rl.record_529(None);
+        }
+        assert!(rl.is_in_cooldown());
+        rl.record_success();
+        assert_eq!(rl.metrics().consecutive_errors, 0);
+        assert!(
+            rl.is_in_cooldown(),
+            "success must not expire an active cooldown"
+        );
+        assert!(matches!(rl.check_request(), RateLimitAction::Reject { .. }));
     }
 
     #[test]
     fn short_retry_after_does_not_enter_cooldown() {
         let rl = RateLimitCooldown::new();
-        let action = rl.record_429(Some(5000), false); // 5 seconds
-        assert_eq!(action, RateLimitAction::WaitAndRetry { delay_ms: 5000 });
-        assert_eq!(rl.state(), RateLimitState::Active);
+        for _ in 0..=CONSECUTIVE_ERROR_THRESHOLD {
+            let action = rl.record_429(Some(5000));
+            assert_eq!(action, RateLimitAction::WaitAndRetry { delay_ms: 5000 });
+            assert_eq!(rl.state(), RateLimitState::Active);
+        }
     }
 
     #[test]
-    fn repeated_short_retry_after_transfers_to_configured_fallback() {
-        let rl = RateLimitCooldown::new();
-
-        assert!(matches!(
-            rl.record_429(Some(0), true),
-            RateLimitAction::WaitAndRetry { delay_ms: 0 }
-        ));
-        assert!(matches!(
-            rl.record_429(Some(0), true),
-            RateLimitAction::WaitAndRetry { delay_ms: 0 }
-        ));
-        assert!(matches!(
-            rl.record_429(Some(0), true),
-            RateLimitAction::UseFallback {
-                reason: CooldownReason::RateLimit
-            }
-        ));
-        assert_eq!(rl.metrics().fallbacks_triggered, 1);
-    }
-
-    #[test]
-    fn consecutive_errors_trigger_cooldown_no_fallback() {
+    fn consecutive_errors_trigger_cooldown() {
         let rl = RateLimitCooldown::new();
 
         // First two errors: wait and retry
-        let action1 = rl.record_429(None, false);
+        let action1 = rl.record_429(None);
         assert!(matches!(action1, RateLimitAction::WaitAndRetry { .. }));
 
-        let action2 = rl.record_429(None, false);
+        let action2 = rl.record_429(None);
         assert!(matches!(action2, RateLimitAction::WaitAndRetry { .. }));
 
-        // Third error: enters cooldown (no fallback = reject)
-        let action3 = rl.record_429(None, false);
+        // Third error: enters cooldown and rejects the request
+        let action3 = rl.record_429(None);
         assert!(matches!(action3, RateLimitAction::Reject { .. }));
         assert!(rl.is_in_cooldown());
     }
 
     #[test]
-    fn fallback_available_uses_fallback() {
+    fn consecutive_529_rejects() {
         let rl = RateLimitCooldown::new();
 
-        // has_fallback = true → should get UseFallback action
-        rl.record_429(None, true);
-        rl.record_429(None, true);
-        let action = rl.record_429(None, true);
-
-        assert!(matches!(
-            action,
-            RateLimitAction::UseFallback {
-                reason: CooldownReason::RateLimit
-            }
-        ));
-    }
-
-    #[test]
-    fn consecutive_529_triggers_fallback() {
-        let rl = RateLimitCooldown::new();
-
-        rl.record_529(None, true);
-        rl.record_529(None, true);
-        let action = rl.record_529(None, true);
-
-        assert!(matches!(
-            action,
-            RateLimitAction::UseFallback {
-                reason: CooldownReason::Overloaded
-            }
-        ));
-        assert_eq!(rl.metrics().fallbacks_triggered, 1);
-    }
-
-    #[test]
-    fn consecutive_529_no_fallback_rejects() {
-        let rl = RateLimitCooldown::new();
-
-        rl.record_529(None, false);
-        rl.record_529(None, false);
-        let action = rl.record_529(None, false);
+        rl.record_529(None);
+        rl.record_529(None);
+        let action = rl.record_529(None);
 
         assert!(matches!(action, RateLimitAction::Reject { .. }));
     }
@@ -788,34 +591,18 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
 
         // check_request should exit cooldown
-        let action = rl.check_request(false);
+        let action = rl.check_request();
         assert_eq!(action, RateLimitAction::Proceed);
         assert!(!rl.is_in_cooldown());
-    }
-
-    #[test]
-    fn cooldown_check_with_fallback() {
-        let rl = RateLimitCooldown::new();
-
-        rl.enter_cooldown(5000, CooldownReason::RateLimit);
-        assert!(rl.is_in_cooldown());
-
-        // Without fallback → Reject
-        let action = rl.check_request(false);
-        assert!(matches!(action, RateLimitAction::Reject { .. }));
-
-        // With fallback → UseFallback
-        let action = rl.check_request(true);
-        assert!(matches!(action, RateLimitAction::UseFallback { .. }));
     }
 
     #[test]
     fn metrics_tracking() {
         let rl = RateLimitCooldown::new();
 
-        rl.record_429(None, false);
-        rl.record_429(None, false);
-        rl.record_529(None, false);
+        rl.record_429(None);
+        rl.record_429(None);
+        rl.record_529(None);
 
         let m = rl.metrics();
         assert_eq!(m.total_429_errors, 2);
@@ -855,9 +642,9 @@ mod tests {
         let rl = RateLimitCooldown::new();
 
         // Long retry-after on first error
-        rl.record_429(Some(30_000), false); // 30 seconds
-        rl.record_429(Some(30_000), false);
-        let action = rl.record_429(Some(30_000), false);
+        rl.record_429(Some(30_000)); // 30 seconds
+        rl.record_429(Some(30_000));
+        let action = rl.record_429(Some(30_000));
 
         // Should enter cooldown with the provided duration
         assert!(
@@ -874,214 +661,14 @@ mod tests {
     #[test]
     fn reset_for_tests_clears_cooldown_and_counters() {
         let rl = RateLimitCooldown::new();
-        rl.record_429(None, false);
-        rl.record_429(None, false);
-        rl.record_429(None, false);
+        rl.record_429(None);
+        rl.record_429(None);
+        rl.record_429(None);
         assert!(rl.is_in_cooldown());
         rl.reset_for_tests();
         assert!(!rl.is_in_cooldown());
         assert_eq!(rl.metrics().consecutive_errors, 0);
-        assert_eq!(rl.check_request(false), RateLimitAction::Proceed);
-    }
-
-    // ── Fallback model resolution integration tests ──────────────────────────
-
-    #[test]
-    fn fallback_lifecycle_529_then_success_resets() {
-        let rl = RateLimitCooldown::new();
-
-        // Trigger fallback via 3 consecutive 529 errors
-        rl.record_529(None, true);
-        rl.record_529(None, true);
-        let action = rl.record_529(None, true);
-        assert!(
-            matches!(
-                action,
-                RateLimitAction::UseFallback {
-                    reason: CooldownReason::Overloaded
-                }
-            ),
-            "expected UseFallback, got {action:?}"
-        );
-
-        // Simulate success on fallback model
-        rl.record_success();
-
-        // Counters should be reset, but cooldown is still active
-        // (cooldown expires by time, not by success)
-        assert!(
-            rl.is_in_cooldown(),
-            "cooldown should still be active after success"
-        );
-        assert_eq!(
-            rl.metrics().consecutive_errors,
-            0,
-            "consecutive errors should reset"
-        );
-        assert_eq!(rl.metrics().consecutive_errors, 0);
-
-        // During cooldown, check_request with fallback still returns UseFallback
-        let action = rl.check_request(true);
-        assert!(
-            matches!(action, RateLimitAction::UseFallback { .. }),
-            "during cooldown, check_request(true) should return UseFallback"
-        );
-    }
-
-    #[test]
-    fn fallback_lifecycle_cooldown_expires_then_primary_resumes() {
-        let rl = RateLimitCooldown::new();
-
-        // Trigger fallback with short cooldown
-        rl.enter_cooldown_with_fallback(CooldownReason::Overloaded);
-
-        // Override cooldown with a very short duration
-        {
-            let mut info = rl.cooldown_info.lock().expect("lock");
-            if let Some(ref mut ci) = *info {
-                ci.reset_at = Instant::now() + Duration::from_millis(50);
-            }
-        }
-
-        assert!(rl.is_in_cooldown());
-
-        // Wait for cooldown to expire
-        std::thread::sleep(Duration::from_millis(100));
-
-        // check_request should auto-exit cooldown and return Proceed
-        let action = rl.check_request(true);
-        assert_eq!(
-            action,
-            RateLimitAction::Proceed,
-            "after cooldown expires, should proceed with primary"
-        );
-        assert!(!rl.is_in_cooldown());
-    }
-
-    #[test]
-    fn mixed_429_529_only_529_triggers_fallback_metric() {
-        let rl = RateLimitCooldown::new();
-
-        // 2 x 429 (no fallback metric)
-        rl.record_429(None, true);
-        rl.record_429(None, true);
-        assert_eq!(
-            rl.metrics().fallbacks_triggered,
-            0,
-            "429 should not trigger fallback metric"
-        );
-
-        // Reset counters to test 529 path separately
-        rl.record_success();
-
-        // 3 x 529 triggers fallback
-        rl.record_529(None, true);
-        rl.record_529(None, true);
-        let action = rl.record_529(None, true);
-        assert!(matches!(action, RateLimitAction::UseFallback { .. }));
-        assert_eq!(
-            rl.metrics().fallbacks_triggered,
-            1,
-            "529 should trigger fallback metric"
-        );
-    }
-
-    #[test]
-    fn check_request_during_cooldown_without_fallback_rejects() {
-        let rl = RateLimitCooldown::new();
-
-        // Enter cooldown via 429s without fallback
-        rl.record_429(None, false);
-        rl.record_429(None, false);
-        let action = rl.record_429(None, false);
-        assert!(matches!(action, RateLimitAction::Reject { .. }));
-
-        // Subsequent checks without fallback → still reject
-        let action = rl.check_request(false);
-        assert!(matches!(action, RateLimitAction::Reject { .. }));
-
-        // Same cooldown, but NOW fallback is available → UseFallback
-        // (simulates DB config change while in cooldown)
-        let action = rl.check_request(true);
-        assert!(
-            matches!(action, RateLimitAction::UseFallback { .. }),
-            "adding fallback during cooldown should switch to UseFallback"
-        );
-    }
-
-    #[test]
-    fn state_reflects_fallback_triggered() {
-        let rl = RateLimitCooldown::new();
-
-        // Both rate-limit families report the route transfer in state and
-        // metrics; callers must not receive UseFallback while telemetry says
-        // no fallback happened.
-        rl.record_429(None, true);
-        rl.record_429(None, true);
-        rl.record_429(None, true);
-
-        if let RateLimitState::Cooldown {
-            fallback_triggered, ..
-        } = rl.state()
-        {
-            assert!(
-                fallback_triggered,
-                "429 fallback cooldown should set fallback_triggered"
-            );
-        } else {
-            panic!("expected cooldown state");
-        }
-
-        // Reset
-        rl.exit_cooldown();
-
-        // 529-triggered fallback cooldown
-        rl.record_529(None, true);
-        rl.record_529(None, true);
-        rl.record_529(None, true);
-
-        if let RateLimitState::Cooldown {
-            fallback_triggered, ..
-        } = rl.state()
-        {
-            assert!(
-                fallback_triggered,
-                "529 fallback cooldown should set fallback_triggered"
-            );
-        } else {
-            panic!("expected cooldown state");
-        }
-    }
-
-    #[test]
-    fn multiple_fallback_cycles() {
-        let rl = RateLimitCooldown::new();
-
-        // First fallback cycle
-        rl.record_529(None, true);
-        rl.record_529(None, true);
-        rl.record_529(None, true);
-        assert_eq!(rl.metrics().fallbacks_triggered, 1);
-
-        // Simulate cooldown expiry
-        rl.exit_cooldown();
-        rl.record_success();
-
-        // Second fallback cycle
-        rl.record_529(None, true);
-        rl.record_529(None, true);
-        let action = rl.record_529(None, true);
-        assert!(matches!(action, RateLimitAction::UseFallback { .. }));
-        assert_eq!(
-            rl.metrics().fallbacks_triggered,
-            2,
-            "second cycle should increment fallbacks"
-        );
-        assert_eq!(
-            rl.metrics().total_529_errors,
-            6,
-            "total 529 errors accumulated"
-        );
+        assert_eq!(rl.check_request(), RateLimitAction::Proceed);
     }
 
     // ── Additional edge-case tests ──
@@ -1113,19 +700,19 @@ mod tests {
         let pmc = PerModelCooldown::new();
         // Record errors for model A
         pmc.with("model-a", |rl| {
-            rl.record_429(None, false);
-            rl.record_429(None, false);
-            rl.record_429(None, false);
+            rl.record_429(None);
+            rl.record_429(None);
+            rl.record_429(None);
         });
         // Model B should still be active
-        let action = pmc.with("model-b", |rl| rl.check_request(false));
+        let action = pmc.with("model-b", |rl| rl.check_request());
         assert_eq!(action, RateLimitAction::Proceed);
     }
 
     #[test]
     fn per_model_cooldown_creates_on_demand() {
         let pmc = PerModelCooldown::new();
-        let action = pmc.with("new-model", |rl| rl.check_request(false));
+        let action = pmc.with("new-model", |rl| rl.check_request());
         assert_eq!(action, RateLimitAction::Proceed);
     }
 
@@ -1133,14 +720,14 @@ mod tests {
     fn per_model_metrics_scrape_exports_provider_cooldown_state() {
         let pmc = PerModelCooldown::new();
         pmc.with("model-a", |rl| {
-            rl.record_429(None, false);
-            rl.record_429(None, false);
-            rl.record_429(None, false);
+            rl.record_429(None);
+            rl.record_429(None);
+            rl.record_429(None);
         });
         pmc.with("model-b", |rl| {
-            rl.record_529(None, true);
-            rl.record_529(None, true);
-            rl.record_529(None, true);
+            rl.record_529(None);
+            rl.record_529(None);
+            rl.record_529(None);
         });
 
         let registry = MetricsRegistry::new();
@@ -1153,14 +740,18 @@ mod tests {
             ),
             "{rendered}"
         );
+        for model in ["model-a", "model-b"] {
+            assert!(
+                rendered.contains(&format!(
+                    "astra_llm_provider_rate_limit_state{{model=\"{model}\",state=\"cooldown\"}} 1"
+                )),
+                "{rendered}"
+            );
+        }
         assert!(
             rendered.contains(
-                "astra_llm_provider_rate_limit_state{model=\"model-a\",state=\"cooldown\"} 1"
+                "astra_llm_provider_rate_limit_errors_total{model=\"model-b\",status=\"529\"} 3"
             ),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("astra_llm_provider_rate_limit_fallbacks_total{model=\"model-b\"} 1"),
             "{rendered}"
         );
     }
@@ -1168,7 +759,7 @@ mod tests {
     #[test]
     fn single_429_below_threshold_waits_and_retries() {
         let rl = RateLimitCooldown::new();
-        let action = rl.record_429(None, false);
+        let action = rl.record_429(None);
         // Below consecutive threshold + no Retry-After header → WaitAndRetry
         // falls back to DEFAULT_RETRY_AFTER_MS.
         assert_eq!(
@@ -1183,9 +774,9 @@ mod tests {
     fn max_cooldown_capped() {
         let rl = RateLimitCooldown::new();
         // Trigger cooldown with very large retry-after
-        rl.record_429(Some(999_999_999), false);
-        rl.record_429(Some(999_999_999), false);
-        let action = rl.record_429(Some(999_999_999), false);
+        rl.record_429(Some(999_999_999));
+        rl.record_429(Some(999_999_999));
+        let action = rl.record_429(Some(999_999_999));
         // Should be capped at MAX_COOLDOWN_MS (5 minutes)
         match action {
             RateLimitAction::Reject { reset_in_ms, .. } => {
@@ -1221,8 +812,8 @@ mod tests {
         assert!(rl.cooldown_info.lock().is_err(), "mutex should be poisoned");
 
         // Despite the poison, all operations must still work.
-        assert!(matches!(rl.check_request(false), RateLimitAction::Proceed));
-        rl.record_429(None, false);
+        assert!(matches!(rl.check_request(), RateLimitAction::Proceed));
+        rl.record_429(None);
         rl.record_success();
         let m = rl.metrics();
         assert_eq!(m.state, "active");
@@ -1291,144 +882,22 @@ mod tests {
         const _: () = assert!(DEFAULT_COOLDOWN_MS <= 30_000);
     }
 
-    // ── Fallback chain walk decision tests ───────────────────────────────
-
     #[test]
-    fn fallback_chain_skips_cooldown_model_picks_active() {
-        let pmc = PerModelCooldown::new();
-        // Push model-a into cooldown (3 consecutive 429s)
-        pmc.with("model-a", |rl| {
-            rl.record_429(None, true);
-            rl.record_429(None, true);
-            rl.record_429(None, true);
-        });
-        // model-b should still be available
-        let a_action = pmc.with("model-a", |rl| rl.check_request(true));
-        assert!(
-            matches!(a_action, RateLimitAction::UseFallback { .. }),
-            "model-a should trigger fallback, got: {a_action:?}"
-        );
-        let b_action = pmc.with("model-b", |rl| rl.check_request(false));
-        assert_eq!(b_action, RateLimitAction::Proceed);
-    }
-
-    #[test]
-    fn fallback_chain_all_models_in_cooldown() {
+    fn per_model_cooldown_rejects_each_limited_model() {
         let pmc = PerModelCooldown::new();
         for model in &["model-a", "model-b", "model-c"] {
             pmc.with(model, |rl| {
-                rl.record_429(None, false);
-                rl.record_429(None, false);
-                rl.record_429(None, false);
+                rl.record_429(None);
+                rl.record_429(None);
+                rl.record_429(None);
             });
         }
         for model in &["model-a", "model-b", "model-c"] {
-            let action = pmc.with(model, |rl| rl.check_request(false));
+            let action = pmc.with(model, |rl| rl.check_request());
             assert!(
                 matches!(action, RateLimitAction::Reject { .. }),
                 "{model} should reject, got: {action:?}"
             );
         }
-    }
-
-    // ── try_resolve_fallback tests ──────────────────────────────────────────
-
-    #[tokio::test]
-    async fn try_resolve_fallback_picks_first_available() {
-        let pmc = PerModelCooldown::new();
-        // model-a in cooldown
-        pmc.with("model-a", |rl| {
-            rl.record_429(None, true);
-            rl.record_429(None, true);
-            rl.record_429(None, true);
-        });
-        let chain: Vec<String> = vec!["model-a".into(), "model-b".into(), "model-c".into()];
-        let outcome =
-            try_resolve_fallback(&pmc, &chain, CooldownReason::RateLimit, |name| async move {
-                Ok::<_, String>(name)
-            })
-            .await;
-        match outcome {
-            FallbackOutcome::Resolved(name) => assert_eq!(name, "model-b"),
-            other => panic!("expected Resolved, got: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn try_resolve_fallback_empty_chain() {
-        let pmc = PerModelCooldown::new();
-        let chain: Vec<String> = vec![];
-        let outcome =
-            try_resolve_fallback(&pmc, &chain, CooldownReason::RateLimit, |name| async move {
-                Ok::<_, String>(name)
-            })
-            .await;
-        assert!(matches!(outcome, FallbackOutcome::NoFallbackConfigured));
-    }
-
-    #[tokio::test]
-    async fn try_resolve_fallback_all_in_cooldown() {
-        let pmc = PerModelCooldown::new();
-        for model in &["model-a", "model-b"] {
-            pmc.with(model, |rl| {
-                rl.record_429(None, false);
-                rl.record_429(None, false);
-                rl.record_429(None, false);
-            });
-        }
-        let chain: Vec<String> = vec!["model-a".into(), "model-b".into()];
-        let outcome = try_resolve_fallback(
-            &pmc,
-            &chain,
-            CooldownReason::Overloaded,
-            |name| async move { Ok::<_, String>(name) },
-        )
-        .await;
-        match outcome {
-            FallbackOutcome::AllExhausted { chain_len } => assert_eq!(chain_len, 2),
-            other => panic!("expected AllExhausted, got: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn try_resolve_fallback_skips_resolution_failure() {
-        let pmc = PerModelCooldown::new();
-        let chain: Vec<String> = vec!["bad-model".into(), "good-model".into()];
-        let outcome =
-            try_resolve_fallback(&pmc, &chain, CooldownReason::RateLimit, |name| async move {
-                if name == "bad-model" {
-                    Err("not found".to_string())
-                } else {
-                    Ok(name)
-                }
-            })
-            .await;
-        match outcome {
-            FallbackOutcome::Resolved(name) => assert_eq!(name, "good-model"),
-            other => panic!("expected Resolved, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn fallback_chain_first_available_wins() {
-        let pmc = PerModelCooldown::new();
-        // model-a: in cooldown
-        pmc.with("model-a", |rl| {
-            rl.record_429(None, true);
-            rl.record_429(None, true);
-            rl.record_429(None, true);
-        });
-        // model-b: active, model-c: also active
-        // Simulate the chain walk: check each in order, pick first Proceed
-        let chain = ["model-b", "model-c"];
-        let mut picked = None;
-        for fb in &chain {
-            let action = pmc.with(fb, |rl| rl.check_request(false));
-            if matches!(action, RateLimitAction::Proceed) {
-                picked = Some(*fb);
-                break;
-            }
-        }
-        assert_eq!(picked, Some("model-b"), "first available should win");
     }
 }

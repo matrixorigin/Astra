@@ -72,11 +72,6 @@ pub struct IntrospectSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_judgments:
         Option<astra_services::semantic_judgment_observation::SemanticJudgmentView>,
-    /// Shared read-only evaluation/application projection for large tool
-    /// results. This never becomes execution authority.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_result_judgments:
-        Option<astra_services::tool_result_selection_observation::ToolResultJudgmentView>,
 
     // ── Task #46: enhanced self-awareness ──
     /// Summary of the most recent LLM rounds (in-memory ring). Available
@@ -801,22 +796,6 @@ fn judgment_usage_view(
     )
 }
 
-fn tool_result_judgment_view(
-    snapshot: &IntrospectSnapshot,
-    request: &IntrospectRequest,
-) -> Option<astra_services::tool_result_selection_observation::ToolResultJudgmentView> {
-    if request.facet != ObservationFacet::Trace {
-        return None;
-    }
-    Some(if !judgment_source_allowed(request.source_policy, false) {
-        astra_services::tool_result_selection_observation::ToolResultJudgmentView::unavailable(
-            astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::SourceExcluded,
-        )
-    } else {
-        snapshot.tool_result_judgments.clone().unwrap_or_default()
-    })
-}
-
 /// Render a normalized request. Edge-only facets remain explicitly unavailable
 /// when no local artifact provider intercepts them.
 pub fn render_introspect_request(
@@ -866,15 +845,10 @@ pub fn render_introspect_request(
     } else {
         body
     };
-    let body = if let Some(judgments) = tool_result_judgment_view(snapshot, request) {
-        format!("{body}\n\n{}", judgments.render_for_depth(request.depth))
-    } else {
-        body
-    };
     let evidence_revision = observation::evidence_revision(snapshot, &live_request);
     let boundary_prefix = format!(
         "## Observation Boundary\n\
-snapshot_cutoff=before_current_introspect_execution; the selecting round may list `introspect` as requested/in-flight, and calls made after this snapshot are absent. Judgment usage, evaluation traces, and application receipts carry independent source scopes and capture/read cutoffs. Treat counts and states as scoped observations, not final session totals. evidence_revision={evidence_revision} covered_facets="
+snapshot_cutoff=before_current_introspect_execution; the selecting round may list `introspect` as requested/in-flight, and calls made after this snapshot are absent. Judgment usage and semantic observations carry independent source scopes and capture/read cutoffs. Treat counts and states as scoped observations, not final session totals. evidence_revision={evidence_revision} covered_facets="
     );
     let candidate_facets = observation::text_covered_facets(&live_request).join(",");
     let candidate_boundary = format!("{boundary_prefix}{candidate_facets}");
@@ -2051,91 +2025,6 @@ mod tests {
         assert!(!render_introspect_request(&snapshot, &request).contains("Semantic judgments:"));
     }
 
-    #[test]
-    fn tool_result_judgment_is_a_shared_typed_user_facing_fact() {
-        use astra_services::tool_result_selection_observation::{
-            ToolResultApplicationCounts, ToolResultJudgmentCoverage, ToolResultJudgmentModel,
-            ToolResultJudgmentView,
-        };
-        let snapshot = IntrospectSnapshot {
-            tool_result_judgments: Some(ToolResultJudgmentView {
-                evaluation_coverage: ToolResultJudgmentCoverage::Available,
-                application_coverage: ToolResultJudgmentCoverage::Available,
-                evaluations: 1,
-                selected: 1,
-                applications: ToolResultApplicationCounts {
-                    included: 1,
-                    ..Default::default()
-                },
-                models: vec![ToolResultJudgmentModel {
-                    provider: "typesafe".into(),
-                    model: "jev-1.13.0".into(),
-                    observed_invocations: 1,
-                }],
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let overview = IntrospectRequest::from_args(&serde_json::json!({"format":"json"}));
-        let overview_report = build_introspect_report(&snapshot, &overview);
-        assert!(overview_report.tool_result_judgments.is_none());
-        assert!(
-            !overview_report
-                .observations
-                .iter()
-                .any(|item| item.kind == "tool_result_judgment")
-        );
-        let request =
-            IntrospectRequest::from_args(&serde_json::json!({"format":"json", "facet":"trace"}));
-        let report = build_introspect_report(&snapshot, &request);
-        assert_eq!(report.tool_result_judgments, snapshot.tool_result_judgments);
-        let observation = report
-            .observations
-            .iter()
-            .find(|item| item.kind == "tool_result_judgment")
-            .expect("tool-result judgment observation");
-        assert!(
-            observation
-                .summary
-                .contains("execution via Jev · jev-1.13.0")
-        );
-        assert!(observation.summary.contains("1 included"));
-        let text_request = IntrospectRequest::from_args(&serde_json::json!({"facet":"trace"}));
-        let text = render_introspect_request(&snapshot, &text_request);
-        assert!(text.contains("Tool-result selection ·"));
-        assert!(text.contains("execution via Jev · jev-1.13.0"));
-
-        let receipt_only = IntrospectSnapshot {
-            tool_result_judgments: Some(ToolResultJudgmentView {
-                evaluation_coverage: ToolResultJudgmentCoverage::NotObserved,
-                application_coverage: ToolResultJudgmentCoverage::Available,
-                applications: ToolResultApplicationCounts {
-                    included: 1,
-                    ..Default::default()
-                },
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        assert!(
-            build_introspect_report(&receipt_only, &request)
-                .observations
-                .iter()
-                .any(|item| item.kind == "tool_result_judgment")
-        );
-
-        let excluded = IntrospectRequest::from_args(
-            &serde_json::json!({"format":"json", "facet":"trace", "source_policy":"local_only"}),
-        );
-        assert_eq!(
-            build_introspect_report(&snapshot, &excluded)
-                .tool_result_judgments
-                .unwrap()
-                .evaluation_coverage,
-            ToolResultJudgmentCoverage::SourceExcluded
-        );
-    }
-
     fn judgment_facts(count: usize) -> astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
         use astra_turn_types::*;
         ExplainAnalyzeAuxiliaryUsageV1 {
@@ -2500,7 +2389,6 @@ mod tests {
             invocation_lifecycle: None,
             judgment_usage: None,
             semantic_judgments: None,
-            tool_result_judgments: None,
             recent_rounds: Vec::new(),
             step_latency: Vec::new(),
             volatile_pending: Vec::new(),

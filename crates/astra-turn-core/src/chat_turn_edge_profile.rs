@@ -144,7 +144,6 @@ impl RuntimeVolatileInjection {
         ) {
             json!({
                 "kind": kind,
-                "round_index": self.round_index,
                 "authority": "advisory_evidence_only",
                 "model_discretion": "Use the specific feedback below as evidence alongside the user goal and tool results. Apply it to the next decision only when supported by current evidence and consistent with the user request. Repetition alone does not establish lack of progress: authorized verification, sampling, waiting, and evidence recovery can require equivalent operations. This advisory does not authorize the runtime to retry, stop, change tools, or claim completion.",
                 payload_key: context,
@@ -506,7 +505,8 @@ mod tests {
                     "kind": "policy_advisory",
                     "delivery_class": "advisory_evidence",
                     "payload": {
-                        "advisories": [{"kind": "repetition", "severity": "low"}]
+                        "advisories": [{"kind": "repetition", "severity": "low"}],
+                        "round": 9, "round_index": 9
                     },
                     "round_index": 4
                 },
@@ -520,7 +520,7 @@ mod tests {
                 {
                     "kind": "runtime_policy_feedback",
                     "delivery_class": "decision_feedback",
-                    "payload": {"revision": 3, "entries": ["search_fanout"]},
+                    "payload": {"revision": 3, "entries": ["search_fanout"], "round": 9, "round_index": 9},
                     "round_index": 4
                 },
                 {
@@ -561,6 +561,12 @@ mod tests {
                 .expect("required prompt form")
                 .contains("<runtime-required-context>")
         );
+        assert!(
+            injections[1]
+                .render_for_prompt()
+                .unwrap()
+                .contains("\"round_index\":4")
+        );
         assert!(injections[3].render_for_prompt().is_none());
         for (injection, tag) in [
             (&injections[0], "<runtime-advisory-evidence>"),
@@ -568,6 +574,8 @@ mod tests {
         ] {
             let prompt = injection.render_for_prompt().expect("advisory prompt form");
             assert!(prompt.contains(tag));
+            assert!(prompt.contains("\"round\":9"));
+            assert!(prompt.contains("\"round_index\":9"));
             assert!(prompt.contains("\"authority\":\"advisory_evidence_only\""));
             assert!(prompt.contains("consistent with the user request"));
             assert!(prompt.contains("Repetition alone does not establish lack of progress"));
@@ -575,6 +583,17 @@ mod tests {
                 prompt
                     .contains("authorized verification, sampling, waiting, and evidence recovery")
             );
+            // Runtime chronology stays in the typed lane. Repeating the same
+            // evidence on a later round must not rewrite the provider prefix.
+            let mut later = injection.clone();
+            later.round_index += 1;
+            assert_eq!(later.render_for_prompt().as_deref(), Some(prompt.as_str()));
+            assert_ne!(
+                serde_json::to_value(injection).unwrap(),
+                serde_json::to_value(&later).unwrap(),
+            );
+            later.payload = json!({"evidence": "new observation"});
+            assert_ne!(later.render_for_prompt().as_deref(), Some(prompt.as_str()));
         }
     }
 

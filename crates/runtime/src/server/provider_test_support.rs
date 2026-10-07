@@ -122,6 +122,7 @@ impl ProviderGateway {
         let app = Router::new()
             .route("/v1/chat/completions", post(provider_handler))
             .route("/v1/messages", post(provider_handler))
+            .route("/v1/systemone", post(provider_handler))
             .route("/model/{model}/converse", post(provider_handler))
             .route("/model/{model}/converse-stream", post(provider_handler))
             .fallback(unexpected_request)
@@ -536,6 +537,11 @@ impl InferenceLedgerFixture {
     )> {
         self.persistence.admissions()
     }
+    /// Await the existing settlement owner without closing provider admission.
+    /// Cancellation returns after handoff; logical ledger settlement may follow.
+    pub async fn wait_for_settlements(&self, timeout: std::time::Duration) -> bool {
+        crate::turn::llm::durable::wait_for_provider_settlement_coordinator(timeout).await
+    }
     pub fn assert_quiescent(&self) {
         self.persistence.assert_quiescent();
     }
@@ -547,17 +553,14 @@ impl InferenceLedgerFixture {
     }
 }
 
-/// Assemble a real Server host with an explicitly admitted loopback Offering.
-/// Semantic-admission tests supply their own production policies and provider
-/// scripts; these defaults exercise primary request/response execution only.
-pub fn server_host_builder(
+/// Construct the same explicitly registered Offering used by the real fixture
+/// host, including native auxiliary routes without gateway wire overrides.
+pub fn admitted_execution(
     gateway: &ProviderGateway,
-    ledger: &InferenceLedgerFixture,
-    session_id: &str,
     provider: &str,
     model: &str,
     cache: Option<astra_services::models::PromptCacheCapabilityData>,
-) -> super::server_loop_host::ServerAgenticLoopHostBuilder {
+) -> astra_services::AdmittedModelExecution {
     let offering = astra_services::ResolvedModelOffering {
         offering_id: format!("fixture-{provider}"),
         model: astra_services::ResolvedActiveLlmModel {
@@ -571,7 +574,6 @@ pub fn server_host_builder(
                 format!("{}/v1", gateway.base_url)
             },
             provider: provider.into(),
-            fallback_chain: Vec::new(),
             tags: Vec::new(),
             request_body_overrides: None,
             fixed_temperature: None,
@@ -583,7 +585,21 @@ pub fn server_host_builder(
             request_headers: None,
         },
     };
-    let execution = astra_services::AdmittedModelExecution::from_offering(offering).unwrap();
+    astra_services::AdmittedModelExecution::from_offering(offering).unwrap()
+}
+
+/// Assemble a real Server host with an explicitly admitted loopback Offering.
+/// Semantic-admission tests supply their own policies and provider scripts;
+/// these defaults exercise primary request/response execution only.
+pub fn server_host_builder(
+    gateway: &ProviderGateway,
+    ledger: &InferenceLedgerFixture,
+    session_id: &str,
+    provider: &str,
+    model: &str,
+    cache: Option<astra_services::models::PromptCacheCapabilityData>,
+) -> super::server_loop_host::ServerAgenticLoopHostBuilder {
+    let execution = admitted_execution(gateway, provider, model, cache);
     super::server_loop_host::ServerAgenticLoopHostBuilder::new(
         // The fixture supplies its ledger persistence and never connects to a
         // database. Do not depend on dev-defaults or read operator credentials.
@@ -1005,4 +1021,27 @@ pub fn provision_workspace_fixture(
     session_id: &str,
 ) -> Result<astra_runtime_env::WorkspaceRecord, astra_runtime_env::WorkspaceProvisionError> {
     lifecycle.fixture_server_workspace(session_id)
+}
+
+/// Give model-free delegation fixtures the same immutable admission pair as
+/// a no-workspace Server run. Callers still own Run creation and status.
+pub async fn append_control_plane_contract(
+    engine: &crate::server::run::engine::RunEngine,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    let binding = crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+        crate::server::tool_transport::WorkspaceBinding::none(),
+        crate::server::tool_transport::ExecutorBinding::server_control_plane(),
+    );
+    let events = crate::server::run::binding_resolution::binding_snapshot_events(
+        run_id,
+        session_id,
+        &binding,
+        &astra_turn_types::StopHookObligations::default(),
+    );
+    engine
+        .append_events_batch(user_id, session_id, run_id, &events)
+        .await
 }

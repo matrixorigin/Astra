@@ -397,7 +397,6 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         route: self.route.borrowed(),
                         max_output_tokens: Some(self.max_output_tokens),
                         temperature,
-                        has_fallback: false,
                         thinking,
                     };
                     let scope = base_scope.with_logical_attempt(requested_logical_attempt);
@@ -447,7 +446,6 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                         route: self.route.borrowed(),
                         max_output_tokens: Some(self.max_output_tokens),
                         temperature,
-                        has_fallback: false,
                         thinking,
                     },
                     auxiliary_execution_budget(purpose, llm_nonstream_timeout()),

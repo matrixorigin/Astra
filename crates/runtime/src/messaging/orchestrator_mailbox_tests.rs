@@ -166,6 +166,14 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            crate::server::provider_test_support::append_control_plane_contract(
+                &self.run_engine,
+                &request.user_id,
+                &request.session_id,
+                &request.parent_run_id,
+            )
+            .await
+            .unwrap();
         }
 
         async fn execute(

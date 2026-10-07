@@ -627,8 +627,11 @@ impl SessionCapture {
         if self.has_integrity_errors() {
             return Vec::new();
         }
-        let mut calls = Vec::new();
-        let mut seen_ids = std::collections::HashSet::new();
+        let mut calls: Vec<JournalToolCall> = Vec::new();
+        let mut seen_ids = std::collections::HashMap::<String, usize>::new();
+        let mut occurrences =
+            std::collections::HashMap::<_, std::collections::BTreeMap<_, _>>::new();
+        let mut turns = std::collections::HashMap::<_, std::collections::BTreeSet<u32>>::new();
         for event in &self.events {
             if event.event_type != "turn" && event.event_type != "llm_round" {
                 continue;
@@ -657,10 +660,39 @@ impl SessionCapture {
                     .get("result_artifact")
                     .cloned()
                     .and_then(|value| serde_json::from_value(value).ok());
-                if let Some(call_id) = &call_id
-                    && !seen_ids.insert(nested_tool_identity(event, call_id))
-                {
-                    continue;
+                if let Some(call_id) = &call_id {
+                    let identity = nested_tool_identity(event, call_id);
+                    if let Some(turn) = event
+                        .raw
+                        .get("turn")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|turn| u32::try_from(turn).ok())
+                    {
+                        turns.entry(identity.clone()).or_default().insert(turn);
+                    }
+                    if let Some((turn, round, batch, parallel)) = tool_occurrence(event, record) {
+                        let occurrence = occurrences
+                            .entry(identity.clone())
+                            .or_default()
+                            .entry((turn, round))
+                            .or_insert((None, None));
+                        if batch.is_some() {
+                            occurrence.0 = batch;
+                        }
+                        if parallel.is_some() {
+                            occurrence.1 = parallel;
+                        }
+                    }
+                    if let Some(index) = seen_ids.get(&identity) {
+                        // A terminal turn can precede its full round record in
+                        // the authorized union. Preserve the verified artifact
+                        // authority without duplicating or reordering the call.
+                        if calls[*index].result_artifact.is_none() {
+                            calls[*index].result_artifact = result_artifact;
+                        }
+                        continue;
+                    }
+                    seen_ids.insert(identity, calls.len());
                 }
                 calls.push(JournalToolCall {
                     runtime_metadata: serde_json::json!({
@@ -704,6 +736,28 @@ impl SessionCapture {
                     error: record.get("error").cloned(),
                     result_artifact,
                 });
+            }
+        }
+        for (identity, index) in seen_ids {
+            let call = &mut calls[index];
+            // A logical invocation may be replayed in another round. Only a
+            // uniquely witnessed occurrence can certify batch provenance.
+            call.round = None;
+            call.batch_id = None;
+            call.parallel = None;
+            let known_turns = turns.get(&identity);
+            call.turn = known_turns
+                .filter(|turns| turns.len() == 1)
+                .and_then(|turns| turns.first().copied());
+            if let Some(known) = occurrences.get(&identity)
+                && known.len() == 1
+                && known_turns.is_some_and(|turns| turns.len() == 1)
+            {
+                let (&(turn, round), (batch, parallel)) = known.first_key_value().unwrap();
+                call.turn = Some(turn);
+                call.round = Some(round);
+                call.batch_id = batch.clone();
+                call.parallel = *parallel;
             }
         }
         calls
@@ -1169,8 +1223,36 @@ fn embedded_json(value: Option<&serde_json::Value>) -> Option<serde_json::Value>
     }
 }
 
+fn tool_occurrence(
+    event: &JournalEvent,
+    record: &serde_json::Value,
+) -> Option<(u32, u32, Option<String>, Option<bool>)> {
+    let turn = event.raw.get("turn")?.as_u64()?.try_into().ok()?;
+    let round = record
+        .get("round")
+        .filter(|value| !value.is_null())
+        .or_else(|| {
+            (event.event_type == "llm_round")
+                .then(|| event.raw.get("round"))
+                .flatten()
+        })?
+        .as_u64()?
+        .try_into()
+        .ok()?;
+    Some((
+        turn,
+        round,
+        record
+            .get("batch_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        record.get("parallel").and_then(serde_json::Value::as_bool),
+    ))
+}
+
 fn nested_tool_identity_conflict(events: &[JournalEvent]) -> bool {
-    let mut seen = std::collections::HashMap::<String, String>::new();
+    let mut seen = std::collections::HashMap::<String, (String, Option<&serde_json::Value>)>::new();
+    let mut occurrences = std::collections::HashMap::<_, (Option<String>, Option<bool>)>::new();
     for event in events {
         if event.event_type != "turn" && event.event_type != "llm_round" {
             continue;
@@ -1205,12 +1287,36 @@ fn nested_tool_identity_conflict(events: &[JournalEvent]) -> bool {
             }))
             .unwrap_or_default();
             let identity = nested_tool_identity(event, call_id);
-            if let Some(existing) = seen.get(&identity)
-                && existing != &fingerprint
-            {
-                return true;
+            if let Some((turn, round, batch, parallel)) = tool_occurrence(event, record) {
+                let previous = occurrences
+                    .entry((identity.clone(), turn, round))
+                    .or_insert((None, None));
+                if matches!((&previous.0, &batch), (Some(a), Some(b)) if a != b)
+                    || matches!((previous.1, parallel), (Some(a), Some(b)) if a != b)
+                {
+                    return true;
+                }
+                if batch.is_some() {
+                    previous.0 = batch;
+                }
+                if parallel.is_some() {
+                    previous.1 = parallel;
+                }
             }
-            seen.insert(identity, fingerprint);
+            let descriptor = record.get("result_artifact");
+            let retained_descriptor = if let Some((existing, previous_descriptor)) =
+                seen.get(&identity)
+            {
+                if existing != &fingerprint
+                    || matches!((previous_descriptor, descriptor), (Some(previous), Some(current)) if *previous != current)
+                {
+                    return true;
+                }
+                descriptor.or(*previous_descriptor)
+            } else {
+                descriptor
+            };
+            seen.insert(identity, (fingerprint, retained_descriptor));
         }
     }
     false
@@ -1854,21 +1960,92 @@ mod tests {
         });
         let mut round = event.clone();
         round["type"] = "llm_round".into();
+        round["round"] = 0.into();
+        round["tool_calls"][0]["batch_id"] = "batch-a".into();
+        round["tool_calls"][0]["parallel"] = true.into();
         round["producer_scope"] = serde_json::json!({"run_id": "run-fanout"});
         round.as_object_mut().unwrap().remove("metadata");
-        std::fs::write(&journal, format!("{round}\n{event}\n")).unwrap();
-        let capture = load_session_from_path(session_id, &journal).expect("loaded capture");
+        let mut thin = event.clone();
+        thin["tool_calls"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("result_artifact");
+        thin["tool_calls"][0]["result_full"] = full.clone().into();
+        for records in [format!("{round}\n{thin}\n"), format!("{thin}\n{round}\n")] {
+            std::fs::write(&journal, records).unwrap();
+            let capture = load_session_from_path(session_id, &journal).expect("loaded capture");
+            let calls = capture.journal_tool_calls();
+            assert_eq!(calls.len(), 1, "capture: {capture:?}");
+            assert_eq!(calls[0].run_id.as_deref(), Some("run-fanout"));
+            let evidence: serde_json::Value =
+                serde_json::from_str(&capture.render_tool_evidence(8000)).unwrap();
+            assert_eq!(calls[0].round, Some(0));
+            assert_eq!(calls[0].batch_id.as_deref(), Some("batch-a"));
+            assert_eq!(calls[0].parallel, Some(true));
+            assert_eq!(evidence["calls"][0]["round"], 0);
+            assert_eq!(evidence["calls"][0]["batch_id"], "batch-a");
+            assert_eq!(evidence["calls"][0]["parallel"], true);
+            assert_eq!(
+                calls[0].result_artifact.as_ref(),
+                Some(&persisted.descriptor)
+            );
+            assert_eq!(
+                calls[0]
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.pointer("/fanout/accepted"))
+                    .and_then(serde_json::Value::as_u64),
+                Some(3)
+            );
+        }
+        let mut replay = round.clone();
+        replay["ts"] = "2026-08-09T00:00:01Z".into();
+        replay["round"] = 1.into();
+        replay["tool_calls"][0]["batch_id"] = "batch-b".into();
+        std::fs::write(&journal, format!("{thin}\n{round}\n{replay}\n{round}\n")).unwrap();
+        let capture = load_session_from_path(session_id, &journal).unwrap();
+        assert!(!capture.has_integrity_errors());
         let calls = capture.journal_tool_calls();
-        assert_eq!(calls.len(), 1, "capture: {capture:?}");
-        assert_eq!(calls[0].run_id.as_deref(), Some("run-fanout"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].round, None);
+        assert_eq!(calls[0].batch_id, None);
+        assert_eq!(calls[0].parallel, None);
         assert_eq!(
-            calls[0]
-                .result
-                .as_ref()
-                .and_then(|result| result.pointer("/fanout/accepted"))
-                .and_then(serde_json::Value::as_u64),
-            Some(3)
+            calls[0].result_artifact.as_ref(),
+            Some(&persisted.descriptor)
         );
+
+        let mut later_turn = round.clone();
+        later_turn["turn"] = 2.into();
+        later_turn["ts"] = "2026-08-09T00:00:02Z".into();
+        for records in [
+            format!("{thin}\n{later_turn}\n"),
+            format!("{later_turn}\n{thin}\n"),
+        ] {
+            std::fs::write(&journal, records).unwrap();
+            let capture = load_session_from_path(session_id, &journal).unwrap();
+            assert!(!capture.has_integrity_errors());
+            let calls = capture.journal_tool_calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].turn, None);
+            assert_eq!(calls[0].round, None);
+            assert_eq!(calls[0].batch_id, None);
+            assert_eq!(calls[0].parallel, None);
+        }
+        replay["round"] = 0.into();
+        std::fs::write(&journal, format!("{thin}\n{round}\n{replay}\n")).unwrap();
+        let conflict = load_session_from_path(session_id, &journal).unwrap();
+        assert!(conflict.has_integrity_errors());
+        assert!(conflict.journal_tool_calls().is_empty());
+        std::fs::write(&journal, format!("{thin}\n{round}\n")).unwrap();
+        // Equal bytes do not authorize contradictory document identities.
+        let mut capture = load_session_from_path(session_id, &journal).unwrap();
+        capture.events[0].raw["tool_calls"][0]["result_artifact"] =
+            serde_json::to_value(&persisted.descriptor).unwrap();
+        capture.events[1].raw["tool_calls"][0]["result_artifact"]["document_kind"] =
+            "runtime_guidance".into();
+        assert!(capture.has_integrity_errors());
+        assert!(capture.journal_tool_calls().is_empty());
     }
 
     #[test]
@@ -2036,13 +2213,15 @@ mod tests {
         let session_dir = dir.path().join(session_id);
         std::fs::create_dir_all(&session_dir).unwrap();
         let replacement =
-            astra_turn_core::tool::result::storage::persist_tool_result_with_replacement(
+            astra_turn_core::tool::result::storage::persist_tool_result_with_descriptor(
                 &session_dir,
+                "run-display-only",
                 "call-display-only",
                 "agent",
                 r#"{"private":"artifact bytes"}"#,
             )
-            .unwrap();
+            .unwrap()
+            .replacement;
         let journal = dir.path().join(format!("{session_id}.jsonl"));
         let event = serde_json::json!({
             "type": "turn",

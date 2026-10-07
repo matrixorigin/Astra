@@ -839,6 +839,8 @@ fn char_literal() { let slash = '/'; }
             "session_state_revisions",
             "session_history_chunks",
             "session_artifacts_grants",
+            "tool_result_projection_decisions",
+            "tool_result_projection_receipts",
         }
         for table in retired:
             self.assertNotIn(table, self.tables)

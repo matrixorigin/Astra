@@ -14,7 +14,6 @@ pub(crate) mod clipboard;
 pub mod cloud_sync;
 pub mod command_registry;
 pub mod command_router;
-pub mod command_usage;
 pub mod config_manager;
 pub mod context_dump;
 pub mod diagnostic_log;

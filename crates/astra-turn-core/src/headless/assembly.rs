@@ -39,68 +39,24 @@ impl HeadlessPreResolvedToolResult {
     }
 }
 
-/// One tool slot to execute in a headless round: either a server `tool_calls[i]` or synthetic edge row `i`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeadlessRoundToolIdx {
-    ServerToolCall(usize),
-    SyntheticEdge(usize),
-}
-
-/// Resolved id/name/args for one headless round slot (server `tool_calls` row or synthetic edge row).
+/// Exact provider identity and arguments for one admitted tool slot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeadlessResolvedToolSlot {
     pub id: String,
     pub name: String,
     pub args: Value,
-    pub synthetic_edge_index: Option<usize>,
 }
 
-/// Map one [`HeadlessRoundToolIdx`] to flat call fields; `edge_lookup` is used only for [`HeadlessRoundToolIdx::SyntheticEdge`].
 #[must_use]
 pub fn resolve_headless_tool_slot(
-    item: HeadlessRoundToolIdx,
+    index: usize,
     server_tool_calls: &[Value],
-    mut edge_lookup: impl FnMut(usize) -> (String, String, Value),
 ) -> HeadlessResolvedToolSlot {
-    match item {
-        HeadlessRoundToolIdx::ServerToolCall(i) => {
-            let (id, name, args) = server_tool_calls
-                .get(i)
-                .map(parse_flat_tool_call_event)
-                .unwrap_or_else(|| (String::new(), String::new(), json!({})));
-            HeadlessResolvedToolSlot {
-                id,
-                name,
-                args,
-                synthetic_edge_index: None,
-            }
-        }
-        HeadlessRoundToolIdx::SyntheticEdge(i) => {
-            let (id, name, args) = edge_lookup(i);
-            HeadlessResolvedToolSlot {
-                id,
-                name,
-                args,
-                synthetic_edge_index: Some(i),
-            }
-        }
-    }
-}
-
-/// Prefer iterating server `tool_calls` when present; otherwise one synthetic slot per edge row (§5.5).
-pub fn headless_round_tool_indices(
-    server_tool_calls_len: usize,
-    edge_round_len: usize,
-) -> Vec<HeadlessRoundToolIdx> {
-    if server_tool_calls_len > 0 {
-        (0..server_tool_calls_len)
-            .map(HeadlessRoundToolIdx::ServerToolCall)
-            .collect()
-    } else {
-        (0..edge_round_len)
-            .map(HeadlessRoundToolIdx::SyntheticEdge)
-            .collect()
-    }
+    let (id, name, args) = server_tool_calls
+        .get(index)
+        .map(parse_flat_tool_call_event)
+        .unwrap_or_else(|| (String::new(), String::new(), Value::Null));
+    HeadlessResolvedToolSlot { id, name, args }
 }
 
 fn tool_call_ids_are_unique(tool_calls: &[Value]) -> bool {
@@ -182,20 +138,18 @@ pub fn parse_flat_tool_call_event(tc: &Value) -> (String, String, Value) {
 
 /// Tool names still pending when step scheduling times out (abort tail of `indices`).
 pub fn headless_timeout_aborted_tool_names(
-    indices: &[HeadlessRoundToolIdx],
+    indices: &[usize],
     completed_tool_results_len: usize,
     server_tool_calls: &[Value],
-    mut synthetic_tool_name: impl FnMut(usize) -> String,
 ) -> Vec<String> {
     indices
         .iter()
         .skip(completed_tool_results_len)
-        .map(|idx| match *idx {
-            HeadlessRoundToolIdx::ServerToolCall(i) => server_tool_calls
-                .get(i)
-                .map(|tc| parse_flat_tool_call_event(tc).1)
-                .unwrap_or_default(),
-            HeadlessRoundToolIdx::SyntheticEdge(i) => synthetic_tool_name(i),
+        .map(|&index| {
+            server_tool_calls
+                .get(index)
+                .map(|call| parse_flat_tool_call_event(call).1)
+                .unwrap_or_default()
         })
         .collect()
 }
@@ -369,17 +323,9 @@ pub trait EdgeToolRoundRow {
         0
     }
 
-    /// OpenAI `tool_calls[].id` when synthesizing from an edge-only round (§5.5).
-    /// Default `edge-{index}`; rows with a server `request_id` should override.
-    fn assistant_tool_call_id(&self, index: usize) -> String {
-        format!("edge-{index}")
-    }
-
-    /// True when [`Self::assistant_tool_call_id`] came from a server tool-call
-    /// id or edge executor request id, rather than the synthetic `edge-{index}`
-    /// fallback used for edge-only rounds.
-    fn has_explicit_assistant_tool_call_id(&self) -> bool {
-        false
+    /// Exact provider request identity. A callback without an identity cannot match a slot.
+    fn tool_call_id(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -467,7 +413,7 @@ pub fn take_edge_output_for_tool_call_id_with_duration<T: EdgeToolRoundRow>(
 
     let mut explicit_index = None;
     for (i, e) in round.iter().enumerate() {
-        if e.has_explicit_assistant_tool_call_id() && e.assistant_tool_call_id(i) == tool_call_id {
+        if e.tool_call_id() == Some(tool_call_id) {
             if explicit_index.replace(i).is_some() {
                 // One provider call id may own at most one edge result.
                 // Duplicate ids are an ambiguous transport state: do not
@@ -563,30 +509,6 @@ fn no_matching_edge_execution_message(name: &str) -> String {
     )
 }
 
-/// Normalize server `tool_calls` or synthetic edge-round rows for stall / TurnGuard signature tracking.
-pub fn tool_calls_for_stall_guard<T: EdgeToolRoundRow>(
-    server_tool_calls: &[Value],
-    edge_round: &[T],
-) -> Vec<Value> {
-    if !server_tool_calls.is_empty() {
-        server_tool_calls.to_vec()
-    } else {
-        // Match historical CLI behavior: stall/TurnGuard sees synthetic ids `edge-{i}` only
-        // (OpenAI-shaped assistant `tool_calls` may still use `request_id` elsewhere).
-        edge_round
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                json!({
-                    "id": format!("edge-{i}"),
-                    "name": e.tool_name(),
-                    "arguments": e.tool_args().clone(),
-                })
-            })
-            .collect()
-    }
-}
-
 fn openai_tool_call_entries_from_server(tool_calls: &[Value]) -> Vec<Value> {
     tool_calls
         .iter()
@@ -608,19 +530,12 @@ fn openai_tool_call_entries_from_server(tool_calls: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Assistant message with `content: null` and OpenAI-shaped `tool_calls` (server list or edge round).
-pub fn openai_assistant_with_tool_calls_message<T: EdgeToolRoundRow>(
+/// Assistant message with `content: null` and OpenAI-shaped provider `tool_calls`.
+pub fn openai_assistant_with_tool_calls_message(
     server_tool_calls: &[Value],
-    edge_round: &[T],
     reasoning_content: &str,
 ) -> Value {
-    openai_assistant_with_tool_calls_message_ext(
-        server_tool_calls,
-        edge_round,
-        reasoning_content,
-        "",
-        false,
-    )
+    openai_assistant_with_tool_calls_message_ext(server_tool_calls, reasoning_content, "", false)
 }
 
 /// Extended variant that accepts `force_reasoning_field`.
@@ -628,33 +543,13 @@ pub fn openai_assistant_with_tool_calls_message<T: EdgeToolRoundRow>(
 /// When `force_reasoning_field` is true the `reasoning_content` key is always
 /// present (empty string when `reasoning_content` is blank).  Thinking-enabled
 /// models require this on every assistant message.
-pub fn openai_assistant_with_tool_calls_message_ext<T: EdgeToolRoundRow>(
+pub fn openai_assistant_with_tool_calls_message_ext(
     server_tool_calls: &[Value],
-    edge_round: &[T],
     reasoning_content: &str,
     reasoning_signature: &str,
     force_reasoning_field: bool,
 ) -> Value {
-    let tool_calls = if !server_tool_calls.is_empty() {
-        openai_tool_call_entries_from_server(server_tool_calls)
-    } else {
-        edge_round
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                let id = e.assistant_tool_call_id(i);
-                json!({
-                    "id": id,
-                    "type": "function",
-                    "function": {
-                        "name": e.tool_name(),
-                        "arguments": serde_json::to_string(e.tool_args())
-                            .unwrap_or_else(|_| "{}".to_string()),
-                    }
-                })
-            })
-            .collect()
-    };
+    let tool_calls = openai_tool_call_entries_from_server(server_tool_calls);
     let mut msg = json!({
         "role": "assistant",
         "content": Value::Null,
@@ -737,43 +632,34 @@ pub fn openai_tool_roundtrip_values_with_result_fields(
 #[derive(Debug, Clone)]
 pub struct HeadlessRoundOpening {
     pub assistant_message: Value,
-    pub indices: Vec<HeadlessRoundToolIdx>,
+    pub indices: Vec<usize>,
     pub tool_count: usize,
 }
 
 /// Build the assistant message and per-tool indices.
 #[must_use]
-pub fn begin_headless_tool_round_opening<Edge: EdgeToolRoundRow>(
+pub fn begin_headless_tool_round_opening(
     server_tool_calls: &[Value],
-    edge_round: &[Edge],
     reasoning_content: &str,
 ) -> HeadlessRoundOpening {
-    begin_headless_tool_round_opening_ext(
-        server_tool_calls,
-        edge_round,
-        reasoning_content,
-        "",
-        false,
-    )
+    begin_headless_tool_round_opening_ext(server_tool_calls, reasoning_content, "", false)
 }
 
 /// Extended variant that accepts `force_reasoning_field` for thinking-model sessions.
 #[must_use]
-pub fn begin_headless_tool_round_opening_ext<Edge: EdgeToolRoundRow>(
+pub fn begin_headless_tool_round_opening_ext(
     server_tool_calls: &[Value],
-    edge_round: &[Edge],
     reasoning_content: &str,
     reasoning_signature: &str,
     force_reasoning_field: bool,
 ) -> HeadlessRoundOpening {
     let assistant_message = openai_assistant_with_tool_calls_message_ext(
         server_tool_calls,
-        edge_round,
         reasoning_content,
         reasoning_signature,
         force_reasoning_field,
     );
-    let indices = headless_round_tool_indices(server_tool_calls.len(), edge_round.len());
+    let indices = (0..server_tool_calls.len()).collect::<Vec<_>>();
     let tool_count = indices.len();
     HeadlessRoundOpening {
         assistant_message,
@@ -831,11 +717,8 @@ mod tests {
         fn tool_result_fields(&self) -> Option<&serde_json::Map<String, Value>> {
             Some(&self.tool_result_fields)
         }
-        fn assistant_tool_call_id(&self, _index: usize) -> String {
-            self.request_id.clone()
-        }
-        fn has_explicit_assistant_tool_call_id(&self) -> bool {
-            !self.request_id.is_empty()
+        fn tool_call_id(&self) -> Option<&str> {
+            (!self.request_id.is_empty()).then_some(self.request_id.as_str())
         }
     }
 
@@ -930,55 +813,14 @@ mod tests {
     }
 
     #[test]
-    fn headless_round_indices_server_first() {
-        let v = headless_round_tool_indices(2, 5);
-        assert_eq!(
-            v,
-            vec![
-                HeadlessRoundToolIdx::ServerToolCall(0),
-                HeadlessRoundToolIdx::ServerToolCall(1),
-            ]
-        );
-    }
-
-    #[test]
-    fn headless_round_indices_edge_when_no_server_calls() {
-        let v = headless_round_tool_indices(0, 2);
-        assert_eq!(
-            v,
-            vec![
-                HeadlessRoundToolIdx::SyntheticEdge(0),
-                HeadlessRoundToolIdx::SyntheticEdge(1),
-            ]
-        );
-    }
-
-    #[test]
-    fn resolve_headless_slot_server_and_synthetic() {
+    fn resolve_headless_slot_preserves_provider_identity() {
         let server = vec![
             json!({"id":"a","type":"function","function":{"name":"read_file","arguments":"{}"}}),
         ];
-        let s0 =
-            resolve_headless_tool_slot(HeadlessRoundToolIdx::ServerToolCall(0), &server, |_| {
-                panic!("edge lookup not used")
-            });
+        let s0 = resolve_headless_tool_slot(0, &server);
         assert_eq!(s0.id, "a");
         assert_eq!(s0.name, "read_file");
         assert_eq!(s0.args, json!({}));
-        assert!(s0.synthetic_edge_index.is_none());
-
-        let s1 = resolve_headless_tool_slot(HeadlessRoundToolIdx::SyntheticEdge(2), &[], |i| {
-            assert_eq!(i, 2);
-            (
-                "edge-request-2".into(),
-                "bash".into(),
-                json!({"command":"ls"}),
-            )
-        });
-        assert_eq!(s1.id, "edge-request-2");
-        assert_eq!(s1.name, "bash");
-        assert_eq!(s1.args, json!({"command":"ls"}));
-        assert_eq!(s1.synthetic_edge_index, Some(2));
     }
 
     #[test]
@@ -1023,12 +865,12 @@ mod tests {
 
     #[test]
     fn headless_timeout_aborted_names_tail() {
-        let idx = vec![
-            HeadlessRoundToolIdx::ServerToolCall(0),
-            HeadlessRoundToolIdx::SyntheticEdge(0),
+        let idx = vec![0, 1];
+        let server = vec![
+            json!({"id":"read","type":"function","function":{"name":"read_file","arguments":"{}"}}),
+            json!({"id":"shell","type":"function","function":{"name":"bash","arguments":"{}"}}),
         ];
-        let server = vec![json!({"name":"read_file","arguments":{}})];
-        let names = headless_timeout_aborted_tool_names(&idx, 1, &server, |_| "bash".to_string());
+        let names = headless_timeout_aborted_tool_names(&idx, 1, &server);
         assert_eq!(names, vec!["bash".to_string()]);
     }
 
@@ -1159,56 +1001,18 @@ mod tests {
     #[test]
     fn begin_headless_opening_counts_server_calls() {
         let server = vec![json!({"id":"1","name":"bash","arguments":{}})];
-        let edge: Vec<Row> = vec![];
-        let o = begin_headless_tool_round_opening(&server, &edge, "");
+        let o = begin_headless_tool_round_opening(&server, "");
         assert_eq!(o.indices.len(), 1);
         assert_eq!(o.tool_count, 1);
     }
 
     #[test]
     fn begin_headless_opening_does_not_invent_an_action_for_an_empty_round() {
-        let edge: Vec<Row> = vec![];
-        let opening = begin_headless_tool_round_opening(&[], &edge, "");
+        let opening = begin_headless_tool_round_opening(&[], "");
 
         assert!(opening.indices.is_empty());
         assert_eq!(opening.tool_count, 0);
         assert!(opening.assistant_message.get("tool_calls").is_none());
-    }
-
-    #[test]
-    fn tool_calls_for_stall_guard_prefers_server_list() {
-        let server = vec![json!({"id":"1","name":"bash","arguments":{}})];
-        let edge = vec![Row {
-            tool: "read_file".into(),
-            args: json!({}),
-            output: "".into(),
-            duration_ms: 0,
-        }];
-        let g = tool_calls_for_stall_guard(&server, &edge);
-        assert_eq!(g.len(), 1);
-        assert_eq!(g[0]["name"], "bash");
-    }
-
-    #[test]
-    fn tool_calls_for_stall_guard_synthetic_ids() {
-        let edge = vec![
-            Row {
-                tool: "a".into(),
-                args: json!({}),
-                output: "".into(),
-                duration_ms: 0,
-            },
-            Row {
-                tool: "b".into(),
-                args: json!({"x":1}),
-                output: "".into(),
-                duration_ms: 0,
-            },
-        ];
-        let g = tool_calls_for_stall_guard(&[], &edge);
-        assert_eq!(g[0]["id"], "edge-0");
-        assert_eq!(g[1]["id"], "edge-1");
-        assert_eq!(g[1]["name"], "b");
     }
 
     #[test]
@@ -1249,7 +1053,7 @@ mod tests {
             "type": "function",
             "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
         })];
-        let msg = openai_assistant_with_tool_calls_message(&server, &[] as &[Row], "");
+        let msg = openai_assistant_with_tool_calls_message(&server, "");
         assert_eq!(msg["role"], "assistant");
         assert!(msg["content"].is_null());
         let tc = msg["tool_calls"].as_array().unwrap();
@@ -1260,20 +1064,6 @@ mod tests {
         let args: Value =
             serde_json::from_str(tc[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["path"], "a.rs");
-    }
-
-    #[test]
-    fn openai_assistant_message_from_edge_round_default_ids() {
-        let edge = vec![Row {
-            tool: "grep".into(),
-            args: json!({"pattern": "x"}),
-            output: "".into(),
-            duration_ms: 0,
-        }];
-        let msg = openai_assistant_with_tool_calls_message(&[], &edge, "");
-        let tc = msg["tool_calls"].as_array().unwrap();
-        assert_eq!(tc[0]["id"], "edge-0");
-        assert_eq!(tc[0]["function"]["name"], "grep");
     }
 
     #[derive(Debug)]
@@ -1294,51 +1084,20 @@ mod tests {
         fn tool_output(&self) -> &str {
             &self.output
         }
-        fn assistant_tool_call_id(&self, index: usize) -> String {
-            if self.request_id.is_empty() {
-                format!("edge-{index}")
-            } else {
-                self.request_id.clone()
-            }
-        }
-        fn has_explicit_assistant_tool_call_id(&self) -> bool {
-            !self.request_id.is_empty()
+        fn tool_call_id(&self) -> Option<&str> {
+            (!self.request_id.is_empty()).then_some(self.request_id.as_str())
         }
     }
 
     #[test]
-    fn openai_assistant_message_edge_uses_request_id_when_set() {
-        let edge = vec![RowWithRequestId {
-            tool: "bash".into(),
-            args: json!({"command": "true"}),
-            output: "ok".into(),
-            request_id: "req-abc".into(),
-        }];
-        let msg = openai_assistant_with_tool_calls_message(&[], &edge, "");
-        let tc = msg["tool_calls"].as_array().unwrap();
-        assert_eq!(tc[0]["id"], "req-abc");
-    }
-
-    #[test]
-    fn synthetic_edge_slot_id_matches_assistant_tool_call_id() {
-        let edge = vec![RowWithRequestId {
-            tool: "agent_fanout".into(),
-            args: json!({"action": "start"}),
-            output: r#"{"status":"started","group_id":"fanout-1"}"#.into(),
-            request_id: "req-fanout-1".into(),
-        }];
-        let opening = begin_headless_tool_round_opening(&[], &edge, "");
+    fn provider_slot_id_matches_assistant_tool_call_id() {
+        let calls = vec![json!({"id":"req-fanout-1", "type":"function", "function":{
+            "name":"agent_fanout", "arguments":r#"{"action":"start"}"#}})];
+        let opening = begin_headless_tool_round_opening(&calls, "");
         let assistant_id = opening.assistant_message["tool_calls"][0]["id"]
             .as_str()
             .expect("assistant tool call id");
-        let slot = resolve_headless_tool_slot(opening.indices[0], &[], |i| {
-            let edge = &edge[i];
-            (
-                edge.assistant_tool_call_id(i),
-                edge.tool_name().to_string(),
-                edge.tool_args().clone(),
-            )
-        });
+        let slot = resolve_headless_tool_slot(opening.indices[0], &calls);
 
         assert_eq!(assistant_id, "req-fanout-1");
         assert_eq!(slot.id, assistant_id);
@@ -1453,22 +1212,13 @@ mod tests {
 
     #[test]
     fn openai_assistant_message_omits_empty_tool_calls() {
-        let msg = openai_assistant_with_tool_calls_message(&[] as &[Value], &[] as &[Row], "");
+        let msg = openai_assistant_with_tool_calls_message(&[], "");
         assert!(msg.get("tool_calls").is_none(), "{msg:?}");
     }
 
     #[test]
     fn openai_assistant_message_includes_reasoning_content_when_non_empty() {
-        let msg = openai_assistant_with_tool_calls_message(
-            &[],
-            &[Row {
-                tool: "t".into(),
-                args: json!({}),
-                output: "".into(),
-                duration_ms: 0,
-            }],
-            "think",
-        );
+        let msg = openai_assistant_with_tool_calls_message(&[], "think");
         assert_eq!(msg["reasoning_content"], "think");
     }
 
@@ -1686,10 +1436,7 @@ mod tests {
                 "arguments": "{\"action\":\"show\",\"revision\":\"abc\"}"
             }
         })];
-        let slot =
-            resolve_headless_tool_slot(HeadlessRoundToolIdx::ServerToolCall(0), &server, |_| {
-                panic!("edge lookup not used")
-            });
+        let slot = resolve_headless_tool_slot(0, &server);
         assert_eq!(slot.name, "git");
         assert_eq!(slot.args, json!({"action": "show", "revision": "abc"}));
     }
@@ -1709,7 +1456,7 @@ mod tests {
                 "arguments": "{\"skill_name\":\"review-changes\"}"
             }
         })];
-        let msg = openai_assistant_with_tool_calls_message(&server, &[] as &[Row], "");
+        let msg = openai_assistant_with_tool_calls_message(&server, "");
         let tc = msg["tool_calls"].as_array().unwrap();
         assert_eq!(
             tc[0]["function"]["name"], "skill",
@@ -1730,7 +1477,7 @@ mod tests {
             json!({"id": "c1", "type": "function", "function": {"name": "git", "arguments": "{\"action\":\"status\"}"}}),
             json!({"id": "c2", "type": "function", "function": {"name": "git", "arguments": "{\"action\":\"diff\",\"ref\":\"HEAD\"}"}}),
         ];
-        let msg = openai_assistant_with_tool_calls_message(&server, &[] as &[Row], "");
+        let msg = openai_assistant_with_tool_calls_message(&server, "");
         let tc = msg["tool_calls"].as_array().unwrap();
         assert_eq!(tc[0]["function"]["name"], "git");
         assert_eq!(tc[1]["function"]["name"], "git");

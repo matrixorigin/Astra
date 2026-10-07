@@ -2708,6 +2708,14 @@ pub trait SpawnAgentExecutor: Send + Sync {
         Ok(None)
     }
 
+    /// Publish materialized bindings into the exact admitted child's existing context.
+    async fn publish_admitted_child_execution_contract(
+        &self,
+        _config: &crate::server::delegation::engine::SubRunConfig,
+    ) -> Result<(), String> {
+        Err("executor does not support child execution contract publication".into())
+    }
+
     async fn settle_admitted_child_runtime(&self, _run_id: &str, _binding_id: &str, _status: &str) {
     }
 
@@ -11924,7 +11932,7 @@ pub(crate) mod tests {
             checkpoint_json: None,
             error_code: None,
             error_message: None,
-            retry_count: 0,
+
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,

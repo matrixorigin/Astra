@@ -10,7 +10,6 @@ use astra_turn_core::context_feedback::ContextFeedback;
 use astra_turn_core::context_optimizer::optimize;
 use astra_turn_core::context_planner::{PlanInput, plan_turn};
 use astra_turn_core::context_sources::*;
-use astra_turn_core::emergent_context::*;
 use astra_turn_core::microcompact::ProviderCacheStrategy;
 use astra_turn_core::optimize_limits::OptimizeLimits;
 use astra_turn_core::pipeline_config::ProviderCachePolicy;
@@ -28,7 +27,6 @@ fn build_sources() -> (
     SessionContext,
     TurnState,
     ExternalSources,
-    EmergentContext,
     PipelineStats,
 ) {
     (
@@ -74,7 +72,6 @@ fn build_sources() -> (
             )],
             ..Default::default()
         },
-        EmergentContext::default(),
         PipelineStats::default(),
     )
 }
@@ -82,7 +79,7 @@ fn build_sources() -> (
 /// Full pipeline: plan → bind → optimize produces valid output.
 #[test]
 fn pipeline_single_turn_produces_valid_output() {
-    let (statics, agent, latches, session, turn, ext, emer, stats) = build_sources();
+    let (statics, agent, latches, session, turn, ext, stats) = build_sources();
     let sources = ContextSources {
         statics: &statics,
         agent: &agent,
@@ -90,7 +87,6 @@ fn pipeline_single_turn_produces_valid_output() {
         session: &session,
         turn: &turn,
         external: &ext,
-        emergent: &emer,
         working_memory: None,
         stats: &stats,
     };
@@ -156,7 +152,7 @@ fn pipeline_multi_turn_feedback_accumulates() {
 /// High pressure triggers compaction tier escalation.
 #[test]
 fn pipeline_compaction_under_pressure() {
-    let (statics, agent, latches, session, mut turn, ext, emer, stats) = build_sources();
+    let (statics, agent, latches, session, mut turn, ext, stats) = build_sources();
     // Set high token usage: 85% of 100K
     turn.tokens = TokenAccounting::from_fields(85_000, 0, 0, 0);
 
@@ -167,7 +163,6 @@ fn pipeline_compaction_under_pressure() {
         session: &session,
         turn: &turn,
         external: &ext,
-        emergent: &emer,
         working_memory: None,
         stats: &stats,
     };
@@ -196,7 +191,7 @@ fn pipeline_compaction_under_pressure() {
 /// PTL recovery escalates tier on next plan.
 #[test]
 fn pipeline_ptl_recovery_escalates() {
-    let (statics, agent, latches, session, mut turn, ext, emer, stats) = build_sources();
+    let (statics, agent, latches, session, mut turn, ext, stats) = build_sources();
     turn.tokens = TokenAccounting::default(); // Low pressure
     turn.recovery.record_ptl_error();
     turn.recovery.record_ptl_error();
@@ -208,7 +203,6 @@ fn pipeline_ptl_recovery_escalates() {
         session: &session,
         turn: &turn,
         external: &ext,
-        emergent: &emer,
         working_memory: None,
         stats: &stats,
     };
@@ -232,65 +226,6 @@ fn pipeline_ptl_recovery_escalates() {
         plan.compact_tier >= CompactionTier::CompactHistory,
         "2 PTL errors should escalate, got {:?}",
         plan.compact_tier,
-    );
-}
-
-/// Emergent context flows from one turn's output to the next turn's bind.
-#[test]
-fn pipeline_emergent_context_flows() {
-    let (statics, agent, latches, session, turn, ext, mut emer, stats) = build_sources();
-
-    // Simulate previous turn discovering a skill
-    emer.push_skill(EmergentItem {
-        value: DiscoveredSkill {
-            skill_name: "security_review".into(),
-            trigger: "file write to auth.rs".into(),
-        },
-        created_at_turn: 2,
-        content_hash: 12345,
-    });
-
-    let sources = ContextSources {
-        statics: &statics,
-        agent: &agent,
-        latches: &latches,
-        session: &session,
-        turn: &turn,
-        external: &ext,
-        emergent: &emer,
-        working_memory: None,
-        stats: &stats,
-    };
-
-    let plan_input = PlanInput {
-        tokens: &turn.tokens,
-        model_limit: session.model_limit,
-        pre_reserved_output_tokens: 0,
-        recovery: &turn.recovery,
-        latches: &latches,
-        stats: &stats,
-        provider_policy: &session.provider_policy,
-        has_memory: !ext.memory_entries.is_empty(),
-        model_id: &session.model_id,
-        query_source: "repl",
-    };
-
-    let plan = plan_turn(&plan_input);
-    let bound = bind_all(&plan, &sources);
-
-    // The emergent skills section should contain the discovered skill
-    let emergent_section = bound
-        .sections
-        .iter()
-        .find(|s| s.plan.kind == SectionKind::EmergentSkills);
-    assert!(emergent_section.is_some());
-    assert!(
-        emergent_section
-            .unwrap()
-            .text()
-            .unwrap_or("")
-            .contains("security_review"),
-        "Emergent skill should be bound"
     );
 }
 

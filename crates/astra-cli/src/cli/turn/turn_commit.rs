@@ -177,7 +177,6 @@ pub(crate) struct DeferredTurnSidecarWork {
     total_cache_read_tokens: u64,
     total_cache_creation_tokens: u64,
     permission_mode: String,
-    discovered_skills: Vec<String>,
     /// The context trace belongs to the turn boundary, but its workspace
     /// projection is deferred with the other derived sidecars. Keep the
     /// parsed value here so a sidecar worker cannot silently leave the
@@ -304,7 +303,6 @@ impl DeferredTurnSidecarWork {
             total_cache_read_tokens: state.total_cache_read_tokens,
             total_cache_creation_tokens: state.total_cache_creation_tokens,
             permission_mode: state.perm_manager.mode().to_string(),
-            discovered_skills: state.discovered_skills.iter().cloned().collect(),
             latest_context_assembly_trace,
             sidecar_events,
             turn_observability_events,
@@ -383,7 +381,6 @@ impl DeferredTurnSidecarWork {
                 workspace.status = "active".to_string();
                 workspace.updated_at = chrono::Utc::now().to_rfc3339();
                 workspace.permission_mode = Some(self.permission_mode.clone());
-                workspace.discovered_skills = self.discovered_skills.clone();
 
                 // Sidecars are normally serialized per session, but recovery
                 // can replay an older item after a newer turn has already

@@ -25,9 +25,9 @@
 //! # Lifecycle
 //!
 //! 1. `start_run()` — Creates a durable record, returns run_id
-//! 2. `persist_status()` — Syncs status changes to store
+//! 2. owner-fenced transitions — Commit status and audit events together
 //! 3. `persist_checkpoint()` — Saves checkpoint for crash recovery
-//! 4. `persist_usage()` — Updates token/tool counts
+//! 4. `persist_usage_if_current_owner()` — Updates token/tool counts for the exact execution owner
 //! 5. `recover_active_runs()` — On startup, loads runs that were active when process died
 //! 6. `load_run()` — Loads a run from store (cache miss path)
 
@@ -1361,7 +1361,7 @@ impl RunEngine {
     /// Attach the database projection store used by web-agent session state.
     ///
     /// Delegation paths call `RunEngine::start_run_ext` and
-    /// `RunEngine::persist_status`; wiring here keeps projection persistence on
+    /// owner-fenced RunEngine transitions; wiring here keeps projection persistence on
     /// the production run lifecycle instead of isolated test helpers.
     pub fn with_projection_store(
         mut self,
@@ -2057,7 +2057,7 @@ impl RunEngine {
             checkpoint_json: None,
             error_code: None,
             error_message: None,
-            retry_count: 0,
+
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,
@@ -2077,74 +2077,6 @@ impl RunEngine {
             updated_at: now,
         };
         Ok(record)
-    }
-
-    /// Persist a status change to the durable store.
-    pub async fn persist_status(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
-    ) -> Result<bool, String> {
-        if durable_run_status_kind(status) == DurableRunStatusKind::Cancelled {
-            return Err(format!(
-                "persist_status cannot infer cancellation authority for run {run_id}; use the durable User marker flow or cancel_if_exact_live_owner with an explicit Runtime/Unverified origin"
-            ));
-        }
-        let terminal = matches!(
-            durable_run_status_kind(status),
-            DurableRunStatusKind::Completed
-                | DurableRunStatusKind::Delegated
-                | DurableRunStatusKind::Failed
-        );
-        let updated = if terminal {
-            let Some(current) = self.store.load_run(user_id, run_id).await? else {
-                return Ok(false);
-            };
-            self.store
-                .update_run_status_with_events_if_current(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    &[current.status.as_str()],
-                    None,
-                    status,
-                    waiting_for,
-                    error_message,
-                    &[],
-                )
-                .await?
-        } else {
-            self.store
-                .update_run_status(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    status,
-                    waiting_for,
-                    error_message,
-                )
-                .await?
-        };
-        if updated {
-            let summary = error_message.or(waiting_for);
-            if let Err(error) = self
-                .project_delegation_run_if_needed(user_id, run_id, summary)
-                .await
-            {
-                tracing::warn!(
-                    user_id,
-                    run_id,
-                    status,
-                    error = %error,
-                    "run transition committed but delegation projection refresh failed"
-                );
-            }
-        }
-        Ok(updated)
     }
 
     /// Persist a status change only if the durable row is still in one of the
@@ -2168,39 +2100,20 @@ impl RunEngine {
                 "persist_status_if_current cannot infer cancellation authority for run {run_id}; use the durable User marker flow or cancel_if_exact_live_owner with an explicit Runtime/Unverified origin"
             ));
         }
-        let terminal = matches!(
-            durable_run_status_kind(status),
-            DurableRunStatusKind::Completed
-                | DurableRunStatusKind::Delegated
-                | DurableRunStatusKind::Failed
-        );
-        let updated = if terminal {
-            self.store
-                .update_run_status_with_events_if_current(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    expected_statuses,
-                    None,
-                    status,
-                    waiting_for,
-                    error_message,
-                    &[],
-                )
-                .await?
-        } else {
-            self.store
-                .update_run_status_if_current(RunStatusCasRequest {
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    expected_statuses,
-                    status,
-                    waiting_for,
-                    error_message,
-                })
-                .await?
-        };
+        let updated = self
+            .store
+            .update_run_status_with_events_if_current(
+                user_id,
+                expected_session_id,
+                run_id,
+                expected_statuses,
+                None,
+                status,
+                waiting_for,
+                error_message,
+                &[],
+            )
+            .await?;
         if updated {
             let summary = error_message.or(waiting_for);
             if let Err(error) = self
@@ -2238,11 +2151,15 @@ impl RunEngine {
         {
             return Ok(false);
         }
-        self.transition_status_with_events_if_current(
+        let Some(run) = self.load_run(user_id, run_id).await? else {
+            return Ok(false);
+        };
+        self.transition_status_with_events_if_current_owner(
             user_id,
             expected_session_id,
             run_id,
             expected_statuses,
+            run.run_generation,
             STATUS_CANCELLED,
             None,
             None,
@@ -2261,70 +2178,7 @@ impl RunEngine {
         .await
     }
 
-    /// Persist an executor-produced delegation outcome without allowing a
-    /// stale child completion to overwrite a concurrent pause or cancel.
-    ///
-    /// The durable run state is authoritative. Terminal outcomes are committed
-    /// with their replay events in the same CAS; a lost CAS is reported as
-    /// `Ok(false)` and the winning durable state remains untouched.
-    pub async fn persist_delegation_outcome_status(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
-    ) -> Result<bool, String> {
-        let transition = delegation_outcome_transition(status).ok_or_else(|| {
-            format!("unsupported delegation outcome status '{status}' for run {run_id}")
-        })?;
-
-        if !transition.terminal {
-            return self
-                .persist_status_if_current(RunStatusCasRequest {
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    expected_statuses: transition.expected_statuses,
-                    status: transition.canonical_status,
-                    waiting_for,
-                    error_message,
-                })
-                .await;
-        }
-
-        let events = delegation_terminal_events(transition.canonical_status, error_message);
-
-        match self
-            .commit_terminal_status_with_events_if_current(
-                user_id,
-                expected_session_id,
-                run_id,
-                transition.expected_statuses,
-                transition.canonical_status,
-                waiting_for,
-                error_message,
-                &events,
-            )
-            .await?
-        {
-            TerminalTransitionOutcome::Committed(_) => Ok(true),
-            TerminalTransitionOutcome::Superseded(durable) => {
-                tracing::info!(
-                    target: "astra_runtime::delegation",
-                    user_id,
-                    run_id,
-                    attempted_status = transition.canonical_status,
-                    durable_status = %durable.status,
-                    "delegation outcome lost its status CAS; preserving durable authority"
-                );
-                Ok(false)
-            }
-        }
-    }
-
-    /// Owner-fenced counterpart of [`Self::persist_delegation_outcome_status`].
+    /// Persist a delegation outcome under its exact execution owner generation.
     ///
     /// Scheduler-owned executors do not emit their own durable lifecycle. This
     /// method keeps their terminal status and replay events under the same
@@ -2406,44 +2260,20 @@ impl RunEngine {
         error_message: Option<&str>,
         event: serde_json::Value,
     ) -> Result<bool, String> {
-        let terminal = matches!(
-            durable_run_status_kind(status),
-            DurableRunStatusKind::Cancelled
-                | DurableRunStatusKind::Completed
-                | DurableRunStatusKind::Delegated
-                | DurableRunStatusKind::Failed
-        ) || event
-            .pointer("/data/releases_session_slot")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-        let updated = if terminal {
-            self.store
-                .update_run_status_with_events_if_current(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    expected_statuses,
-                    None,
-                    status,
-                    waiting_for,
-                    error_message,
-                    std::slice::from_ref(&event),
-                )
-                .await?
-        } else {
-            self.store
-                .update_run_status_with_event_if_current(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    expected_statuses,
-                    status,
-                    waiting_for,
-                    error_message,
-                    event,
-                )
-                .await?
-        };
+        let updated = self
+            .store
+            .update_run_status_with_events_if_current(
+                user_id,
+                expected_session_id,
+                run_id,
+                expected_statuses,
+                None,
+                status,
+                waiting_for,
+                error_message,
+                std::slice::from_ref(&event),
+            )
+            .await?;
         if updated {
             let summary = error_message.or(waiting_for);
             if let Err(error) = self
@@ -2518,52 +2348,6 @@ impl RunEngine {
             }
         }
         Ok(outcome)
-    }
-
-    /// Atomically persist a status transition and a durable audit event batch.
-    ///
-    /// Empty `events` is valid and behaves as a CAS status transition.
-    pub async fn transition_status_with_events_if_current(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_statuses: &[&str],
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
-        events: &[serde_json::Value],
-    ) -> Result<bool, String> {
-        let updated = self
-            .store
-            .update_run_status_with_events_if_current(
-                user_id,
-                expected_session_id,
-                run_id,
-                expected_statuses,
-                None,
-                status,
-                waiting_for,
-                error_message,
-                events,
-            )
-            .await?;
-        if updated {
-            let summary = error_message.or(waiting_for);
-            if let Err(error) = self
-                .project_delegation_run_if_needed(user_id, run_id, summary)
-                .await
-            {
-                tracing::warn!(
-                    user_id,
-                    run_id,
-                    status,
-                    error = %error,
-                    "run transition committed but delegation projection refresh failed"
-                );
-            }
-        }
-        Ok(updated)
     }
 
     pub async fn load_run_event_by_idempotency_key(
@@ -3395,28 +3179,6 @@ impl RunEngine {
         }
     }
 
-    /// Persist token/tool usage counters.
-    pub async fn persist_usage(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        tool_calls: u32,
-    ) -> Result<bool, String> {
-        self.store
-            .update_run_usage(
-                user_id,
-                expected_session_id,
-                run_id,
-                prompt_tokens,
-                completion_tokens,
-                tool_calls,
-            )
-            .await
-    }
-
     /// Persist the semantic run aggregate only for the exact execution
     /// generation that produced it. Provider-attempt accounting remains
     /// independent and append-only; this protects the user-visible run total
@@ -4095,19 +3857,6 @@ impl RunEngine {
         delegation_id: &str,
     ) -> Result<Vec<DurableRunRecord>, String> {
         self.store.find_sub_runs(user_id, delegation_id).await
-    }
-
-    /// Persist the verification-gate retry count for a run.
-    pub async fn persist_retry_count(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        retry_count: u32,
-    ) -> Result<bool, String> {
-        self.store
-            .update_retry_count(user_id, expected_session_id, run_id, retry_count)
-            .await
     }
 
     pub async fn load_run_interaction_event(
@@ -5605,12 +5354,20 @@ mod tests {
                     .expect("persist explicit User cancellation marker")
             );
         }
+        let Some(run) = engine
+            .load_run(user_id, run_id)
+            .await
+            .expect("load cancellation fixture")
+        else {
+            return false;
+        };
         engine
-            .transition_status_with_events_if_current(
+            .transition_status_with_events_if_current_owner(
                 user_id,
                 session_id,
                 run_id,
                 expected_statuses,
+                run.run_generation,
                 STATUS_CANCELLED,
                 None,
                 None,
@@ -5680,7 +5437,7 @@ mod tests {
             ("delegation-cancel-wins", STATUS_CANCELLED),
         ] {
             let engine = test_engine();
-            engine
+            let execution_authority = engine
                 .start_run(run_id, "user-1", "session-1")
                 .await
                 .unwrap();
@@ -5697,24 +5454,28 @@ mod tests {
                     .await
                 );
             } else {
-                engine
-                    .persist_status(
-                        "user-1",
-                        "session-1",
-                        run_id,
-                        winning_status,
-                        Some("control"),
-                        None,
-                    )
-                    .await
-                    .unwrap();
+                assert!(
+                    engine
+                        .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                            user_id: "user-1",
+                            expected_session_id: "session-1",
+                            run_id,
+                            status: winning_status,
+                            waiting_for: Some("control"),
+                            error_message: None,
+                            expected_statuses: &["running"],
+                        })
+                        .await
+                        .unwrap()
+                );
             }
 
             let committed = engine
-                .persist_delegation_outcome_status(
+                .persist_delegation_outcome_status_if_current_owner(
                     "user-1",
                     "session-1",
                     run_id,
+                    execution_authority.owner_generation,
                     STATUS_COMPLETED,
                     None,
                     None,
@@ -5735,17 +5496,18 @@ mod tests {
     #[tokio::test]
     async fn delegation_verification_failure_uses_canonical_failed_status() {
         let engine = test_engine();
-        engine
+        let execution_authority = engine
             .start_run("delegation-verification", "user-1", "session-1")
             .await
             .unwrap();
 
         assert!(
             engine
-                .persist_delegation_outcome_status(
+                .persist_delegation_outcome_status_if_current_owner(
                     "user-1",
                     "session-1",
                     "delegation-verification",
+                    execution_authority.owner_generation,
                     "verification_failed",
                     None,
                     Some("evidence did not satisfy the gate"),
@@ -5769,17 +5531,18 @@ mod tests {
     async fn repeated_delegation_terminal_outcome_does_not_append_duplicate_events() {
         let engine = test_engine();
         let run_id = "delegation-terminal-replay";
-        engine
+        let execution_authority = engine
             .start_run(run_id, "user-1", "session-1")
             .await
             .unwrap();
 
         assert!(
             engine
-                .persist_delegation_outcome_status(
+                .persist_delegation_outcome_status_if_current_owner(
                     "user-1",
                     "session-1",
                     run_id,
+                    execution_authority.owner_generation,
                     STATUS_FAILED,
                     None,
                     Some("worker failed"),
@@ -5791,10 +5554,11 @@ mod tests {
 
         assert!(
             !engine
-                .persist_delegation_outcome_status(
+                .persist_delegation_outcome_status_if_current_owner(
                     "user-1",
                     "session-1",
                     run_id,
+                    execution_authority.owner_generation,
                     STATUS_FAILED,
                     None,
                     Some("worker failed"),
@@ -7824,59 +7588,6 @@ mod tests {
             Ok(delta)
         }
 
-        async fn update_run_status(
-            &self,
-            user_id: &str,
-            expected_session_id: &str,
-            run_id: &str,
-            status: &str,
-            waiting_for: Option<&str>,
-            error_message: Option<&str>,
-        ) -> Result<bool, String> {
-            self.inner
-                .update_run_status(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    status,
-                    waiting_for,
-                    error_message,
-                )
-                .await
-        }
-
-        async fn update_run_status_if_current(
-            &self,
-            request: RunStatusCasRequest<'_>,
-        ) -> Result<bool, String> {
-            self.inner.update_run_status_if_current(request).await
-        }
-
-        async fn update_run_status_with_event_if_current(
-            &self,
-            user_id: &str,
-            expected_session_id: &str,
-            run_id: &str,
-            expected_statuses: &[&str],
-            status: &str,
-            waiting_for: Option<&str>,
-            error_message: Option<&str>,
-            event: serde_json::Value,
-        ) -> Result<bool, String> {
-            self.inner
-                .update_run_status_with_event_if_current(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    expected_statuses,
-                    status,
-                    waiting_for,
-                    error_message,
-                    event,
-                )
-                .await
-        }
-
         async fn update_run_status_with_events_if_current(
             &self,
             user_id: &str,
@@ -7936,15 +7647,17 @@ mod tests {
                     }
                     BatchTransitionFailureMode::FailAfterStatusWrite => {
                         self.inner
-                            .update_run_status_if_current(RunStatusCasRequest {
+                            .update_run_status_with_events_if_current(
                                 user_id,
                                 expected_session_id,
                                 run_id,
                                 expected_statuses,
+                                None,
                                 status,
                                 waiting_for,
                                 error_message,
-                            })
+                                &[],
+                            )
                             .await?;
                         return Err("transient EOF after status-only commit".to_string());
                     }
@@ -7999,27 +7712,6 @@ mod tests {
                 tokio::time::sleep(delay).await;
             }
             Ok(outcome)
-        }
-
-        async fn update_run_usage(
-            &self,
-            user_id: &str,
-            expected_session_id: &str,
-            run_id: &str,
-            prompt_tokens: u64,
-            completion_tokens: u64,
-            tool_calls: u32,
-        ) -> Result<bool, String> {
-            self.inner
-                .update_run_usage(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    prompt_tokens,
-                    completion_tokens,
-                    tool_calls,
-                )
-                .await
         }
 
         async fn update_run_usage_if_current_owner(
@@ -8236,18 +7928,6 @@ mod tests {
             delegation_id: &str,
         ) -> Result<Vec<DurableRunRecord>, String> {
             self.inner.find_sub_runs(user_id, delegation_id).await
-        }
-
-        async fn update_retry_count(
-            &self,
-            user_id: &str,
-            expected_session_id: &str,
-            run_id: &str,
-            retry_count: u32,
-        ) -> Result<bool, String> {
-            self.inner
-                .update_retry_count(user_id, expected_session_id, run_id, retry_count)
-                .await
         }
     }
 
@@ -9322,6 +9002,7 @@ mod tests {
     {
         let engine = test_engine();
         let request = astra_services::runs::ChatRequestData {
+            completion_checks: None,
             agent_profile_selection: None,
             admitted_agent_profiles: None,
             model_catalog_reader: None,
@@ -9491,34 +9172,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_status_updates() {
-        let engine = test_engine();
-        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
-        let ok = engine
-            .persist_status(
-                "user-1",
-                "sess-1",
-                "run-1",
-                "paused",
-                Some("user_resume"),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(ok);
+    async fn owner_status_transition_rejects_stale_missing_and_wrong_session_targets() {
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let engine = RunEngine::new(store.clone());
+        let authority = engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
+        let claimed = store.claim_recoverable_active_runs(1).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        let generation = claimed[0].run.run_generation;
+        assert_eq!(authority.owner_generation, 0);
+        assert_eq!(generation, 1);
+        for (session, run, generation) in [
+            ("sess-1", "nope", generation),
+            ("wrong-session", "run-1", generation),
+            ("sess-1", "run-1", authority.owner_generation),
+            ("sess-1", "run-1", generation + 1),
+        ] {
+            assert!(
+                !engine
+                    .transition_status_with_events_if_current_owner(
+                        "user-1",
+                        session,
+                        run,
+                        &[STATUS_RUNNING],
+                        generation,
+                        STATUS_PAUSED,
+                        Some("user_resume"),
+                        None,
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                engine
+                    .load_run("user-1", "run-1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                STATUS_RUNNING
+            );
+        }
+        assert!(
+            engine
+                .transition_status_with_events_if_current_owner(
+                    "user-1",
+                    "sess-1",
+                    "run-1",
+                    &[STATUS_RUNNING],
+                    generation,
+                    STATUS_PAUSED,
+                    Some("user_resume"),
+                    None,
+                    &[],
+                )
+                .await
+                .unwrap()
+        );
         let run = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
-        assert_eq!(run.status, "paused");
+        assert_eq!(run.status, STATUS_PAUSED);
         assert_eq!(run.waiting_for.as_deref(), Some("user_resume"));
-    }
-
-    #[tokio::test]
-    async fn persist_status_nonexistent_returns_false() {
-        let engine = test_engine();
-        let ok = engine
-            .persist_status("user-1", "sess-1", "nope", "failed", None, Some("crash"))
-            .await
-            .unwrap();
-        assert!(!ok);
     }
 
     #[tokio::test]
@@ -9531,14 +9244,15 @@ mod tests {
 
         assert!(
             !engine
-                .persist_status(
-                    "user-1",
-                    "session-other",
-                    "session-fenced-run",
-                    STATUS_PAUSED,
-                    Some("user_resume"),
-                    None,
-                )
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "session-other",
+                    run_id: "session-fenced-run",
+                    status: STATUS_PAUSED,
+                    waiting_for: Some("user_resume"),
+                    error_message: None,
+                    expected_statuses: &["running"]
+                })
                 .await
                 .unwrap(),
             "a same-user caller from another session must lose the status mutation fence"
@@ -9854,11 +9568,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_usage_updates() {
+    async fn owned_usage_updates() {
         let engine = test_engine();
-        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
+        let authority = engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
-            .persist_usage("user-1", "sess-1", "run-1", 1000, 500, 7)
+            .persist_usage_if_current_owner(
+                "user-1",
+                "sess-1",
+                "run-1",
+                authority.owner_generation,
+                1000,
+                500,
+                7,
+            )
             .await
             .unwrap();
         let run = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
@@ -9888,7 +9610,7 @@ mod tests {
     #[tokio::test]
     async fn run_projection_tracks_latest_event_usage_and_checkpoint() {
         let engine = test_engine();
-        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
+        let authority = engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine
             .append_event(
                 "user-1",
@@ -9899,7 +9621,15 @@ mod tests {
             .await
             .unwrap();
         engine
-            .persist_usage("user-1", "sess-1", "run-1", 11, 7, 3)
+            .persist_usage_if_current_owner(
+                "user-1",
+                "sess-1",
+                "run-1",
+                authority.owner_generation,
+                11,
+                7,
+                3,
+            )
             .await
             .unwrap();
         engine
@@ -9911,17 +9641,20 @@ mod tests {
             )
             .await
             .unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "sess-1",
-                "run-1",
-                "waiting",
-                Some("user_input"),
-                None,
-            )
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-1",
+                    run_id: "run-1",
+                    status: "waiting",
+                    waiting_for: Some("user_input"),
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
 
         let projection = engine
             .load_run_projection("user-1", "run-1")
@@ -9987,17 +9720,20 @@ mod tests {
         let engine = test_engine();
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine.start_run("run-2", "user-1", "sess-2").await.unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "sess-2",
-                "run-2",
-                "waiting",
-                Some("tool_approval"),
-                None,
-            )
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-2",
+                    run_id: "run-2",
+                    status: "waiting",
+                    waiting_for: Some("tool_approval"),
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         let waiting = engine.find_waiting_runs().await.unwrap();
         assert_eq!(waiting.len(), 1);
         assert_eq!(waiting[0].run_id, "run-2");
@@ -10014,18 +9750,38 @@ mod tests {
             .start_run("paused-free", "user-1", "sess-free")
             .await
             .unwrap();
-        engine
-            .persist_status("user-1", "sess-free", "paused-free", "paused", None, None)
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-free",
+                    run_id: "paused-free",
+                    status: "paused",
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         engine
             .start_run("completed", "user-1", "sess-done")
             .await
             .unwrap();
-        engine
-            .persist_status("user-1", "sess-done", "completed", "completed", None, None)
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-done",
+                    run_id: "completed",
+                    status: "completed",
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
 
         let blocked = engine
             .find_blocking_session_run("user-1", "sess-blocked")
@@ -10052,32 +9808,38 @@ mod tests {
             .start_run("paused", "user-1", "sess-paused")
             .await
             .unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "sess-paused",
-                "paused",
-                "paused",
-                Some("user_resume"),
-                None,
-            )
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-paused",
+                    run_id: "paused",
+                    status: "paused",
+                    waiting_for: Some("user_resume"),
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         engine
             .start_run("waiting", "user-1", "sess-waiting")
             .await
             .unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "sess-waiting",
-                "waiting",
-                "waiting",
-                Some("tool_approval"),
-                None,
-            )
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-waiting",
+                    run_id: "waiting",
+                    status: "waiting",
+                    waiting_for: Some("tool_approval"),
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         engine
             .start_run("cancelled", "user-1", "sess-cancelled")
             .await
@@ -10149,17 +9911,20 @@ mod tests {
             .await
             .unwrap();
 
-        engine
-            .persist_status(
-                "user-1",
-                "session-1",
-                "root",
-                STATUS_PAUSED,
-                Some("user_resume"),
-                None,
-            )
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "session-1",
+                    run_id: "root",
+                    status: STATUS_PAUSED,
+                    waiting_for: Some("user_resume"),
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         assert_eq!(
             engine
                 .check_control_status("user-1", "grandchild")
@@ -10352,18 +10117,6 @@ mod tests {
             .start_run("ambiguous-cancel", "user-1", "session-1")
             .await
             .unwrap();
-        let direct_error = engine
-            .persist_status(
-                "user-1",
-                "session-1",
-                "ambiguous-cancel",
-                STATUS_CANCELLED,
-                None,
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(direct_error.contains("cannot infer cancellation authority"));
         let cas_error = engine
             .persist_status_if_current(RunStatusCasRequest {
                 user_id: "user-1",
@@ -10586,10 +10339,20 @@ mod tests {
             )
             .await
             .unwrap();
-        engine
-            .persist_status("user-1", "session-1", "root", STATUS_PAUSED, None, None)
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "session-1",
+                    run_id: "root",
+                    status: STATUS_PAUSED,
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
 
         assert_eq!(
             engine.check_control_status("user-1", "root").await.unwrap(),
@@ -10709,17 +10472,20 @@ mod tests {
             .start_run("run-waiting-metric", "user-1", "sess-waiting")
             .await
             .unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "sess-waiting",
-                "run-waiting-metric",
-                STATUS_WAITING,
-                Some("user_resume"),
-                None,
-            )
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-waiting",
+                    run_id: "run-waiting-metric",
+                    status: STATUS_WAITING,
+                    waiting_for: Some("user_resume"),
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         engine
             .start_run("run-resume-metric", "user-1", "sess-resume")
             .await
@@ -11273,17 +11039,20 @@ mod tests {
             )
             .await
             .unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "sess-queued",
-                "run-queued",
-                STATUS_WAITING,
-                Some("edge_executor"),
-                None,
-            )
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-queued",
+                    run_id: "run-queued",
+                    status: STATUS_WAITING,
+                    waiting_for: Some("edge_executor"),
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
 
         let ack = engine
             .mark_user_intents_applied(
@@ -11530,17 +11299,20 @@ mod tests {
             )
             .await
             .unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "sess-paused",
-                "run-paused-release",
-                STATUS_PAUSED,
-                Some("user_resume"),
-                None,
-            )
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-paused",
+                    run_id: "run-paused-release",
+                    status: STATUS_PAUSED,
+                    waiting_for: Some("user_resume"),
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
 
         let error = engine
             .mark_user_intents_applied(
@@ -11798,17 +11570,20 @@ mod tests {
             .start_run("run-cas", "user-1", "sess-cas")
             .await
             .unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "sess-cas",
-                "run-cas",
-                STATUS_PAUSED,
-                Some("user_resume"),
-                None,
-            )
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-cas",
+                    run_id: "run-cas",
+                    status: STATUS_PAUSED,
+                    waiting_for: Some("user_resume"),
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
 
         let updated = engine
             .persist_status_if_current(RunStatusCasRequest {
@@ -11875,21 +11650,34 @@ mod tests {
         let engine = test_engine();
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine.start_run("run-2", "user-1", "sess-2").await.unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "sess-1",
-                "run-1",
-                "waiting",
-                Some("user_resume"),
-                None,
-            )
-            .await
-            .unwrap();
-        engine
-            .persist_status("user-1", "sess-2", "run-2", "completed", None, None)
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-1",
+                    run_id: "run-1",
+                    status: "waiting",
+                    waiting_for: Some("user_resume"),
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-2",
+                    run_id: "run-2",
+                    status: "completed",
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         let active = engine.recover_active_runs().await.unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].run_id, "run-1");
@@ -12035,17 +11823,20 @@ mod tests {
             .start_run("run-waiting", "user-1", "sess-waiting")
             .await
             .unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "sess-waiting",
-                "run-waiting",
-                STATUS_WAITING,
-                Some("user_resume"),
-                None,
-            )
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-waiting",
+                    run_id: "run-waiting",
+                    status: STATUS_WAITING,
+                    waiting_for: Some("user_resume"),
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         engine
             .start_run("run-crashed", "user-1", "sess-crashed")
             .await
@@ -12082,17 +11873,20 @@ mod tests {
             .start_run("run-paused", "user-1", "sess-paused")
             .await
             .unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "sess-paused",
-                "run-paused",
-                STATUS_PAUSED,
-                Some("user_resume"),
-                None,
-            )
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-paused",
+                    run_id: "run-paused",
+                    status: STATUS_PAUSED,
+                    waiting_for: Some("user_resume"),
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
 
         let recovered = engine.recover_active_runs().await.unwrap();
 
@@ -12304,48 +12098,50 @@ mod tests {
     #[tokio::test]
     async fn full_lifecycle_start_pause_resume_complete() {
         let engine = test_engine();
-        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
+        let authority = engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
 
-        // Simulate pause
-        engine
-            .persist_status(
-                "user-1",
-                "sess-1",
-                "run-1",
-                "paused",
+        for (before, after, waiting_for, event_type) in [
+            (
+                STATUS_RUNNING,
+                STATUS_PAUSED,
                 Some("user_resume"),
-                None,
-            )
-            .await
-            .unwrap();
-        engine
-            .append_event(
-                "user-1",
-                "sess-1",
-                "run-1",
-                serde_json::json!({"event_type": "run_paused"}),
-            )
-            .await
-            .unwrap();
-
-        // Simulate resume
-        engine
-            .persist_status("user-1", "sess-1", "run-1", "running", None, None)
-            .await
-            .unwrap();
-        engine
-            .append_event(
-                "user-1",
-                "sess-1",
-                "run-1",
-                serde_json::json!({"event_type": "run_resumed"}),
-            )
-            .await
-            .unwrap();
+                "run_paused",
+            ),
+            (STATUS_PAUSED, STATUS_RUNNING, None, "run_resumed"),
+        ] {
+            assert!(
+                engine
+                    .transition_status_with_events_if_current_owner(
+                        "user-1",
+                        "sess-1",
+                        "run-1",
+                        &[before],
+                        authority.owner_generation,
+                        after,
+                        waiting_for,
+                        None,
+                        &[serde_json::json!({"event_type": event_type})],
+                    )
+                    .await
+                    .unwrap()
+            );
+            let run = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
+            assert_eq!(run.status, after);
+            assert_eq!(run.waiting_for.as_deref(), waiting_for);
+            assert_eq!(run.events.last().unwrap()["event_type"], event_type);
+        }
 
         // Simulate completion
         engine
-            .persist_usage("user-1", "sess-1", "run-1", 2000, 800, 12)
+            .persist_usage_if_current_owner(
+                "user-1",
+                "sess-1",
+                "run-1",
+                authority.owner_generation,
+                2000,
+                800,
+                12,
+            )
             .await
             .unwrap();
         engine
@@ -12357,19 +12153,13 @@ mod tests {
             )
             .await
             .unwrap();
-        engine
-            .persist_status("user-1", "sess-1", "run-1", "completed", None, None)
-            .await
-            .unwrap();
-        engine
-            .append_event(
-                "user-1",
-                "sess-1",
-                "run-1",
-                serde_json::json!({"event_type": "run_finished", "data": {}}),
+        assert!(matches!(engine
+            .commit_terminal_status_with_events_if_current_owner(
+                "user-1", "sess-1", "run-1", &[STATUS_RUNNING],
+                authority.owner_generation, STATUS_COMPLETED, None, None,
+                &[serde_json::json!({"event_type": "run_finished", "data": {"status": STATUS_COMPLETED}})],
             )
-            .await
-            .unwrap();
+            .await.unwrap(), TerminalTransitionOutcome::Committed(_)));
 
         let run = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
         assert_eq!(run.status, "completed");
@@ -12395,17 +12185,20 @@ mod tests {
     async fn error_message_persists() {
         let engine = test_engine();
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "sess-1",
-                "run-1",
-                "failed",
-                None,
-                Some("OOM killed"),
-            )
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-1",
+                    run_id: "run-1",
+                    status: "failed",
+                    waiting_for: None,
+                    error_message: Some("OOM killed"),
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         let run = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
         assert_eq!(run.status, "failed");
         assert_eq!(run.error_message.as_deref(), Some("OOM killed"));
@@ -12420,10 +12213,6 @@ mod tests {
         // Insert a run that was running when the process crashed
         engine
             .start_run("run-crash", "user-1", "sess-1")
-            .await
-            .unwrap();
-        engine
-            .persist_status("user-1", "sess-1", "run-crash", "running", None, None)
             .await
             .unwrap();
         engine
@@ -12450,10 +12239,20 @@ mod tests {
             .start_run("run-wait", "user-1", "sess-2")
             .await
             .unwrap();
-        engine
-            .persist_status("user-1", "sess-2", "run-wait", "waiting", None, None)
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "user-1",
+                    expected_session_id: "sess-2",
+                    run_id: "run-wait",
+                    status: "waiting",
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         engine
             .append_event(
                 "user-1",
@@ -12555,17 +12354,13 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "sess-race",
-                "run-race",
-                astra_core::STATUS_COMPLETED,
-                None,
-                None,
+        assert!(matches!(engine
+            .commit_terminal_status_with_events_if_current_owner(
+                "user-1", "sess-race", "run-race", &[STATUS_RUNNING],
+                stale_running.run.run_generation, STATUS_COMPLETED, None, None,
+                &[serde_json::json!({"event_type": "run_finished", "data": {"status": STATUS_COMPLETED}})],
             )
-            .await
-            .unwrap();
+            .await.unwrap(), TerminalTransitionOutcome::Committed(_)));
 
         let recovered = engine.recover_active_run(stale_running).await;
 
@@ -12584,8 +12379,27 @@ mod tests {
         assert!(
             durable.events.iter().all(|event| !matches!(
                 event.get("event_type").and_then(serde_json::Value::as_str),
-                Some("run_error" | "run_finished")
+                Some("run_error")
             )),
+            "stale recovery must not append crash-recovery errors"
+        );
+        assert_eq!(
+            durable
+                .events
+                .iter()
+                .filter(|event| event["event_type"] == "run_finished")
+                .count(),
+            1
+        );
+        assert_eq!(
+            durable.events.last().unwrap()["data"]["status"],
+            STATUS_COMPLETED
+        );
+        assert!(
+            durable
+                .events
+                .iter()
+                .all(|event| event["data"]["error_code"] != "crash_recovery"),
             "stale recovery must not append crash-recovery terminal events"
         );
     }

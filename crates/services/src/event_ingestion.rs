@@ -1102,68 +1102,6 @@ impl IngestionSender {
         self.pending_deferrals.load(Ordering::Relaxed)
     }
 
-    /// Enqueue with backpressure (waits if channel full).
-    pub async fn enqueue_async(&self, mut event: IngestionEvent) {
-        let priority = event.priority();
-        let bytes = match astra_core::history_work::serialized_bytes(&event) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                self.record_drop_before_acceptance(priority);
-                tracing::warn!(
-                    target: "astra_services::event_ingestion",
-                    priority = priority.as_label(),
-                    error = %error,
-                    "ingestion event could not be sized and was rejected before acceptance"
-                );
-                return;
-            }
-        };
-        if bytes > self.admission.limits.max_event_bytes {
-            self.record_drop_before_acceptance(priority);
-            tracing::warn!(
-                target: "astra_services::event_ingestion",
-                priority = priority.as_label(),
-                event_bytes = bytes,
-                max_event_bytes = self.admission.limits.max_event_bytes,
-                "oversized ingestion event rejected before acceptance"
-            );
-            return;
-        }
-        let lease = tokio::select! {
-            lease = self.admission.acquire(&event, bytes, priority) => lease,
-            _ = self.tx.closed() => {
-                self.overflow_count.fetch_add(1, Ordering::Relaxed);
-                self.record_drop_before_acceptance(priority);
-                tracing::warn!(
-                    target: "astra_services::event_ingestion",
-                    priority = priority.as_label(),
-                    "ingestion channel closed while waiting for admission; event dropped"
-                );
-                return;
-            }
-        };
-        let Ok(lease) = lease else {
-            self.record_drop_before_acceptance(priority);
-            return;
-        };
-        event.history_work_queue_reservation = Some(ingestion_queue_reservation(bytes, lease));
-        event.ingestion_enqueued_at = Some(std::time::Instant::now());
-        if let Ok(permit) = self.tx.reserve().await {
-            if let Some(lease) = delivery_lease(&event) {
-                lease.accept();
-            }
-            permit.send(event);
-        } else {
-            self.overflow_count.fetch_add(1, Ordering::Relaxed);
-            self.record_drop_before_acceptance(priority);
-            tracing::warn!(
-                target: "astra_services::event_ingestion",
-                priority = priority.as_label(),
-                "ingestion channel closed; event dropped"
-            );
-        }
-    }
-
     /// Signal the worker to flush remaining events and shut down.
     /// Dropping the sender closes the channel; the worker drains its buffer on close.
     pub fn shutdown(self) {
@@ -1283,7 +1221,6 @@ struct IngestionAdmissionState {
 struct IngestionAdmission {
     limits: IngestionAdmissionLimits,
     state: Mutex<IngestionAdmissionState>,
-    released: tokio::sync::Notify,
     stats: Arc<Mutex<IngestionStats>>,
 }
 
@@ -1368,7 +1305,6 @@ impl IngestionAdmission {
         Arc::new(Self {
             limits: IngestionAdmissionLimits::from_config(config),
             state: Mutex::new(IngestionAdmissionState::default()),
-            released: tokio::sync::Notify::new(),
             stats,
         })
     }
@@ -1466,26 +1402,6 @@ impl IngestionAdmission {
         })
     }
 
-    async fn acquire(
-        self: &Arc<Self>,
-        event: &IngestionEvent,
-        bytes: u64,
-        priority: IngestionEventPriority,
-    ) -> Result<IngestionAdmissionLease, IngestionAdmissionRejection> {
-        loop {
-            let notified = self.released.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            match self.try_acquire(event, bytes, priority) {
-                Ok(lease) => return Ok(lease),
-                Err(IngestionAdmissionRejection::Oversized) => {
-                    return Err(IngestionAdmissionRejection::Oversized);
-                }
-                Err(_) => notified.await,
-            }
-        }
-    }
-
     fn release(&self, user_id: &str, session_id: &str, bytes: u64) {
         let mut state = astra_core::sync_poison::recover_mutex_lock(&self.state);
         remove_usage(&mut state.global, bytes);
@@ -1502,7 +1418,6 @@ impl IngestionAdmission {
         stats.resident_bytes_current = current.bytes;
         drop(stats);
         drop(state);
-        self.released.notify_waiters();
     }
 }
 
@@ -3245,9 +3160,7 @@ mod tests {
             ("drain-failed", Some(true), 1),
             ("cancelled", None, 2),
         ] {
-            sender
-                .enqueue_async(test_event(id, "session", "user_query"))
-                .await;
+            sender.enqueue(test_event(id, "session", "user_query"));
             let event = receiver.recv().await.unwrap();
             let retry = event.clone();
             if let Some(unresolved) = terminal {
@@ -3268,30 +3181,6 @@ mod tests {
             assert_eq!(snapshot.events_unresolved_shutdown, expected);
             assert_eq!(snapshot.resident_events_current, 0);
         }
-    }
-
-    #[tokio::test]
-    async fn cancelled_pre_channel_send_is_not_an_unresolved_delivery() {
-        let (sender, mut receiver) = IngestionSender::for_tests(1);
-        sender
-            .enqueue_async(test_event("accepted", "session", "user_query"))
-            .await;
-        let mut waiting = test_event("waiting", "other-session", "user_query");
-        waiting.user_id = "other-owner".to_string();
-        let mut pending = Box::pin(sender.enqueue_async(waiting));
-        assert!(futures_util::poll!(pending.as_mut()).is_pending());
-        assert_eq!(
-            astra_core::sync_poison::recover_mutex_lock(&sender.admission.stats)
-                .resident_events_current,
-            2
-        );
-        drop(pending);
-        let event = receiver.recv().await.unwrap();
-        delivery_lease(&event).unwrap().finish(false);
-        drop(event);
-        let stats = astra_core::sync_poison::recover_mutex_lock(&sender.admission.stats);
-        assert_eq!(stats.resident_events_current, 0);
-        assert_eq!(stats.events_unresolved_shutdown, 0);
     }
 
     #[test]
@@ -3346,52 +3235,6 @@ mod tests {
             .try_acquire(&other_owner, other_bytes, IngestionEventPriority::Critical)
             .expect("global headroom remains for another owner");
         drop((first, second, third, other));
-    }
-
-    #[tokio::test]
-    async fn async_admission_waits_for_saturated_session_without_blocking_other_owner() {
-        let config = IngestionConfig {
-            channel_capacity: 3,
-            max_owner_resident_events: 2,
-            max_session_resident_events: 1,
-            ..Default::default()
-        }
-        .normalized();
-        let admission =
-            IngestionAdmission::new(&config, Arc::new(Mutex::new(IngestionStats::default())));
-        let event = test_event("blocked-1", "blocked", "turn");
-        let bytes = astra_core::history_work::serialized_bytes(&event).expect("event size");
-        let held = admission
-            .try_acquire(&event, bytes, IngestionEventPriority::Critical)
-            .expect("initial session lease");
-        let waiting_admission = Arc::clone(&admission);
-        let waiting_event = test_event("blocked-2", "blocked", "turn");
-        let waiter = tokio::spawn(async move {
-            waiting_admission
-                .acquire(&waiting_event, bytes, IngestionEventPriority::Critical)
-                .await
-        });
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished(), "saturated session must wait");
-
-        let mut healthy = test_event("healthy-1", "healthy", "turn");
-        healthy.user_id = "other-owner".to_string();
-        let healthy_bytes =
-            astra_core::history_work::serialized_bytes(&healthy).expect("event size");
-        let healthy_lease = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            admission.acquire(&healthy, healthy_bytes, IngestionEventPriority::Critical),
-        )
-        .await
-        .expect("another owner must not be blocked")
-        .expect("healthy owner admission");
-        drop(held);
-        let waited = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-            .await
-            .expect("waiting session should wake after release")
-            .expect("waiter task")
-            .expect("waiter admission");
-        drop((healthy_lease, waited));
     }
 
     #[tokio::test]
@@ -4559,24 +4402,6 @@ mod tests {
     }
 
     // ── Batching / pipeline logic (no DB required) ──
-
-    #[tokio::test]
-    async fn sender_enqueue_async_respects_backpressure() {
-        let (tx, mut rx) = mpsc::channel(3);
-        let sender = test_sender(tx, 3);
-
-        for i in 0..3 {
-            sender
-                .enqueue_async(test_event(&format!("e{i}"), "s1", "turn"))
-                .await;
-        }
-
-        let mut received = 0;
-        while rx.try_recv().is_ok() {
-            received += 1;
-        }
-        assert_eq!(received, 3, "all 3 events should be buffered");
-    }
 
     #[tokio::test]
     async fn sender_enqueue_defers_until_capacity_is_available() {

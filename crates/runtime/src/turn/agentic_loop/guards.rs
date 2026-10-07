@@ -249,9 +249,9 @@ fn check_work_evidence_sufficiency(
         "owned WorkItem evidence-sufficiency advisory observed"
     );
     GuardOutcome::Advisory {
-        // Keep decision feedback compact: CurrentUserOnly providers place it
-        // on the uncached tail for one request. The count remains in tracing;
-        // the model needs only the decision boundary on wire.
+        // Keep decision feedback compact. The selected delivery policy and
+        // placement control its projection; the count remains in tracing.
+        // The model needs only the decision boundary on wire.
         message: "Owned WorkItem: settle_work_item if expected_result is supported; otherwise pursue one specific missing fact.".to_string(),
         kind: VolatileKind::BehaviorAdvisory,
         hint: None,

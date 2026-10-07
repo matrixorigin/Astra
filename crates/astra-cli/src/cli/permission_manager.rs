@@ -488,8 +488,7 @@ fn sensitive_path_match_for_request(tool_name: &str, args: &serde_json::Value) -
 // its own `PermissionMode`, `PermissionRule`, and decision type
 // alongside the ones in `astra-turn-core::permission_types`. Three
 // independent type names with overlapping semantics caused a string-
-// roundtrip wart at every crate boundary (`with_inherited` matched
-// the cli enum, then converted to turn-core, then back).
+// roundtrip at crate boundaries when exporting permission envelopes.
 //
 // We now use turn-core's types directly via type aliases; the rule
 // parser and matcher are identical (compared field-by-field) so this
@@ -1098,8 +1097,6 @@ pub(crate) struct PermissionManager {
     /// Cached parsed user-level rules.
     cached_user_allow: Vec<PermissionRule>,
     cached_user_deny: Vec<PermissionRule>,
-    /// Permissions inherited from parent agent (if this is a child agent).
-    inherited: Option<astra_runtime::orchestration::InheritedPermissions>,
     /// Gap 3: ring of the most recent `(tool, reason)` rejections for the
     /// SelfModel surface. Newest at the back, capped at ~5 entries.
     recent_rejections: std::collections::VecDeque<(String, String)>,
@@ -1392,7 +1389,6 @@ impl PermissionManager {
             user_settings: PermissionSettings::default(),
             cached_user_allow: Vec::new(),
             cached_user_deny: Vec::new(),
-            inherited: None,
             last_save_error: None,
             load_errors: Vec::new(),
             load_policy: PermissionLoadPolicy::TrustAll,
@@ -1528,157 +1524,12 @@ impl PermissionManager {
             user_settings,
             cached_user_allow,
             cached_user_deny,
-            inherited: None,
             last_save_error: None,
             load_errors,
             load_policy: policy,
             workspace_trust,
             active_session_id: None,
         }
-    }
-
-    /// Create with inherited permissions from a parent agent.
-    ///
-    /// The child agent inherits the parent's effective permission mode and
-    /// rules, but can still load project-level settings for additional rules.
-    /// Root-only Bypass is projected to Auto before export so fan-out agents
-    /// do not inherit the parent UI's approval-prompt bypass as a safety
-    /// policy.
-    ///
-    /// Issue #326 P0 / R1 Major 10 / task #17: if the parent envelope
-    /// carries a `fingerprinted_overrides` JSON blob, we deserialize
-    /// it back into the child's `session_overrides` so the child
-    /// honours per-fingerprint decisions
-    /// (`Bash(argv_prefix="cargo test")` -> Allow) instead of relying
-    /// on a broad `tool_name -> bool` collapse.
-    /// A deserialization failure logs a warning and leaves overrides
-    /// empty rather than silently downgrading to a wider rule.
-    pub(crate) fn with_inherited(
-        project_root: &Path,
-        inherited: astra_runtime::orchestration::InheritedPermissions,
-    ) -> Self {
-        // Use inherited mode, but load project settings too
-        let mode = match inherited.mode.child_inherited_mode() {
-            astra_runtime::orchestration::ChildPermissionMode::Auto => PermissionMode::Auto,
-            astra_runtime::orchestration::ChildPermissionMode::Plan => PermissionMode::Plan,
-            astra_runtime::orchestration::ChildPermissionMode::AcceptEdits => {
-                PermissionMode::AcceptEdits
-            }
-            astra_runtime::orchestration::ChildPermissionMode::Prompt => PermissionMode::Prompt,
-            astra_runtime::orchestration::ChildPermissionMode::Deny => PermissionMode::Deny,
-        };
-        let project_outcome = PermissionSettings::try_load(project_root);
-        let user_outcome = PermissionSettings::try_load_user();
-        let mut load_errors = Vec::new();
-        if let Some(err) = project_outcome.error {
-            load_errors.push(err);
-        }
-        if let Some(err) = user_outcome.error {
-            load_errors.push(err);
-        }
-        // Child/background managers cannot prompt for workspace trust.
-        // They still apply project deny rules, while allow rules arrive
-        // through the parent's inherited envelope when the parent was
-        // allowed to honour them.
-        let load_policy = PermissionLoadPolicy::HeadlessSafe;
-        let settings = apply_load_policy(project_outcome.settings, &load_policy);
-        let cached_allow = settings.parsed_allow_rules();
-        let cached_deny = settings.parsed_deny_rules();
-        let user_settings = user_outcome.settings;
-        let cached_user_allow = user_settings.parsed_allow_rules();
-        let cached_user_deny = user_settings.parsed_deny_rules();
-
-        // Decode the parent's fingerprinted overrides if any. Failures
-        // are loud (tracing::warn) — we never silently fall back to a
-        // wider tool-level rule.
-        let session_overrides = match inherited.fingerprinted_overrides.as_ref() {
-            Some(value) => match serde_json::from_value::<
-                astra_turn_core::approval_fingerprint::FingerprintedOverrides,
-            >(value.clone())
-            {
-                Ok(decoded) => decoded,
-                Err(err) => {
-                    tracing::warn!(
-                        "permission_manager: child failed to decode fingerprinted_overrides from parent: {err}; \
-                         child will run with no session overrides (still has parent allow/deny rules)"
-                    );
-                    astra_turn_core::approval_fingerprint::FingerprintedOverrides::default()
-                }
-            },
-            None => astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(),
-        };
-
-        Self {
-            mode,
-            mode_mirror: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
-                encode_mode_for_mirror(mode),
-            )),
-            applied_mode_request_id: Default::default(),
-            permission_control_signal: tokio::sync::watch::channel(None).0,
-            session_overrides,
-            turn_overrides: astra_turn_core::approval_fingerprint::FingerprintedOverrides::default(
-            ),
-            denial_tracker: astra_turn_core::approval_fingerprint::DenialTracker::default(),
-            recent_rejections: std::collections::VecDeque::new(),
-            trusted_sandbox_roots: Vec::new(),
-            settings,
-            project_root: Some(project_root.to_path_buf()),
-            cached_allow,
-            cached_deny,
-            user_settings,
-            cached_user_allow,
-            cached_user_deny,
-            inherited: Some(inherited),
-            last_save_error: None,
-            load_errors,
-            load_policy,
-            workspace_trust: None,
-            active_session_id: None,
-        }
-    }
-
-    /// Check if a tool is allowed by inherited permissions.
-    fn is_inherited_allowed(&self, tool_name: &str, command: Option<&str>) -> bool {
-        if let Some(ref inherited) = self.inherited {
-            inherited.is_allowed(tool_name, command)
-        } else {
-            false
-        }
-    }
-
-    fn is_inherited_allowed_with_context(
-        &self,
-        tool_name: &str,
-        ctx: &astra_turn_core::permission::types::RuleMatchContext,
-    ) -> bool {
-        if let Some(ref inherited) = self.inherited {
-            inherited.is_allowed_with_context(tool_name, ctx)
-        } else {
-            false
-        }
-    }
-
-    /// Check if a tool is denied by inherited permissions.
-    fn is_inherited_denied(&self, tool_name: &str, command: Option<&str>) -> bool {
-        if let Some(ref inherited) = self.inherited {
-            inherited.is_denied(tool_name, command)
-        } else {
-            false
-        }
-    }
-
-    /// Check if the tool is in the inherited tool allowlist (if any).
-    fn is_tool_in_inherited_allowlist(&self, tool_name: &str) -> bool {
-        if let Some(ref inherited) = self.inherited {
-            inherited.is_tool_allowed_by_allowlist(tool_name)
-        } else {
-            true // No allowlist = all tools allowed
-        }
-    }
-
-    /// Check if this is a background agent (cannot show prompts).
-    pub(crate) fn is_background_agent(&self) -> bool {
-        self.inherited.as_ref().is_some_and(|i| i.is_background)
     }
 
     /// Export the current effective permission envelope for a spawned child agent.
@@ -1714,11 +1565,7 @@ impl PermissionManager {
             ChildPermissionMode::Deny => RuntimePermissionMode::Deny,
         };
 
-        let mut inherited = self
-            .inherited
-            .clone()
-            .unwrap_or_else(|| InheritedPermissions::new(mode));
-        inherited.mode = mode;
+        let mut inherited = InheritedPermissions::new(mode);
         inherited.is_background = is_background;
 
         for rule in self
@@ -1932,13 +1779,9 @@ impl PermissionManager {
         }
     }
 
-    /// Check persistent allow rules: inherited first, then project-level, then user-level.
+    /// Check persistent project-level and user-level allow rules.
     fn check_allow_rules(&self, name: &str, args: &serde_json::Value) -> bool {
         let ctx = astra_turn_core::permission::types::RuleMatchContext::from_tool_args(name, args);
-        // Check inherited allow rules first (from parent agent)
-        if self.is_inherited_allowed_with_context(name, &ctx) {
-            return true;
-        }
         self.cached_allow.iter().any(|rule| {
             !rule.is_dangerous_bash_allow_shape() && rule.matches_with_context(name, &ctx)
         }) || self.cached_user_allow.iter().any(|rule| {
@@ -1965,11 +1808,7 @@ impl PermissionManager {
     }
 
     fn evaluation_context(&self) -> astra_turn_core::permission::types::PermissionSyncContext {
-        let mut inherited = self
-            .inherited
-            .clone()
-            .unwrap_or_else(|| astra_runtime::orchestration::InheritedPermissions::new(self.mode));
-        inherited.mode = self.mode;
+        let mut inherited = astra_runtime::orchestration::InheritedPermissions::new(self.mode);
 
         for rule in self
             .cached_allow
@@ -5218,61 +5057,6 @@ mod tests {
     // ── inherited permissions ──────────────────────────────────────────────────
 
     #[test]
-    fn with_inherited_uses_parent_mode() {
-        use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
-
-        let inherited = InheritedPermissions::new(RuntimeMode::Auto);
-        let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
-        assert_eq!(pm.mode, PermissionMode::Auto);
-    }
-
-    #[test]
-    fn with_inherited_downgrades_parent_bypass_mode() {
-        use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
-
-        let inherited = InheritedPermissions::new(RuntimeMode::Bypass);
-        let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
-
-        assert_eq!(
-            pm.mode,
-            PermissionMode::Auto,
-            "child permission managers must not preserve root-only Bypass"
-        );
-    }
-
-    #[test]
-    fn with_inherited_checks_parent_allow_rules() {
-        use astra_runtime::orchestration::{
-            InheritedPermissions, PermissionMode as RuntimeMode, PermissionRule as RuntimeRule,
-        };
-
-        let mut inherited = InheritedPermissions::new(RuntimeMode::Prompt);
-        inherited.add_allow(RuntimeRule::parse(r#"Bash(argv_prefix="git commit")"#));
-
-        let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
-
-        // Should be allowed by inherited rules
-        let args = serde_json::json!({"command": "git commit -m 'test'"});
-        assert!(pm.is_inherited_allowed("bash", Some("git commit -m 'test'")));
-        assert!(pm.check_allow_rules("bash", &args));
-    }
-
-    #[test]
-    fn with_inherited_checks_parent_deny_rules() {
-        use astra_runtime::orchestration::{
-            InheritedPermissions, PermissionMode as RuntimeMode, PermissionRule as RuntimeRule,
-        };
-
-        let mut inherited = InheritedPermissions::new(RuntimeMode::Prompt);
-        inherited.add_deny(RuntimeRule::parse(r#"Bash(argv_prefix="rm -rf")"#));
-
-        let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
-
-        // Should be denied by inherited rules
-        assert!(pm.is_inherited_denied("bash", Some("rm -rf /tmp")));
-    }
-
-    #[test]
     fn inherited_permissions_for_child_includes_session_overrides() {
         // Issue #326 P0 / R1 Major 10 / task #17:
         // session_overrides now flow through `fingerprinted_overrides`
@@ -5316,114 +5100,59 @@ mod tests {
         assert!(inherited.is_background);
     }
 
-    #[test]
-    fn child_inherits_fingerprinted_session_overrides_not_collapsed_to_tool_level() {
-        // Contract test for issue #326 P0 / R1 Major 10 / task #17:
-        // parent allowed `Bash(argv_prefix="cargo test")` via session override.
-        // The child must NOT see this as `Bash() → Allow` (which would
-        // let it run `Bash(rm -rf …)`); it must reconstruct the same
-        // command-prefix-level fingerprint and only allow `cargo test`.
-        use astra_runtime::orchestration::PermissionMode as RuntimeMode;
-        use astra_turn_core::approval_fingerprint::{
-            ApprovalFingerprint, PathMatchKind, SideEffectClass,
-        };
-
+    #[tokio::test]
+    async fn child_inherits_fingerprinted_session_overrides_not_collapsed_to_tool_level() {
+        use astra_runtime::turn::permission_gate::{PermissionCheckResult, check_tool_permission};
+        use astra_turn_core::permission::types::PermissionSyncContext;
         let dir = tempfile::tempdir().unwrap();
         let mut parent = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
-
-        // Parent presses Always on `Bash(argv_prefix="cargo test")` -> session override.
-        let cargo_test_fp = ApprovalFingerprint {
-            tool_name: "bash".to_string(),
-            command_exact: None,
-            command_prefix: Some("cargo test".to_string()),
-            path_pattern: None,
-            path_match: PathMatchKind::Pattern,
-            side_effect: SideEffectClass::Execute,
-        };
-        parent.session_overrides.insert(cargo_test_fp.clone(), true);
-
-        // Hand off to child.
-        let envelope = parent.inherited_permissions_for_child(true);
-        assert_eq!(envelope.mode, RuntimeMode::Prompt);
-
-        let child_dir = tempfile::tempdir().unwrap();
-        let child = PermissionManager::with_inherited(child_dir.path(), envelope);
-
-        // The child's session_overrides must contain the same fingerprint.
-        // Verify by re-running the override lookup: `cargo test` should
-        // be allowed; `rm -rf /tmp` must NOT match the override (the
-        // override is command-prefix-level; rm doesn't share that prefix).
-        let cargo_test_match = child.session_overrides.check(&cargo_test_fp);
-        assert_eq!(
-            cargo_test_match,
-            Some(true),
-            "child must inherit the cargo-test fingerprint Allow decision"
+        parent.record_approval(
+            "bash",
+            Some(&serde_json::json!({"command": "cargo test"})),
+            true,
         );
-
-        let rm_fp = ApprovalFingerprint {
-            tool_name: "bash".to_string(),
-            command_exact: None,
-            command_prefix: Some("rm -rf".to_string()),
-            path_pattern: None,
-            path_match: PathMatchKind::Pattern,
-            side_effect: SideEffectClass::Execute,
-        };
-        let rm_match = child.session_overrides.check(&rm_fp);
-        assert!(
-            rm_match.is_none() || rm_match == Some(false),
-            "child must NOT see the cargo-test override generalize to rm; got {rm_match:?}"
-        );
+        let child = PermissionSyncContext::shared(parent.inherited_permissions_for_child(true));
+        let approved = check_tool_permission(
+            "bash",
+            Some(r#"{"command":"cargo test"}"#),
+            Some(&child),
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(approved, PermissionCheckResult::Allowed));
+        // A safe, nonmatching command must still require its own approval.
+        // Dangerous-command rejection would hide an accidentally broad grant.
+        let unapproved = check_tool_permission(
+            "bash",
+            Some(r#"{"command":"cargo build"}"#),
+            Some(&child),
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(unapproved, PermissionCheckResult::Denied { .. }));
     }
 
-    #[test]
-    fn child_with_corrupt_fingerprinted_payload_falls_back_quietly() {
-        // If the JSON blob fails to decode (shouldn't happen in
-        // practice, but the contract is "warn loudly, never silently
-        // downgrade to a wider rule"), the child gets an empty
-        // session_overrides and otherwise-default behaviour. Crucially
-        // the parent's allow_rules / deny_rules are still honoured.
-        use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
-
-        let mut envelope = InheritedPermissions::new(RuntimeMode::Prompt);
-        envelope.fingerprinted_overrides =
-            Some(serde_json::json!({"this is": "not the right shape"}));
-
+    #[tokio::test]
+    async fn child_permission_evaluation_rejects_corrupt_fingerprinted_payload() {
+        use astra_runtime::turn::permission_gate::{PermissionCheckResult, check_tool_permission};
+        use astra_turn_core::permission::types::PermissionSyncContext;
         let dir = tempfile::tempdir().unwrap();
-        let child = PermissionManager::with_inherited(dir.path(), envelope);
-
-        assert!(child.session_overrides.is_empty());
-    }
-
-    #[test]
-    fn with_inherited_tool_allowlist() {
-        use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
-
-        let mut inherited = InheritedPermissions::new(RuntimeMode::Auto);
-        inherited.allowed_tools = Some(
-            ["view".to_string(), "grep".to_string()]
-                .into_iter()
-                .collect(),
-        );
-
-        let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
-
-        // Only allowed tools should pass
-        assert!(pm.is_tool_in_inherited_allowlist("view"));
-        assert!(pm.is_tool_in_inherited_allowlist("grep"));
-        assert!(!pm.is_tool_in_inherited_allowlist("bash"));
-        assert!(!pm.is_tool_in_inherited_allowlist("edit"));
-    }
-
-    #[test]
-    fn with_inherited_background_agent_flag() {
-        use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
-
-        let mut inherited = InheritedPermissions::new(RuntimeMode::Auto);
-        inherited.is_background = true;
-
-        let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
-
-        assert!(pm.is_background_agent());
+        let parent = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+        let mut envelope = parent.inherited_permissions_for_child(true);
+        envelope.add_allow(PermissionRule::parse("Bash()"));
+        envelope.fingerprinted_overrides = Some(serde_json::json!({"invalid": "shape"}));
+        let child = PermissionSyncContext::shared(envelope);
+        let result = check_tool_permission(
+            "bash",
+            Some(r#"{"command":"cargo test"}"#),
+            Some(&child),
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(result, PermissionCheckResult::Denied { .. }));
     }
 
     // ── is_read_only_allowlisted: pipe-aware classifier ───────────────────────

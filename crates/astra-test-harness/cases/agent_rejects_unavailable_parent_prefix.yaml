@@ -1,0 +1,72 @@
+name: agent_rejects_unavailable_parent_prefix
+description: |
+  Explicit parent-prefix inheritance is unavailable in the Server child executor.
+  Reject the request before launching any child instead of acknowledging a
+  required prefix and silently running from a fresh task. This checks the current
+  unsupported boundary; it does not prove parent-prefix inheritance is implemented.
+prompt: |
+  First select the canonical agent contract with tool_search(query="select:agent").
+  Invoke it exactly once through invoke_tool(name="agent", arguments=...) with:
+    action: "spawn"
+    description: "Probe required parent context"
+    prompt: "Use the inherited parent context. Do not use tools."
+    inherit_prefix:
+      required: true
+
+  Report the admission result accurately. Do not retry or substitute an ordinary
+  child. If no child launched, state that no child reply or inherited result exists.
+debug_log: true
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: tool_search
+    min: 1
+    max: 1
+    document: arguments
+    path: /query
+    equals: select:agent
+  - type: journal_tool_json
+    name: tool_search
+    document: result
+    path: /matches/0/name
+    equals: agent
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+    document: arguments
+    path: /inherit_prefix/required
+    equals: true
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /status
+    equals: failed
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /executed
+    equals: false
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /error
+    equals: "spawn admission failed: Delegation failed: agent execution does not support parent prefix inheritance"
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
+  - type: hard_judger
+    threshold: 1.0
+    question: |
+      Required parent-prefix inheritance was rejected before child execution.
+      Did the final answer accurately report that inheritance is unavailable and
+      no child reply exists, without claiming a launch, an inherited result, or
+      a cache hit? Do not accept a retry or a substituted ordinary child.
+      Score 1 only if every condition holds, otherwise 0.

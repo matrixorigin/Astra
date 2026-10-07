@@ -5,6 +5,11 @@
 
 Context window management defines how Astra uses finite model context without losing task continuity, provider state, audit-critical facts, or prompt-cache stability.
 
+Unused standalone request and compaction circuit-breaker APIs are retired.
+They were not connected to provider forwarding or compaction execution. Active
+loop limits and Memoria failure handling remain with their production owners;
+this retirement does not change their admission or recovery behavior.
+
 ## Principles
 
 - Context is a scarce runtime resource.

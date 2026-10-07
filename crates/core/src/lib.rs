@@ -896,6 +896,9 @@ pub use sqlx;
 /// to keep the two in sync.
 pub const WORKTREE_BASE_DIR: &str = "mo-agent-worktrees";
 
+/// Shared upper bound for a shell invocation, including its directory prefix.
+pub const MAX_SHELL_COMMAND_BYTES: usize = 100 * 1024;
+
 /// Return the canonical worktree base path: `<temp_dir>/mo-agent-worktrees`.
 pub fn worktree_base_path() -> PathBuf {
     std::env::temp_dir().join(WORKTREE_BASE_DIR)

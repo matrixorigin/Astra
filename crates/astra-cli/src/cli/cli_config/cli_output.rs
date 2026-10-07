@@ -95,53 +95,6 @@ pub fn cli_kv(label: &str, value: &str) {
     eprintln!("  {}: {}", label.dim(), value);
 }
 
-/// Print a table with headers and rows.
-///
-/// Headers are bold, values are styled based on theme.
-pub fn cli_table(headers: &[&str], rows: &[Vec<String>]) {
-    if headers.is_empty() || rows.is_empty() {
-        return;
-    }
-
-    // Calculate column widths
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
-    for row in rows {
-        for (i, cell) in row.iter().enumerate() {
-            if i < widths.len() {
-                widths[i] = widths[i].max(cell.len());
-            }
-        }
-    }
-
-    // Print header
-    let header_line: String = headers
-        .iter()
-        .zip(&widths)
-        .map(|(h, w)| format!("{:width$}", h, width = w))
-        .collect::<Vec<_>>()
-        .join("  ");
-    eprintln!("  {}", header_line.bold());
-
-    // Separator
-    let sep: String = widths
-        .iter()
-        .map(|w| "─".repeat(*w))
-        .collect::<Vec<_>>()
-        .join("──");
-    eprintln!("  {}", sep.dim());
-
-    // Rows
-    for row in rows {
-        let row_line: String = row
-            .iter()
-            .zip(&widths)
-            .map(|(cell, w)| format!("{:width$}", cell, width = w))
-            .collect::<Vec<_>>()
-            .join("  ");
-        eprintln!("  {}", row_line);
-    }
-}
-
 /// Print a simple key-value list (two columns).
 ///
 /// Example:
@@ -227,46 +180,6 @@ pub fn find_suggestions<'a>(input: &str, candidates: &[&'a str], limit: usize) -
     scored.into_iter().take(limit).map(|(_, c)| c).collect()
 }
 
-/// Format a "not found" error with suggestions and next steps.
-///
-/// # Example output
-/// ```text
-///   ✗ Model 'gpt-4x' not found
-///     Did you mean: gpt-4, gpt-4o, gpt-4-turbo?
-///     Try: /model to see available models
-/// ```
-pub fn format_not_found_error(
-    entity_type: &str,          // "Model", "Session", "Skill", etc.
-    name: &str,                 // The name that wasn't found
-    suggestions: &[&str],       // Fuzzy-matched candidates
-    hint_command: Option<&str>, // e.g. "/model", "/session list"
-) {
-    eprintln!(
-        "  {} {} '{}' not found",
-        theme::icon_err(),
-        entity_type,
-        name.red()
-    );
-
-    if !suggestions.is_empty() {
-        let suggestion_text = suggestions
-            .iter()
-            .take(3)
-            .copied()
-            .collect::<Vec<_>>()
-            .join(", ");
-        eprintln!(
-            "    {} {}",
-            "Did you mean:".dim(),
-            suggestion_text.magenta()
-        );
-    }
-
-    if let Some(cmd) = hint_command {
-        eprintln!("    {} {}", "Try:".dim(), cmd.magenta());
-    }
-}
-
 /// Format an invalid value error with valid options.
 ///
 /// # Example output
@@ -310,31 +223,14 @@ pub fn suggest_skills(input: &str, available: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cli_bullet, cli_kv, cli_kvlist, cli_numbered, cli_table, find_suggestions,
-        format_invalid_value_error, format_not_found_error, fuzzy_score, suggest_models,
+        cli_bullet, cli_kv, cli_kvlist, cli_numbered, find_suggestions, format_invalid_value_error,
+        fuzzy_score, suggest_models,
     };
 
     #[test]
     fn cli_kv_prints_formatted() {
         // Just verify no panic
         cli_kv("Label", "Value");
-    }
-
-    #[test]
-    fn cli_table_basic() {
-        cli_table(
-            &["Name", "Value"],
-            &[
-                vec!["foo".to_string(), "bar".to_string()],
-                vec!["baz".to_string(), "qux".to_string()],
-            ],
-        );
-    }
-
-    #[test]
-    fn cli_table_empty_no_panic() {
-        cli_table(&[], &[]);
-        cli_table(&["A"], &[]);
     }
 
     #[test]
@@ -398,13 +294,6 @@ mod tests {
         ];
         let suggestions = suggest_models("gpt", &models);
         assert!(suggestions.contains(&"gpt-4".to_string()));
-    }
-
-    #[test]
-    fn format_not_found_no_panic() {
-        // Just verify no panic with various inputs
-        format_not_found_error("Model", "gpt-999", &["gpt-4", "gpt-4o"], Some("/model"));
-        format_not_found_error("Session", "abc", &[], None);
     }
 
     #[test]

@@ -31,6 +31,22 @@ base contract
   -> user turn
 ```
 
+Context assembly consumes selected skills, retrieved memory, working memory,
+and runtime feedback through their existing owners. The unused emergent-context
+prototype is retired, including its extra skill/memory/summary/attachment
+container, snapshot projection, opportunistic sections, and Explain source
+kinds. Current snapshots retain warm statistics, latches, recovery, working
+memory, provider-cache observations, and the session date. Older pipeline
+snapshots containing retired section kinds are outside the current snapshot
+layout: the existing corrupt-snapshot diagnostic initializes advisory pipeline
+state afresh. Canonical journal recovery remains unchanged; no legacy emergent
+restoration or compatibility mapping is provided.
+
+Pipeline warm-start uses the complete session snapshot and its canonical
+restore entrypoint. Unused partial-state constructors, standalone stats codec
+wrappers, and the unconnected metrics DTO are retired. Actual statistics serde
+and journal-derived session facts remain with their existing owners.
+
 ## Stable prefix
 
 Stable prefix should contain:
@@ -163,6 +179,11 @@ recovery-only transition: provider delivery, rather than the presence of a
 particular authority shape, creates the durability obligation. Initial
 authority frames are authority-only appends; an internal continuation is one
 atomic assistant-plus-authority append.
+
+Linked transition construction consumes the parent identity and its new message
+delta. The unused full-history linked constructor and standalone predecessor
+reconstruction APIs are retired; canonical recovery uses the validated chain
+application path.
 
 A resumed host uses the admitted durable message count as an ownership
 boundary. It detaches the fresh request suffix, loads the database-authoritative

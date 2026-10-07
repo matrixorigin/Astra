@@ -740,76 +740,6 @@ fn print_memory_usage() {
     );
 }
 
-/// Format the session memory markdown body for human-readable terminal display.
-/// Pure function — no I/O, no API calls. Testable in isolation.
-pub(crate) fn format_session_memory_display(
-    body: &str,
-    session_id: Option<&str>,
-    status_hint: Option<&str>,
-) -> String {
-    if body.trim().is_empty() {
-        let mut out = String::new();
-        out.push_str(&format!("  {}\n", "No session memory yet.".dim()));
-        if let Some(sid) = session_id {
-            out.push_str(&format!("  {} {}\n", "session:".dim(), sid.dim()));
-        }
-        if let Some(hint) = status_hint.filter(|hint| !hint.trim().is_empty()) {
-            out.push_str(&format!("  {}\n", hint.yellow()));
-        }
-        out.push_str(&format!(
-            "  {}\n",
-            "Memory is captured automatically during the conversation. Use /save to capture the current context immediately.".dim()
-        ));
-        return out;
-    }
-
-    let mut out = String::new();
-    out.push_str(&format!("\n  {}", "── Session Memory".dim()));
-    if let Some(sid) = session_id {
-        out.push_str(&format!("    {} {}", "session:".dim(), sid.dim()));
-    }
-    out.push('\n');
-
-    // Priority-ordered sections: actionable state first, then background
-    const PER_SECTION_LIMIT: usize = 12;
-    let mut sections_shown = 0usize;
-    for sections in [SECTION_DISPLAY_NAMES, FALLBACK_SECTION_DISPLAY_NAMES] {
-        if sections_shown > 0 {
-            break;
-        }
-        for (section_name, label) in sections {
-            if let Some(content) = extract_md_section(body, section_name) {
-                let trimmed = content.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                sections_shown += 1;
-                out.push_str(&format!("\n  {}\n", label.bold()));
-                let lines: Vec<&str> = trimmed.lines().collect();
-                for line in lines.iter().take(PER_SECTION_LIMIT) {
-                    out.push_str(&format!("    {line}\n"));
-                }
-                if lines.len() > PER_SECTION_LIMIT {
-                    out.push_str(&format!(
-                        "    {}\n",
-                        format!("… {} more lines", lines.len() - PER_SECTION_LIMIT).dim()
-                    ));
-                }
-            }
-        }
-    }
-
-    if sections_shown == 0 {
-        out.push_str(&format!("  {}\n", "No sections populated yet.".dim()));
-    }
-
-    out.push_str(&format!(
-        "\n  {}\n",
-        "───────────────────────────────────────────────────────".dim()
-    ));
-    out
-}
-
 pub(crate) fn format_session_memory_response(
     summary: Option<&str>,
     body: &str,
@@ -2097,23 +2027,14 @@ fn collect_dismiss_candidates(arr: &[serde_json::Value]) -> Vec<DismissCandidate
 mod tests {
     use super::{
         DismissCandidate, SECTION_NAMES, SessionMemorySurfaceStatus, collect_dismiss_candidates,
-        confirmed_memory_purge_notice, extract_md_section, format_session_memory_display,
-        format_session_memory_response, is_session_proto, load_current_session_memory,
-        load_local_session_memory, memory_health_lines, memory_result_id, parse_memory_forget_args,
+        confirmed_memory_purge_notice, extract_md_section, format_session_memory_response,
+        is_session_proto, load_current_session_memory, load_local_session_memory,
+        memory_health_lines, memory_result_id, parse_memory_forget_args,
         parse_session_memory_status_hint_from_journal_text, replace_md_section,
         sanitize_md_section_content, select_session_memory_record,
         session_memory_headline_from_body, store_current_session_memory,
     };
     use astra_services::SessionArtifactStore;
-    use regex::Regex;
-
-    fn strip_ansi(input: &str) -> String {
-        Regex::new(r"\x1b\[[0-9;]*m")
-            .unwrap()
-            .replace_all(input, "")
-            .into_owned()
-    }
-
     #[test]
     fn memory_health_lines_uses_shared_health_icon_semantics() {
         let lines = memory_health_lines(r#"{"status":"healthy","total_memories":3}"#);
@@ -2125,100 +2046,56 @@ mod tests {
         assert!(rendered.contains("⚠ degraded"), "{rendered}");
     }
 
-    // ── /memory session display ──────────────────────────────────────────
-
     #[test]
-    fn format_session_memory_display_empty_is_graceful() {
-        let result = format_session_memory_display("", None, None);
-        assert!(
-            result.contains("No session memory") || result.contains("not yet extracted"),
-            "empty body should show a helpful message, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn format_session_memory_display_empty_shows_recent_failure_hint() {
-        let result = strip_ansi(&format_session_memory_display(
-            "",
-            Some("sess-1"),
-            Some("Latest extraction failed on turn 15: write_failed — upstream 500."),
-        ));
-        assert!(result.contains("Latest extraction failed on turn 15"));
-        assert!(result.contains("sess-1"));
-    }
-
-    #[test]
-    fn format_session_memory_display_shows_l0_content() {
-        let body = "## L0 Critical\n- Goal: fix auth module\n";
-        let result = format_session_memory_display(body, None, None);
-        assert!(
-            result.contains("fix auth module"),
-            "should show L0 content, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn format_session_memory_display_shows_goals_todos_completed() {
-        let body = "## Active Goals\n- Refactor memory\n\n## Pending Todos\n- Write tests\n\n## Completed\n- Scaffold done\n";
-        let result = format_session_memory_display(body, None, None);
-        assert!(
-            result.contains("Refactor memory"),
-            "missing goals, got: {result:?}"
-        );
-        assert!(
-            result.contains("Write tests"),
-            "missing todos, got: {result:?}"
-        );
-        assert!(
-            result.contains("Scaffold done"),
-            "missing completed, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn format_session_memory_display_omits_missing_sections() {
-        let body = "## L0 Critical\n- only this section\n";
-        let result = strip_ansi(&format_session_memory_display(body, None, None));
-        // Missing sections must not produce empty labelled blocks
-        assert!(
-            !result.contains("📝 Important (L1)"),
-            "spurious L1 block, got: {result:?}"
-        );
-        assert!(
-            !result.contains("📋 Context (L2)"),
-            "spurious L2 block, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn format_session_memory_display_hides_template_comment_sections() {
-        let body = "## Active Goals\n<!-- Current goals explicitly stated by the user or assistant. Do NOT invent goals. -->\n\n## Pending Todos\n- real todo\n";
-        let result = strip_ansi(&format_session_memory_display(body, None, None));
-        assert!(!result.contains("Current goals explicitly stated"));
-        assert!(!result.contains("🎯 Active Goals"));
-        assert!(result.contains("📌 Pending Todos"));
-        assert!(result.contains("real todo"));
-    }
-
-    #[test]
-    fn format_session_memory_display_preserves_explicit_completion_goal() {
-        let body =
-            "## Active Goals\n- None remaining; task completed.\n\n## Completed\n- Finished work\n";
-        let result = strip_ansi(&format_session_memory_display(body, None, None));
-        assert!(result.contains("🎯 Active Goals"));
-        assert!(result.contains("None remaining; task completed."));
-        assert!(result.contains("✅ Completed"));
-        assert!(result.contains("Finished work"));
-    }
-
-    #[test]
-    fn format_session_memory_display_falls_back_to_context_sections() {
-        let body = "## Task Specification\nClean up /memory subcommands\n\n## Current State\nSession memory extracted after a long /memory cleanup turn.\n\n## Workflow\n- Reviewed slash_memory routing\n- Reworked help text\n";
-        let result = strip_ansi(&format_session_memory_display(body, None, None));
-        assert!(result.contains("🧭 Task Specification"));
-        assert!(result.contains("Clean up /memory subcommands"));
-        assert!(result.contains("📍 Current State"));
-        assert!(result.contains("🛠 Workflow"));
+    fn session_memory_response_preserves_populated_sections_and_hides_templates() {
+        let cases = [
+            ("", vec!["No session memory yet."], vec![]),
+            (
+                "## L0 Critical\n- Goal: fix auth module\n",
+                vec!["fix auth module"],
+                vec!["📝 Important (L1)", "📋 Context (L2)"],
+            ),
+            (
+                "## Active Goals\n- Refactor memory\n\n## Pending Todos\n- Write tests\n\n## Completed\n- Scaffold done\n",
+                vec!["Refactor memory", "Write tests", "Scaffold done"],
+                vec![],
+            ),
+            (
+                "## Active Goals\n<!-- Current goals explicitly stated by the user or assistant. Do NOT invent goals. -->\n\n## Pending Todos\n- real todo\n",
+                vec!["📌 Pending Todos", "real todo"],
+                vec!["Current goals explicitly stated", "🎯 Active Goals"],
+            ),
+            (
+                "## Active Goals\n- None remaining; task completed.\n\n## Completed\n- Finished work\n",
+                vec![
+                    "🎯 Active Goals",
+                    "None remaining; task completed.",
+                    "✅ Completed",
+                    "Finished work",
+                ],
+                vec![],
+            ),
+            (
+                "## Task Specification\nClean up /memory subcommands\n\n## Current State\nSession memory extracted after cleanup.\n\n## Workflow\n- Reviewed routing\n",
+                vec![
+                    "🧭 Task Specification",
+                    "Clean up /memory subcommands",
+                    "📍 Current State",
+                    "🛠 Workflow",
+                    "Reviewed routing",
+                ],
+                vec![],
+            ),
+        ];
+        for (body, present, absent) in cases {
+            let result = format_session_memory_response(None, body, None, None, None);
+            for text in present {
+                assert!(result.contains(text), "missing {text:?}: {result:?}");
+            }
+            for text in absent {
+                assert!(!result.contains(text), "unexpected {text:?}: {result:?}");
+            }
+        }
     }
 
     #[test]

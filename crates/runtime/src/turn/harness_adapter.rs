@@ -27,7 +27,7 @@ mod enabled {
         pub kernel: Option<Arc<dyn HarnessKernel>>,
         pub sink: Option<Arc<dyn SnapshotSink>>,
         pub(crate) session_start_unix_millis: u64,
-        pub(crate) session_ended: bool,
+        session_ended: std::sync::atomic::AtomicBool,
         /// Registry reference for cleanup on session end (prevents resource leak).
         pub(crate) registry: Option<crate::server::harness::handlers::HarnessSinkRegistry>,
         /// Session ID used to unregister from the registry on cleanup.
@@ -43,7 +43,7 @@ mod enabled {
                 kernel: None,
                 sink: None,
                 session_start_unix_millis: now_millis(),
-                session_ended: false,
+                session_ended: std::sync::atomic::AtomicBool::new(false),
                 registry: None,
                 session_id_for_cleanup: None,
                 server_sink: None,
@@ -55,7 +55,7 @@ mod enabled {
                 kernel: Some(kernel),
                 sink: Some(sink),
                 session_start_unix_millis: now_millis(),
-                session_ended: false,
+                session_ended: std::sync::atomic::AtomicBool::new(false),
                 registry: None,
                 session_id_for_cleanup: None,
                 server_sink: None,
@@ -70,7 +70,7 @@ mod enabled {
                 kernel: None,
                 sink: Some(sink),
                 session_start_unix_millis: now_millis(),
-                session_ended: false,
+                session_ended: std::sync::atomic::AtomicBool::new(false),
                 registry: None,
                 session_id_for_cleanup: None,
                 server_sink: None,
@@ -112,25 +112,36 @@ mod enabled {
         capture_snapshot_at(state, session_start_unix_millis, now_millis())
     }
 
-    pub(crate) fn capture_snapshot_at(
-        state: &AgenticLoopState,
-        session_start_unix_millis: u64,
-        now: u64,
-    ) -> RuntimeSnapshot {
-        let session_id = state.current_session_id.clone().unwrap_or_default();
+    /// Borrowed observation facts; this does not grant execution authority.
+    pub struct HarnessSnapshotInput<'a> {
+        pub session_id: Option<&'a str>,
+        pub round_index: u32,
+        pub turns_used: u32,
+        pub turns_limit: Option<u32>,
+        pub settlement_rounds_reserved: Option<u32>,
+        pub session_turn: u32,
+        pub prompt_tokens: u64,
+        pub completion_tokens: u64,
+        pub cache_read_tokens: u64,
+        pub cache_creation_tokens: u64,
+        pub input_budget_tokens: u64,
+        pub measured_prompt_tokens: Option<u64>,
+        pub message_count: usize,
+        pub tool_calls: u32,
+        pub tools_used: &'a std::collections::HashSet<String>,
+        pub tool_signatures:
+            &'a [std::collections::BTreeSet<astra_turn_core::stall::StallSignature>],
+        pub final_text: &'a str,
+        pub interruption: Option<&'a astra_turn_core::interruption::InterruptionRecord>,
+        pub tool_records: &'a [astra_services::session_journal::ToolCallRecord],
+        pub read_only_round_streak: usize,
+        pub recursion_depth: u8,
+        pub consecutive_errors: u32,
+        pub causal_chain_id: Option<&'a str>,
+    }
 
-        let turns_used = state.current_round_index + 1;
-        let turns_limit = if state.max_turns > 0 {
-            Some(state.max_turns as u32)
-        } else {
-            None
-        };
-        // `begin_budget_settlement` deliberately adds a bounded, text-only
-        // boundary after the agentic hard limit. Keep that accounting fact
-        // explicit in the snapshot so the harness can allow only the exact
-        // runtime-owned settlement boundary without weakening its ordinary
-        // over-budget guard. The runtime currently permits at most one retry
-        // for this boundary; cap the exported fact defensively as well.
+    fn snapshot_input(state: &AgenticLoopState) -> HarnessSnapshotInput<'_> {
+        // Bounded text-only settlement may reserve up to two extra rounds.
         let settlement_rounds_reserved = if state.hooks.completion_settlement.text_only
             || state.hooks.completion_settlement.work_settlement_only
         {
@@ -141,83 +152,121 @@ mod enabled {
         } else {
             Some(0)
         };
+        HarnessSnapshotInput {
+            session_id: state.current_session_id.as_deref(),
+            round_index: state.current_round_index,
+            turns_used: state.current_round_index + 1,
+            turns_limit: (state.max_turns > 0).then_some(state.max_turns as u32),
+            settlement_rounds_reserved,
+            session_turn: state.session_turn,
+            prompt_tokens: state.total_prompt,
+            completion_tokens: state.total_completion,
+            cache_read_tokens: state.total_cache_read,
+            cache_creation_tokens: state.total_cache_creation,
+            input_budget_tokens: state.max_turn_input_tokens,
+            measured_prompt_tokens: state.last_measured_prompt_tokens,
+            message_count: state.messages.len(),
+            tool_calls: state.total_tool_calls,
+            tools_used: &state.telemetry.all_tools_used,
+            tool_signatures: &state.turn_guard.tool_sigs,
+            final_text: &state.final_text,
+            interruption: state.interruption.as_ref(),
+            tool_records: &state.stall.tool_call_records,
+            read_only_round_streak: state.stall.circuit_breaker.consecutive_read_only(),
+            recursion_depth: state.recursion_depth,
+            consecutive_errors: state.error_recovery.consecutive_same_error,
+            causal_chain_id: state.canonical_turn_chain_id.as_deref(),
+        }
+    }
 
-        let tokens_used_session = state.total_prompt
-            + state.total_completion
-            + state.total_cache_read
-            + state.total_cache_creation;
+    #[cfg(test)]
+    pub(crate) fn capture_snapshot_at(
+        state: &AgenticLoopState,
+        session_start_unix_millis: u64,
+        now: u64,
+    ) -> RuntimeSnapshot {
+        capture_turn_snapshot_at(snapshot_input(state), session_start_unix_millis, now)
+    }
 
-        let context_budget_tokens = if state.max_turn_input_tokens > 0 {
-            Some(state.max_turn_input_tokens as u32)
+    fn capture_turn_snapshot_at(
+        input: HarnessSnapshotInput<'_>,
+        session_start_unix_millis: u64,
+        now: u64,
+    ) -> RuntimeSnapshot {
+        let session_id = input.session_id.unwrap_or_default().to_owned();
+
+        let turns_used = input.turns_used;
+        let turns_limit = input.turns_limit;
+        let settlement_rounds_reserved = input.settlement_rounds_reserved;
+
+        let tokens_used_session = input.prompt_tokens
+            + input.completion_tokens
+            + input.cache_read_tokens
+            + input.cache_creation_tokens;
+
+        let context_budget_tokens = if input.input_budget_tokens > 0 {
+            Some(input.input_budget_tokens as u32)
         } else {
             None
         };
 
-        let context_total_tokens = state.last_measured_prompt_tokens.map(|t| t as u32);
+        let context_total_tokens = input.measured_prompt_tokens.map(|t| t as u32);
 
         let context_utilization = match (context_total_tokens, context_budget_tokens) {
             (Some(total), Some(budget)) if budget > 0 => Some(total as f32 / budget as f32),
             _ => None,
         };
 
-        let mut unique_tools: Vec<String> =
-            state.telemetry.all_tools_used.iter().cloned().collect();
+        let mut unique_tools: Vec<String> = input.tools_used.iter().cloned().collect();
         unique_tools.sort();
 
-        let last_tool_called = state.turn_guard.tool_sigs.last().and_then(|sigs| {
+        let last_tool_called = input.tool_signatures.last().and_then(|sigs| {
             sigs.iter()
                 .last()
                 .map(|signature| signature.tool_name().to_owned())
         });
 
-        let consecutive_same_tool = compute_consecutive_same_tool(&state.turn_guard.tool_sigs);
-        let has_final_text = !state.final_text.trim().is_empty();
-        let interruption_kind = state
+        let consecutive_same_tool = compute_consecutive_same_tool(input.tool_signatures);
+        let has_final_text = !input.final_text.trim().is_empty();
+        let interruption_kind = input
             .interruption
-            .as_ref()
             .map(|interruption| interruption.kind.label().to_string());
         let final_state = Some(classify_final_state(
             has_final_text,
             interruption_kind.as_deref(),
         ));
-        let last_tool_result_class = state
-            .stall
-            .tool_call_records
+        let last_tool_result_class = input
+            .tool_records
             .iter()
             .rev()
             .find_map(|record| record.result_class.clone());
-        let read_only_round_streak = state
-            .stall
-            .circuit_breaker
-            .consecutive_read_only()
-            .min(u32::MAX as usize) as u32;
-        let redundant_read_count = astra_turn_core::evaluation::count_redundant_overlapping_reads(
-            &state.stall.tool_call_records,
-        )
-        .min(u32::MAX as usize) as u32;
+        let read_only_round_streak = input.read_only_round_streak.min(u32::MAX as usize) as u32;
+        let redundant_read_count =
+            astra_turn_core::evaluation::count_redundant_overlapping_reads(input.tool_records)
+                .min(u32::MAX as usize) as u32;
 
         let elapsed = now.saturating_sub(session_start_unix_millis);
 
         RuntimeSnapshot {
             session_id,
-            turn_number: state.current_round_index,
+            turn_number: input.round_index,
             model: None,
             context_total_tokens,
             context_budget_tokens,
-            context_message_count: state.messages.len() as u32,
+            context_message_count: input.message_count as u32,
             context_system_prompt_tokens: None,
             context_utilization,
             turns_used,
             turns_limit,
             settlement_rounds_reserved,
-            session_turn: state.session_turn,
+            session_turn: input.session_turn,
             tokens_used_session,
-            tokens_prompt: state.total_prompt,
-            tokens_completion: state.total_completion,
-            tokens_cache_read: state.total_cache_read,
-            tokens_cache_creation: state.total_cache_creation,
+            tokens_prompt: input.prompt_tokens,
+            tokens_completion: input.completion_tokens,
+            tokens_cache_read: input.cache_read_tokens,
+            tokens_cache_creation: input.cache_creation_tokens,
             elapsed_millis: elapsed,
-            tool_calls_this_session: state.total_tool_calls,
+            tool_calls_this_session: input.tool_calls,
             unique_tools_used: unique_tools,
             last_tool_called,
             consecutive_same_tool,
@@ -227,12 +276,11 @@ mod enabled {
             last_tool_result_class,
             read_only_round_streak,
             redundant_read_count,
-            delegations_this_turn: state.delegations_this_turn,
-            recursion_depth: state.recursion_depth,
-            consecutive_errors: state.error_recovery.consecutive_same_error,
+            recursion_depth: input.recursion_depth,
+            consecutive_errors: input.consecutive_errors,
             captured_at_unix_millis: now,
             session_start_unix_millis,
-            causal_chain_id: state.canonical_turn_chain_id.clone(),
+            causal_chain_id: input.causal_chain_id.map(str::to_owned),
             schema_version: 3,
         }
     }
@@ -269,30 +317,41 @@ mod enabled {
         point: HookPoint,
         state: &AgenticLoopState,
     ) -> HookVerdict {
-        if slot.kernel.is_none() && slot.sink.is_none() {
-            return HookVerdict::Continue;
-        }
+        slot.fire(point, snapshot_input(state))
+    }
 
-        let now = now_millis();
-        let elapsed = now.saturating_sub(slot.session_start_unix_millis);
-        let snapshot = capture_snapshot_at(state, slot.session_start_unix_millis, now);
-
-        let record = DecisionRecord {
-            session_id: snapshot.session_id.clone(),
-            turn: snapshot.turn_number,
-            point,
-            wall_time_unix_millis: now,
-            monotonic_millis_since_session: elapsed,
-            snapshot,
-        };
-
-        if let Some(ref kernel) = slot.kernel {
-            kernel.on_record(&record)
-        } else if let Some(ref sink) = slot.sink {
-            sink.update(&record);
-            HookVerdict::Continue
-        } else {
-            HookVerdict::Continue
+    impl HarnessSlot {
+        /// Observe or enforce a hook from the same shared snapshot projection.
+        /// The slot owns terminal deduplication across normal and error exits.
+        pub fn fire(&self, point: HookPoint, input: HarnessSnapshotInput<'_>) -> HookVerdict {
+            if point == HookPoint::SessionEnd
+                && self
+                    .session_ended
+                    .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                return HookVerdict::Continue;
+            }
+            if self.kernel.is_none() && self.sink.is_none() {
+                return HookVerdict::Continue;
+            }
+            let now = now_millis();
+            let snapshot = capture_turn_snapshot_at(input, self.session_start_unix_millis, now);
+            let record = DecisionRecord {
+                session_id: snapshot.session_id.clone(),
+                turn: snapshot.turn_number,
+                point,
+                wall_time_unix_millis: now,
+                monotonic_millis_since_session: now.saturating_sub(self.session_start_unix_millis),
+                snapshot,
+            };
+            if let Some(ref kernel) = self.kernel {
+                kernel.on_record(&record)
+            } else if let Some(ref sink) = self.sink {
+                sink.update(&record);
+                HookVerdict::Continue
+            } else {
+                HookVerdict::Continue
+            }
         }
     }
 
@@ -476,12 +535,10 @@ mod enabled {
         #[test]
         fn capture_snapshot_delegation_and_error_fields() {
             let mut state = make_state();
-            state.delegations_this_turn = 3;
             state.recursion_depth = 2;
             state.error_recovery.consecutive_same_error = 4;
 
             let snap = capture_snapshot(&state, 0);
-            assert_eq!(snap.delegations_this_turn, 3);
             assert_eq!(snap.recursion_depth, 2);
             assert_eq!(snap.consecutive_errors, 4);
         }
@@ -523,6 +580,34 @@ mod enabled {
             let verdict = harness_fire(&slot, HookPoint::PostTurn, &state);
             assert!(matches!(verdict, HookVerdict::Continue));
             assert!(sink.latest().is_some(), "observe_only must write to sink");
+        }
+
+        #[test]
+        fn normal_and_error_exits_publish_one_terminal_snapshot() {
+            for enforce in [false, true] {
+                let sink = InMemorySnapshotSink::arc();
+                let slot = if enforce {
+                    HarnessSlot::new(
+                        Arc::new(StandardKernel::new(sink.clone(), Vec::new())),
+                        sink.clone(),
+                    )
+                } else {
+                    HarnessSlot::observe_only(sink.clone())
+                };
+                let mut state = make_state();
+                slot.fire(HookPoint::SessionStart, snapshot_input(&state));
+                state.final_text = "Delivered answer".into();
+                slot.fire(HookPoint::SessionEnd, snapshot_input(&state));
+                // Error cleanup must not replace a settled snapshot or run
+                // the terminal verifiers a second time.
+                state.final_text.clear();
+                state.error_recovery.consecutive_same_error = 1;
+                slot.fire(HookPoint::SessionEnd, snapshot_input(&state));
+                let history = sink.history(10);
+                assert_eq!(history.len(), 2);
+                assert_eq!(history[0].final_state.as_deref(), Some("completed"));
+                assert_eq!(history[0].consecutive_errors, 0);
+            }
         }
     }
 }

@@ -220,3 +220,22 @@ Capability migration should proceed in stages:
 | Tool schema visible but execution route unavailable | Invalid state; projection/admission/execution decision must be fixed. |
 | Plan mode mutation | PolicyBlocked with explanation. |
 | Unknown tool name | Unknown/malformed, not missing runtime binding. |
+
+Approval fingerprint decisions and denial-loop limits remain active. The unused
+`DenialTracker` auto-rule extraction and denial-reason history APIs are retired;
+repeated denial does not synthesize a second permission rule store. Final-text
+response guards retain hard redaction and advisory evidence, while tool names
+and arguments are validated by tool binding and execution admission. The
+source-only tool-quality report fields and warning projection are retired.
+Request-failure dumps remain owner-scoped remote artifacts; the unused
+`LlmRequestDump::write_local` API is retired.
+
+Tool-health retry guidance is emitted by `TurnGuard` from current health
+evidence, with read-only tool exemptions and duplicate-warning suppression.
+The unused `ToolHealthTracker::health_avoidance_warning` text projection is
+retired; tracking, recovery evidence and cross-session persistence remain.
+
+SQL approval and snapshot policy retain their shared quote- and comment-aware
+scanner. The unused `strip_sql_comments` source API is retired. Sandbox retry
+continues through its validated path-expansion entrypoint; the unused
+`extract_first_absolute_path` API is retired without a compatibility wrapper.

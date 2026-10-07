@@ -565,20 +565,6 @@ pub fn verify_trace_contract(trace: &SessionTrace) -> Vec<TraceContractViolation
                     });
                 }
             }
-            // Delegation count is per turn and may reset at the next turn;
-            // only compare it within the same turn.
-            if previous.turn == record.turn
-                && record.snapshot.delegations_this_turn < previous.snapshot.delegations_this_turn
-            {
-                violations.push(TraceContractViolation {
-                    invariant: "counters_monotonic",
-                    detail: format!(
-                        "delegations_this_turn regressed from {} to {}",
-                        previous.snapshot.delegations_this_turn,
-                        record.snapshot.delegations_this_turn
-                    ),
-                });
-            }
         }
         if let (Some(total), Some(budget)) = (
             record.snapshot.context_total_tokens,

@@ -180,12 +180,6 @@ pub enum SectionKind {
     /// These change every turn so they must live in `CacheScope::None`, AFTER
     /// the cache marker, otherwise they would invalidate the cached prefix.
     RuntimeVolatile,
-    /// Emergent — discovered skills from previous turn.
-    EmergentSkills,
-    /// Emergent — prefetched memory from previous turn.
-    EmergentMemory,
-    /// Emergent — tool use summary from previous turn.
-    EmergentSummary,
 }
 
 impl SectionKind {
@@ -212,16 +206,11 @@ impl SectionKind {
             Self::Skills,
             Self::RuntimeIdentity,
             Self::RuntimeVolatile,
-            Self::EmergentSkills,
-            Self::EmergentMemory,
-            Self::EmergentSummary,
         ]
     }
 
     /// Sections whose budget is pre-allocated by `ContextBudget::allocate`,
-    /// carried outside the planned-text stream (`History`), or emitted with a
-    /// fixed zero budget (`Emergent*`) and must NOT be included in the
-    /// remainder distribution.
+    /// or carried outside the planned-text stream (`History`).
     ///
     /// Centralising this predicate means adding a new "pre-allocated" variant
     /// only requires updating this match. The exhaustive match forces
@@ -231,11 +220,8 @@ impl SectionKind {
         match self {
             // Pre-allocated with explicit budget in `ContextBudget::allocate`.
             Self::Identity | Self::Constraints | Self::Memory => true,
-            // Carried as provider messages, not a planned text section, or
-            // emitted as opportunistic zero-budget context by the planner.
-            Self::History | Self::EmergentSkills | Self::EmergentMemory | Self::EmergentSummary => {
-                true
-            }
+            // Carried as provider messages, not a planned text section.
+            Self::History => true,
             // Remaining variants participate in the remainder distribution.
             Self::SelfModel
             | Self::ProjectContext
@@ -262,8 +248,8 @@ impl SectionKind {
             Self::AvailableSkills => 4,
             Self::Skills => 5,
             Self::RuntimeIdentity => 6, // session-stable; sits with Session blocks
-            Self::Memory | Self::EmergentMemory => 7,
-            Self::WorkingMemory | Self::EmergentSkills | Self::EmergentSummary => 8,
+            Self::Memory => 7,
+            Self::WorkingMemory => 8,
             Self::History => 9,
             Self::RuntimeVolatile => 10, // turn-volatile; latest in the prompt
         }
@@ -297,13 +283,7 @@ impl SectionKind {
             | Self::Skills
             | Self::RuntimeIdentity => false,
             // Mutate per-turn — must sit post-boundary.
-            Self::Memory
-            | Self::WorkingMemory
-            | Self::History
-            | Self::RuntimeVolatile
-            | Self::EmergentSkills
-            | Self::EmergentMemory
-            | Self::EmergentSummary => true,
+            Self::Memory | Self::WorkingMemory | Self::History | Self::RuntimeVolatile => true,
         }
     }
 }
@@ -335,8 +315,6 @@ pub enum SectionSource {
     Skill,
     /// Edge profile / runtime environment.
     Environment,
-    /// Emergent context from previous turn's execution.
-    Emergent,
 }
 
 /// A section as planned (before binding). Describes what to include and how.
@@ -371,7 +349,7 @@ impl SectionArtifact {
         }
         match kind {
             SectionKind::Identity | SectionKind::Constraints => Self::SystemText(text),
-            SectionKind::Memory | SectionKind::EmergentMemory => Self::MemoryText(text),
+            SectionKind::Memory => Self::MemoryText(text),
             SectionKind::History => Self::HistorySummary(text),
             SectionKind::SelfModel
             | SectionKind::ProjectContext
@@ -380,9 +358,7 @@ impl SectionArtifact {
             | SectionKind::WorkingMemory
             | SectionKind::Skills
             | SectionKind::RuntimeIdentity
-            | SectionKind::RuntimeVolatile
-            | SectionKind::EmergentSkills
-            | SectionKind::EmergentSummary => Self::RuntimeText(text),
+            | SectionKind::RuntimeVolatile => Self::RuntimeText(text),
         }
     }
 

@@ -56,6 +56,50 @@ async fn seed_model(pool: &sqlx::Pool<sqlx::MySql>, model_name: &str) -> String 
 #[tokio::test]
 #[ignore = "requires a dedicated live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
+async fn complete_quirks_replacement_corrects_noncanonical_stored_controls() {
+    let (shared_pool, settings) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get().clone();
+    let name = format!("quirks_replacement_{}", Uuid::new_v4().simple());
+    let id = seed_model(&pool, &name).await;
+    sqlx::query("UPDATE infra_llm_models SET quirks = ? WHERE model_id = ?")
+        .bind(r#"{"unknown_control":true}"#)
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let service = DatabaseModelService::new(
+        settings,
+        Arc::new(FernetTokenEncryptor::new("quirks-replacement-db-it-key").unwrap()),
+    )
+    .with_pool(shared_pool);
+    let mut unrelated = model_patch();
+    unrelated.description = Some("must not silently discard invalid controls".into());
+    assert!(service.update_model(name.clone(), unrelated).await.is_err());
+    let mut replacement = model_patch();
+    replacement.quirks = Some(astra_services::models::QuirksData {
+        fixed_temperature: Some(0.7),
+        ..Default::default()
+    });
+    service.update_model(name, replacement).await.unwrap();
+    let stored: String =
+        sqlx::query_scalar("SELECT CAST(quirks AS CHAR) FROM infra_llm_models WHERE model_id = ?")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    assert_eq!(stored["fixed_temperature"], 0.7);
+    assert!(stored.get("unknown_control").is_none());
+    sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires a dedicated live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
 async fn configured_catalog_price_matches_full_and_paginated_reads() {
     let (shared_pool, settings) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get().clone();

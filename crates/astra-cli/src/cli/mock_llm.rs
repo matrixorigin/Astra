@@ -1,8 +1,8 @@
 //! Scripted HTTP/SSE fixtures for client protocol and UI tests without real LLM calls.
 //!
 //! Mock Server protocol facts for client tests; no Server execution or settlement is exercised.
-//! Edge-tool fixtures validate exact callbacks on one stream. Inference-only
-//! scenarios remain missing-terminal negative controls.
+//! Edge-tool fixtures validate exact callbacks on one stream. Scenarios are
+//! kept only where an actual client journey consumes them.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,134 +22,29 @@ use tokio::net::TcpListener;
 /// A named scenario that determines what SSE stream the mock server returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MockScenario {
-    /// Agent immediately outputs a completion message with canonical Server
-    /// terminal evidence. No tool calls.
-    Complete,
     /// Agent calls one edge tool (write_file), then completes.
     ToolThenComplete,
-    /// Negative control: execute the callback, then close without Server terminal evidence.
-    ToolThenMissingTerminal,
-    /// Agent makes two LLM turns: first asks a question, second completes.
-    MultiTurn,
-    /// Agent returns an error response.
-    Fail,
     /// Agent delays 3s before responding (tests timeout/progress display).
     Slow,
-    /// Agent remains pending long enough for cancellation journeys to prove
-    /// that Ctrl+C, rather than a naturally completed response, settles the turn.
-    CancellationPending,
-    /// Root activates and launches one asynchronous child, then acknowledges
-    /// its launch receipt.
+    /// Root activates and launches one asynchronous child, then acknowledges its launch receipt.
     AgentThenComplete,
-    /// Server launches three slots; tests publish partial results and release
-    /// the same root stream after observing the active run projection.
+    /// Server launches three slots; tests release the same stream after observing the active run.
     FanoutThenComplete,
     /// The same Server fanout fixture, with a failed second slot.
     FanoutPartialThenComplete,
-    /// Adversarial: a single tool_call_start event's JSON is split across
-    /// multiple SSE `data:` chunks (with blank lines in between) so a naive
-    /// per-chunk JSON decoder will fail on each half. A correct client must
-    /// reassemble across SSE frames before parsing.
-    SseChunkSplit,
-    /// Adversarial: emits an SSE event whose JSON payload is malformed
-    /// (unterminated string). A correct client must skip the bad frame and
-    /// still deliver the surrounding valid frames (session_info → done).
-    MalformedJson,
-    /// Adversarial: the HTTP response is NOT 200. Returns 429 Too Many
-    /// Requests with a Retry-After header and a JSON error body. A correct
-    /// client must NOT panic parsing SSE from a non-200 response.
-    RateLimited,
-    /// Inference-only: the model returns text only, no tool_calls, even in
-    /// a context where tool use was expected. Verifies callers do not
-    /// assume tool_calls are always present and still finalize cleanly.
-    TextOnly,
 }
 
 impl MockScenario {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "complete" => Some(Self::Complete),
-            "tool_then_complete" | "tool" => Some(Self::ToolThenComplete),
-            "tool_then_missing_terminal" => Some(Self::ToolThenMissingTerminal),
-            "multi_turn" | "multi" => Some(Self::MultiTurn),
-            "fail" | "error" => Some(Self::Fail),
-            "slow" => Some(Self::Slow),
-            "cancellation_pending" => Some(Self::CancellationPending),
-            "agent_then_complete" | "agent" => Some(Self::AgentThenComplete),
-            "fanout_then_complete" | "fanout" => Some(Self::FanoutThenComplete),
-            "fanout_partial_then_complete" | "fanout_partial" => {
-                Some(Self::FanoutPartialThenComplete)
-            }
-            "sse_chunk_split" | "sse_split" | "chunk_split" => Some(Self::SseChunkSplit),
-            "malformed_json" | "malformed" | "bad_json" => Some(Self::MalformedJson),
-            "rate_limited" | "rate_limit" | "429" => Some(Self::RateLimited),
-            "text_only" | "inference_only" | "no_tools" => Some(Self::TextOnly),
-            _ => None,
-        }
-    }
-
-    pub fn description(self) -> &'static str {
+    fn description(self) -> &'static str {
         match self {
-            Self::Complete => "immediate Server-owned completion (no tools)",
             Self::ToolThenComplete => "one write_file tool call, then completion",
-            Self::ToolThenMissingTerminal => "callback executed but Server terminal missing",
-            Self::MultiTurn => "two LLM turns: think then complete",
-            Self::Fail => "agent returns error",
             Self::Slow => "3s delay before response (tests progress display)",
-            Self::CancellationPending => "pending response for cancellation journeys",
             Self::AgentThenComplete => "one asynchronous child agent, then launch acknowledgement",
             Self::FanoutThenComplete => "Server-owned three-slot fanout with streamed completion",
             Self::FanoutPartialThenComplete => {
                 "Server-owned three-slot fanout with one failed child"
             }
-            Self::SseChunkSplit => "tool_call JSON split across SSE frames (adversarial)",
-            Self::MalformedJson => "one SSE event carries malformed JSON (adversarial)",
-            Self::RateLimited => "HTTP 429 with Retry-After (adversarial)",
-            Self::TextOnly => "text completion only, no tool_calls (inference-only)",
         }
-    }
-
-    pub fn all() -> &'static [(&'static str, &'static str)] {
-        &[
-            ("complete", "immediate Server-owned completion (no tools)"),
-            (
-                "tool_then_complete",
-                "one write_file tool call, then completion",
-            ),
-            (
-                "tool_then_missing_terminal",
-                "callback executed but Server terminal missing",
-            ),
-            ("multi_turn", "two LLM turns: think then complete"),
-            ("fail", "agent returns error"),
-            ("slow", "3s delay before response (tests progress display)"),
-            (
-                "cancellation_pending",
-                "pending response for cancellation journeys",
-            ),
-            (
-                "agent_then_complete",
-                "one asynchronous child agent, then launch acknowledgement",
-            ),
-            (
-                "fanout_then_complete",
-                "Server-owned three-slot fanout with streamed completion",
-            ),
-            (
-                "fanout_partial_then_complete",
-                "Server-owned three-slot fanout with one failed child",
-            ),
-            (
-                "sse_chunk_split",
-                "tool_call JSON split across SSE frames (adversarial)",
-            ),
-            (
-                "malformed_json",
-                "one SSE event carries malformed JSON (adversarial)",
-            ),
-            ("rate_limited", "HTTP 429 with Retry-After (adversarial)"),
-            ("text_only", "text completion only, no tool_calls"),
-        ]
     }
 }
 
@@ -221,14 +116,6 @@ fn tool_request_for_run(
     }))
 }
 
-fn tool_result(call_id: &str, result: &str) -> String {
-    sse_line(&serde_json::json!({
-        "type": "tool_result",
-        "call_id": call_id,
-        "result": result,
-    }))
-}
-
 fn done_event(tokens: u64) -> String {
     // Emit a FLAT `usage` event first (matching the real server at
     // server_loop_host.rs line 822 and ws_handler.rs line 2505), THEN
@@ -261,7 +148,6 @@ fn done_event(tokens: u64) -> String {
 }
 
 /// Emit canonical completion and usage for the fixture's Server-owned run.
-/// Inference-only TextOnly responses deliberately omit this boundary.
 fn server_terminal_event(run_id: &str, assistant_text: &str, tokens: u64) -> String {
     let receipt = astra_turn_core::tool_ledger_receipt::ToolLedgerReceipt::empty(run_id, 1);
     let finished = sse_line(&serde_json::json!({
@@ -337,36 +223,6 @@ fn body_tool_then_complete(agent_id: &str, turn: u32) -> String {
     s
 }
 
-fn body_multi_turn(agent_id: &str, turn: u32) -> String {
-    // Turn 1: thinking text; Turn 2+: completion
-    if turn == 1 {
-        let msg = format!("{agent_id}: analyzing the task requirements...");
-        let mut s = String::new();
-        s.push_str(&session_info("mock-run-multi"));
-        s.push_str(&text_delta(&msg));
-        s.push_str(&text_done(&msg));
-        s.push_str(&done_event(150));
-        s
-    } else {
-        let msg = format!("{agent_id}: analysis complete. Task finished on turn {turn}.");
-        let mut s = String::new();
-        s.push_str(&session_info("mock-run-multi"));
-        s.push_str(&text_delta(&msg));
-        s.push_str(&text_done(&msg));
-        s.push_str(&done_event(200));
-        s
-    }
-}
-
-fn body_fail(_agent_id: &str, turn: u32) -> String {
-    let mut s = String::new();
-    s.push_str(&session_info(&format!("mock-run-fail-{turn}")));
-    s.push_str(&error_event(
-        "Mock agent failure: simulated LLM error for testing",
-    ));
-    s
-}
-
 async fn body_slow(
     agent_id: &str,
     turn: u32,
@@ -379,114 +235,8 @@ async fn body_slow(
     body_complete(agent_id, turn)
 }
 
-async fn body_cancellation_pending(agent_id: &str, turn: u32) -> String {
-    // This is deliberately longer than the journey's own settlement timeout.
-    // A passing cancellation journey must therefore be released by Ctrl+C and
-    // cannot accidentally pass or fail because a short mock delay elapsed.
-    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-    body_complete(agent_id, turn)
-}
-
 fn server_message(body: &Value) -> Option<&str> {
     body.get("message").and_then(Value::as_str)
-}
-
-// ─── Adversarial bodies (P1 hardening) ──────────────────────────────────────
-
-/// Split one `tool_call_start` event across multiple SSE frames.
-///
-/// A compliant SSE client MUST reassemble `data:` lines within one event
-/// (separated by `\n`, terminated by `\n\n`). We abuse this by emitting:
-///
-/// ```text
-/// data: {"type":"tool_call_start","call_id":"call-1","tool":{"name":"write_file","argume
-/// data: nts":"{\"path\":\"/tmp/x\",\"content\":\"hi\"}"}}
-///
-/// ```
-///
-/// Both halves are under one SSE event (one blank line at the end) so a
-/// correct parser joins them before JSON-decoding. A naive per-line decoder
-/// will fail twice and miss the tool call entirely.
-fn body_sse_chunk_split(agent_id: &str, turn: u32) -> String {
-    let path = format!("/tmp/split-{agent_id}-{turn}.txt");
-    let full_json = serde_json::json!({
-        "type": "tool_call_start",
-        "call_id": "call-split",
-        "tool": {
-            "name": "write_file",
-            "arguments": serde_json::json!({
-                "path": path,
-                "content": "chunked payload"
-            }).to_string()
-        }
-    })
-    .to_string();
-
-    // Split between fields at a comma so the SSE reassembly newline lands
-    // on JSON whitespace (where it is legal); each half is still invalid
-    // JSON on its own (an unbalanced object).
-    let split_at = full_json
-        .match_indices("\",\"")
-        .nth(1) // second field boundary: after call_id
-        .map(|(i, _)| i + 2) // include the `,`
-        .unwrap_or(full_json.len() / 2);
-    let (left, right) = full_json.split_at(split_at);
-
-    let mut s = String::new();
-    s.push_str(&session_info(&format!("mock-run-split-{turn}")));
-    // Two `data:` lines, ONE blank terminator = one logical SSE event.
-    s.push_str(&format!("data: {left}\ndata: {right}\n\n"));
-    s.push_str(&tool_result("call-split", &format!("Written {path}")));
-    let msg = format!("{agent_id}: completed after chunk-split tool call.");
-    s.push_str(&text_delta(&msg));
-    s.push_str(&text_done(&msg));
-    s.push_str(&done_event(250));
-    s
-}
-
-/// Emit a valid session_info, then a deliberately malformed JSON event, then
-/// valid text_done + done frames. A robust parser must skip the broken frame
-/// and still deliver a turn-complete signal.
-fn body_malformed_json(agent_id: &str, turn: u32) -> String {
-    let mut s = String::new();
-    s.push_str(&session_info(&format!("mock-run-bad-{turn}")));
-    // Unterminated string literal: no closing `"` before the newline.
-    s.push_str("data: {\"type\":\"text_delta\",\"content\":\"unterminated\n\n");
-    let msg = format!("{agent_id}: recovered after malformed frame (turn {turn}).");
-    s.push_str(&text_done(&msg));
-    s.push_str(&done_event(100));
-    s
-}
-
-/// Body for the 429 Rate-Limited response. The mock handler uses this only
-/// to fill the HTTP body — the status and Retry-After header are set by
-/// `handle_chat_turn` so the non-200 path is exercised end-to-end.
-fn body_rate_limited(turn: u32) -> String {
-    serde_json::json!({
-        "error": {
-            "type": "rate_limit_error",
-            "message": format!("mock rate limit (turn {turn})"),
-            "retry_after_seconds": 1
-        }
-    })
-    .to_string()
-}
-
-/// Inference-only: text completion with NO tool_call_start or Server-owned
-/// terminal events. Even if a caller passed tool schemas in the request, the
-/// model is free to answer with text, but this response must not be admitted
-/// as a successful Server-owned execution.
-fn body_text_only(agent_id: &str, turn: u32) -> String {
-    let msg = format!(
-        "{agent_id}: answering directly without tools on turn {turn}. \
-         No write_file, no read_file — pure inference."
-    );
-    let mut s = String::new();
-    s.push_str(&session_info(&format!("mock-run-textonly-{turn}")));
-    s.push_str(&text_delta(&msg));
-    s.push_str(&text_done(&msg));
-    s.push_str(&done_event(75));
-    s
 }
 
 // ─── Server state ─────────────────────────────────────────────────────────────
@@ -657,16 +407,13 @@ fn orchestration_response(state: ServerState, request: Value) -> Response<axum::
                 }
             }
             let body = match state.scenario {
-                MockScenario::ToolThenMissingTerminal if round > 0 => String::new(),
-                MockScenario::ToolThenComplete | MockScenario::ToolThenMissingTerminal => {
-                    body_tool_then_complete(
-                        request
-                            .get("agent_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("mock-agent"),
-                        round + 1,
-                    )
-                }
+                MockScenario::ToolThenComplete => body_tool_then_complete(
+                    request
+                        .get("agent_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("mock-agent"),
+                    round + 1,
+                ),
                 _ => unreachable!("only Edge-tool scenarios wait for callbacks"),
             };
             let run_id = body
@@ -988,7 +735,7 @@ async fn handle_chat_turn(
         requests.push(request_body.clone());
     }
 
-    // Extract agent_id from top-level payload field (set by chat_turn_base_payload)
+    // Extract agent_id from the Server admission request.
     let agent_id = request_body
         .get("agent_id")
         .and_then(Value::as_str)
@@ -1004,10 +751,7 @@ async fn handle_chat_turn(
         return server_orchestration_response(state);
     }
 
-    if matches!(
-        state.scenario,
-        MockScenario::ToolThenComplete | MockScenario::ToolThenMissingTerminal
-    ) {
+    if matches!(state.scenario, MockScenario::ToolThenComplete) {
         return orchestration_response(state, request_body);
     }
 
@@ -1017,26 +761,11 @@ async fn handle_chat_turn(
         | MockScenario::FanoutPartialThenComplete => {
             unreachable!("Server agent scenarios own their stream")
         }
-        MockScenario::Complete => body_complete(&agent_id, turn),
-        MockScenario::ToolThenComplete | MockScenario::ToolThenMissingTerminal => {
+        MockScenario::ToolThenComplete => {
             unreachable!("tool scenarios use one orchestration stream")
         }
-        MockScenario::MultiTurn => body_multi_turn(&agent_id, turn),
-        MockScenario::Fail => body_fail(&agent_id, turn),
         MockScenario::Slow => {
             body_slow(&agent_id, turn, state.held_response_release.as_deref()).await
-        }
-        MockScenario::CancellationPending => body_cancellation_pending(&agent_id, turn).await,
-        MockScenario::SseChunkSplit => body_sse_chunk_split(&agent_id, turn),
-        MockScenario::MalformedJson => body_malformed_json(&agent_id, turn),
-        MockScenario::TextOnly => body_text_only(&agent_id, turn),
-        MockScenario::RateLimited => {
-            return Response::builder()
-                .status(StatusCode::TOO_MANY_REQUESTS)
-                .header("content-type", "application/json")
-                .header("retry-after", "1")
-                .body(axum::body::Body::from(body_rate_limited(turn)))
-                .expect("valid HTTP response");
         }
     };
     // Callback authority is the exact request identity this mock emitted,
@@ -1645,39 +1374,21 @@ impl MockLlmServer {
 #[cfg(test)]
 mod tests {
     use super::{
-        IssuedToolRequestIdentity, MockScenario, body_complete, body_fail, body_malformed_json,
-        body_multi_turn, body_rate_limited, body_sse_chunk_split, body_text_only,
-        body_tool_then_complete, issued_tool_requests_from_sse, tool_request_for_run,
+        IssuedToolRequestIdentity, MockScenario, issued_tool_requests_from_sse,
+        tool_request_for_run,
     };
     use serde_json::Value;
 
-    // Test the SSE body generators directly (no HTTP server needed)
-
-    #[test]
-    fn complete_body_contains_required_events() {
-        let body = body_complete("test-agent", 1);
-        assert!(body.contains("session_info"));
-        assert!(body.contains("text_delta"));
-        assert!(body.contains("text_done"));
-        assert!(body.contains("\"type\":\"done\""));
-        assert!(body.contains("\"type\":\"run_finished\""));
-        assert!(body.contains("\"type\":\"turn_complete\""));
-        assert!(body.contains("\"continuation_owner\":\"server\""));
-        assert!(body.contains("\"tool_ledger_receipt\""));
-        assert!(body.contains("test-agent"));
-    }
-
-    #[test]
-    fn tool_rounds_emit_request_then_server_completion() {
-        let request = body_tool_then_complete("coder", 1);
-        let completion = body_tool_then_complete("coder", 2);
-        assert!(request.contains("tool_call_start"));
-        assert!(request.contains("write_file"));
-        assert!(!request.contains("tool_result"));
-        assert!(!request.contains("text_done"));
-        assert!(completion.contains("text_done"));
-        assert!(!completion.contains("tool_call_start"));
-        assert!(completion.contains("\"type\":\"done\""));
+    fn wire_events(body: &str) -> Vec<Value> {
+        let mut framer = astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseFramer::new();
+        let blocks = framer.push_bytes(body.as_bytes()).unwrap();
+        assert!(framer.take_trailing_dispatch_blob().unwrap().is_empty());
+        blocks
+            .into_iter()
+            .map(|block| {
+                serde_json::from_str(block.strip_prefix("data: ").unwrap().trim()).unwrap()
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -1897,10 +1608,7 @@ mod tests {
             while let Some(chunk) = response.chunk().await.unwrap() {
                 wire.push_str(std::str::from_utf8(&chunk).unwrap());
             }
-            let events: Vec<Value> = parse_sse_events(&wire)
-                .iter()
-                .map(|event| serde_json::from_str(event).unwrap())
-                .collect();
+            let events = wire_events(&wire);
             let terminal: Vec<_> = events
                 .iter()
                 .filter(|event| event["type"] == "turn_complete")
@@ -1994,10 +1702,7 @@ mod tests {
             while let Some(chunk) = response.chunk().await.unwrap() {
                 full.push_str(std::str::from_utf8(&chunk).unwrap());
             }
-            let events: Vec<Value> = parse_sse_events(&full)
-                .iter()
-                .map(|event| serde_json::from_str(event).unwrap())
-                .collect();
+            let events = wire_events(&full);
             let mut accum = astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default();
             for event in &events {
                 astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
@@ -2097,7 +1802,7 @@ mod tests {
         assert!(observed.contains("tool callback failed or timed out"));
         assert!(!observed.contains("turn_complete"));
         let mut accum = astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default();
-        for event in parse_sse_events(&observed) {
+        for event in wire_events(&observed) {
             astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
                 &format!("data: {event}\n\n"),
                 &mut accum,
@@ -2186,248 +1891,5 @@ mod tests {
             },
         );
         assert!(!issued[0].matches_result(&foreign_result));
-    }
-
-    #[test]
-    fn fail_body_contains_error_event() {
-        let body = body_fail("agent", 1);
-        assert!(body.contains("\"type\":\"error\""));
-        assert!(body.contains("mock_error"));
-    }
-
-    #[test]
-    fn multi_turn_body_differs_by_turn() {
-        let turn1 = body_multi_turn("agent", 1);
-        let turn2 = body_multi_turn("agent", 2);
-        assert!(turn1.contains("analyzing"));
-        assert!(turn2.contains("finished on turn 2"));
-        assert!(!turn1.contains("finished"));
-    }
-
-    #[test]
-    fn all_sse_lines_are_valid_data_lines() {
-        for body in [
-            body_complete("a", 1),
-            body_tool_then_complete("a", 1),
-            body_fail("a", 1),
-            body_multi_turn("a", 1),
-            body_multi_turn("a", 2),
-        ] {
-            for chunk in body.split("\n\n").filter(|s| !s.is_empty()) {
-                assert!(
-                    chunk.starts_with("data: "),
-                    "SSE chunk must start with 'data: ': {chunk:?}"
-                );
-                let json_str = &chunk["data: ".len()..];
-                let parsed: serde_json::Value = serde_json::from_str(json_str)
-                    .unwrap_or_else(|e| panic!("invalid JSON in SSE chunk: {e}\n{json_str}"));
-                assert!(
-                    parsed.get("type").is_some(),
-                    "SSE event must have 'type' field: {parsed}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn scenario_from_str_roundtrip() {
-        for (name, _) in MockScenario::all() {
-            assert!(
-                MockScenario::parse(name).is_some(),
-                "scenario '{name}' not parseable"
-            );
-        }
-        assert!(MockScenario::parse("nonexistent").is_none());
-        // Aliases
-        assert_eq!(
-            MockScenario::parse("tool"),
-            Some(MockScenario::ToolThenComplete)
-        );
-        assert_eq!(MockScenario::parse("multi"), Some(MockScenario::MultiTurn));
-        assert_eq!(MockScenario::parse("error"), Some(MockScenario::Fail));
-        assert_eq!(
-            MockScenario::parse("chunk_split"),
-            Some(MockScenario::SseChunkSplit)
-        );
-        assert_eq!(
-            MockScenario::parse("malformed"),
-            Some(MockScenario::MalformedJson)
-        );
-        assert_eq!(MockScenario::parse("429"), Some(MockScenario::RateLimited));
-        assert_eq!(
-            MockScenario::parse("no_tools"),
-            Some(MockScenario::TextOnly)
-        );
-    }
-
-    // ─── P1: adversarial scenario body tests ────────────────────────────────
-
-    /// Parse raw SSE text into (event_id, data_payload) tuples exactly the
-    /// way a compliant client would: `data:` lines within one event are
-    /// joined with `\n`, blank line terminates the event.
-    fn parse_sse_events(body: &str) -> Vec<String> {
-        let mut events = Vec::new();
-        let mut current = String::new();
-        for line in body.split_inclusive('\n') {
-            if line == "\n" || line == "\r\n" {
-                if !current.is_empty() {
-                    events.push(std::mem::take(&mut current));
-                }
-                continue;
-            }
-            let trimmed = line.trim_end_matches(['\r', '\n']);
-            if let Some(rest) = trimmed.strip_prefix("data: ") {
-                if !current.is_empty() {
-                    current.push('\n');
-                }
-                current.push_str(rest);
-            } else if let Some(rest) = trimmed.strip_prefix("data:") {
-                if !current.is_empty() {
-                    current.push('\n');
-                }
-                current.push_str(rest);
-            }
-        }
-        if !current.is_empty() {
-            events.push(current);
-        }
-        events
-    }
-
-    #[test]
-    fn sse_chunk_split_event_reassembles_to_valid_tool_call_json() {
-        let body = body_sse_chunk_split("coder", 1);
-        let events = parse_sse_events(&body);
-
-        // Find the event carrying the split tool_call — it must parse as
-        // valid JSON ONLY after SSE reassembly.
-        let tool_event = events
-            .iter()
-            .find(|e| e.contains("tool_call_start"))
-            .expect("reassembled body must contain the tool_call event");
-
-        let parsed: Value = serde_json::from_str(tool_event)
-            .expect("after SSE reassembly the tool_call JSON must be valid");
-        assert_eq!(parsed["type"], "tool_call_start");
-        assert_eq!(parsed["call_id"], "call-split");
-        assert_eq!(parsed["tool"]["name"], "write_file");
-
-        // The raw body MUST actually contain a mid-JSON chunk boundary —
-        // otherwise the scenario is a liar. Verify the split produces at
-        // least one `data:` line whose standalone payload is NOT valid JSON.
-        let raw_data_lines: Vec<&str> = body
-            .lines()
-            .filter_map(|l| l.strip_prefix("data: "))
-            .collect();
-        let tool_related: Vec<&&str> = raw_data_lines
-            .iter()
-            .filter(|l| l.contains("tool_call_start") || l.contains("\"arguments\":"))
-            .collect();
-        assert_eq!(
-            tool_related.len(),
-            2,
-            "the tool_call event MUST span exactly 2 `data:` lines"
-        );
-        let at_least_one_half_is_invalid = tool_related
-            .iter()
-            .any(|l| serde_json::from_str::<Value>(l).is_err());
-        assert!(
-            at_least_one_half_is_invalid,
-            "at least one half of the split event must be invalid JSON on \
-             its own — otherwise the adversarial shape is not exercised"
-        );
-    }
-
-    #[test]
-    fn malformed_json_body_has_exactly_one_broken_frame_surrounded_by_valid_ones() {
-        let body = body_malformed_json("agent", 7);
-        let events = parse_sse_events(&body);
-
-        let mut valid = 0usize;
-        let mut invalid = 0usize;
-        for e in &events {
-            match serde_json::from_str::<Value>(e) {
-                Ok(_) => valid += 1,
-                Err(_) => invalid += 1,
-            }
-        }
-        assert_eq!(
-            invalid, 1,
-            "exactly one event must be malformed JSON (got {invalid}): \
-             events = {events:?}"
-        );
-        assert!(
-            valid >= 2,
-            "at least session_info + done must be valid (got valid={valid})"
-        );
-        // And the order must be: valid session_info FIRST, malformed in
-        // the middle, valid done LAST — so a recovering parser still sees
-        // turn start and turn end.
-        let first_valid: Value = serde_json::from_str(&events[0]).unwrap();
-        assert_eq!(first_valid["type"], "session_info");
-        let last_valid: Value = serde_json::from_str(events.last().unwrap()).unwrap();
-        assert_eq!(last_valid["type"], "done");
-    }
-
-    #[test]
-    fn rate_limited_body_is_json_error_not_sse() {
-        let body = body_rate_limited(3);
-        // Must not be SSE — a non-200 response body should be structured
-        // error JSON, not `data: ...` frames.
-        assert!(
-            !body.contains("data: "),
-            "rate-limited body must not be SSE-framed, got: {body}"
-        );
-        let parsed: Value = serde_json::from_str(&body).expect("body must be JSON");
-        assert_eq!(parsed["error"]["type"], "rate_limit_error");
-        assert!(parsed["error"]["retry_after_seconds"].is_number());
-    }
-
-    #[test]
-    fn text_only_body_emits_no_tool_call_events() {
-        let body = body_text_only("assistant", 1);
-        assert!(
-            !body.contains("tool_call_start"),
-            "text_only must not emit any tool_call_start events"
-        );
-        assert!(
-            !body.contains("tool_result"),
-            "text_only must not emit any tool_result events"
-        );
-        assert!(
-            !body.contains("\"type\":\"turn_complete\""),
-            "text_only must remain a missing-terminal negative control"
-        );
-        assert!(
-            !body.contains("\"type\":\"run_finished\""),
-            "text_only must not fabricate durable Server completion"
-        );
-        // It still has a complete provider response shape for inference-only
-        // callers, but it is not a successful Server-owned turn.
-        let events = parse_sse_events(&body);
-        let kinds: Vec<String> = events
-            .iter()
-            .filter_map(|e| serde_json::from_str::<Value>(e).ok())
-            .filter_map(|v| v["type"].as_str().map(str::to_string))
-            .collect();
-        assert!(kinds.iter().any(|kind| kind == "session_info"));
-        assert!(kinds.iter().any(|kind| kind == "text_done"));
-        assert!(kinds.iter().any(|kind| kind == "done"));
-    }
-
-    #[test]
-    fn all_new_scenarios_are_listed_and_descriptive() {
-        let names: Vec<&str> = MockScenario::all().iter().map(|(n, _)| *n).collect();
-        for s in [
-            "sse_chunk_split",
-            "malformed_json",
-            "rate_limited",
-            "text_only",
-        ] {
-            assert!(
-                names.contains(&s),
-                "new scenario '{s}' must be registered in MockScenario::all()"
-            );
-        }
     }
 }

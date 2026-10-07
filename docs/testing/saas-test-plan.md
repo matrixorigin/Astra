@@ -382,7 +382,7 @@ helm install astra deployment/kubernetes/chart \
 | 单 API Pod 终止 | 其他副本接管；客户端重试成功 |
 | MatrixOne 30s 不可用 | `/health` unhealthy；恢复后 OK |
 | Memoria 不可用 | 记忆跳过；Chat 可用 |
-| LLM 区域故障 | fallback_chain 切换模型 |
+| LLM 区域故障 | 返回可观察的 provider 失败；不静默切换已准入模型 |
 
 ### 7.4 可观测性
 

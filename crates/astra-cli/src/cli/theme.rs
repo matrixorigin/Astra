@@ -6,7 +6,6 @@
 //! - Readline prompts use only ASCII text (ANSI codes are safe for cursor math)
 
 use crossterm::style::Stylize;
-use std::borrow::Cow;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
@@ -243,62 +242,11 @@ pub fn warning(text: &str) -> String {
 /// Move cursor up one line and clear it.
 pub const CURSOR_UP_CLEAR: &str = "\x1b[A\x1b[2K";
 
-// ── Strip ANSI for non-TTY ───────────────────────────────────────────────
-
-/// Strip ANSI escape codes from a string (for logging, file output, etc.)
-///
-/// Handles CSI sequences (`\x1b[...X` where X is any letter `@`–`~`),
-/// OSC sequences (`\x1b]...BEL/ST`), and simple two-byte sequences (`\x1bX`).
-pub fn strip_ansi(s: &str) -> Cow<'_, str> {
-    // Fast path: no escape char means no ANSI codes
-    if !s.contains('\x1b') {
-        return Cow::Borrowed(s);
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            match chars.peek() {
-                Some('[') => {
-                    // CSI sequence: \x1b[ ... <final byte 0x40–0x7E>
-                    chars.next(); // consume '['
-                    for inner in chars.by_ref() {
-                        if ('@'..='~').contains(&inner) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    // OSC sequence: \x1b] ... (BEL or ST)
-                    chars.next();
-                    for inner in chars.by_ref() {
-                        if inner == '\x07' {
-                            break;
-                        }
-                        if inner == '\x1b' {
-                            chars.next(); // consume '\\' of ST
-                            break;
-                        }
-                    }
-                }
-                Some(_) => {
-                    // Two-byte sequence (e.g. \x1b= , \x1b> )
-                    chars.next();
-                }
-                None => {}
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    Cow::Owned(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         PROMPT_BG, PROMPT_DEFAULT, PROMPT_PAUSE, PROMPT_PLAN, PROMPT_PLAN_ONLY, dim, error, header,
-        icon_err, icon_info, icon_ok, icon_warn, section, strip_ansi, success, warning,
+        icon_err, icon_info, icon_ok, icon_warn, section, success, warning,
     };
 
     #[test]
@@ -311,37 +259,12 @@ mod tests {
             PROMPT_BG,
             PROMPT_PLAN_ONLY,
         ] {
-            let text = strip_ansi(prompt);
+            let text = crate::cli::terminal_region::strip_ansi_codes(prompt);
             assert!(
                 text.is_ascii(),
                 "Prompt text must be ASCII-only, got: {text:?}"
             );
         }
-    }
-
-    #[test]
-    fn strip_ansi_no_codes() {
-        assert_eq!(strip_ansi("hello"), "hello");
-    }
-
-    #[test]
-    fn strip_ansi_with_codes() {
-        assert_eq!(strip_ansi("\x1b[1;36m>\x1b[0m "), "> ");
-        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m text"), "red text");
-    }
-
-    #[test]
-    fn strip_ansi_csi_non_sgr() {
-        // Cursor movement (\x1b[2J = clear screen, \x1b[H = cursor home)
-        assert_eq!(strip_ansi("\x1b[2Jtext\x1b[Hmore"), "textmore");
-        // Cursor up (\x1b[A)
-        assert_eq!(strip_ansi("before\x1b[Aafter"), "beforeafter");
-    }
-
-    #[test]
-    fn strip_ansi_osc() {
-        // OSC title set: \x1b]0;title\x07
-        assert_eq!(strip_ansi("\x1b]0;My Title\x07visible"), "visible");
     }
 
     #[test]

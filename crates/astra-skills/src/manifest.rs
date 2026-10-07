@@ -246,7 +246,7 @@ pub struct SkillManifest {
     /// Publisher identity information.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publisher: Option<PublisherMetadata>,
-    /// Compatibility constraints.
+    /// Descriptive compatibility metadata; execution admission is owned by the runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compatibility: Option<CompatibilityInfo>,
 
@@ -427,7 +427,7 @@ pub struct PublisherMetadata {
     pub published_at: Option<String>,
 }
 
-/// Compatibility constraints for a skill.
+/// Descriptive compatibility metadata for a published skill.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CompatibilityInfo {
     /// Minimum runtime version required (semver string, e.g. "0.9.0").
@@ -525,48 +525,6 @@ impl SkillManifest {
     /// Whether this skill has path-based conditional activation.
     pub fn is_conditional(&self) -> bool {
         !self.paths.is_empty()
-    }
-
-    /// Check if this skill is compatible with the current runtime environment.
-    pub fn check_compatibility(
-        &self,
-        runtime_version: &str,
-        available_capabilities: &[&str],
-    ) -> Vec<CompatibilityIssue> {
-        let mut issues = Vec::new();
-        if let Some(ref compat) = self.compatibility {
-            if let Some(ref min_ver) = compat.min_runtime_version
-                && !version_satisfies(runtime_version, min_ver)
-            {
-                issues.push(CompatibilityIssue::RuntimeVersion {
-                    required: min_ver.clone(),
-                    actual: runtime_version.to_string(),
-                });
-            }
-            for cap in &compat.required_capabilities {
-                if !available_capabilities.contains(&cap.as_str()) {
-                    issues.push(CompatibilityIssue::MissingCapability(cap.clone()));
-                }
-            }
-            if !compat.platforms.is_empty() {
-                let current_platform = if cfg!(target_os = "linux") {
-                    "linux"
-                } else if cfg!(target_os = "macos") {
-                    "macos"
-                } else if cfg!(target_os = "windows") {
-                    "windows"
-                } else {
-                    "unknown"
-                };
-                if !compat.platforms.iter().any(|p| p == current_platform) {
-                    issues.push(CompatibilityIssue::UnsupportedPlatform {
-                        supported: compat.platforms.clone(),
-                        current: current_platform.to_string(),
-                    });
-                }
-            }
-        }
-        issues
     }
 
     /// Validate the manifest for required fields and well-formedness.
@@ -696,58 +654,6 @@ pub fn validate_skill_manifest_core(
     errors
 }
 
-/// A compatibility issue detected by `check_compatibility()`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CompatibilityIssue {
-    /// Runtime version too old.
-    RuntimeVersion { required: String, actual: String },
-    /// A required capability is not available.
-    MissingCapability(String),
-    /// Current platform not in supported list.
-    UnsupportedPlatform {
-        supported: Vec<String>,
-        current: String,
-    },
-}
-
-impl std::fmt::Display for CompatibilityIssue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CompatibilityIssue::RuntimeVersion { required, actual } => {
-                write!(f, "requires runtime >= {required}, have {actual}")
-            }
-            CompatibilityIssue::MissingCapability(cap) => {
-                write!(f, "missing capability: {cap}")
-            }
-            CompatibilityIssue::UnsupportedPlatform { supported, current } => {
-                write!(
-                    f,
-                    "unsupported platform: {current} (supports: {})",
-                    supported.join(", ")
-                )
-            }
-        }
-    }
-}
-
-fn version_satisfies(actual: &str, required: &str) -> bool {
-    let parse = |s: &str| -> (u32, u32, u32) {
-        let parts: Vec<u32> = s
-            .split('.')
-            .take(3)
-            .map(|p| p.parse().unwrap_or(0))
-            .collect();
-        (
-            parts.first().copied().unwrap_or(0),
-            parts.get(1).copied().unwrap_or(0),
-            parts.get(2).copied().unwrap_or(0),
-        )
-    };
-    let a = parse(actual);
-    let r = parse(required);
-    a >= r
-}
-
 /// A fully loaded skill: manifest + instruction text + optional resources.
 #[derive(Clone, Debug)]
 pub struct LoadedSkill {
@@ -836,46 +742,6 @@ mod tests {
     fn default_trust_tier_is_unverified() {
         let m = SkillManifest::default();
         assert_eq!(m.trust_tier, TrustTier::Unverified);
-    }
-
-    #[test]
-    fn compatibility_check_passes_when_no_constraints() {
-        let m = SkillManifest::default();
-        let issues = m.check_compatibility("1.0.0", &["shell_execution", "file_read"]);
-        assert!(issues.is_empty());
-    }
-
-    #[test]
-    fn compatibility_check_version_too_old() {
-        let m = SkillManifest {
-            compatibility: Some(CompatibilityInfo {
-                min_runtime_version: Some("2.0.0".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let issues = m.check_compatibility("1.5.3", &[]);
-        assert_eq!(issues.len(), 1);
-        assert!(matches!(
-            issues[0],
-            CompatibilityIssue::RuntimeVersion { .. }
-        ));
-    }
-
-    #[test]
-    fn compatibility_check_missing_capability() {
-        let m = SkillManifest {
-            compatibility: Some(CompatibilityInfo {
-                required_capabilities: vec!["shell_execution".into(), "network_access".into()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let issues = m.check_compatibility("1.0.0", &["shell_execution", "file_read"]);
-        assert_eq!(issues.len(), 1);
-        assert!(
-            matches!(issues[0], CompatibilityIssue::MissingCapability(ref c) if c == "network_access")
-        );
     }
 
     #[test]

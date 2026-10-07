@@ -2,13 +2,11 @@ use std::io::Write;
 
 use astra_services::session_restore::RestoredSession;
 use astra_services::{session_journal, session_workspace};
-use chrono::{DateTime, Utc};
 
 use crate::cli::permission_manager::PermissionMode;
 use crate::cli::session::session_restore_client;
 use crate::cli::session::session_runtime;
 use crate::cli::surface::session_source_surface::session_source_surface;
-use crate::cli::surface::session_workspace_status_surface::session_workspace_status_surface;
 use crate::cli::tool_call_groups;
 use crate::cli::{
     cli_config::cli_utils::{
@@ -22,143 +20,11 @@ use crate::cli::{
 };
 use crossterm::style::Stylize;
 
-/// `/home/foo/bar` → `~/bar` when under the user home dir (readability).
-fn tilde_path(abs: &str) -> String {
-    let Some(home) = dirs::home_dir() else {
-        return abs.to_string();
-    };
-    let home = home.to_string_lossy();
-    let home = home.trim_end_matches('/');
-    if abs == home {
-        return "~".to_string();
-    }
-    let prefix = format!("{home}/");
-    if let Some(rest) = abs.strip_prefix(&prefix) {
-        return format!("~/{rest}");
-    }
-    abs.to_string()
-}
-
-/// Short relative age from RFC3339 `updated_at` (for scan-friendly lists).
-fn rel_updated_label(iso: &str) -> Option<String> {
-    let dt = DateTime::parse_from_rfc3339(iso).ok()?.with_timezone(&Utc);
-    let secs = Utc::now().signed_duration_since(dt).num_seconds();
-    let secs = secs.max(0);
-    if secs < 60 {
-        return Some("just now".to_string());
-    }
-    if secs < 3600 {
-        return Some(format!("{}m ago", secs / 60));
-    }
-    if secs < 86_400 {
-        return Some(format!("{}h ago", secs / 3600));
-    }
-    if secs < 86_400 * 7 {
-        return Some(format!("{}d ago", secs / 86_400));
-    }
-    Some(format!("{}d ago", secs / 86_400))
-}
-
-fn turn_count_label(turns: u32) -> String {
-    if turns == 1 {
-        "1 turn".to_string()
-    } else {
-        format!("{turns} turns")
-    }
-}
-
-#[derive(Debug, Clone)]
-enum SessionWorkspaceState {
-    Present(Box<session_workspace::WorkspaceMetadata>),
-    Missing { journal_turns: u32 },
-    Invalid { journal_turns: u32 },
-}
-
-impl SessionWorkspaceState {
-    fn load(session_id: &str) -> Self {
-        match session_workspace::read_workspace_optional(session_id) {
-            Ok(Some(workspace)) => Self::Present(Box::new(workspace)),
-            Ok(None) => Self::Missing {
-                journal_turns: session_journal::count_turns(session_id),
-            },
-            Err(_) => Self::Invalid {
-                journal_turns: session_journal::count_turns(session_id),
-            },
-        }
-    }
-
-    fn summary_hint(&self) -> String {
-        match self {
-            Self::Present(ws) => {
-                let mut parts: Vec<String> = Vec::new();
-                let cwd = tilde_path(ws.cwd.as_str());
-                parts.push(ellipsize(&cwd, 56));
-                match (&ws.git_branch, &ws.git_head) {
-                    (Some(b), Some(h)) => parts.push(format!("{b} @ {h}")),
-                    (Some(b), None) => parts.push(b.clone()),
-                    (None, Some(h)) => parts.push(format!("@ {h}")),
-                    (None, None) => {}
-                }
-                if ws.turn_count > 0 {
-                    parts.push(turn_count_label(ws.turn_count));
-                }
-                let status = session_workspace_status_surface(ws.status.as_str());
-                if !status.is_active() {
-                    parts.push(status.label().to_string());
-                }
-                if ws
-                    .last_persistence_error
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|error| !error.is_empty())
-                    .is_some()
-                {
-                    parts.push("persistence degraded".to_string());
-                }
-                if let Some(lbl) = rel_updated_label(ws.updated_at.as_str()) {
-                    parts.push(lbl);
-                }
-                parts.join(" · ")
-            }
-            Self::Missing { journal_turns } => {
-                if *journal_turns > 0 {
-                    format!(
-                        "workspace metadata missing · journal has {}",
-                        turn_count_label(*journal_turns)
-                    )
-                } else {
-                    "workspace metadata missing".to_string()
-                }
-            }
-            Self::Invalid { journal_turns } => {
-                if *journal_turns > 0 {
-                    format!(
-                        "workspace metadata unreadable · journal has {}",
-                        turn_count_label(*journal_turns)
-                    )
-                } else {
-                    "workspace metadata unreadable".to_string()
-                }
-            }
-        }
-    }
-}
-
-/// One-line hint for session lists: cwd, git, turns (from `workspace.yaml` if present).
-fn workspace_summary_line(sid: &str) -> String {
-    SessionWorkspaceState::load(sid).summary_hint()
-}
-
 fn resume_persistence_warning(error: Option<&str>) -> Option<String> {
     error
         .map(str::trim)
         .filter(|error| !error.is_empty())
         .map(|error| format!("Session persistence degraded: {}", ellipsize(error, 96)))
-}
-
-fn list_local_sessions_by_time(limit: usize) -> Result<Vec<String>, String> {
-    session_journal::list_sessions_by_time(limit)
-        .map_err(|error| format!("failed to scan local sessions: {error}"))
 }
 
 fn ellipsize(s: &str, max_chars: usize) -> String {
@@ -167,59 +33,6 @@ fn ellipsize(s: &str, max_chars: usize) -> String {
         format!("{t}…")
     } else {
         t
-    }
-}
-
-pub(crate) fn resolve_journal_target_session(
-    sub_arg: &str,
-    state: &SessionState,
-    _missing_active_msg: &str,
-) -> Result<(String, bool), String> {
-    if !sub_arg.is_empty() {
-        let requested = sub_arg.trim();
-        let resolved =
-            session_journal::resolve_session_id(requested).map_err(|e| format!("  ✗ {e}"))?;
-        Ok((resolved.clone(), resolved != requested))
-    } else if let Some(ref sid) = state.session_id {
-        Ok((sid.clone(), false))
-    } else {
-        // No active session — list local journals and let user pick
-        let sessions = list_local_sessions_by_time(10).map_err(|error| format!("  ✗ {error}"))?;
-        if sessions.is_empty() {
-            return Err("  No sessions found. Start a conversation to create one.".to_string());
-        }
-        eprintln!(
-            "\n{}",
-            "─── Available Sessions ──────────────────────────"
-                .bold()
-                .magenta()
-        );
-        eprintln!(
-            "  {}",
-            "newest first · path / git / turns from workspace.yaml".dim()
-        );
-        let show = sessions.len().min(10);
-        for (i, sid) in sessions.iter().take(show).enumerate() {
-            let hint = workspace_summary_line(sid);
-            eprintln!(
-                "  {}  {}  {}",
-                format!("[{}]", i + 1).magenta().bold(),
-                sid.as_str().magenta(),
-                hint.dim()
-            );
-        }
-        eprintln!();
-        eprint!("  {} ", "Select (number or Enter to cancel):".bold());
-        let _ = std::io::stderr().flush();
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_ok()
-            && let Ok(n) = input.trim().parse::<usize>()
-            && n >= 1
-            && n <= show
-        {
-            return Ok((sessions[n - 1].clone(), false));
-        }
-        Err("  Cancelled.".to_string())
     }
 }
 
@@ -828,7 +641,6 @@ mod export_tests {
 struct PreparedWorkspaceRestore {
     workspace: Option<session_workspace::WorkspaceMetadata>,
     session_persistence_error: Option<String>,
-    discovered_skills: std::collections::HashSet<String>,
     runtime_config: astra_config::RuntimeConfig,
     config_version_id: String,
 }
@@ -850,10 +662,6 @@ fn prepared_workspace_restore_from_workspace(
             .map_err(|error| format!("saved {error}"))?;
     Ok(PreparedWorkspaceRestore {
         session_persistence_error: ws.as_ref().and_then(|ws| ws.last_persistence_error.clone()),
-        discovered_skills: ws
-            .as_ref()
-            .map(|ws| ws.discovered_skills.iter().cloned().collect())
-            .unwrap_or_default(),
         runtime_config,
         config_version_id,
         workspace: ws,
@@ -903,7 +711,6 @@ fn load_prepared_workspace_restore(
 
 fn apply_prepared_workspace_restore(state: &mut SessionState, prepared: &PreparedWorkspaceRestore) {
     state.session_persistence_error = prepared.session_persistence_error.clone();
-    state.discovered_skills = prepared.discovered_skills.clone();
     session_startup::apply_session_runtime_config(
         state,
         prepared.runtime_config.clone(),
@@ -1659,7 +1466,7 @@ mod resume_tests {
     use super::{
         apply_heavy_checkpoint_fallback, apply_restored_session, apply_resume_recovery_state,
         build_step_resume_guidance, prepare_session_history, restore_session_into_state,
-        resume_persistence_warning, session_restore_client, workspace_summary_line,
+        resume_persistence_warning, session_restore_client,
     };
     use crate::cli::permission_manager::PermissionMode;
     use crate::cli::session::session_state::SessionState;
@@ -2345,7 +2152,7 @@ mod resume_tests {
             session_id: Some("existing-session".into()),
             turn: 7,
             history: vec![("old".into(), "state".into())],
-            discovered_skills: ["stale-skill".to_string()].into_iter().collect(),
+
             ..Default::default()
         };
 
@@ -2355,7 +2162,6 @@ mod resume_tests {
 
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
         assert_eq!(state.turn, 2);
-        assert!(state.discovered_skills.is_empty());
         let warning = state
             .session_persistence_error
             .as_deref()
@@ -2390,40 +2196,6 @@ mod resume_tests {
     }
 
     #[test]
-    #[serial_test::serial]
-    fn workspace_summary_line_marks_invalid_workspace() {
-        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let session_id = format!("resume-bad-summary-{}", uuid::Uuid::new_v4());
-        write_local_resumable_session(&session_id, 1);
-        let workspace_path =
-            astra_services::session_workspace::workspace_file_path(&session_id).unwrap();
-        std::fs::write(&workspace_path, ":\nnot-valid-yaml").unwrap();
-
-        let summary = workspace_summary_line(&session_id);
-        assert!(
-            summary.contains("workspace metadata unreadable"),
-            "{summary}"
-        );
-        assert!(!summary.contains("not-valid-yaml"), "{summary}");
-        assert!(summary.contains("1 turn"), "{summary}");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn workspace_summary_line_journal_only_includes_turn_count() {
-        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let session_id = format!("resume-journal-only-{}", uuid::Uuid::new_v4());
-        write_local_resumable_session(&session_id, 2);
-        let workspace_path =
-            astra_services::session_workspace::workspace_file_path(&session_id).unwrap();
-        std::fs::remove_file(&workspace_path).unwrap();
-
-        let summary = workspace_summary_line(&session_id);
-        assert!(summary.contains("workspace metadata missing"), "{summary}");
-        assert!(summary.contains("1 turn"), "{summary}");
-    }
-
-    #[test]
     fn resume_persistence_warning_formats_user_visible_notice() {
         let warning =
             resume_persistence_warning(Some("failed to append turn event: Is a directory"))
@@ -2435,21 +2207,6 @@ mod resume_tests {
         assert!(warning.contains("failed to append turn event"), "{warning}");
         assert!(resume_persistence_warning(None).is_none());
         assert!(resume_persistence_warning(Some("   ")).is_none());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn workspace_summary_line_marks_persistence_degraded() {
-        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let session_id = format!("resume-degraded-summary-{}", uuid::Uuid::new_v4());
-        write_local_resumable_session(&session_id, 2);
-        let mut workspace = session_workspace::read_workspace(&session_id).unwrap();
-        workspace.last_persistence_error = Some("failed to append turn event".to_string());
-        session_workspace::write_workspace(&workspace).unwrap();
-
-        let summary = workspace_summary_line(&session_id);
-        assert!(summary.contains("persistence degraded"), "{summary}");
-        assert!(summary.contains("2 turns"), "{summary}");
     }
 
     #[serial_test::serial]
@@ -3296,7 +3053,7 @@ mod resume_tests {
         let mut state = SessionState {
             session_id: Some("current-session".into()),
             history: vec![("old".into(), "state".into())],
-            discovered_skills: ["obsolete".to_string()].into_iter().collect(),
+
             ..Default::default()
         };
         state.set_session_id("current-session");
@@ -3315,7 +3072,12 @@ mod resume_tests {
             state.history,
             vec![("continue".to_string(), "restored".to_string())]
         );
-        assert!(state.discovered_skills.contains("session-recovery"));
+        assert_eq!(
+            session_workspace::read_workspace(&session_id)
+                .unwrap()
+                .discovered_skills,
+            vec!["session-recovery".to_string()]
+        );
         assert_eq!(
             state.session_persistence_error.as_deref(),
             Some("failed to append turn event")
@@ -3415,10 +3177,6 @@ mod resume_tests {
         assert_eq!(state.total_cache_read_tokens, 22);
         assert_eq!(state.total_cache_creation_tokens, 7);
         assert_eq!(
-            state.discovered_skills,
-            ["cloud-recovery".to_string()].into_iter().collect()
-        );
-        assert_eq!(
             state.session_persistence_error.as_deref(),
             Some("failed to write workspace metadata")
         );
@@ -3439,6 +3197,31 @@ mod resume_tests {
         assert_eq!(
             persisted.last_persistence_error.as_deref(),
             Some("failed to write workspace metadata")
+        );
+
+        // The next real commit updates its own facts without replacing
+        // workspace-owned skill history with a new CLI default.
+        state.turn += 1;
+        let mut result = crate::tests::stub_stream_result("continued");
+        let learning = crate::cli::turn::turn_learning::consume_chat_turn_learning(&result);
+        let primary = crate::cli::turn::turn_commit::commit_primary_turn(
+            &mut state,
+            "continue again",
+            &mut result,
+            &learning,
+            std::time::Instant::now(),
+        );
+        assert!(primary.outcome.turn_persisted);
+        primary
+            .deferred_sidecars
+            .expect("real deferred workspace projection")
+            .execute(false)
+            .unwrap();
+        let committed = session_workspace::read_workspace(&session_id).unwrap();
+        assert_eq!(committed.turn_count, 4);
+        assert_eq!(
+            committed.discovered_skills,
+            vec!["cloud-recovery".to_string()]
         );
     }
 

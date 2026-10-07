@@ -1468,7 +1468,7 @@ async fn execute_cli_command_impl(
                 &std::env::current_dir().unwrap_or_default(),
                 &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
             );
-            let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+
             let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
                 mcp_manager: Some(_pipeline.mcp_manager.clone()),
                 api,
@@ -1493,10 +1493,7 @@ async fn execute_cli_command_impl(
                 stream_json_emitter: None,
                 #[cfg(feature = "harness")]
                 harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
-                #[cfg(feature = "harness")]
-                harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(
-                    astra_harness::SessionTrace::new(None),
-                ))),
+
                 #[cfg(feature = "harness")]
                 benchmark_profile: None,
             };
@@ -1514,7 +1511,6 @@ async fn execute_cli_command_impl(
                 session_id.as_deref(),
                 profile.as_deref(),
                 &mut pm,
-                &mut skill_qt,
                 turn_options.clone(),
             )
             .await
@@ -1538,7 +1534,6 @@ async fn execute_cli_command_impl(
                                 session_id.as_deref(),
                                 profile.as_deref(),
                                 &mut pm,
-                                &mut skill_qt,
                                 turn_options.clone(),
                             )
                             .await
@@ -2075,7 +2070,6 @@ async fn execute_cli_command_impl(
             // When quiet, don't render markdown (no terminal formatting)
             let render_md = is_tty && !quiet;
 
-            let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
             let render_policy = if quiet {
                 crate::cli::stream::stream_render::RenderPolicy::Silent
             } else {
@@ -2099,10 +2093,7 @@ async fn execute_cli_command_impl(
             };
             #[cfg(feature = "harness")]
             let harness_sink = astra_harness::InMemorySnapshotSink::arc();
-            #[cfg(feature = "harness")]
-            let harness_trace = std::sync::Arc::new(std::sync::RwLock::new(
-                astra_harness::SessionTrace::new(None),
-            ));
+
             let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
                 mcp_manager: Some(_pipeline.mcp_manager.clone()),
                 api,
@@ -2127,8 +2118,7 @@ async fn execute_cli_command_impl(
                 stream_json_emitter: None,
                 #[cfg(feature = "harness")]
                 harness_sink: Some(harness_sink.clone()),
-                #[cfg(feature = "harness")]
-                harness_trace: Some(harness_trace),
+
                 #[cfg(feature = "harness")]
                 benchmark_profile: args.benchmark_profile,
             };
@@ -2166,7 +2156,6 @@ async fn execute_cli_command_impl(
                     session_id.as_deref(),
                     profile.as_deref(),
                     &mut pm,
-                    &mut skill_qt,
                     turn_options,
                 );
                 tokio::pin!(turn_future);
@@ -2335,6 +2324,14 @@ async fn execute_cli_command_impl(
                         }
                         print_one_shot_completion_warning(&sr, exit_code, args.json);
                         return Ok(exit_code);
+                    }
+                    if args.json {
+                        let error = e.error.clone();
+                        write_headless_stdout_line(
+                            &serde_json::to_string_pretty(&hard_failure_json_output(e))
+                                .map_err(|error| error.to_string())?,
+                        )?;
+                        return Err(error);
                     }
                     return Err(e.error);
                 }
@@ -3099,6 +3096,50 @@ fn final_json_output(sr: &StreamResult, exit_code: ExitCode) -> serde_json::Valu
     final_json_output_with_context(sr, exit_code, trace_id, request_id)
 }
 
+/// Project observed failure facts without committing a successful turn or
+/// inferring a durable terminal from a transport error. Run identity comes
+/// only from the physical stream's validated root binding.
+fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
+    let partial = failure.partial;
+    let classes = partial
+        .tool_outcomes
+        .as_ref()
+        .filter(|outcomes| outcomes.is_consistent())
+        .map(|outcomes| {
+            serde_json::json!({
+                "succeeded": outcomes.succeeded,
+                "failed": outcomes.failed,
+                "rejected": outcomes.rejected,
+                "reused": outcomes.reused,
+                "suppressed": outcomes.suppressed,
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!({}));
+    let result = StreamResult {
+        session_id: partial.session_id,
+        run_id: partial.run_id,
+        full_text: partial.partial_text,
+        prompt_tokens: partial.prompt_tokens,
+        completion_tokens: partial.completion_tokens,
+        cache_read_tokens: partial.cache_read_tokens,
+        cache_creation_tokens: partial.cache_creation_tokens,
+        token_usage_coverage: partial.token_usage_coverage,
+        llm_rounds: partial.llm_rounds,
+        tool_calls_count: partial.tool_calls_count,
+        tools_used: partial.tools_used,
+        final_state: "failed".to_string(),
+        server_terminal_unverified: true,
+        tool_record_coverage_partial: true,
+        ..Default::default()
+    };
+    let mut output = final_json_output(&result, ExitCode::ApiError);
+    output["tool_result_class_counts"] = classes;
+    output["error"] = serde_json::json!(failure.error);
+    output["error_code"] = serde_json::json!(partial.error_code);
+    output["error_metadata"] = serde_json::json!(partial.error_metadata);
+    output
+}
+
 fn final_stream_json_result(sr: &StreamResult, exit_code: ExitCode) -> serde_json::Value {
     let mut result = final_json_output(sr, exit_code);
     if let Some(object) = result.as_object_mut() {
@@ -3281,7 +3322,6 @@ pub(crate) async fn run_print_mode(
         }
         return Ok(ExitCode::ToolFailure);
     }
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
     let session_turn = session_routing.next_server_turn_index();
     let stream_json_emitter = if output_format == "stream-json" {
@@ -3316,10 +3356,7 @@ pub(crate) async fn run_print_mode(
         stream_json_emitter: stream_json_emitter.clone(),
         #[cfg(feature = "harness")]
         harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
-        #[cfg(feature = "harness")]
-        harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(
-            astra_harness::SessionTrace::new(None),
-        ))),
+
         #[cfg(feature = "harness")]
         benchmark_profile: None,
     };
@@ -3338,7 +3375,6 @@ pub(crate) async fn run_print_mode(
         session_id.as_deref(),
         profile,
         &mut pm,
-        &mut skill_qt,
         turn_options,
     )
     .await
@@ -3348,45 +3384,25 @@ pub(crate) async fn run_print_mode(
             return Ok(ExitCode::Success);
         }
         Err(e) => {
-            let error = e.error;
-            let partial = e.partial;
-            if let Some(emitter) = stream_json_emitter.as_ref() {
-                let total_prompt_tokens = astra_turn_types::NormalizedPromptCacheUsage::new(
-                    partial.prompt_tokens,
-                    partial.cache_read_tokens,
-                    partial.cache_creation_tokens,
-                )
-                .total_input_tokens();
-                let result_session_id = partial.session_id.clone().or_else(|| session_id.clone());
-                let (trace_id, request_id) = gateway_env_context();
-                emitter.emit_result(
-                    result_session_id.as_deref(),
-                    serde_json::json!({
-                        "trace_id": trace_id,
-                        "request_id": request_id,
-                        "session_id": partial.session_id,
-                        "text": partial.partial_text,
-                        "final_state": "failed",
-                        "interruption_kind": serde_json::Value::Null,
-                        "prompt_tokens": total_prompt_tokens,
-                        "fresh_prompt_tokens": partial.prompt_tokens,
-                        "cache": {
-                            "hit": partial.cache_read_tokens > 0,
-                            "read_tokens": partial.cache_read_tokens,
-                            "creation_tokens": partial.cache_creation_tokens,
-                        },
-                        "completion_tokens": partial.completion_tokens,
-                        "tool_calls_count": partial.tool_calls_count,
-                        "tools_used": partial.tools_used,
-                        "persistence_error": serde_json::Value::Null,
-                        "exit_code": serde_json::Value::Null,
-                        "success": false,
-                        "error_kind": serde_json::Value::Null,
-                        "error": &error,
-                    }),
-                )?;
+            if output_format == "json" || stream_json_emitter.is_some() {
+                let error = e.error.clone();
+                let mut output = hard_failure_json_output(e);
+                if let Some(emitter) = stream_json_emitter.as_ref() {
+                    let result_session_id = output["session_id"].as_str().map(str::to_string);
+                    output
+                        .as_object_mut()
+                        .expect("terminal projection is an object")
+                        .remove("run_id");
+                    emitter.emit_result(result_session_id.as_deref(), output)?;
+                } else {
+                    write_headless_stdout_line(
+                        &serde_json::to_string_pretty(&output)
+                            .map_err(|error| error.to_string())?,
+                    )?;
+                }
+                return Err(error);
             }
-            return Err(error);
+            return Err(e.error);
         }
     };
 

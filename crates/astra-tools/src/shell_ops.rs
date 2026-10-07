@@ -1860,17 +1860,34 @@ pub fn command_has_background_operator(command: &str) -> bool {
 
 /// Search files with bounded, cancellable subprocess execution.
 pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
+    let requested_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    let resolved = match resolve_existing_search_path(&ctx.workspace_root, requested_path) {
+        Ok(path) => path,
+        Err(error) => return ToolResult::error(error),
+    };
+    grep_at_authorized_path(ctx, args, &resolved).await
+}
+
+/// Search a target already authorized by the selected execution owner.
+/// CLI uses its current path policy; ordinary executors resolve their own scope
+/// through `grep`. The workspace remains unchanged for ignore rules and output.
+pub async fn grep_at_authorized_path(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    resolved: &Path,
+) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
     let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => return ToolResult::error("Error: Missing 'pattern' parameter".into()),
     };
-    let requested_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-    let resolved = match resolve_existing_search_path(workspace_root, requested_path) {
-        Ok(path) => path,
-        Err(e) => return ToolResult::error(e),
-    };
-    let target = relative_search_target(workspace_root, &resolved);
+    if !resolved.exists() {
+        return ToolResult::error(format!(
+            "Error: path '{}' does not exist. Use list_dir or glob to discover valid paths.",
+            resolved.display()
+        ));
+    }
+    let target = relative_search_target(workspace_root, resolved);
     let ignore_rules = match load_search_ignore_rules(workspace_root) {
         Ok(rules) => rules,
         Err(e) => return ToolResult::error(e),
@@ -2109,8 +2126,9 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     };
 
     let pre_truncate_text = visible_lines.join("\n");
-    let was_truncated_by_output_limit = pre_truncate_text.len() > per_tool_output_limit("grep");
-    let mut result_text = truncate_output(pre_truncate_text, per_tool_output_limit("grep"));
+    let output_limit = per_tool_output_limit("grep").min(ctx.sandbox.max_output_bytes);
+    let was_truncated_by_output_limit = pre_truncate_text.len() > output_limit;
+    let mut result_text = truncate_output(pre_truncate_text, output_limit);
 
     if cancelled {
         if !result_text.is_empty() {
@@ -2993,7 +3011,18 @@ async fn load_gitignored_search_paths(
     let mut candidates = paths
         .iter()
         .filter(|path| !path.is_empty())
-        .cloned()
+        .filter_map(|path| {
+            let path = Path::new(path);
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                workspace_root.join(path)
+            };
+            // An explicitly authorized external target has no Git-ignore
+            // authority from this workspace's repository.
+            crate::fs_ops::relative_to_workspace_root(workspace_root, &absolute)
+                .map(|relative| relative.to_string_lossy().into_owned())
+        })
         .collect::<Vec<_>>();
     dedup_preserve_order(&mut candidates);
     if candidates.is_empty() {
@@ -7040,6 +7069,50 @@ printf 'probe.txt:1:needle\n'
             "expected partial stdout, got: {}",
             output.stdout
         );
+    }
+
+    #[tokio::test]
+    async fn readonly_partial_capture_preserves_complete_lines_without_secret_fragments() {
+        for cancel in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let token = CancellationToken::new();
+            let trigger = token.clone();
+            let ready = root.path().join("ready");
+            let waiter = tokio::spawn(async move {
+                if !cancel {
+                    return;
+                }
+                for _ in 0..200 {
+                    if ready.exists() {
+                        trigger.cancel();
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                panic!("readonly child did not announce readiness");
+            });
+            let mut command = Command::new("bash");
+            command.current_dir(root.path()).arg("-c").arg("printf 'complete\nAWS_SECRET_KEY=abcdefghijklmnopqrstuvwxyz'; printf 'warning\nunfinished-secret' >&2; touch ready; sleep 5");
+            let result = run_readonly_command_with_partial(
+                &mut command,
+                if cancel {
+                    Duration::from_secs(3)
+                } else {
+                    Duration::from_millis(200)
+                },
+                1024,
+                1024,
+                Some(&token),
+                "test search capture",
+            )
+            .await
+            .unwrap();
+            waiter.await.unwrap();
+            assert_eq!(result.cancelled, cancel);
+            assert_eq!(result.timed_out, !cancel);
+            assert_eq!(result.stdout, "complete");
+            assert_eq!(result.stderr, "warning");
+        }
     }
 
     #[tokio::test]

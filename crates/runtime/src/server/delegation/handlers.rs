@@ -51,7 +51,7 @@ pub(crate) async fn delegate_run_handler(
     let forward_headers = collect_forward_headers(&headers);
     request
         .context
-        .remove(crate::turn::agentic::delegate_interception::FORWARD_HEADERS_CONTEXT_KEY);
+        .remove(crate::server::delegation::FORWARD_HEADERS_CONTEXT_KEY);
 
     let engine = state.delegation_engine.as_ref().ok_or_else(|| {
         error_response(

@@ -171,8 +171,14 @@ mod tests {
                 &request.user_id,
                 &request.session_id,
             )
-            .await
-            .map(|_| ())
+            .await?;
+        crate::server::provider_test_support::append_control_plane_contract(
+            run_engine,
+            &request.user_id,
+            &request.session_id,
+            &request.parent_run_id,
+        )
+        .await
     }
 
     // ── Tests ───────────────────────────────────────────────────────────────

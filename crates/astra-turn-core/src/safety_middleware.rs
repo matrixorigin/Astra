@@ -341,7 +341,7 @@ fn with_tool_output_safety_note(
     if let Some(canonical) = canonicalize_generated_safety_notes(&content) {
         return canonical;
     }
-    let (has_trusted_marker, has_any_marker) = marker_status;
+    let (_, has_any_marker) = marker_status;
     if stripped_lines == 0 && credential_redactions == 0 && !has_any_marker {
         return content;
     }
@@ -363,11 +363,10 @@ fn with_tool_output_safety_note(
         parts.join("; ")
     );
     let note = if credential_redactions > 0 || has_any_marker {
-        let marker_guidance = if has_trusted_marker {
-            "Preserve complete executor-issued [REDACTED:opaque-label:opaque-ref] markers when editing; display-only [REDACTED:label] markers are not edit anchors."
-        } else {
-            "Complete redaction markers are opaque source references; preserve them verbatim and edit through the source-owning executor. Display-only [REDACTED:label] markers are not edit anchors; re-read when no owner is available."
-        };
+        // Presentation must be stable across source and consuming processes.
+        // Only the source-owning executor validates a marker for editing;
+        // this process's marker registry must not change durable result bytes.
+        let marker_guidance = "Complete redaction markers are opaque source references; preserve them verbatim and edit through the source-owning executor. Display-only [REDACTED:label] markers are not edit anchors; re-read when no owner is available.";
         format!("{note} {marker_guidance} The raw credential remains unavailable by design.")
     } else {
         note
@@ -1829,43 +1828,6 @@ fn is_inside_quotes(line: &str, match_start: usize, match_end: usize) -> bool {
 }
 
 #[must_use]
-pub fn strip_sql_comments(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '-' && chars.peek() == Some(&'-') {
-            for ch in chars.by_ref() {
-                if ch == '\n' {
-                    out.push(' ');
-                    break;
-                }
-            }
-        } else if c == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            let mut depth = 1u32;
-            while depth > 0 {
-                match chars.next() {
-                    Some('/') if chars.peek() == Some(&'*') => {
-                        chars.next();
-                        depth += 1;
-                    }
-                    Some('*') if chars.peek() == Some(&'/') => {
-                        chars.next();
-                        depth -= 1;
-                    }
-                    None => break,
-                    _ => {}
-                }
-            }
-            out.push(' ');
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-#[must_use]
 pub fn check_sql_safety(sql: &str) -> Option<&'static str> {
     // Issue #326 P5 / R2 Major: previously this only checked the
     // first whitespace-separated word of each statement, which let
@@ -1884,131 +1846,147 @@ pub fn check_sql_safety(sql: &str) -> Option<&'static str> {
     scan_sql_destructive_keyword(sql)
 }
 
-/// Token-level scan for destructive SQL verbs.
-///
-/// Skips:
-/// - Line comments (`-- … \n`)
-/// - Block comments (`/* … */`)
-/// - Single-quoted string literals (`'…'` with `''` escape)
-/// - Double-quoted identifiers / strings (`"…"` with `""` escape)
-/// - Backtick-quoted identifiers (MySQL)
-///
-/// Then walks word-boundaries and reports the first token that
-/// matches `DESTRUCTIVE_KEYWORDS`. We intentionally don't filter
-/// "is this a verb position?" — for the purposes of approval
-/// gating, a literal keyword anywhere in user-supplied SQL is
-/// suspicious enough to require the user's eye on it. False
-/// positives are bounded (the legitimate `SELECT name FROM
-/// drop_log` where `drop_log` is a column name does NOT trigger
-/// because the keyword check is exact-match against the whole
-/// token, not substring).
-fn scan_sql_destructive_keyword(sql: &str) -> Option<&'static str> {
+/// Walk unquoted SQL words and real statement boundaries. Policies consume the
+/// same lexical surface; snapshot requirements never authorize execution.
+fn scan_sql_tokens(sql: &str, mut visit: impl FnMut(Option<&str>) -> bool) -> bool {
     let bytes = sql.as_bytes();
     let mut i = 0;
-    let n = bytes.len();
-    let mut current_word = String::new();
-
-    let flush_word = |word: &mut String| -> Option<&'static str> {
-        if word.is_empty() {
-            return None;
-        }
-        let upper: String = word.chars().map(|c| c.to_ascii_uppercase()).collect();
-        word.clear();
-        DESTRUCTIVE_KEYWORDS
-            .iter()
-            .find(|&&kw| upper == kw)
-            .copied()
-    };
-
-    while i < n {
-        let b = bytes[i];
-
-        // Line comment
-        if b == b'-' && i + 1 < n && bytes[i + 1] == b'-' {
-            if let Some(found) = flush_word(&mut current_word) {
-                return Some(found);
-            }
-            while i < n && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        // Block comment
-        if b == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
-            if let Some(found) = flush_word(&mut current_word) {
-                return Some(found);
-            }
-            i += 2;
-            while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
-            }
-            i = (i + 2).min(n);
-            continue;
-        }
-        // Single-quoted string
-        if b == b'\'' {
-            if let Some(found) = flush_word(&mut current_word) {
-                return Some(found);
-            }
-            i += 1;
-            while i < n {
-                if bytes[i] == b'\'' {
-                    if i + 1 < n && bytes[i + 1] == b'\'' {
-                        i += 2; // escaped
-                        continue;
-                    }
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'-')
+                && bytes.get(i + 2).is_none_or(u8::is_ascii_whitespace) =>
+            {
+                while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
-                    break;
+                }
+            }
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                if bytes.get(i + 2) == Some(&b'!') {
+                    // MySQL executable comments contain SQL, not inert text.
+                    i += 3;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                } else {
+                    i += 2;
+                    while i + 1 < bytes.len() && &bytes[i..i + 2] != b"*/" {
+                        i += 1;
+                    }
+                    i = (i + 2).min(bytes.len());
+                }
+            }
+            quote @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        i += 1;
+                        if bytes.get(i) == Some(&quote) {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b';' => {
+                if visit(None) {
+                    return true;
                 }
                 i += 1;
             }
-            continue;
-        }
-        // Double-quoted identifier / string
-        if b == b'"' {
-            if let Some(found) = flush_word(&mut current_word) {
-                return Some(found);
-            }
-            i += 1;
-            while i < n {
-                if bytes[i] == b'"' {
-                    if i + 1 < n && bytes[i + 1] == b'"' {
-                        i += 2;
-                        continue;
-                    }
+            b if b.is_ascii_alphanumeric() || b == b'_' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
-                    break;
                 }
-                i += 1;
+                if visit(Some(&sql[start..i])) {
+                    return true;
+                }
             }
-            continue;
+            _ => i += 1,
         }
-        // Backtick identifier (MySQL)
-        if b == b'`' {
-            if let Some(found) = flush_word(&mut current_word) {
-                return Some(found);
-            }
-            i += 1;
-            while i < n && bytes[i] != b'`' {
-                i += 1;
-            }
-            if i < n {
-                i += 1;
-            }
-            continue;
-        }
-
-        // Word-character boundary
-        if (b.is_ascii_alphanumeric() || b == b'_') && current_word.len() < 64 {
-            current_word.push(b as char);
-        } else {
-            if let Some(found) = flush_word(&mut current_word) {
-                return Some(found);
-            }
-        }
-        i += 1;
     }
-    flush_word(&mut current_word)
+    false
+}
+
+fn scan_sql_destructive_keyword(sql: &str) -> Option<&'static str> {
+    let mut found = None;
+    scan_sql_tokens(sql, |token| {
+        found = token.and_then(|word| {
+            DESTRUCTIVE_KEYWORDS
+                .iter()
+                .copied()
+                .find(|keyword| word.eq_ignore_ascii_case(keyword))
+        });
+        found.is_some()
+    });
+    found
+}
+
+/// Snapshot every potentially mutating batch before execution. This is a
+/// rollback policy, independent of the destructive-operation approval gate.
+pub fn sql_requires_pre_state_snapshot(sql: &str, allow_destructive: bool) -> bool {
+    let mut first_word = true;
+    let mut read_only_statement = false;
+    scan_sql_tokens(sql, |token| {
+        let Some(word) = token else {
+            first_word = true;
+            read_only_statement = false;
+            return false;
+        };
+        let keyword = word.to_ascii_uppercase();
+        if first_word {
+            read_only_statement =
+                matches!(keyword.as_str(), "SHOW" | "EXPLAIN" | "DESC" | "DESCRIBE");
+        }
+        if read_only_statement {
+            first_word = false;
+            return false;
+        }
+        if matches!(
+            keyword.as_str(),
+            "INSERT"
+                | "UPDATE"
+                | "REPLACE"
+                | "CREATE"
+                | "DROP"
+                | "DELETE"
+                | "TRUNCATE"
+                | "ALTER"
+                | "GRANT"
+                | "REVOKE"
+                | "LOAD"
+        ) {
+            return true;
+        }
+        let unknown_statement = first_word
+            && !matches!(
+                keyword.as_str(),
+                "SELECT"
+                    | "SHOW"
+                    | "EXPLAIN"
+                    | "DESC"
+                    | "DESCRIBE"
+                    | "USE"
+                    | "HELP"
+                    | "SOURCE"
+                    | "START_TRANSACTION"
+                    | "BEGIN"
+                    | "COMMIT"
+                    | "ROLLBACK"
+                    | "SET"
+                    | "PREPARE"
+            );
+        first_word = false;
+        unknown_statement && allow_destructive
+    })
 }
 
 #[cfg(test)]
@@ -2019,6 +1997,53 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════
     // SQL safety scanner (issue #326 P5 / R2 Major)
     // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn snapshot_policy_uses_real_statement_boundaries() {
+        for sql in [
+            "SELECT 1; UPDATE t SET x = 1",
+            "SHOW CREATE TABLE t; UPDATE t SET x = 1",
+            "LOAD DATA INFILE 'rows.csv' INTO TABLE t",
+            "/* leading UPDATE; */ UPDATE t SET x = 1",
+            "SELECT 'quoted; UPDATE t'; -- ignored DELETE\nLOAD DATA INFILE 'x' INTO TABLE t",
+            "WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c",
+            "SELECT 1; /*!50000 UPDATE t SET x = 1 */",
+        ] {
+            assert!(
+                sql_requires_pre_state_snapshot(sql, false),
+                "missed write: {sql}"
+            );
+        }
+        for sql in [
+            "SELECT 'semicolon; UPDATE t SET x = 1'",
+            "SHOW CREATE TABLE t",
+            "EXPLAIN UPDATE t SET x = 1",
+            "DESC t; DESCRIBE t",
+            "SELECT 'O''Brien; DELETE'",
+            "SELECT `column``UPDATE`, \"quoted; LOAD\" FROM t",
+            "/* UPDATE */ SELECT 1; -- DELETE\n SHOW TABLES",
+            "SELECT 1 # DELETE; UPDATE\n; SELECT 2",
+        ] {
+            assert!(
+                !sql_requires_pre_state_snapshot(sql, true),
+                "spurious snapshot: {sql}"
+            );
+            assert_eq!(check_sql_safety(sql), None, "spurious approval: {sql}");
+        }
+        assert!(sql_requires_pre_state_snapshot(
+            "SELECT 1; MERGE INTO t",
+            true
+        ));
+        assert!(!sql_requires_pre_state_snapshot(
+            "SELECT 1; MERGE INTO t",
+            false
+        ));
+        assert_eq!(
+            check_sql_safety("SELECT 1; /*!50000 DROP TABLE t */"),
+            Some("DROP")
+        );
+        assert_eq!(check_sql_safety("SELECT 1--1; DROP TABLE t"), Some("DROP"));
+    }
 
     #[test]
     fn sql_safety_scanner_blocks() {
@@ -2633,7 +2658,18 @@ mod tests {
         .0;
         let sanitized = sanitize_tool_output_for_llm(&issued);
         assert!(sanitized.content.contains(&issued));
-        assert!(sanitized.content.contains("executor-issued"));
+        assert!(sanitized.content.contains("source-owning executor"));
+        assert!(!sanitized.content.contains("executor-issued"));
+        assert_eq!(
+            astra_text_utils::credential_redaction::resolve_redacted_anchor(
+                "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+                &issued,
+                false,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE")
+        );
     }
 
     #[test]
@@ -2643,6 +2679,18 @@ mod tests {
         assert!(sanitized.content.contains(foreign));
         assert!(sanitized.content.contains("source-owning executor"));
         assert!(!sanitized.content.contains("executor-issued"));
+        assert!(
+            astra_text_utils::credential_redaction::resolve_redacted_anchor(
+                "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+                foreign,
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            sanitize_tool_output_for_llm(&sanitized.content).content,
+            sanitized.content
+        );
     }
 
     #[test]

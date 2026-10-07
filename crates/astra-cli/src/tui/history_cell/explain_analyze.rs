@@ -814,9 +814,6 @@ fn source_label(kind: astra_turn_types::ExplainAnalyzeContextSourceKindV1) -> &'
         Skills => "Skills",
         RuntimeIdentity => "Runtime identity",
         RuntimeVolatile => "Runtime state",
-        EmergentSkills => "Emergent skills",
-        EmergentMemory => "Emergent memory",
-        EmergentSummary => "Emergent summary",
     }
 }
 

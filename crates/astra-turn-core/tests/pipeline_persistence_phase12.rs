@@ -1,4 +1,4 @@
-//! Phase 12 TDD: persistence, journal events, emergent checkpoint, cloud sync.
+//! Phase 12 TDD: persistence, journal events, warm checkpoints, cloud sync.
 //!
 //! Tests written first (red), then implementation makes them green.
 
@@ -48,46 +48,6 @@ fn runtime_feedback(turn: u32) -> RuntimeFeedbackFrame {
         cache_break_detected: None,
         policy_feedback: Default::default(),
     }
-}
-
-// ── 12.2: EmergentContext in checkpoints ────────────────────────────────────
-
-#[test]
-fn emergent_context_survives_serialize_roundtrip() {
-    let mut sess = PipelineSession::new(PipelineConfig::default());
-    sess.push_emergent_skill("debug", "error detected", 1);
-    sess.push_emergent_memory("User prefers verbose output.", 0.9, 1);
-
-    let state = sess.snapshot_full_state();
-    let json = serde_json::to_value(&state).unwrap();
-    let restored: astra_turn_core::pipeline_session::PipelineSessionSnapshot =
-        serde_json::from_value(json).unwrap();
-
-    assert_eq!(restored.emergent.discovered_skills.len(), 1);
-    assert_eq!(
-        restored.emergent.discovered_skills[0].value.skill_name,
-        "debug"
-    );
-    assert_eq!(restored.emergent.prefetched_memory.len(), 1);
-}
-
-#[test]
-fn emergent_context_restored_into_session() {
-    let mut sess = PipelineSession::new(PipelineConfig::default());
-    sess.push_emergent_skill("review", "code change", 5);
-
-    let state = sess.snapshot_full_state();
-    let json = serde_json::to_value(&state).unwrap();
-    let restored: astra_turn_core::pipeline_session::PipelineSessionSnapshot =
-        serde_json::from_value(json).unwrap();
-
-    let sess2 =
-        PipelineSession::from_snapshot(PipelineConfig::default(), restored, sess.current_date());
-    assert!(!sess2.emergent.is_empty());
-    assert_eq!(
-        sess2.emergent.discovered_skills[0].value.skill_name,
-        "review"
-    );
 }
 
 // ── 12.4: Journal events ────────────────────────────────────────────────────
@@ -183,7 +143,6 @@ fn full_session_snapshot_includes_all_state() {
         let mut feedback = ContextFeedback::from_usage(0, 800, 200, 300 + i * 50, false);
         sess.record_feedback("model", "repl", &mut feedback, None);
     }
-    sess.push_emergent_skill("test-skill", "trigger", 3);
     sess.latch_cache_scope(CacheScope::Global, 1);
     sess.record_ptl_error();
 
@@ -193,5 +152,4 @@ fn full_session_snapshot_includes_all_state() {
     assert!(snapshot.stats.avg_cache_hit_ratio > 0.5);
     assert_eq!(snapshot.latches.cache_scope, Some(CacheScope::Global));
     assert_eq!(snapshot.recovery.consecutive_ptl_errors, 1);
-    assert_eq!(snapshot.emergent.discovered_skills.len(), 1);
 }

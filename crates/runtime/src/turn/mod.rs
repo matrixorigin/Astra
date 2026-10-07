@@ -16,7 +16,6 @@ pub mod headless_tool_pipeline;
 pub mod inspection_service;
 pub(crate) mod llm;
 pub mod local_provider;
-pub mod loop_dispatcher;
 pub mod memory_prefetch;
 pub mod permission_gate;
 pub(crate) mod plan_mode_guard;

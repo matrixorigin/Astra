@@ -5,8 +5,6 @@
 
 use std::borrow::Cow;
 use std::io::{Read, Write};
-#[cfg(test)]
-use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -736,12 +734,7 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
         if file_size < 1_000_000
             && let Some(outline_str) = render_outline(&path, &raw_preview, total_lines)
         {
-            preview.push_str(
-                &astra_text_utils::credential_redaction::redact_credentials_for_display(
-                    &outline_str,
-                )
-                .0,
-            );
+            preview.push_str(&outline_str);
         }
 
         // Truncate before appending tip so the tip is always intact when within limit.
@@ -767,9 +760,7 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
     if outline {
         let rendered = render_outline(&path, &raw_content, total_lines)
             .unwrap_or_else(|| no_definitions_outline_message(total_lines));
-        return ToolResult::text(
-            astra_text_utils::credential_redaction::redact_credentials_for_display(&rendered).0,
-        );
+        return ToolResult::text(rendered);
     }
 
     if !has_range {
@@ -830,84 +821,6 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
     ToolResult::text(result)
 }
 
-/// Read the last N lines of a file efficiently.
-///
-/// Uses reverse reading from the end of the file to avoid loading
-/// the entire file into memory for large files.
-#[cfg(test)]
-fn read_last_n_lines(path: &Path, n: usize) -> std::io::Result<Vec<String>> {
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut file = std::fs::File::open(path)?;
-    let file_size = file.metadata()?.len() as usize;
-
-    if file_size == 0 {
-        return Ok(Vec::new());
-    }
-
-    // Read raw bytes from the end and only decode once we've aligned to a newline
-    // boundary. That avoids starting in the middle of a UTF-8 codepoint.
-    let mut buffer_size = 8192usize.min(file_size);
-    let mut suffix = Vec::new();
-    let mut newline_count = 0usize;
-    let mut position = file_size;
-
-    loop {
-        let seek_pos = position.saturating_sub(buffer_size);
-        file.seek(SeekFrom::Start(seek_pos as u64))?;
-
-        let to_read = position - seek_pos;
-        let mut buffer = vec![0u8; to_read];
-        file.read_exact(&mut buffer)?;
-        newline_count += buffer.iter().filter(|&&byte| byte == b'\n').count();
-
-        if suffix.is_empty() {
-            suffix = buffer;
-        } else {
-            buffer.extend_from_slice(&suffix);
-            suffix = buffer;
-        }
-
-        if newline_count >= n || seek_pos == 0 {
-            break;
-        }
-
-        position = seek_pos;
-        buffer_size = (buffer_size * 2).min(65536); // Double buffer size, cap at 64KB
-    }
-
-    let scan_end = suffix
-        .len()
-        .saturating_sub(usize::from(matches!(suffix.last(), Some(b'\n'))));
-    let mut start = 0usize;
-    let mut seen_newlines = 0usize;
-    for idx in (0..scan_end).rev() {
-        if suffix[idx] == b'\n' {
-            seen_newlines += 1;
-            if seen_newlines == n {
-                start = idx + 1;
-                break;
-            }
-        }
-    }
-
-    // Ensure we start at a valid UTF-8 character boundary. If `start` landed
-    // inside a multi-byte sequence (e.g. a CJK character), scan forward to the
-    // next lead byte (0x00–0x7F or 0xC0–0xFF) so the first decoded line isn't
-    // garbled with a `` replacement. This matters both when start > 0 (common
-    // case: landed mid-character after a newline) and when start == 0 (rare
-    // case: file has fewer lines than n and seek_pos landed mid-character).
-    let mut safe_start = start;
-    while safe_start < suffix.len() && suffix[safe_start] & 0xC0 == 0x80 {
-        safe_start += 1;
-    }
-
-    let text = String::from_utf8_lossy(&suffix[safe_start..]);
-    Ok(text.lines().map(|line| line.to_string()).collect())
-}
-
 pub fn read_to_string_lossy(path: &Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
     match String::from_utf8(bytes) {
@@ -929,61 +842,24 @@ fn add_line_numbers(content: &str, start_line: usize) -> String {
         .join("\n")
 }
 
-fn render_outline(path: &Path, content: &str, total_lines: usize) -> Option<String> {
-    if let Some(lang) = code_intel::detect_language(path) {
-        let outline = code_intel::generate_outline(content, lang);
-        if !outline.is_empty() {
-            let symbol_count = outline.lines().count();
-            return Some(format!(
-                "# Outline ({total_lines} lines, {symbol_count} symbols)\n{outline}"
-            ));
-        }
+/// Render AST signatures for display. Unsupported languages and files without
+/// symbols have no outline; this does not authorize edits or imply full delivery.
+pub fn render_outline(path: &Path, content: &str, total_lines: usize) -> Option<String> {
+    let language = code_intel::detect_language(path)?;
+    let outline = code_intel::generate_outline(content, language);
+    if outline.is_empty() {
+        return None;
     }
-
-    let fallback = fallback_outline(content);
-    if fallback.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "# Outline ({total_lines} lines total, {} definitions)\n{}",
-            fallback.len(),
-            fallback
-                .into_iter()
-                .map(|(line_no, sig)| format!("L{line_no}: {sig}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ))
-    }
+    let symbol_count = outline.lines().count();
+    let safe_outline =
+        astra_text_utils::credential_redaction::redact_credentials_for_display(&outline).0;
+    Some(format!(
+        "# Outline ({total_lines} lines, {symbol_count} symbols)\n{safe_outline}"
+    ))
 }
 
 fn no_definitions_outline_message(total_lines: usize) -> String {
     format!("(no definitions found in {total_lines}-line file)")
-}
-
-fn fallback_outline(content: &str) -> Vec<(usize, String)> {
-    content
-        .lines()
-        .enumerate()
-        .filter_map(|(idx, line)| {
-            let trimmed = line.trim_start();
-            let looks_like_definition = trimmed.starts_with("fn ")
-                || trimmed.starts_with("pub fn ")
-                || trimmed.starts_with("async fn ")
-                || trimmed.starts_with("pub async fn ")
-                || trimmed.starts_with("def ")
-                || trimmed.starts_with("class ")
-                || trimmed.starts_with("struct ")
-                || trimmed.starts_with("pub struct ")
-                || trimmed.starts_with("trait ")
-                || trimmed.starts_with("pub trait ")
-                || trimmed.starts_with("enum ")
-                || trimmed.starts_with("pub enum ")
-                || trimmed.starts_with("interface ")
-                || trimmed.starts_with("type ")
-                || trimmed.starts_with("func ");
-            looks_like_definition.then(|| (idx + 1, trimmed.to_string()))
-        })
-        .collect()
 }
 
 #[derive(Debug)]
@@ -1106,7 +982,8 @@ impl PreparedWriteFile {
                 ),
             );
         }
-        if let Some(parent) = self.path.parent()
+        if self.original_content.is_none()
+            && let Some(parent) = self.path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
         {
             return ToolResult::error(format!("Error: Cannot create directories: {e}"));
@@ -1194,23 +1071,40 @@ pub fn write_file(workspace_root: &Path, args: &Value) -> ToolResult {
 
 #[derive(Debug)]
 pub struct PreparedStrReplace {
-    path: PathBuf,
-    new_content: String,
+    publication: PreparedWriteFile,
     dry_run: bool,
+    matched_range: std::ops::Range<usize>,
+    replacement: String,
+    match_strategy: Option<&'static str>,
+    occurrence_count: usize,
     success_message: String,
-    /// SHA-256 hex digest of the file content as it was read.
-    /// Verified before commit to detect concurrent modifications.
-    original_content_hash: Option<String>,
-    original_content: Vec<u8>,
 }
 
 impl PreparedStrReplace {
+    pub fn matched_text(&self) -> &str {
+        std::str::from_utf8(&self.original_content_bytes()[self.matched_range.clone()])
+            .expect("captured text preimage is UTF-8")
+    }
+
+    pub fn replacement(&self) -> &str {
+        &self.replacement
+    }
+    pub fn match_strategy(&self) -> Option<&'static str> {
+        self.match_strategy
+    }
+    pub fn occurrence_count(&self) -> usize {
+        self.occurrence_count
+    }
+    pub fn first_edit_start(&self) -> usize {
+        self.matched_range.start
+    }
+
     pub fn path(&self) -> &Path {
-        &self.path
+        self.publication.path()
     }
 
     pub fn new_content_bytes(&self) -> &[u8] {
-        self.new_content.as_bytes()
+        self.publication.content_bytes()
     }
 
     pub fn is_dry_run(&self) -> bool {
@@ -1218,61 +1112,178 @@ impl PreparedStrReplace {
     }
 
     pub fn original_content_bytes(&self) -> &[u8] {
-        &self.original_content
+        self.publication
+            .original_content_bytes()
+            .expect("replacement captures an existing target")
     }
 
     pub fn apply(&self) -> ToolResult {
         if self.dry_run {
             return ToolResult::text(self.success_message.clone());
         }
-        match write_file_atomic(
-            &self.path,
-            self.new_content.as_bytes(),
-            self.original_content_hash.as_deref(),
-        ) {
-            Ok(()) => {
-                ToolResult::text(self.success_message.clone()).with_workspace_mutation_applied()
-            }
-            Err(e) => ToolResult::error(e),
+        let mut result = self.publication.apply();
+        if !result.is_error {
+            result.output = self.success_message.clone();
         }
+        result
+    }
+
+    pub fn publication(&self) -> &PreparedWriteFile {
+        &self.publication
     }
 }
 
-pub fn prepare_str_replace(
-    workspace_root: &Path,
-    args: &Value,
-) -> Result<PreparedStrReplace, ToolResult> {
-    let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
-    let args = &args;
+fn replacement_match_failure(mut result: ToolResult, strategy: &str, outcome: &str) -> ToolResult {
+    let metadata = result.metadata.get_or_insert_with(Default::default);
+    metadata.insert(
+        "replacement_match_strategy".into(),
+        Value::String(strategy.into()),
+    );
+    metadata.insert(
+        "replacement_match_outcome".into(),
+        Value::String(outcome.into()),
+    );
+    result.with_workspace_mutation_not_applied()
+}
+
+fn resolve_replacement_match<'a>(
+    content: &'a str,
+    old_str: &'a str,
+    new_str: &'a str,
+    path_str: &str,
+    replace_all: bool,
+    edit_index: Option<usize>,
+) -> Result<(&'a str, Cow<'a, str>, Option<&'static str>), ToolResult> {
+    let count = content.matches(old_str).count();
+    if count > 0 {
+        if count > 1 && !replace_all {
+            let label = edit_index.map_or_else(
+                || "old_str".to_owned(),
+                |index| format!("edit[{index}] old_str"),
+            );
+            let next = if edit_index.is_some() {
+                "Add surrounding context so the batch anchor matches exactly once."
+            } else {
+                "Add surrounding context to match exactly once, or use replace_all=true to replace every occurrence."
+            };
+            let mut message = str_replace_fail(
+                &format!("{label} is ambiguous in {path_str}."),
+                &format!("old_str matched {count} times; anchors must be unique."),
+                next,
+            );
+            let locations: Vec<_> = content
+                .match_indices(old_str)
+                .take(10)
+                .map(|(offset, _)| {
+                    content[..offset]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                        + 1
+                })
+                .collect();
+            message.push_str(&format!("\nLocations (match start lines): {locations:?}\n"));
+            return Err(replacement_match_failure(
+                caller_correctable_no_effect(
+                    message,
+                    astra_core::ToolRecoveryAction::CorrectArguments,
+                ),
+                "exact",
+                "ambiguous",
+            ));
+        }
+        return Ok((old_str, Cow::Borrowed(new_str), None));
+    }
+    let normalized_quote_count = quote_normalized_match_count(content, old_str);
+    if normalized_quote_count > 1 && !replace_all {
+        return Err(replacement_match_failure(
+            caller_correctable_no_effect(
+                format!(
+                    "Error: old_str found {normalized_quote_count} times in {path_str} after normalizing curly quotes. Make old_str more specific to match exactly once."
+                ),
+                astra_core::ToolRecoveryAction::CorrectArguments,
+            ),
+            crate::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED,
+            "ambiguous",
+        ));
+    }
+    let Some(matched) = fuzzy_find_replacement(content, old_str, replace_all) else {
+        if replace_all && normalized_quote_count > 1 {
+            return Err(replacement_match_failure(
+                caller_correctable_no_effect(
+                    str_replace_fail(
+                        &format!("Cannot replace_all in {path_str}."),
+                        &format!(
+                            "old_str matches {normalized_quote_count} occurrences after normalizing curly quotes, but the file mixes straight and curly quote forms."
+                        ),
+                        "Split into targeted edits with surrounding context, or normalize the quote style first.",
+                    ),
+                    astra_core::ToolRecoveryAction::CorrectArguments,
+                ),
+                crate::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED,
+                "ambiguous",
+            ));
+        }
+        let message = match edit_index {
+            Some(index) => str_replace_not_found_hint_for_edit(path_str, content, old_str, index),
+            None => str_replace_not_found_hint(path_str, content, old_str),
+        };
+        return Err(replacement_match_failure(
+            caller_correctable_no_effect(
+                message,
+                astra_core::ToolRecoveryAction::ReadTargetedRange,
+            ),
+            "none",
+            "not_found",
+        ));
+    };
+    let replacement = if matched.is_quote_normalized() {
+        Cow::Owned(preserve_quote_style(old_str, matched.actual, new_str))
+    } else {
+        Cow::Borrowed(new_str)
+    };
+    Ok((matched.actual, replacement, Some(matched.strategy)))
+}
+
+struct ReplacementArguments<'a> {
+    path_str: &'a str,
+    old_str: &'a str,
+    new_str: &'a str,
+    replace_all: bool,
+    dry_run: bool,
+    allow_structural_change: bool,
+}
+
+fn replacement_arguments(args: &Value) -> Result<ReplacementArguments<'_>, ToolResult> {
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => {
             return Err(ToolResult::error(
-                "Error: Missing 'path' parameter. Retry str_replace with path plus either old_str/new_str or edits.".into(),
-            ));
+        "Error: Missing 'path' parameter. Retry str_replace with path plus either old_str/new_str or edits.".into(),
+        ));
         }
     };
     let old_str = match args.get("old_str").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
             return Err(ToolResult::error(
-                "Error: Missing 'old_str' parameter. Retry str_replace single-edit mode with path, old_str, and new_str; or use edits for batch mode.".into(),
-            ));
+        "Error: Missing 'old_str' parameter. Retry str_replace single-edit mode with path, old_str, and new_str; or use edits for batch mode.".into(),
+        ));
         }
     };
     let new_str = match args.get("new_str").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
             return Err(ToolResult::error(
-                "Error: Missing 'new_str' parameter. Retry str_replace single-edit mode with path, old_str, and new_str; or use edits for batch mode.".into(),
-            ));
+        "Error: Missing 'new_str' parameter. Retry str_replace single-edit mode with path, old_str, and new_str; or use edits for batch mode.".into(),
+        ));
         }
     };
     astra_text_utils::credential_redaction::reject_redaction_markers_in_replacement(new_str)
         .map_err(ToolResult::error)?;
     validate_str_replace_anchor("str_replace", old_str).map_err(ToolResult::error)?;
     if old_str == new_str {
-        return Err(ToolResult::error(str_replace_fail(
+        return Err(replacement_no_effect(str_replace_fail(
             "old_str and new_str are identical — no change needed.",
             "The replacement is a no-op; the file would be unchanged.",
             "Provide a new_str that actually differs from old_str, or skip the edit.",
@@ -1296,129 +1307,165 @@ pub fn prepare_str_replace(
         return Err(ToolResult::error(err));
     }
 
-    let path = resolve_existing_path_for_tool(workspace_root, path_str, "str_replace")?;
-
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => return Err(ToolResult::error(format!("Error: Cannot read file: {e}"))),
-    };
-
-    // Credential values are intentionally unavailable in model context.  A
-    // complete non-secret redaction marker is a safe edit reference: resolve
-    // it against the raw file at execution time, and fail closed on forged or
-    // ambiguous references instead of asking the model to repeat the secret.
-    let redaction_reference = astra_text_utils::credential_redaction::resolve_redacted_anchor(
-        &content,
+    Ok(ReplacementArguments {
+        path_str,
         old_str,
+        new_str,
         replace_all,
-    )
-    .map_err(ToolResult::error)?;
-    let old_str = redaction_reference.as_deref().unwrap_or(old_str);
-    // Resolve opaque anchors before deciding whether this is a no-op.  A
-    // marker can differ from the source value while still resolving to the
-    // exact new_str (for example when a credential-shaped placeholder was
-    // already applied).  Such a request must not write, journal, advance the
-    // workspace generation, or emit a mutation-success sentinel.
-    if old_str == new_str {
-        return Err(ToolResult::error(str_replace_fail(
-            "the resolved old_str already equals new_str — no change needed.",
-            "The anchor resolved successfully, but the file already contains the requested replacement.",
-            "Choose a different new_str or skip this edit; no bytes were changed.",
-        )));
-    }
-
-    // Capture content hash BEFORE any mutation so the commit phase
-    // can detect concurrent modifications (another process or a
-    // parallel agent writing the same file between our read and
-    // the final rename).
-    let original_hash = content_hash(&content);
-
-    let count = content.matches(old_str).count();
-    let (anchor, replacement, match_strategy) = if count == 0 {
-        let normalized_quote_count = quote_normalized_match_count(&content, old_str);
-        if normalized_quote_count > 1 && !replace_all {
-            return Err(ToolResult::error(format!(
-                "Error: old_str found {normalized_quote_count} times in {path_str} after normalizing curly quotes. Make old_str more specific to match exactly once."
-            )));
-        }
-        let Some(fuzzy_match) = fuzzy_find_replacement(&content, old_str, replace_all) else {
-            if replace_all && normalized_quote_count > 1 {
-                return Err(ToolResult::error(str_replace_fail(
-                    &format!("Cannot replace_all in {path_str}."),
-                    &format!(
-                        "old_str matches {normalized_quote_count} occurrences after normalizing curly quotes, but the file mixes straight and curly quote forms."
-                    ),
-                    "Either (a) split into multiple targeted str_replace calls with surrounding context to disambiguate, or (b) normalize the file's quote style first, then retry.",
-                )));
-            }
-            return Err(ToolResult::error(str_replace_not_found_hint(
-                path_str, &content, old_str,
-            )));
-        };
-        let replacement = if fuzzy_match.is_quote_normalized() {
-            Cow::Owned(preserve_quote_style(old_str, fuzzy_match.actual, new_str))
-        } else {
-            Cow::Borrowed(new_str)
-        };
-        (fuzzy_match.actual, replacement, Some(fuzzy_match.strategy))
-    } else {
-        if count > 1 && !replace_all {
-            return Err(ToolResult::error(str_replace_fail(
-                &format!("old_str is ambiguous in {path_str}."),
-                &format!(
-                    "old_str matched {count} times; without replace_all=true the target location is undefined."
-                ),
-                "Add more surrounding context lines to old_str so it matches exactly once, OR pass replace_all=true if you intend to replace every occurrence.",
-            )));
-        }
-        (old_str, Cow::Borrowed(new_str), None)
-    };
-    let mut new_content = if replace_all {
-        content.replace(anchor, &replacement)
-    } else {
-        content.replacen(anchor, &replacement, 1)
-    };
-    if new_content == content {
-        return Err(ToolResult::error(str_replace_fail(
-            "the resolved replacement would not change the file.",
-            "The anchor matched, but the resulting file bytes are identical to the current content.",
-            "Choose a different new_str or skip this edit; no bytes were changed.",
-        )));
-    }
-    if !allow_structural_change {
-        validate_structural_edit(&path, &content, &new_content, anchor, new_str)
-            .map_err(ToolResult::error)?;
-    }
-    new_content = normalize_content_before_write(&path, &new_content);
-    if new_content == content {
-        return Err(ToolResult::error(str_replace_fail(
-            "the normalized replacement would not change the file.",
-            "The anchor matched, but deterministic newline/format normalization returns the exact original bytes.",
-            "Choose a replacement that changes the normalized file, or skip this edit; no bytes were changed.",
-        )));
-    }
-    let success_message = if dry_run {
-        unified_diff(&content, &new_content, path_str)
-    } else if let Some(strategy) = match_strategy {
-        format!("Successfully replaced text in {path_str} (matched via {strategy})")
-    } else if replace_all {
-        format!(
-            "Successfully replaced text in {} ({count} occurrences)",
-            path_str
-        )
-    } else {
-        format!("Successfully replaced text in {}", path_str)
-    };
-    Ok(PreparedStrReplace {
-        path,
-        new_content,
         dry_run,
-        success_message,
-        original_content_hash: Some(original_hash),
-        original_content: content.into_bytes(),
+        allow_structural_change,
     })
 }
 
+/// Validate single-edit parameters without resolving or reading a target.
+pub fn validate_str_replace_args(args: &Value) -> Result<(), ToolResult> {
+    let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
+    replacement_arguments(&args)
+        .map(|_| ())
+        .map_err(ToolResult::with_workspace_mutation_not_applied)
+}
+
+fn replacement_no_effect(message: String) -> ToolResult {
+    caller_correctable_no_effect(message, astra_core::ToolRecoveryAction::CorrectArguments)
+        .with_workspace_mutation_not_applied()
+}
+
+pub fn prepare_str_replace(
+    workspace_root: &Path,
+    args: &Value,
+) -> Result<PreparedStrReplace, ToolResult> {
+    prepare_str_replace_inner(workspace_root, args)
+        .map_err(ToolResult::with_workspace_mutation_not_applied)
+}
+
+fn prepare_str_replace_inner(
+    workspace_root: &Path,
+    args: &Value,
+) -> Result<PreparedStrReplace, ToolResult> {
+    let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
+    let path_str = replacement_arguments(&args)?.path_str;
+    let path = resolve_existing_path_for_tool(workspace_root, path_str, "str_replace")?;
+    let content = std::fs::read_to_string(&path)
+        .map_err(|error| ToolResult::error(format!("Error: Cannot read file: {error}")))?;
+    PreparedStrReplace::from_authorized_preimage(path, content, &args)
+}
+
+impl PreparedStrReplace {
+    /// Builds an edit from a target and UTF-8 preimage captured by the caller's
+    /// workspace authority. `path` must be the authorized bound referent,
+    /// rather than a symlink alias; `args.path` is only a display label.
+    /// This constructor performs no filesystem access; publication still
+    /// verifies that the captured preimage has not changed.
+    pub fn from_authorized_preimage(
+        path: PathBuf,
+        content: String,
+        args: &Value,
+    ) -> Result<Self, ToolResult> {
+        Self::from_authorized_preimage_inner(path, content, args)
+            .map_err(ToolResult::with_workspace_mutation_not_applied)
+    }
+
+    fn from_authorized_preimage_inner(
+        path: PathBuf,
+        content: String,
+        args: &Value,
+    ) -> Result<Self, ToolResult> {
+        let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
+        let args = &args;
+        let ReplacementArguments {
+            path_str,
+            old_str,
+            new_str,
+            replace_all,
+            dry_run,
+            allow_structural_change,
+        } = replacement_arguments(args)?;
+
+        // Credential values are intentionally unavailable in model context.  A
+        // complete non-secret redaction marker is a safe edit reference: resolve
+        // it against the raw file at execution time, and fail closed on forged or
+        // ambiguous references instead of asking the model to repeat the secret.
+        let redaction_reference = astra_text_utils::credential_redaction::resolve_redacted_anchor(
+            &content,
+            old_str,
+            replace_all,
+        )
+        .map_err(ToolResult::error)?;
+        let old_str = redaction_reference.as_deref().unwrap_or(old_str);
+        // Resolve opaque anchors before deciding whether this is a no-op.  A
+        // marker can differ from the source value while still resolving to the
+        // exact new_str (for example when a credential-shaped placeholder was
+        // already applied).  Such a request must not write, journal, advance the
+        // workspace generation, or emit a mutation-success sentinel.
+        if old_str == new_str {
+            return Err(replacement_no_effect(str_replace_fail(
+                "the resolved old_str already equals new_str — no change needed.",
+                "The anchor resolved successfully, but the file already contains the requested replacement.",
+                "Choose a different new_str or skip this edit; no bytes were changed.",
+            )));
+        }
+
+        let count = content.matches(old_str).count();
+        let (anchor, replacement, match_strategy) =
+            resolve_replacement_match(&content, old_str, new_str, path_str, replace_all, None)?;
+        let mut new_content = if replace_all {
+            content.replace(anchor, &replacement)
+        } else {
+            content.replacen(anchor, &replacement, 1)
+        };
+        if new_content == content {
+            return Err(replacement_no_effect(str_replace_fail(
+                "the resolved replacement would not change the file.",
+                "The anchor matched, but the resulting file bytes are identical to the current content.",
+                "Choose a different new_str or skip this edit; no bytes were changed.",
+            )));
+        }
+        if !allow_structural_change {
+            validate_structural_edit(&path, &content, &new_content, anchor, &replacement)
+                .map_err(ToolResult::error)?;
+        }
+        new_content = normalize_content_before_write(&path, &new_content);
+        if new_content == content {
+            return Err(replacement_no_effect(str_replace_fail(
+                "the normalized replacement would not change the file.",
+                "The anchor matched, but deterministic newline/format normalization returns the exact original bytes.",
+                "Choose a replacement that changes the normalized file, or skip this edit; no bytes were changed.",
+            )));
+        }
+        let success_message = if dry_run {
+            unified_diff(&content, &new_content, path_str)
+        } else if let Some(strategy) = match_strategy {
+            format!("Successfully replaced text in {path_str} (matched via {strategy})")
+        } else if replace_all {
+            format!(
+                "Successfully replaced text in {} ({count} occurrences)",
+                path_str
+            )
+        } else {
+            format!("Successfully replaced text in {}", path_str)
+        };
+        let match_start = content
+            .find(anchor)
+            .expect("resolved anchor occurs in preimage");
+        let matched_range = match_start..match_start + anchor.len();
+        let replacement = replacement.into_owned();
+        let publication = PreparedWriteFile::from_authorized_exact_candidate(
+            path,
+            path_str,
+            new_content,
+            Some(content.into_bytes()),
+        );
+        Ok(PreparedStrReplace {
+            publication,
+            matched_range,
+            replacement,
+            match_strategy,
+            occurrence_count: count,
+            dry_run,
+            success_message,
+        })
+    }
+}
 pub fn str_replace(workspace_root: &Path, args: &Value) -> ToolResult {
     let args = match normalize_str_replace_args(args) {
         Ok(args) => args,
@@ -1433,54 +1480,58 @@ pub fn str_replace(workspace_root: &Path, args: &Value) -> ToolResult {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PreparedMultiEdit {
-    path: PathBuf,
-    path_str: String,
-    new_content: String,
+    publication: PreparedWriteFile,
     edit_count: usize,
+    fuzzy_applications: Vec<(usize, &'static str)>,
+    first_edit_start: Option<usize>,
     dry_run: bool,
-    /// SHA-256 hex digest of the file content as it was read.
-    /// Verified before commit to detect concurrent modifications.
-    original_content_hash: Option<String>,
-    original_content: Vec<u8>,
 }
 
 impl PreparedMultiEdit {
+    pub fn fuzzy_applications(&self) -> &[(usize, &'static str)] {
+        &self.fuzzy_applications
+    }
+
+    pub fn first_edit_start(&self) -> Option<usize> {
+        self.first_edit_start
+    }
+
     pub fn path(&self) -> &Path {
-        &self.path
+        self.publication.path()
     }
 
     pub fn new_content_bytes(&self) -> &[u8] {
-        self.new_content.as_bytes()
+        self.publication.content_bytes()
     }
 
     pub fn original_content_bytes(&self) -> &[u8] {
-        &self.original_content
+        self.publication
+            .original_content_bytes()
+            .expect("batch captures an existing target")
     }
 
     pub fn apply(&self) -> ToolResult {
         if self.dry_run {
             return ToolResult::text(format!(
                 "Dry run: {} edit(s) would be applied to {}",
-                self.edit_count, self.path_str
+                self.edit_count, self.publication.path_str
             ));
         }
 
-        match write_file_atomic(
-            &self.path,
-            self.new_content.as_bytes(),
-            self.original_content_hash.as_deref(),
-        ) {
-            Ok(()) => {
-                let message = format!(
-                    "Successfully applied {} edit(s) to {}",
-                    self.edit_count, self.path_str
-                );
-                ToolResult::text(message).with_workspace_mutation_applied()
-            }
-            Err(e) => ToolResult::error(e),
+        let mut result = self.publication.apply();
+        if !result.is_error {
+            result.output = format!(
+                "Successfully applied {} edit(s) to {}",
+                self.edit_count, self.publication.path_str
+            );
         }
+        result
+    }
+
+    pub fn publication(&self) -> &PreparedWriteFile {
+        &self.publication
     }
 }
 
@@ -1496,18 +1547,13 @@ pub fn prepare_multi_edit(
         .map_err(ToolResult::with_workspace_mutation_not_applied)
 }
 
-fn prepare_multi_edit_inner(
-    workspace_root: &Path,
-    args: &Value,
-) -> Result<PreparedMultiEdit, ToolResult> {
-    let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
-    let args = &args;
+fn batch_arguments(args: &Value) -> Result<(&str, &[Value]), ToolResult> {
     let path_str = match args.get("path").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => {
             return Err(ToolResult::error(
-                "Error: Missing 'path' parameter. Retry str_replace batch mode with path and edits.".into(),
-            ));
+        "Error: Missing 'path' parameter. Retry str_replace batch mode with path and edits.".into(),
+        ));
         }
     };
     let edits = match args.get("edits").and_then(|v| v.as_array()) {
@@ -1517,112 +1563,181 @@ fn prepare_multi_edit_inner(
     if edits.is_empty() {
         return Err(ToolResult::error("Error: 'edits' array is empty".into()));
     }
-    let dry_run = args
-        .get("dry_run")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let allow_structural_change = args
-        .get("allow_structural_change")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    Ok((path_str, edits))
+}
 
+fn prepare_multi_edit_inner(
+    workspace_root: &Path,
+    args: &Value,
+) -> Result<PreparedMultiEdit, ToolResult> {
+    let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
+    let path_str = batch_arguments(&args)?.0;
     let path = resolve_existing_path_for_tool(workspace_root, path_str, "multi_edit")?;
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => return Err(ToolResult::error(format!("Error: Cannot read file: {e}"))),
-    };
+    let content = std::fs::read_to_string(&path)
+        .map_err(|error| ToolResult::error(format!("Error: Cannot read file: {error}")))?;
+    PreparedMultiEdit::from_authorized_preimage(path, content, &args)
+}
 
-    let original_content = content;
-    let mut working = original_content.clone();
-    for (i, edit) in edits.iter().enumerate() {
-        let old_str = match edit.get("old_str").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => {
-                return Err(ToolResult::error(format!(
-                    "Error: edit[{i}] missing 'old_str'"
-                )));
-            }
-        };
-        let new_str = match edit.get("new_str").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => {
-                return Err(ToolResult::error(format!(
-                    "Error: edit[{i}] missing 'new_str'"
-                )));
-            }
-        };
-        astra_text_utils::credential_redaction::reject_redaction_markers_in_replacement(new_str)
+impl PreparedMultiEdit {
+    /// Builds a batch from a caller-authorized target and captured preimage.
+    /// `path` must be the authorized bound referent; `args.path` is only a
+    /// display label. No path resolution or file access occurs until publication.
+    pub fn from_authorized_preimage(
+        path: PathBuf,
+        content: String,
+        args: &Value,
+    ) -> Result<Self, ToolResult> {
+        Self::from_authorized_preimage_inner(path, content, args)
+            .map_err(ToolResult::with_workspace_mutation_not_applied)
+    }
+
+    fn from_authorized_preimage_inner(
+        path: PathBuf,
+        content: String,
+        args: &Value,
+    ) -> Result<Self, ToolResult> {
+        let args = normalize_str_replace_args(args).map_err(ToolResult::error)?;
+        let args = &args;
+        let (path_str, edits) = batch_arguments(args)?;
+        let dry_run = args
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let allow_structural_change = args
+            .get("allow_structural_change")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let original_content = content;
+        let mut working = original_content.clone();
+        let mut fuzzy_applications = Vec::new();
+        let mut first_edit_start = None;
+        let mut fuzzy_regions: Vec<std::ops::Range<usize>> = Vec::new();
+        for (i, edit) in edits.iter().enumerate() {
+            let old_str = match edit.get("old_str").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => {
+                    return Err(ToolResult::error(format!(
+                        "Error: edit[{i}] missing 'old_str'"
+                    )));
+                }
+            };
+            let new_str = match edit.get("new_str").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => {
+                    return Err(ToolResult::error(format!(
+                        "Error: edit[{i}] missing 'new_str'"
+                    )));
+                }
+            };
+            astra_text_utils::credential_redaction::reject_redaction_markers_in_replacement(
+                new_str,
+            )
             .map_err(ToolResult::error)?;
-        validate_str_replace_anchor(&format!("edit[{i}]"), old_str).map_err(ToolResult::error)?;
-        let redaction_reference = astra_text_utils::credential_redaction::resolve_redacted_anchor(
-            &working, old_str, false,
-        )
-        .map_err(ToolResult::error)?;
-        let old_str = redaction_reference.as_deref().unwrap_or(old_str);
-        if old_str == new_str {
-            return Err(caller_correctable_no_effect(
-                str_replace_fail(
-                    &format!("edit[{i}] is a no-op."),
-                    "old_str and new_str are byte-for-byte identical.",
-                    "Remove this edit, or fix new_str to reflect the intended change.",
-                ),
-                astra_core::ToolRecoveryAction::CorrectArguments,
-            ));
-        }
-        if let Some(err) =
-            check_anchor_vs_replacement_size(&format!("edit[{i}]"), old_str, new_str, false)
-        {
-            return Err(ToolResult::error(err));
-        }
-        let count = working.matches(old_str).count();
-        if count == 0 {
-            return Err(caller_correctable_no_effect(
-                str_replace_not_found_hint_for_edit(path_str, &working, old_str, i),
-                astra_core::ToolRecoveryAction::ReadTargetedRange,
-            ));
-        }
-        if count > 1 {
-            return Err(caller_correctable_no_effect(
-                str_replace_fail(
-                    &format!("edit[{i}] old_str is ambiguous in {path_str}."),
-                    &format!(
-                        "old_str matched {count} times; batch edits require exactly one match per edit."
-                    ),
-                    "Extend old_str with more surrounding context lines so it matches exactly once.",
-                ),
-                astra_core::ToolRecoveryAction::CorrectArguments,
-            ));
-        }
-        let next = working.replacen(old_str, new_str, 1);
-        if !allow_structural_change {
-            validate_structural_edit(&path, &working, &next, old_str, new_str)
+            validate_str_replace_anchor(&format!("edit[{i}]"), old_str)
                 .map_err(ToolResult::error)?;
+            let redaction_reference =
+                astra_text_utils::credential_redaction::resolve_redacted_anchor(
+                    &working, old_str, false,
+                )
+                .map_err(ToolResult::error)?;
+            let old_str = redaction_reference.as_deref().unwrap_or(old_str);
+            if old_str == new_str {
+                return Err(caller_correctable_no_effect(
+                    str_replace_fail(
+                        &format!("edit[{i}] is a no-op."),
+                        "old_str and new_str are byte-for-byte identical.",
+                        "Remove this edit, or fix new_str to reflect the intended change.",
+                    ),
+                    astra_core::ToolRecoveryAction::CorrectArguments,
+                ));
+            }
+            if let Some(err) =
+                check_anchor_vs_replacement_size(&format!("edit[{i}]"), old_str, new_str, false)
+            {
+                return Err(ToolResult::error(err));
+            }
+            let (anchor, replacement, strategy) =
+                resolve_replacement_match(&working, old_str, new_str, path_str, false, Some(i))?;
+            let start = working
+                .find(anchor)
+                .expect("resolved anchor occurs in current buffer");
+            let end = start + anchor.len();
+            if i == 0 {
+                first_edit_start = Some(start);
+            }
+            if let Some(strategy) = strategy {
+                fuzzy_applications.push((i, strategy));
+            }
+            if strategy.is_some()
+                && fuzzy_regions
+                    .iter()
+                    .any(|region| start < region.end && region.start < end)
+            {
+                return Err(caller_correctable_no_effect(
+                    format!(
+                        "Error: edit[{i}] overlaps an earlier fuzzy replacement; use the exact updated text as its anchor."
+                    ),
+                    astra_core::ToolRecoveryAction::CorrectArguments,
+                ));
+            }
+            let next = working.replacen(anchor, &replacement, 1);
+            if next == working {
+                return Err(caller_correctable_no_effect(
+                    format!("Error: edit[{i}] resolved replacement would not change the file."),
+                    astra_core::ToolRecoveryAction::CorrectArguments,
+                ));
+            }
+            // Keep prior fuzzy regions in coordinates of the next buffer.
+            // Exact sequential edits remain legal, including edits of earlier results.
+            let map_boundary = |position: usize, right: bool| {
+                if position >= end {
+                    start + replacement.len() + (position - end)
+                } else if position > start {
+                    start + if right { replacement.len() } else { 0 }
+                } else {
+                    position
+                }
+            };
+            for region in &mut fuzzy_regions {
+                region.start = map_boundary(region.start, false);
+                region.end = map_boundary(region.end, true);
+            }
+            if strategy.is_some() {
+                fuzzy_regions.push(start..start + replacement.len());
+            }
+            if !allow_structural_change {
+                validate_structural_edit(&path, &working, &next, anchor, &replacement)
+                    .map_err(ToolResult::error)?;
+            }
+            working = next;
         }
-        working = next;
-    }
-    working = normalize_content_before_write(&path, &working);
-    if working == original_content {
-        return Err(caller_correctable_no_effect(
-            str_replace_fail(
-                "the normalized batch replacement would not change the file.",
-                "The edits cancel out after deterministic newline normalization, so the final bytes equal the original.",
-                "Change or remove the no-op edit; no bytes were changed.",
-            ),
-            astra_core::ToolRecoveryAction::CorrectArguments,
-        ));
-    }
+        working = normalize_content_before_write(&path, &working);
+        if working == original_content {
+            return Err(caller_correctable_no_effect(
+                str_replace_fail(
+                    "the normalized batch replacement would not change the file.",
+                    "The edits cancel out after deterministic newline normalization, so the final bytes equal the original.",
+                    "Change or remove the no-op edit; no bytes were changed.",
+                ),
+                astra_core::ToolRecoveryAction::CorrectArguments,
+            ));
+        }
 
-    let original_content_hash = Some(content_hash(&original_content));
-
-    Ok(PreparedMultiEdit {
-        path,
-        path_str: path_str.to_string(),
-        new_content: working,
-        edit_count: edits.len(),
-        dry_run,
-        original_content_hash,
-        original_content: original_content.into_bytes(),
-    })
+        let publication = PreparedWriteFile::from_authorized_exact_candidate(
+            path,
+            path_str,
+            working,
+            Some(original_content.into_bytes()),
+        );
+        Ok(PreparedMultiEdit {
+            publication,
+            edit_count: edits.len(),
+            fuzzy_applications,
+            first_edit_start,
+            dry_run,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1807,6 +1922,33 @@ pub struct PreparedMultiPathEdit {
 }
 
 impl PreparedMultiPathEdit {
+    /// Assemble candidates captured by one workspace authority, without I/O.
+    /// Aliases must not publish competing candidates to the same bound target.
+    pub fn from_authorized_edits(prepared: Vec<PreparedMultiEdit>) -> Result<Self, ToolResult> {
+        if prepared.is_empty() {
+            return Err(replacement_no_effect(
+                "Error: batch contains no file edits".into(),
+            ));
+        }
+        let mut targets = std::collections::HashSet::new();
+        let dry_run = prepared[0].dry_run;
+        for edit in &prepared {
+            if !targets.insert(edit.path().to_path_buf()) {
+                return Err(replacement_no_effect("Error: multiple batch paths refer to the same bound target; group its edits under one path.".into()));
+            }
+            if edit.dry_run != dry_run {
+                return Err(replacement_no_effect(
+                    "Error: batch candidates disagree on dry_run".into(),
+                ));
+            }
+        }
+        Ok(Self {
+            prepared,
+            #[cfg(test)]
+            rename_failure_index: None,
+        })
+    }
+
     pub fn prepared_edits(&self) -> &[PreparedMultiEdit] {
         &self.prepared
     }
@@ -1826,7 +1968,7 @@ impl PreparedMultiPathEdit {
                 .map(|prepared| {
                     format!(
                         "Dry run: {} edit(s) would be applied to {}",
-                        prepared.edit_count, prepared.path_str
+                        prepared.edit_count, prepared.publication.path_str
                     )
                 })
                 .collect();
@@ -1852,7 +1994,7 @@ impl PreparedMultiPathEdit {
                 // Dry-run batches are handled before reaching this point.
                 continue;
             }
-            let staging = match stage_file(&prepared.path, prepared.new_content.as_bytes()) {
+            let staging = match stage_file(prepared.path(), prepared.new_content_bytes()) {
                 Ok(staging) => staging,
                 Err(error) => return ToolResult::error(error),
             };
@@ -1864,8 +2006,8 @@ impl PreparedMultiPathEdit {
         // multi-file commit behind.
         for (_, prepared) in &staging_entries {
             if let Err(error) = verify_expected_original_hash(
-                &prepared.path,
-                prepared.original_content_hash.as_deref(),
+                prepared.path(),
+                prepared.publication.original_content_hash.as_deref(),
             ) {
                 return ToolResult::error(error);
             }
@@ -1880,7 +2022,7 @@ impl PreparedMultiPathEdit {
                 let committed_paths = committed_paths.clone();
                 let error = ToolResult::error(format!(
                     "Error: injected multi-path commit failure for {}",
-                    prepared.path_str
+                    prepared.publication.path_str
                 ));
                 return if committed_paths.is_empty() {
                     error
@@ -1890,8 +2032,8 @@ impl PreparedMultiPathEdit {
             }
             if let Err(error) = publish_staged_file(
                 staging,
-                &prepared.path,
-                prepared.original_content_hash.as_deref(),
+                prepared.path(),
+                prepared.publication.original_content_hash.as_deref(),
             ) {
                 let error = ToolResult::error(error);
                 return if committed_paths.is_empty() {
@@ -1900,11 +2042,11 @@ impl PreparedMultiPathEdit {
                     error.with_workspace_mutation_partial(committed_paths)
                 };
             }
-            committed_paths.push(prepared.path.display().to_string());
+            committed_paths.push(prepared.path().display().to_string());
             on_committed(prepared);
             let message = format!(
                 "Successfully applied {} edit(s) to {}",
-                prepared.edit_count, prepared.path_str
+                prepared.edit_count, prepared.publication.path_str
             );
             messages.push(message);
         }
@@ -2008,11 +2150,7 @@ pub fn prepare_multi_path_edit(
         prepared.push(prepare_multi_edit(workspace_root, &Value::Object(scoped))?);
     }
 
-    Ok(PreparedMultiPathEdit {
-        prepared,
-        #[cfg(test)]
-        rename_failure_index: None,
-    })
+    PreparedMultiPathEdit::from_authorized_edits(prepared)
 }
 
 pub fn normalize_str_replace_args(args: &Value) -> Result<Value, String> {
@@ -2088,6 +2226,7 @@ fn normalize_edit_array(value: &Value) -> Result<Value, String> {
 /// Fast SHA-256 hex digest for concurrent-modification detection.
 /// Not security-critical — a content change within the same turn is
 /// overwhelmingly a real race, not a crafted collision.
+#[cfg(test)]
 fn content_hash(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
@@ -2578,6 +2717,209 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn prepared_existing_publications_do_not_recreate_removed_parent_directories() {
+        let directory = TempDir::new().unwrap();
+        let parent = directory.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("f.txt");
+        std::fs::write(&path, "before\n").unwrap();
+        let single = prepare_str_replace(
+            directory.path(),
+            &serde_json::json!({
+                "path":"parent/f.txt", "old_str":"before", "new_str":"after"
+            }),
+        )
+        .unwrap();
+        let batch = prepare_multi_edit(
+            directory.path(),
+            &serde_json::json!({
+                "path":"parent/f.txt", "edits":[{"old_str":"before", "new_str":"after"}]
+            }),
+        )
+        .unwrap();
+        let write = prepare_write_file(
+            directory.path(),
+            &serde_json::json!({
+                "path":"parent/f.txt", "content":"after\n"
+            }),
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&parent).unwrap();
+        for result in [single.apply(), batch.apply(), write.apply()] {
+            assert!(result.is_error, "{}", result.output);
+            assert!(!parent.exists());
+        }
+    }
+
+    #[test]
+    fn batch_ambiguous_anchor_preserves_caller_recovery_facts() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("f.txt");
+        std::fs::write(&path, "same same\n").unwrap();
+        let result = str_replace(
+            directory.path(),
+            &serde_json::json!({
+                "path":"f.txt", "edits":[{"old_str":"same", "new_str":"changed"}]
+            }),
+        );
+        assert!(result.is_error);
+        let metadata = result.metadata.unwrap();
+        let evidence: astra_core::ToolFailureEvidence =
+            serde_json::from_value(metadata["recovery_evidence"].clone()).unwrap();
+        assert_eq!(
+            evidence.recovery_actions,
+            vec![astra_core::ToolRecoveryAction::CorrectArguments]
+        );
+        assert_eq!(metadata["workspace_mutation_applied"], false);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "same same\n");
+    }
+
+    #[test]
+    fn batch_fuzzy_regions_follow_length_changes_and_allow_independent_edits() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("f.txt");
+        let before =
+            "prefix-original\nfn f() {\n    let value = 1;\n}\nfn g() {\n    let value = 1;\n}\n";
+        let f_anchor = "fn f() {\n  let value = 1;\n}";
+        let f_replacement = "fn f() {\n  let value = 2;\n}";
+        for prefix in ["x", "prefix-expanded-with-more-bytes-than-original"] {
+            for stale in [false, true] {
+                std::fs::write(&path, before).unwrap();
+                let last = if stale {
+                    serde_json::json!({"old_str":f_anchor, "new_str":"fn f() {\n  let value = 3;\n}"})
+                } else {
+                    serde_json::json!({"old_str":"fn g() {\n  let value = 1;\n}", "new_str":"fn g() {\n  let value = 3;\n}"})
+                };
+                let result = str_replace(
+                    directory.path(),
+                    &serde_json::json!({
+                        "path":"f.txt", "edits":[
+                            {"old_str":f_anchor, "new_str":f_replacement},
+                            {"old_str":"prefix-original", "new_str":prefix},
+                            last
+                        ]
+                    }),
+                );
+                let actual = std::fs::read_to_string(&path).unwrap();
+                if stale {
+                    assert!(result.is_error, "{}", result.output);
+                    assert!(result.output.contains("overlaps"), "{}", result.output);
+                    assert_eq!(actual, before);
+                } else {
+                    assert!(!result.is_error, "{}", result.output);
+                    assert_eq!(
+                        actual,
+                        format!("{prefix}\n{f_replacement}\nfn g() {{\n  let value = 3;\n}}\n")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batch_rejects_stale_fuzzy_reuse_without_publishing_first_edit() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("f.txt");
+        let before = "fn f() {\n    let value = 1;\n}\n";
+        std::fs::write(&path, before).unwrap();
+        let anchor = "fn f() {\n  let value = 1;\n}";
+        let result = str_replace(
+            directory.path(),
+            &serde_json::json!({
+                "path":"f.txt", "edits":[
+                    {"old_str":anchor, "new_str":"fn f() {\n  let value = 2;\n}"},
+                    {"old_str":anchor, "new_str":"fn f() {\n  let value = 3;\n}"}
+                ]
+            }),
+        );
+        assert!(result.is_error, "{}", result.output);
+        assert!(result.output.contains("overlaps"), "{}", result.output);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+    }
+
+    #[test]
+    fn replacement_shapes_reject_ambiguous_quote_normalized_anchors_without_commit() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("f.txt");
+        let before = "begin\n“a”\nend\nbegin\n“a“\nend\n";
+        std::fs::write(&path, before).unwrap();
+        let edit =
+            serde_json::json!({"old_str":"begin\n\"a\"\nend", "new_str":"begin\n\"b\"\nend"});
+        for arguments in [
+            serde_json::json!({"path":"f.txt", "old_str":edit["old_str"], "new_str":edit["new_str"]}),
+            serde_json::json!({"path":"f.txt", "edits":[edit]}),
+        ] {
+            let result = str_replace(directory.path(), &arguments);
+            assert!(result.is_error, "{}", result.output);
+            assert!(result.output.contains("2 times"), "{}", result.output);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn invalid_edit_arguments_are_rejected_before_target_resolution() {
+        let directory = TempDir::new().unwrap();
+        let single = prepare_str_replace(
+            directory.path(),
+            &serde_json::json!({
+                "path":"missing.txt", "old_str":"", "new_str":"replacement"
+            }),
+        )
+        .unwrap_err();
+        assert!(single.output.contains("old_str"), "{}", single.output);
+        let batch = prepare_multi_edit(
+            directory.path(),
+            &serde_json::json!({
+                "path":"missing.txt", "edits":[]
+            }),
+        )
+        .unwrap_err();
+        assert!(batch.output.contains("array is empty"), "{}", batch.output);
+        assert!(!directory.path().join("missing.txt").exists());
+    }
+
+    #[test]
+    fn single_and_batch_quote_normalized_edits_preserve_identical_bytes() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("quotes.txt");
+        let before = "say “hello”\n".to_owned();
+        let single = PreparedStrReplace::from_authorized_preimage(
+            path.clone(), before.clone(),
+            &serde_json::json!({"path":"quotes.txt", "old_str":"say \"hello\"", "new_str":"say \"bye\""}),
+        ).unwrap();
+        let batch = PreparedMultiEdit::from_authorized_preimage(
+            path, before,
+            &serde_json::json!({"path":"quotes.txt", "edits":[{"old_str":"say \"hello\"", "new_str":"say \"bye\""}]}),
+        ).unwrap();
+        assert_eq!(single.new_content_bytes(), "say “bye”\n".as_bytes());
+        assert_eq!(batch.new_content_bytes(), single.new_content_bytes());
+    }
+
+    #[test]
+    fn authorized_edit_preimages_do_not_read_or_overwrite_changed_targets() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("captured.txt");
+        let single = PreparedStrReplace::from_authorized_preimage(
+            path.clone(),
+            "before\n".into(),
+            &serde_json::json!({"path":"captured.txt", "old_str":"before", "new_str":"after"}),
+        )
+        .unwrap();
+        let batch = PreparedMultiEdit::from_authorized_preimage(
+            path.clone(),
+            "before\n".into(),
+            &serde_json::json!({"path":"captured.txt", "edits":[{"old_str":"before", "new_str":"after"}]}),
+        ).unwrap();
+        assert!(!path.exists());
+        assert_eq!(single.new_content_bytes(), batch.new_content_bytes());
+        std::fs::write(&path, "concurrent\n").unwrap();
+        assert!(single.apply().is_error);
+        assert!(batch.apply().is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "concurrent\n");
+    }
+
+    #[test]
     fn format_file_size_mb_shows_fractional_for_small_files() {
         // 500 KB → should show "0.5 MB", NOT "0 MB" (integer division bug)
         assert_eq!(format_file_size_mb(500 * 1024), "0.5 MB");
@@ -2731,25 +3073,78 @@ mod tests {
     }
 
     #[test]
-    fn read_file_outline_without_definitions_returns_fallback_message() {
+    fn read_file_outline_uses_language_grammar_and_source_coordinates() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join("notes.txt"),
-            "plain text\nstill plain text\n",
-        )
-        .unwrap();
+        for (name, source, signature) in [
+            (
+                "lib.rs",
+                "// fn invented() {}\n\npub fn actual() {}\n",
+                "pub fn actual",
+            ),
+            (
+                "types.pyi",
+                "# def invented(): pass\n\ndef actual(key=\"AKIAIOSFODNN7EXAMPLE\"): ...\n",
+                "def actual",
+            ),
+            (
+                "module.mjs",
+                "// function invented() {}\n\nexport function actual() {}\n",
+                "function actual",
+            ),
+            (
+                "module.mts",
+                "// function invented() {}\n\nexport function actual(): void {}\n",
+                "function actual",
+            ),
+        ] {
+            std::fs::write(tmp.path().join(name), source).unwrap();
+            let result = read_file(
+                tmp.path(),
+                &serde_json::json!({"path": name, "outline": true}),
+            );
+            assert!(!result.is_error, "{}", result.output);
+            assert!(result.output.contains(signature), "{}", result.output);
+            assert!(result.output.contains("3:"), "{}", result.output);
+            assert!(!result.output.contains("invented"), "{}", result.output);
+            assert!(
+                !result.output.contains("AKIAIOSFODNN7EXAMPLE"),
+                "{}",
+                result.output
+            );
+            if name == "types.pyi" {
+                assert!(
+                    result.output.contains("[REDACTED:AWS_ACCESS_KEY]"),
+                    "{}",
+                    result.output
+                );
+            }
+        }
+    }
 
-        let result = read_file(
-            tmp.path(),
-            &serde_json::json!({"path": "notes.txt", "outline": true}),
-        );
-
-        assert!(!result.is_error);
-        assert!(
-            result.output.contains("no definitions found"),
-            "got: {}",
-            result.output
-        );
+    #[test]
+    fn read_file_outline_without_definitions_reports_no_definitions() {
+        let tmp = TempDir::new().unwrap();
+        for (name, source) in [
+            ("notes.txt", "fn invented() {}\nclass Imaginary {}\n"),
+            ("lib.rs", "// fn invented() {}\n/* struct Imaginary; */\n"),
+            ("source.kt", "class Imaginary {}\n"),
+            ("source.scala", "class Imaginary {}\n"),
+            ("source.cs", "class Imaginary {}\n"),
+        ] {
+            std::fs::write(tmp.path().join(name), source).unwrap();
+            let result = read_file(
+                tmp.path(),
+                &serde_json::json!({"path": name, "outline": true}),
+            );
+            assert!(!result.is_error);
+            assert!(
+                result.output.contains("no definitions found"),
+                "{}",
+                result.output
+            );
+            assert!(!result.output.contains("Imaginary"));
+            assert!(!result.output.contains("invented"));
+        }
     }
 
     #[test]
@@ -2832,60 +3227,6 @@ mod tests {
                 astra_core::ToolRecoveryAction::SearchBeforeRead,
                 astra_core::ToolRecoveryAction::NarrowScope,
             ]
-        );
-    }
-
-    #[test]
-    fn read_last_n_lines_preserves_multibyte_characters() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("utf8-tail.txt");
-
-        let prefix = "头\n";
-        let body = "你".repeat(4000);
-        let mut pad = String::new();
-        let suffix = loop {
-            let candidate = format!("\npad{pad}\n倒数第二行\n最终行");
-            let total_len = prefix.len() + body.len() + candidate.len();
-            let seek_pos = total_len.saturating_sub(8192);
-            let body_start = prefix.len();
-            let body_end = body_start + body.len();
-            if total_len > 8192
-                && seek_pos > body_start
-                && seek_pos < body_end
-                && !(seek_pos - body_start).is_multiple_of(3)
-            {
-                break candidate;
-            }
-            pad.push('x');
-        };
-
-        std::fs::write(&path, format!("{prefix}{body}{suffix}")).unwrap();
-
-        let lines = read_last_n_lines(&path, 2).unwrap();
-        assert_eq!(lines, vec!["倒数第二行".to_string(), "最终行".to_string()]);
-    }
-
-    #[test]
-    fn read_last_n_lines_few_lines_avoids_mid_utf8_start() {
-        // Edge case: file has fewer lines than n, so start == 0 but seek_pos
-        // may land mid-UTF-8. Verify the safe_start scan produces valid output.
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("few-cjk.txt");
-        // Two lines of CJK text — requesting 10 last lines (more than exist).
-        std::fs::write(&path, "第一行内容\n第二行内容").unwrap();
-        let lines = read_last_n_lines(&path, 10).unwrap();
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "第一行内容");
-        assert_eq!(lines[1], "第二行内容");
-        // No `` replacement characters from mid-UTF-8 boundary corruption.
-        assert!(!lines.iter().any(|l| l.contains('\u{FFFD}')));
-    }
-
-    #[test]
-    fn render_outline_returns_none_when_no_definitions() {
-        assert_eq!(
-            render_outline(Path::new("notes.txt"), "plain text\n", 1),
-            None
         );
     }
 
@@ -4641,7 +4982,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_edit_missing_anchor_reports_structured_near_match_hint() {
+    fn multi_edit_resolves_unique_whitespace_anchor() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("f.txt"),
@@ -4657,21 +4998,10 @@ mod tests {
         });
 
         let result = multi_edit(tmp.path(), &args);
-        assert!(result.is_error);
-        assert!(
-            result.output.contains("edit[0] old_str not found"),
-            "got: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("whitespace_normalized_match: true"),
-            "got: {}",
-            result.output
-        );
-        assert!(
-            result.output.contains("first_line_at: L1"),
-            "got: {}",
-            result.output
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
+            "fn hello() {}\n"
         );
     }
 

@@ -139,9 +139,8 @@ async fn unsupported_session_state_actions_are_rejected_on_cli_edge_executor() {
     }
 }
 
-/// Standalone `delegate` is not a CLI executor tool. Server/runtime
-/// interception must happen before local tool execution; if it reaches
-/// this executor, it must fail closed.
+/// Standalone `delegate` is not a built-in CLI executor tool. An undeclared
+/// tool must fail closed rather than return an execution acknowledgment.
 #[tokio::test]
 async fn execute_delegate_tool_does_not_return_fake_acknowledgment() {
     let executor = test_executor();
@@ -157,7 +156,11 @@ async fn execute_delegate_tool_does_not_return_fake_acknowledgment() {
 async fn execute_with_metadata_marks_structured_str_replace_failure_as_error() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("f.txt"), "let current = 1;\n").unwrap();
-    let executor = ToolExecutor::new(temp.path().to_path_buf());
+    let session = std::sync::Arc::new(std::sync::RwLock::new(
+        astra_runtime::observability::ObservabilitySession::new_simple("failed-edit"),
+    ));
+    let executor =
+        ToolExecutor::new(temp.path().to_path_buf()).with_observability_session(session.clone());
 
     let read = executor
         .execute("read_file", &json!({"path": "f.txt"}))
@@ -185,6 +188,18 @@ async fn execute_with_metadata_marks_structured_str_replace_failure_as_error() {
         astra_turn_core::tool_result_semantics::cloud_tool_result_status_label(&outcome.output),
         "failed"
     );
+    let events = &session.read().unwrap().fuzzy_match_events;
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].outcome,
+        astra_runtime::observability::FuzzyMatchOutcome::NotFound
+    );
+    assert_eq!(events[0].strategy, "none");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("f.txt")).unwrap(),
+        "let current = 1;\n"
+    );
+    assert_eq!(executor.file_journal.lock().unwrap().entries().count(), 0);
 }
 
 #[tokio::test]

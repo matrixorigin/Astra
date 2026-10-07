@@ -356,7 +356,7 @@ mod tests {
         let mut out = Vec::new();
         write_history_line_content(&mut out, &line, false).expect("history row writes");
         let rendered = String::from_utf8(out).expect("history bytes are UTF-8");
-        let plain = crate::cli::theme::strip_ansi(&rendered);
+        let plain = crate::cli::terminal_region::strip_ansi_codes(&rendered);
         assert_eq!(plain, "  └    1 + changed");
         assert!(
             rendered.matches("\x1b[K").count() >= 2,
@@ -389,7 +389,7 @@ mod tests {
         let mut out = Vec::new();
         write_history_line_content(&mut out, &line, false).expect("blank diff row writes");
         let rendered = String::from_utf8(out).expect("history bytes are UTF-8");
-        let plain = crate::cli::theme::strip_ansi(&rendered);
+        let plain = crate::cli::terminal_region::strip_ansi_codes(&rendered);
 
         assert_eq!(plain, "       2 + ");
         assert!(
@@ -397,7 +397,7 @@ mod tests {
             "one diff item must not inject an extra row"
         );
         assert!(
-            UnicodeWidthStr::width(plain.as_ref()) < 40,
+            UnicodeWidthStr::width(plain.as_str()) < 40,
             "semantic content must not be padded to the physical edge: {plain:?}"
         );
     }

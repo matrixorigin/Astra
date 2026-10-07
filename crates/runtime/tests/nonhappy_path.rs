@@ -1,49 +1,5 @@
 //! Non-happy-path integration tests proving control mechanisms actually work.
 
-mod circuit_breaker_integration {
-    use astra_turn_core::circuit_breaker::CircuitBreaker;
-    use std::time::Duration;
-
-    /// Proves CB fast-rejects after threshold failures (as wired in forward())
-    #[test]
-    fn fast_reject_prevents_timeout_cascade() {
-        let cb = CircuitBreaker::new(3, Duration::from_secs(30), 2);
-
-        // Simulate 3 bridge failures
-        for _ in 0..3 {
-            assert!(cb.allow_request());
-            cb.record_failure();
-        }
-
-        // Now CB is open — requests should be rejected instantly
-        assert!(!cb.allow_request(), "CB should fast-reject after threshold");
-        assert_eq!(cb.state(), "open");
-
-        // Key proof: without CB, request would wait 30s timeout.
-        // With CB, it returns immediately.
-    }
-
-    /// Proves CB recovers after timeout
-    #[test]
-    fn auto_recovery_after_timeout() {
-        let cb = CircuitBreaker::new(1, Duration::from_millis(10), 1);
-        cb.record_failure();
-        assert_eq!(cb.state(), "open");
-
-        std::thread::sleep(Duration::from_millis(20));
-
-        assert!(cb.allow_request(), "Should allow after recovery timeout");
-        assert_eq!(cb.state(), "half_open");
-
-        cb.record_success();
-        assert_eq!(
-            cb.state(),
-            "closed",
-            "Should close after success in half_open"
-        );
-    }
-}
-
 mod stall_detection {
     use astra_turn_core::stall::{SERVER_STALL_WINDOW, StallSignature, detect_server_stall};
     use std::collections::BTreeSet;

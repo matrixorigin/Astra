@@ -885,7 +885,6 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
         // facts in the shared round snapshot or add them to primary usage.
         snapshot.judgment_usage = None;
         snapshot.semantic_judgments = None;
-        snapshot.tool_result_judgments = None;
         if astra_services::semantic_judgment_observation::semantic_judgment_facet_enabled(
             request.facet,
         ) {
@@ -894,7 +893,7 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
                 request.depth,
                 astra_core::ObservationDepth::Diagnostic | astra_core::ObservationDepth::Forensic
             );
-            let (usage_capture, mut semantics, tool_result_judgments) = tokio::join!(
+            let (usage_capture, mut semantics) = tokio::join!(
                 async {
                     if matches!(
                         request.source_policy,
@@ -918,40 +917,6 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
                     request.source_policy,
                     request.depth,
                 ),
-                async {
-                    if !astra_services::tool_result_selection_observation::historical_tool_result_judgment_facet_enabled(request.facet) {
-                        return astra_services::tool_result_selection_observation::ToolResultJudgmentView::default();
-                    }
-                    if matches!(
-                        request.source_policy,
-                        astra_core::SourcePolicy::LiveOnly | astra_core::SourcePolicy::LocalOnly
-                    ) {
-                        return astra_services::tool_result_selection_observation::ToolResultJudgmentView::unavailable(
-                            astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::SourceExcluded,
-                        );
-                    }
-                    let Some(pool) = context.context_manifest_pool.as_ref() else {
-                        return astra_services::tool_result_selection_observation::ToolResultJudgmentView::unavailable(
-                            astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::SourceUnavailable,
-                        );
-                    };
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        astra_services::tool_result_selection_observation::load_tool_result_judgment_view(
-                            pool,
-                            &context.user_id,
-                            &context.session_id,
-                            128,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(view)) => view,
-                        _ => astra_services::tool_result_selection_observation::ToolResultJudgmentView::unavailable(
-                            astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::SourceUnavailable,
-                        ),
-                    }
-                }
             );
             let usage = match &usage_capture {
                 Ok(capture) => JudgmentUsageSnapshot::from_ledger(capture.facts.clone()),
@@ -978,9 +943,6 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
             }
             snapshot.judgment_usage = Some(usage);
             snapshot.semantic_judgments = Some(semantics);
-            if astra_services::tool_result_selection_observation::historical_tool_result_judgment_facet_enabled(request.facet) {
-                snapshot.tool_result_judgments = Some(tool_result_judgments);
-            }
         }
         let run_id = args
             .get("_run_id")
@@ -1545,6 +1507,7 @@ impl ToolHandler<RuntimeToolExecutor> for MoQueryToolHandler {
             context.database_snapshot_journal.as_ref(),
             args,
             context.journal_turn_index.load(Ordering::Relaxed),
+            cancel_token,
         )
     }
 }
@@ -1749,7 +1712,7 @@ mod tests {
             assert!(report["semantic_judgments"].get("model_adoption").is_none());
             assert!(
                 report.get("tool_result_judgments").is_none(),
-                "overview must omit unrequested historical selector evidence"
+                "retired selector evidence must not be projected"
             );
 
             let trace = IntrospectToolHandler
@@ -1765,18 +1728,7 @@ mod tests {
             let trace_report: Value = serde_json::from_str(&trace.output).unwrap();
             assert_eq!(trace_report["judgment_usage"]["coverage"], expected);
             assert_eq!(trace_report["semantic_judgments"]["coverage"], expected);
-            assert_eq!(
-                trace_report["tool_result_judgments"]["evaluation_coverage"],
-                if policy == "auto" {
-                    "source_unavailable"
-                } else {
-                    "source_excluded"
-                }
-            );
-            assert_eq!(
-                trace_report["tool_result_judgments"]["application_coverage"],
-                trace_report["tool_result_judgments"]["evaluation_coverage"]
-            );
+            assert!(trace_report.get("tool_result_judgments").is_none());
         }
     }
 

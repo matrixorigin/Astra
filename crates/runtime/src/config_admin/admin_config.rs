@@ -333,7 +333,6 @@ mod tests {
                     api_key: self.key.clone(),
                     base_url: "http://unused.invalid".into(),
                     provider: "typesafe".into(),
-                    fallback_chain: vec![],
                     tags: vec![],
                     request_body_overrides: None,
                     fixed_temperature: None,
