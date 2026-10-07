@@ -910,87 +910,6 @@ impl BackgroundTaskRegistry {
         requested
     }
 
-    /// Read output from a task's stdout file. Returns (content, total_bytes).
-    pub fn get_output(
-        &self,
-        id: &str,
-        tail_bytes: usize,
-    ) -> Result<(String, u64), BackgroundTaskError> {
-        let handle = self
-            .tasks
-            .get(id)
-            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
-        if handle.status().is_terminal() && !handle.stdout_path.exists() {
-            return Err(BackgroundTaskError::output_artifact_missing(
-                id,
-                &handle.stdout_path,
-            ));
-        }
-        read_tail_str(
-            &handle.stdout_path,
-            tail_bytes,
-            handle.status().is_terminal(),
-        )
-        .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
-    }
-
-    /// Read output from a task's stdout file starting at `offset`.
-    /// Returns `(content, end_offset, total_bytes, total_lines)`.
-    pub fn get_output_since(
-        &self,
-        id: &str,
-        offset: u64,
-        max_bytes: usize,
-    ) -> Result<(String, u64, u64, u64), BackgroundTaskError> {
-        let handle = self
-            .tasks
-            .get(id)
-            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
-        if handle.status().is_terminal() && !handle.stdout_path.exists() {
-            return Err(BackgroundTaskError::output_artifact_missing(
-                id,
-                &handle.stdout_path,
-            ));
-        }
-        read_from_str(
-            &handle.stdout_path,
-            offset,
-            max_bytes,
-            handle.status().is_terminal(),
-        )
-        .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
-    }
-
-    /// Read the model-facing combined stdout/stderr projection starting at
-    /// `offset`. Offsets are over the rendered projection, not raw stdout.
-    pub fn get_combined_output_since(
-        &self,
-        id: &str,
-        offset: u64,
-        max_bytes: usize,
-    ) -> Result<(String, u64, u64, u64), BackgroundTaskError> {
-        let handle = self
-            .tasks
-            .get(id)
-            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
-        let stdout_missing = !handle.stdout_path.exists();
-        let stderr_has_output = file_len(&handle.stderr_path) > 0;
-        if handle.status().is_terminal() && stdout_missing && !stderr_has_output {
-            return Err(BackgroundTaskError::output_artifact_missing(
-                id,
-                &handle.stdout_path,
-            ));
-        }
-        read_combined_from_str(
-            &handle.stdout_path,
-            &handle.stderr_path,
-            offset,
-            max_bytes,
-            handle.status().is_terminal(),
-        )
-        .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
-    }
-
     pub async fn get_combined_output_since_async(
         &mut self,
         id: &str,
@@ -1068,148 +987,6 @@ impl BackgroundTaskRegistry {
             BackgroundTaskError::output_unavailable(
                 id,
                 format!("background output search task failed: {error}"),
-            )
-        })?
-    }
-
-    /// Read stderr from a task.
-    pub fn get_stderr(
-        &self,
-        id: &str,
-        tail_bytes: usize,
-    ) -> Result<(String, u64), BackgroundTaskError> {
-        let handle = self
-            .tasks
-            .get(id)
-            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
-        read_tail_str(
-            &handle.stderr_path,
-            tail_bytes,
-            handle.status().is_terminal(),
-        )
-        .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
-    }
-
-    /// Read stdout plus stderr if available. Missing stderr must not mask valid
-    /// stdout; users checking progress should still see the main output stream.
-    pub fn get_combined_output(
-        &self,
-        id: &str,
-        tail_bytes: usize,
-    ) -> Result<(String, u64), BackgroundTaskError> {
-        let handle = self
-            .tasks
-            .get(id)
-            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
-        let stdout_missing = !handle.stdout_path.exists();
-        let stderr_has_output = file_len(&handle.stderr_path) > 0;
-        if handle.status().is_terminal() && stdout_missing && !stderr_has_output {
-            return Err(BackgroundTaskError::output_artifact_missing(
-                id,
-                &handle.stdout_path,
-            ));
-        };
-        let (stdout, stdout_bytes) = if stdout_missing {
-            (String::new(), 0)
-        } else {
-            read_tail_str(
-                &handle.stdout_path,
-                tail_bytes,
-                handle.status().is_terminal(),
-            )
-            .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))?
-        };
-        let (stderr, stderr_bytes) = read_tail_str(
-            &handle.stderr_path,
-            tail_bytes,
-            handle.status().is_terminal(),
-        )
-        .unwrap_or_else(|_| (String::new(), 0));
-        let combined = if stderr.trim().is_empty() {
-            stdout
-        } else if stdout.trim().is_empty() {
-            format!("<stderr>\n{stderr}\n</stderr>")
-        } else {
-            format!("{stdout}\n<stderr>\n{stderr}\n</stderr>")
-        };
-        Ok((combined, stdout_bytes.saturating_add(stderr_bytes)))
-    }
-
-    /// Read stdout/stderr tail plus total byte and line counts for detail views.
-    pub fn get_combined_output_stats(
-        &self,
-        id: &str,
-        tail_bytes: usize,
-    ) -> Result<(String, u64, u64), BackgroundTaskError> {
-        let handle = self
-            .tasks
-            .get(id)
-            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
-        let (combined, total_bytes) = self.get_combined_output(id, tail_bytes)?;
-        let stdout_lines =
-            count_redacted_file_lines(&handle.stdout_path, handle.status().is_terminal())
-                .unwrap_or(0);
-        let stderr_lines =
-            count_redacted_file_lines(&handle.stderr_path, handle.status().is_terminal())
-                .unwrap_or(0);
-        Ok((
-            combined,
-            total_bytes,
-            stdout_lines.saturating_add(stderr_lines),
-        ))
-    }
-
-    pub async fn get_combined_output_stats_async(
-        &mut self,
-        id: &str,
-        tail_bytes: usize,
-    ) -> Result<(String, u64, u64), BackgroundTaskError> {
-        self.drain_join_set();
-        let handle = self
-            .tasks
-            .get(id)
-            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
-        let stdout_path = handle.stdout_path.clone();
-        let stderr_path = handle.stderr_path.clone();
-        let terminal = handle.status().is_terminal();
-        let task_id = id.to_string();
-        tokio::task::spawn_blocking(move || {
-            let stdout_missing = !stdout_path.exists();
-            let stderr_has_output = file_len(&stderr_path) > 0;
-            if terminal && stdout_missing && !stderr_has_output {
-                return Err(BackgroundTaskError::output_artifact_missing(
-                    &task_id,
-                    &stdout_path,
-                ));
-            }
-            let (stdout, stdout_bytes) = if stdout_missing {
-                (String::new(), 0)
-            } else {
-                read_tail_str(&stdout_path, tail_bytes, terminal)
-                    .map_err(|detail| BackgroundTaskError::output_unavailable(&task_id, detail))?
-            };
-            let (stderr, stderr_bytes) = read_tail_str(&stderr_path, tail_bytes, terminal)
-                .unwrap_or_else(|_| (String::new(), 0));
-            let combined = if stderr.trim().is_empty() {
-                stdout
-            } else if stdout.trim().is_empty() {
-                format!("<stderr>\n{stderr}\n</stderr>")
-            } else {
-                format!("{stdout}\n<stderr>\n{stderr}\n</stderr>")
-            };
-            let stdout_lines = count_redacted_file_lines(&stdout_path, terminal).unwrap_or(0);
-            let stderr_lines = count_redacted_file_lines(&stderr_path, terminal).unwrap_or(0);
-            Ok((
-                combined,
-                stdout_bytes.saturating_add(stderr_bytes),
-                stdout_lines.saturating_add(stderr_lines),
-            ))
-        })
-        .await
-        .map_err(|error| {
-            BackgroundTaskError::output_unavailable(
-                id,
-                format!("background output read task failed: {error}"),
             )
         })?
     }
@@ -1993,23 +1770,6 @@ fn read_tail_str(path: &Path, max_bytes: usize, settled: bool) -> Result<(String
     Ok((chunk, total as u64))
 }
 
-fn read_from_str(
-    path: &Path,
-    offset: u64,
-    max_bytes: usize,
-    settled: bool,
-) -> Result<(String, u64, u64, u64), String> {
-    let projection = read_safe_projection(path, settled)?;
-    let total_bytes = projection.total_bytes() as u64;
-    if offset > total_bytes {
-        return Err(format!(
-            "offset {offset} beyond end of output ({total_bytes} bytes)"
-        ));
-    }
-    let (chunk, end, total, lines) = projection.window(offset as usize, max_bytes);
-    Ok((chunk, end as u64, total as u64, lines as u64))
-}
-
 /// Build the owner-side model view before any byte window is applied. A
 /// credential may begin before a requested offset, so slicing the raw file
 /// first is not safe. Background output is bounded by MAX_OUTPUT_BYTES; the
@@ -2398,53 +2158,6 @@ fn append_utf8_bounded(output: &mut String, text: &str, max_bytes: usize) -> boo
     true
 }
 
-fn count_file_lines(path: &Path) -> Result<u64, String> {
-    use std::io::Read;
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut buf = [0_u8; 8192];
-    let mut lines = 0_u64;
-    let mut saw_any = false;
-    let mut last_byte = None;
-    loop {
-        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        saw_any = true;
-        lines = lines.saturating_add(buf[..n].iter().filter(|&&b| b == b'\n').count() as u64);
-        last_byte = Some(buf[n - 1]);
-    }
-    if saw_any && last_byte != Some(b'\n') {
-        lines = lines.saturating_add(1);
-    }
-    Ok(lines)
-}
-
-fn count_redacted_file_lines(path: &Path, settled: bool) -> Result<u64, String> {
-    Ok(read_safe_projection(path, settled)?.total_lines() as u64)
-}
-
-fn read_combined_tail_str(
-    stdout_path: &Path,
-    stderr_path: &Path,
-    max_bytes: usize,
-) -> Result<String, String> {
-    let stdout = read_tail_str(stdout_path, max_bytes, true)
-        .map(|(s, _)| s)
-        .unwrap_or_default();
-    let stderr = read_tail_str(stderr_path, max_bytes, true)
-        .map(|(s, _)| s)
-        .unwrap_or_default();
-    if stderr.trim().is_empty() {
-        Ok(stdout)
-    } else if stdout.trim().is_empty() {
-        Ok(stderr)
-    } else {
-        Ok(format!("{stdout}\n{stderr}"))
-    }
-}
-
 // ── Notification XML rendering ──────────────────────────────────────
 
 pub(crate) fn format_notification_xml(event: &BgTaskEvent) -> String {
@@ -2690,22 +2403,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_output_since_reads_incremental_chunks_by_offset() {
+    async fn output_observation_reads_incremental_chunks_by_offset() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'hello\\nworld\\n'", "test chunks");
 
         wait_for_task_terminal(&mut reg, &id).await;
 
-        let (first, first_end, total, total_lines) =
-            reg.get_output_since(&id, 0, 6).expect("first chunk");
+        let (first, first_end, total, total_lines) = reg
+            .get_combined_output_since_async(&id, 0, 6)
+            .await
+            .expect("first chunk");
         assert_eq!(first, "hello\n");
         assert_eq!(first_end, 6);
         assert_eq!(total, 12);
         assert_eq!(total_lines, 2);
 
         let (second, second_end, second_total, second_total_lines) = reg
-            .get_output_since(&id, first_end, 1024)
+            .get_combined_output_since_async(&id, first_end, 1024)
+            .await
             .expect("second chunk");
         assert_eq!(second, "world\n");
         assert_eq!(second_end, 12);
@@ -2724,12 +2440,14 @@ mod tests {
 
         wait_for_task_terminal(&mut reg, &id).await;
         let (full, _, total, _) = reg
-            .get_output_since(&id, 0, 4096)
+            .get_combined_output_since_async(&id, 0, 4096)
+            .await
             .expect("safe full output");
         assert!(!full.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
         let offset = "prefix AWS_SECRET_KEY=".len() as u64 + 3;
         let (page, end, safe_total, _) = reg
-            .get_output_since(&id, offset, 64)
+            .get_combined_output_since_async(&id, offset, 64)
+            .await
             .expect("offset inside raw secret must still be safe");
         assert!(!page.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
         assert_eq!(safe_total, total);
@@ -2737,14 +2455,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_output_since_counts_final_line_without_trailing_newline() {
+    async fn output_observation_counts_final_line_without_trailing_newline() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'short'", "line count");
 
         wait_for_task_terminal(&mut reg, &id).await;
 
-        let (chunk, end, total, total_lines) = reg.get_output_since(&id, 0, 1024).expect("chunk");
+        let (chunk, end, total, total_lines) = reg
+            .get_combined_output_since_async(&id, 0, 1024)
+            .await
+            .expect("chunk");
         assert_eq!(chunk, "short");
         assert_eq!(end, total);
         assert_eq!(total_lines, 1);
@@ -2789,26 +2510,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_combined_output_stats_counts_stdout_and_stderr_source_files() {
-        let tmp = crate::tests::test_temp_dir();
-        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
-        let id = reg.spawn_shell(
-            "printf 'out1\\nout2\\n'; printf 'err1\\n' >&2",
-            "combined stats",
-        );
-
-        wait_for_task_terminal(&mut reg, &id).await;
-
-        let (tail, total_bytes, total_lines) =
-            reg.get_combined_output_stats(&id, 1024).expect("stats");
-        assert!(tail.contains("out1"), "{tail}");
-        assert!(tail.contains("err1"), "{tail}");
-        assert_eq!(total_bytes, 15);
-        assert_eq!(total_lines, 3);
-    }
-
-    #[tokio::test]
-    async fn get_combined_output_since_reads_stderr_only_projection() {
+    async fn combined_output_observation_reads_stderr_only_projection() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'stderr-line\\n' >&2; exit 2", "stderr only");
@@ -2817,7 +2519,8 @@ mod tests {
 
         let expected = "<stderr>\nstderr-line\n\n</stderr>";
         let (chunk, end, total, total_lines) = reg
-            .get_combined_output_since(&id, 0, 4096)
+            .get_combined_output_since_async(&id, 0, 4096)
+            .await
             .expect("combined chunk");
         assert_eq!(chunk, expected);
         assert_eq!(end, expected.len() as u64);
@@ -2836,22 +2539,18 @@ mod tests {
         std::fs::remove_file(stdout_path).unwrap();
 
         let expected = "<stderr>\nstderr-line\n\n</stderr>";
-        let sync_stats = reg
-            .get_combined_output_stats(&id, 4096)
-            .expect("sync tail should preserve stderr");
-        let async_stats = reg
-            .get_combined_output_stats_async(&id, 4096)
+        let (output, end, total, lines) = reg
+            .get_combined_output_since_async(&id, 0, 4096)
             .await
-            .expect("async tail should preserve stderr");
-
-        assert_eq!(sync_stats.0, expected);
-        assert_eq!(async_stats.0, expected);
-        assert_eq!(sync_stats.1, async_stats.1);
-        assert_eq!(sync_stats.2, async_stats.2);
+            .expect("observation preserves stderr when stdout is missing");
+        assert_eq!(output, expected);
+        assert_eq!(end, expected.len() as u64);
+        assert_eq!(total, expected.len() as u64);
+        assert_eq!(lines, expected.lines().count() as u64);
     }
 
     #[tokio::test]
-    async fn get_combined_output_since_uses_offsets_over_rendered_projection() {
+    async fn combined_output_observation_uses_offsets_over_rendered_projection() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell(
@@ -2863,7 +2562,8 @@ mod tests {
 
         let expected = "stdout-line\n\n<stderr>\nstderr-line\n\n</stderr>";
         let (first, first_end, total, total_lines) = reg
-            .get_combined_output_since(&id, 0, "stdout-line\n".len())
+            .get_combined_output_since_async(&id, 0, "stdout-line\n".len())
+            .await
             .expect("first combined chunk");
         assert_eq!(first, "stdout-line\n");
         assert_eq!(first_end, "stdout-line\n".len() as u64);
@@ -2871,7 +2571,8 @@ mod tests {
         assert_eq!(total_lines, expected.lines().count() as u64);
 
         let (second, second_end, second_total, second_total_lines) = reg
-            .get_combined_output_since(&id, first_end, 4096)
+            .get_combined_output_since_async(&id, first_end, 4096)
+            .await
             .expect("second combined chunk");
         assert_eq!(second, "\n<stderr>\nstderr-line\n\n</stderr>");
         assert_eq!(second_end, expected.len() as u64);
@@ -2880,7 +2581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_combined_output_since_reports_missing_stdout_when_stderr_is_empty() {
+    async fn combined_output_observation_reports_missing_stdout_when_stderr_is_empty() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'short'", "missing stdout");
@@ -2890,7 +2591,8 @@ mod tests {
         std::fs::remove_file(&stdout_path).unwrap();
 
         let error = reg
-            .get_combined_output_since(&id, 0, 1024)
+            .get_combined_output_since_async(&id, 0, 1024)
+            .await
             .expect_err("missing stdout with empty stderr should fail");
         assert_eq!(
             error,
@@ -2902,7 +2604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_output_since_rejects_offsets_past_end() {
+    async fn output_observation_rejects_offsets_past_end() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("printf 'short'", "test offset bounds");
@@ -2910,7 +2612,8 @@ mod tests {
         wait_for_task_terminal(&mut reg, &id).await;
 
         let err = reg
-            .get_output_since(&id, 99, 16)
+            .get_combined_output_since_async(&id, 99, 16)
+            .await
             .expect_err("offset beyond end must fail");
         assert!(matches!(
             err,
@@ -2918,8 +2621,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn terminal_task_with_missing_output_artifact_reports_explicit_error() {
+    #[tokio::test]
+    async fn terminal_task_with_missing_output_artifact_reports_explicit_error() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let (mut handle, _dir) = test_handle_with_status(BgTaskStatus::Completed);
@@ -2927,7 +2630,8 @@ mod tests {
         reg.tasks.insert(handle.id.clone(), handle);
 
         let err = reg
-            .get_output_since("bg-shell-missing-output", 0, 1024)
+            .get_combined_output_since_async("bg-shell-missing-output", 0, 1024)
+            .await
             .expect_err("terminal task with missing stdout ref should be explicit");
 
         assert!(matches!(
@@ -3010,35 +2714,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_output_reads_file() {
+    async fn output_observation_reads_file() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("echo 'line1'; echo 'line2'", "test output");
 
         wait_for_task_terminal(&mut reg, &id).await;
-        let (output, _) = reg.get_output(&id, 4096).unwrap();
+        let (output, _, _, _) = reg
+            .get_combined_output_since_async(&id, 0, 4096)
+            .await
+            .unwrap();
         assert!(output.contains("line1"));
         assert!(output.contains("line2"));
     }
 
-    #[test]
-    fn background_output_window_redacts_before_offset() {
+    #[tokio::test]
+    async fn background_output_window_redacts_before_offset() {
         let tmp = crate::tests::test_temp_dir();
         let path = tmp.path().join("stdout");
         let raw = "prefix AKIAIOSFODNN7EXAMPLE suffix\n";
         std::fs::write(&path, raw).unwrap();
         let safe = astra_text_utils::credential_redaction::redact_credentials_for_display(raw).0;
         let marker_start = safe.find("[REDACTED:").expect("display marker");
+        let mut registry = BackgroundTaskRegistry::new(tmp.path().join("registry"));
+        let (mut handle, _handle_dir) = test_handle_with_status(BgTaskStatus::Completed);
+        handle.stdout_path = path;
+        std::fs::write(&handle.stderr_path, "").unwrap();
+        let id = handle.id.clone();
+        registry.tasks.insert(id.clone(), handle);
 
-        let (before, before_end, total, _) =
-            read_from_str(&path, 0, marker_start + 2, true).unwrap();
+        let (before, before_end, total, _) = registry
+            .get_combined_output_since_async(&id, 0, marker_start + 2)
+            .await
+            .unwrap();
         assert!(!before.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(!before.contains("[REDACTED:"));
         assert_eq!(before_end as usize, marker_start);
         assert_eq!(total as usize, safe.len());
 
-        let (after, after_end, _, _) =
-            read_from_str(&path, marker_start as u64 + 3, 128, true).unwrap();
+        let (after, after_end, _, _) = registry
+            .get_combined_output_since_async(&id, marker_start as u64 + 3, 128)
+            .await
+            .unwrap();
         assert!(!after.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(!after.contains("[REDACTED:"));
         assert!(after_end > before_end);
@@ -3215,7 +2932,8 @@ mod tests {
             }
         );
         let (output, end, total, lines) = reg
-            .get_output_since("bg-shell-restored", 0, 1024)
+            .get_combined_output_since_async("bg-shell-restored", 0, 1024)
+            .await
             .expect("restored output remains readable");
         assert_eq!(output, "still building\n");
         assert_eq!(end, total);
@@ -3339,8 +3057,8 @@ mod tests {
         assert_eq!(reg.failed_count(), 1);
     }
 
-    #[test]
-    fn poll_completions_retains_terminal_tasks_for_inspection() {
+    #[tokio::test]
+    async fn poll_completions_retains_terminal_tasks_for_inspection() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         for (id, status) in [
@@ -3365,13 +3083,15 @@ mod tests {
         assert!(reg.get("failed").is_some());
         assert!(reg.get("completed").is_some());
         assert!(
-            reg.get_combined_output("failed", 4096)
+            reg.get_combined_output_since_async("failed", 0, 4096)
+                .await
                 .expect("failed output")
                 .0
                 .contains("failed output")
         );
         assert!(
-            reg.get_combined_output("completed", 4096)
+            reg.get_combined_output_since_async("completed", 0, 4096)
+                .await
                 .expect("completed output")
                 .0
                 .contains("completed output")
@@ -3494,7 +3214,10 @@ mod tests {
         let stderr_path = reg.get(&id).unwrap().stderr_path.clone();
         std::fs::remove_file(stderr_path).unwrap();
 
-        let (output, _) = reg.get_combined_output(&id, 4096).unwrap();
+        let (output, _, _, _) = reg
+            .get_combined_output_since_async(&id, 0, 4096)
+            .await
+            .unwrap();
         assert!(
             output.contains("stdout-only"),
             "missing stderr must not hide stdout: {output}"
@@ -3511,7 +3234,10 @@ mod tests {
         );
 
         wait_for_task_terminal(&mut reg, &id).await;
-        let (output, _) = reg.get_output(&id, 4096).unwrap();
+        let (output, _, _, _) = reg
+            .get_combined_output_since_async(&id, 0, 4096)
+            .await
+            .unwrap();
         assert!(
             output.contains("no-stdin"),
             "background shell must not inherit/steal TUI stdin: {output}"
@@ -3974,7 +3700,10 @@ mod tests {
         // after detach. Without the prefix the LLM sees only post-
         // detach output and can't reason about what was already
         // displayed; without the remainder the adoption is useless.
-        let (out, _bytes) = reg.get_output(&id, 1024).expect("output");
+        let (out, _, _bytes, _) = reg
+            .get_combined_output_since_async(&id, 0, 1024)
+            .await
+            .expect("output");
         assert!(
             out.contains("before-detach"),
             "adopted output must include partial prefix: {out:?}"

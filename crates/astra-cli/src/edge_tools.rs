@@ -18,7 +18,9 @@ use astra_runtime::tool_sandbox::{
     SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
 };
 use astra_services::SessionArtifactStore;
-use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_reset_on_poison};
+use astra_turn_core::sync_utils::{
+    rwlock_read_clone_or_default, rwlock_read_project_or_default, rwlock_write_reset_on_poison,
+};
 use astra_turn_core::tool::deferred_activation::ToolSurfaceNames;
 
 use crate::background_task_error::BackgroundTaskError;
@@ -78,7 +80,6 @@ pub use astra_tools::code_intel;
 use astra_tools::truncate_output;
 #[path = "edge_tools/fs.rs"]
 mod fs_tools;
-pub(crate) use astra_tools::fuzzy_replacer;
 #[path = "edge_tools/lsp_stdio_session.rs"]
 mod lsp_stdio_session;
 #[path = "edge_tools/mo_tools.rs"]
@@ -4459,7 +4460,7 @@ impl ToolExecutor {
             return outcome;
         }
         if name == "mo_query" {
-            let mut outcome = self.mo_query_with_metadata(args);
+            let mut outcome = self.mo_query_with_metadata(args, cancel_token);
             let output = self.finalize_tool_output(outcome.output, name);
             self.record_output_size(output.len());
             outcome.output = output;
@@ -4499,17 +4500,38 @@ impl ToolExecutor {
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> EdgeToolRun {
         let argument_validation = if runtime_env_builtin_registry().get(name).is_none() {
-            self.provider_owned_schemas_snapshot("provider_owned_schema_argument_validation")
-                .into_iter()
-                .find(|schema| {
-                    astra_turn_core::tool::schema::tool_schema_name(schema) == Some(name)
-                })
-                .map(|schema| {
-                    astra_tools::schemas::validate_tool_arguments_against_schema(
-                        name, args, &schema,
-                    )
-                })
-                .unwrap_or(Ok(()))
+            rwlock_read_project_or_default(
+                &self.cli_local_provider_schemas,
+                "provider_owned_schema_argument_validation",
+                |schemas| {
+                    schemas
+                        .iter()
+                        .find(|schema| {
+                            astra_turn_core::tool::schema::tool_schema_name(schema) == Some(name)
+                        })
+                        .cloned()
+                },
+            )
+            .or_else(|| {
+                rwlock_read_project_or_default(
+                    &self.mcp_runtime,
+                    "mcp_runtime_schema_snapshot",
+                    |runtime| {
+                        runtime
+                            .schemas
+                            .iter()
+                            .find(|schema| {
+                                astra_turn_core::tool::schema::tool_schema_name(schema)
+                                    == Some(name)
+                            })
+                            .cloned()
+                    },
+                )
+            })
+            .map(|schema| {
+                astra_tools::schemas::validate_tool_arguments_against_schema(name, args, &schema)
+            })
+            .unwrap_or(Ok(()))
         } else {
             astra_tools::schemas::validate_tool_arguments(name, args)
         };
@@ -5023,7 +5045,12 @@ impl ToolExecutor {
                     }
                 }
                 "list_dir" => self.list_dir(args),
-                "grep" => self.grep(args),
+                "grep" => {
+                    let result = self.grep(args, cancel_token).await;
+                    *source_is_error = Some(result.is_error);
+                    *tool_result_fields = result.metadata;
+                    result.output
+                }
                 // Glob is owned by the shared executor so CLI-local,
                 // CLI+Server edge callbacks, and pure Server runs have one
                 // traversal, ignore, pagination, and failure contract.
@@ -7178,6 +7205,179 @@ pub(crate) mod tests {
         assert!(updated.contains("[configured-secret]"));
         assert!(!updated.contains("D4w8z9wKN1aVeT3BpQj6kIuN7wH8X0M9KfV5OqzF"));
         assert!(!updated.contains("hf_abcdefghijklmnopqrstuvwxyz123456"));
+    }
+
+    #[tokio::test]
+    async fn cli_grep_retains_current_path_authority() {
+        let (root, executor) = temp_executor();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(
+            external.path().join("evidence.txt"),
+            "approved-external-evidence",
+        )
+        .unwrap();
+        let args = serde_json::json!({"path":external.path(), "pattern":"approved-external"});
+        let mut restricted = super::SandboxPolicy::for_project(root.path());
+        restricted.allowed_paths.clear();
+        *executor.sandbox_policy.write().unwrap() = Some(restricted.clone());
+        let denied = executor.execute_with_metadata("grep", &args).await;
+        assert!(
+            denied.is_error && denied.output.contains(super::SANDBOX_DENIED_PREFIX),
+            "{denied:?}"
+        );
+        executor
+            .expand_sandbox_path(external.path().canonicalize().unwrap())
+            .unwrap();
+        let approved = executor.execute_with_metadata("grep", &args).await;
+        assert!(
+            !approved.is_error && approved.output.contains("approved-external-evidence"),
+            "{approved:?}"
+        );
+        assert!(approved.tool_result_fields.as_ref().is_none_or(|fields| {
+            !fields.contains_key(astra_tools::workspace_observation::OBSERVED_FIELD)
+        }));
+        *executor.sandbox_policy.write().unwrap() = Some(restricted);
+        assert!(executor.execute_with_metadata("grep", &args).await.is_error);
+        *executor.sandbox_policy.write().unwrap() = None;
+        assert!(!executor.execute_with_metadata("grep", &args).await.is_error);
+        assert_eq!(executor.default_executor.workspace_root(), root.path());
+
+        let sensitive = root.path().join(".ssh/id_rsa");
+        std::fs::create_dir_all(sensitive.parent().unwrap()).unwrap();
+        std::fs::write(&sensitive, "never-readable-evidence").unwrap();
+        *executor.sandbox_policy.write().unwrap() =
+            Some(super::SandboxPolicy::permissive(root.path()));
+        let denied = executor
+            .execute_with_metadata(
+                "grep",
+                &serde_json::json!({"path":sensitive, "pattern":"evidence"}),
+            )
+            .await;
+        assert!(
+            denied.is_error && !denied.output.contains("never-readable-evidence"),
+            "{denied:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_grep_uses_shared_options_and_terminal_facts() {
+        let (root, executor) = temp_executor();
+        std::fs::write(
+            root.path().join("sample.rs"),
+            "a.b:first\naXb:wrong\na.b:second\na.b:third\n",
+        )
+        .unwrap();
+        let result = executor.execute_with_metadata("grep", &serde_json::json!({"pattern":"a.b", "fixed_strings":true, "include":"*.rs", "offset":1, "head_limit":1})).await;
+        assert!(
+            !result.is_error && result.output.contains("a.b:second"),
+            "{result:?}"
+        );
+        assert!(!result.output.contains("aXb:wrong") && !result.output.contains("a.b:third"));
+        assert_eq!(
+            result.tool_result_fields.unwrap()["exit_semantics"],
+            "success"
+        );
+        let empty = executor
+            .execute_with_metadata("grep", &serde_json::json!({"pattern":"absent"}))
+            .await;
+        assert!(!empty.is_error, "{empty:?}");
+        assert_eq!(
+            empty.tool_result_fields.unwrap()["exit_semantics"],
+            "empty_result"
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let cancelled = executor
+            .execute_with_metadata_cancelable(
+                "grep",
+                &serde_json::json!({"pattern":"a.b"}),
+                Some(&token),
+            )
+            .await;
+        assert!(cancelled.is_error, "{cancelled:?}");
+        assert_eq!(cancelled.tool_result_fields.unwrap()["cancelled"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires working rg: FIFO targets are not regular-file fallback candidates"]
+    async fn cli_grep_cancels_after_the_backend_opens_its_target() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let (root, executor) = temp_executor();
+        let fifo = root.path().join("input");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        let caller = token.clone();
+        let running = tokio::spawn(async move {
+            executor
+                .execute_with_metadata_cancelable(
+                    "grep",
+                    &serde_json::json!({"pattern":"needle", "path":"input"}),
+                    Some(&caller),
+                )
+                .await
+        });
+        let reader_opened = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo)
+                {
+                    Ok(writer) => break writer,
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await
+                    }
+                    Err(error) => panic!("cannot open test FIFO: {error}"),
+                }
+            }
+        })
+        .await;
+        // Keep the writer alive: only cancellation can release the blocked search.
+        token.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reader_opened.is_ok(), "the search never opened its target");
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            result.tool_result_fields.unwrap()["exit_semantics"],
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_grep_retains_pressure_scaled_output_budget() {
+        let (root, executor) = temp_executor();
+        let content = (0..200)
+            .map(|index| format!("needle:{index}:abcdefghijklmnopqrstuvwxyz0123456789\n"))
+            .collect::<String>();
+        std::fs::write(root.path().join("evidence.txt"), content).unwrap();
+        executor.set_budget_pressure(1.0);
+        let result = executor
+            .execute_with_metadata(
+                "grep",
+                &serde_json::json!({"pattern":"needle", "head_limit":0}),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.output.len() < 4000, "pressure budget ignored");
+        assert!(result.output.contains("truncated"));
     }
 
     #[tokio::test]

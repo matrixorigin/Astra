@@ -11,10 +11,8 @@ use astra_runtime::{
     server::run::engine::RunEngine,
 };
 use astra_services::runs::{
-    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DatabaseRunStateStore,
-    DurableRunRecord, RunLifecycleService, RunListCursor, RunListRecord, RunMutationRecord,
-    RunStateStore, RunStatusRecord, RunUserIntentData, RunUserIntentRecord,
-    SSE_HEARTBEAT_INTERVAL_SECS, ToolOutputBatchItem, transform_run_event_for_client,
+    DatabaseRunStateStore, DurableRunRecord, RunStateStore, SSE_HEARTBEAT_INTERVAL_SECS,
+    ToolOutputBatchItem,
 };
 use async_trait::async_trait;
 use axum::{
@@ -25,7 +23,6 @@ use axum::{
 use serde_json::{Value, json};
 use sqlx::Row;
 use test_support::{parse_sse_events, require_db_it_env};
-use tokio::sync::RwLock;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
@@ -110,7 +107,7 @@ fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRe
         checkpoint_json: None,
         error_code: None,
         error_message: None,
-        retry_count: 0,
+
         total_prompt_tokens: 0,
         total_completion_tokens: 0,
         total_tool_calls: 0,
@@ -265,252 +262,25 @@ impl SessionService for Phase1HttpSession {
     }
 }
 
-#[derive(Clone)]
-struct Phase1HttpRunLifecycle {
-    store: Arc<RwLock<DatabaseRunStateStore>>,
-    session_id: String,
-}
-
-impl Phase1HttpRunLifecycle {
-    async fn store(&self) -> DatabaseRunStateStore {
-        self.store.read().await.clone()
-    }
-}
-
-#[async_trait]
-impl RunLifecycleService for Phase1HttpRunLifecycle {
-    async fn create_run(
-        &self,
-        _user_id: String,
-        _request: ChatRequestData,
-    ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        unsupported_phase1_http_method("runs.create_run")
-    }
-
-    async fn stream_chat(
-        &self,
-        _user_id: String,
-        _request: ChatRequestData,
-    ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
-        unsupported_phase1_http_method("runs.stream_chat")
-    }
-
-    async fn get_run_status(
-        &self,
-        run_id: String,
-        user_id: String,
-    ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
-        let run = self
-            .store()
-            .await
-            .load_run(&user_id, &run_id)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse::new(error)),
-                )
-            })?
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse::new("run not found")),
-                )
-            })?;
-        if run.user_id != user_id {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(ErrorResponse::new("access denied")),
-            ));
-        }
-        Ok(RunStatusRecord {
-            artifact_publication: None,
-            explain_requested: false,
-            run_id,
-            session_id: run.session_id,
-            parent_run_id: run.parent_run_id,
-            root_run_id: run.root_run_id,
-            depth: run.depth,
-            status: run.status,
-            waiting_for: run.waiting_for,
-            events_count: run.events.len() as i64,
-            workspace: None,
-            executor: None,
-            transport: None,
-            accounting: None,
-        })
-    }
-
-    async fn stream_run(
-        &self,
-        run_id: String,
-        user_id: String,
-        last_index: u32,
-    ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
-        let run = self
-            .store()
-            .await
-            .load_run(&user_id, &run_id)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse::new(error)),
-                )
-            })?
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse::new("run not found")),
-                )
-            })?;
-        if run.user_id != user_id {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(ErrorResponse::new("access denied")),
-            ));
-        }
-        Ok(astra_services::runs::DurableRunEventDelta {
-            session_id: run.session_id,
-            status: run.status,
-            last_event_idx: run.last_event_idx,
-            events: run.events.into_iter().skip(last_index as usize).collect(),
-        })
-    }
-
-    async fn cancel_run(
-        &self,
-        run_id: String,
-        _user_id: String,
-    ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        Ok(CancelRunRecord {
-            run_id,
-            status: "cancelled".to_string(),
-            execution_settled: true,
-        })
-    }
-
-    async fn list_runs_cursor(
-        &self,
-        _user_id: String,
-        limit: u32,
-        _cursor: Option<RunListCursor>,
-    ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
-        Ok(RunListRecord {
-            runs: Vec::new(),
-            total: None,
-            limit,
-            next_cursor: None,
-        })
-    }
-
-    async fn submit_run_user_intent(
-        &self,
-        run_id: String,
-        user_id: String,
-        input: RunUserIntentData,
-    ) -> Result<RunUserIntentRecord, (StatusCode, Json<ErrorResponse>)> {
-        let intent_id = input.intent_id.clone();
-        let store = self.store().await;
-        let run = store
-            .load_run(&user_id, &run_id)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse::new(error)),
-                )
-            })?
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse::new("run not found")),
-                )
-            })?;
-        if run.user_id != user_id {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(ErrorResponse::new("access denied")),
-            ));
-        }
-        let duplicate = run.events.iter().any(|event| {
-            event
-                .get("data")
-                .and_then(|data| data.get("intent_id"))
-                .and_then(Value::as_str)
-                == Some(input.intent_id.as_str())
-        });
-        if !duplicate {
-            store
-                .append_event(
-                    &user_id,
-                    &run.session_id,
-                    &run_id,
-                    json!({
-                        "event_type": "user_intent",
-                        "data": {
-                            "intent_id": input.intent_id,
-                            "delivery": input.delivery,
-                            "input": input.input,
-                        },
-                    }),
-                )
-                .await
-                .map_err(|error| {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(ErrorResponse::new(error)),
-                    )
-                })?;
-        }
-        Ok(RunUserIntentRecord {
-            run_id,
-            intent_id,
-            status: astra_turn_types::UserIntentStatus::AcceptedRemote,
-            duplicate,
-            event_index: 0,
-        })
-    }
-
-    async fn pause_run(
-        &self,
-        run_id: String,
-        user_id: String,
-    ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.store()
-            .await
-            .update_run_status(
-                &user_id,
-                &self.session_id,
-                &run_id,
-                "waiting",
-                Some("user"),
-                None,
-            )
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse::new(error)),
-                )
-            })?;
-        Ok(RunMutationRecord::applied(run_id, "waiting", "running"))
-    }
-}
-
 fn build_phase1_http_app(
     pool: astra_core::SharedPool,
-    session_id: String,
     user_id: String,
-    store: Arc<RwLock<DatabaseRunStateStore>>,
+    store: Arc<DatabaseRunStateStore>,
 ) -> Router {
+    let lifecycle = astra_runtime::AgenticRunLifecycleService::new(
+        pool.settings().clone(),
+        test_support::test_fernet_encryptor("phase1-run-durability-fixture"),
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        RunEngine::new(store),
+    )
+    .with_pool(pool.clone());
     let state = AppState::new(ServiceInfo::default(), Arc::new(Phase1HttpHealth))
         .with_shared_pool(pool)
         .with_auth_service(Arc::new(Phase1HttpAuth {
             user_id: user_id.clone(),
         }))
         .with_session_service(Arc::new(Phase1HttpSession { user_id }))
-        .with_run_lifecycle_service(Arc::new(Phase1HttpRunLifecycle { store, session_id }));
+        .with_run_lifecycle_service(Arc::new(lifecycle));
     build_app(state)
 }
 
@@ -518,7 +288,7 @@ async fn http_get_run_stream(app: &Router, run_id: &str, last_index: u32) -> Vec
     let request = Request::builder()
         .method("GET")
         .uri(format!(
-            "/chat/runs/{run_id}/stream?last_index={last_index}"
+            "/chat/runs/{run_id}/stream?last_index={last_index}&replay_only=true"
         ))
         .header("authorization", HTTP_TOKEN)
         .body(Body::empty())
@@ -531,7 +301,12 @@ async fn http_get_run_stream(app: &Router, run_id: &str, last_index: u32) -> Vec
     parse_sse_events(&String::from_utf8_lossy(&bytes))
 }
 
-async fn http_post_user_intent(app: &Router, run_id: &str, key: &str, input: Value) {
+async fn http_post_user_intent(
+    app: &Router,
+    run_id: &str,
+    key: &str,
+    input: Value,
+) -> (StatusCode, Value) {
     let request = Request::builder()
         .method("POST")
         .uri(format!("/chat/runs/{run_id}/intents"))
@@ -547,7 +322,11 @@ async fn http_post_user_intent(app: &Router, run_id: &str, key: &str, input: Val
         ))
         .unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
 }
 
 shared_db_test! {
@@ -883,11 +662,12 @@ async fn l3_s04_reconnect_replays_monotonic_events() {
 
 shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
+async fn reconnect_replays_recovery_and_guidance_uses_a_new_run() {
     let pool = setup_pool().await;
     let (run_id, session_id, user_id) = test_ids();
     insert_session(&pool, &user_id, &session_id).await;
-    let store_a = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("phase1-pod-a");
+    let store_a =
+        Arc::new(DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("phase1-pod-a"));
     store_a
         .insert_run(durable_record(&run_id, &session_id, &user_id))
         .await
@@ -898,20 +678,12 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
             .await
             .unwrap()
     );
-    let active_store = Arc::new(RwLock::new(store_a.clone()));
-    let app = build_phase1_http_app(
-        pool.clone(),
-        session_id.clone(),
-        user_id.clone(),
-        active_store.clone(),
-    );
+    let app = build_phase1_http_app(pool.clone(), user_id.clone(), store_a.clone());
 
     let mut next_index = 0_u32;
     let mut client_indexes = Vec::new();
     for disconnect in 0..17 {
-        active_store
-            .read()
-            .await
+        store_a
             .append_event(
                 &user_id,
                 &session_id,
@@ -934,9 +706,7 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
         next_index = new_events.last().copied().unwrap() as u32 + 1;
     }
 
-    active_store
-        .read()
-        .await
+    store_a
         .save_checkpoint(astra_services::runs::RunCheckpointWriteRequest {
             user_id: &user_id,
             expected_session_id: &session_id,
@@ -957,140 +727,99 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
             .to_string(),
         })
         .await
-        .unwrap().expect("checkpoint was persisted");
-    let engine = RunEngine::new(Arc::new(active_store.read().await.clone()));
+        .unwrap()
+        .expect("checkpoint was persisted");
+    let engine = RunEngine::new(store_a.clone());
     let recovered = engine.recover_active_runs().await.unwrap();
     assert!(recovered.iter().any(|run| run.run_id == run_id));
 
-    sqlx::query(
-        "UPDATE agent_runs
-         SET owner_lease_expires_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND)
-         WHERE user_id = ? AND run_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&run_id)
-    .execute(pool.get())
-    .await
-    .unwrap();
-    let store_b = DatabaseRunStateStore::new(pool).with_owner_pod_id("phase1-pod-b");
+    let recovered_run = recovered.iter().find(|run| run.run_id == run_id).unwrap();
+    assert_eq!(recovered_run.status, "paused");
+    assert!(recovered_run.waiting_for.is_none());
+    let events = http_get_run_stream(&app, &run_id, next_index).await;
     assert!(
-        store_b
-            .acquire_owner_lease(&user_id, &run_id, "phase1-pod-b", Duration::from_secs(30))
+        events.is_empty(),
+        "internal recovery facts are not SSE events"
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/chat/runs/{run_id}"))
+                .header("authorization", HTTP_TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let public_status: Value = serde_json::from_slice(
+        &body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap(),
-        "new pod should take over the durable agent_runs lease after restart"
+    )
+    .unwrap();
+    assert_eq!(public_status["status"], "paused");
+    let (status, _) = http_post_user_intent(
+        &app,
+        &run_id,
+        "rejected-old-run",
+        json!({"content": "continue"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let loaded = store_a.load_run(&user_id, &run_id).await.unwrap().unwrap();
+    assert_eq!(loaded.status, "paused");
+    assert!(loaded.waiting_for.is_none());
+    assert_eq!(loaded.events.len(), 19);
+    assert_eq!(client_indexes, (0..18).collect::<Vec<_>>());
+    assert_eq!(
+        loaded.events.last().unwrap()["event_type"],
+        "run_interrupted_after_restart"
     );
-    *active_store.write().await = store_b.clone();
+    assert_eq!(loaded.events.last().unwrap()["index"], 18);
+    assert!(
+        loaded
+            .events
+            .iter()
+            .all(|event| event["data"]["intent_id"] != "rejected-old-run")
+    );
 
-    for (idx, guidance) in ["read before editing", "run focused tests first"]
+    let continuation_id = format!("{run_id}-continuation");
+    engine
+        .start_run(&continuation_id, &user_id, &session_id)
+        .await
+        .unwrap();
+    for (index, guidance) in ["read before editing", "run focused tests first"]
         .into_iter()
         .enumerate()
     {
-        active_store
-            .read()
-            .await
-            .append_event(
-                &user_id,
-                &session_id,
-                &run_id,
-                json!({"event_type": "run_paused", "data": {"waiting_for": "user"}}),
-            )
-            .await
-            .unwrap();
-        active_store
-            .read()
-            .await
-            .append_event(
-                &user_id,
-                &session_id,
-                &run_id,
-                json!({"event_type": "approval_required", "data": {"request_id": format!("approval-{idx}")}}),
-            )
-            .await
-            .unwrap();
-        active_store
-            .read()
-            .await
-            .update_run_status(
-                &user_id,
-                &session_id,
-                &run_id,
-                "waiting",
-                Some("user"),
-                None,
-            )
-            .await
-            .unwrap();
-        let waiting = http_get_run_stream(&app, &run_id, next_index).await;
-        let waiting_indexes = waiting
-            .iter()
-            .filter_map(|event| event.get("index").and_then(Value::as_u64))
-            .collect::<Vec<_>>();
-        client_indexes.extend(waiting_indexes.iter().map(|idx| *idx as i64));
-        next_index = waiting_indexes.last().copied().unwrap() as u32 + 1;
-
-        http_post_user_intent(
-            &app,
-            &run_id,
-            &format!("intent-{idx}"),
-            json!({"content": guidance}),
-        )
-        .await;
-        let resumed = http_get_run_stream(&app, &run_id, next_index).await;
-        let resumed_indexes = resumed
-            .iter()
-            .filter_map(|event| event.get("index").and_then(Value::as_u64))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            resumed_indexes.len(),
-            1,
-            "active-run guidance should append exactly one typed intent event"
-        );
-        client_indexes.extend(resumed_indexes.iter().map(|idx| *idx as i64));
-        next_index = resumed_indexes.last().copied().unwrap() as u32 + 1;
+        let intent_id = format!("intent-{index}");
+        let input = json!({"content": guidance});
+        let (status, first) =
+            http_post_user_intent(&app, &continuation_id, &intent_id, input.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first["duplicate"], false);
+        assert_eq!(first["event_index"], index + 1);
+        let (status, duplicate) =
+            http_post_user_intent(&app, &continuation_id, &intent_id, input).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(duplicate["duplicate"], true);
+        assert_eq!(duplicate["event_index"], first["event_index"]);
+        let events = http_get_run_stream(&app, &continuation_id, index as u32 + 1).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "user_intent_accepted");
+        assert_eq!(events[0]["intent_id"], intent_id);
+        assert_eq!(events[0]["index"], index + 1);
     }
-    let loaded = active_store
-        .read()
-        .await
-        .load_run(&user_id, &run_id)
+    let continuation = store_a
+        .load_run(&user_id, &continuation_id)
         .await
         .unwrap()
         .unwrap();
-    let indexes = loaded
-        .events
-        .iter()
-        .map(|event| {
-            event
-                .get("index")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    let client_visible_indexes = loaded
-        .events
-        .iter()
-        .filter_map(|event| {
-            let transformed = transform_run_event_for_client(event.clone());
-            if transformed.is_null() {
-                return None;
-            }
-            event.get("index").and_then(serde_json::Value::as_i64)
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        client_indexes, client_visible_indexes,
-        "client-side HTTP SSE replay should receive every externally visible event exactly once"
-    );
-    // One run_started + 17 streamed fragments + one restart resume, then two
-    // cycles of pause, approval_required, and one typed guidance intent.
-    // Guidance intentionally no longer synthesizes the old user_input +
-    // run_resumed pair.
-    const EXPECTED_EVENT_COUNT: i64 = 1 + 17 + 1 + (2 * 3);
-    assert_eq!(
-        indexes,
-        (0..EXPECTED_EVENT_COUNT).collect::<Vec<_>>(),
-        "restart recovery and typed guidance cycles stay gap-free and monotonic"
-    );
+    assert_eq!(continuation.status, "running");
+    assert!(continuation.waiting_for.is_none());
+    assert_eq!(continuation.events.len(), 3);
 }
 
 }

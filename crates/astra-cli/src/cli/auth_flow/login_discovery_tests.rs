@@ -7,8 +7,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn browser_login_completion_requires_registered_checkout_before_runtime_ready() {
-    let _credentials = crate::tests::isolate_credentials();
     let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+    let _credentials = crate::tests::isolate_credentials();
     let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
         "default",
         Some("browser-user"),

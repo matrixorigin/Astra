@@ -429,9 +429,6 @@ function contextSourceLabel(kind: ExplainAnalyzeContextSourceKindV1): string {
     skills: "Active skills",
     runtime_identity: "Runtime context",
     runtime_volatile: "Turn instructions",
-    emergent_skills: "Discovered skills",
-    emergent_memory: "Prefetched memory",
-    emergent_summary: "Tool summaries",
   };
   return labels[kind];
 }

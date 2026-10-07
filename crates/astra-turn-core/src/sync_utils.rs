@@ -106,8 +106,19 @@ pub fn rwlock_read_clone_or_default<T: Clone + Default>(
     lock: &std::sync::RwLock<T>,
     label: &str,
 ) -> T {
+    rwlock_read_project_or_default(lock, label, Clone::clone)
+}
+
+/// Read a short-lived projection without cloning the guarded catalog.
+/// Poison recovery uses the same reset contract as the snapshot reader.
+/// The closure runs under the lock; it must not block or reenter this lock.
+pub fn rwlock_read_project_or_default<T: Default, R>(
+    lock: &std::sync::RwLock<T>,
+    label: &str,
+    project: impl FnOnce(&T) -> R,
+) -> R {
     match lock.read() {
-        Ok(guard) => guard.clone(),
+        Ok(guard) => project(&guard),
         Err(poisoned) => {
             tracing::error!(
                 cache = label,
@@ -119,17 +130,47 @@ pub fn rwlock_read_clone_or_default<T: Clone + Default>(
             match lock.write() {
                 Ok(g) => {
                     // Another caller already recovered — return their state untouched.
-                    g.clone()
+                    project(&g)
                 }
                 Err(p) => {
                     lock.clear_poison();
                     let mut guard = p.into_inner();
-                    let default_val = T::default();
-                    let result = default_val.clone();
-                    *guard = default_val;
-                    result
+                    *guard = T::default();
+                    project(&guard)
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projected_read_resets_poisoned_catalog_and_preserves_snapshot_reads() {
+        let catalog = std::sync::RwLock::new(vec!["partial"]);
+        let _ = std::panic::catch_unwind(|| {
+            let mut guard = catalog.write().unwrap();
+            guard.push("unfinished");
+            panic!("interrupted catalog update");
+        });
+        assert!(catalog.is_poisoned());
+        assert_eq!(
+            rwlock_read_project_or_default(&catalog, "test_catalog", |items| items
+                .first()
+                .copied()),
+            None,
+        );
+        assert!(!catalog.is_poisoned());
+        *catalog.write().unwrap() = vec!["first", "second"];
+        assert_eq!(
+            rwlock_read_project_or_default(&catalog, "test_catalog", |items| items.last().copied()),
+            Some("second"),
+        );
+        assert_eq!(
+            rwlock_read_clone_or_default(&catalog, "test_catalog"),
+            vec!["first", "second"]
+        );
     }
 }

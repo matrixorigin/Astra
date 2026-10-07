@@ -1,33 +1,15 @@
 //! Reconstruct a child agent's first-request message array from a
 //! captured parent [`ForkPrefix`].
 //!
-//! ## Role in the fork-prefix pipeline
-//!
-//! - PR 1: [`ForkPrefix`] type (frozen canonical bytes)
-//! - PR 2: [`PrefixCaptureSink`] store
-//! - PR 3: capture-site helper
-//! - PR 4: spawn-side resolver
-//! - PR 4.5: runtime wires resolver into spawner
-//! - PR 5a: turn-loop hook
-//! - **PR 5b (this)**: the reconstructor — parses prefix canonical
-//!   bytes back into a JSON `messages` array and concatenates a
-//!   child suffix. Downstream provider adapters (astra's
-//!   `chat_turn_base_payload` in particular) use the result as the
-//!   `messages` field of the child's first request.
-//!
-//! ## Why this lives in turn-core
-//!
-//! The astra turn payload is built in multiple crates (CLI, server,
-//! bridge) via `chat_turn_base_payload`. All of them need the same
-//! prefix deserialization / concatenation invariants; keeping the
-//! helper in `turn-core` is the single source of truth.
+//! Server execution reconstructs a child request from the captured parent
+//! messages and the child suffix. Prefix decoding and concatenation live here
+//! so capture and provider preparation share the same byte invariants.
 //!
 //! ## What the prefix bytes contain
 //!
 //! By convention (enforced by the capture-site contract, PR 3), the
-//! canonical bytes hold a **JSON-serialized array of message
-//! objects** — the same shape as the `messages` field of
-//! `chat_turn_base_payload`. The reconstructor round-trips through
+//! canonical bytes hold a **JSON-serialized array of message objects**.
+//! The reconstructor round-trips through
 //! `serde_json::Value` so the prefix survives formatting quirks in
 //! the serializer (whitespace, key-order on write), as long as the
 //! bytes produced by capture and the bytes produced by reconstruct

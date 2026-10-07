@@ -15,7 +15,7 @@ use astra_turn_core::microcompact::ProviderCacheStrategy;
 use astra_turn_core::optimize_limits::OptimizeLimits;
 use astra_turn_core::pipeline_config::{PipelineConfig, ProviderCachePolicy};
 use astra_turn_core::pipeline_session::{PipelineSession, TurnInput};
-use astra_turn_core::pipeline_session_serde::{deserialize_stats, serialize_stats};
+use astra_turn_core::pipeline_session_serde::restore_or_new_with_current_date;
 use astra_turn_core::recovery_state::RecoveryState;
 use astra_turn_core::token_accounting::TokenAccounting;
 
@@ -125,21 +125,21 @@ fn ten_turn_session_lifecycle() {
 }
 
 #[test]
-fn warm_start_from_serialized_stats() {
+fn warm_start_from_serialized_snapshot() {
     let config = PipelineConfig {
         provider_policy: ProviderCachePolicy::anthropic(),
     };
 
-    let mut first_session = PipelineSession::new(config.clone());
+    let mut first_session = PipelineSession::new_with_current_date(config.clone(), "2026-05-25");
     for _ in 1..=5 {
         let mut feedback = ContextFeedback::from_usage(0, 900, 100, 400, false);
         first_session.record_feedback("claude-sonnet-4-6", "repl", &mut feedback, None);
     }
 
-    let bytes = serialize_stats(&first_session.stats).expect("serialization should succeed");
-    let restored_stats = deserialize_stats(&bytes).expect("deserialization should succeed");
-
-    let second_session = PipelineSession::with_warm_stats(config, restored_stats, "2026-05-25");
+    let snapshot = serde_json::to_value(first_session.snapshot_full_state()).unwrap();
+    let second_session = restore_or_new_with_current_date(config, Some(&snapshot), "2030-01-01");
+    assert_eq!(second_session.turns_completed(), 5);
+    assert_eq!(second_session.current_date(), "2026-05-25");
     assert_eq!(second_session.stats.turns_executed, 5);
     assert!(second_session.stats.avg_cache_hit_ratio > 0.8);
 }
@@ -211,7 +211,7 @@ fn response_token_estimator_improves_over_turns() {
 }
 
 #[test]
-fn full_lifecycle_with_emergent_and_latches() {
+fn full_lifecycle_with_feedback_and_latches() {
     use astra_turn_core::pipeline_session::AdaptiveTurnInput;
     use astra_turn_core::section_types::CacheScope;
 
@@ -256,18 +256,8 @@ fn full_lifecycle_with_emergent_and_latches() {
         .expect("turn 1 should succeed");
     assert_eq!(output1.metrics.turn_index, 1);
 
-    // Simulate: during turn 1 execution, we discover a skill and prefetch memory
-    sess.push_emergent_skill("debug", "error detected in tool output", 1);
-    sess.push_emergent_memory("Related: user debugged similar issue last week", 0.85, 1);
-
     let mut feedback1 = ContextFeedback::from_usage(0, 900, 100, 400, false);
     sess.record_feedback("claude-sonnet-4-6", "repl", &mut feedback1, Some(&output1));
-
-    // Turn 2: emergent context should be available (not empty)
-    assert!(
-        !sess.emergent.is_empty(),
-        "emergent should have items from turn 1"
-    );
 
     let turn2 = make_turn_state(2, 4);
     let input2 = AdaptiveTurnInput {
@@ -324,8 +314,13 @@ fn full_lifecycle_with_emergent_and_latches() {
     );
 
     // Verify warm start preservation
-    let bytes = serialize_stats(&sess.stats).unwrap();
-    let restored = deserialize_stats(&bytes).unwrap();
-    assert_eq!(restored.turns_executed, 3);
-    assert!((restored.avg_cache_hit_ratio - sess.stats.avg_cache_hit_ratio).abs() < 1e-9);
+    let snapshot = serde_json::to_value(sess.snapshot_full_state()).unwrap();
+    let mut restored =
+        restore_or_new_with_current_date(sess.config().clone(), Some(&snapshot), "2030-01-01");
+    assert_eq!(restored.stats.turns_executed, 3);
+    assert_eq!(restored.turns_completed(), 3);
+    assert_eq!(restored.current_date(), sess.current_date());
+    assert!((restored.stats.avg_cache_hit_ratio - sess.stats.avg_cache_hit_ratio).abs() < 1e-9);
+    assert!(!restored.latch_cache_scope(CacheScope::Session, 4));
+    assert!(!restored.latch_header("anthropic-beta", "different-value", 4));
 }

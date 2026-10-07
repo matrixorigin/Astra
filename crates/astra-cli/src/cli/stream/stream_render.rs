@@ -1226,10 +1226,6 @@ pub(crate) struct EdgeSseContext<'a> {
     pub ask_user_request_tx: Option<chat_stream::AskUserRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls in the SSE stream.
     pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
-    /// When true, this is a continuation turn after a skill has already produced output.
-    /// Text is buffered (not streamed) and thinking previews are suppressed to avoid
-    /// intermediate noise between skill iterations.
-    pub skill_continuation: bool,
     /// When true, the whole turn becomes a deterministic rollback-on-failure boundary.
     pub turn_rollback_on_failure: bool,
     /// Cross-turn tool output cache (persists across turns via `CliAgenticLoopHost`).
@@ -1750,8 +1746,7 @@ impl<'a> CliSseStreamHost<'a> {
         render_md: bool,
         auth_profile: Option<&'a str>,
     ) -> Self {
-        let suppress_reasoning =
-            ctx.render_policy == RenderPolicy::Silent || ctx.skill_continuation;
+        let suppress_reasoning = ctx.render_policy == RenderPolicy::Silent;
         let active_turn_rollback = ctx.turn_rollback_on_failure.then(|| ActiveTurnRollback {
             turn_index: ctx
                 .executor
@@ -3285,8 +3280,6 @@ impl<'a> CliSseStreamHost<'a> {
         results
     }
 }
-
-// `extract_first_absolute_path` moved to `crate::sandbox_retry`.
 
 impl CliSseStreamHost<'_> {
     fn effective_tool_cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
@@ -8800,7 +8793,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut cache,
                 incremental_state: None,
@@ -8887,7 +8879,6 @@ mod tests {
                     approval_request_tx: None,
                     ask_user_request_tx: None,
                     skill_resolver: None,
-                    skill_continuation: false,
                     turn_rollback_on_failure: false,
                     tool_cache: &mut tool_cache,
                     incremental_state: None,
@@ -9114,7 +9105,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -9209,7 +9199,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -9437,7 +9426,6 @@ mod tests {
             approval_request_tx: None,
             ask_user_request_tx: None,
             skill_resolver: None,
-            skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
             incremental_state: None,
@@ -10125,7 +10113,6 @@ mod tests {
             approval_request_tx: None,
             ask_user_request_tx: None,
             skill_resolver: None,
-            skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
             incremental_state: None,
@@ -11076,7 +11063,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -11505,7 +11491,6 @@ mod tests {
                         approval_request_tx: Some(approval_tx),
                         ask_user_request_tx: None,
                         skill_resolver: None,
-                        skill_continuation: false,
                         turn_rollback_on_failure: false,
                         tool_cache: &mut tool_cache,
                         incremental_state: None,
@@ -11579,7 +11564,6 @@ mod tests {
                 approval_request_tx: Some(approval_tx),
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -11671,7 +11655,6 @@ mod tests {
                 approval_request_tx: Some(approval_tx),
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -11745,7 +11728,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -11816,7 +11798,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -11882,7 +11863,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -12003,7 +11983,6 @@ mod tests {
                     approval_request_tx: None,
                     ask_user_request_tx: None,
                     skill_resolver: None,
-                    skill_continuation: false,
                     turn_rollback_on_failure: false,
                     tool_cache: cache,
                     incremental_state: None,
@@ -12449,7 +12428,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: Some(incremental.clone()),
@@ -12651,7 +12629,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -12734,7 +12711,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -12815,7 +12791,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -12897,7 +12872,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -12948,7 +12922,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: Some(incremental_state.clone()),
@@ -13082,7 +13055,6 @@ mod tests {
                         approval_request_tx: Some(approval_tx),
                         ask_user_request_tx: None,
                         skill_resolver: None,
-                        skill_continuation: false,
                         turn_rollback_on_failure: false,
                         tool_cache: &mut tool_cache,
                         incremental_state: None,
@@ -13210,7 +13182,6 @@ mod tests {
                     approval_request_tx: Some(approval_tx),
                     ask_user_request_tx: None,
                     skill_resolver: None,
-                    skill_continuation: false,
                     turn_rollback_on_failure: false,
                     tool_cache: &mut tool_cache,
                     incremental_state: None,
@@ -13303,7 +13274,6 @@ mod tests {
                     approval_request_tx: Some(approval_tx),
                     ask_user_request_tx: None,
                     skill_resolver: None,
-                    skill_continuation: false,
                     turn_rollback_on_failure: false,
                     tool_cache: &mut tool_cache,
                     incremental_state: None,
@@ -13460,7 +13430,6 @@ mod tests {
             approval_request_tx: None,
             ask_user_request_tx: None,
             skill_resolver: None,
-            skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
             incremental_state: None,
@@ -13548,7 +13517,6 @@ mod tests {
             approval_request_tx: None,
             ask_user_request_tx: None,
             skill_resolver: None,
-            skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
             incremental_state: None,
@@ -13916,10 +13884,6 @@ mod tests {
         assert_eq!(got2.as_ref(), embedded.trim());
     }
 
-    // extract_first_absolute_path moved to crate::sandbox_retry — its
-    // tests live there now as part of the TDD coverage for the shared
-    // SANDBOX_DENIED retry path.
-
     // ── style_tool_description tests ──
 
     #[test]
@@ -14226,7 +14190,7 @@ mod tests {
         };
 
         let rendered = format_terminal_tool_summary("str_replace", &summary, false);
-        let plain = crate::cli::theme::strip_ansi(&rendered);
+        let plain = crate::cli::terminal_region::strip_ansi_codes(&rendered);
         let rows = plain.lines().collect::<Vec<_>>();
 
         assert_eq!(rows[1].trim(), "1 - old");
@@ -14741,7 +14705,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut cache,
                 incremental_state: None,
@@ -14822,7 +14785,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -15052,7 +15014,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -15162,7 +15123,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -15264,7 +15224,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -15382,7 +15341,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -15471,7 +15429,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -15587,7 +15544,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -15723,7 +15679,6 @@ mod tests {
                 ask_user_request_tx: None,
                 approval_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -16068,7 +16023,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -16189,7 +16143,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -16299,7 +16252,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -16395,7 +16347,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -16501,7 +16452,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -16617,7 +16567,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -16757,7 +16706,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -16871,7 +16819,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -16971,7 +16918,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -17091,7 +17037,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -17177,7 +17122,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -17288,7 +17232,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,
@@ -17393,7 +17336,6 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
                 incremental_state: None,

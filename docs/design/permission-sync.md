@@ -17,6 +17,12 @@ This document owns:
 
 Safety policy belongs to [safety-and-permissions.md](safety-and-permissions.md). Provider routing belongs to [capability-system.md](capability-system.md).
 
+The CLI permission manager owns root interaction approvals and exports scoped
+permissions to the runtime. Child execution receives that envelope through the
+canonical runtime permission context and gate, including fingerprint validation,
+deny rules and the immutable read-only ceiling. The unconnected CLI child-manager
+constructor and its separate inheritance receiver are retired.
+
 ## Principle
 
 ```text

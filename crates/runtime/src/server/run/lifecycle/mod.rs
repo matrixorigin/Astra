@@ -1407,78 +1407,6 @@ impl DurableHostInteractionSink {
 
 #[async_trait]
 impl server_loop_host::HostInteractionSink for DurableHostInteractionSink {
-    #[cfg(test)]
-    async fn commit_and_deliver(&self, mut event: Value) -> Result<(), String> {
-        let event_object = event
-            .as_object_mut()
-            .ok_or_else(|| "interaction event must be an object".to_string())?;
-        event_object
-            .entry("run_id".to_string())
-            .or_insert_with(|| Value::String(self.run_id.clone()));
-        event_object
-            .entry("session_id".to_string())
-            .or_insert_with(|| Value::String(self.session_id.clone()));
-        if let Some(agent_id) = &self.agent_id {
-            event_object
-                .entry("agent_id".to_string())
-                .or_insert_with(|| Value::String(agent_id.clone()));
-        }
-
-        if canonical_edge_tool_request(&event).is_some() {
-            return Err(
-                "Edge tool requests require guarded action admission in the same transaction"
-                    .to_string(),
-            );
-        }
-        if event.get("type").and_then(Value::as_str) == Some("approval_batch_required") {
-            return Err("each durable approval wait must contain exactly one request".to_string());
-        }
-        let durable_events = canonical_edge_approval_requests(&event);
-        if durable_events.is_empty() {
-            return Err("interaction event has no durable canonical form".to_string());
-        }
-        if durable_events.len() != 1 {
-            return Err("each durable approval wait must contain exactly one request".to_string());
-        }
-        let committed = self
-            .run_engine
-            .transition_status_with_events_if_current(
-                &self.user_id,
-                &self.session_id,
-                &self.run_id,
-                &[STATUS_RUNNING],
-                STATUS_WAITING,
-                Some("tool_approval"),
-                None,
-                &durable_events,
-            )
-            .await
-            .map_err(|error| format!("interaction persistence failed: {error}"))?;
-        if !committed {
-            return Err(format!(
-                "run {} cannot enter a durable approval wait from its current state",
-                self.run_id
-            ));
-        }
-
-        let event_object = event
-            .as_object_mut()
-            .ok_or_else(|| "interaction event must remain an object".to_string())?;
-        event_object.insert(
-            HOST_INTERACTION_COMMITTED_FIELD.to_string(),
-            Value::Bool(true),
-        );
-        if let Some(event_tx) = &self.event_tx
-            && event_tx.send(event).await.is_err()
-        {
-            tracing::debug!(
-                run_id = %self.run_id,
-                "durable interaction committed after live observer detached"
-            );
-        }
-        Ok(())
-    }
-
     async fn commit_approval_batch_and_deliver(
         &self,
         mut event: Value,
@@ -1810,13 +1738,6 @@ fn should_restore_prior_prompt_history(
     session_has_prior_prompt_history: bool,
 ) -> bool {
     request_targets_existing_session && session_has_prior_prompt_history
-}
-
-fn should_build_session_resume_hydration_hint(
-    restore_prior_prompt_history: bool,
-    prompt_message_count: usize,
-) -> bool {
-    restore_prior_prompt_history && prompt_message_count <= 1
 }
 
 fn should_hydrate_degraded_session_resume(
@@ -5141,12 +5062,29 @@ struct OwnedBackgroundExecution {
     execution_lease_lost: Arc<AtomicBool>,
     descendant_spawner: Arc<DynamicAgentSpawner>,
     /// Existing stream bridge resources; background execution allocates none.
-    event_tx: Option<mpsc::Sender<Value>>,
-    fanout_control_tx: Option<mpsc::Sender<DurableLiveFanoutControl>>,
-    durable_tool_terminals: Option<DurableToolTerminalTracker>,
-    host_event_bridge: Option<tokio::task::JoinHandle<()>>,
-    host_event_gap: Option<server_loop_host::HostEventGapTracker>,
-    progress_bridge: Option<AgentProgressStreamBridge>,
+    delivery: Option<OwnedStreamDelivery>,
+}
+
+/// Live delivery resources travel together with their execution owner.
+/// They do not decide admission, cancellation, or terminal status.
+struct OwnedStreamDelivery {
+    event_tx: mpsc::Sender<Value>,
+    fanout_control_tx: mpsc::Sender<DurableLiveFanoutControl>,
+    durable_tool_terminals: DurableToolTerminalTracker,
+    host_event_bridge: tokio::task::JoinHandle<()>,
+    host_event_gap: server_loop_host::HostEventGapTracker,
+    progress_bridge: AgentProgressStreamBridge,
+    agent_live_gap_tracker: WorkSurfaceAgentLiveGapTracker,
+}
+
+enum NewRunPreparation {
+    Owned {
+        execution: Box<OwnedBackgroundExecution>,
+        event_rx: Option<mpsc::Receiver<Value>>,
+    },
+    Existing {
+        run_id: String,
+    },
 }
 
 #[derive(Clone)]
@@ -8655,9 +8593,15 @@ impl AgenticRunLifecycleService {
                     bindings.executor.kind != ExecutorBindingKind::ServerLocal
                         || bindings.executor.transport != ToolTransportKind::ServerLocal
                 }
-                None => request.executor_binding.as_ref().is_some_and(|binding| {
-                    binding.kind != astra_services::runs::ExecutorBindingRequestKind::ServerLocal
-                }),
+                None => {
+                    request.executor_binding.as_ref().is_some_and(|binding| {
+                        binding.kind
+                            != astra_services::runs::ExecutorBindingRequestKind::ServerLocal
+                    }) || request.workspace_binding.as_ref().is_some_and(|binding| {
+                        binding.kind
+                            == astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace
+                    })
+                }
             } {
                 RuntimeCapabilitySource::BoundExecutor
             } else {
@@ -8819,49 +8763,6 @@ impl AgenticRunLifecycleService {
         };
         runs.write().await.remove(run_id);
         committed.then_some(terminal_events)
-    }
-
-    async fn fail_started_run_before_spawn(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        execution_owner_generation: u64,
-        message: &str,
-        failure_code: PreSpawnFailureCode,
-    ) {
-        let _ = Self::fail_started_run_before_spawn_with_handles(
-            &self.run_engine,
-            &self.runs,
-            user_id,
-            expected_session_id,
-            run_id,
-            execution_owner_generation,
-            message,
-            failure_code,
-        )
-        .await;
-    }
-
-    async fn fail_claimed_idempotent_run_before_spawn(
-        &self,
-        execution_owner_generation: Option<u64>,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        message: &str,
-    ) {
-        if let Some(execution_owner_generation) = execution_owner_generation {
-            self.fail_started_run_before_spawn(
-                user_id,
-                expected_session_id,
-                run_id,
-                execution_owner_generation,
-                message,
-                PreSpawnFailureCode::PreSpawnFailure,
-            )
-            .await;
-        }
     }
 
     fn durable_run_accounting(loop_state: &AgenticLoopState) -> Value {
@@ -14053,43 +13954,6 @@ impl AgenticRunLifecycleService {
         Ok(Self::extract_edge_context(request)?.edge_profile.to_map())
     }
 
-    /// Provision a cloud workspace record for orchestrator-managed workspaces.
-    async fn provision_cloud_workspace_record(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        request: &ChatRequestData,
-        run_id: &str,
-    ) -> Result<Option<RuntimeWorkspaceRecord>, (StatusCode, Json<ErrorResponse>)> {
-        let Some(provision_request) =
-            cloud_workspace_provision_request_from_request(request, run_id)?
-        else {
-            return Ok(None);
-        };
-        let record = CloudWorkspaceProvisioner::from_env()
-            .provision(provision_request)
-            .await
-            .map_err(cloud_workspace_provision_error)?;
-        if let Err(error) = self
-            .persist_workspace_record(user_id, session_id, run_id, &record)
-            .await
-        {
-            self.cleanup_cloud_workspace_after_failed_start(
-                user_id,
-                session_id,
-                run_id,
-                &record,
-                format!(
-                    "workspace record persistence failed before orchestrator binding: {}",
-                    error.1.0.detail
-                ),
-            )
-            .await;
-            return Err(error);
-        }
-        Ok(Some(record))
-    }
-
     async fn persist_workspace_record(
         &self,
         user_id: &str,
@@ -14441,24 +14305,7 @@ impl AgenticRunLifecycleService {
     }
 
     fn durable_status_record(run: &DurableRunRecord) -> RunStatusRecord {
-        let mut binding = Self::durable_run_execution_binding_snapshot(run);
-        // A server-local run has a canonical execution boundary even when an
-        // older durable row predates the explicit binding snapshot events.
-        // Keep list/status projections consistent without allowing later
-        // runtime metadata to rebind a run that already has a real snapshot.
-        if binding.workspace.is_none() && binding.executor.is_none() {
-            binding.workspace = Some(json!({
-                "kind": "none",
-                "cwd": null,
-                "authority": "none"
-            }));
-            binding.executor = Some(json!({
-                "kind": "server_local",
-                "executor_id": "server-control-plane",
-                "transport": "server_local"
-            }));
-            binding.transport = Some("server_local".to_string());
-        }
+        let binding = Self::durable_run_execution_binding_snapshot(run);
         let accounting = run
             .events
             .iter()
@@ -15394,13 +15241,26 @@ impl AgenticRunLifecycleService {
             llm_cancel_token,
             execution_lease_lost,
             descendant_spawner,
+            delivery,
+        } = execution;
+        let (
             event_tx,
             fanout_control_tx,
             durable_tool_terminals,
             mut host_event_bridge,
             host_event_gap,
             mut progress_bridge,
-        } = execution;
+        ) = match delivery {
+            Some(delivery) => (
+                Some(delivery.event_tx),
+                Some(delivery.fanout_control_tx),
+                Some(delivery.durable_tool_terminals),
+                Some(delivery.host_event_bridge),
+                Some(delivery.host_event_gap),
+                Some(delivery.progress_bridge),
+            ),
+            None => (None, None, None, None, None, None),
+        };
         let mut state = loop_state;
         let execution_start_tokens = state.provider_total_tokens();
         let streaming = event_tx.is_some();
@@ -16858,785 +16718,16 @@ impl AgenticRunLifecycleService {
     }
 }
 
-#[async_trait]
-impl RunLifecycleService for AgenticRunLifecycleService {
-    fn workspace_executor_id(&self) -> Option<&str> {
-        self.selected_server_workspace_provider
-            .as_ref()
-            .map(ServerWorkspaceProvisioner::executor_id)
-    }
-
-    fn resolve_server_workspace(
-        &self,
-        record: &astra_runtime_env::WorkspaceRecord,
-    ) -> Result<PathBuf, astra_runtime_env::WorkspaceProvisionError> {
-        self.selected_server_workspace_provider
-            .as_ref()
-            .ok_or_else(|| {
-                astra_runtime_env::WorkspaceProvisionError::unavailable(
-                    &record.workspace_id,
-                    "No local workspace provider is selected",
-                )
-            })?
-            .resolve_existing(record)
-            .map_err(crate::server::run::workspace_provisioning::server_error_to_workspace_error)
-    }
-
-    fn execution_owner_pod_id(&self) -> Option<&str> {
-        self.run_engine.execution_owner_pod_id()
-    }
-
-    /// Create a run (background mode): spawns the agentic loop in a task, returns immediately.
-    async fn create_run(
+impl AgenticRunLifecycleService {
+    async fn prepare_new_owned_execution(
         &self,
         user_id: String,
         request: ChatRequestData,
-    ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        start_identity: Option<RunStartIdempotency>,
+        streaming: bool,
+    ) -> Result<NewRunPreparation, (StatusCode, Json<ErrorResponse>)> {
         self.require_invocation_composition()?;
         let request = self.prepare_chat_request(&user_id, request).await?;
-        let request_constraints = self
-            .validate_request_constraints(&user_id, &request)
-            .await?;
-        let mut request = request;
-        Self::install_agent_binding_runtime_forward_headers(&mut request)?;
-
-        // ── Resource governance check (Phase 5) ─────────────────────
-        if let Some(ref gov) = self.resource_governor {
-            if let astra_services::resource_governor::LimitCheck::Denied { limit, reason } =
-                gov.check_run_start(&user_id).await
-            {
-                return Err(per_user_run_quota_response(limit, reason));
-            }
-        }
-
-        let run_id = request
-            .conversation_authority
-            .as_ref()
-            .map(|authority| authority.run_id.clone())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let session_id = request
-            .session_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let active_personal_skills =
-            load_active_personal_skills(self.shared_pool.as_ref(), &user_id, &session_id).await?;
-        let work_runtime_binding = self
-            .validate_work_runtime_binding(&user_id, &session_id, &request)
-            .await?;
-        let runtime_capabilities = self
-            .prepare_runtime_capabilities(&user_id, &request, &request_constraints)
-            .await?;
-        self.bind_execution_selection(
-            &user_id,
-            &session_id,
-            &mut request,
-            work_runtime_binding.as_ref(),
-        )
-        .await?;
-
-        let agent_binding_mode = request.has_agent_binding_runtime();
-        let edge_context = Self::extract_edge_context(&request)?;
-        let edge_tools = edge_context.edge_tools.clone();
-        let server_service_tool_catalog_enabled =
-            Self::server_service_tool_catalog_enabled_for_request(
-                agent_binding_mode,
-                edge_context.has_tools(),
-            );
-        let mut edge_profile =
-            Self::edge_profile_with_skill_listing(&edge_context, &request_constraints);
-        Self::apply_agent_binding_prompt_context(
-            &mut edge_profile,
-            runtime_capabilities.agent_binding.as_ref(),
-            request.stable_runtime_system_prompt.as_deref(),
-            request.runtime_system_prompt.as_deref(),
-            request.context.as_ref(),
-            request.admitted_agent_profiles.as_deref(),
-        )?;
-        if let Some(binding) = work_runtime_binding.as_ref() {
-            crate::server::work_context::install_canonical_work_context(
-                &mut edge_profile,
-                binding.context_payload.clone(),
-            );
-        }
-
-        // Guard: reject if this session already has a blocking run.
-        // Hold write lock across check+insert to prevent TOCTOU race.
-        let (run_state, cancel_flag, pause_flag, llm_cancel_token, execution_lease_lost) =
-            Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
-        {
-            let mut runs = self.runs.write().await;
-            let has_active = Self::session_has_blocking_run(&runs, &user_id, &session_id);
-            if has_active {
-                // Start-rejection: no run was admitted, so this must flow
-                // through the client's pre-admission-rejection contract
-                // (`admission_state: "rejected"`) rather than ordinary failed-
-                // turn settlement.
-                return Err(error_response_coded_with_metadata(
-                    StatusCode::CONFLICT,
-                    "session already has an active run",
-                    SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE,
-                    json!({"admission_state": "rejected"}),
-                ));
-            }
-            runs.insert(run_id.clone(), run_state);
-        }
-
-        // Provision explicit workspace bindings only after start ownership is
-        // established. They feed initial state and are persisted before any
-        // binding event is delivered to the client.
-        let cloud_workspace_record = match self
-            .provision_cloud_workspace_record(&user_id, &session_id, &request, &run_id)
-            .await
-        {
-            Ok(record) => record,
-            Err(error) => {
-                self.runs.write().await.remove(&run_id);
-                return Err(error);
-            }
-        };
-        let cloud_execution_bindings = cloud_workspace_record
-            .as_ref()
-            .map(|record| execution_bindings_from_workspace_record(record));
-        let cloud_workspace = cloud_workspace_record
-            .as_ref()
-            .map(|record| PathBuf::from(&record.root_or_volume_ref));
-
-        let server_workspace =
-            if cloud_workspace_record.is_none() && request_uses_server_workspace(&request) {
-                match self
-                    .provision_persisted_server_workspace(&user_id, &session_id, &run_id)
-                    .await
-                {
-                    Ok(workspace) => Some(workspace),
-                    Err(error) => {
-                        self.runs.write().await.remove(&run_id);
-                        return Err(error);
-                    }
-                }
-            } else {
-                None
-            };
-        let mut execution_bindings = cloud_execution_bindings
-            .or_else(|| {
-                server_workspace.as_deref().map(|workspace| {
-                    let (workspace, executor) =
-                        resolve_request_execution_bindings(&request, workspace);
-                    ExecutionBindingSnapshot::inferred(workspace, executor)
-                })
-            })
-            .or_else(|| {
-                resolve_request_execution_bindings_without_server_workspace(
-                    &request,
-                    &edge_context.edge_profile,
-                )
-                .map(|(workspace, executor)| {
-                    ExecutionBindingSnapshot::inferred(workspace, executor)
-                })
-            });
-        if let Some(generation) = request.execution_binding_generation {
-            let Some(snapshot) = execution_bindings.as_mut() else {
-                self.runs.write().await.remove(&run_id);
-                return Err(error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Work execution provider could not be materialized",
-                    "execution_binding_unavailable",
-                ));
-            };
-            snapshot.execution_binding_generation = Some(generation);
-        }
-        if let Err(error) = self
-            .validate_optional_tool_availability(
-                &user_id,
-                &request_constraints,
-                execution_bindings.as_ref(),
-            )
-            .await
-        {
-            self.runs.write().await.remove(&run_id);
-            if let Some(record) = cloud_workspace_record.as_ref() {
-                self.cleanup_cloud_workspace_after_failed_start(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    record,
-                    "enabled optional tools became unavailable before run start".to_string(),
-                )
-                .await;
-            }
-            return Err(error);
-        }
-        let tool_runtime_workspace = cloud_workspace.clone().or_else(|| server_workspace.clone());
-        if let Some(binding) = work_runtime_binding.as_ref()
-            && let Some(pool) = self.shared_pool.clone()
-            && let Err(error) =
-                Self::invalidate_work_subject_before_execution(pool, binding, &run_id).await
-        {
-            self.runs.write().await.remove(&run_id);
-            return Err(work_subject_invalidation_response(error));
-        }
-        let server_tool_executor_workspace = if let Some(workspace) = tool_runtime_workspace.clone()
-        {
-            Some(workspace)
-        } else {
-            // Server-owned services are available in every execution topology.
-            // An edge binding owns workspace/process execution, while this
-            // private scratch workspace lets the server execute its durable
-            // control-plane handlers without borrowing the edge workspace.
-            match self.provision_server_workspace(&session_id) {
-                Ok(workspace) => Some(workspace),
-                Err(error) => {
-                    self.runs.write().await.remove(&run_id);
-                    return Err(error);
-                }
-            }
-        };
-
-        let execution_owner_generation = match self
-            .persist_run_start(
-                &run_id,
-                &user_id,
-                &session_id,
-                &request,
-                execution_bindings.as_ref(),
-                runtime_capabilities.agent_binding.as_ref(),
-                work_runtime_binding.as_ref(),
-                None,
-                RunStartPersistenceMode::Insert,
-            )
-            .await
-        {
-            Ok(DurableRunStartClaim::Started { owner_generation }) => owner_generation,
-            Ok(other) => unreachable!("insert-only run start returned {other:?}"),
-            Err(error) => {
-                self.runs.write().await.remove(&run_id);
-                if let Some(record) = cloud_workspace_record.as_ref() {
-                    self.cleanup_cloud_workspace_after_failed_start(
-                        &user_id,
-                        &session_id,
-                        &run_id,
-                        record,
-                        format!(
-                            "durable run start failed after cloud workspace provisioning: {}",
-                            error.1.0.detail
-                        ),
-                    )
-                    .await;
-                }
-                return Err(error);
-            }
-        };
-        let execution_authority_confirmation = self
-            .run_engine
-            .confirm_execution_authority(
-                &user_id,
-                &session_id,
-                &run_id,
-                execution_owner_generation,
-                llm_cancel_token.as_ref(),
-            )
-            .await;
-        let confirmed_authority = match execution_authority_confirmation {
-            Ok(ExecutionAuthorityConfirmation::Confirmed(confirmed)) => confirmed,
-            failed => {
-                self.runs.write().await.remove(&run_id);
-                if let Some(record) = cloud_workspace_record.as_ref() {
-                    self.cleanup_cloud_workspace_after_failed_start(
-                        &user_id,
-                        &session_id,
-                        &run_id,
-                        record,
-                        "durable execution authority could not be confirmed before activation"
-                            .to_string(),
-                    )
-                    .await;
-                }
-                return match failed {
-                    Ok(ExecutionAuthorityConfirmation::Superseded) => {
-                        Err(execution_authority_not_current_response(
-                            "before_activation",
-                            &user_id,
-                            &session_id,
-                            &run_id,
-                            execution_owner_generation,
-                        ))
-                    }
-                    Err(error) => Err(error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to confirm durable execution authority: {error}"),
-                    )),
-                    Ok(ExecutionAuthorityConfirmation::Confirmed(_)) => {
-                        unreachable!("matched above")
-                    }
-                };
-            }
-        };
-        let owner_lease_heartbeat = self.run_engine.start_owner_lease_heartbeat(
-            user_id.clone(),
-            session_id.clone(),
-            run_id.clone(),
-            execution_owner_generation,
-            confirmed_authority,
-            execution_lease_lost.clone(),
-            llm_cancel_token.clone(),
-        );
-
-        // Spawn background agentic loop.
-        // Load plan state as structured data: prompt hint for context, plus
-        // an independent authoring flag for the tool gate. Ordinary session
-        // resume context must not activate plan-mode blocking.
-        let plan_resume_snapshot = self
-            .plan_resume_snapshot_for_request(&request, &user_id, &session_id)
-            .await;
-        let plan_snapshot_resume_hint = plan_resume_snapshot.prompt_hint;
-        let plan_resume_hint = plan_snapshot_resume_hint.clone();
-        let plan_authoring_active = plan_resume_snapshot.authoring_active;
-        let mut host = self.build_host(
-            &user_id,
-            &session_id,
-            &run_id,
-            &request,
-            edge_tools,
-            edge_profile.clone(),
-            server_service_tool_catalog_enabled,
-            !agent_binding_mode,
-            execution_bindings.as_ref(),
-            plan_resume_hint,
-            plan_authoring_active,
-            work_runtime_binding.as_ref(),
-        );
-        let interaction_sink: Arc<dyn server_loop_host::HostInteractionSink> =
-            Arc::new(DurableHostInteractionSink {
-                run_engine: self.run_engine.clone(),
-                user_id: user_id.clone(),
-                run_id: run_id.clone(),
-                session_id: session_id.clone(),
-                agent_id: None,
-                event_tx: None,
-            });
-        host.set_interaction_sink(Arc::clone(&interaction_sink));
-        if let Some(snapshot) = execution_bindings.as_ref() {
-            host.set_execution_metadata(Value::Object(binding_snapshot_fields(snapshot)));
-        }
-        if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
-            host.install_runtime_tool_schemas_with_native_ids(
-                bundle.schemas.clone(),
-                bundle.control_tools.clone(),
-                bundle.native_tool_ids_by_public_name(),
-            );
-            host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
-        }
-        // In agent-binding mode with an EdgeAgent executor, the host only installs
-        // MCP schemas by default. Merge edge-builtin tool schemas (bash, read_file, …)
-        // for any tools explicitly listed in allow_tools so the model can see and call
-        // them via the edge dispatch path.
-        if let Some(snapshot) = execution_bindings.as_ref() {
-            if snapshot.executor.kind == ExecutorBindingKind::EdgeAgent {
-                if let Some(allow_tools) = request.allow_tools.as_deref() {
-                    let tools: Vec<String> = allow_tools.iter().map(|s| s.to_string()).collect();
-                    host.merge_allowlisted_edge_tool_schemas(&tools);
-                }
-            }
-        }
-        let canonical_turn = match self
-            .prepare_canonical_turn(
-                &user_id,
-                &session_id,
-                &run_id,
-                &request,
-                (*llm_cancel_token).clone(),
-            )
-            .await
-        {
-            Ok(admission) => admission,
-            Err(error) => {
-                self.fail_started_run_before_spawn(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    execution_owner_generation,
-                    "canonical turn admission failed",
-                    PreSpawnFailureCode::PreSpawnFailure,
-                )
-                .await;
-                if let Some(record) = cloud_workspace_record.as_ref() {
-                    self.cleanup_cloud_workspace_after_failed_start(
-                        &user_id,
-                        &session_id,
-                        &run_id,
-                        record,
-                        "canonical turn admission failed".to_string(),
-                    )
-                    .await;
-                }
-                return Err(error);
-            }
-        };
-        let restore_prior_prompt_history = should_restore_prior_prompt_history(
-            request.session_id.is_some(),
-            match canonical_turn.as_ref() {
-                Some(admission) if admission.had_canonical_head => true,
-                _ => {
-                    self.session_has_prior_prompt_history(&user_id, &session_id)
-                        .await
-                }
-            },
-        );
-        let mut loop_state = self.build_initial_state_inner(
-            &user_id,
-            &request,
-            &session_id,
-            &run_id,
-            tool_runtime_workspace
-                .as_deref()
-                .or(server_workspace.as_deref()),
-            execution_bindings.as_ref(),
-            Some(llm_cancel_token.clone()),
-            Some(execution_lease_lost.clone()),
-            Some(Arc::clone(&interaction_sink)),
-            request_constraints.clone(),
-            &edge_context,
-            Some(&edge_profile),
-            &runtime_capabilities,
-            Some(execution_owner_generation),
-        )?;
-        install_active_personal_skills(&mut loop_state, active_personal_skills);
-        bind_execution_owner_generation(&mut loop_state, execution_owner_generation);
-        loop_state.runtime_manifest = Self::build_runtime_manifest(
-            &request,
-            &runtime_capabilities,
-            tool_runtime_workspace.is_some(),
-        )?;
-        // Inject user_id into the harness sink used by DB-persistence tests.
-        #[cfg(feature = "harness")]
-        loop_state.harness.set_user_id(&user_id);
-
-        loop_state.session_turn = match canonical_turn.as_ref() {
-            Some(admission) => admission.reservation.reserved_turn,
-            None => infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await,
-        };
-        if let Some(admission) = canonical_turn.as_ref() {
-            loop_state.initialize_provider_canonical_wal_base(&admission.prior_messages);
-            host.bind_execution_handoff(
-                self.execution_handoff_requested.clone(),
-                self.run_engine.clone(),
-                admission.reservation.clone(),
-                request.message.clone(),
-            );
-        }
-        if let Some(admission) = canonical_turn.as_ref()
-            && admission.had_canonical_head
-        {
-            let mut messages = admission.prior_messages.clone();
-            messages.append(&mut loop_state.messages);
-            loop_state.messages = messages;
-            if let Some(base) = admission.reservation.expected_cursor.as_ref() {
-                loop_state.initialize_canonical_rewrite_proof(
-                    &admission.prior_messages,
-                    &base.canonical_root_hash,
-                    base.compaction_generation,
-                );
-            }
-        }
-        self.configure_host_approval_audit_context(
-            &mut host,
-            &user_id,
-            &session_id,
-            &run_id,
-            loop_state.session_turn,
-        );
-        let fresh_session_current_date = loop_state
-            .pipeline_session
-            .as_ref()
-            .map(|session| session.current_date().to_string())
-            .unwrap_or_else(|| {
-                crate::turn::session_current_date::resolve_session_current_date_for_user(
-                    &user_id,
-                    &session_id,
-                )
-            });
-
-        // ── Runtime warm-start: restore loop state from checkpoint ──
-        // Overwrites fresh advisory state with checkpointed pipeline,
-        // compaction, and context-window counters. Without this, server-side
-        // session resume starts cold even though finalization persisted the
-        // state needed for long-running sessions.
-        if restore_prior_prompt_history {
-            if let Ok(Some(restored)) =
-                astra_pipeline::step_restore::restore_session(&user_id, &session_id)
-            {
-                restore_step_checkpoint_runtime_state(
-                    restored,
-                    &fresh_session_current_date,
-                    &mut loop_state,
-                )
-                .map_err(|error| {
-                    error_response_coded(
-                        StatusCode::CONFLICT,
-                        &error.message,
-                        "execution_reconstruction_required",
-                    )
-                })?;
-            }
-        }
-
-        // ── CSL: Load conversation history from the log ─────────────
-        let csl_manager = if restore_prior_prompt_history
-            && canonical_turn
-                .as_ref()
-                .is_none_or(|admission| !admission.had_canonical_head)
-        {
-            self.restore_csl_history(&user_id, &session_id, &run_id, &mut loop_state)
-                .await
-        } else {
-            None
-        };
-
-        if should_build_session_resume_hydration_hint(
-            restore_prior_prompt_history,
-            loop_state.messages.len(),
-        ) {
-            let session_resume_hint = self
-                .session_resume_hydration_hint_for_session(&user_id, &session_id, &run_id, true)
-                .await;
-            let merged_hint = astra_turn_core::resume_hydration::merge_resume_hints(
-                session_resume_hint,
-                plan_snapshot_resume_hint,
-            );
-            match host.plan_resume_hint_handle().write() {
-                Ok(mut hint) => *hint = merged_hint,
-                Err(poisoned) => *poisoned.into_inner() = merged_hint,
-            }
-        };
-
-        let agent_spawner_entry = self
-            .server_agent_spawner_for_session(&user_id, &session_id)
-            .await;
-        self.configure_loop_state_runtime_controls(
-            &mut loop_state,
-            &agent_spawner_entry.spawner,
-            &cancel_flag,
-            &pause_flag,
-            (*llm_cancel_token).clone(),
-            execution_lease_lost.clone(),
-        );
-        configure_runtime_controllers(
-            &self.matrixone,
-            self.shared_pool.as_ref(),
-            &mut loop_state,
-            &user_id,
-            &session_id,
-            self.trace_ingestion.clone(),
-        )
-        .await;
-        // The RuntimeToolExecutor is the owner for server-side runtime tools
-        // such as `agent`. For edge-bound runs this workspace is only an
-        // internal runtime scratch dir; execution routing still follows the
-        // explicit workspace/executor binding and cannot silently fall back.
-        let mut root_runtime_context_guard = None;
-        if let Some(workspace) = server_tool_executor_workspace {
-            let mut executor = self.build_root_runtime_tool_executor(
-                workspace.clone(),
-                &user_id,
-                &session_id,
-                &run_id,
-                request.model_catalog_reader.clone(),
-                Self::runtime_process_authorization_context(&request)
-                    .expect("runtime process authorization was validated before run start"),
-                Self::runtime_edge_dispatch_authorization_context(&request)
-                    .expect("runtime executor authorization was validated before run start"),
-                request.admitted_execution_deadline,
-                &loop_state,
-                &host,
-                &runtime_capabilities,
-                work_runtime_binding.as_ref(),
-            );
-            let binding_snapshot = execution_bindings.clone().unwrap_or_else(|| {
-                let (workspace_binding, executor_binding) =
-                    resolve_request_execution_bindings(&request, workspace.as_path());
-                ExecutionBindingSnapshot::inferred(workspace_binding, executor_binding)
-            });
-            let agent_working_dir =
-                agent_working_dir_for_bindings(execution_bindings.as_ref(), workspace.as_path());
-            executor.set_execution_binding_snapshot(binding_snapshot);
-            executor.set_workspace_record(provider_effective_workspace_record(
-                cloud_workspace_record.as_ref(),
-                request.provider_run_owner.as_ref(),
-            ));
-            host.set_execution_metadata(executor.binding_metadata());
-
-            let _fanout_admission = agent_spawner_entry.spawner.fanout_parent(&run_id);
-            let durable_agent_restore = self
-                .restore_server_dynamic_agents(&agent_spawner_entry, &user_id, &session_id)
-                .await;
-            let wiring = match self
-                .wire_server_dynamic_agent_tools(
-                    &agent_spawner_entry,
-                    durable_agent_restore,
-                    &mut executor,
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    loop_state.session_turn,
-                    &request,
-                    &edge_context.edge_tools,
-                    execution_bindings.as_ref(),
-                    agent_working_dir.as_path(),
-                    None,
-                    None,
-                    Some(pause_flag.clone()),
-                    Some(llm_cancel_token.clone()),
-                    #[cfg(feature = "harness")]
-                    loop_state.harness.sink.clone(),
-                )
-                .await
-            {
-                Ok(wiring) => wiring,
-                Err(error) => {
-                    self.fail_started_run_before_spawn(
-                        &user_id,
-                        &session_id,
-                        &run_id,
-                        execution_owner_generation,
-                        "root runtime context publication was fenced",
-                        PreSpawnFailureCode::PreSpawnFailure,
-                    )
-                    .await;
-                    if let Some(record) = cloud_workspace_record.as_ref() {
-                        self.cleanup_cloud_workspace_after_failed_start(
-                            &user_id,
-                            &session_id,
-                            &run_id,
-                            record,
-                            error.clone(),
-                        )
-                        .await;
-                    }
-                    return Err(error_response_coded(
-                        StatusCode::CONFLICT,
-                        error,
-                        "runtime_context_publication_fenced",
-                    ));
-                }
-            };
-            loop_state.attach_active_work_registry(wiring.active_work_registry);
-            root_runtime_context_guard = Some(wiring.root_runtime_context_guard);
-
-            self.install_background_interaction_gates(
-                &mut executor,
-                &user_id,
-                &session_id,
-                &run_id,
-                loop_state.session_turn,
-                llm_cancel_token.clone(),
-                request.interactive_client,
-                request.provider_run_owner.clone(),
-            )
-            .await;
-
-            wire_executor_into_state(executor, &mut loop_state);
-            if let Some(event) =
-                restore_continuation_primary_work_attempt(&loop_state, &run_id).await
-            {
-                host.on_committed_work_task_board_update(&loop_state, event)
-                    .await;
-            }
-        }
-
-        let explain = request.explain;
-        self.launch_owned_background_execution(OwnedBackgroundExecution {
-            resumed: false,
-            user_id,
-            session_id: session_id.clone(),
-            run_id: run_id.clone(),
-            explain,
-            profile_selection: request.admitted_agent_profiles.as_ref().map(|snapshot| {
-                astra_turn_types::AgentProfileSelection {
-                    team_id: snapshot.source_team_id.clone(),
-                    lead_agent_id: snapshot.lead_agent_id.clone(),
-                }
-            }),
-            agent_id: request.agent_id,
-            model_name: request.model,
-            user_message: request.message,
-            #[cfg(feature = "e2e-hooks")]
-            test_post_loop_settlement_delay_ms: request
-                .context
-                .as_ref()
-                .and_then(|context| context.get("test_post_loop_settlement_delay_ms"))
-                .and_then(Value::as_u64)
-                .unwrap_or_default(),
-            host,
-            loop_state,
-            execution_owner_generation,
-            owner_lease_heartbeat,
-            canonical_turn,
-            root_runtime_context_guard,
-            work_runtime_binding,
-            tool_runtime_workspace,
-            cloud_workspace_record,
-            csl_manager,
-            cancel_flag,
-            pause_flag,
-            llm_cancel_token,
-            execution_lease_lost,
-            descendant_spawner: Arc::clone(&agent_spawner_entry.spawner),
-            event_tx: None,
-            fanout_control_tx: None,
-            durable_tool_terminals: None,
-            host_event_bridge: None,
-            host_event_gap: None,
-            progress_bridge: None,
-        })
-        .await;
-
-        Ok(ChatRunRecord {
-            session_id,
-            run_id,
-            status: STATUS_RUNNING.to_string(),
-            explain: if explain {
-                Some(json!({"mode": "background"}))
-            } else {
-                None
-            },
-        })
-    }
-
-    /// Stream chat (incremental SSE mode): spawns the agentic loop in a
-    /// background task and returns an event channel for incremental streaming.
-    /// Post-loop cleanup (persistence, learning state) runs inside the task.
-    async fn stream_chat(
-        &self,
-        user_id: String,
-        request: ChatRequestData,
-    ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.require_invocation_composition()?;
-        let start_identity = self.run_start_idempotency(&user_id, &request)?;
-        let request = if let Some(identity) = start_identity.as_ref() {
-            // Replays attach to existing execution facts. Preparing first
-            // would reread mutable member configuration and re-admit a model
-            // even though no new execution will be started.
-            let requested_session_id = request.session_id.clone();
-            if let Some(durable) = self
-                .load_durable_run_for_user(identity.run_id(), &user_id)
-                .await?
-            {
-                Self::validate_start_request_session(
-                    identity,
-                    requested_session_id.as_deref(),
-                    &durable.session_id,
-                )?;
-                Self::validate_start_request_fingerprint(
-                    identity,
-                    durable.start_request_fingerprint.as_deref(),
-                )?;
-                return self
-                    .stream_run_live(identity.run_id().to_string(), user_id, 0)
-                    .await;
-            }
-            self.prepare_chat_request(&user_id, request).await?
-        } else {
-            self.prepare_chat_request(&user_id, request).await?
-        };
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
             .await?;
@@ -17720,60 +16811,57 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             );
         }
 
-        // Claim a caller-derived durable run identity before provisioning a
-        // workspace or starting any execution-side task. Concurrent exact
-        // retries then attach to the one admitted run instead of duplicating
-        // side effects.
-        let mut execution_owner_generation = None;
-        let idempotent_run_claimed = if idempotent_start {
-            match self
-                .persist_run_start(
-                    &run_id,
-                    &user_id,
-                    &session_id,
-                    &request,
-                    None,
-                    runtime_capabilities.agent_binding.as_ref(),
-                    work_runtime_binding.as_ref(),
+        let cloud_provision_request =
+            cloud_workspace_provision_request_from_request(&request, &run_id)?;
+
+        // Win the durable session slot before provisioning any resources.
+        // Exact retries attach to the winner instead of repeating preparation.
+        let execution_owner_generation = match self
+            .persist_run_start(
+                &run_id,
+                &user_id,
+                &session_id,
+                &request,
+                None,
+                runtime_capabilities.agent_binding.as_ref(),
+                work_runtime_binding.as_ref(),
+                start_identity
+                    .as_ref()
+                    .map(RunStartIdempotency::request_fingerprint),
+                if idempotent_start {
+                    RunStartPersistenceMode::ClaimOrReplay
+                } else {
+                    RunStartPersistenceMode::Insert
+                },
+            )
+            .await?
+        {
+            DurableRunStartClaim::Started { owner_generation } => Some(owner_generation),
+            DurableRunStartClaim::Existing {
+                start_request_fingerprint,
+                ..
+            } => {
+                Self::validate_start_request_fingerprint(
                     start_identity
                         .as_ref()
-                        .map(RunStartIdempotency::request_fingerprint),
-                    RunStartPersistenceMode::ClaimOrReplay,
-                )
-                .await?
-            {
-                DurableRunStartClaim::Started { owner_generation } => {
-                    execution_owner_generation = Some(owner_generation);
-                    true
-                }
-                DurableRunStartClaim::Existing {
-                    start_request_fingerprint,
-                    ..
-                } => {
-                    Self::validate_start_request_fingerprint(
-                        start_identity
-                            .as_ref()
-                            .expect("identity exists for idempotent run claim"),
-                        start_request_fingerprint.as_deref(),
-                    )?;
-                    return self.stream_run_live(run_id, user_id, 0).await;
-                }
-                DurableRunStartClaim::SessionMismatch { bound_session_id } => {
-                    Self::validate_start_request_session(
-                        start_identity
-                            .as_ref()
-                            .expect("identity exists for idempotent run claim"),
-                        request.session_id.as_deref(),
-                        &bound_session_id,
-                    )?;
-                    unreachable!("session mismatch must return a typed conflict");
-                }
+                        .expect("identity exists for idempotent run claim"),
+                    start_request_fingerprint.as_deref(),
+                )?;
+                return Ok(NewRunPreparation::Existing { run_id });
             }
-        } else {
-            false
+            DurableRunStartClaim::SessionMismatch { bound_session_id } => {
+                Self::validate_start_request_session(
+                    start_identity
+                        .as_ref()
+                        .expect("identity exists for idempotent run claim"),
+                    request.session_id.as_deref(),
+                    &bound_session_id,
+                )?;
+                unreachable!("session mismatch must return a typed conflict");
+            }
         };
 
-        // An idempotent start claim is already a durable execution owner. Its
+        // A new start claim is already a durable execution owner. Its
         // lease must be activated before workspace provisioning, catalog
         // checks, fanout setup, or Work projection can await external systems.
         // Otherwise recovery may rotate the generation while the old request
@@ -17782,7 +16870,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let (mut run_state, cancel_flag, pause_flag, llm_cancel_token, execution_lease_lost) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
         let mut owner_lease_heartbeat = None;
-        let mut owner_lease_fence_initialized = false;
         if let Some(owner_generation) = execution_owner_generation {
             let early_authority_confirmation = self
                 .run_engine
@@ -17803,7 +16890,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     // No provider/tool side effect has started, so drop only the
                     // process-local projection and let the exact-generation lease
                     // recovery path reconcile the durable Running row.
-                    self.runs.write().await.remove(&run_id);
                     tracing::warn!(
                         target: "astra_runtime::run_lifecycle",
                         user_id,
@@ -17840,1211 +16926,915 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 execution_lease_lost.clone(),
                 llm_cancel_token.clone(),
             );
-            owner_lease_fence_initialized = true;
         }
 
-        // Provision explicit workspace bindings early so build_initial_state
-        // and durable run_started metadata use the same execution boundary.
-        let cloud_workspace_record = match self
-            .provision_cloud_workspace_record(&user_id, &session_id, &request, &run_id)
-            .await
-        {
-            Ok(record) => record,
-            Err(error) => {
-                self.fail_claimed_idempotent_run_before_spawn(
-                    execution_owner_generation,
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    "cloud workspace provisioning failed after idempotent run claim",
-                )
-                .await;
-                return Err(error);
-            }
+        let mut cloud_workspace_record = None;
+        let mut delivery: Option<OwnedStreamDelivery> = None;
+        let mut event_rx = None;
+        let (event_tx, mut fanout_rx) = if streaming {
+            let (sender, receiver) = mpsc::channel::<Value>(512);
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
         };
-        // Orchestrator-managed architecture: executor bindings come directly
-        // from the workspace record — no server-owned executor scheduling.
-        let cloud_execution_bindings = cloud_workspace_record
-            .as_ref()
-            .map(|record| execution_bindings_from_workspace_record(record));
-        let cloud_workspace = cloud_workspace_record
-            .as_ref()
-            .map(|record| PathBuf::from(&record.root_or_volume_ref));
-
-        let server_workspace =
-            if cloud_workspace_record.is_none() && request_uses_server_workspace(&request) {
-                match self
-                    .provision_persisted_server_workspace(&user_id, &session_id, &run_id)
-                    .await
-                {
-                    Ok(workspace) => Some(workspace),
-                    Err(error) => {
-                        self.fail_claimed_idempotent_run_before_spawn(
-                            execution_owner_generation,
-                            &user_id,
-                            &session_id,
-                            &run_id,
-                            "server workspace provisioning failed after idempotent run claim",
-                        )
-                        .await;
-                        return Err(error);
-                    }
-                }
-            } else {
-                None
-            };
-        let mut execution_bindings = cloud_execution_bindings
-            .or_else(|| {
-                server_workspace.as_deref().map(|workspace| {
-                    let (workspace, executor) =
-                        resolve_request_execution_bindings(&request, workspace);
-                    ExecutionBindingSnapshot::inferred(workspace, executor)
-                })
-            })
-            .or_else(|| {
-                resolve_request_execution_bindings_without_server_workspace(
-                    &request,
-                    &edge_context.edge_profile,
-                )
-                .map(|(workspace, executor)| {
-                    ExecutionBindingSnapshot::inferred(workspace, executor)
-                })
-            });
-        if let Some(generation) = request.execution_binding_generation {
-            let Some(snapshot) = execution_bindings.as_mut() else {
-                self.fail_claimed_idempotent_run_before_spawn(
-                    execution_owner_generation,
+        let mut authority_unconfirmed = false;
+        let prepared = async {
+            // Provision explicit workspace bindings early so build_initial_state
+            // and durable run_started metadata use the same execution boundary.
+            if let Some(provision_request) = cloud_provision_request {
+                cloud_workspace_record = Some(
+                    CloudWorkspaceProvisioner::from_env()
+                        .provision(provision_request)
+                        .await
+                        .map_err(cloud_workspace_provision_error)?,
+                );
+                self.persist_workspace_record(
                     &user_id,
                     &session_id,
                     &run_id,
-                    "Work execution provider could not be materialized",
+                    cloud_workspace_record
+                        .as_ref()
+                        .expect("workspace was provisioned"),
                 )
-                .await;
-                return Err(error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Work execution provider could not be materialized",
-                    "execution_binding_unavailable",
-                ));
-            };
-            snapshot.execution_binding_generation = Some(generation);
-        }
-        if let Err(error) = self
-            .validate_optional_tool_availability(
+                .await?;
+            }
+            // Orchestrator-managed architecture: executor bindings come directly
+            // from the workspace record — no server-owned executor scheduling.
+            let cloud_execution_bindings = cloud_workspace_record
+                .as_ref()
+                .map(|record| execution_bindings_from_workspace_record(record));
+            let cloud_workspace = cloud_workspace_record
+                .as_ref()
+                .map(|record| PathBuf::from(&record.root_or_volume_ref));
+
+            let server_workspace =
+                if cloud_workspace_record.is_none() && request_uses_server_workspace(&request) {
+                    match self
+                        .provision_persisted_server_workspace(&user_id, &session_id, &run_id)
+                        .await
+                    {
+                        Ok(workspace) => Some(workspace),
+                        Err(error) => {
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    None
+                };
+            let mut execution_bindings = cloud_execution_bindings
+                .or_else(|| {
+                    server_workspace.as_deref().map(|workspace| {
+                        let (workspace, executor) =
+                            resolve_request_execution_bindings(&request, workspace);
+                        ExecutionBindingSnapshot::inferred(workspace, executor)
+                    })
+                })
+                .or_else(|| {
+                    resolve_request_execution_bindings_without_server_workspace(
+                        &request,
+                        &edge_context.edge_profile,
+                    )
+                    .map(|(workspace, executor)| {
+                        ExecutionBindingSnapshot::inferred(workspace, executor)
+                    })
+                });
+            if let Some(generation) = request.execution_binding_generation {
+                let Some(snapshot) = execution_bindings.as_mut() else {
+                    return Err(error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Work execution provider could not be materialized",
+                        "execution_binding_unavailable",
+                    ));
+                };
+                snapshot.execution_binding_generation = Some(generation);
+            }
+            self.validate_optional_tool_availability(
                 &user_id,
                 &request_constraints,
                 execution_bindings.as_ref(),
             )
-            .await
-        {
-            self.fail_claimed_idempotent_run_before_spawn(
-                execution_owner_generation,
-                &user_id,
-                &session_id,
-                &run_id,
-                "optional tool validation failed after idempotent run claim",
-            )
-            .await;
-            if let Some(record) = cloud_workspace_record.as_ref() {
-                self.cleanup_cloud_workspace_after_failed_start(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    record,
-                    "enabled optional tools became unavailable before stream start".to_string(),
-                )
-                .await;
-            }
-            return Err(error);
-        }
-        if idempotent_run_claimed && let Some(snapshot) = execution_bindings.as_ref() {
-            let binding_events = binding_snapshot_events(&run_id, &session_id, snapshot);
-            if let Err(error) = self
-                .run_engine
-                .append_events_batch(&user_id, &session_id, &run_id, &binding_events)
-                .await
-            {
-                self.fail_claimed_idempotent_run_before_spawn(
-                    execution_owner_generation,
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    "execution binding persistence failed after idempotent run claim",
-                )
-                .await;
-                if let Some(record) = cloud_workspace_record.as_ref() {
-                    self.cleanup_cloud_workspace_after_failed_start(
+            .await?;
+            if let Some(snapshot) = execution_bindings.as_ref() {
+                let binding_events = binding_snapshot_events(&run_id, &session_id, snapshot);
+                let owner_generation = execution_owner_generation
+                    .expect("an idempotent start claim owns an execution generation");
+                let binding_commit = self
+                    .run_engine
+                    .append_events_if_current_generation_and_status(
                         &user_id,
                         &session_id,
                         &run_id,
-                        record,
-                        "execution binding persistence failed before stream start".to_string(),
+                        owner_generation,
+                        &[STATUS_RUNNING],
+                        &binding_events,
                     )
                     .await;
-                }
-                return Err(error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to persist provider run execution binding: {error}"),
-                ));
-            }
-        }
-        let tool_runtime_workspace = cloud_workspace.clone().or_else(|| server_workspace.clone());
-        if let Some(binding) = work_runtime_binding.as_ref()
-            && let Some(pool) = self.shared_pool.clone()
-            && let Err(error) =
-                Self::invalidate_work_subject_before_execution(pool, binding, &run_id).await
-        {
-            self.fail_claimed_idempotent_run_before_spawn(
-                execution_owner_generation,
-                &user_id,
-                &session_id,
-                &run_id,
-                "Work subject invalidation failed after idempotent run claim",
-            )
-            .await;
-            return Err(work_subject_invalidation_response(error));
-        }
-        let server_tool_executor_workspace = if let Some(workspace) = tool_runtime_workspace.clone()
-        {
-            Some(workspace)
-        } else {
-            // Keep the durable server control plane available when an edge
-            // binding supplies execution capacity.  Its scratch workspace is
-            // not an authority fallback for edge-bound workspace tools.
-            match self.provision_server_workspace(&session_id) {
-                Ok(workspace) => Some(workspace),
-                Err(error) => {
-                    self.fail_claimed_idempotent_run_before_spawn(
-                        execution_owner_generation,
-                        &user_id,
-                        &session_id,
-                        &run_id,
-                        "tool executor workspace provisioning failed after idempotent run claim",
-                    )
-                    .await;
-                    if let Some(record) = cloud_workspace_record.as_ref() {
-                        self.cleanup_cloud_workspace_after_failed_start(
+                match binding_commit {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        authority_unconfirmed = true;
+                        return Err(execution_authority_not_current_response(
+                            "execution_binding_commit",
                             &user_id,
                             &session_id,
                             &run_id,
-                            record,
-                            "tool executor workspace provisioning failed before stream start"
-                                .to_string(),
-                        )
-                        .await;
+                            owner_generation,
+                        ));
                     }
-                    return Err(error);
+                    Err(error) => {
+                        return Err(error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("Failed to persist provider run execution binding: {error}"),
+                        ));
+                    }
                 }
             }
-        };
-        let stream_agent_spawner_entry = self
-            .server_agent_spawner_for_session(&user_id, &session_id)
-            .await;
-        let stream_agent_spawner = Arc::clone(&stream_agent_spawner_entry.spawner);
-
-        // Network observer delivery is bounded. Internal producers are
-        // drained independently below so browser backpressure cannot drop an
-        // approval or permanently detach later host progress.
-        const SSE_CHANNEL_CAPACITY: usize = 512;
-        let (client_event_tx, event_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
-        let (event_tx, mut fanout_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
-        let (fanout_control_tx, mut fanout_control_rx) =
-            mpsc::channel::<DurableLiveFanoutControl>(1);
-        let durable_tool_terminals = DurableToolTerminalTracker::default();
-        let fanout_durable_tool_terminals = durable_tool_terminals.clone();
-        let (agent_live_gap_tracker, mut agent_live_gap_rx) = WorkSurfaceAgentLiveGapTracker::new();
-        let (live_tx, _) = broadcast::channel::<Value>(SSE_CHANNEL_CAPACITY);
-        let live_tx_for_fanout = live_tx.clone();
-        let mut client_event_tx_for_fanout = AttachedStreamDelivery::new(client_event_tx.clone());
-        let fanout_runs = self.runs_handle();
-        let fanout_run_engine = self.run_engine.clone();
-        let fanout_user_id = user_id.clone();
-        let fanout_session_id = session_id.clone();
-        let fanout_run_id = run_id.clone();
-        let fanout_gap_tracker = agent_live_gap_tracker.clone();
-        let _ = spawn_observed(
-            async move {
-                let mut gap_watch_open = true;
-                let mut control_open = true;
-                let mut pending = PendingDurableLiveEvents::default();
-                let flush_deadline = tokio::time::sleep(DURABLE_LIVE_BATCH_FLUSH_INTERVAL);
-                tokio::pin!(flush_deadline);
-                loop {
-                    tokio::select! {
-                        event = fanout_rx.recv() => {
-                            let Some(event) = event else {
-                                if let Err(error) = flush_durable_live_events(
-                                    &mut pending,
-                                    &fanout_run_engine,
-                                    &fanout_runs,
-                                    &fanout_user_id,
-                                    &fanout_session_id,
-                                    &fanout_run_id,
-                                    &live_tx_for_fanout,
-                                    &mut client_event_tx_for_fanout,
-                                    &fanout_durable_tool_terminals,
-                                ).await {
-                                    publish_live_persistence_failure(
-                                        &fanout_runs,
-                                        &live_tx_for_fanout,
-                                        &mut client_event_tx_for_fanout,
-                                        &fanout_user_id,
-                                        &fanout_run_id,
-                                        "live_event_persistence_failed",
-                                        "live run event could not be recorded durably",
-                                        &error,
-                                    ).await;
-                                }
-                                for gap in fanout_gap_tracker.drain() {
-                                    let event = agent_live_gap_to_work_surface_sse(gap);
-                                    deliver_live_fanout_event(
-                                        &live_tx_for_fanout,
-                                        &mut client_event_tx_for_fanout,
-                                        &fanout_run_id,
-                                        event,
-                                    )
-                                    .await;
-                                }
-                                break;
-                            };
-                            let starts_new_batch = pending.is_empty();
-                            if let Err(error) = process_ordered_live_fanout_event(
-                                event,
-                                &mut pending,
-                                &fanout_run_engine,
-                                &fanout_runs,
-                                &fanout_user_id,
-                                &fanout_session_id,
-                                &fanout_run_id,
-                                &live_tx_for_fanout,
-                                &mut client_event_tx_for_fanout,
-                                &fanout_durable_tool_terminals,
-                            ).await {
-                                publish_live_persistence_failure(
-                                    &fanout_runs,
-                                    &live_tx_for_fanout,
-                                    &mut client_event_tx_for_fanout,
-                                    &fanout_user_id,
-                                    &fanout_run_id,
-                                    error.code,
-                                    error.message,
-                                    &error.detail,
-                                ).await;
-                                break;
-                            }
-                            if starts_new_batch && !pending.is_empty() {
-                                flush_deadline.as_mut().reset(
-                                    tokio::time::Instant::now() + DURABLE_LIVE_BATCH_FLUSH_INTERVAL,
-                                );
-                            }
-                        }
-                        control = fanout_control_rx.recv(), if control_open => {
-                            let Some(DurableLiveFanoutControl::Flush { ack }) = control else {
-                                control_open = false;
-                                continue;
-                            };
-                            let mut result = Ok(());
-                            while let Ok(event) = fanout_rx.try_recv() {
-                                if let Err(error) = process_ordered_live_fanout_event(
-                                    event,
-                                    &mut pending,
-                                    &fanout_run_engine,
-                                    &fanout_runs,
-                                    &fanout_user_id,
-                                    &fanout_session_id,
-                                    &fanout_run_id,
-                                    &live_tx_for_fanout,
-                                    &mut client_event_tx_for_fanout,
-                                    &fanout_durable_tool_terminals,
-                                ).await {
-                                    publish_live_persistence_failure(
-                                        &fanout_runs,
-                                        &live_tx_for_fanout,
-                                        &mut client_event_tx_for_fanout,
-                                        &fanout_user_id,
-                                        &fanout_run_id,
-                                        error.code,
-                                        error.message,
-                                        &error.detail,
-                                    ).await;
-                                    result = Err(error.detail);
-                                    break;
-                                }
-                            }
-                            if result.is_ok() {
-                                result = flush_durable_live_events(
-                                    &mut pending,
-                                    &fanout_run_engine,
-                                    &fanout_runs,
-                                    &fanout_user_id,
-                                    &fanout_session_id,
-                                    &fanout_run_id,
-                                    &live_tx_for_fanout,
-                                    &mut client_event_tx_for_fanout,
-                                    &fanout_durable_tool_terminals,
-                                ).await;
-                                if let Err(error) = &result {
-                                    publish_live_persistence_failure(
-                                        &fanout_runs,
-                                        &live_tx_for_fanout,
-                                        &mut client_event_tx_for_fanout,
-                                        &fanout_user_id,
-                                        &fanout_run_id,
-                                        "live_event_persistence_failed",
-                                        "live run event could not be recorded durably",
-                                        error,
-                                    ).await;
-                                }
-                            }
-                            let failed = result.is_err();
-                            let _ = ack.send(result);
-                            if failed {
-                                break;
-                            }
-                        }
-                        _ = &mut flush_deadline, if !pending.is_empty() => {
-                            if let Err(error) = flush_durable_live_events(
-                                &mut pending,
-                                &fanout_run_engine,
-                                &fanout_runs,
-                                &fanout_user_id,
-                                &fanout_session_id,
-                                &fanout_run_id,
-                                &live_tx_for_fanout,
-                                &mut client_event_tx_for_fanout,
-                                &fanout_durable_tool_terminals,
-                            ).await {
-                                publish_live_persistence_failure(
-                                    &fanout_runs,
-                                    &live_tx_for_fanout,
-                                    &mut client_event_tx_for_fanout,
-                                    &fanout_user_id,
-                                    &fanout_run_id,
-                                    "live_event_persistence_failed",
-                                    "live run event could not be recorded durably",
-                                    &error,
-                                ).await;
-                                break;
-                            }
-                        }
-                        changed = agent_live_gap_rx.changed(), if gap_watch_open => {
-                            if changed.is_err() {
-                                gap_watch_open = false;
-                                continue;
-                            }
-                            for gap in fanout_gap_tracker.drain() {
-                                let event = agent_live_gap_to_work_surface_sse(gap);
-                                if let Err(error) = flush_durable_live_events(
-                                    &mut pending,
-                                    &fanout_run_engine,
-                                    &fanout_runs,
-                                    &fanout_user_id,
-                                    &fanout_session_id,
-                                    &fanout_run_id,
-                                    &live_tx_for_fanout,
-                                    &mut client_event_tx_for_fanout,
-                                    &fanout_durable_tool_terminals,
-                                ).await {
-                                    publish_live_persistence_failure(
-                                        &fanout_runs,
-                                        &live_tx_for_fanout,
-                                        &mut client_event_tx_for_fanout,
-                                        &fanout_user_id,
-                                        &fanout_run_id,
-                                        "live_event_persistence_failed",
-                                        "live run event could not be recorded durably",
-                                        &error,
-                                    ).await;
-                                    break;
-                                }
-                                deliver_live_fanout_event(
-                                    &live_tx_for_fanout,
-                                    &mut client_event_tx_for_fanout,
-                                    &fanout_run_id,
-                                    event,
-                                ).await;
-                            }
+            let tool_runtime_workspace =
+                cloud_workspace.clone().or_else(|| server_workspace.clone());
+            if let Some(binding) = work_runtime_binding.as_ref()
+                && let Some(pool) = self.shared_pool.clone()
+                && let Err(error) =
+                    Self::invalidate_work_subject_before_execution(pool, binding, &run_id).await
+            {
+                return Err(work_subject_invalidation_response(error));
+            }
+            let server_tool_executor_workspace =
+                if let Some(workspace) = tool_runtime_workspace.clone() {
+                    Some(workspace)
+                } else {
+                    // Keep the durable server control plane available when an edge
+                    // binding supplies execution capacity.  Its scratch workspace is
+                    // not an authority fallback for edge-bound workspace tools.
+                    match self.provision_server_workspace(&session_id) {
+                        Ok(workspace) => Some(workspace),
+                        Err(error) => {
+                            return Err(error);
                         }
                     }
+                };
+            let stream_agent_spawner_entry = self
+                .server_agent_spawner_for_session(&user_id, &session_id)
+                .await;
+            let stream_agent_spawner = Arc::clone(&stream_agent_spawner_entry.spawner);
+
+            let interaction_sink: Arc<dyn server_loop_host::HostInteractionSink> =
+                Arc::new(DurableHostInteractionSink {
+                    run_engine: self.run_engine.clone(),
+                    user_id: user_id.clone(),
+                    run_id: run_id.clone(),
+                    session_id: session_id.clone(),
+                    agent_id: None,
+                    event_tx: event_tx.clone(),
+                });
+            // The session-scoped durable-agent snapshot and canonical turn
+            // admission are independent database reads. Restore them together so
+            // first-turn recovery does not add another full round trip chain to
+            // SSE response-header latency.
+            let _fanout_admission = stream_agent_spawner_entry.spawner.fanout_parent(&run_id);
+            let (canonical_turn, mut durable_agent_restore) = tokio::join!(
+                self.prepare_canonical_turn(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    &request,
+                    (*llm_cancel_token).clone(),
+                ),
+                async {
+                    if server_tool_executor_workspace.is_some() {
+                        Some(
+                            self.restore_server_dynamic_agents(
+                                &stream_agent_spawner_entry,
+                                &user_id,
+                                &session_id,
+                            )
+                            .await,
+                        )
+                    } else {
+                        None
+                    }
+                },
+            );
+            let canonical_turn = match canonical_turn {
+                Ok(admission) => admission,
+                Err(error) => {
+                    return Err(error);
                 }
-            },
-            "sse_fanout",
-        );
-        let progress_bridge =
-            self.spawn_agent_progress_stream_bridge(run_id.clone(), event_tx.clone());
+            };
+            let mut state = self.build_initial_state_inner(
+                &user_id,
+                &request,
+                &session_id,
+                &run_id,
+                tool_runtime_workspace
+                    .as_deref()
+                    .or(server_workspace.as_deref()),
+                execution_bindings.as_ref(),
+                Some(llm_cancel_token.clone()),
+                Some(execution_lease_lost.clone()),
+                Some(Arc::clone(&interaction_sink)),
+                request_constraints.clone(),
+                &edge_context,
+                Some(&edge_profile),
+                &runtime_capabilities,
+                execution_owner_generation,
+            )?;
+            install_active_personal_skills(&mut state, active_personal_skills);
+            state.context_manifest_user_id = Some(user_id.clone());
+            state.current_run_owner_generation = execution_owner_generation;
+            state.runtime_manifest = Self::build_runtime_manifest(
+                &request,
+                &runtime_capabilities,
+                tool_runtime_workspace.is_some(),
+            )?;
+            if let Some(admission) = canonical_turn.as_ref() {
+                state.initialize_provider_canonical_wal_base(&admission.prior_messages);
+            }
+            // Inject user_id into the harness sink used by DB-persistence tests.
+            #[cfg(feature = "harness")]
+            state.harness.set_user_id(&user_id);
 
-        run_state.live_tx = Some(live_tx.clone());
-        run_state.attached_event_tx = Some(client_event_tx.downgrade());
+            if let Some(admission) = canonical_turn.as_ref()
+                && admission.had_canonical_head
+            {
+                let mut messages = admission.prior_messages.clone();
+                messages.append(&mut state.messages);
+                state.messages = messages;
+                if let Some(base) = admission.reservation.expected_cursor.as_ref() {
+                    state.initialize_canonical_rewrite_proof(
+                        &admission.prior_messages,
+                        &base.canonical_root_hash,
+                        base.compaction_generation,
+                    );
+                }
+            }
+            let fresh_session_current_date = state
+                .pipeline_session
+                .as_ref()
+                .map(|session| session.current_date().to_string())
+                .unwrap_or_else(|| {
+                    crate::turn::session_current_date::resolve_session_current_date_for_user(
+                        &user_id,
+                        &session_id,
+                    )
+                });
 
-        let interaction_sink: Arc<dyn server_loop_host::HostInteractionSink> =
-            Arc::new(DurableHostInteractionSink {
-                run_engine: self.run_engine.clone(),
-                user_id: user_id.clone(),
-                run_id: run_id.clone(),
-                session_id: session_id.clone(),
-                agent_id: None,
-                event_tx: Some(event_tx.clone()),
-            });
-        // The session-scoped durable-agent snapshot and canonical turn
-        // admission are independent database reads. Restore them together so
-        // first-turn recovery does not add another full round trip chain to
-        // SSE response-header latency.
-        let _fanout_admission = stream_agent_spawner_entry.spawner.fanout_parent(&run_id);
-        let (canonical_turn, mut durable_agent_restore) = tokio::join!(
-            self.prepare_canonical_turn(
+            let canonical_has_prior_prompt_history = canonical_turn
+                .as_ref()
+                .is_some_and(|admission| admission.had_canonical_head);
+            let reserved_session_turn = canonical_turn
+                .as_ref()
+                .map(|admission| admission.reservation.reserved_turn);
+            let session_turn = match reserved_session_turn {
+                Some(turn) => turn,
+                None => infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await,
+            };
+            // Legacy CSL resume cursors derive their completed turn from this
+            // field, so establish it before history restoration.
+            state.session_turn = session_turn;
+            let history_restore = async {
+                // ── Runtime warm-start from step checkpoint ────────────────
+                let restore_prior_prompt_history = should_restore_prior_prompt_history(
+                    request.session_id.is_some(),
+                    if canonical_has_prior_prompt_history {
+                        true
+                    } else {
+                        self.session_has_prior_prompt_history(&user_id, &session_id)
+                            .await
+                    },
+                );
+
+                if restore_prior_prompt_history {
+                    if let Ok(Some(restored)) =
+                        astra_pipeline::step_restore::restore_session(&user_id, &session_id)
+                    {
+                        restore_step_checkpoint_runtime_state(
+                            restored,
+                            &fresh_session_current_date,
+                            &mut state,
+                        )
+                        .map_err(|error| {
+                            error_response_coded(
+                                StatusCode::CONFLICT,
+                                &error.message,
+                                "execution_reconstruction_required",
+                            )
+                        })?;
+                    }
+                }
+
+                // ── CSL: Load conversation history from the log ─────────────
+                let csl_manager = if restore_prior_prompt_history
+                    && canonical_turn
+                        .as_ref()
+                        .is_none_or(|admission| !admission.had_canonical_head)
+                {
+                    self.restore_csl_history(&user_id, &session_id, &run_id, &mut state)
+                        .await
+                } else {
+                    None
+                };
+
+                let needs_session_resume_hydration = should_hydrate_degraded_session_resume(
+                    restore_prior_prompt_history,
+                    canonical_has_prior_prompt_history,
+                );
+                let session_resume_hint = self
+                    .session_resume_hydration_hint_for_session(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        needs_session_resume_hydration,
+                    )
+                    .await;
+                Ok::<_, (StatusCode, Json<astra_core::ErrorResponse>)>((
+                    csl_manager,
+                    session_resume_hint,
+                ))
+            };
+            let plan_resume = async {
+                self.plan_resume_snapshot_for_request(&request, &user_id, &session_id)
+                    .await
+            };
+            let (history_restore, plan_resume_snapshot) =
+                tokio::join!(history_restore, plan_resume);
+            let (csl_manager, session_resume_hint) = history_restore?;
+            let plan_resume_hint = astra_turn_core::resume_hydration::merge_resume_hints(
+                session_resume_hint,
+                plan_resume_snapshot.prompt_hint,
+            );
+            let plan_authoring_active = plan_resume_snapshot.authoring_active;
+            let mut host = self.build_host(
                 &user_id,
                 &session_id,
                 &run_id,
                 &request,
-                (*llm_cancel_token).clone(),
-            ),
-            async {
-                if server_tool_executor_workspace.is_some() {
-                    Some(
-                        self.restore_server_dynamic_agents(
-                            &stream_agent_spawner_entry,
-                            &user_id,
-                            &session_id,
-                        )
-                        .await,
-                    )
-                } else {
-                    None
-                }
-            },
-        );
-        let canonical_turn = match canonical_turn {
-            Ok(admission) => admission,
-            Err(error) => {
-                self.fail_claimed_idempotent_run_before_spawn(
-                    execution_owner_generation,
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    "canonical turn admission failed",
-                )
-                .await;
-                if let Some(record) = cloud_workspace_record.as_ref() {
-                    self.cleanup_cloud_workspace_after_failed_start(
-                        &user_id,
-                        &session_id,
-                        &run_id,
-                        record,
-                        "canonical turn admission failed".to_string(),
-                    )
-                    .await;
-                }
-                return Err(error);
-            }
-        };
-        let mut state = self.build_initial_state_inner(
-            &user_id,
-            &request,
-            &session_id,
-            &run_id,
-            tool_runtime_workspace
-                .as_deref()
-                .or(server_workspace.as_deref()),
-            execution_bindings.as_ref(),
-            Some(llm_cancel_token.clone()),
-            Some(execution_lease_lost.clone()),
-            Some(Arc::clone(&interaction_sink)),
-            request_constraints.clone(),
-            &edge_context,
-            Some(&edge_profile),
-            &runtime_capabilities,
-            execution_owner_generation,
-        )?;
-        install_active_personal_skills(&mut state, active_personal_skills);
-        state.current_run_owner_generation = execution_owner_generation;
-        state.runtime_manifest = Self::build_runtime_manifest(
-            &request,
-            &runtime_capabilities,
-            tool_runtime_workspace.is_some(),
-        )?;
-        if let Some(admission) = canonical_turn.as_ref() {
-            state.initialize_provider_canonical_wal_base(&admission.prior_messages);
-        }
-        // Inject user_id into the harness sink used by DB-persistence tests.
-        #[cfg(feature = "harness")]
-        state.harness.set_user_id(&user_id);
-
-        if let Some(admission) = canonical_turn.as_ref()
-            && admission.had_canonical_head
-        {
-            let mut messages = admission.prior_messages.clone();
-            messages.append(&mut state.messages);
-            state.messages = messages;
-            if let Some(base) = admission.reservation.expected_cursor.as_ref() {
-                state.initialize_canonical_rewrite_proof(
-                    &admission.prior_messages,
-                    &base.canonical_root_hash,
-                    base.compaction_generation,
-                );
-            }
-        }
-        let fresh_session_current_date = state
-            .pipeline_session
-            .as_ref()
-            .map(|session| session.current_date().to_string())
-            .unwrap_or_else(|| {
-                crate::turn::session_current_date::resolve_session_current_date_for_user(
-                    &user_id,
-                    &session_id,
-                )
-            });
-
-        let canonical_has_prior_prompt_history = canonical_turn
-            .as_ref()
-            .is_some_and(|admission| admission.had_canonical_head);
-        let reserved_session_turn = canonical_turn
-            .as_ref()
-            .map(|admission| admission.reservation.reserved_turn);
-        let session_turn = match reserved_session_turn {
-            Some(turn) => turn,
-            None => infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await,
-        };
-        // Legacy CSL resume cursors derive their completed turn from this
-        // field, so establish it before history restoration.
-        state.session_turn = session_turn;
-        let history_restore = async {
-            // ── Runtime warm-start from step checkpoint ────────────────
-            let restore_prior_prompt_history = should_restore_prior_prompt_history(
-                request.session_id.is_some(),
-                if canonical_has_prior_prompt_history {
-                    true
-                } else {
-                    self.session_has_prior_prompt_history(&user_id, &session_id)
-                        .await
-                },
-            );
-
-            if restore_prior_prompt_history {
-                if let Ok(Some(restored)) =
-                    astra_pipeline::step_restore::restore_session(&user_id, &session_id)
-                {
-                    restore_step_checkpoint_runtime_state(
-                        restored,
-                        &fresh_session_current_date,
-                        &mut state,
-                    )
-                    .map_err(|error| {
-                        error_response_coded(
-                            StatusCode::CONFLICT,
-                            &error.message,
-                            "execution_reconstruction_required",
-                        )
-                    })?;
-                }
-            }
-
-            // ── CSL: Load conversation history from the log ─────────────
-            let csl_manager = if restore_prior_prompt_history
-                && canonical_turn
-                    .as_ref()
-                    .is_none_or(|admission| !admission.had_canonical_head)
-            {
-                self.restore_csl_history(&user_id, &session_id, &run_id, &mut state)
-                    .await
-            } else {
-                None
-            };
-
-            let needs_session_resume_hydration = should_hydrate_degraded_session_resume(
-                restore_prior_prompt_history,
-                canonical_has_prior_prompt_history,
-            );
-            let session_resume_hint = self
-                .session_resume_hydration_hint_for_session(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    needs_session_resume_hydration,
-                )
-                .await;
-            Ok::<_, (StatusCode, Json<astra_core::ErrorResponse>)>((
-                csl_manager,
-                session_resume_hint,
-            ))
-        };
-        let plan_resume = async {
-            self.plan_resume_snapshot_for_request(&request, &user_id, &session_id)
-                .await
-        };
-        let (history_restore, plan_resume_snapshot) = tokio::join!(history_restore, plan_resume);
-        let (csl_manager, session_resume_hint) = history_restore?;
-        let plan_resume_hint = astra_turn_core::resume_hydration::merge_resume_hints(
-            session_resume_hint,
-            plan_resume_snapshot.prompt_hint,
-        );
-        let plan_authoring_active = plan_resume_snapshot.authoring_active;
-        let mut host = self.build_host(
-            &user_id,
-            &session_id,
-            &run_id,
-            &request,
-            edge_tools,
-            edge_profile.clone(),
-            server_service_tool_catalog_enabled,
-            !agent_binding_mode,
-            execution_bindings.as_ref(),
-            plan_resume_hint,
-            plan_authoring_active,
-            work_runtime_binding.as_ref(),
-        );
-        if let Some(admission) = canonical_turn.as_ref() {
-            host.bind_execution_handoff(
-                self.execution_handoff_requested.clone(),
-                self.run_engine.clone(),
-                admission.reservation.clone(),
-                request.message.clone(),
-            );
-        }
-        self.configure_host_approval_audit_context(
-            &mut host,
-            &user_id,
-            &session_id,
-            &run_id,
-            state.session_turn,
-        );
-        const HOST_EVENT_CHANNEL_CAPACITY: usize = 256;
-        let (host_event_tx, mut host_event_rx) =
-            mpsc::channel::<Value>(HOST_EVENT_CHANNEL_CAPACITY);
-        let host_event_gap = server_loop_host::HostEventGapTracker::default();
-        let bridge_gap = host_event_gap.clone();
-        let host_event_bridge_tx = event_tx.clone();
-        let host_event_server_run_id = run_id.clone();
-        let host_event_bridge = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    event = host_event_rx.recv() => {
-                        let Some(event) = event else { break; };
-                        if !flush_host_event_gap_recovery(
-                            &host_event_bridge_tx,
-                            &bridge_gap,
-                            &host_event_server_run_id,
-                        )
-                        .await
-                        {
-                            record_unforwarded_host_event_tail(&mut host_event_rx, &bridge_gap);
-                            return;
-                        }
-                        let explain_event_id = (event.get("type").and_then(Value::as_str)
-                            == Some("explain_analyze"))
-                            .then(|| event.get("event_id").and_then(Value::as_str))
-                            .flatten()
-                            .map(str::to_owned);
-                        if let Err(error) = host_event_bridge_tx.send(event).await {
-                            record_unforwarded_host_event(&bridge_gap, error.0);
-                            record_unforwarded_host_event_tail(&mut host_event_rx, &bridge_gap);
-                            return;
-                        }
-                        if let Some(event_id) = explain_event_id {
-                            bridge_gap.acknowledge_explain_analyze_delivery(&event_id);
-                        }
-                    }
-                    _ = bridge_gap.notified() => {
-                        if !flush_host_event_gap_recovery(
-                            &host_event_bridge_tx,
-                            &bridge_gap,
-                            &host_event_server_run_id,
-                        )
-                        .await
-                        {
-                            record_unforwarded_host_event_tail(&mut host_event_rx, &bridge_gap);
-                            return;
-                        }
-                    }
-                }
-            }
-            let _ = flush_host_event_gap_recovery(
-                &host_event_bridge_tx,
-                &bridge_gap,
-                &host_event_server_run_id,
-            )
-            .await;
-        });
-        host.set_event_tx_with_gap(host_event_tx, host_event_gap.clone());
-        host.set_interaction_sink(interaction_sink);
-        host.set_client_cancel(llm_cancel_token.clone());
-        if let Some(snapshot) = execution_bindings.as_ref() {
-            host.set_execution_metadata(Value::Object(binding_snapshot_fields(snapshot)));
-        }
-
-        // ── MCP: inject request-scoped schemas into host tool surface ─
-        if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
-            host.install_runtime_tool_schemas_with_native_ids(
-                bundle.schemas.clone(),
-                bundle.control_tools.clone(),
-                bundle.native_tool_ids_by_public_name(),
-            );
-            host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
-        }
-        // In agent-binding mode with an EdgeAgent executor, the host only installs
-        // MCP schemas by default. Merge edge-builtin tool schemas (bash, read_file, …)
-        // for any tools explicitly listed in allow_tools so the model can see and call
-        // them via the edge dispatch path.
-        if let Some(snapshot) = execution_bindings.as_ref() {
-            if snapshot.executor.kind == ExecutorBindingKind::EdgeAgent {
-                if let Some(allow_tools) = request.allow_tools.as_deref() {
-                    let tools: Vec<String> = allow_tools.iter().map(|s| s.to_string()).collect();
-                    host.merge_allowlisted_edge_tool_schemas(&tools);
-                }
-            }
-        }
-
-        // Guard: reject if this session already has a blocking run.
-        // Hold write lock across check+insert to prevent TOCTOU race.
-        let local_session_blocked = {
-            let mut runs = self.runs.write().await;
-            let has_active = Self::session_has_blocking_run(&runs, &user_id, &session_id);
-            if !has_active {
-                runs.insert(run_id.clone(), run_state);
-            }
-            has_active
-        };
-        if local_session_blocked {
-            self.fail_claimed_idempotent_run_before_spawn(
-                execution_owner_generation,
-                &user_id,
-                &session_id,
-                &run_id,
-                "local session state conflicted after idempotent run claim",
-            )
-            .await;
-            if let Some(record) = cloud_workspace_record.as_ref() {
-                self.cleanup_cloud_workspace_after_failed_start(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    record,
-                    "session already has an active run before streaming agentic loop start"
-                        .to_string(),
-                )
-                .await;
-            }
-            // Start-rejection, same contract as the `create_run` guard above.
-            return Err(error_response_coded_with_metadata(
-                StatusCode::CONFLICT,
-                "session already has an active run",
-                SESSION_EXECUTION_SLOT_OCCUPIED_ERROR_CODE,
-                json!({"admission_state": "rejected"}),
-            ));
-        }
-        // Persist run first, so the binding is durable before the client
-        // receives binding events and starts using the workspace.
-        if !idempotent_run_claimed {
-            match self
-                .persist_run_start(
-                    &run_id,
-                    &user_id,
-                    &session_id,
-                    &request,
-                    execution_bindings.as_ref(),
-                    runtime_capabilities.agent_binding.as_ref(),
-                    work_runtime_binding.as_ref(),
-                    None,
-                    RunStartPersistenceMode::Insert,
-                )
-                .await
-            {
-                Ok(DurableRunStartClaim::Started { owner_generation }) => {
-                    execution_owner_generation = Some(owner_generation);
-                }
-                Ok(other) => unreachable!("insert-only streaming start returned {other:?}"),
-                Err(error) => {
-                    self.runs.write().await.remove(&run_id);
-                    if let Some(record) = cloud_workspace_record.as_ref() {
-                        self.cleanup_cloud_workspace_after_failed_start(
-                            &user_id,
-                            &session_id,
-                            &run_id,
-                            record,
-                            format!(
-                                "durable streaming run start failed after cloud workspace provisioning: {}",
-                                error.1.0.detail
-                            ),
-                        )
-                        .await;
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        let execution_owner_generation = execution_owner_generation
-            .expect("every newly executing stream owns its durable generation");
-        // Ordinary (non-idempotent) streaming runs acquire their durable
-        // execution authority only after the initial loop state is built.
-        // Publish that capability into the state before any host/tool work can
-        // start; otherwise every guarded dispatch correctly fails closed even
-        // though this executor owns the run.
-        bind_execution_owner_generation(&mut state, execution_owner_generation);
-        let execution_authority_confirmation = self
-            .run_engine
-            .confirm_execution_authority(
-                &user_id,
-                &session_id,
-                &run_id,
-                execution_owner_generation,
-                llm_cancel_token.as_ref(),
-            )
-            .await;
-        let confirmed_authority = match execution_authority_confirmation {
-            Ok(ExecutionAuthorityConfirmation::Confirmed(confirmed)) => confirmed,
-            failed => {
-                self.runs.write().await.remove(&run_id);
-                if let Some(record) = cloud_workspace_record.as_ref() {
-                    self.cleanup_cloud_workspace_after_failed_start(
-                        &user_id,
-                        &session_id,
-                        &run_id,
-                        record,
-                        "durable execution authority could not be confirmed before streaming activation"
-                            .to_string(),
-                    )
-                    .await;
-                }
-                return match failed {
-                    Ok(ExecutionAuthorityConfirmation::Superseded) => {
-                        Err(execution_authority_not_current_response(
-                            "before_streaming_activation",
-                            &user_id,
-                            &session_id,
-                            &run_id,
-                            execution_owner_generation,
-                        ))
-                    }
-                    Err(error) => Err(error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to confirm durable execution authority: {error}"),
-                    )),
-                    Ok(ExecutionAuthorityConfirmation::Confirmed(_)) => {
-                        unreachable!("matched above")
-                    }
-                };
-            }
-        };
-        if !owner_lease_fence_initialized {
-            owner_lease_heartbeat = self.run_engine.start_owner_lease_heartbeat(
-                user_id.clone(),
-                session_id.clone(),
-                run_id.clone(),
-                execution_owner_generation,
-                confirmed_authority,
-                execution_lease_lost.clone(),
-                llm_cancel_token.clone(),
-            );
-        }
-        if let Some(snapshot) = execution_bindings.as_ref() {
-            for mut event in binding_snapshot_events(&run_id, &session_id, snapshot) {
-                if idempotent_run_claimed && let Some(object) = event.as_object_mut() {
-                    object.insert(DURABLE_EVENT_COMMITTED_FIELD.to_string(), Value::Bool(true));
-                }
-                if event_tx.send(event).await.is_err() {
-                    self.fail_started_run_before_spawn(
-                        &user_id,
-                        &session_id,
-                        &run_id,
-                        execution_owner_generation,
-                        "failed to start streaming run event stream",
-                        PreSpawnFailureCode::PreSpawnFailure,
-                    )
-                    .await;
-                    if let Some(record) = cloud_workspace_record.as_ref() {
-                        self.cleanup_cloud_workspace_after_failed_start(
-                            &user_id,
-                            &session_id,
-                            &run_id,
-                            record,
-                            "failed to start streaming run event stream after cloud workspace provisioning"
-                                .to_string(),
-                        )
-                        .await;
-                    }
-                    return Err(error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "failed to start run event stream".to_string(),
-                    ));
-                }
-            }
-        }
-        let transcript_turn = state.session_turn;
-        let persist_user_transcript = async {
-            let Some(pool) = &self.shared_pool else {
-                return;
-            };
-            let trace = server_trace_context(&user_id, &session_id, &run_id, transcript_turn);
-            let user_transcript = TranscriptPersistItem {
-                run_id: Some(run_id.clone()),
-                role: "user",
-                content: request.message.clone(),
-                payload: None,
-                source_event_id: trace.root_event_id,
-            };
-            if let Err(error) =
-                persist_session_transcript_items(pool, &user_id, &session_id, &[user_transcript])
-                    .await
-            {
-                tracing::warn!(
-                    %session_id,
-                    %error,
-                    "user intent transcript item was not committed"
-                );
-            }
-        };
-
-        self.configure_loop_state_runtime_controls(
-            &mut state,
-            &stream_agent_spawner_entry.spawner,
-            &cancel_flag,
-            &pause_flag,
-            (*llm_cancel_token).clone(),
-            execution_lease_lost.clone(),
-        );
-        let configure_controllers = configure_runtime_controllers(
-            &self.matrixone,
-            self.shared_pool.as_ref(),
-            &mut state,
-            &user_id,
-            &session_id,
-            self.trace_ingestion.clone(),
-        );
-        tokio::join!(persist_user_transcript, configure_controllers);
-
-        // Wire the server-side runtime tool owner whenever the host exposes the
-        // server tool catalog. For edge-bound runs this uses an internal
-        // scratch workspace only; the visible binding still routes local-code
-        // tools to edge or blocks when edge is unavailable.
-        let mut root_runtime_context_guard = None;
-        if let Some(workspace) = server_tool_executor_workspace {
-            let mut executor = self.build_root_runtime_tool_executor(
-                workspace.clone(),
-                &user_id,
-                &session_id,
-                &run_id,
-                request.model_catalog_reader.clone(),
-                Self::runtime_process_authorization_context(&request)
-                    .expect("runtime process authorization was validated before run start"),
-                Self::runtime_edge_dispatch_authorization_context(&request)
-                    .expect("runtime executor authorization was validated before run start"),
-                request.admitted_execution_deadline,
-                &state,
-                &host,
-                &runtime_capabilities,
+                edge_tools,
+                edge_profile.clone(),
+                server_service_tool_catalog_enabled,
+                !agent_binding_mode,
+                execution_bindings.as_ref(),
+                plan_resume_hint,
+                plan_authoring_active,
                 work_runtime_binding.as_ref(),
             );
-            let binding_snapshot = execution_bindings.clone().unwrap_or_else(|| {
-                let (workspace_binding, executor_binding) =
-                    resolve_request_execution_bindings(&request, workspace.as_path());
-                ExecutionBindingSnapshot::inferred(workspace_binding, executor_binding)
-            });
-            let agent_working_dir =
-                agent_working_dir_for_bindings(execution_bindings.as_ref(), workspace.as_path());
-            executor.set_execution_binding_snapshot(binding_snapshot);
-            executor.set_workspace_record(provider_effective_workspace_record(
-                cloud_workspace_record.as_ref(),
-                request.provider_run_owner.as_ref(),
-            ));
-            host.set_execution_metadata(executor.binding_metadata());
-            executor.set_work_surface_event_tx(event_tx.clone());
-            let wiring = match self
-                .wire_server_dynamic_agent_tools(
-                    &stream_agent_spawner_entry,
-                    durable_agent_restore
-                        .take()
-                        .expect("durable agent restore ran for server tool executor"),
-                    &mut executor,
+            if let Some(admission) = canonical_turn.as_ref() {
+                host.bind_execution_handoff(
+                    self.execution_handoff_requested.clone(),
+                    self.run_engine.clone(),
+                    admission.reservation.clone(),
+                    request.message.clone(),
+                );
+            }
+            self.configure_host_approval_audit_context(
+                &mut host,
+                &user_id,
+                &session_id,
+                &run_id,
+                state.session_turn,
+            );
+            if streaming {
+                let (stream_delivery, receiver) = self.prepare_stream_delivery(
                     &user_id,
                     &session_id,
                     &run_id,
-                    state.session_turn,
-                    &request,
-                    &edge_context.edge_tools,
-                    execution_bindings.as_ref(),
-                    agent_working_dir.as_path(),
-                    Some(event_tx.clone()),
-                    Some(agent_live_gap_tracker.clone()),
-                    Some(pause_flag.clone()),
-                    Some(llm_cancel_token.clone()),
-                    #[cfg(feature = "harness")]
-                    state.harness.sink.clone(),
+                    &mut run_state,
+                    &mut host,
+                    (
+                        event_tx.as_ref().expect("stream sender exists").clone(),
+                        fanout_rx.take().expect("stream receiver exists"),
+                    ),
+                );
+                event_rx = Some(receiver);
+                delivery = Some(stream_delivery);
+            }
+            host.set_interaction_sink(interaction_sink);
+            host.set_client_cancel(llm_cancel_token.clone());
+            if let Some(snapshot) = execution_bindings.as_ref() {
+                host.set_execution_metadata(Value::Object(binding_snapshot_fields(snapshot)));
+            }
+
+            // ── MCP: inject request-scoped schemas into host tool surface ─
+            if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
+                host.install_runtime_tool_schemas_with_native_ids(
+                    bundle.schemas.clone(),
+                    bundle.control_tools.clone(),
+                    bundle.native_tool_ids_by_public_name(),
+                );
+                host.install_runtime_stop_after_success_tools(
+                    bundle.stop_after_success_tools.clone(),
+                );
+            }
+            // In agent-binding mode with an EdgeAgent executor, the host only installs
+            // MCP schemas by default. Merge edge-builtin tool schemas (bash, read_file, …)
+            // for any tools explicitly listed in allow_tools so the model can see and call
+            // them via the edge dispatch path.
+            if let Some(snapshot) = execution_bindings.as_ref() {
+                if snapshot.executor.kind == ExecutorBindingKind::EdgeAgent {
+                    if let Some(allow_tools) = request.allow_tools.as_deref() {
+                        let tools: Vec<String> =
+                            allow_tools.iter().map(|s| s.to_string()).collect();
+                        host.merge_allowlisted_edge_tool_schemas(&tools);
+                    }
+                }
+            }
+
+            // Guard: reject if this session already has a blocking run.
+            // Hold write lock across check+insert to prevent TOCTOU race.
+            let local_session_blocked = {
+                let mut runs = self.runs.write().await;
+                let has_active = Self::session_has_blocking_run(&runs, &user_id, &session_id);
+                if !has_active {
+                    runs.insert(run_id.clone(), run_state);
+                }
+                has_active
+            };
+            if local_session_blocked {
+                // Durable admission already succeeded. This is an activation
+                // failure, so clients must settle the admitted failed run.
+                return Err(error_response_coded(
+                    StatusCode::CONFLICT,
+                    "the admitted execution could not publish its local projection",
+                    "execution_local_projection_conflict",
+                ));
+            }
+            let execution_owner_generation = execution_owner_generation
+                .expect("every newly executing stream owns its durable generation");
+            if let (Some(snapshot), Some(event_tx)) =
+                (execution_bindings.as_ref(), event_tx.as_ref())
+            {
+                for mut event in binding_snapshot_events(&run_id, &session_id, snapshot) {
+                    if let Some(object) = event.as_object_mut() {
+                        object.insert(DURABLE_EVENT_COMMITTED_FIELD.to_string(), Value::Bool(true));
+                    }
+                    if event_tx.send(event).await.is_err() {
+                        return Err(error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "failed to start run event stream".to_string(),
+                        ));
+                    }
+                }
+            }
+            let transcript_turn = state.session_turn;
+            let persist_user_transcript = async {
+                let Some(pool) = &self.shared_pool else {
+                    return;
+                };
+                let trace = server_trace_context(&user_id, &session_id, &run_id, transcript_turn);
+                let user_transcript = TranscriptPersistItem {
+                    run_id: Some(run_id.clone()),
+                    role: "user",
+                    content: request.message.clone(),
+                    payload: None,
+                    source_event_id: trace.root_event_id,
+                };
+                if let Err(error) = persist_session_transcript_items(
+                    pool,
+                    &user_id,
+                    &session_id,
+                    &[user_transcript],
                 )
                 .await
-            {
-                Ok(wiring) => wiring,
-                Err(error) => {
-                    self.fail_started_run_before_spawn(
+                {
+                    tracing::warn!(
+                        %session_id,
+                        %error,
+                        "user intent transcript item was not committed"
+                    );
+                }
+            };
+
+            self.configure_loop_state_runtime_controls(
+                &mut state,
+                &stream_agent_spawner_entry.spawner,
+                &cancel_flag,
+                &pause_flag,
+                (*llm_cancel_token).clone(),
+                execution_lease_lost.clone(),
+            );
+            let configure_controllers = configure_runtime_controllers(
+                &self.matrixone,
+                self.shared_pool.as_ref(),
+                &mut state,
+                &user_id,
+                &session_id,
+                self.trace_ingestion.clone(),
+            );
+            tokio::join!(persist_user_transcript, configure_controllers);
+
+            // Wire the server-side runtime tool owner whenever the host exposes the
+            // server tool catalog. For edge-bound runs this uses an internal
+            // scratch workspace only; the visible binding still routes local-code
+            // tools to edge or blocks when edge is unavailable.
+            let mut root_runtime_context_guard = None;
+            if let Some(workspace) = server_tool_executor_workspace {
+                let mut executor = self.build_root_runtime_tool_executor(
+                    workspace.clone(),
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    request.model_catalog_reader.clone(),
+                    Self::runtime_process_authorization_context(&request)
+                        .expect("runtime process authorization was validated before run start"),
+                    Self::runtime_edge_dispatch_authorization_context(&request)
+                        .expect("runtime executor authorization was validated before run start"),
+                    request.admitted_execution_deadline,
+                    &state,
+                    &host,
+                    &runtime_capabilities,
+                    work_runtime_binding.as_ref(),
+                );
+                let binding_snapshot = execution_bindings.clone().unwrap_or_else(|| {
+                    let (workspace_binding, executor_binding) =
+                        resolve_request_execution_bindings(&request, workspace.as_path());
+                    ExecutionBindingSnapshot::inferred(workspace_binding, executor_binding)
+                });
+                let agent_working_dir = agent_working_dir_for_bindings(
+                    execution_bindings.as_ref(),
+                    workspace.as_path(),
+                );
+                executor.set_execution_binding_snapshot(binding_snapshot);
+                executor.set_workspace_record(provider_effective_workspace_record(
+                    cloud_workspace_record.as_ref(),
+                    request.provider_run_owner.as_ref(),
+                ));
+                host.set_execution_metadata(executor.binding_metadata());
+                if let Some(event_tx) = &event_tx {
+                    executor.set_work_surface_event_tx(event_tx.clone());
+                }
+                let wiring = match self
+                    .wire_server_dynamic_agent_tools(
+                        &stream_agent_spawner_entry,
+                        durable_agent_restore
+                            .take()
+                            .expect("durable agent restore ran for server tool executor"),
+                        &mut executor,
                         &user_id,
                         &session_id,
                         &run_id,
-                        execution_owner_generation,
-                        "root runtime context publication was fenced",
-                        PreSpawnFailureCode::PreSpawnFailure,
+                        state.session_turn,
+                        &request,
+                        &edge_context.edge_tools,
+                        execution_bindings.as_ref(),
+                        agent_working_dir.as_path(),
+                        event_tx.clone(),
+                        delivery
+                            .as_ref()
+                            .map(|delivery| delivery.agent_live_gap_tracker.clone()),
+                        Some(pause_flag.clone()),
+                        Some(llm_cancel_token.clone()),
+                        #[cfg(feature = "harness")]
+                        state.harness.sink.clone(),
                     )
-                    .await;
-                    if let Some(record) = cloud_workspace_record.as_ref() {
-                        self.cleanup_cloud_workspace_after_failed_start(
-                            &user_id,
-                            &session_id,
-                            &run_id,
-                            record,
-                            error.clone(),
-                        )
-                        .await;
+                    .await
+                {
+                    Ok(wiring) => wiring,
+                    Err(error) => {
+                        return Err(error_response_coded(
+                            StatusCode::CONFLICT,
+                            error,
+                            "runtime_context_publication_fenced",
+                        ));
                     }
-                    return Err(error_response_coded(
-                        StatusCode::CONFLICT,
-                        error,
-                        "runtime_context_publication_fenced",
-                    ));
-                }
-            };
-            state.attach_active_work_registry(wiring.active_work_registry);
-            root_runtime_context_guard = Some(wiring.root_runtime_context_guard);
+                };
+                state.attach_active_work_registry(wiring.active_work_registry);
+                root_runtime_context_guard = Some(wiring.root_runtime_context_guard);
 
-            // Match the background-run interaction contract.  The stream is
-            // only a delivery surface: Server Only requests still wait on the
-            // same shared durable interaction and can be resolved
-            // after this particular SSE connection disappears.
-            if request.interactive_client {
-                let (approval_tx, approval_rx) = mpsc::channel::<Value>(64);
-                let approval_gate = DurableRunApprovalGate::new(
-                    user_id.clone(),
-                    session_id.clone(),
-                    run_id.clone(),
-                    Some(state.session_turn),
-                    self.run_engine.clone(),
-                    self.runs_handle(),
-                    Some(approval_tx),
-                    Some(event_tx.clone()),
-                )
-                .with_cancel_token(llm_cancel_token.clone());
-                executor.set_approval_gate(std::sync::Arc::new(approval_gate));
-                self.approval_channels
-                    .lock()
-                    .await
-                    .insert(run_id.clone(), approval_rx);
-
-                let (user_prompt_tx, user_prompt_rx) = mpsc::channel::<Value>(64);
-                let user_prompt_gate = DurableRunUserPromptGate::new(
-                    user_id.clone(),
-                    session_id.clone(),
-                    run_id.clone(),
-                    Some(state.session_turn),
-                    self.run_engine.clone(),
-                    self.runs_handle(),
-                    Some(user_prompt_tx),
-                    Some(event_tx.clone()),
-                )
-                .with_provider_run_owner(request.provider_run_owner.clone())
-                .with_cancel_token(llm_cancel_token.clone());
-                let user_prompt_gate = std::sync::Arc::new(user_prompt_gate);
-                executor.set_ask_user_gate(user_prompt_gate.clone());
-                executor.set_provider_interaction_gate(user_prompt_gate);
-                self.user_prompt_channels
-                    .lock()
-                    .await
-                    .insert(run_id.clone(), user_prompt_rx);
-
-                let (progress_tx, progress_rx) = mpsc::channel::<ProgressEvent>(64);
-                let progress_cb =
-                    astra_server_types::ws_progress_callback::WebSocketProgressCallback::new(
-                        progress_tx,
-                    );
-                executor.set_progress_callback(std::sync::Arc::new(progress_cb));
-                self.progress_channels
-                    .lock()
-                    .await
-                    .insert(run_id.clone(), progress_rx);
-            } else {
-                executor.set_approval_gate(std::sync::Arc::new(
-                    DurableRunApprovalGate::new(
+                // Match the background-run interaction contract.  The stream is
+                // only a delivery surface: Server Only requests still wait on the
+                // same shared durable interaction and can be resolved
+                // after this particular SSE connection disappears.
+                if request.interactive_client {
+                    let (approval_tx, approval_rx) = mpsc::channel::<Value>(64);
+                    let approval_gate = DurableRunApprovalGate::new(
                         user_id.clone(),
                         session_id.clone(),
                         run_id.clone(),
                         Some(state.session_turn),
                         self.run_engine.clone(),
                         self.runs_handle(),
-                        None,
-                        Some(event_tx.clone()),
+                        Some(approval_tx),
+                        event_tx.clone(),
                     )
-                    .with_cancel_token(llm_cancel_token.clone()),
-                ));
-                let user_prompt_gate = std::sync::Arc::new(
-                    DurableRunUserPromptGate::new(
+                    .with_cancel_token(llm_cancel_token.clone());
+                    executor.set_approval_gate(std::sync::Arc::new(approval_gate));
+                    self.approval_channels
+                        .lock()
+                        .await
+                        .insert(run_id.clone(), approval_rx);
+
+                    let (user_prompt_tx, user_prompt_rx) = mpsc::channel::<Value>(64);
+                    let user_prompt_gate = DurableRunUserPromptGate::new(
                         user_id.clone(),
                         session_id.clone(),
                         run_id.clone(),
                         Some(state.session_turn),
                         self.run_engine.clone(),
                         self.runs_handle(),
-                        None,
-                        Some(event_tx.clone()),
+                        Some(user_prompt_tx),
+                        event_tx.clone(),
                     )
                     .with_provider_run_owner(request.provider_run_owner.clone())
-                    .with_cancel_token(llm_cancel_token.clone()),
-                );
-                executor.set_ask_user_gate(user_prompt_gate.clone());
-                executor.set_provider_interaction_gate(user_prompt_gate);
+                    .with_cancel_token(llm_cancel_token.clone());
+                    let user_prompt_gate = std::sync::Arc::new(user_prompt_gate);
+                    executor.set_ask_user_gate(user_prompt_gate.clone());
+                    executor.set_provider_interaction_gate(user_prompt_gate);
+                    self.user_prompt_channels
+                        .lock()
+                        .await
+                        .insert(run_id.clone(), user_prompt_rx);
+
+                    let (progress_tx, progress_rx) = mpsc::channel::<ProgressEvent>(64);
+                    let progress_cb =
+                        astra_server_types::ws_progress_callback::WebSocketProgressCallback::new(
+                            progress_tx,
+                        );
+                    executor.set_progress_callback(std::sync::Arc::new(progress_cb));
+                    self.progress_channels
+                        .lock()
+                        .await
+                        .insert(run_id.clone(), progress_rx);
+                } else {
+                    executor.set_approval_gate(std::sync::Arc::new(
+                        DurableRunApprovalGate::new(
+                            user_id.clone(),
+                            session_id.clone(),
+                            run_id.clone(),
+                            Some(state.session_turn),
+                            self.run_engine.clone(),
+                            self.runs_handle(),
+                            None,
+                            event_tx.clone(),
+                        )
+                        .with_cancel_token(llm_cancel_token.clone()),
+                    ));
+                    let user_prompt_gate = std::sync::Arc::new(
+                        DurableRunUserPromptGate::new(
+                            user_id.clone(),
+                            session_id.clone(),
+                            run_id.clone(),
+                            Some(state.session_turn),
+                            self.run_engine.clone(),
+                            self.runs_handle(),
+                            None,
+                            event_tx.clone(),
+                        )
+                        .with_provider_run_owner(request.provider_run_owner.clone())
+                        .with_cancel_token(llm_cancel_token.clone()),
+                    );
+                    executor.set_ask_user_gate(user_prompt_gate.clone());
+                    executor.set_provider_interaction_gate(user_prompt_gate);
+                }
+                wire_executor_into_state(executor, &mut state);
+                if let Some(event) =
+                    restore_continuation_primary_work_attempt(&state, &run_id).await
+                {
+                    host.on_committed_work_task_board_update(&state, event)
+                        .await;
+                }
             }
-            wire_executor_into_state(executor, &mut state);
-            if let Some(event) = restore_continuation_primary_work_attempt(&state, &run_id).await {
-                host.on_committed_work_task_board_update(&state, event)
+
+            // Reconfirm the same generation immediately before activation.
+            bind_execution_owner_generation(&mut state, execution_owner_generation);
+            let execution_authority_confirmation = self
+                .run_engine
+                .confirm_execution_authority(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    execution_owner_generation,
+                    llm_cancel_token.as_ref(),
+                )
+                .await;
+            match execution_authority_confirmation {
+                Ok(ExecutionAuthorityConfirmation::Confirmed(_)) => {}
+                failed => {
+                    authority_unconfirmed = true;
+                    return match failed {
+                        Ok(ExecutionAuthorityConfirmation::Superseded) => {
+                            Err(execution_authority_not_current_response(
+                                "before_streaming_activation",
+                                &user_id,
+                                &session_id,
+                                &run_id,
+                                execution_owner_generation,
+                            ))
+                        }
+                        Err(error) => Err(error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("failed to confirm durable execution authority: {error}"),
+                        )),
+                        Ok(ExecutionAuthorityConfirmation::Confirmed(_)) => {
+                            unreachable!("matched above")
+                        }
+                    };
+                }
+            };
+            Ok(OwnedBackgroundExecution {
+                user_id: user_id.clone(),
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                resumed: false,
+                explain: request.explain,
+                profile_selection: request.admitted_agent_profiles.as_ref().map(|snapshot| {
+                    astra_turn_types::AgentProfileSelection {
+                        team_id: snapshot.source_team_id.clone(),
+                        lead_agent_id: snapshot.lead_agent_id.clone(),
+                    }
+                }),
+                agent_id: request.agent_id,
+                model_name: request.model,
+                user_message: request.message,
+                #[cfg(feature = "e2e-hooks")]
+                test_post_loop_settlement_delay_ms: request
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.get("test_post_loop_settlement_delay_ms"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                host,
+                loop_state: state,
+                execution_owner_generation,
+                owner_lease_heartbeat: owner_lease_heartbeat.take(),
+                canonical_turn,
+                root_runtime_context_guard,
+                work_runtime_binding,
+                tool_runtime_workspace,
+                cloud_workspace_record: cloud_workspace_record.take(),
+                csl_manager,
+                cancel_flag,
+                pause_flag,
+                llm_cancel_token: llm_cancel_token.clone(),
+                execution_lease_lost,
+                descendant_spawner: stream_agent_spawner,
+                delivery: delivery.take(),
+            })
+        }
+        .await;
+        match prepared {
+            Ok(execution) => Ok(NewRunPreparation::Owned {
+                execution: Box::new(execution),
+                event_rx,
+            }),
+            Err(error) => {
+                let generation =
+                    execution_owner_generation.expect("new execution was durably claimed");
+                let committed = if authority_unconfirmed {
+                    false
+                } else {
+                    let events = pre_spawn_failure_terminal_events(
+                        &error.1.0.detail,
+                        PreSpawnFailureCode::PreSpawnFailure,
+                    );
+                    matches!(
+                        self.run_engine
+                            .commit_terminal_status_with_events_if_current_owner(
+                                &user_id,
+                                &session_id,
+                                &run_id,
+                                &[STATUS_RUNNING, STATUS_PAUSED, STATUS_WAITING],
+                                generation,
+                                STATUS_FAILED,
+                                None,
+                                Some(&error.1.0.detail),
+                                &events,
+                            )
+                            .await,
+                        Ok(TerminalTransitionOutcome::Committed(_))
+                    )
+                };
+                let mut runs = self.runs.write().await;
+                let owns_local = runs
+                    .get(&run_id)
+                    .is_some_and(|run| Arc::ptr_eq(&run.llm_cancel_token, &llm_cancel_token));
+                if owns_local {
+                    runs.remove(&run_id);
+                }
+                drop(runs);
+                if owns_local {
+                    self.approval_channels.lock().await.remove(&run_id);
+                    self.user_prompt_channels.lock().await.remove(&run_id);
+                    self.progress_channels.lock().await.remove(&run_id);
+                }
+                if let Some(delivery) = delivery {
+                    delivery.host_event_bridge.abort();
+                    let _ = delivery.progress_bridge.stop_and_drain().await;
+                }
+                if committed && let Some(record) = cloud_workspace_record.as_ref() {
+                    self.cleanup_cloud_workspace_after_failed_start(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        record,
+                        error.1.0.detail.clone(),
+                    )
                     .await;
+                }
+                Err(error)
             }
         }
+    }
+}
 
-        self.launch_owned_background_execution(OwnedBackgroundExecution {
-            resumed: false,
-            user_id,
-            session_id: session_id.clone(),
-            run_id: run_id.clone(),
-            explain: request.explain,
-            profile_selection: request.admitted_agent_profiles.as_ref().map(|snapshot| {
-                astra_turn_types::AgentProfileSelection {
-                    team_id: snapshot.source_team_id.clone(),
-                    lead_agent_id: snapshot.lead_agent_id.clone(),
-                }
-            }),
-            agent_id: request.agent_id,
-            model_name: request.model,
-            user_message: request.message,
-            #[cfg(feature = "e2e-hooks")]
-            test_post_loop_settlement_delay_ms: request
-                .context
-                .as_ref()
-                .and_then(|context| context.get("test_post_loop_settlement_delay_ms"))
-                .and_then(Value::as_u64)
-                .unwrap_or_default(),
-            host,
-            loop_state: state,
-            execution_owner_generation,
-            owner_lease_heartbeat,
-            canonical_turn,
-            root_runtime_context_guard,
-            work_runtime_binding,
-            tool_runtime_workspace,
-            cloud_workspace_record,
-            csl_manager,
-            cancel_flag,
-            pause_flag,
-            llm_cancel_token,
-            execution_lease_lost,
-            descendant_spawner: stream_agent_spawner,
-            event_tx: Some(event_tx),
-            fanout_control_tx: Some(fanout_control_tx),
-            durable_tool_terminals: Some(durable_tool_terminals),
-            host_event_bridge: Some(host_event_bridge),
-            host_event_gap: Some(host_event_gap),
-            progress_bridge: Some(progress_bridge),
-        })
-        .await;
+#[async_trait]
+impl RunLifecycleService for AgenticRunLifecycleService {
+    fn workspace_executor_id(&self) -> Option<&str> {
+        self.selected_server_workspace_provider
+            .as_ref()
+            .map(ServerWorkspaceProvisioner::executor_id)
+    }
 
-        Ok(ChatStreamRecord {
-            session_id,
-            run_id,
-            events: Vec::new(),
-            event_rx: Some(event_rx),
-        })
+    fn resolve_server_workspace(
+        &self,
+        record: &astra_runtime_env::WorkspaceRecord,
+    ) -> Result<PathBuf, astra_runtime_env::WorkspaceProvisionError> {
+        self.selected_server_workspace_provider
+            .as_ref()
+            .ok_or_else(|| {
+                astra_runtime_env::WorkspaceProvisionError::unavailable(
+                    &record.workspace_id,
+                    "No local workspace provider is selected",
+                )
+            })?
+            .resolve_existing(record)
+            .map_err(crate::server::run::workspace_provisioning::server_error_to_workspace_error)
+    }
+
+    fn execution_owner_pod_id(&self) -> Option<&str> {
+        self.run_engine.execution_owner_pod_id()
+    }
+
+    /// Create a run (background mode): spawns the agentic loop in a task, returns immediately.
+    async fn create_run(
+        &self,
+        user_id: String,
+        request: ChatRequestData,
+    ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        let NewRunPreparation::Owned { execution, .. } = self
+            .prepare_new_owned_execution(user_id, request, None, false)
+            .await?
+        else {
+            unreachable!("insert-only background start cannot replay")
+        };
+        let record = ChatRunRecord {
+            session_id: execution.session_id.clone(),
+            run_id: execution.run_id.clone(),
+            status: STATUS_RUNNING.to_string(),
+            explain: execution.explain.then(|| json!({"mode": "background"})),
+        };
+        self.launch_owned_background_execution(*execution).await;
+        Ok(record)
+    }
+
+    /// Stream chat (incremental SSE mode): spawns the agentic loop in a
+    /// background task and returns an event channel for incremental streaming.
+    /// Post-loop cleanup (persistence, learning state) runs inside the task.
+    async fn stream_chat(
+        &self,
+        user_id: String,
+        request: ChatRequestData,
+    ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.require_invocation_composition()?;
+        let start_identity = self.run_start_idempotency(&user_id, &request)?;
+        // Replays consume frozen execution facts before mutable admission.
+        if let Some(identity) = start_identity.as_ref()
+            && let Some(durable) = self
+                .load_durable_run_for_user(identity.run_id(), &user_id)
+                .await?
+        {
+            Self::validate_start_request_session(
+                identity,
+                request.session_id.as_deref(),
+                &durable.session_id,
+            )?;
+            Self::validate_start_request_fingerprint(
+                identity,
+                durable.start_request_fingerprint.as_deref(),
+            )?;
+            return self
+                .stream_run_live(identity.run_id().to_owned(), user_id, 0)
+                .await;
+        }
+        match self
+            .prepare_new_owned_execution(user_id.clone(), request, start_identity, true)
+            .await?
+        {
+            NewRunPreparation::Existing { run_id } => {
+                self.stream_run_live(run_id, user_id, 0).await
+            }
+            NewRunPreparation::Owned {
+                execution,
+                event_rx,
+            } => {
+                let record = ChatStreamRecord {
+                    session_id: execution.session_id.clone(),
+                    run_id: execution.run_id.clone(),
+                    events: Vec::new(),
+                    event_rx,
+                };
+                self.launch_owned_background_execution(*execution).await;
+                Ok(record)
+            }
+        }
     }
 
     async fn get_run_status(
@@ -22536,6 +21326,13 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
     ) -> Result<Vec<Box<dyn PreparedSpawn>>, crate::orchestration::SpawnError> {
         if inputs.iter().any(|input| input.isolated) {
             return Err("agent execution does not support isolated Git workspaces".into());
+        }
+        // This executor starts each child from its admitted task. A resolved
+        // process-local snapshot is not authorized, durable child context.
+        // Reject both required and optional requests before preparing any slot;
+        // never acknowledge inheritance while silently launching a fresh child.
+        if inputs.iter().any(|input| input.inherit_prefix.is_some()) {
+            return Err("agent execution does not support parent prefix inheritance".into());
         }
         let parent = self
             .runtime_context_for_parent_run(&context.parent_run_id)

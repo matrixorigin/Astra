@@ -639,50 +639,6 @@ impl ToolHealthTracker {
         &self.tools
     }
 
-    /// Build a structured warning message for tools under retry caution.
-    /// Returns None if no tools need retry-caution guidance.
-    pub fn health_avoidance_warning(&self) -> Option<String> {
-        let retry_cautioned: Vec<&str> = self.health_avoidance_tools();
-        if retry_cautioned.is_empty() {
-            return None;
-        }
-        let tools_list = retry_cautioned.join(", ");
-        let mut msg = format!(
-            "⚠ The following tools have failed {} or more times consecutively \
-             and should not be retried blindly with the same inputs: [{}]. \
-             The tools remain available; retry only after changing inputs, scope, \
-             working directory, or the underlying hypothesis.",
-            CONSECUTIVE_FAILURE_THRESHOLD, tools_list
-        );
-        // Provide specific alternative suggestions for common retry-cautioned tools.
-        for tool in &retry_cautioned {
-            match *tool {
-                "read_file" => {
-                    msg.push_str(
-                        " Instead of read_file, use grep to search for specific content, \
-                         or glob to find files by pattern.",
-                    );
-                }
-                "bash" => {
-                    msg.push_str(
-                        " If bash failed because the command or cwd was wrong, fix that and retry. \
-                         For file inspection, built-in tools like read_file, grep, glob, or list_dir \
-                         may provide narrower evidence.",
-                    );
-                }
-                "str_replace" => {
-                    msg.push_str(
-                        " If str_replace keeps failing, read the file first to verify \
-                         the exact content, then retry. If it still fails after 2 retries, \
-                         use write_file to rewrite the entire file instead.",
-                    );
-                }
-                _ => {}
-            }
-        }
-        Some(msg)
-    }
-
     /// Export tool health data for cross-session persistence.
     /// Exports ALL tracked tools, not just those used in this session.
     /// Tools used this session get updated timestamps; others retain their loaded timestamps.
@@ -1328,7 +1284,6 @@ mod tests {
         let tracker = ToolHealthTracker::new();
         assert!(!tracker.is_avoidance_advised("bash"));
         assert!(tracker.health_avoidance_tools().is_empty());
-        assert!(tracker.health_avoidance_warning().is_none());
     }
 
     #[test]
@@ -1414,39 +1369,6 @@ mod tests {
         let mut cautioned = tracker.health_avoidance_tools();
         cautioned.sort();
         assert_eq!(cautioned, vec!["bash", "read_file"]);
-    }
-
-    #[test]
-    fn health_avoidance_warning_message() {
-        let mut tracker = ToolHealthTracker::new();
-        assert!(tracker.health_avoidance_warning().is_none());
-
-        for _ in 0..3 {
-            tracker.record_failure("bash");
-        }
-        let warning = tracker.health_avoidance_warning().unwrap();
-        assert!(warning.contains("bash"));
-        assert!(warning.contains("3"));
-        assert!(warning.contains("retried blindly"));
-        // Should include specific alternative suggestions
-        assert!(
-            warning.contains("read_file") || warning.contains("grep"),
-            "bash warning should suggest alternatives: {warning}"
-        );
-    }
-
-    #[test]
-    fn health_avoidance_warning_read_file_suggests_grep() {
-        let mut tracker = ToolHealthTracker::new();
-        for _ in 0..3 {
-            tracker.record_failure("read_file");
-        }
-        let warning = tracker.health_avoidance_warning().unwrap();
-        assert!(warning.contains("read_file"));
-        assert!(
-            warning.contains("grep"),
-            "read_file warning should suggest grep: {warning}"
-        );
     }
 
     #[test]
@@ -2343,8 +2265,6 @@ mod tests {
                     .recent_outcomes
                     .is_empty()
             );
-            let (merged, _, _) = persistence::merge_tool_health(&invalid, &invalid);
-            assert!(merged[0].recent_outcomes.is_empty());
         }
         let mut restored = ToolHealthTracker::from_entries(&exported);
         assert_eq!(restored.recent_outcome(signature), Some(&outcome));
@@ -2649,23 +2569,6 @@ mod tests {
         let c = ToolOutcome::new(true, 0, "aaa");
         assert_ne!(a.result_hash, b.result_hash);
         assert_eq!(a.result_hash, c.result_hash);
-    }
-
-    #[test]
-    fn str_replace_injection_suggests_write_file_fallback() {
-        let mut tracker = ToolHealthTracker::new();
-        for _ in 0..4 {
-            tracker.record_failure("str_replace");
-        }
-        let msg = tracker.health_avoidance_warning().unwrap();
-        assert!(
-            msg.contains("write_file"),
-            "injection should suggest write_file fallback, got: {msg}"
-        );
-        assert!(
-            msg.contains("str_replace"),
-            "injection should mention str_replace, got: {msg}"
-        );
     }
 
     // ── Tests for record_outcome_with_preview + recent_errors ─────────

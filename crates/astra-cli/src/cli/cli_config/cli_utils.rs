@@ -994,34 +994,6 @@ pub(crate) fn eprint_api_error(status: u16, context: &str) {
     }
 }
 
-/// Print a transport/request error with helpful hints.
-pub(crate) fn eprint_request_error<E: std::fmt::Display>(error: &E) {
-    use crossterm::style::Stylize;
-    let err_str = error.to_string().to_lowercase();
-
-    eprintln!("  {} Request failed: {}", theme::icon_err(), error);
-
-    // Provide hints based on common error patterns
-    let hint = if err_str.contains("connection refused") || err_str.contains("connrefused") {
-        Some("Server may be down — check if the service is running")
-    } else if err_str.contains("timeout") || err_str.contains("timed out") {
-        Some("Request timed out — check network or try again")
-    } else if err_str.contains("dns") || err_str.contains("resolve") {
-        Some("DNS lookup failed — check your network connection")
-    } else if err_str.contains("ssl") || err_str.contains("tls") || err_str.contains("certificate")
-    {
-        Some("TLS/SSL error — check certificates or system time")
-    } else if err_str.contains("reset") || err_str.contains("closed") {
-        Some("Connection was reset — server may have restarted")
-    } else {
-        None
-    };
-
-    if let Some(h) = hint {
-        eprintln!("      {}", h.dim());
-    }
-}
-
 pub(crate) fn compact_or_raw(body: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(body) {
         Ok(value) => value.to_string(),
@@ -1099,55 +1071,18 @@ pub(crate) fn urlencoding(s: &str) -> String {
     astra_text_utils::url_component::encode_url_component(s)
 }
 
-/// Read current git HEAD (short SHA) and branch name for journal git snapshots.
-///
-/// `cwd` should be the session's `git_root` so the snapshot reflects the
-/// correct repo even if the process cwd differs. Falls back to process cwd
-/// when `None`.
-///
-/// Returns `(git_head, git_branch)` — either or both may be `None` if not in a
-/// git repo or in detached HEAD state (branch will be None).
-pub(crate) fn git_snapshot(cwd: Option<&str>) -> (Option<String>, Option<String>) {
-    let mut head_cmd = std::process::Command::new("git");
-    head_cmd.args(["rev-parse", "--short", "HEAD"]);
-    if let Some(dir) = cwd {
-        head_cmd.current_dir(dir);
-    }
-    let head = head_cmd
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let mut branch_cmd = std::process::Command::new("git");
-    branch_cmd.args(["symbolic-ref", "--short", "HEAD"]);
-    if let Some(dir) = cwd {
-        branch_cmd.current_dir(dir);
-    }
-    let branch = branch_cmd
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    (head, branch)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         CliProfileIdentityAdmission, CredentialsFile, Profile,
         clear_profile_last_session_if_matches, cli_owner_auth_snapshot, cli_user_id,
         compact_or_raw, configure_cli_profile_identity, credentials_path,
-        format_error_with_context, get_profile_and_token, git_snapshot,
-        install_cli_profile_identity_for_test, is_astra_session_auth_error, load_credentials,
-        local_profile_owner_id, local_resumable_last_session_id, local_session_is_resumable,
-        mutate_credentials, normalize_model_override, persist_profile_last_session,
-        persist_profile_memoria_api_key, profile_name, read_api_error, save_credentials,
-        session_is_resumable, status_hint, status_hint_for, urlencoding,
-        validated_resumable_last_session_id,
+        format_error_with_context, get_profile_and_token, install_cli_profile_identity_for_test,
+        is_astra_session_auth_error, load_credentials, local_profile_owner_id,
+        local_resumable_last_session_id, local_session_is_resumable, mutate_credentials,
+        normalize_model_override, persist_profile_last_session, persist_profile_memoria_api_key,
+        profile_name, read_api_error, save_credentials, session_is_resumable, status_hint,
+        status_hint_for, urlencoding, validated_resumable_last_session_id,
     };
     use astra_services::{SessionArtifactStore as _, session_journal};
     use std::sync::{Mutex, OnceLock};
@@ -2255,55 +2190,5 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "credentials.json must be 0600, got {mode:o}");
         }
-    }
-
-    #[test]
-    fn git_snapshot_returns_head_and_branch_in_git_repo() {
-        // This test runs inside the astra git repo, so both should be Some.
-        let (head, _branch) = git_snapshot(None);
-        assert!(
-            head.is_some(),
-            "git_snapshot must return Some(head) inside a git repo"
-        );
-        let h = head.unwrap();
-        assert!(
-            h.len() >= 7 && h.len() <= 40,
-            "git HEAD should be 7-40 chars, got {}: '{h}'",
-            h.len()
-        );
-        // branch may be None in CI detached HEAD, so we only check head is valid hex
-        assert!(
-            h.chars().all(|c| c.is_ascii_hexdigit()),
-            "git HEAD must be hex, got '{h}'"
-        );
-    }
-
-    #[test]
-    fn git_snapshot_with_explicit_cwd_matches_none() {
-        // Passing the current dir explicitly should give the same result as None.
-        let cwd = std::env::current_dir().unwrap();
-        let (head_none, branch_none) = git_snapshot(None);
-        let (head_cwd, branch_cwd) = git_snapshot(Some(cwd.to_str().unwrap()));
-        assert_eq!(head_none, head_cwd, "explicit cwd must match implicit cwd");
-        assert_eq!(
-            branch_none, branch_cwd,
-            "explicit cwd must match implicit cwd"
-        );
-    }
-
-    #[test]
-    fn git_snapshot_with_non_git_dir_returns_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        // TMPDIR may be inside the checkout: stop Git's ancestor discovery.
-        std::fs::write(tmp.path().join(".git"), "gitdir: absent-repository\n").unwrap();
-        let (head, branch) = git_snapshot(Some(tmp.path().to_str().unwrap()));
-        assert!(
-            head.is_none(),
-            "non-git dir must return None for head, got {head:?}"
-        );
-        assert!(
-            branch.is_none(),
-            "non-git dir must return None for branch, got {branch:?}"
-        );
     }
 }

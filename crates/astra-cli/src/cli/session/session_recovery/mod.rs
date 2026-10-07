@@ -469,12 +469,12 @@ mod tests {
     }
 
     #[test]
-    fn sync_session_state_to_workspace_copies_skills_and_adaptive_state() {
+    fn sync_session_state_to_workspace_preserves_workspace_history_and_config() {
         let mut state = SessionState::default();
         state.session_persistence_error = Some("journal append failed".to_string());
-        state.discovered_skills.insert("skill-b".to_string());
 
         let mut ws = astra_services::session_workspace::WorkspaceMetadata::new("sid-adaptive", "m");
+        ws.discovered_skills = vec!["skill-b".to_string()];
         sync_session_state_to_workspace(&state, &mut ws);
 
         assert_eq!(

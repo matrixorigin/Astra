@@ -145,8 +145,6 @@ fn plan_cache_strategy(policy: &ProviderCachePolicy, latches: &SessionLatches) -
 /// Identity and Constraints are always present. Memory is included only if
 /// retrieval has already produced concrete snippets. Conversation history
 /// travels in the provider messages array, not as a hollow system section.
-/// Emergent sections are always included (the Bind phase will produce empty
-/// BoundSections if there's nothing to inject).
 fn plan_section_manifest(budget: &TokenBudget, has_memory: bool) -> Vec<PlannedSection> {
     let mut sections = vec![
         PlannedSection {
@@ -253,21 +251,6 @@ fn plan_section_manifest(budget: &TokenBudget, has_memory: bool) -> Vec<PlannedS
             estimated_tokens: budget.budget_for(SectionKind::Memory),
             priority: CompressionPriority::Normal,
             source: SectionSource::Memory,
-        });
-    }
-
-    // Emergent sections always present (Bind produces empty if nothing to inject)
-    for kind in [
-        SectionKind::EmergentSkills,
-        SectionKind::EmergentMemory,
-        SectionKind::EmergentSummary,
-    ] {
-        sections.push(PlannedSection {
-            kind,
-            scope: CacheScope::None,
-            estimated_tokens: 0,
-            priority: CompressionPriority::First,
-            source: SectionSource::Emergent,
         });
     }
 
@@ -506,28 +489,6 @@ mod tests {
         assert!(plan.compact_tier >= CompactionTier::CompactHistory);
     }
 
-    #[test]
-    fn plan_includes_emergent_sections() {
-        let (tokens, recovery, latches, stats, policy) = default_input();
-        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
-        let plan = plan_turn(&input);
-        assert!(
-            plan.sections
-                .iter()
-                .any(|s| s.kind == SectionKind::EmergentSkills)
-        );
-        assert!(
-            plan.sections
-                .iter()
-                .any(|s| s.kind == SectionKind::EmergentMemory)
-        );
-        assert!(
-            plan.sections
-                .iter()
-                .any(|s| s.kind == SectionKind::EmergentSummary)
-        );
-    }
-
     /// Golden test: locks the canonical system-prompt section order.
     ///
     /// The **order** of sections emitted by `plan_section_manifest` is load-bearing:
@@ -558,9 +519,6 @@ mod tests {
                 SectionKind::DeferredTools,
                 SectionKind::RuntimeVolatile,
                 SectionKind::WorkingMemory,
-                SectionKind::EmergentSkills,
-                SectionKind::EmergentMemory,
-                SectionKind::EmergentSummary,
             ],
             "canonical section order drifted — this breaks Anthropic prompt-cache prefix. \
              RuntimeIdentity (Session) must precede RuntimeVolatile (None) so the 2nd cache \
@@ -589,11 +547,8 @@ mod tests {
                 SectionKind::RuntimeVolatile,
                 SectionKind::WorkingMemory,
                 SectionKind::Memory,
-                SectionKind::EmergentSkills,
-                SectionKind::EmergentMemory,
-                SectionKind::EmergentSummary,
             ],
-            "canonical section order (with memory) drifted — WorkingMemory and Memory must sit between RuntimeVolatile and Emergent*"
+            "canonical section order (with memory) drifted — WorkingMemory and Memory follow RuntimeVolatile"
         );
     }
 

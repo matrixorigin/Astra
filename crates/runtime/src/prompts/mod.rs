@@ -29,8 +29,7 @@ pub use system::{
     build_skill_listing_section_for_model, build_skill_listing_section_with_caps,
     build_skill_listing_section_with_context_window_and_caps, default_overrides_dir,
     execution_slice_guidance, load_overrides, parallel_batching_nudge_directive,
-    parallel_execution_feedback, tool_round_guidance, tool_round_guidance_trace,
-    trailing_single_tool_round_streak,
+    tool_round_guidance_trace, trailing_single_tool_round_streak,
 };
 pub(crate) use system::{
     DURABLE_WORK_ATTEMPT_CONTINUATION_INSTRUCTION, DURABLE_WORK_ATTEMPT_FRAME_INSTRUCTION,

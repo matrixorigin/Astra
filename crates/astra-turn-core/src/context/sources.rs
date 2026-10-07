@@ -9,7 +9,6 @@
 
 use serde_json::Value;
 
-use crate::emergent_context::EmergentContext;
 use crate::microcompact::ProviderCacheStrategy;
 use crate::pipeline_config::ProviderCachePolicy;
 use crate::pipeline_stats::PipelineStats;
@@ -226,7 +225,6 @@ pub struct ContextSources<'a> {
     pub session: &'a SessionContext,
     pub turn: &'a TurnState,
     pub external: &'a ExternalSources,
-    pub emergent: &'a EmergentContext,
     pub working_memory: Option<&'a WorkingMemoryState>,
     pub stats: &'a PipelineStats,
 }

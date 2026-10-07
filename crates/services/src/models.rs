@@ -245,6 +245,7 @@ fn validate_pricing_data(pricing: &PricingData) -> Result<(), String> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct QuirksData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fixed_temperature: Option<f64>,
@@ -263,10 +264,6 @@ pub struct QuirksData {
     pub no_system_message: bool,
     #[serde(default)]
     pub system_as_user_prefix: bool,
-    /// Ordered fallback chain. Tried in sequence when the primary model hits
-    /// rate limits or becomes unavailable.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallback_chain: Vec<String>,
     /// Upstream model name sent in the `model` field of the LLM request.
     ///
     /// When the local registry needs to track the same upstream model under
@@ -737,8 +734,8 @@ pub fn model_catalog_revision(items: &[ModelListItem]) -> String {
 #[derive(Clone, PartialEq)]
 pub struct ResolvedActiveLlmModel {
     pub price_snapshot: Option<InferencePriceSnapshot>,
-    /// Local model name used for routing, telemetry, fallback_chain lookups,
-    /// and capture-file labels. Unique per row.
+    /// Local model name used for routing, telemetry, and capture-file labels.
+    /// Unique per row.
     pub model_name: String,
     /// Optional literal name to send in the upstream LLM `model` field.
     /// `None` means the upstream receives `model_name` verbatim.
@@ -750,7 +747,6 @@ pub struct ResolvedActiveLlmModel {
     pub api_key: String,
     pub base_url: String,
     pub provider: String,
-    pub fallback_chain: Vec<String>,
     pub tags: Vec<String>,
     pub request_body_overrides: Option<Map<String, Value>>,
     /// Mode-independent fixed temperature declared by the admitted Offering.
@@ -1125,7 +1121,6 @@ impl std::fmt::Debug for ResolvedActiveLlmModel {
             .field("api_key", &"<redacted>")
             .field("base_url", &self.base_url)
             .field("provider", &self.provider)
-            .field("fallback_chain", &self.fallback_chain)
             .field("tags", &self.tags)
             .field("request_body_overrides", &self.request_body_overrides)
             .field("fixed_temperature", &self.fixed_temperature)
@@ -1426,7 +1421,6 @@ fn build_resolved_active_llm_from_row(
         &quirks_json,
     );
     let thinking_capability = cached_capability(snapshot.as_deref(), &identity, thinking_protocol);
-    let fallback_chain = quirks.fallback_chain;
     let wire_model_name = quirks.wire_model_name;
     let prompt_cache_capability = quirks.prompt_cache_capability;
     let request_body_overrides = quirks.request_body_overrides;
@@ -1477,7 +1471,6 @@ fn build_resolved_active_llm_from_row(
         api_key,
         base_url,
         provider,
-        fallback_chain,
         tags,
         request_body_overrides,
         fixed_temperature,
@@ -1546,7 +1539,6 @@ async fn require_pool(
 /// otherwise this returns an error (no aliasing or silent fallback to another model). When
 /// `preferred` is `None`, returns an error instead of silently choosing an arbitrary active model.
 ///
-/// Also extracts `fallback_chain` from the `quirks` JSON column (cloud-managed config).
 pub async fn resolve_active_llm_model(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
@@ -4440,11 +4432,17 @@ impl ModelService for DatabaseModelService {
             .try_get("api_key_encrypted")
             .map_err(internal_error)?;
         let stored_quirks_json: String = existing.try_get("quirks_json").map_err(internal_error)?;
-        let stored_quirks: QuirksData =
-            parse_json_column("quirks_json", &stored_quirks_json).map_err(internal_error)?;
-        // Quirks are a complete replacement: an omitted wire name in a new
-        // quirks object must not keep the prior override during validation.
-        let quirks = request.quirks.as_ref().unwrap_or(&stored_quirks);
+        // Quirks are a complete replacement. Only decode the stored object
+        // when no replacement was supplied; the raw stored JSON still fences
+        // the update so an explicit correction cannot bypass concurrent edits.
+        let stored_quirks;
+        let quirks = if let Some(quirks) = request.quirks.as_ref() {
+            quirks
+        } else {
+            stored_quirks = parse_json_column::<QuirksData>("quirks_json", &stored_quirks_json)
+                .map_err(internal_error)?;
+            &stored_quirks
+        };
         let provider = request.provider.as_deref().unwrap_or(&stored_provider);
         let base_url = request.base_url.as_deref().or(stored_base_url.as_deref());
         let probe_name = quirks.wire_model_name.as_deref().unwrap_or(&model_name);
@@ -6715,7 +6713,6 @@ mod tests {
             api_key: "sk-test".to_string(),
             base_url: "http://127.0.0.1:18080".to_string(),
             provider: "openai".to_string(),
-            fallback_chain: Vec::new(),
             tags: Vec::new(),
             request_body_overrides: None,
             fixed_temperature: None,
@@ -7203,7 +7200,6 @@ mod tests {
             api_key: "k".into(),
             base_url: "https://api.deepseek.com/anthropic".into(),
             provider: "anthropic".into(),
-            fallback_chain: vec![],
             tags: vec![],
             request_body_overrides: None,
             fixed_temperature: None,
@@ -7228,7 +7224,6 @@ mod tests {
             api_key: "k".into(),
             base_url: "https://api.anthropic.com".into(),
             provider: "anthropic".into(),
-            fallback_chain: vec![],
             tags: vec![],
             request_body_overrides: None,
             fixed_temperature: None,
@@ -7357,11 +7352,21 @@ mod tests {
     }
 
     #[test]
-    fn quirks_data_extra_unknown_fields_ignored() {
-        let q: QuirksData =
-            serde_json::from_str(r#"{"no_system_message": true, "unknown_future_field": 42}"#)
-                .unwrap();
-        assert!(q.no_system_message);
+    fn quirks_data_rejects_unknown_controls() {
+        for field in ["fallback_chain", "unknown_future_field"] {
+            let error = serde_json::from_value::<QuirksData>(serde_json::json!({(field): []}))
+                .expect_err("unsupported controls must not appear to take effect");
+            assert!(error.to_string().contains("unknown field"));
+            assert!(error.to_string().contains(field));
+        }
+        let quirks: QuirksData = serde_json::from_value(serde_json::json!({
+            "request_body_overrides": {"custom_provider_option": {"enabled": true}}
+        }))
+        .expect("explicit request body extension remains open");
+        assert_eq!(
+            quirks.request_body_overrides.unwrap()["custom_provider_option"]["enabled"],
+            true
+        );
     }
 
     #[test]
@@ -7381,7 +7386,6 @@ mod tests {
             strict_tool_call_ids: true,
             no_system_message: false,
             system_as_user_prefix: true,
-            fallback_chain: vec!["claude-haiku".into(), "gpt-4o-mini".into()],
             wire_model_name: Some("deepseek-v4-pro".into()),
             prompt_cache_capability: Some(PromptCacheCapabilityData {
                 protocol: PromptCacheProtocolData::StrictHistoryMatch,
@@ -8568,34 +8572,6 @@ mod tests {
         assert_eq!(
             memory_model_priority(false, Some(ThinkingCapability::Both)),
             memory_model_priority(false, Some(ThinkingCapability::None)),
-        );
-    }
-
-    // ── QuirksData fallback_chain serde ──────────────────────────────────
-
-    #[test]
-    fn quirks_fallback_chain_serde_roundtrip() {
-        let json = r#"{"fallback_chain":["model-b","model-c"]}"#;
-        let q: QuirksData = serde_json::from_str(json).unwrap();
-        assert_eq!(q.fallback_chain, vec!["model-b", "model-c"]);
-        let serialized = serde_json::to_string(&q).unwrap();
-        assert!(serialized.contains("model-b"));
-    }
-
-    #[test]
-    fn quirks_fallback_chain_defaults_empty_when_absent() {
-        let json = r#"{}"#;
-        let q: QuirksData = serde_json::from_str(json).unwrap();
-        assert!(q.fallback_chain.is_empty());
-    }
-
-    #[test]
-    fn quirks_fallback_chain_empty_not_serialized() {
-        let q = QuirksData::default();
-        let json = serde_json::to_string(&q).unwrap();
-        assert!(
-            !json.contains("fallback_chain"),
-            "empty fallback_chain should be skipped: {json}"
         );
     }
 

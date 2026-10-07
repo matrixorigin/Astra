@@ -35,7 +35,6 @@ pub(crate) fn genesis_execution() -> AdmittedModelExecution {
             api_key: "test-genesis-secret".into(),
             base_url: "https://genesis.example/v1".into(),
             provider: "openai".into(),
-            fallback_chain: Vec::new(),
             tags: Vec::new(),
             request_body_overrides: None,
             fixed_temperature: None,

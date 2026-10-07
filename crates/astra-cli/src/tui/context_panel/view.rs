@@ -2737,7 +2737,6 @@ mod tests {
         };
         t.system_prompt.guidance_signals = PromptGuidanceSignals {
             parallel_batching_nudge: true,
-            ..PromptGuidanceSignals::default()
         };
         let b = ContextBreakdown::from_trace_with(&t, &ContextSnapshot::default());
         let focus = ViewState::collapsed(Some(Section::PromptSignals));

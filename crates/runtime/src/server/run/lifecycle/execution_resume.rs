@@ -766,12 +766,7 @@ impl AgenticRunLifecycleService {
             llm_cancel_token: token.clone(),
             execution_lease_lost: lease_lost.clone(),
             descendant_spawner: entry.spawner.clone(),
-            event_tx: None,
-            fanout_control_tx: None,
-            durable_tool_terminals: None,
-            host_event_bridge: None,
-            host_event_gap: None,
-            progress_bridge: None,
+            delivery: None,
         })
     }
 }

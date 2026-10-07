@@ -56,8 +56,8 @@ pub use astra_skills::version::{Dependency, Version, VersionConstraint};
 
 pub use astra_skills::providers::DatabaseSkillProvider;
 pub use registry::{
-    SharedSkillRegistry, SkillDiscoveryFailure, SkillDiscoveryReport, SkillHealthInputs,
-    UnifiedSkillRegistry, UnifiedSkillResolver,
+    SharedSkillRegistry, SkillDiscoveryFailure, SkillDiscoveryReport, UnifiedSkillRegistry,
+    UnifiedSkillResolver,
 };
 
 /// Returns a shared reference to a static empty `UnifiedSkillRegistry`.

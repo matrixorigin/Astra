@@ -517,14 +517,14 @@ async fn event_ingest_idempotent_duplicate_key_no_error() {
     // Spawn worker, send event, shutdown — first insert
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(event.clone()).await;
+    sender.enqueue(event.clone());
     shutdown.signal();
     handle.await.unwrap();
 
     // Spawn worker again, send same event — INSERT IGNORE should make it idempotent
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(event.clone()).await;
+    sender.enqueue(event.clone());
     shutdown.signal();
     handle.await.unwrap();
 
@@ -574,22 +574,18 @@ async fn blocked_session_fence_does_not_delay_an_unrelated_session() {
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender
-        .enqueue_async(test_event_for_user(
-            &user_id,
-            &blocked_event,
-            &blocked_session,
-            "blocked_trace",
-        ))
-        .await;
-    sender
-        .enqueue_async(test_event_for_user(
-            &user_id,
-            &healthy_event,
-            &healthy_session,
-            "healthy_trace",
-        ))
-        .await;
+    sender.enqueue(test_event_for_user(
+        &user_id,
+        &blocked_event,
+        &blocked_session,
+        "blocked_trace",
+    ));
+    sender.enqueue(test_event_for_user(
+        &user_id,
+        &healthy_event,
+        &healthy_session,
+        "healthy_trace",
+    ));
 
     wait_for_event(
         &pool,
@@ -649,14 +645,12 @@ async fn late_arriving_session_commits_while_an_earlier_transaction_is_blocked()
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender
-        .enqueue_async(test_event_for_user(
-            &user_id,
-            &blocked_event,
-            &blocked_session,
-            "blocked_first",
-        ))
-        .await;
+    sender.enqueue(test_event_for_user(
+        &user_id,
+        &blocked_event,
+        &blocked_session,
+        "blocked_first",
+    ));
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             if astra_core::sync_poison::recover_mutex_lock(&stats).events_received == 1 {
@@ -669,14 +663,12 @@ async fn late_arriving_session_commits_while_an_earlier_transaction_is_blocked()
     .expect("worker must receive the first event before the late arrival");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    sender
-        .enqueue_async(test_event_for_user(
-            &user_id,
-            &late_event,
-            &late_session,
-            "late_healthy",
-        ))
-        .await;
+    sender.enqueue(test_event_for_user(
+        &user_id,
+        &late_event,
+        &late_session,
+        "late_healthy",
+    ));
     wait_for_event(
         &pool,
         &user_id,
@@ -743,14 +735,12 @@ async fn session_flush_concurrency_is_bounded_to_two_transactions() {
         (&event_b, &session_b),
         (&event_c, &session_c),
     ] {
-        sender
-            .enqueue_async(test_event_for_user(
-                &user_id,
-                event_id,
-                session_id,
-                "bounded_trace",
-            ))
-            .await;
+        sender.enqueue(test_event_for_user(
+            &user_id,
+            event_id,
+            session_id,
+            "bounded_trace",
+        ));
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -822,14 +812,12 @@ async fn all_ingestion_slots_timeout_without_starving_a_healthy_session_or_leaki
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
     for (event_id, session_id) in [(&event_a, &blocked_a), (&event_b, &blocked_b)] {
-        sender
-            .enqueue_async(test_event_for_user(
-                &user_id,
-                event_id,
-                session_id,
-                "timeout_blocked",
-            ))
-            .await;
+        sender.enqueue(test_event_for_user(
+            &user_id,
+            event_id,
+            session_id,
+            "timeout_blocked",
+        ));
     }
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -844,14 +832,12 @@ async fn all_ingestion_slots_timeout_without_starving_a_healthy_session_or_leaki
     .await
     .expect("both ingestion attempt slots must be occupied by held fences");
 
-    sender
-        .enqueue_async(test_event_for_user(
-            &user_id,
-            &healthy_event,
-            &healthy,
-            "timeout_healthy",
-        ))
-        .await;
+    sender.enqueue(test_event_for_user(
+        &user_id,
+        &healthy_event,
+        &healthy,
+        "timeout_healthy",
+    ));
     wait_for_event(
         &pool,
         &user_id,
@@ -920,14 +906,12 @@ async fn queued_ingestion_cannot_resurrect_a_hard_deleted_session() {
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender
-        .enqueue_async(test_event_for_user(
-            &user_id,
-            &event_id,
-            &session_id,
-            "queued_before_delete",
-        ))
-        .await;
+    sender.enqueue(test_event_for_user(
+        &user_id,
+        &event_id,
+        &session_id,
+        "queued_before_delete",
+    ));
 
     let session_service = DatabaseSessionService::new(astra_core::MatrixOneSettings::from_env())
         .with_pool(shared.clone());
@@ -1084,7 +1068,7 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
     let b1 = barrier.clone();
     let handle1 = tokio::spawn(async move {
         let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool1, config);
-        sender.enqueue_async(event1).await;
+        sender.enqueue(event1);
         b1.wait().await;
         shutdown.signal();
         handle.await.unwrap();
@@ -1097,7 +1081,7 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
     let b2 = barrier.clone();
     let handle2 = tokio::spawn(async move {
         let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool2, config);
-        sender.enqueue_async(event2).await;
+        sender.enqueue(event2);
         b2.wait().await;
         shutdown.signal();
         handle.await.unwrap();
@@ -1150,22 +1134,18 @@ async fn event_ingest_same_event_id_isolated_by_user() {
 
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender
-        .enqueue_async(test_event_for_user(
-            user_a,
-            &event_id,
-            &session_a,
-            "test_cross_user",
-        ))
-        .await;
-    sender
-        .enqueue_async(test_event_for_user(
-            user_b,
-            &event_id,
-            &session_b,
-            "test_cross_user",
-        ))
-        .await;
+    sender.enqueue(test_event_for_user(
+        user_a,
+        &event_id,
+        &session_a,
+        "test_cross_user",
+    ));
+    sender.enqueue(test_event_for_user(
+        user_b,
+        &event_id,
+        &session_b,
+        "test_cross_user",
+    ));
     shutdown.signal();
     handle.await.unwrap();
 
@@ -1214,15 +1194,15 @@ async fn event_ingest_batch_partial_duplicate_no_error() {
     // Insert batch of 2
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(event1.clone()).await;
-    sender.enqueue_async(event2.clone()).await;
+    sender.enqueue(event1.clone());
+    sender.enqueue(event2.clone());
     shutdown.signal();
     handle.await.unwrap();
 
     // Re-insert subset (event1 only) — should not error
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(event1.clone()).await;
+    sender.enqueue(event1.clone());
     shutdown.signal();
     handle.await.unwrap();
 
@@ -1259,7 +1239,7 @@ async fn event_ingest_closes_session_only_for_inserted_session_end() {
     let existing = test_event(&duplicate_event_id, &session_id, "ordinary_event");
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(existing).await;
+    sender.enqueue(existing);
     shutdown.signal();
     handle.await.unwrap();
     assert_session_event_count(&pool, TEST_USER_ID, &session_id, 1).await;
@@ -1267,7 +1247,7 @@ async fn event_ingest_closes_session_only_for_inserted_session_end() {
     let ignored_session_end = test_event(&duplicate_event_id, &session_id, "session_end");
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(ignored_session_end).await;
+    sender.enqueue(ignored_session_end);
     shutdown.signal();
     handle.await.unwrap();
 
@@ -1292,7 +1272,7 @@ async fn event_ingest_closes_session_only_for_inserted_session_end() {
     );
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(inserted_session_end).await;
+    sender.enqueue(inserted_session_end);
     shutdown.signal();
     handle.await.unwrap();
 
@@ -1341,8 +1321,8 @@ async fn event_ingest_configuration_change_replays_once_with_exact_metadata() {
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(event).await;
-    sender.enqueue_async(retry).await;
+    sender.enqueue(event);
+    sender.enqueue(retry);
     shutdown.signal();
     sender.shutdown();
     handle
@@ -1412,7 +1392,7 @@ async fn event_ingest_multi_session_batch_uses_per_session_insert_delta_and_lazy
         ..Default::default()
     };
     let (sender, shutdown, first_stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(duplicate_a.clone()).await;
+    sender.enqueue(duplicate_a.clone());
     shutdown.signal();
     handle.await.unwrap();
 
@@ -1434,7 +1414,7 @@ async fn event_ingest_multi_session_batch_uses_per_session_insert_delta_and_lazy
         unique_b1.clone(),
         unique_b2.clone(),
     ] {
-        sender.enqueue_async(event).await;
+        sender.enqueue(event);
     }
     shutdown.signal();
     handle.await.unwrap();
@@ -1479,9 +1459,7 @@ async fn event_ingest_drops_late_events_for_deleted_session_without_recreating_r
 
     let (sender, shutdown, stats, handle) =
         EventIngestionWorker::spawn(pool.clone(), IngestionConfig::default());
-    sender
-        .enqueue_async(test_event(&event_id, &session_id, "late_after_delete"))
-        .await;
+    sender.enqueue(test_event(&event_id, &session_id, "late_after_delete"));
     shutdown.signal();
     handle.await.expect("join ingestion worker");
 
@@ -1549,8 +1527,8 @@ async fn rejected_session_configuration_change_cannot_block_a_peer() {
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(rejected_config).await;
-    sender.enqueue_async(healthy).await;
+    sender.enqueue(rejected_config);
+    sender.enqueue(healthy);
     shutdown.signal();
     sender.shutdown();
     handle.await.expect("join mixed rejected ingestion worker");
@@ -1604,8 +1582,8 @@ async fn retryable_group_failure_retains_only_that_session_and_commits_its_peer_
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(failing).await;
-    sender.enqueue_async(healthy).await;
+    sender.enqueue(failing);
+    sender.enqueue(healthy);
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -1700,14 +1678,12 @@ async fn event_ingest_100_users_by_10_sessions_finishes_finite_burst() {
             let user_id = format!("{user_prefix}{user:03}");
             let session_id = format!("session-{user:03}-{session:02}-{run}");
             let event_id = format!("event-{user:03}-{session:02}-{run}");
-            sender
-                .enqueue_async(test_event_for_user(
-                    &user_id,
-                    &event_id,
-                    &session_id,
-                    &event_type,
-                ))
-                .await;
+            sender.enqueue(test_event_for_user(
+                &user_id,
+                &event_id,
+                &session_id,
+                &event_type,
+            ));
         }
     }
 
@@ -1824,8 +1800,8 @@ async fn event_ingest_isolates_same_session_id_across_owners_without_blocking_va
     );
     let config = IngestionConfig::default();
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(foreign_event).await;
-    sender.enqueue_async(valid_event).await;
+    sender.enqueue(foreign_event);
+    sender.enqueue(valid_event);
     shutdown.signal();
     handle.await.unwrap();
 
@@ -1901,7 +1877,7 @@ async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
     let config = IngestionConfig::default();
     let (sender, shutdown, _initial_stats, handle) =
         EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(first.clone()).await;
+    sender.enqueue(first.clone());
     shutdown.signal();
     handle.await.unwrap();
 
@@ -1919,8 +1895,8 @@ async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(duplicate_with_parent).await;
-    sender.enqueue_async(unique_with_parent).await;
+    sender.enqueue(duplicate_with_parent);
+    sender.enqueue(unique_with_parent);
     shutdown.signal();
     handle.await.unwrap();
 

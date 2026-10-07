@@ -2111,20 +2111,10 @@ fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane
 
         "learn" => {
             let mut pairs: Vec<(&str, String)> = Vec::new();
-            // Entity graph + pattern library panes removed along with the
-            // self-evolution subsystem. Skill quality + drift metrics remain.
-            pairs.push((
-                "skills tracked",
-                state.skill_quality_tracker.all_entries().len().to_string(),
-            ));
             if let Some(ref q) = state.drift_original_query {
                 let short: String = q.chars().take(50).collect();
                 pairs.push(("original query", short));
             }
-            pairs.push((
-                "discovered skills",
-                state.discovered_skills.len().to_string(),
-            ));
             if pairs.is_empty() {
                 pairs.push(("status", "No learning data yet.".into()));
             }

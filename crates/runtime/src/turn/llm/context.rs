@@ -469,7 +469,7 @@ pub(crate) struct LlmContextAssemblyOutput {
 }
 
 const EXPLAIN_ANALYZE_CONTEXT_SOURCE_ORDER: [astra_turn_types::ExplainAnalyzeContextSourceKindV1;
-    15] = [
+    12] = [
     astra_turn_types::ExplainAnalyzeContextSourceKindV1::Identity,
     astra_turn_types::ExplainAnalyzeContextSourceKindV1::SelfModel,
     astra_turn_types::ExplainAnalyzeContextSourceKindV1::ProjectContext,
@@ -482,9 +482,6 @@ const EXPLAIN_ANALYZE_CONTEXT_SOURCE_ORDER: [astra_turn_types::ExplainAnalyzeCon
     astra_turn_types::ExplainAnalyzeContextSourceKindV1::Skills,
     astra_turn_types::ExplainAnalyzeContextSourceKindV1::RuntimeIdentity,
     astra_turn_types::ExplainAnalyzeContextSourceKindV1::RuntimeVolatile,
-    astra_turn_types::ExplainAnalyzeContextSourceKindV1::EmergentSkills,
-    astra_turn_types::ExplainAnalyzeContextSourceKindV1::EmergentMemory,
-    astra_turn_types::ExplainAnalyzeContextSourceKindV1::EmergentSummary,
 ];
 
 fn explain_analyze_source_kind(
@@ -506,9 +503,6 @@ fn explain_analyze_source_kind(
         SectionKind::Skills => SourceKind::Skills,
         SectionKind::RuntimeIdentity => SourceKind::RuntimeIdentity,
         SectionKind::RuntimeVolatile => SourceKind::RuntimeVolatile,
-        SectionKind::EmergentSkills => SourceKind::EmergentSkills,
-        SectionKind::EmergentMemory => SourceKind::EmergentMemory,
-        SectionKind::EmergentSummary => SourceKind::EmergentSummary,
     }
 }
 
@@ -1738,10 +1732,10 @@ pub(crate) fn assemble_context_pipeline(
             let mut stable_text = String::new();
             let mut volatile_text = String::new();
             for block in &pipeline_output.serialized.system_blocks {
-                // Strict-history providers suppress ordinary volatile text to
-                // keep prior messages byte-stable. Capability-epoch metadata
-                // (including deferred discovery) is already marked Session by
-                // the canonical planner, so scope alone decides placement.
+                // Scope separates stable system content from runtime context.
+                // The independent delivery policy decides which runtime classes
+                // are admitted; CurrentUserOnly only selects their wire boundary.
+                // Capability-epoch metadata is already Session-scoped by the planner.
                 if block.scope != CacheScope::None {
                     stable_text.push_str(&block.text);
                 } else {
@@ -2537,7 +2531,14 @@ mod context_cache_contract_tests {
             .copied()
             .map(explain_analyze_source_kind)
             .collect::<HashSet<_>>();
-        assert_eq!(mapped.len(), 15);
+        assert_eq!(
+            mapped.len(),
+            astra_turn_core::section_types::SectionKind::all_planned().len()
+        );
+        assert_eq!(
+            mapped,
+            EXPLAIN_ANALYZE_CONTEXT_SOURCE_ORDER.into_iter().collect()
+        );
     }
 
     #[test]

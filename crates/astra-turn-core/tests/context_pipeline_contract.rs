@@ -3,18 +3,17 @@ use astra_turn_core::context_optimizer::{CacheMarker, ContextOptimized};
 use astra_turn_core::context_pipeline::{ContextPipeline, PipelineAbort, PipelineRunInput};
 use astra_turn_core::context_planner::{PlanInput, plan_turn};
 use astra_turn_core::context_serializer::{
-    flatten_serialized_system_blocks, serialize_prompt_sections, serialize_provider_request,
+    flatten_serialized_system_blocks, serialize_provider_request,
 };
 use astra_turn_core::context_sources::*;
-use astra_turn_core::emergent_context::EmergentContext;
 use astra_turn_core::microcompact::ProviderCacheStrategy;
 use astra_turn_core::optimize_limits::OptimizeLimits;
 use astra_turn_core::pipeline_config::{PipelineConfig, ProviderCachePolicy};
 use astra_turn_core::pipeline_stats::PipelineStats;
 use astra_turn_core::recovery_state::RecoveryState;
 use astra_turn_core::section_types::{
-    BoundSection, CacheScope, CompressionPriority, PlannedSection, PromptSection, SectionArtifact,
-    SectionKind, SectionSource,
+    BoundSection, CacheScope, CompressionPriority, PlannedSection, SectionArtifact, SectionKind,
+    SectionSource,
 };
 use astra_turn_core::session_latches::SessionLatches;
 use astra_turn_core::token_accounting::TokenAccounting;
@@ -26,7 +25,6 @@ fn build_sources() -> (
     SessionContext,
     TurnState,
     ExternalSources,
-    EmergentContext,
     PipelineStats,
 ) {
     (
@@ -67,14 +65,13 @@ fn build_sources() -> (
             memory_entries: vec![MemoryEntry::new("contract memory")],
             ..Default::default()
         },
-        EmergentContext::default(),
         PipelineStats::default(),
     )
 }
 
 #[test]
 fn bind_outputs_typed_artifacts_not_raw_string_only() {
-    let (statics, agent, latches, session, turn, ext, emer, stats) = build_sources();
+    let (statics, agent, latches, session, turn, ext, stats) = build_sources();
     let sources = ContextSources {
         statics: &statics,
         agent: &agent,
@@ -82,7 +79,6 @@ fn bind_outputs_typed_artifacts_not_raw_string_only() {
         session: &session,
         turn: &turn,
         external: &ext,
-        emergent: &emer,
         working_memory: None,
         stats: &stats,
     };
@@ -113,7 +109,7 @@ fn bind_outputs_typed_artifacts_not_raw_string_only() {
 
 #[test]
 fn context_pipeline_serializes_provider_request_and_metrics() {
-    let (statics, agent, latches, session, turn, ext, emer, stats) = build_sources();
+    let (statics, agent, latches, session, turn, ext, stats) = build_sources();
     let sources = ContextSources {
         statics: &statics,
         agent: &agent,
@@ -121,7 +117,6 @@ fn context_pipeline_serializes_provider_request_and_metrics() {
         session: &session,
         turn: &turn,
         external: &ext,
-        emergent: &emer,
         working_memory: None,
         stats: &stats,
     };
@@ -154,7 +149,7 @@ fn context_pipeline_serializes_provider_request_and_metrics() {
 
 #[test]
 fn context_pipeline_rejects_zero_model_limit_before_compaction() {
-    let (statics, agent, latches, mut session, turn, ext, emer, stats) = build_sources();
+    let (statics, agent, latches, mut session, turn, ext, stats) = build_sources();
     session.model_limit = 0;
     let sources = ContextSources {
         statics: &statics,
@@ -163,7 +158,6 @@ fn context_pipeline_rejects_zero_model_limit_before_compaction() {
         session: &session,
         turn: &turn,
         external: &ext,
-        emergent: &emer,
         working_memory: None,
         stats: &stats,
     };
@@ -190,7 +184,7 @@ fn context_pipeline_rejects_zero_model_limit_before_compaction() {
 
 #[test]
 fn context_pipeline_uses_session_provider_policy_not_default_config() {
-    let (statics, agent, latches, session, turn, ext, emer, stats) = build_sources();
+    let (statics, agent, latches, session, turn, ext, stats) = build_sources();
     let sources = ContextSources {
         statics: &statics,
         agent: &agent,
@@ -198,7 +192,6 @@ fn context_pipeline_uses_session_provider_policy_not_default_config() {
         session: &session,
         turn: &turn,
         external: &ext,
-        emergent: &emer,
         working_memory: None,
         stats: &stats,
     };
@@ -224,32 +217,70 @@ fn context_pipeline_uses_session_provider_policy_not_default_config() {
 }
 
 #[test]
-fn prompt_sections_serialize_through_pipeline_without_text_loss() {
-    let sections = vec![
-        PromptSection::stable("global", CacheScope::Global),
-        PromptSection::stable("", CacheScope::Session),
-        PromptSection::stable("session", CacheScope::Session),
-        PromptSection::dynamic(
-            "dynamic",
-            astra_turn_core::section_types::PromptTokenBucket::Environment,
-        ),
-    ];
-    let serialized = serialize_prompt_sections(&sections, &ProviderCachePolicy::default());
-
-    assert_eq!(
-        flatten_serialized_system_blocks(&serialized),
-        "globalsessiondynamic"
-    );
-    assert_eq!(serialized.system_blocks.len(), 3);
-    assert!(serialized.messages.is_empty());
-    assert!(serialized.tool_schemas.is_empty());
-    assert!(serialized.cache_markers.is_empty());
-    assert_eq!(serialized.system_blocks[0].kind, SectionKind::Identity);
-    assert_eq!(serialized.system_blocks[1].kind, SectionKind::SelfModel);
-    assert_eq!(
-        serialized.system_blocks[2].kind,
-        SectionKind::ProjectContext
-    );
+fn optimized_sections_serialize_supplied_markers_without_text_or_payload_loss() {
+    let optimized = ContextOptimized {
+        sections: vec![
+            bound_section(SectionKind::Identity, CacheScope::Global, "global"),
+            bound_section(SectionKind::SelfModel, CacheScope::Session, ""),
+            bound_section(SectionKind::SelfModel, CacheScope::Session, "session"),
+            bound_section(SectionKind::ProjectContext, CacheScope::None, "dynamic"),
+        ],
+        messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+        tool_schemas: vec![serde_json::json!({"name": "bash"})],
+        cache_markers: vec![
+            CacheMarker {
+                after_section_index: 0,
+                scope: CacheScope::Global,
+                cumulative_tokens: 10,
+            },
+            CacheMarker {
+                after_section_index: 1,
+                scope: CacheScope::Session,
+                cumulative_tokens: 10,
+            },
+            CacheMarker {
+                after_section_index: 2,
+                scope: CacheScope::Session,
+                cumulative_tokens: 20,
+            },
+        ],
+        stats: Default::default(),
+    };
+    for policy in [
+        ProviderCachePolicy::anthropic(),
+        ProviderCachePolicy::openai_compatible(),
+    ] {
+        let serialized = serialize_provider_request(&optimized, &policy);
+        assert_eq!(
+            flatten_serialized_system_blocks(&serialized),
+            "globalsessiondynamic"
+        );
+        assert_eq!(serialized.system_blocks.len(), 3);
+        assert_eq!(serialized.messages, optimized.messages);
+        assert_eq!(serialized.tool_schemas, optimized.tool_schemas);
+        assert_eq!(serialized.system_blocks[0].kind, SectionKind::Identity);
+        assert_eq!(serialized.system_blocks[1].kind, SectionKind::SelfModel);
+        assert_eq!(
+            serialized.system_blocks[2].kind,
+            SectionKind::ProjectContext
+        );
+        assert!(serialized.system_blocks[0].cache_control.is_none());
+        assert!(serialized.system_blocks[2].cache_control.is_none());
+        if policy.protocol
+            == astra_turn_core::microcompact::PromptCacheProtocol::AnthropicCacheControl
+        {
+            assert_eq!(serialized.cache_markers.len(), 1);
+            assert_eq!(serialized.cache_markers[0].after_section_index, 1);
+            assert_eq!(serialized.cache_markers[0].scope, CacheScope::Session);
+            assert_eq!(
+                serialized.system_blocks[1].cache_control,
+                Some(serde_json::json!({"type": "ephemeral"}))
+            );
+        } else {
+            assert!(serialized.cache_markers.is_empty());
+            assert!(serialized.system_blocks[1].cache_control.is_none());
+        }
+    }
 }
 
 fn bound_section(kind: SectionKind, scope: CacheScope, text: &str) -> BoundSection {
@@ -272,7 +303,7 @@ fn cache_marker_indices_match_serialized_system_blocks() {
     let optimized = ContextOptimized {
         sections: vec![
             bound_section(SectionKind::Identity, CacheScope::Global, "global"),
-            bound_section(SectionKind::EmergentSkills, CacheScope::Session, ""),
+            bound_section(SectionKind::SelfModel, CacheScope::Session, ""),
         ],
         messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
         tool_schemas: vec![serde_json::json!({"name": "bash"})],
@@ -305,7 +336,7 @@ fn cache_marker_indices_match_serialized_system_blocks() {
 
 #[test]
 fn pipeline_aborts_on_consecutive_ptl_errors() {
-    let (statics, agent, latches, session, mut turn, ext, emer, stats) = build_sources();
+    let (statics, agent, latches, session, mut turn, ext, stats) = build_sources();
     // Simulate 3 consecutive PTL errors
     turn.recovery.record_ptl_error();
     turn.recovery.record_ptl_error();
@@ -319,7 +350,6 @@ fn pipeline_aborts_on_consecutive_ptl_errors() {
         session: &session,
         turn: &turn,
         external: &ext,
-        emergent: &emer,
         working_memory: None,
         stats: &stats,
     };
@@ -348,7 +378,7 @@ fn pipeline_aborts_on_consecutive_ptl_errors() {
 
 #[test]
 fn serialized_output_format_system_blocks_are_well_structured() {
-    let (statics, agent, latches, session, turn, ext, emer, stats) = build_sources();
+    let (statics, agent, latches, session, turn, ext, stats) = build_sources();
     let sources = ContextSources {
         statics: &statics,
         agent: &agent,
@@ -356,7 +386,6 @@ fn serialized_output_format_system_blocks_are_well_structured() {
         session: &session,
         turn: &turn,
         external: &ext,
-        emergent: &emer,
         working_memory: None,
         stats: &stats,
     };

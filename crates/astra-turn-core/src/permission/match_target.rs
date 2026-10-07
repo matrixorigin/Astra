@@ -16,7 +16,6 @@ use crate::cloud::approval_policy::{
 use crate::parallel_tool_exec::is_read_only_tool_with_args;
 use crate::permission::memory_profile::{permission_memory_profile, workspace_write_prefix};
 use crate::permission::rule_grammar::{PermissionRuleSpec, serialize_rule};
-use crate::permission::scope::AllowScope;
 use crate::tool::args::hints::{command_hint_from_args, path_hint_from_args};
 
 /// The second dimension of an approval choice: what future tool call
@@ -106,54 +105,6 @@ pub fn fingerprint_for_match_target(
             }
             _ => ApprovalFingerprint::bare(tool_name),
         },
-    }
-}
-
-#[must_use]
-pub fn match_target_description(
-    scope: AllowScope,
-    target: &AllowMatchTarget,
-    tool_name: &str,
-    args: &Value,
-) -> String {
-    let duration = match scope {
-        AllowScope::OnceThisCall => "for this request",
-        AllowScope::RestOfTurn => "for the rest of this turn",
-        AllowScope::RestOfSession => "in this session",
-        AllowScope::Project => "for this workspace",
-        AllowScope::User => "for this user",
-    };
-    let is_execute = matches!(
-        cloud_gated_tool_kind(tool_name),
-        Some(CloudGatedToolKind::Execute)
-    );
-    match target {
-        AllowMatchTarget::Exact if is_execute => {
-            format!("Approve exactly this command {duration}.")
-        }
-        AllowMatchTarget::Exact => {
-            format!("Approve exactly this tool request {duration}.")
-        }
-        AllowMatchTarget::Tool => {
-            format!("Approve this tool for all future permission requests {duration}.")
-        }
-        AllowMatchTarget::Prefix(prefix) if is_execute => {
-            format!("Approve commands starting with `{prefix}` {duration}.")
-        }
-        AllowMatchTarget::Prefix(prefix)
-            if matches!(
-                cloud_gated_tool_kind(tool_name),
-                Some(CloudGatedToolKind::Write)
-            ) && path_hint_from_args(args)
-                .and_then(|path| workspace_write_prefix(&path))
-                .as_deref()
-                == Some(prefix.as_str()) =>
-        {
-            format!("Approve file edits in this workspace {duration}.")
-        }
-        AllowMatchTarget::Prefix(prefix) => {
-            format!("Approve paths matching `{prefix}` {duration}.")
-        }
     }
 }
 
@@ -510,20 +461,6 @@ mod tests {
             &AllowMatchTarget::Prefix("git ".to_string()),
         );
         assert_eq!(rule, r#"Bash(argv_prefix="git ", op="execute")"#);
-    }
-
-    #[test]
-    fn description_mentions_scope_and_target() {
-        let text = match_target_description(
-            AllowScope::RestOfSession,
-            &AllowMatchTarget::Tool,
-            "bash",
-            &serde_json::json!({"command": "git status"}),
-        );
-        assert_eq!(
-            text,
-            "Approve this tool for all future permission requests in this session."
-        );
     }
 
     #[test]

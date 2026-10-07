@@ -121,7 +121,7 @@ reports cache coverage for every positive-input request, and the input
 denominator is positive. Incomplete usage retains known token counts without
 claiming a cache percentage. Display identities are bounded and escaped.
 The session view covers the supported judgment operations (request admission,
-skill routing, memory relevance/feedback, tool-result selection, verification,
+skill routing, memory relevance/feedback, completion-proxy tool-result rerank, verification,
 and completion-proxy turn intent), not every auxiliary model call. Routine hint/summary projections
 bound group detail and report how many groups were omitted.
 
@@ -198,26 +198,15 @@ Their zero-length intervals mark observation instants, not inference latency;
 measured provider duration and usage retain their existing owners. Labels are
 derived from the typed facts and are never parsed back into semantic state.
 
-Historical tool-result selection observations retain a separate shared read
-projection for explicit `facet=trace` introspection and reflection; routine
-overview, recent, and session views omit this historical source without querying
-it. Omission is not evidence that no historical judgments exist. The agent loop no longer evaluates
-or applies new tool-result selection decisions: the optional semantic rerank did
-not demonstrate a reliable reduction of the final provider context, while even
-the no-auxiliary route scanned candidates and read frozen decisions. Trace
-decoding remains for historical audit; the unused recommendation builder and
-trace producer are removed rather than kept as a dormant execution path.
-Historical evaluation traces describe recommendations, and immutable receipts
-describe
-what an earlier provider wire contained; neither is evidence of a new runtime
-selection. A recommendation without a receipt has unconfirmed application. A
-receipt without a trace is valid historical application evidence but does not
-recover the missing evaluation rationale. A `Started` trace without a terminal
-trace is reported as missing terminal evidence, not inferred to be a
-cancellation or interruption. Evaluation and application capture have
-independent bounded-coverage states; conflicting identities are quarantined
-without discarding unrelated facts. Default text is a compact outcome summary;
-hashes, ranges and internal identities remain diagnostic details.
+Tool-result selection and its dedicated historical projection are retired. The
+runtime does not evaluate selection recommendations, freeze projection decisions,
+or publish application receipts. Introspection and reflection retain current
+semantic observations, provider usage and generic trace evidence; they do not
+query or decode a special historical selector source. The fresh schema contract
+excludes the retired decision/receipt tables and event field. Old databases are
+not accepted by this contract, and no compatibility decoder or migration is
+provided. Provider-wire identity, canonical history, admission ownership and
+current accepted-to-terminal recovery retain their existing contracts.
 
 Runtime tool fallback permitted by source policy uses the populated runtime snapshot.
 The unused `InspectionService` journal-derived summary path is retired; missing runtime evidence

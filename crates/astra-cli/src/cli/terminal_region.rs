@@ -205,7 +205,7 @@ pub(crate) fn char_display_width(c: char) -> usize {
 /// - SGR sequences: ESC [ ... m (colors, styles)
 /// - CSI sequences: ESC [ ... @ through ~ (cursor movement, clear, etc.)
 /// - OSC sequences: ESC ] ... BEL or ST (window title, etc.)
-fn strip_ansi_codes(input: &str) -> String {
+pub(crate) fn strip_ansi_codes(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {

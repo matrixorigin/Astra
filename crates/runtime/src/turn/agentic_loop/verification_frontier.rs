@@ -210,6 +210,7 @@ fn workspace_mutation_risk(record: &ToolCallRecord, root: Option<&str>) -> bool 
             super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
         )
         && !super::lifecycle::is_authoritative_unchanged_bash_observation_record(record)
+        && !super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(record)
         && !super::execution_phase::record_is_proven_external_scratch_mutation(root, record)
 }
 
@@ -566,6 +567,69 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn parallel_verify_receipts_require_live_parameters_and_unchanged_owner_facts() {
+        use astra_tools::workspace_observation as observation;
+        for invalid in [
+            None,
+            Some("mode"),
+            Some("ownership"),
+            Some("mutation"),
+            Some("failure"),
+        ] {
+            let mut ledger =
+                astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
+            let writer = executed_with_args(
+                &mut ledger,
+                "writer",
+                "write_file",
+                serde_json::json!({"path": "/app/answer.txt", "content": "new"}),
+            );
+            let hooks = [hook("./a"), hook("./b")];
+            let mut records = vec![writer];
+            for (i, command) in ["./a", "./b"].into_iter().enumerate() {
+                let mut args = serde_json::json!({"command": command, "mode": "verify"});
+                if i == 0 && invalid == Some("mode") {
+                    args.as_object_mut().unwrap().remove("mode");
+                }
+                let mut verifier =
+                    executed_with_args(&mut ledger, &format!("verify-{i}"), "bash", args);
+                let fields = observation::explicit_workspace_verification_receipt();
+                verifier.workspace_mutation_scope = Some(observation::BOUND_WORKSPACE_SCOPE.into());
+                verifier.workspace_mutation_receipt =
+                    fields.get(observation::OBSERVATION_RECEIPT_FIELD).cloned();
+                verifier.batch_id = Some("verify-batch".into());
+                verifier.parallel = Some(true);
+                if i == 0 {
+                    match invalid {
+                        Some("ownership") => {
+                            verifier.workspace_mutation_receipt.as_mut().unwrap()["ownership"] =
+                                serde_json::json!(observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+                        }
+                        Some("mutation") => verifier.workspace_mutation_observed = Some(true),
+                        Some("failure") => verifier.ok = false,
+                        _ => {}
+                    }
+                }
+                records.push(verifier);
+            }
+            let mut frontier = VerificationFrontier::default();
+            frontier.advance(Some("/app"), &hooks, &records).unwrap();
+            assert_eq!(
+                frontier.missing().unwrap().is_empty(),
+                invalid.is_none(),
+                "{invalid:?}"
+            );
+            if invalid.is_none() {
+                assert!(
+                    frontier
+                        .evaluate_workspace_observation(Some("/app"), &hooks, &records)
+                        .unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn parallel_explicit_verifier_does_not_prove_a_concurrent_write() {
         let mut ledger = astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
         let mut writer = executed_with_args(
@@ -574,7 +638,18 @@ pub(crate) mod tests {
             "write_file",
             serde_json::json!({"path": "/app/answer.txt", "content": "new"}),
         );
-        let mut verifier = executed(&mut ledger, "verifier", "bash", "./verify");
+        let mut verifier = executed_with_args(
+            &mut ledger,
+            "verifier",
+            "bash",
+            serde_json::json!({"command": "./verify", "mode": "verify"}),
+        );
+        verifier.workspace_mutation_scope =
+            Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+        verifier.workspace_mutation_receipt =
+            astra_tools::workspace_observation::explicit_workspace_verification_receipt()
+                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                .cloned();
         writer.batch_id = Some("parallel-verify".into());
         verifier.batch_id = writer.batch_id.clone();
         let hooks = [hook("./verify")];

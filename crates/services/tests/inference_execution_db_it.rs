@@ -17,18 +17,13 @@ use astra_services::{
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
     finish_successful_inference_provider_attempt_and_invocation,
-    load_existing_inference_operation_ids_for_route,
     load_inference_canonical_transitions_for_session, load_session_auxiliary_capture,
-    load_tool_result_projection_decisions, next_inference_logical_attempt_pair_base,
-    plan_inference_invocation, plan_inference_provider_attempt, reconcile_inference_settlements,
+    next_inference_logical_attempt_pair_base, plan_inference_invocation,
+    plan_inference_provider_attempt, reconcile_inference_settlements,
     renew_inference_invocation_owner, retire_inference_canonical_transitions_through_turn,
     settle_uncertain_inference_admission,
 };
-use astra_turn_types::{
-    InferenceInvocationScope, InferencePurpose, ToolResultProjectionBindingV1,
-    ToolResultProjectionDecisionV1, ToolResultProjectionDispositionV1,
-    ToolResultProjectionFallbackV1, ToolResultProjectionReceiptV1, ToolResultProjectionWireStateV1,
-};
+use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serial_test::serial;
 use sha2::Digest;
 use sqlx::Row;
@@ -233,41 +228,6 @@ fn provider_attempt_with_wire(
     )
 }
 
-fn projection_binding_for_call(
-    run_id: &str,
-    wire_hash: &str,
-    call_id: &str,
-    target_byte: char,
-    fallback: ToolResultProjectionFallbackV1,
-) -> ToolResultProjectionBindingV1 {
-    let body = b"full canonical tool result";
-    let decision = ToolResultProjectionDecisionV1::new(
-        run_id,
-        call_id,
-        "a".repeat(64),
-        4096,
-        target_byte.to_string().repeat(64),
-        "c".repeat(64),
-        ToolResultProjectionDispositionV1::Baseline,
-        Vec::new(),
-        None,
-        Some(fallback),
-        body,
-    )
-    .expect("projection decision");
-    ToolResultProjectionBindingV1 {
-        receipt: ToolResultProjectionReceiptV1 {
-            decision_sha256: decision.decision_sha256.clone(),
-            provider_wire_sha256: wire_hash.to_string(),
-            state: ToolResultProjectionWireStateV1::Included,
-            actual_ranges: Vec::new(),
-            actual_body_sha256: Some(decision.rendered_body_sha256.clone()),
-            reason: None,
-        },
-        decision,
-    }
-}
-
 fn canonical_authority(label: &str) -> serde_json::Value {
     let content = astra_turn_types::render_append_only_runtime_authority_frame(
         "test_authority",
@@ -337,11 +297,11 @@ async fn seed_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &st
         "INSERT INTO agent_runs
          (run_id, user_id, session_id, root_run_id, ancestor_path, depth, retry_scope,
           status, execution_mode, owner_pod_id, owner_lease_expires_at,
-          run_generation, last_event_idx, retry_count,
+          run_generation, last_event_idx,
           total_prompt_tokens, total_completion_tokens, total_tool_calls,
           created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, 0, 'node', 'running', 'web_agent', ?,
-                 TIMESTAMPADD(MINUTE, 5, NOW(6)), 0, -1, 0,
+                 TIMESTAMPADD(MINUTE, 5, NOW(6)), 0, -1,
                  0, 0, 0, NOW(6), NOW(6))",
     )
     .bind(run_id)
@@ -1918,19 +1878,19 @@ async fn competing_canonical_children_commit_exactly_one_branch_without_orphans(
     .await;
     history.extend(root.appended_messages.iter().cloned());
 
-    let left = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_durable_base(
+    let left = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_deltas(
         root.transition_id.clone(),
         root.result.clone(),
         durable_base.clone(),
-        &history,
+        Vec::new(),
         vec![canonical_authority("left")],
     )
     .expect("construct left fork");
-    let right = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_durable_base(
+    let right = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_deltas(
         root.transition_id.clone(),
         root.result.clone(),
         durable_base,
-        &history,
+        Vec::new(),
         vec![canonical_authority("right")],
     )
     .expect("construct right fork");
@@ -2090,11 +2050,11 @@ async fn canonical_wal_capacity_rejects_append_atomically_and_accepts_checkpoint
     .await
     .expect("simulate a WAL head exactly at capacity");
 
-    let append = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_durable_base(
+    let append = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_deltas(
         root.transition_id.clone(),
         root.result.clone(),
         durable_base.clone(),
-        &history,
+        Vec::new(),
         vec![canonical_authority("over-capacity")],
     )
     .expect("construct over-capacity append");
@@ -3623,146 +3583,6 @@ async fn orphaned_settlement_debt_is_quarantined_out_of_the_active_batch() {
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
-async fn selection_subject_gate_is_scoped_to_owner_session_and_route() {
-    let shared_pool = common::setup_pool().await;
-    let pool = shared_pool.get();
-    let suffix = Uuid::new_v4().simple().to_string();
-    let user_id = format!("selection-gate-user-{suffix}");
-    let session_id = format!("selection-gate-session-{suffix}");
-    let run_id = format!("selection-gate-run-{suffix}");
-    let other_session_id = format!("selection-gate-other-session-{suffix}");
-    let other_run_id = format!("selection-gate-other-run-{suffix}");
-    let other_user_id = format!("selection-gate-other-user-{suffix}");
-    let other_user_run_id = format!("selection-gate-other-user-run-{suffix}");
-    seed_run(pool, &user_id, &session_id, &run_id).await;
-    seed_run(pool, &user_id, &other_session_id, &other_run_id).await;
-    seed_run(pool, &other_user_id, &session_id, &other_user_run_id).await;
-
-    let selection_input = |owner: &str,
-                           session: &str,
-                           run: &str,
-                           operation_id: &str,
-                           offering_id: &str,
-                           model: &str| {
-        InferenceInvocationInput {
-            user_id: owner.to_string(),
-            scope: InferenceInvocationScope::Run {
-                session_id: session.to_string(),
-                run_id: run.to_string(),
-                turn: 1,
-                round: 0,
-                operation_id: operation_id.to_string(),
-                logical_attempt: 0,
-            },
-            offering_id: offering_id.to_string(),
-            resolved_model_name: model.to_string(),
-            upstream_model_name: model.to_string(),
-            provider: "typesafe".to_string(),
-            purpose: InferencePurpose::ToolResultRerank,
-            execution_placement: ModelExecutionPlacement::Server,
-            access_kind: ModelAccessKind::SelfHosted,
-            run_authority: run_authority(),
-        }
-    };
-
-    let subject_a = "a".repeat(64);
-    let primary_plan = plan_inference_invocation(selection_input(
-        &user_id,
-        &session_id,
-        &run_id,
-        &subject_a,
-        "selection-gate-offering",
-        "selection-gate-model",
-    ))
-    .expect("plan primary selection subject");
-    admit_inference_invocation(&shared_pool, &primary_plan)
-        .await
-        .expect("admit primary selection subject");
-
-    let other_session_subject = "b".repeat(64);
-    let other_session_plan = plan_inference_invocation(selection_input(
-        &user_id,
-        &other_session_id,
-        &other_run_id,
-        &other_session_subject,
-        "selection-gate-offering",
-        "selection-gate-model",
-    ))
-    .expect("plan other-session selection subject");
-    admit_inference_invocation(&shared_pool, &other_session_plan)
-        .await
-        .expect("admit other-session selection subject");
-
-    let other_route_subject = "c".repeat(64);
-    let other_route_plan = plan_inference_invocation(selection_input(
-        &user_id,
-        &session_id,
-        &run_id,
-        &other_route_subject,
-        "selection-gate-other-offering",
-        "selection-gate-other-model",
-    ))
-    .expect("plan other-route selection subject");
-    admit_inference_invocation(&shared_pool, &other_route_plan)
-        .await
-        .expect("admit other-route selection subject");
-
-    let other_user_subject = "d".repeat(64);
-    let other_user_plan = plan_inference_invocation(selection_input(
-        &other_user_id,
-        &session_id,
-        &other_user_run_id,
-        &other_user_subject,
-        "selection-gate-offering",
-        "selection-gate-model",
-    ))
-    .expect("plan other-user selection subject");
-    admit_inference_invocation(&shared_pool, &other_user_plan)
-        .await
-        .expect("admit other-user selection subject");
-
-    let lookup = selection_input(
-        &user_id,
-        &session_id,
-        &run_id,
-        "tool_result_rerank",
-        "selection-gate-offering",
-        "selection-gate-model",
-    );
-    let existing = load_existing_inference_operation_ids_for_route(&shared_pool, &lookup)
-        .await
-        .expect("load selection subject gate");
-    assert_eq!(
-        existing,
-        std::collections::BTreeSet::from([subject_a.clone()]),
-        "the retry gate must not cross session, route, or user boundaries"
-    );
-
-    let other_user_lookup = selection_input(
-        &other_user_id,
-        &session_id,
-        &other_user_run_id,
-        "tool_result_rerank",
-        "selection-gate-offering",
-        "selection-gate-model",
-    );
-    let other_user_existing =
-        load_existing_inference_operation_ids_for_route(&shared_pool, &other_user_lookup)
-            .await
-            .expect("load other-user selection subject gate");
-    assert_eq!(
-        other_user_existing,
-        std::collections::BTreeSet::from([other_user_subject])
-    );
-
-    cleanup(pool, &user_id, &session_id, &run_id).await;
-    cleanup(pool, &user_id, &other_session_id, &other_run_id).await;
-    cleanup(pool, &other_user_id, &session_id, &other_user_run_id).await;
-}
-
-#[tokio::test]
-#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
-#[serial]
 async fn detailed_auxiliary_capture_decodes_multiple_invocations_and_attempts() {
     let shared_pool = common::setup_pool().await;
     let pool = shared_pool.get();
@@ -3855,525 +3675,8 @@ async fn detailed_auxiliary_capture_decodes_multiple_invocations_and_attempts() 
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
-#[tokio::test]
-#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
-#[serial]
-async fn projection_decision_is_session_scoped_immutable_and_attempt_receipted() {
-    let shared_pool = common::setup_pool().await;
-    let pool = shared_pool.get();
-    let suffix = Uuid::new_v4().simple().to_string();
-    let user_id = format!("projection-user-{suffix}");
-    let session_id = format!("projection-session-{suffix}");
-    let run_id = format!("projection-run-{suffix}");
-    seed_run(pool, &user_id, &session_id, &run_id).await;
-
-    let terminal = InferenceInvocationTerminal {
-        status: InferenceTerminalStatus::Cancelled,
-        usage: InferenceUsage::default(),
-        usage_status: InferenceUsageStatus::Unavailable,
-        provider_response_id: None,
-        error_kind: Some("fixture_complete".to_string()),
-        error_message: Some("close projection fixture".to_string()),
-    };
-    let first_plan = plan_inference_invocation(run_input(
-        &user_id,
-        &session_id,
-        &run_id,
-        0,
-        "projection_first",
-    ))
-    .expect("plan first projection invocation");
-    admit_inference_invocation(&shared_pool, &first_plan)
-        .await
-        .expect("admit first projection invocation");
-    let first_base = provider_attempt_with_wire(&first_plan, 0, "a".repeat(64));
-    let binding_a = projection_binding_for_call(
-        &run_id,
-        first_base.wire().provider_wire_hash(),
-        "tool-call-a",
-        'b',
-        ToolResultProjectionFallbackV1::JudgmentUnavailable,
-    );
-    let binding_b = projection_binding_for_call(
-        &run_id,
-        first_base.wire().provider_wire_hash(),
-        "tool-call-b",
-        'c',
-        ToolResultProjectionFallbackV1::JudgmentUnavailable,
-    );
-    let first_keys = vec![
-        binding_a.decision.freeze_key_sha256.clone(),
-        binding_b.decision.freeze_key_sha256.clone(),
-    ];
-    let first_attempt = first_base
-        .with_tool_result_projections(vec![binding_b.clone(), binding_a.clone()])
-        .expect("bind first projections");
-    begin_inference_provider_attempt(&shared_pool, &first_attempt)
-        .await
-        .expect("atomically freeze first decisions and receipts");
-
-    let loaded =
-        load_tool_result_projection_decisions(&shared_pool, &user_id, &session_id, &first_keys)
-            .await
-            .expect("load frozen projection decisions");
-    assert_eq!(loaded.len(), 2);
-    assert_eq!(loaded.get(&first_keys[0]), Some(&binding_a.decision));
-    assert_eq!(loaded.get(&first_keys[1]), Some(&binding_b.decision));
-
-    finish_inference_provider_attempt(&shared_pool, &first_attempt, &terminal)
-        .await
-        .expect("finish first projection attempt");
-    finish_inference_invocation(&shared_pool, &first_plan, &terminal)
-        .await
-        .expect("finish first projection invocation");
-
-    let second_plan = plan_inference_invocation(run_input(
-        &user_id,
-        &session_id,
-        &run_id,
-        1,
-        "projection_reuse",
-    ))
-    .expect("plan projection reuse");
-    admit_inference_invocation(&shared_pool, &second_plan)
-        .await
-        .expect("admit projection reuse");
-    let second_base = provider_attempt_with_wire(&second_plan, 0, "b".repeat(64));
-    assert_ne!(
-        first_attempt.wire().provider_wire_hash(),
-        second_base.wire().provider_wire_hash(),
-        "each physical attempt must carry a distinct provider wire identity"
-    );
-    let reused_a = projection_binding_for_call(
-        &run_id,
-        second_base.wire().provider_wire_hash(),
-        "tool-call-a",
-        'b',
-        ToolResultProjectionFallbackV1::JudgmentUnavailable,
-    );
-    let reused_b = projection_binding_for_call(
-        &run_id,
-        second_base.wire().provider_wire_hash(),
-        "tool-call-b",
-        'c',
-        ToolResultProjectionFallbackV1::JudgmentUnavailable,
-    );
-    assert_eq!(reused_a.decision, binding_a.decision);
-    assert_eq!(reused_b.decision, binding_b.decision);
-    let new_c = projection_binding_for_call(
-        &run_id,
-        second_base.wire().provider_wire_hash(),
-        "tool-call-c",
-        'd',
-        ToolResultProjectionFallbackV1::JudgmentUnavailable,
-    );
-    let new_d = projection_binding_for_call(
-        &run_id,
-        second_base.wire().provider_wire_hash(),
-        "tool-call-d",
-        'e',
-        ToolResultProjectionFallbackV1::JudgmentUnavailable,
-    );
-    let second_attempt = second_base
-        .with_tool_result_projections(vec![
-            new_d.clone(),
-            reused_a.clone(),
-            new_c.clone(),
-            reused_b.clone(),
-        ])
-        .expect("bind mixed old and new projections");
-    begin_inference_provider_attempt(&shared_pool, &second_attempt)
-        .await
-        .expect("atomically freeze mixed old and new projections");
-    let all_keys = [
-        binding_a.decision.freeze_key_sha256.clone(),
-        binding_b.decision.freeze_key_sha256.clone(),
-        new_c.decision.freeze_key_sha256.clone(),
-        new_d.decision.freeze_key_sha256.clone(),
-    ];
-    let loaded =
-        load_tool_result_projection_decisions(&shared_pool, &user_id, &session_id, &all_keys)
-            .await
-            .expect("load mixed old and new projection decisions");
-    assert_eq!(loaded.len(), 4);
-    assert_eq!(loaded.get(&all_keys[0]), Some(&binding_a.decision));
-    assert_eq!(loaded.get(&all_keys[1]), Some(&binding_b.decision));
-    assert_eq!(loaded.get(&all_keys[2]), Some(&new_c.decision));
-    assert_eq!(loaded.get(&all_keys[3]), Some(&new_d.decision));
-    let first_admitted_attempts: Vec<(String, String)> = sqlx::query_as(
-        "SELECT freeze_key_sha256, first_admitted_attempt_id
-         FROM tool_result_projection_decisions
-         WHERE user_id = ? AND session_id = ? ORDER BY freeze_key_sha256",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .fetch_all(pool)
-    .await
-    .expect("load first admitted attempt for every decision");
-    assert_eq!(first_admitted_attempts.len(), 4);
-    for (freeze_key, attempt_id) in first_admitted_attempts {
-        let expected_attempt = if freeze_key == binding_a.decision.freeze_key_sha256
-            || freeze_key == binding_b.decision.freeze_key_sha256
-        {
-            first_attempt.attempt_id()
-        } else {
-            second_attempt.attempt_id()
-        };
-        assert_eq!(attempt_id, expected_attempt);
-    }
-    let receipt_rows = sqlx::query(
-        "SELECT attempt_id, freeze_key_sha256, decision_sha256,
-                provider_wire_sha256, receipt_sha256, receipt_json,
-                receipt_bytes, wire_state
-         FROM tool_result_projection_receipts
-         WHERE user_id = ? AND session_id = ?
-         ORDER BY attempt_id, freeze_key_sha256",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .fetch_all(pool)
-    .await
-    .expect("load every mixed projection receipt");
-    let expected_receipts = [
-        (first_attempt.attempt_id(), &binding_a),
-        (first_attempt.attempt_id(), &binding_b),
-        (second_attempt.attempt_id(), &reused_a),
-        (second_attempt.attempt_id(), &reused_b),
-        (second_attempt.attempt_id(), &new_c),
-        (second_attempt.attempt_id(), &new_d),
-    ];
-    assert_eq!(receipt_rows.len(), expected_receipts.len());
-    for row in receipt_rows {
-        let attempt_id: String = row.try_get("attempt_id").expect("decode receipt attempt");
-        let freeze_key: String = row
-            .try_get("freeze_key_sha256")
-            .expect("decode receipt key");
-        let (_, expected) = expected_receipts
-            .iter()
-            .find(|(expected_attempt, binding)| {
-                *expected_attempt == attempt_id && binding.decision.freeze_key_sha256 == freeze_key
-            })
-            .expect("receipt belongs to one expected binding");
-        let expected_json =
-            serde_json::to_string(&expected.receipt).expect("serialize expected receipt");
-        assert_eq!(
-            row.try_get::<String, _>("decision_sha256")
-                .expect("decode receipt decision"),
-            expected.receipt.decision_sha256
-        );
-        assert_eq!(
-            row.try_get::<String, _>("provider_wire_sha256")
-                .expect("decode receipt provider wire"),
-            expected.receipt.provider_wire_sha256
-        );
-        assert_eq!(
-            row.try_get::<String, _>("receipt_json")
-                .expect("decode receipt JSON"),
-            expected_json
-        );
-        assert_eq!(
-            row.try_get::<String, _>("receipt_sha256")
-                .expect("decode receipt hash"),
-            format!("{:x}", sha2::Sha256::digest(expected_json.as_bytes()))
-        );
-        assert_eq!(
-            row.try_get::<i64, _>("receipt_bytes")
-                .expect("decode receipt byte count"),
-            i64::try_from(expected_json.len()).expect("receipt JSON length fits BIGINT")
-        );
-        assert_eq!(
-            row.try_get::<String, _>("wire_state")
-                .expect("decode receipt wire state"),
-            "included"
-        );
-    }
-    finish_inference_provider_attempt(&shared_pool, &second_attempt, &terminal)
-        .await
-        .expect("finish reuse attempt");
-    finish_inference_invocation(&shared_pool, &second_plan, &terminal)
-        .await
-        .expect("finish reuse invocation");
-
-    let immutable_conflict_plan = plan_inference_invocation(run_input(
-        &user_id,
-        &session_id,
-        &run_id,
-        2,
-        "projection_immutable_conflict",
-    ))
-    .expect("plan immutable projection conflict");
-    admit_inference_invocation(&shared_pool, &immutable_conflict_plan)
-        .await
-        .expect("admit immutable projection conflict");
-    let immutable_conflict_base =
-        provider_attempt_with_wire(&immutable_conflict_plan, 0, "c".repeat(64));
-    let immutable_conflict_binding = projection_binding_for_call(
-        &run_id,
-        immutable_conflict_base.wire().provider_wire_hash(),
-        "tool-call-a",
-        'b',
-        ToolResultProjectionFallbackV1::JudgmentInvalid,
-    );
-    assert_eq!(
-        immutable_conflict_binding.decision.freeze_key_sha256, binding_a.decision.freeze_key_sha256,
-        "conflict must address the same frozen subject"
-    );
-    assert_ne!(
-        immutable_conflict_binding.decision.decision_sha256, binding_a.decision.decision_sha256,
-        "conflict must carry a different immutable decision"
-    );
-    let immutable_conflict = immutable_conflict_base
-        .with_tool_result_projections(vec![immutable_conflict_binding])
-        .expect("bind structurally valid immutable conflict");
-    assert_eq!(
-        begin_inference_provider_attempt(&shared_pool, &immutable_conflict)
-            .await
-            .expect_err("same freeze key cannot change its decision")
-            .kind,
-        ServiceErrorKind::Conflict
-    );
-    let preserved_decision = load_tool_result_projection_decisions(
-        &shared_pool,
-        &user_id,
-        &session_id,
-        std::slice::from_ref(&binding_a.decision.freeze_key_sha256),
-    )
-    .await
-    .expect("load decision after immutable conflict");
-    assert_eq!(
-        preserved_decision.get(&binding_a.decision.freeze_key_sha256),
-        Some(&binding_a.decision)
-    );
-    let immutable_conflict_receipts: i64 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS SIGNED) FROM tool_result_projection_receipts
-         WHERE user_id = ? AND attempt_id = ?",
-    )
-    .bind(&user_id)
-    .bind(immutable_conflict.attempt_id())
-    .fetch_one(pool)
-    .await
-    .expect("count receipts after immutable conflict");
-    assert_eq!(immutable_conflict_receipts, 0);
-
-    let rollback_plan = plan_inference_invocation(run_input(
-        &user_id,
-        &session_id,
-        &run_id,
-        3,
-        "projection_receipt_rollback",
-    ))
-    .expect("plan projection receipt rollback");
-    admit_inference_invocation(&shared_pool, &rollback_plan)
-        .await
-        .expect("admit projection receipt rollback");
-    let conflict_base = provider_attempt_with_wire(&rollback_plan, 0, "d".repeat(64));
-    let rollback_a = projection_binding_for_call(
-        &run_id,
-        conflict_base.wire().provider_wire_hash(),
-        "tool-call-e",
-        'f',
-        ToolResultProjectionFallbackV1::JudgmentUnavailable,
-    );
-    let rollback_b = projection_binding_for_call(
-        &run_id,
-        conflict_base.wire().provider_wire_hash(),
-        "tool-call-f",
-        '0',
-        ToolResultProjectionFallbackV1::JudgmentUnavailable,
-    );
-    let rollback_attempt = conflict_base
-        .with_tool_result_projections(vec![rollback_a.clone(), rollback_b.clone()])
-        .expect("bind structurally valid rollback batch");
-    let corrupt_receipt_json =
-        serde_json::to_string(&rollback_a.receipt).expect("serialize injected conflicting receipt");
-    let corrupt_receipt_hash = format!(
-        "{:x}",
-        sha2::Sha256::digest(corrupt_receipt_json.as_bytes())
-    );
-    let corrupt_provider_wire = "e".repeat(64);
-    sqlx::query(
-        "INSERT INTO tool_result_projection_receipts
-         (user_id, session_id, attempt_id, freeze_key_sha256, decision_sha256,
-          provider_wire_sha256, receipt_sha256, receipt_json, receipt_bytes,
-          wire_state, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'included', NOW(6))",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .bind(rollback_attempt.attempt_id())
-    .bind(&rollback_a.decision.freeze_key_sha256)
-    .bind(&rollback_a.decision.decision_sha256)
-    .bind(&corrupt_provider_wire)
-    .bind(&corrupt_receipt_hash)
-    .bind(&corrupt_receipt_json)
-    .bind(i64::try_from(corrupt_receipt_json.len()).expect("receipt JSON length fits BIGINT"))
-    .execute(pool)
-    .await
-    .expect("inject conflicting receipt after the decision boundary");
-    assert_eq!(
-        begin_inference_provider_attempt(&shared_pool, &rollback_attempt)
-            .await
-            .expect_err("receipt conflict must roll back the whole admission batch")
-            .kind,
-        ServiceErrorKind::Conflict
-    );
-    let rollback_keys = [
-        rollback_a.decision.freeze_key_sha256.clone(),
-        rollback_b.decision.freeze_key_sha256.clone(),
-    ];
-    let rolled_back_decisions =
-        load_tool_result_projection_decisions(&shared_pool, &user_id, &session_id, &rollback_keys)
-            .await
-            .expect("load decisions after rolled-back admission");
-    assert!(rolled_back_decisions.is_empty());
-    let conflict_receipts: i64 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS SIGNED) FROM tool_result_projection_receipts
-         WHERE user_id = ? AND attempt_id = ?",
-    )
-    .bind(&user_id)
-    .bind(rollback_attempt.attempt_id())
-    .fetch_one(pool)
-    .await
-    .expect("count receipts after rolled-back admission");
-    assert_eq!(conflict_receipts, 1, "only the injected conflict survives");
-    let provider_attempt_count: i64 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS SIGNED) FROM inference_provider_attempts
-         WHERE user_id = ? AND attempt_id = ?",
-    )
-    .bind(&user_id)
-    .bind(rollback_attempt.attempt_id())
-    .fetch_one(pool)
-    .await
-    .expect("count rolled-back provider attempt");
-    assert_eq!(provider_attempt_count, 0);
-    let context_event_count: i64 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS SIGNED) FROM model_request_context_events
-         WHERE user_id = ? AND attempt_id = ?",
-    )
-    .bind(&user_id)
-    .bind(rollback_attempt.attempt_id())
-    .fetch_one(pool)
-    .await
-    .expect("count rolled-back context events");
-    assert_eq!(context_event_count, 0);
-
-    let injected_receipt: (String, String) = sqlx::query_as(
-        "SELECT provider_wire_sha256, receipt_sha256
-         FROM tool_result_projection_receipts
-         WHERE user_id = ? AND attempt_id = ? AND freeze_key_sha256 = ?",
-    )
-    .bind(&user_id)
-    .bind(rollback_attempt.attempt_id())
-    .bind(&rollback_a.decision.freeze_key_sha256)
-    .fetch_one(pool)
-    .await
-    .expect("load injected conflict receipt");
-    assert_eq!(injected_receipt.0, corrupt_provider_wire);
-    assert_eq!(injected_receipt.1, corrupt_receipt_hash);
-
-    sqlx::query(
-        "DELETE FROM tool_result_projection_receipts
-         WHERE user_id = ? AND attempt_id = ? AND freeze_key_sha256 = ?",
-    )
-    .bind(&user_id)
-    .bind(rollback_attempt.attempt_id())
-    .bind(&rollback_a.decision.freeze_key_sha256)
-    .execute(pool)
-    .await
-    .expect("remove injected conflict before retry");
-    begin_inference_provider_attempt(&shared_pool, &rollback_attempt)
-        .await
-        .expect("retry the rolled-back batch after removing the injected conflict");
-    let recovered_decisions =
-        load_tool_result_projection_decisions(&shared_pool, &user_id, &session_id, &rollback_keys)
-            .await
-            .expect("load decisions after successful rollback retry");
-    assert_eq!(recovered_decisions.len(), 2);
-    assert_eq!(
-        recovered_decisions.get(&rollback_keys[0]),
-        Some(&rollback_a.decision)
-    );
-    assert_eq!(
-        recovered_decisions.get(&rollback_keys[1]),
-        Some(&rollback_b.decision)
-    );
-    let recovered_receipts: i64 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS SIGNED) FROM tool_result_projection_receipts
-         WHERE user_id = ? AND attempt_id = ?",
-    )
-    .bind(&user_id)
-    .bind(rollback_attempt.attempt_id())
-    .fetch_one(pool)
-    .await
-    .expect("count receipts after successful rollback retry");
-    assert_eq!(recovered_receipts, 2);
-    let recovered_attempts: i64 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS SIGNED) FROM inference_provider_attempts
-         WHERE user_id = ? AND attempt_id = ?",
-    )
-    .bind(&user_id)
-    .bind(rollback_attempt.attempt_id())
-    .fetch_one(pool)
-    .await
-    .expect("count provider attempts after successful rollback retry");
-    assert_eq!(recovered_attempts, 1);
-    let recovered_context_events: i64 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS SIGNED) FROM model_request_context_events
-         WHERE user_id = ? AND attempt_id = ?",
-    )
-    .bind(&user_id)
-    .bind(rollback_attempt.attempt_id())
-    .fetch_one(pool)
-    .await
-    .expect("count context events after successful rollback retry");
-    assert_eq!(recovered_context_events, 1);
-    assert_eq!(
-        begin_inference_provider_attempt(&shared_pool, &rollback_attempt)
-            .await
-            .expect_err("exact rollback retry replay must forbid duplicate delivery")
-            .kind,
-        ServiceErrorKind::Conflict
-    );
-    let receipts_after_duplicate: i64 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS SIGNED) FROM tool_result_projection_receipts
-         WHERE user_id = ? AND attempt_id = ?",
-    )
-    .bind(&user_id)
-    .bind(rollback_attempt.attempt_id())
-    .fetch_one(pool)
-    .await
-    .expect("count receipts after duplicate rollback retry");
-    assert_eq!(receipts_after_duplicate, recovered_receipts);
-    let attempts_after_duplicate: i64 = sqlx::query_scalar(
-        "SELECT CAST(COUNT(*) AS SIGNED) FROM inference_provider_attempts
-         WHERE user_id = ? AND attempt_id = ?",
-    )
-    .bind(&user_id)
-    .bind(rollback_attempt.attempt_id())
-    .fetch_one(pool)
-    .await
-    .expect("count provider attempts after duplicate rollback retry");
-    assert_eq!(attempts_after_duplicate, recovered_attempts);
-    finish_inference_provider_attempt(&shared_pool, &rollback_attempt, &terminal)
-        .await
-        .expect("finish recovered rollback attempt");
-    finish_inference_invocation(&shared_pool, &rollback_plan, &terminal)
-        .await
-        .expect("finish recovered rollback invocation");
-
-    cleanup(pool, &user_id, &session_id, &run_id).await;
-}
-
 async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str, run_id: &str) {
     for (statement, identity) in [
-        (
-            "DELETE FROM tool_result_projection_receipts WHERE user_id = ? AND session_id = ?",
-            session_id,
-        ),
-        (
-            "DELETE FROM tool_result_projection_decisions WHERE user_id = ? AND session_id = ?",
-            session_id,
-        ),
         (
             "DELETE FROM model_request_context_events WHERE user_id = ? AND session_id = ?",
             session_id,

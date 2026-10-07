@@ -76,7 +76,7 @@ pub(crate) fn build_external_sources(
     };
 
     let (mut tool_guidance_text, _signals) =
-        crate::prompts::tool_round_guidance_trace(&state.messages, state.llm_rounds_completed);
+        crate::prompts::tool_round_guidance_trace(&state.messages);
     if !state.suppress_execution_slice_guidance() {
         let slice_guidance = crate::prompts::execution_slice_guidance(
             state.remaining_turns,

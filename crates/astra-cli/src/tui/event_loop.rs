@@ -5325,7 +5325,7 @@ fn drain_agent_workbench_outcomes(
                 }
             }
         }
-        refresh_open_agent_views(chat_widget, bottom_pane);
+        refresh_open_agent_monitor(chat_widget, bottom_pane);
         frame_requester.schedule_frame();
     }
 }
@@ -5344,7 +5344,7 @@ fn reconcile_server_agent_observer(
     }
     *applied_sequence = Some(projection.sequence);
     if chat_widget.reconcile_server_agent_projection(&projection) {
-        refresh_open_agent_views(chat_widget, bottom_pane);
+        refresh_open_agent_monitor(chat_widget, bottom_pane);
         frame_requester.schedule_frame();
     }
 }
@@ -10808,7 +10808,7 @@ pub(crate) async fn run_tui_session(
                                                             std::time::Instant::now()
                                                                 + LOCAL_AGENT_RECONCILE_INTERVAL;
                                                         if changed {
-                                                            refresh_open_agent_views(
+                                                            refresh_open_agent_monitor(
                                                                 &chat_widget,
                                                                 &mut bottom_pane,
                                                             );
@@ -12345,7 +12345,7 @@ pub(crate) async fn run_tui_session(
                         next_local_agent_reconcile =
                             std::time::Instant::now() + LOCAL_AGENT_RECONCILE_INTERVAL;
                         if projection_changed {
-                            refresh_open_agent_views(&chat_widget, &mut bottom_pane);
+                            refresh_open_agent_monitor(&chat_widget, &mut bottom_pane);
                             frame_requester.schedule_frame();
                         }
                     } else {
@@ -12407,7 +12407,7 @@ pub(crate) async fn run_tui_session(
                     next_local_agent_reconcile =
                         std::time::Instant::now() + LOCAL_AGENT_RECONCILE_INTERVAL;
                     if projection_changed {
-                        refresh_open_agent_views(&chat_widget, &mut bottom_pane);
+                        refresh_open_agent_monitor(&chat_widget, &mut bottom_pane);
                         frame_requester.schedule_frame();
                     }
                 }
@@ -14168,9 +14168,7 @@ mod tests {
         assert!(run_control.pending_remote_submission_ids().is_empty());
         assert!(run_control.pending_remote_disposition_ids().is_empty());
         assert!(
-            !astra_runtime::turn::run_control::UserIntentProvider::has_pending_inputs(
-                &*run_control
-            ),
+            run_control.take_pending_runtime_notifications().is_empty(),
             "deadline expiry records Unconfirmed closure; it must not synthesize a next-turn input"
         );
     }
@@ -16321,14 +16319,15 @@ mod tests {
     }
 
     #[test]
-    fn runtime_reconciliation_refreshes_an_open_agent_detail_view() {
+    fn runtime_reconciliation_refreshes_an_open_agent_monitor() {
         use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
 
-        let agent_id = "agent-open-detail";
+        let agent_id = "agent-open-monitor";
+        let run_id = format!("run-{agent_id}");
         let mut widget = chat_widget::ChatWidget::new("");
         widget.handle_event(chat_widget::AppEvent::wire(
             chat_widget::WireEvent::AgentLive(AgentLiveEvent {
-                run_id: "test-run".into(),
+                run_id: run_id.clone(),
                 agent_id: agent_id.into(),
                 kind: AgentLiveEventKind::OutputDelta {
                     model_item_id: Some("test-model-item".into()),
@@ -16337,11 +16336,10 @@ mod tests {
             }),
         ));
         let mut bottom_pane = BottomPane::new();
-        bottom_pane.push_view(Box::new(
-            bottom_pane::task_detail_view::TaskDetailView::from_task_cell(
-                widget.agent_run_cell(agent_id).expect("live agent detail"),
-            )
-            .with_live_task_id(agent_id),
+        assert!(open_agents_view(&widget, &mut bottom_pane));
+        bottom_pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('h'),
+            crossterm::event::KeyModifiers::NONE,
         ));
 
         let snapshot = crate::tui::local_agent_snapshot::LocalAgentSnapshot {
@@ -16356,12 +16354,18 @@ mod tests {
             fanout_groups: Vec::new(),
         };
         assert!(widget.reconcile_local_agent_snapshot(&snapshot, &[]));
-        assert!(refresh_open_agent_views(&widget, &mut bottom_pane));
+        assert!(refresh_open_agent_monitor(&widget, &mut bottom_pane));
 
         let rendered = render_bottom_pane_text(&bottom_pane, 100, 12);
-        assert!(
-            rendered.contains("authoritative final result"),
-            "{rendered}"
+        assert!(rendered.contains("1 done"), "{rendered}");
+        assert!(rendered.contains("review auth flow"), "{rendered}");
+        assert_eq!(
+            widget
+                .agent_run_cell(agent_id)
+                .unwrap()
+                .output_summary
+                .as_deref(),
+            Some("authoritative final result"),
         );
     }
 
@@ -20280,8 +20284,9 @@ mod tests {
         );
 
         wait_for_background_shell_terminal(&mut registry, &id).await;
-        let (output, _, _) = registry
-            .get_combined_output_stats(&id, 4096)
+        let (output, _, _, _) = registry
+            .get_combined_output_since_async(&id, 0, 4096)
+            .await
             .expect("captured local shell output");
         assert!(output.contains("local shell ready"), "{output:?}");
         assert!(
@@ -20377,7 +20382,7 @@ mod tests {
     }
 
     #[test]
-    fn detail_refresh_is_scoped_to_incoming_agent_id() {
+    fn transcript_refresh_is_scoped_to_incoming_agent_and_run() {
         use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
 
         let mut chat_widget = chat_widget::ChatWidget::new(String::new());
@@ -20403,10 +20408,16 @@ mod tests {
         ));
 
         let mut bottom_pane = BottomPane::new();
-        let cell = chat_widget.task_cell_anywhere("agent-a").unwrap();
         bottom_pane.push_view(Box::new(
-            bottom_pane::task_detail_view::TaskDetailView::from_task_cell(cell)
-                .with_live_task_id("agent-a"),
+            bottom_pane::agent_transcript_view::AgentTranscriptView::live_unbound(
+                "agent-a".into(),
+                "Reviewer".into(),
+                "test-run".into(),
+                None,
+                "agents",
+                100,
+                12,
+            ),
         ));
 
         let unrelated = TuiAppEvent::AgentLive(AgentLiveEvent {
@@ -20418,9 +20429,26 @@ mod tests {
             },
         });
         assert!(
-            !refresh_open_agent_detail_for_event(&unrelated, &chat_widget, &mut bottom_pane),
-            "non-open agent events must not rebuild the open detail view"
+            !refresh_open_agent_transcript_for_event(&unrelated, &chat_widget, &mut bottom_pane),
+            "non-open agent events must not rebuild the open transcript"
         );
+
+        let wrong_run = TuiAppEvent::AgentLive(AgentLiveEvent {
+            run_id: "another-run".into(),
+            agent_id: "agent-a".into(),
+            kind: AgentLiveEventKind::OutputDelta {
+                model_item_id: Some("wrong-model-item".into()),
+                text: "wrong run output".into(),
+            },
+        });
+        assert!(!refresh_open_agent_transcript_for_event(
+            &wrong_run,
+            &chat_widget,
+            &mut bottom_pane,
+        ));
+        let before = render_bottom_pane_text(&bottom_pane, 100, 12);
+        assert!(!before.contains("more b"), "{before}");
+        assert!(!before.contains("wrong run output"), "{before}");
 
         let related = TuiAppEvent::AgentLive(AgentLiveEvent {
             run_id: "test-run".into(),
@@ -20431,13 +20459,17 @@ mod tests {
             },
         });
         assert!(
-            refresh_open_agent_detail_for_event(&related, &chat_widget, &mut bottom_pane),
-            "open agent events should refresh the detail view"
+            refresh_open_agent_transcript_for_event(&related, &chat_widget, &mut bottom_pane),
+            "open agent events should refresh the transcript"
         );
+        let rendered = render_bottom_pane_text(&bottom_pane, 100, 12);
+        assert!(rendered.contains("more a"), "{rendered}");
+        assert!(!rendered.contains("more b"), "{rendered}");
+        assert!(!rendered.contains("wrong run output"), "{rendered}");
     }
 
     #[test]
-    fn detail_refresh_skips_work_when_no_agent_detail_is_open() {
+    fn transcript_refresh_skips_work_when_no_agent_transcript_is_open() {
         use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
 
         let mut chat_widget = chat_widget::ChatWidget::new(String::new());
@@ -20462,8 +20494,8 @@ mod tests {
         });
         let mut bottom_pane = BottomPane::new();
         assert!(
-            !refresh_open_agent_detail_for_event(&event, &chat_widget, &mut bottom_pane),
-            "agent live events should not rebuild detail rows unless a matching detail view is open"
+            !refresh_open_agent_transcript_for_event(&event, &chat_widget, &mut bottom_pane),
+            "agent live events should not update a transcript when no conversation view is open"
         );
     }
 

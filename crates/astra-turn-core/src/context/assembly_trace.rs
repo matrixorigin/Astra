@@ -165,7 +165,6 @@ pub struct SystemPromptBreakdown {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptGuidanceSignals {
-    pub parallel_feedback: bool,
     /// Set when the trailing N rounds in conversation history each ran
     /// exactly one tool — strong signal the model is making sequential
     /// single-tool calls that should have been batched.

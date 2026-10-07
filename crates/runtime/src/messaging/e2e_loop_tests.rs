@@ -59,6 +59,7 @@ mod tests {
 
     struct MockHost {
         turn_results: Vec<HostTurnResult>,
+        admitted_results: Vec<Vec<EdgeToolExecResult>>,
         current_turn: usize,
         valid_tools: HashSet<String>,
         emitted_lines: Vec<String>,
@@ -79,6 +80,7 @@ mod tests {
         fn new(results: Vec<HostTurnResult>) -> Self {
             Self {
                 turn_results: results,
+                admitted_results: Vec::new(),
                 current_turn: 0,
                 valid_tools: HashSet::new(),
                 emitted_lines: Vec::new(),
@@ -94,6 +96,12 @@ mod tests {
                 readmission_started: None,
                 execution_budget: None,
             }
+        }
+
+        fn with_admitted_results(mut self, results: Vec<Vec<EdgeToolExecResult>>) -> Self {
+            assert_eq!(results.len(), self.turn_results.len());
+            self.admitted_results = results;
+            self
         }
 
         fn with_valid_tools(mut self, tools: &[&str]) -> Self {
@@ -166,6 +174,25 @@ mod tests {
             Ok(result)
         }
 
+        async fn handle_admitted_tool_calls(
+            &mut self,
+            _state: &AgenticLoopState,
+            tool_calls: &[Value],
+        ) -> crate::turn::agentic_loop::host::AdmittedToolCallOutcome {
+            let results = self
+                .current_turn
+                .checked_sub(1)
+                .and_then(|index| self.admitted_results.get_mut(index))
+                .map(std::mem::take)
+                .unwrap_or_default();
+            assert!(results.iter().all(|result| {
+                tool_calls.iter().any(|call| {
+                    call.get("id").and_then(Value::as_str) == Some(result.request_id.as_str())
+                })
+            }));
+            results.into()
+        }
+
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
             self.emitted_lines.push(line);
         }
@@ -222,7 +249,7 @@ mod tests {
                 ..ChatTurnSseAccum::default()
             },
             ttft_ms: Some(10),
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         }
     }
@@ -585,19 +612,23 @@ mod tests {
                     ..ChatTurnSseAccum::default()
                 },
                 ttft_ms: Some(10),
-                edge_tool_round: vec![EdgeToolExecResult {
-                    execution_completion: None,
-                    request_id: "call-read-1".into(),
-                    tool: "read_file".into(),
-                    args: json!({"path": "note.txt"}),
-                    output: "read-only evidence".into(),
-                    tool_result_fields: Some(edge_runtime_environment_fields()),
-                    status: "completed".into(),
-                    duration_ms: 1,
-                }],
+
                 error_kind: None,
             },
             text_result("Cleanup reviewed."),
+        ])
+        .with_admitted_results(vec![
+            vec![EdgeToolExecResult {
+                execution_completion: None,
+                request_id: "call-read-1".into(),
+                tool: "read_file".into(),
+                args: json!({"path": "note.txt"}),
+                output: "read-only evidence".into(),
+                tool_result_fields: Some(edge_runtime_environment_fields()),
+                status: "completed".into(),
+                duration_ms: 1,
+            }],
+            Vec::new(),
         ])
         .with_valid_tools(&["read_file"]);
         let mut state = make_state();
@@ -1643,11 +1674,12 @@ mod tests {
                     ..ChatTurnSseAccum::default()
                 },
                 ttft_ms: Some(10),
-                edge_tool_round: edge_tools,
+
                 error_kind: None,
             },
             text_result("Read the file."),
         ])
+        .with_admitted_results(vec![edge_tools, Vec::new()])
         .with_valid_tools(&["read_file"]);
 
         let mut state = make_state();
@@ -2000,7 +2032,7 @@ mod tests {
     /// Provider tool batches are canonical authority input. Missing call ids
     /// fail the whole batch closed instead of inventing execution identity.
     #[tokio::test]
-    async fn empty_tool_call_id_rejects_provider_batch_before_execution() {
+    async fn invalid_or_absent_provider_batch_is_rejected_before_execution() {
         let tool_calls = vec![json!({
             "id": "",
             "type": "function",
@@ -2010,76 +2042,98 @@ mod tests {
             }
         })];
 
-        let mut messages = Vec::new();
-        let mut tool_results = Vec::new();
-        let valid_tool_names = HashSet::from(["bash".to_string()]);
-        let mut restricted_tools = HashSet::new();
-        let mut turn_guard = TurnGuard::new();
-        let mut step_recorder = StepRecorder::new("test-user", "test-session", "empty-id");
-        let mut idempotency_cache = InMemoryIdempotencyCache::new();
-        let mut semantic_dedup = SemanticDedup::new(0.95);
-        let mut tool_call_records = Vec::new();
-        let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
-        let mut term = NoopHeadlessTerminal;
-        let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
+        let callback = EdgeToolExecResult {
+            execution_completion: None,
+            request_id: "call-read".into(),
+            tool: "read_file".into(),
+            args: json!({"path":"note.txt"}),
+            output: "read-only evidence".into(),
+            tool_result_fields: Some(edge_runtime_environment_fields()),
+            status: "completed".into(),
+            duration_ms: 1,
+        };
+        for (tool_calls, edge_tool_round, expected_error) in [
+            (tool_calls, Vec::new(), "tool call id is missing"),
+            (
+                Vec::new(),
+                vec![callback],
+                "requires a provider request batch",
+            ),
+            (Vec::new(), Vec::new(), "requires a provider request batch"),
+        ] {
+            let original_messages = vec![json!({"role":"user","content":"inspect note"})];
+            let mut messages = original_messages.clone();
+            let mut tool_results = Vec::new();
+            let valid_tool_names = HashSet::from(["bash".to_string()]);
+            let mut restricted_tools = HashSet::new();
+            let mut turn_guard = TurnGuard::new();
+            let mut step_recorder = StepRecorder::new("test-user", "test-session", "empty-id");
+            let mut idempotency_cache = InMemoryIdempotencyCache::new();
+            let mut semantic_dedup = SemanticDedup::new(0.95);
+            let mut tool_call_records = Vec::new();
+            let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
+            let mut term = NoopHeadlessTerminal;
+            let original_event_count = step_recorder.events().len();
 
-        let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
-            turn_index: 0,
-            session_turn: 1,
-            quiet: true,
-            api: &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
-            token: "",
-            current_user_id: None,
-            current_session_id: None,
-            current_run_id: None,
-            current_turn_chain_id: None,
-            durable_dispatch_admission: None,
-            delegation_model_admissions: None,
-            physical_tool_calls: &tool_calls,
-            logical_tool_calls: &tool_calls,
-            deferred_activations_by_call_id: &std::collections::HashMap::new(),
-            runtime_control_calls_by_id: &std::collections::HashMap::new(),
-            edge_tool_round: &edge_tool_round,
-            reasoning_content: "",
-            reasoning_signature: "",
-            messages: &mut messages,
-            tool_results: &mut tool_results,
-            valid_tool_names: &valid_tool_names,
-            deferred_tool_names: &std::collections::HashSet::new(),
-            restricted_tools: &mut restricted_tools,
-            turn_guard: &mut turn_guard,
-            step_recorder: &mut step_recorder,
-            idempotency_cache: &mut idempotency_cache,
-            semantic_dedup: &mut semantic_dedup,
-            call_counts: &mut std::collections::HashMap::new(),
-            max_identical_calls: 2,
-            max_tools_per_turn: 15,
-            max_consecutive_empty_name: 3,
-            tool_call_records: &mut tool_call_records,
-            tool_event_hooks: &tool_event_hooks,
-            term: &mut term,
-            mailbox: None,
-            permission_context: None,
-            progress_emitter: None,
-            pre_resolved_results: &[],
-            runtime_tool_executor: None,
-            external_effect_recovery_paths: None,
-            turn_start: None,
-            llm_round: 0,
-            plan_mode_active: false,
-        })
-        .await;
+            let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+                turn_index: 0,
+                session_turn: 1,
+                quiet: true,
+                api: &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+                token: "",
+                current_user_id: None,
+                current_session_id: None,
+                current_run_id: None,
+                current_turn_chain_id: None,
+                durable_dispatch_admission: None,
+                delegation_model_admissions: None,
+                physical_tool_calls: &tool_calls,
+                logical_tool_calls: &tool_calls,
+                deferred_activations_by_call_id: &std::collections::HashMap::new(),
+                runtime_control_calls_by_id: &std::collections::HashMap::new(),
+                edge_tool_round: &edge_tool_round,
+                reasoning_content: "",
+                reasoning_signature: "",
+                messages: &mut messages,
+                tool_results: &mut tool_results,
+                valid_tool_names: &valid_tool_names,
+                deferred_tool_names: &std::collections::HashSet::new(),
+                restricted_tools: &mut restricted_tools,
+                turn_guard: &mut turn_guard,
+                step_recorder: &mut step_recorder,
+                idempotency_cache: &mut idempotency_cache,
+                semantic_dedup: &mut semantic_dedup,
+                call_counts: &mut std::collections::HashMap::new(),
+                max_identical_calls: 2,
+                max_tools_per_turn: 15,
+                max_consecutive_empty_name: 3,
+                tool_call_records: &mut tool_call_records,
+                tool_event_hooks: &tool_event_hooks,
+                term: &mut term,
+                mailbox: None,
+                permission_context: None,
+                progress_emitter: None,
+                pre_resolved_results: &[],
+                runtime_tool_executor: None,
+                external_effect_recovery_paths: None,
+                turn_start: None,
+                llm_round: 0,
+                plan_mode_active: false,
+            })
+            .await;
 
-        assert!(messages.is_empty());
-        assert!(tool_results.is_empty());
-        assert!(tool_call_records.is_empty());
-        assert!(
-            outcome
-                .action_admission_error
-                .as_deref()
-                .is_some_and(|error| error.contains("tool call id is missing")),
-            "unexpected admission result: {outcome:?}"
-        );
+            assert_eq!(messages, original_messages);
+            assert_eq!(step_recorder.events().len(), original_event_count);
+            assert!(tool_results.is_empty());
+            assert!(tool_call_records.is_empty());
+            assert!(
+                outcome
+                    .action_admission_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(expected_error)),
+                "unexpected admission result: {outcome:?}"
+            );
+        }
     }
 
     /// Regression test for session 4a9c9697: skill + non-skill tool calls in

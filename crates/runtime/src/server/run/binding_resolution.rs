@@ -167,6 +167,10 @@ pub(crate) fn binding_snapshot_events(
     );
     workspace_event.insert("run_id".to_string(), Value::String(run_id.to_string()));
     workspace_event.insert(
+        "idempotency_key".to_string(),
+        Value::String(format!("run-start:{run_id}:workspace-bound")),
+    );
+    workspace_event.insert(
         "session_id".to_string(),
         Value::String(session_id.to_string()),
     );
@@ -180,6 +184,10 @@ pub(crate) fn binding_snapshot_events(
         Value::String("executor_bound".to_string()),
     );
     executor_event.insert("run_id".to_string(), Value::String(run_id.to_string()));
+    executor_event.insert(
+        "idempotency_key".to_string(),
+        Value::String(format!("run-start:{run_id}:executor-bound")),
+    );
     executor_event.insert(
         "session_id".to_string(),
         Value::String(session_id.to_string()),

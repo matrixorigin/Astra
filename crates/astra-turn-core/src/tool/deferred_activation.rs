@@ -86,69 +86,6 @@ pub struct CanonicalToolInvocation {
     target: InvocationTarget,
 }
 
-/// One provider response after canonicalization, retaining provider order.
-///
-/// The two projections are intentionally exposed only as parallel views of
-/// the same ordered records. Callers must never concatenate admitted and
-/// rejected subsets to rebuild history: provider ordering is transcript and
-/// prompt-cache evidence.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CanonicalToolInvocationBatch {
-    invocations: Vec<CanonicalToolInvocation>,
-}
-
-impl CanonicalToolInvocationBatch {
-    #[must_use]
-    pub fn new(invocations: Vec<CanonicalToolInvocation>) -> Self {
-        Self { invocations }
-    }
-
-    #[must_use]
-    pub fn invocations(&self) -> &[CanonicalToolInvocation] {
-        &self.invocations
-    }
-
-    #[must_use]
-    pub fn physical_provider_calls(&self) -> Vec<Value> {
-        self.invocations
-            .iter()
-            .map(|call| call.physical_provider_call().clone())
-            .collect()
-    }
-
-    #[must_use]
-    pub fn logical_target_calls(&self) -> Vec<Value> {
-        self.invocations
-            .iter()
-            .map(|call| call.logical_target_call().clone())
-            .collect()
-    }
-
-    /// The same provider identity must address both views, exactly once and
-    /// in the exact provider sequence. This makes joining execution outcomes
-    /// back to transcript evidence deterministic.
-    pub fn validate(&self) -> Result<(), &'static str> {
-        let mut ids = HashSet::with_capacity(self.invocations.len());
-        for invocation in &self.invocations {
-            let physical_id = invocation
-                .provider_call_id()
-                .ok_or("provider call id is missing")?;
-            let logical_id = invocation
-                .logical_target_call()
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or("logical target id is missing")?;
-            if physical_id != logical_id {
-                return Err("physical and logical call ids differ");
-            }
-            if !ids.insert(physical_id) {
-                return Err("provider batch contains duplicate call ids");
-            }
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 enum InvocationTarget {
     Direct,
@@ -457,38 +394,6 @@ where
     }))
 }
 
-/// Canonicalize one provider batch into paired invocations.
-///
-/// Ordinary calls retain their single canonical value. A carrier is resolved
-/// only from schema-addressed activation evidence supplied by retained
-/// canonical history; callers receive a per-call result so one stale carrier
-/// cannot erase independent calls in a mixed provider batch.
-pub fn canonicalize_tool_invocation_batch<F>(
-    provider_calls: &[Value],
-    activations: &[DeferredToolActivation],
-    current_schema_digest: F,
-) -> Vec<Result<CanonicalToolInvocation, DeferredToolInvocationError>>
-where
-    F: Fn(&str) -> Option<String> + Copy,
-{
-    provider_calls
-        .iter()
-        .map(|provider_call| {
-            let canonical =
-                crate::tool::args::shape::canonicalize_tool_call_for_execution(provider_call)
-                    .map_err(|_| DeferredToolInvocationError::Malformed)?;
-            match canonicalize_deferred_tool_invocation(
-                &canonical,
-                activations,
-                current_schema_digest,
-            )? {
-                Some(invocation) => Ok(invocation),
-                None => Ok(CanonicalToolInvocation::ordinary(canonical)),
-            }
-        })
-        .collect()
-}
-
 /// Current tool surface installed by the runtime for admission/search.
 ///
 /// `Uninstalled` means no LLM-request surface has been installed yet; callers
@@ -706,32 +611,6 @@ pub fn deferred_tool_activations_from_tool_search_output(
         }
     }
     activations
-}
-
-/// Keep only schema-addressed selections that this turn's deferred manifest
-/// actually offered and that the current runtime can bind. Visible tools
-/// (notably the carrier itself) are searchable for discovery but never become
-/// carrier targets merely because a model selected them.
-#[must_use]
-pub fn recordable_deferred_tool_activations<F>(
-    output: &str,
-    surface: &ToolSurfaceNames,
-    has_runtime_binding: F,
-) -> Vec<DeferredToolActivation>
-where
-    F: Fn(&str) -> bool,
-{
-    let Some(activatable) = surface.activatable() else {
-        return Vec::new();
-    };
-    deferred_tool_activations_from_tool_search_output(output)
-        .into_iter()
-        .filter(|activation| {
-            activation.name != DEFERRED_TOOL_INVOCATION_CARRIER
-                && activatable.contains(&activation.name)
-                && has_runtime_binding(&activation.name)
-        })
-        .collect()
 }
 
 /// Apply newly selected evidence to a session's carrier activation state.
@@ -1074,41 +953,6 @@ mod tests {
     }
 
     #[test]
-    fn recordable_carrier_activations_require_deferred_manifest_not_visibility() {
-        let digest = format!("sha256:{}", "a".repeat(64));
-        let output = json!({
-            "mode": "select",
-            "status": "completed",
-            "query": "select:invoke_tool,read_file,web_fetch",
-            "requested": ["invoke_tool", "read_file", "web_fetch"],
-            "resolved": ["invoke_tool", "read_file", "web_fetch"],
-            "matches": [
-                {"name": "invoke_tool", "schema_digest": digest},
-                {"name": "read_file", "schema_digest": format!("sha256:{}", "b".repeat(64))},
-                {"name": "web_fetch", "schema_digest": format!("sha256:{}", "c".repeat(64))}
-            ],
-            "missing": []
-        })
-        .to_string();
-        let surface = ToolSurfaceNames::installed(
-            HashSet::from([
-                DEFERRED_TOOL_INVOCATION_CARRIER.to_string(),
-                "read_file".to_string(),
-            ]),
-            HashSet::from(["web_fetch".to_string()]),
-        );
-
-        assert_eq!(
-            recordable_deferred_tool_activations(&output, &surface, |_| true),
-            vec![DeferredToolActivation {
-                name: "web_fetch".to_string(),
-                schema_digest: format!("sha256:{}", "c".repeat(64)),
-                descriptor: None,
-            }]
-        );
-    }
-
-    #[test]
     fn carrier_activation_requires_schema_addressed_selection_evidence() {
         let digest = format!("sha256:{}", "a".repeat(64));
         let selected = json!({
@@ -1436,36 +1280,6 @@ mod tests {
     }
 
     #[test]
-    fn batch_resolution_keeps_independent_direct_calls_when_carrier_is_stale() {
-        let calls = vec![
-            json!({"id":"direct-1","type":"function","function":{"name":"read_file","arguments":"{}"}}),
-            json!({"id":"carrier-1","type":"function","function":{"name":"invoke_tool","arguments":"{\"name\":\"web_fetch\",\"arguments\":{}}"}}),
-        ];
-        let resolved = canonicalize_tool_invocation_batch(
-            &calls,
-            &[DeferredToolActivation {
-                name: "web_fetch".to_string(),
-                schema_digest: format!("sha256:{}", "a".repeat(64)),
-                descriptor: None,
-            }],
-            |_| Some(format!("sha256:{}", "b".repeat(64))),
-        );
-
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(
-            resolved[0]
-                .as_ref()
-                .expect("direct call survives")
-                .logical_target_call()["function"]["name"],
-            "read_file"
-        );
-        assert_eq!(
-            resolved[1],
-            Err(DeferredToolInvocationError::ActivationStale)
-        );
-    }
-
-    #[test]
     fn refreshing_carrier_activation_replaces_the_previous_schema_revision() {
         let mut activations = vec![DeferredToolActivation {
             name: "web_fetch".to_string(),
@@ -1633,47 +1447,6 @@ mod tests {
         assert!(
             msg.contains("tool_search(query=\"select:github\")"),
             "{msg}"
-        );
-    }
-
-    #[test]
-    fn paired_batch_preserves_provider_order_and_identity_across_views() {
-        let direct = CanonicalToolInvocation::ordinary(json!({
-            "id": "direct-1", "type": "function",
-            "function": {"name": "read_file", "arguments": "{}"}
-        }));
-        let carrier = json!({
-            "id": "carrier-2", "type": "function",
-            "function": {"name": "invoke_tool", "arguments": "{\"name\":\"web_fetch\",\"arguments\":{}}"}
-        });
-        let activation = DeferredToolActivation {
-            name: "web_fetch".to_string(),
-            schema_digest: "sha256:current".to_string(),
-            descriptor: None,
-        };
-        let deferred = canonicalize_deferred_tool_invocation(&carrier, &[activation], |_| {
-            Some("sha256:current".to_string())
-        })
-        .expect("carrier is valid")
-        .expect("carrier resolves");
-        let batch = CanonicalToolInvocationBatch::new(vec![direct, deferred]);
-
-        assert!(batch.validate().is_ok());
-        assert_eq!(
-            batch
-                .physical_provider_calls()
-                .iter()
-                .filter_map(|call| crate::tool::args::shape::tool_call_name(call))
-                .collect::<Vec<_>>(),
-            vec!["read_file", "invoke_tool"]
-        );
-        assert_eq!(
-            batch
-                .logical_target_calls()
-                .iter()
-                .filter_map(|call| crate::tool::args::shape::tool_call_name(call))
-                .collect::<Vec<_>>(),
-            vec!["read_file", "web_fetch"]
         );
     }
 

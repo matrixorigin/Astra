@@ -2551,7 +2551,6 @@ fn test_resolved_model_offering_at(base_url: &str) -> astra_services::ResolvedMo
             api_key: "test-provider-secret".to_string(),
             base_url: base_url.to_string(),
             provider: "openai".to_string(),
-            fallback_chain: Vec::new(),
             tags: Vec::new(),
             request_body_overrides: None,
             fixed_temperature: None,
@@ -5479,16 +5478,17 @@ async fn waiting_and_paused_root_settlement_retains_resumable_publications() {
         ("paused-root-context", STATUS_PAUSED),
     ] {
         let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-        engine
+        let execution_authority = engine
             .start_run(run_id, "user-a", "session-1")
             .await
             .unwrap();
         assert!(
             engine
-                .persist_delegation_outcome_status(
+                .persist_delegation_outcome_status_if_current_owner(
                     "user-a",
                     "session-1",
                     run_id,
+                    execution_authority.owner_generation,
                     status,
                     Some("resumable"),
                     None,
@@ -5537,7 +5537,7 @@ async fn normal_terminal_root_history_does_not_grow_runtime_context_indexes() {
 
     for ordinal in 0..64 {
         let run_id = format!("settled-root-{ordinal}");
-        engine
+        let execution_authority = engine
             .start_run(&run_id, "user-a", "session-1")
             .await
             .unwrap();
@@ -5548,10 +5548,11 @@ async fn normal_terminal_root_history_does_not_grow_runtime_context_indexes() {
         assert!(executor.set_runtime_context(context).await);
         assert!(
             engine
-                .persist_delegation_outcome_status(
+                .persist_delegation_outcome_status_if_current_owner(
                     "user-a",
                     "session-1",
                     &run_id,
+                    execution_authority.owner_generation,
                     STATUS_COMPLETED,
                     None,
                     None,
@@ -5577,7 +5578,7 @@ async fn normal_terminal_root_history_does_not_grow_runtime_context_indexes() {
 async fn rejected_root_wiring_fails_before_installing_the_agent_provider() {
     for invalid_constraints in [false, true] {
         let service = test_service();
-        service
+        let execution_authority = service
             .run_engine
             .start_run("preterminal-root", "user-a", "session-1")
             .await
@@ -5586,10 +5587,11 @@ async fn rejected_root_wiring_fails_before_installing_the_agent_provider() {
             assert!(
                 service
                     .run_engine
-                    .persist_delegation_outcome_status(
+                    .persist_delegation_outcome_status_if_current_owner(
                         "user-a",
                         "session-1",
                         "preterminal-root",
+                        execution_authority.owner_generation,
                         STATUS_COMPLETED,
                         None,
                         None,
@@ -6976,17 +6978,20 @@ async fn server_child_cancellation_never_overwrites_an_existing_terminal() {
         .start_run("child-run", "user-a", "session-1")
         .await
         .expect("start durable child");
-    engine
-        .persist_status(
-            "user-a",
-            "session-1",
-            "child-run",
-            STATUS_COMPLETED,
-            None,
-            None,
-        )
-        .await
-        .expect("complete durable child");
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-a",
+                expected_session_id: "session-1",
+                run_id: "child-run",
+                status: STATUS_COMPLETED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .expect("complete durable child")
+    );
     let executor = ServerSpawnAgentExecutor::new(
         test_settings(),
         test_encryptor(),
@@ -7174,6 +7179,55 @@ async fn server_dynamic_child_becomes_a_valid_parent_for_grandchildren() {
         context.spawner.upgrade().is_some(),
         "the live child must retain the session-owned spawner capability"
     );
+}
+
+#[tokio::test]
+async fn server_spawn_rejects_prefix_requests_before_preparing_any_child() {
+    use astra_turn_core::orchestration_spawn_tool::{InheritPrefixSpec, SpawnAgentInput};
+
+    let executor = Arc::new(ServerSpawnAgentExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    ));
+    let context = test_spawn_context("unpublished-parent");
+    for required in [true, false] {
+        let inputs = [
+            SpawnAgentInput {
+                description: "ordinary child".into(),
+                prompt: "read one file".into(),
+                ..Default::default()
+            },
+            SpawnAgentInput {
+                description: "prefix child".into(),
+                prompt: "use inherited context".into(),
+                inherit_prefix: Some(InheritPrefixSpec {
+                    from_run_id: Some("another-run".into()),
+                    required,
+                }),
+                ..Default::default()
+            },
+        ];
+        let error = match Arc::clone(&executor)
+            .prepare_batch(&inputs, &context, None)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported inheritance must reject the whole batch"),
+        };
+        assert!(
+            matches!(error, crate::orchestration::SpawnError::DelegationFailed(ref reason)
+            if reason == "agent execution does not support parent prefix inheritance")
+        );
+        assert!(
+            executor
+                .runtime_context_registry
+                .read()
+                .await
+                .current_context_id_by_run
+                .is_empty()
+        );
+    }
 }
 
 #[tokio::test]
@@ -9161,6 +9215,9 @@ pub(crate) struct FaultInjectedRunStateStore {
     guarded_transition_release: Option<Arc<tokio::sync::Notify>>,
     activation_renewal_entered: Option<Arc<tokio::sync::Notify>>,
     activation_renewal_refused: bool,
+    live_owner_lease: bool,
+    refuse_final_activation: bool,
+    owner_lease_renewals: AtomicUsize,
     descendant_transition_entered: Option<Arc<tokio::sync::Notify>>,
     descendant_transition_release: Option<Arc<tokio::sync::Notify>>,
     blocked_descendant_run_id: Option<String>,
@@ -9170,6 +9227,17 @@ pub(crate) struct FaultInjectedRunStateStore {
 }
 
 impl FaultInjectedRunStateStore {
+    fn with_refused_final_activation(mut self) -> Self {
+        self.live_owner_lease = true;
+        self.refuse_final_activation = true;
+        self
+    }
+
+    fn with_live_owner_lease(mut self) -> Self {
+        self.live_owner_lease = true;
+        self
+    }
+
     pub(crate) fn new(fail_status_calls: &[usize], fail_append_calls: &[usize]) -> Self {
         Self {
             inner: InMemoryRunStateStore::new(),
@@ -9198,6 +9266,9 @@ impl FaultInjectedRunStateStore {
             guarded_transition_release: None,
             activation_renewal_entered: None,
             activation_renewal_refused: false,
+            live_owner_lease: false,
+            refuse_final_activation: false,
+            owner_lease_renewals: AtomicUsize::new(0),
             descendant_transition_entered: None,
             descendant_transition_release: None,
             blocked_descendant_run_id: None,
@@ -9434,16 +9505,27 @@ impl FaultInjectedRunStateStore {
 
     async fn apply_status_mutation_before_call(&self, call: usize) -> Result<(), String> {
         if let Some(mutation) = self.mutate_before_status_call.get(&call) {
-            self.inner
-                .update_run_status(
-                    &mutation.user_id,
-                    &mutation.session_id,
-                    &mutation.run_id,
-                    &mutation.status,
-                    mutation.waiting_for.as_deref(),
-                    mutation.error_message.as_deref(),
-                )
-                .await?;
+            if mutation.status == "cancellation_requested" {
+                self.inner
+                    .request_run_cancellation(&mutation.user_id, &mutation.run_id)
+                    .await?;
+            } else {
+                assert!(
+                    self.inner
+                        .update_run_status_with_events_if_current(
+                            &mutation.user_id,
+                            &mutation.session_id,
+                            &mutation.run_id,
+                            &["running"],
+                            None,
+                            &mutation.status,
+                            mutation.waiting_for.as_deref(),
+                            mutation.error_message.as_deref(),
+                            &[]
+                        )
+                        .await?
+                );
+            }
         }
         Ok(())
     }
@@ -9746,87 +9828,6 @@ impl RunStateStore for FaultInjectedRunStateStore {
             .await
     }
 
-    async fn update_run_status(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
-    ) -> Result<bool, String> {
-        let call = self.next_status_call();
-        self.apply_status_mutation_before_call(call).await?;
-        if self.fail_status_calls.contains(&call) {
-            return Err(format!("injected update_run_status failure on call {call}"));
-        }
-        self.inner
-            .update_run_status(
-                user_id,
-                expected_session_id,
-                run_id,
-                status,
-                waiting_for,
-                error_message,
-            )
-            .await
-    }
-
-    async fn update_run_status_if_current(
-        &self,
-        request: RunStatusCasRequest<'_>,
-    ) -> Result<bool, String> {
-        let call = self.next_status_call();
-        self.apply_status_mutation_before_call(call).await?;
-        if self.fail_status_calls.contains(&call) {
-            return Err(format!(
-                "injected update_run_status_if_current failure on call {call}"
-            ));
-        }
-        self.inner.update_run_status_if_current(request).await
-    }
-
-    async fn update_run_status_with_event_if_current(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_statuses: &[&str],
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
-        event: serde_json::Value,
-    ) -> Result<bool, String> {
-        let call = self.next_status_call();
-        if self.cas_loss_run_ids.contains(run_id) {
-            return Ok(false);
-        }
-        self.apply_status_mutation_before_call(call).await?;
-        if self.fail_status_calls.contains(&call) || self.fail_status_run_ids.contains(run_id) {
-            return Err(format!(
-                "injected update_run_status_with_event_if_current failure on call {call}"
-            ));
-        }
-        let append_call = self.next_append_call();
-        if self.fail_append_calls.contains(&append_call) {
-            return Err(format!(
-                "injected transition append_event failure on call {append_call}"
-            ));
-        }
-        self.inner
-            .update_run_status_with_event_if_current(
-                user_id,
-                expected_session_id,
-                run_id,
-                expected_statuses,
-                status,
-                waiting_for,
-                error_message,
-                event,
-            )
-            .await
-    }
-
     async fn update_run_status_with_event_if_current_unless_session_blocked(
         &self,
         request: astra_services::runs::GuardedRunStatusTransitionRequest<'_>,
@@ -9902,15 +9903,23 @@ impl RunStateStore for FaultInjectedRunStateStore {
                 tokio::time::sleep(self.descendant_transition_delay).await;
             }
         }
-        let terminal_call = self.next_terminal_transition_call();
+        let terminal = astra_services::runs::durable_run_status_is_terminal(status)
+            || events.iter().any(|event| {
+                event
+                    .pointer("/data/releases_session_slot")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            });
+        let terminal_call = terminal.then(|| self.next_terminal_transition_call());
         let call = self.next_status_call();
         if self.cas_loss_run_ids.contains(run_id) {
             return Ok(false);
         }
         self.apply_status_mutation_before_call(call).await?;
-        if self.fail_terminal_transition_calls.contains(&terminal_call) {
+        if terminal_call.is_some_and(|call| self.fail_terminal_transition_calls.contains(&call)) {
             return Err(format!(
-                "injected terminal transition failure on call {terminal_call}"
+                "injected terminal transition failure on call {}",
+                terminal_call.unwrap()
             ));
         }
         if self.fail_status_calls.contains(&call) || self.fail_status_run_ids.contains(run_id) {
@@ -9918,23 +9927,28 @@ impl RunStateStore for FaultInjectedRunStateStore {
                 "injected update_run_status_with_events_if_current failure on call {call}"
             ));
         }
-        let append_call = self.next_append_call();
-        if self.fail_append_calls.contains(&append_call) {
-            return Err(format!(
-                "injected transition append_events failure on call {append_call}"
-            ));
+        // Inject caller-supplied event failures without consuming them for status-only setup.
+        if !events.is_empty() {
+            let append_call = self.next_append_call();
+            if self.fail_append_calls.contains(&append_call) {
+                return Err(format!(
+                    "injected transition append_events failure on call {append_call}"
+                ));
+            }
         }
-        self.terminal_transition_entries
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        if let Some(release) = &self.terminal_transition_release {
-            release
-                .acquire()
-                .await
-                .expect("terminal barrier open")
-                .forget();
-        }
-        if !self.terminal_transition_delay.is_zero() {
-            tokio::time::sleep(self.terminal_transition_delay).await;
+        if terminal {
+            self.terminal_transition_entries
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if let Some(release) = &self.terminal_transition_release {
+                release
+                    .acquire()
+                    .await
+                    .expect("terminal barrier open")
+                    .forget();
+            }
+            if !self.terminal_transition_delay.is_zero() {
+                tokio::time::sleep(self.terminal_transition_delay).await;
+            }
         }
         self.inner
             .update_run_status_with_events_if_current(
@@ -9947,27 +9961,6 @@ impl RunStateStore for FaultInjectedRunStateStore {
                 waiting_for,
                 error_message,
                 events,
-            )
-            .await
-    }
-
-    async fn update_run_usage(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        tool_calls: u32,
-    ) -> Result<bool, String> {
-        self.inner
-            .update_run_usage(
-                user_id,
-                expected_session_id,
-                run_id,
-                prompt_tokens,
-                completion_tokens,
-                tool_calls,
             )
             .await
     }
@@ -10068,15 +10061,16 @@ impl RunStateStore for FaultInjectedRunStateStore {
                     .await?;
             }
             self.inner
-                .update_run_status_with_event_if_current(
+                .update_run_status_with_events_if_current(
                     &mutation.user_id,
                     &mutation.session_id,
                     &mutation.run_id,
                     &[STATUS_PAUSED],
+                    None,
                     &mutation.status,
                     mutation.waiting_for.as_deref(),
                     mutation.error_message.as_deref(),
-                    json!({
+                    &[json!({
                         "event_type": "run_finished",
                         "data": {
                             "status": mutation.status,
@@ -10084,7 +10078,7 @@ impl RunStateStore for FaultInjectedRunStateStore {
                             "cancellation_origin": (mutation.status == STATUS_CANCELLED)
                                 .then_some(CancellationOrigin::User),
                         }
-                    }),
+                    })],
                 )
                 .await?;
         }
@@ -10195,45 +10189,48 @@ impl RunStateStore for FaultInjectedRunStateStore {
     }
 
     fn owner_lease_renewal_interval(&self) -> Option<Duration> {
-        (self.activation_renewal_entered.is_some() || self.activation_renewal_refused)
+        (self.activation_renewal_entered.is_some()
+            || self.activation_renewal_refused
+            || self.live_owner_lease)
             .then_some(Duration::from_secs(1))
     }
 
     fn owner_lease_duration(&self) -> Option<Duration> {
-        (self.activation_renewal_entered.is_some() || self.activation_renewal_refused)
+        (self.activation_renewal_entered.is_some()
+            || self.activation_renewal_refused
+            || self.live_owner_lease)
             .then_some(Duration::from_secs(3))
     }
 
     async fn renew_owner_lease(
         &self,
-        _user_id: &str,
-        _expected_session_id: &str,
-        _run_id: &str,
-        _expected_owner_generation: u64,
-        _expected_statuses: &[&str],
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        expected_owner_generation: u64,
+        expected_statuses: &[&str],
     ) -> Result<bool, String> {
         if let Some(entered) = self.activation_renewal_entered.as_ref() {
             entered.notify_one();
         }
-        if self.activation_renewal_refused {
+        let renewal = self.owner_lease_renewals.fetch_add(1, Ordering::SeqCst);
+        if self.activation_renewal_refused || (self.refuse_final_activation && renewal > 0) {
             Ok(false)
         } else if self.activation_renewal_entered.is_some() {
             std::future::pending::<Result<bool, String>>().await
+        } else if self.live_owner_lease {
+            Ok(self
+                .inner
+                .load_run_control(user_id, run_id)
+                .await?
+                .is_some_and(|run| {
+                    run.session_id == expected_session_id
+                        && run.run_generation == expected_owner_generation
+                        && expected_statuses.contains(&run.status.as_str())
+                }))
         } else {
             Ok(false)
         }
-    }
-
-    async fn update_retry_count(
-        &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        retry_count: u32,
-    ) -> Result<bool, String> {
-        self.inner
-            .update_retry_count(user_id, expected_session_id, run_id, retry_count)
-            .await
     }
 }
 
@@ -11214,16 +11211,17 @@ async fn non_streaming_user_convergence_cancels_archived_child_and_grandchild_ex
     let service = test_service();
     let engine = service.run_engine.clone();
 
-    engine
+    let execution_authority = engine
         .start_run("other-root", "user-1", "session-1")
         .await
         .unwrap();
     assert!(
         engine
-            .persist_delegation_outcome_status(
+            .persist_delegation_outcome_status_if_current_owner(
                 "user-1",
                 "session-1",
                 "other-root",
+                execution_authority.owner_generation,
                 STATUS_COMPLETED,
                 None,
                 None,
@@ -11235,7 +11233,7 @@ async fn non_streaming_user_convergence_cancels_archived_child_and_grandchild_ex
         .start_run("root", "user-1", "session-1")
         .await
         .unwrap();
-    engine
+    let child_execution_authority = engine
         .start_run_ext_with_context(
             "archived-child",
             "user-1",
@@ -11251,7 +11249,7 @@ async fn non_streaming_user_convergence_cancels_archived_child_and_grandchild_ex
         )
         .await
         .unwrap();
-    engine
+    let grandchild_execution_authority = engine
         .start_run_ext_with_context(
             "archived-grandchild",
             "user-1",
@@ -11269,10 +11267,11 @@ async fn non_streaming_user_convergence_cancels_archived_child_and_grandchild_ex
         .unwrap();
     assert!(
         engine
-            .persist_delegation_outcome_status(
+            .persist_delegation_outcome_status_if_current_owner(
                 "user-1",
                 "session-1",
                 "archived-child",
+                child_execution_authority.owner_generation,
                 STATUS_WAITING,
                 Some("executor_offline"),
                 None,
@@ -11282,10 +11281,11 @@ async fn non_streaming_user_convergence_cancels_archived_child_and_grandchild_ex
     );
     assert!(
         engine
-            .persist_delegation_outcome_status(
+            .persist_delegation_outcome_status_if_current_owner(
                 "user-1",
                 "session-1",
                 "archived-grandchild",
+                grandchild_execution_authority.owner_generation,
                 STATUS_PAUSED,
                 Some("user_resume"),
                 None,
@@ -11420,7 +11420,7 @@ async fn subrun_user_convergence_reaches_recovered_durable_grandchild_absent_fro
         )
         .await
         .unwrap();
-    engine
+    let execution_authority = engine
         .start_run_ext_with_context(
             "local-child",
             "user-1",
@@ -11450,10 +11450,11 @@ async fn subrun_user_convergence_reaches_recovered_durable_grandchild_absent_fro
         .unwrap();
     assert!(
         engine
-            .persist_delegation_outcome_status(
+            .persist_delegation_outcome_status_if_current_owner(
                 "user-1",
                 "session-1",
                 "local-child",
+                execution_authority.owner_generation,
                 STATUS_WAITING,
                 Some("remote_wait"),
                 None,
@@ -11537,16 +11538,17 @@ async fn subrun_user_convergence_reaches_recovered_durable_grandchild_absent_fro
 async fn durable_descendant_cancellation_pages_past_500_descendants_and_unrelated_runs() {
     let service = test_service();
     let engine = service.run_engine.clone();
-    engine
+    let execution_authority = engine
         .start_run("other-root", "user-1", "session-wide")
         .await
         .unwrap();
     assert!(
         engine
-            .persist_delegation_outcome_status(
+            .persist_delegation_outcome_status_if_current_owner(
                 "user-1",
                 "session-wide",
                 "other-root",
+                execution_authority.owner_generation,
                 STATUS_COMPLETED,
                 None,
                 None,
@@ -11643,16 +11645,6 @@ fn resume_hydration_requires_existing_session_with_prior_prompt_history() {
         should_restore_prior_prompt_history(true, true),
         "resume is only valid when an existing session has prompt-facing history"
     );
-}
-
-#[test]
-fn session_resume_hydration_hint_is_only_needed_without_restored_prompt_messages() {
-    assert!(should_build_session_resume_hydration_hint(true, 1));
-    assert!(
-        !should_build_session_resume_hydration_hint(true, 3),
-        "restored user/assistant history already carries the resume context"
-    );
-    assert!(!should_build_session_resume_hydration_hint(false, 1));
 }
 
 #[test]
@@ -12611,7 +12603,8 @@ async fn durable_event_pressure_case(
 
     let started = Instant::now();
     let result = async {
-        svc.run_engine
+        let authority = svc
+            .run_engine
             .start_run(&run_id, user_id, &session_id)
             .await
             .map_err(|err| format!("start durable DB run {run_id}: {err}"))?;
@@ -12653,11 +12646,12 @@ async fn durable_event_pressure_case(
 
         let transitioned = svc
             .run_engine
-            .transition_status_with_events_if_current(
+            .transition_status_with_events_if_current_owner(
                 user_id,
                 &session_id,
                 &run_id,
                 &[STATUS_RUNNING],
+                authority.owner_generation,
                 STATUS_COMPLETED,
                 None,
                 None,
@@ -15277,17 +15271,20 @@ async fn delegated_subrun_tool_terminal_is_durable_and_idempotent_while_paused()
         .start_run("paused-child", "user-1", "session-1")
         .await
         .expect("start child");
-    run_engine
-        .persist_status(
-            "user-1",
-            "session-1",
-            "paused-child",
-            STATUS_PAUSED,
-            Some("user_resume"),
-            None,
-        )
-        .await
-        .expect("pause child before settlement");
+    assert!(
+        run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "session-1",
+                run_id: "paused-child",
+                status: STATUS_PAUSED,
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .expect("pause child before settlement")
+    );
     let mut host_events = vec![
         json!({
             "type": "tool_call_end",
@@ -15622,17 +15619,20 @@ async fn delegated_subrun_cancel_wins_generation_fenced_terminal_append() {
         .start_run(run_id, "user-1", "session-1")
         .await
         .expect("start child");
-    run_engine
-        .persist_status(
-            "user-1",
-            "session-1",
-            run_id,
-            STATUS_PAUSED,
-            Some("user_resume"),
-            None,
-        )
-        .await
-        .expect("pause child");
+    assert!(
+        run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "session-1",
+                run_id,
+                status: STATUS_PAUSED,
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .expect("pause child")
+    );
     let terminals = durable_subrun_host_terminal_events(
         vec![json!({
             "type": "tool_call_end",
@@ -19615,17 +19615,20 @@ async fn paused_terminal_repair_persists_accounting_without_reintroducing_resume
         )
         .await
         .expect("start durable run");
-    svc.run_engine
-        .persist_status(
-            "test-user",
-            "session-paused-accounting",
-            "run-paused-accounting",
-            STATUS_PAUSED,
-            Some("user_resume"),
-            None,
-        )
-        .await
-        .expect("pause durable run");
+    assert!(
+        svc.run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "test-user",
+                expected_session_id: "session-paused-accounting",
+                run_id: "run-paused-accounting",
+                status: STATUS_PAUSED,
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .expect("pause durable run")
+    );
     assert!(
         svc.run_engine
             .persist_status_if_current(RunStatusCasRequest {
@@ -19818,10 +19821,20 @@ async fn paused_terminal_accounting_retries_transient_append_failures_and_fails_
             .start_run(&run_id, "test-user", &session_id)
             .await
             .expect("start durable run");
-        svc.run_engine
-            .persist_status("test-user", &session_id, &run_id, STATUS_PAUSED, None, None)
-            .await
-            .expect("pause durable run");
+        assert!(
+            svc.run_engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "test-user",
+                    expected_session_id: &session_id,
+                    run_id: &run_id,
+                    status: STATUS_PAUSED,
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .expect("pause durable run")
+        );
         let request = test_request("retry paused accounting");
         let mut state = svc.build_initial_state(
             "test-user",
@@ -19899,17 +19912,20 @@ async fn paused_accounting_settlement_reclassifies_same_generation_cancellation(
         .start_run(run_id, "test-user", "session-paused-then-cancelled")
         .await
         .expect("start durable run");
-    svc.run_engine
-        .persist_status(
-            "test-user",
-            "session-paused-then-cancelled",
-            run_id,
-            STATUS_PAUSED,
-            None,
-            None,
-        )
-        .await
-        .expect("pause durable run");
+    assert!(
+        svc.run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "test-user",
+                expected_session_id: "session-paused-then-cancelled",
+                run_id,
+                status: STATUS_PAUSED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .expect("pause durable run")
+    );
     let request = test_request("pause then cancel during settlement");
     let mut state = svc.build_initial_state(
         "test-user",
@@ -21079,14 +21095,239 @@ async fn create_run_returns_running_status() {
     assert!(!result.session_id.is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1; provider is localhost fixture"]
+async fn streamed_edge_approval_reaches_current_observer_before_cancellation() {
+    use crate::server::provider_test_support::{ProviderGateway, ProviderResponse, ProviderScript};
+    let tool = |id: &str, name: &str, arguments: Value| {
+        ProviderResponse::OpenAi(json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "",
+                "tool_calls": [{"id": id, "type": "function", "function": {
+                    "name": name, "arguments": arguments.to_string()
+                }}]}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+        }))
+    };
+    let gateway = ProviderGateway::start(vec![ProviderScript::new(
+        "edge write waits for approval",
+        |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+        vec![tool(
+            "write-request",
+            "invoke_tool",
+            json!({"name": "write_file", "arguments": {
+                "path": "/edge/notes.txt", "content": "requires approval"
+            }}),
+        )],
+    )])
+    .await;
+    let pool = setup_lifecycle_run_db_it().await;
+    let owner = format!("stream-approval-owner-{}", Uuid::new_v4());
+    let session = format!("stream-approval-session-{}", Uuid::new_v4());
+    let edge_pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (edge_sender, _edge_receiver) = tokio::sync::mpsc::channel(1);
+    edge_pool.register_with_capabilities_registry_and_materialization_id(
+        &owner,
+        "approval-edge",
+        None,
+        Some("/edge".into()),
+        None,
+        None,
+        Some("approval-edge-registry".into()),
+        Some("approval-edge-materialization".into()),
+        edge_sender,
+    );
+    let svc = db_backed_test_service(&pool, "stream-approval-test")
+        .with_edge_connection_pool(edge_pool)
+        .with_fixture_workspace_provider(
+            Arc::new(tempfile::tempdir().unwrap()),
+            "stream-approval-control-plane",
+        )
+        .with_model_service(Arc::new(ActiveTestModelService::new(format!(
+            "{}/v1",
+            gateway.base_url
+        ))));
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &session).await;
+    let mut request = test_request("write notes after approval");
+    request.session_id = Some(session.clone());
+    request.interactive_client = true;
+    request.allow_tools = Some(vec!["write_file".into()]);
+    request.edge_executor_id = Some("approval-edge".into());
+    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+        display_name: None,
+        root: Some("/edge".into()),
+        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+            path: "/edge".into(),
+        }),
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+    });
+    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+        executor_id: Some("approval-edge".into()),
+        display_name: None,
+        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
+        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+    });
+    request.execution_policy.turn_intent =
+        astra_services::runs::TurnIntentExecutionPolicy::FixedDefault;
+    request.execution_policy.skill_auto_route =
+        astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+    let mut stream = ok(svc.stream_chat(owner.clone(), request).await);
+    let mut receiver = stream.event_rx.take().unwrap();
+    let approval = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut observed = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            observed.push(
+                json!({"type": event["type"], "status": event["status"], "error": event["error"]}),
+            );
+            if event["type"] == "approval_required" || event["type"] == "approval_batch_required" {
+                return event;
+            }
+        }
+        panic!("stream ended before approval reached its observer: {observed:?}");
+    })
+    .await
+    .expect("the current SSE observer must receive the durable approval batch");
+    assert_eq!(approval["run_id"], stream.run_id);
+    let durable = svc
+        .run_engine
+        .load_run(&owner, &stream.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        durable
+            .events
+            .iter()
+            .any(|event| replay_event_type(event) == Some("approval_required"))
+    );
+    ok(svc.cancel_run(stream.run_id.clone(), owner.clone()).await);
+    let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = receiver.recv().await {
+            if replay_event_type(&event) == Some("run_finished") {
+                return event;
+            }
+        }
+        panic!("cancelled stream ended without terminal");
+    })
+    .await
+    .unwrap();
+    assert_eq!(terminal["status"], STATUS_CANCELLED);
+    assert!(svc.drain_background_tasks(Duration::from_secs(5)).await);
+    gateway.assert_complete();
+    cleanup_lifecycle_run_fixture(&pool, &owner, &stream.run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session).await;
+}
+
+#[tokio::test]
+async fn final_activation_refusal_closes_prepared_delivery_and_preserves_recovery_workspace() {
+    for streaming in [false, true] {
+        let store =
+            Arc::new(FaultInjectedRunStateStore::new(&[], &[]).with_refused_final_activation());
+        let directory = Arc::new(tempfile::tempdir().unwrap());
+        let svc = test_service_with_store(store.clone())
+            .with_fixture_workspace_provider(directory, "final-activation-provider");
+        let mut request = test_request("must not launch without final authority");
+        request.session_id = Some("final-activation-session".into());
+        request.interactive_client = true;
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
+            display_name: None,
+            root: None,
+            source: None,
+            authority: None,
+        });
+        let result = if streaming {
+            err(svc.stream_chat("user-1".into(), request).await)
+        } else {
+            err(svc.create_run("user-1".into(), request).await)
+        };
+        assert_eq!(
+            result.1.0.error_code.as_deref(),
+            Some("execution_authority_not_current")
+        );
+        assert!(svc.runs.read().await.is_empty());
+        assert!(svc.approval_channels.lock().await.is_empty());
+        assert!(svc.user_prompt_channels.lock().await.is_empty());
+        assert!(svc.progress_channels.lock().await.is_empty());
+        assert_eq!(
+            store.terminal_transition_calls(),
+            0,
+            "recovery owns unconfirmed authority"
+        );
+        let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+        assert_eq!(runs.runs[0].status, STATUS_RUNNING);
+        let workspace = runs.runs[0].workspace.as_ref().unwrap()["cwd"]
+            .as_str()
+            .unwrap();
+        assert!(std::path::Path::new(workspace).is_dir());
+    }
+}
+
+#[tokio::test]
+async fn preparation_failure_keeps_lease_until_terminal_commit_and_releases_session_slot() {
+    for streaming in [false, true] {
+        let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[1]).with_live_owner_lease());
+        let svc = test_service_with_store(store.clone()).with_run_concurrency_limit(1);
+        let permit = svc.test_run_semaphore().acquire_owned().await.unwrap();
+        let mut request = test_request("fail before execution");
+        request.session_id = Some("failed-preparation-session".into());
+        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+            kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
+            display_name: None,
+            root: None,
+            source: None,
+            authority: None,
+        });
+        let failure = if streaming {
+            err(svc.stream_chat("user-1".into(), request).await)
+        } else {
+            err(svc.create_run("user-1".into(), request).await)
+        };
+        assert_eq!(failure.0, StatusCode::SERVICE_UNAVAILABLE);
+        let runs = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+        assert_eq!(runs.runs.len(), 1);
+        assert_eq!(runs.runs[0].status, STATUS_FAILED);
+        let run = svc
+            .run_engine
+            .load_run("user-1", &runs.runs[0].run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(|event| replay_event_type(event) == Some("run_finished"))
+                .count(),
+            1
+        );
+        assert_eq!(store.terminal_transition_calls(), 1);
+        assert!(svc.runs.read().await.is_empty());
+        let mut next = test_request("the released slot can accept a new run");
+        next.session_id = Some("failed-preparation-session".into());
+        let next = ok(svc.create_run("user-1".into(), next).await);
+        ok(svc.cancel_run(next.run_id, "user-1".into()).await);
+        drop(permit);
+    }
+}
+
 #[tokio::test]
 async fn refused_activation_returns_coded_conflict_without_rejecting_durable_admission() {
-    for entrypoint in ["create", "stream", "idempotent_stream"] {
+    for entrypoint in ["create", "stream", "idempotent_stream", "cloud"] {
         let store =
             Arc::new(FaultInjectedRunStateStore::new(&[], &[]).with_refused_activation_renewal());
         let svc = test_service_with_store(store);
         let mut request = test_request("hello");
         request.session_id = Some("authority-session".into());
+        if entrypoint == "cloud" {
+            request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+                kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
+                display_name: None,
+                root: None,
+                source: Some(astra_services::runs::WorkspaceSourceRequest::Scratch),
+                authority: None,
+            });
+        }
         if entrypoint == "idempotent_stream" {
             request.run_start_idempotency = Some(
                 RunStartIdempotency::new(
@@ -21120,6 +21361,20 @@ async fn refused_activation_returns_coded_conflict_without_rejecting_durable_adm
             svc.runs.read().await.is_empty(),
             "no local execution may start"
         );
+        if entrypoint == "cloud" {
+            let list = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+            let run = svc
+                .run_engine
+                .load_run("user-1", &list.runs[0].run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                run.events[0]["data"]["admission_source"]["capability_source"],
+                "bound_executor"
+            );
+            assert!(list.runs[0].workspace.is_none() && list.runs[0].executor.is_none());
+        }
         if entrypoint == "idempotent_stream" {
             let run = svc
                 .run_engine
@@ -21298,10 +21553,20 @@ async fn idempotent_stream_replays_frozen_run_before_team_or_model_preparation()
         )
         .await
         .expect("seed durable replay run");
-    svc.run_engine
-        .persist_status("user-1", session_id, run_id, STATUS_COMPLETED, None, None)
-        .await
-        .expect("freeze durable replay run");
+    assert!(
+        svc.run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: session_id,
+                run_id,
+                status: STATUS_COMPLETED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .expect("freeze durable replay run")
+    );
     let before = svc
         .run_engine
         .load_run("user-1", run_id)
@@ -22893,10 +23158,20 @@ async fn create_run_session_exclusion_is_scoped_by_user() {
 
 #[tokio::test]
 async fn stream_chat_conflicts_when_same_session_already_has_active_run() {
-    let svc = test_service();
+    // Independent local projections share only durable admission, as pods do.
+    let store = Arc::new(InMemoryRunStateStore::new());
+    let first_service = test_service_with_store(store.clone()).with_run_concurrency_limit(1);
+    let held_permit = first_service
+        .test_run_semaphore()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let loser_workspace = Arc::new(tempfile::tempdir().unwrap());
+    let svc = test_service_with_store(store)
+        .with_fixture_workspace_provider(loser_workspace.clone(), "loser-executor");
     let mut first = test_request("hello");
     first.session_id = Some("shared-session".into());
-    ok(svc.create_run("user-1".into(), first).await);
+    let started = ok(first_service.create_run("user-1".into(), first).await);
 
     let mut second = test_request("again");
     second.session_id = Some("shared-session".into());
@@ -22915,6 +23190,17 @@ async fn stream_chat_conflicts_when_same_session_already_has_active_run() {
             .and_then(|m| m.get("admission_state")),
         Some(&json!("rejected"))
     );
+
+    assert!(svc.runs.read().await.is_empty());
+    assert_eq!(
+        std::fs::read_dir(loser_workspace.path()).unwrap().count(),
+        0,
+        "a durable-slot loser must not provision a workspace"
+    );
+    ok(first_service
+        .cancel_run(started.run_id, "user-1".into())
+        .await);
+    drop(held_permit);
 }
 
 #[tokio::test]
@@ -23001,7 +23287,18 @@ async fn get_run_status_returns_state() {
         .await);
     assert_eq!(status.run_id, run.run_id);
     assert_eq!(status.status, "running");
-    assert_eq!(status.events_count, 1);
+    let replay = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await);
+    assert_eq!(status.events_count as usize, replay.events.len());
+    for kind in ["run_started", "workspace_bound", "executor_bound"] {
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| astra_services::runs::extract_event_type(event) == kind)
+                .count(),
+            1
+        );
+    }
     let workspace = status.workspace.expect("explicit no-file environment");
     assert_eq!(workspace["kind"], "none");
     assert_eq!(workspace["authority"], "none");
@@ -23069,6 +23366,138 @@ async fn run_projection_binding_is_first_snapshot_and_ignores_later_runtime_meta
     );
     assert_eq!(binding.executor.expect("executor")["kind"], "edge_agent");
     assert_eq!(binding.transport.as_deref(), Some("edge_ws"));
+}
+
+#[tokio::test]
+async fn late_execution_binding_requires_current_generation_and_is_immutable() {
+    let svc = test_service();
+    let run_id = "late-binding";
+    let session_id = "late-binding-session";
+    svc.run_engine
+        .start_run(run_id, "user-1", session_id)
+        .await
+        .unwrap();
+    let initial = svc
+        .run_engine
+        .load_run("user-1", run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let status = ok(svc.get_run_status(run_id.into(), "user-1".into()).await);
+    let listing = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+    assert!(status.workspace.is_none() && status.executor.is_none() && status.transport.is_none());
+    assert!(
+        listing.runs[0].workspace.is_none()
+            && listing.runs[0].executor.is_none()
+            && listing.runs[0].transport.is_none()
+    );
+    let snapshot = ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox("/workspace/late-binding"),
+        ExecutorBinding::server_local(),
+    );
+    let events = binding_snapshot_events(run_id, session_id, &snapshot);
+    for (user, session, generation, statuses) in [
+        (
+            "user-1",
+            session_id,
+            initial.run_generation + 1,
+            &[STATUS_RUNNING][..],
+        ),
+        (
+            "user-2",
+            session_id,
+            initial.run_generation,
+            &[STATUS_RUNNING][..],
+        ),
+        (
+            "user-1",
+            "other-session",
+            initial.run_generation,
+            &[STATUS_RUNNING][..],
+        ),
+        (
+            "user-1",
+            session_id,
+            initial.run_generation,
+            &[STATUS_COMPLETED][..],
+        ),
+    ] {
+        assert!(
+            !svc.run_engine
+                .append_events_if_current_generation_and_status(
+                    user, session, run_id, generation, statuses, &events,
+                )
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        svc.run_engine
+            .load_run("user-1", run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .events,
+        initial.events
+    );
+    for _ in 0..2 {
+        assert!(
+            svc.run_engine
+                .append_events_if_current_generation_and_status(
+                    "user-1",
+                    session_id,
+                    run_id,
+                    initial.run_generation,
+                    &[STATUS_RUNNING],
+                    &events,
+                )
+                .await
+                .unwrap()
+        );
+    }
+    let committed = svc
+        .run_engine
+        .load_run("user-1", run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.events.len(), initial.events.len() + 2);
+    let status = ok(svc.get_run_status(run_id.into(), "user-1".into()).await);
+    assert_eq!(status.workspace.unwrap()["cwd"], "/workspace/late-binding");
+    assert_eq!(status.executor.unwrap()["kind"], "server_local");
+    let listing = ok(svc.list_runs_cursor("user-1".into(), 10, None).await);
+    assert_eq!(
+        listing.runs[0].workspace.as_ref().unwrap()["cwd"],
+        "/workspace/late-binding"
+    );
+    assert_eq!(
+        listing.runs[0].executor.as_ref().unwrap()["kind"],
+        "server_local"
+    );
+    let mut changed = events;
+    changed[0]["workspace"]["cwd"] = json!("/workspace/conflicting-binding");
+    assert!(
+        svc.run_engine
+            .append_events_if_current_generation_and_status(
+                "user-1",
+                session_id,
+                run_id,
+                initial.run_generation,
+                &[STATUS_RUNNING],
+                &changed,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        svc.run_engine
+            .load_run("user-1", run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .events,
+        committed.events
+    );
 }
 
 #[tokio::test]
@@ -25167,57 +25596,10 @@ async fn durable_edge_approval_timeout_is_not_recorded_as_denial() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn durable_edge_sink_rejects_multi_request_wait_without_partial_state() {
-    let svc = test_service();
-    svc.run_engine
-        .start_run("edge-batch-rejected", "user-1", "edge-batch-session")
-        .await
-        .unwrap();
-    let sink = DurableHostInteractionSink {
-        run_engine: svc.run_engine.clone(),
-        user_id: "user-1".to_string(),
-        run_id: "edge-batch-rejected".to_string(),
-        session_id: "edge-batch-session".to_string(),
-        agent_id: None,
-        event_tx: None,
-    };
-
-    let error = crate::server::server_loop_host::HostInteractionSink::commit_and_deliver(
-        &sink,
-        json!({
-            "type": "approval_batch_required",
-            "requests": [
-                {"request_id": "approval-a", "tool": "write_file"},
-                {"request_id": "approval-b", "tool": "write_file"}
-            ]
-        }),
-    )
-    .await
-    .expect_err("a run-level wait cannot safely represent multiple unresolved approvals");
-    assert!(error.contains("exactly one request"), "{error}");
-
-    let run = svc
-        .run_engine
-        .load_run("user-1", "edge-batch-rejected")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(run.status, STATUS_RUNNING);
-    assert!(run.waiting_for.is_none());
-    assert_eq!(
-        run.events
-            .iter()
-            .filter(|event| event["event_type"] == "approval_required")
-            .count(),
-        0,
-        "fail-closed rejection must not leave a partial approval lifecycle"
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn newer_guidance_fences_an_approved_stale_tool_before_execution() {
     let svc = test_service();
-    svc.run_engine
+    let authority = svc
+        .run_engine
         .start_run("approval-guidance", "user-1", "approval-guidance-session")
         .await
         .unwrap();
@@ -25247,11 +25629,12 @@ async fn newer_guidance_fences_an_approved_stale_tool_before_execution() {
 
     assert!(
         svc.run_engine
-            .transition_status_with_events_if_current(
+            .transition_status_with_events_if_current_owner(
                 "user-1",
                 "approval-guidance-session",
                 "approval-guidance",
                 &[STATUS_WAITING],
+                authority.owner_generation,
                 STATUS_WAITING,
                 Some("tool_approval"),
                 None,
@@ -25393,7 +25776,14 @@ async fn create_run_persists_interaction_mode_into_run_started_event() {
     assert_eq!(durable.events[0]["event_type"], "run_started");
     assert_eq!(durable.events[0]["data"]["interaction_mode"], "auto");
     assert_eq!(durable.events[0]["data"]["interactive_client"], true);
-    let start = &durable.events[0]["data"];
+    // Execution binding becomes authoritative at the generation-fenced
+    // binding commit, after the start claim and before the provider launch.
+    let binding = durable
+        .events
+        .iter()
+        .find(|event| astra_services::runs::extract_event_type(event) == "workspace_bound")
+        .expect("admitted workspace binding");
+    let start = binding;
     assert_eq!(start["workspace"]["kind"], "none");
     assert_eq!(start["workspace"]["authority"], "none");
     assert!(start["workspace"]["cwd"].is_null());
@@ -25404,7 +25794,7 @@ async fn create_run_persists_interaction_mode_into_run_started_event() {
 }
 
 #[tokio::test]
-async fn create_run_persists_edge_binding_into_run_started_event() {
+async fn create_run_persists_edge_binding_before_execution_launch() {
     let svc = test_service();
     let mut req = test_request("review this repo");
     req.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
@@ -25435,20 +25825,28 @@ async fn create_run_persists_edge_binding_into_run_started_event() {
         .expect("load run")
         .expect("run exists");
     assert_eq!(durable.events[0]["event_type"], "run_started");
-    assert_eq!(
-        durable.events[0]["data"]["workspace"]["kind"],
-        "edge_workspace"
-    );
-    assert_eq!(
-        durable.events[0]["data"]["workspace"]["cwd"],
-        "/workspace/astra"
-    );
-    assert_eq!(durable.events[0]["data"]["executor"]["kind"], "edge_agent");
-    assert_eq!(
-        durable.events[0]["data"]["executor"]["executor_id"],
-        "edge-macbook-1"
-    );
-    assert_eq!(durable.events[0]["data"]["transport"], "edge_ledger");
+    assert!(durable.events[0]["data"].get("workspace").is_none());
+    let binding = durable
+        .events
+        .iter()
+        .find(|event| replay_event_type(event) == Some("workspace_bound"))
+        .unwrap();
+    let binding = AgenticRunLifecycleService::durable_event_payload(binding).unwrap();
+    assert_eq!(binding["workspace"]["kind"], "edge_workspace");
+    assert_eq!(binding["workspace"]["cwd"], "/workspace/astra");
+    assert_eq!(binding["executor"]["kind"], "edge_agent");
+    assert_eq!(binding["executor"]["executor_id"], "edge-macbook-1");
+    assert_eq!(binding["transport"], "edge_ledger");
+    for event_type in ["workspace_bound", "executor_bound"] {
+        assert_eq!(
+            durable
+                .events
+                .iter()
+                .filter(|event| replay_event_type(event) == Some(event_type))
+                .count(),
+            1
+        );
+    }
     assert_eq!(
         durable.events[0]["data"]["admission_source"]["capability_source"],
         "bound_executor"
@@ -25814,17 +26212,20 @@ async fn cancel_session_runs_retry_keeps_terminal_local_execution_pending() {
         .start_run("terminal-live", "user-1", "session-terminal-live")
         .await
         .unwrap();
-    svc.run_engine
-        .persist_status(
-            "user-1",
-            "session-terminal-live",
-            "terminal-live",
-            STATUS_COMPLETED,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        svc.run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "session-terminal-live",
+                run_id: "terminal-live",
+                status: STATUS_COMPLETED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
     let (mut local, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
         "terminal-live".into(),
         "session-terminal-live".into(),
@@ -25873,17 +26274,20 @@ async fn cancel_session_runs_waits_for_retained_terminal_target_to_stop() {
         .start_run("draining", "user-1", "session-draining")
         .await
         .unwrap();
-    svc.run_engine
-        .persist_status(
-            "user-1",
-            "session-draining",
-            "draining",
-            STATUS_COMPLETED,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        svc.run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "session-draining",
+                run_id: "draining",
+                status: STATUS_COMPLETED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
     let (mut local, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
         "draining".into(),
         "session-draining".into(),
@@ -26137,10 +26541,18 @@ async fn stream_run_returns_events_from_offset() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
     let first = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await);
-    assert_eq!(first.events.len(), 1);
+    assert!(first.events.len() > 1);
     assert_eq!(first.events[0]["event_type"], "run_started");
-    assert_eq!(first.last_event_idx, 0);
-    let caught_up = ok(svc.stream_run(run.run_id, "user-1".into(), 1).await);
+    assert_eq!(first.last_event_idx as usize, first.events.len() - 1);
+    let tail = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 1).await);
+    assert_eq!(tail.events, first.events[1..]);
+    let caught_up = ok(svc
+        .stream_run(
+            run.run_id,
+            "user-1".into(),
+            u32::try_from(first.last_event_idx + 1).unwrap(),
+        )
+        .await);
     assert!(caught_up.events.is_empty());
     assert_eq!(caught_up.last_event_idx, first.last_event_idx);
     assert_eq!(caught_up.status, first.status);
@@ -26184,25 +26596,6 @@ async fn list_runs_filters_by_user() {
     assert!(ids.contains(u1_a.run_id.as_str()));
     assert!(ids.contains(u1_c.run_id.as_str()));
     assert!(!ids.contains(u2_b.run_id.as_str()));
-    assert!(
-        for_u1
-            .runs
-            .iter()
-            .all(|run| run.workspace.as_ref().unwrap()["kind"] == "none")
-    );
-    assert!(
-        for_u1
-            .runs
-            .iter()
-            .all(|run| run.executor.as_ref().unwrap()["kind"] == "server_local")
-    );
-    assert!(
-        for_u1
-            .runs
-            .iter()
-            .all(|run| run.executor.as_ref().unwrap()["executor_id"] == "server-control-plane")
-    );
-
     let for_u2 = ok(svc.list_runs_cursor("user-2".into(), 10, None).await);
     assert_eq!(for_u2.total, None);
     assert_eq!(for_u2.runs[0].run_id, u2_b.run_id);
@@ -26295,7 +26688,7 @@ fn durable_recent_events_honors_work_surface_hydrate_limit() {
         checkpoint_json: None,
         error_code: None,
         error_message: None,
-        retry_count: 0,
+
         total_prompt_tokens: 0,
         total_completion_tokens: 0,
         total_tool_calls: 0,
@@ -28806,17 +29199,20 @@ fn preserve_manual_pause_wins_over_late_completed_status() {
 async fn durable_paused_state_wins_over_late_completed_status() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-    svc.run_engine
-        .persist_status(
-            "user-1",
-            &run.session_id,
-            &run.run_id,
-            STATUS_PAUSED,
-            Some("user_resume"),
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        svc.run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: &run.session_id,
+                run_id: &run.run_id,
+                status: STATUS_PAUSED,
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
 
     assert!(
         should_preserve_manual_pause_from_durable(
@@ -28837,17 +29233,20 @@ async fn durable_paused_state_wins_over_late_completed_status() {
         .await
     );
 
-    svc.run_engine
-        .persist_status(
-            "user-1",
-            &run.session_id,
-            &run.run_id,
-            STATUS_PAUSED,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        svc.run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: &run.session_id,
+                run_id: &run.run_id,
+                status: STATUS_PAUSED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["paused"],
+            })
+            .await
+            .unwrap()
+    );
     assert!(
         !should_preserve_manual_pause_from_durable(
             &svc.run_engine,
@@ -29002,10 +29401,20 @@ async fn ordinary_chat_entrypoints_do_not_discover_or_recover_explain() {
                     )
                     .await
                     .unwrap();
-                svc.run_engine
-                    .persist_status("user-1", &session, "prior-explain", status, None, None)
-                    .await
-                    .unwrap();
+                assert!(
+                    svc.run_engine
+                        .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                            user_id: "user-1",
+                            expected_session_id: &session,
+                            run_id: "prior-explain",
+                            status,
+                            waiting_for: None,
+                            error_message: None,
+                            expected_statuses: &["running"],
+                        })
+                        .await
+                        .unwrap()
+                );
             }
             let mut request = test_request("ordinary follow-up");
             request.session_id = Some(session);
@@ -29065,10 +29474,20 @@ async fn db_explain_publication_failure_survives_database_outage() {
     let session = format!("explain-outage-{}", Uuid::new_v4());
     let run = Uuid::new_v4().to_string();
     seed_lifecycle_run_for_pause_resume_it(&pool, &svc, user, &run, &session).await;
-    svc.run_engine
-        .persist_status(user, &session, &run, STATUS_COMPLETED, None, None)
-        .await
-        .unwrap();
+    assert!(
+        svc.run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: user,
+                expected_session_id: &session,
+                run_id: &run,
+                status: STATUS_COMPLETED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
     let generation = svc
         .run_engine
         .load_run(user, &run)
@@ -29187,10 +29606,20 @@ async fn db_explain_publication_is_discoverable_and_readable() {
         )
         .await
         .expect("mark Explain publication request");
-    svc.run_engine
-        .persist_status(user, &session, &run, STATUS_COMPLETED, None, None)
-        .await
-        .unwrap();
+    assert!(
+        svc.run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: user,
+                expected_session_id: &session,
+                run_id: &run,
+                status: STATUS_COMPLETED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
     svc.run_engine
         .append_event(
             user,
@@ -29378,10 +29807,20 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
         .expect("canonical Explain benchmark handle");
 
     let current = format!("current-{}", Uuid::new_v4());
-    svc.run_engine
-        .persist_status(user, &session, &run, STATUS_COMPLETED, None, None)
-        .await
-        .expect("complete prior Explain run before starting the next root");
+    assert!(
+        svc.run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: user,
+                expected_session_id: &session,
+                run_id: &run,
+                status: STATUS_COMPLETED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .expect("complete prior Explain run before starting the next root")
+    );
     svc.run_engine
         .start_run_with_context(
             &current,
@@ -29553,10 +29992,20 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
         )
         .await
         .expect("append recoverable Explain fact");
-    svc.run_engine
-        .persist_status(user, &session, &run, STATUS_COMPLETED, None, None)
-        .await
-        .expect("complete recoverable Explain run");
+    assert!(
+        svc.run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: user,
+                expected_session_id: &session,
+                run_id: &run,
+                status: STATUS_COMPLETED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .expect("complete recoverable Explain run")
+    );
     svc.run_engine
         .append_event(
             user,
@@ -30241,18 +30690,21 @@ async fn db_orphan_resume_returns_typed_session_continuation() {
         .start_run(&run_id, &user_id, &session_id)
         .await
         .expect("start durable run");
-    service
-        .run_engine
-        .persist_status(
-            &user_id,
-            &session_id,
-            &run_id,
-            STATUS_PAUSED,
-            Some("user_resume"),
-            None,
-        )
-        .await
-        .expect("pause durable run");
+    assert!(
+        service
+            .run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: &user_id,
+                expected_session_id: &session_id,
+                run_id: &run_id,
+                status: STATUS_PAUSED,
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .expect("pause durable run")
+    );
     sqlx::query(
         "UPDATE agent_runs SET owner_pod_id = NULL, owner_lease_expires_at = NULL
          WHERE user_id = ? AND run_id = ?",
@@ -30384,7 +30836,8 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
     let budget = DurableRunEventBatchBudget::default();
     cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
     crate::server::run::insert_active_run_session_fixture(&pool, user_id, &session_id).await;
-    svc.run_engine
+    let authority = svc
+        .run_engine
         .start_run(&run_id, user_id, &session_id)
         .await
         .expect("start durable DB run");
@@ -30462,11 +30915,12 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
 
     let transitioned = svc
         .run_engine
-        .transition_status_with_events_if_current(
+        .transition_status_with_events_if_current_owner(
             user_id,
             &session_id,
             &run_id,
             &[STATUS_RUNNING],
+            authority.owner_generation,
             STATUS_COMPLETED,
             None,
             None,
@@ -30781,16 +31235,18 @@ async fn resume_run_not_found() {
 async fn pause_resume_round_trip_preserves_events() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+    let initial = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await).events;
     ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
     ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
     let status = ok(svc
         .get_run_status(run.run_id.clone(), "user-1".into())
         .await);
-    assert_eq!(status.events_count, 3); // run_started + run_paused + run_resumed
     let events = ok(svc.stream_run(run.run_id, "user-1".into(), 0).await).events;
-    assert_eq!(events[0]["event_type"], "run_started");
-    assert_eq!(events[1]["event_type"], "run_paused");
-    assert_eq!(events[2]["event_type"], "run_resumed");
+    assert_eq!(status.events_count as usize, events.len());
+    assert_eq!(events[..initial.len()], initial);
+    assert_eq!(events.len(), initial.len() + 2);
+    assert_eq!(events[initial.len()]["event_type"], "run_paused");
+    assert_eq!(events[initial.len() + 1]["event_type"], "run_resumed");
 }
 
 #[tokio::test]
@@ -31084,10 +31540,20 @@ async fn cancel_run_returns_durable_terminal_status_on_cache_miss() {
     let svc = test_service();
     let engine = &svc.run_engine;
     engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
-    engine
-        .persist_status("user-1", "sess-1", "run-1", STATUS_COMPLETED, None, None)
-        .await
-        .unwrap();
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "sess-1",
+                run_id: "run-1",
+                status: STATUS_COMPLETED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
 
     let result = ok(svc.cancel_run("run-1".into(), "user-1".into()).await);
     assert_eq!(result.run_id, "run-1");
@@ -31148,10 +31614,20 @@ async fn cancel_run_durable_only_active_statuses_settle_cancelled() {
             .await
             .unwrap();
         if status != STATUS_RUNNING {
-            engine
-                .persist_status("user-1", &session_id, &run_id, status, waiting_for, None)
-                .await
-                .unwrap();
+            assert!(
+                engine
+                    .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                        user_id: "user-1",
+                        expected_session_id: &session_id,
+                        run_id: &run_id,
+                        status,
+                        waiting_for,
+                        error_message: None,
+                        expected_statuses: &["running"],
+                    })
+                    .await
+                    .unwrap()
+            );
         }
         engine
             .append_event(
@@ -31341,10 +31817,20 @@ async fn cancel_run_stale_read_does_not_overwrite_completed() {
         .start_run("run-race", "user-1", "sess-1")
         .await
         .unwrap();
-    engine
-        .persist_status("user-1", "sess-1", "run-race", STATUS_COMPLETED, None, None)
-        .await
-        .unwrap();
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "sess-1",
+                run_id: "run-race",
+                status: STATUS_COMPLETED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
 
     let result = ok(svc.cancel_run("run-race".into(), "user-1".into()).await);
     assert_eq!(result.status, STATUS_COMPLETED);
@@ -31406,7 +31892,7 @@ async fn pause_run_stale_read_does_not_overwrite_completed() {
 }
 
 #[tokio::test]
-async fn resume_run_stale_read_does_not_overwrite_cancelled() {
+async fn resume_run_stale_read_does_not_overwrite_cancellation_request() {
     let store: Arc<dyn RunStateStore> = Arc::new(
         FaultInjectedRunStateStore::new(&[], &[]).with_status_mutation_before_call(
             2,
@@ -31424,17 +31910,20 @@ async fn resume_run_stale_read_does_not_overwrite_cancelled() {
         .start_run("run-resume-race", "user-1", "sess-1")
         .await
         .unwrap();
-    engine
-        .persist_status(
-            "user-1",
-            "sess-1",
-            "run-resume-race",
-            STATUS_PAUSED,
-            Some("user_resume"),
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "sess-1",
+                run_id: "run-resume-race",
+                status: STATUS_PAUSED,
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
     let (mut live, _, pause_flag, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
         "run-resume-race".to_string(),
         "sess-1".to_string(),
@@ -31452,14 +31941,23 @@ async fn resume_run_stale_read_does_not_overwrite_cancelled() {
         .resume_run("run-resume-race".into(), "user-1".into())
         .await);
     assert_eq!(e.0, StatusCode::CONFLICT);
-    assert!(e.1.0.detail.contains("cancellation_requested"));
+    assert!(e.1.0.detail.contains(STATUS_PAUSED));
 
     let durable = engine
         .load_run("user-1", "run-resume-race")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(durable.status, "cancellation_requested");
+    assert_eq!(durable.status, STATUS_PAUSED);
+    assert!(
+        engine
+            .load_run_control("user-1", "run-resume-race")
+            .await
+            .unwrap()
+            .unwrap()
+            .cancellation_requested
+    );
+    assert!(pause_flag.load(Ordering::SeqCst));
     assert!(
         durable
             .events
@@ -31499,17 +31997,20 @@ async fn resume_run_paused_without_live_executor_requires_session_continuation()
     let svc = test_service();
     let engine = &svc.run_engine;
     engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
-    engine
-        .persist_status(
-            "user-1",
-            "sess-1",
-            "run-1",
-            STATUS_PAUSED,
-            Some("user_resume"),
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "sess-1",
+                run_id: "run-1",
+                status: STATUS_PAUSED,
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
     let (mut stale_local, _, pause_flag, _, _) =
         AgenticRunLifecycleService::build_tracked_run_state(
             "run-1".to_string(),
@@ -31557,9 +32058,16 @@ async fn resume_run_paused_without_live_executor_requires_session_continuation()
 
 #[tokio::test]
 async fn cancel_run_uses_independent_control_plane_when_status_transitions_are_unavailable() {
-    let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[1]));
+    let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[1], &[]));
     let svc = test_service_with_store(store);
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+
+    let before = svc
+        .run_engine
+        .load_run("user-1", &run.run_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     let cancelled = ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
     assert_eq!(cancelled.status, "cancellation_requested");
@@ -31572,7 +32080,7 @@ async fn cancel_run_uses_independent_control_plane_when_status_transitions_are_u
         .unwrap();
     assert_eq!(durable.status, STATUS_RUNNING);
     assert!(durable.waiting_for.is_none());
-    assert_eq!(durable.events.len(), 1);
+    assert_eq!(durable.events, before.events);
     assert!(
         svc.run_engine
             .store()
@@ -31590,9 +32098,25 @@ async fn cancel_run_uses_independent_control_plane_when_status_transitions_are_u
 
 #[tokio::test]
 async fn pause_run_transition_failure_does_not_commit_status_or_event() {
-    let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[1]));
+    let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[1], &[]));
     let svc = test_service_with_store(store);
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+
+    let before = svc
+        .run_engine
+        .load_run("user-1", &run.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let live_events_before = svc
+        .runs
+        .read()
+        .await
+        .get(&run.run_id)
+        .expect("live run state")
+        .events
+        .clone();
 
     let e = err(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
     assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
@@ -31606,7 +32130,7 @@ async fn pause_run_transition_failure_does_not_commit_status_or_event() {
         .unwrap();
     assert_eq!(durable.status, STATUS_RUNNING);
     assert!(durable.waiting_for.is_none());
-    assert_eq!(durable.events.len(), 1);
+    assert_eq!(durable.events, before.events);
     assert_eq!(durable.events[0]["event_type"], "run_started");
 
     let runs = svc.runs.read().await;
@@ -31614,16 +32138,31 @@ async fn pause_run_transition_failure_does_not_commit_status_or_event() {
     assert_eq!(live.status, RunStatus::Running);
     assert!(live.waiting_for.is_none());
     assert!(!live.pause_flag.load(Ordering::SeqCst));
-    assert_eq!(live.events.len(), 1);
-    assert_eq!(live.events[0]["event_type"], "run_started");
+    assert_eq!(live.events, live_events_before);
 }
 
 #[tokio::test]
 async fn resume_run_transition_failure_does_not_commit_status_or_event() {
-    let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[2]));
+    let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[2], &[]));
     let svc = test_service_with_store(store);
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
     ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
+
+    let before = svc
+        .run_engine
+        .load_run("user-1", &run.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let live_events_before = svc
+        .runs
+        .read()
+        .await
+        .get(&run.run_id)
+        .expect("live run state")
+        .events
+        .clone();
 
     let e = err(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
     assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
@@ -31637,16 +32176,15 @@ async fn resume_run_transition_failure_does_not_commit_status_or_event() {
         .unwrap();
     assert_eq!(durable.status, STATUS_PAUSED);
     assert_eq!(durable.waiting_for.as_deref(), Some("user_resume"));
-    assert_eq!(durable.events.len(), 2);
-    assert_eq!(durable.events[1]["event_type"], "run_paused");
+    assert_eq!(durable.events, before.events);
+    assert_eq!(durable.events.last().unwrap()["event_type"], "run_paused");
 
     let runs = svc.runs.read().await;
     let live = runs.get(&run.run_id).expect("live run state");
     assert_eq!(live.status, RunStatus::Paused);
     assert_eq!(live.waiting_for.as_deref(), Some("user_resume"));
     assert!(live.pause_flag.load(Ordering::SeqCst));
-    assert_eq!(live.events.len(), 2);
-    assert_eq!(live.events[1]["event_type"], "run_paused");
+    assert_eq!(live.events, live_events_before);
 }
 
 // Durable resume/session exclusivity
@@ -31660,17 +32198,20 @@ async fn durable_resume_succeeds_when_current_paused_run_is_only_blocker() {
         .start_run("run-solo-resume", "user-1", "sess-solo-resume")
         .await
         .unwrap();
-    engine
-        .persist_status(
-            "user-1",
-            "sess-solo-resume",
-            "run-solo-resume",
-            STATUS_PAUSED,
-            Some("user_resume"),
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "sess-solo-resume",
+                run_id: "run-solo-resume",
+                status: STATUS_PAUSED,
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
     install_live_run_state(
         &svc,
         "user-1",
@@ -31705,17 +32246,20 @@ async fn durable_resume_rejects_blocking_sibling_after_cache_miss() {
         .start_run("run-parent-blocked", "user-1", "sess-blocked")
         .await
         .unwrap();
-    engine
-        .persist_status(
-            "user-1",
-            "sess-blocked",
-            "run-parent-blocked",
-            STATUS_PAUSED,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "sess-blocked",
+                run_id: "run-parent-blocked",
+                status: STATUS_PAUSED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
     engine
         .start_run("run-root-blocker", "user-1", "sess-blocked")
         .await
@@ -31767,17 +32311,20 @@ async fn durable_resume_promotes_buffered_completion_even_when_session_has_block
         .start_run("run-buffered-complete", "user-1", "sess-buffered")
         .await
         .unwrap();
-    engine
-        .persist_status(
-            "user-1",
-            "sess-buffered",
-            "run-buffered-complete",
-            STATUS_PAUSED,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "sess-buffered",
+                run_id: "run-buffered-complete",
+                status: STATUS_PAUSED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
     engine
         .append_event(
             "user-1",
@@ -31821,18 +32368,21 @@ async fn cross_pod_resume_waits_for_durable_settlement_fence() {
         .start_run(run_id, "user-1", "session-cross-pod-settlement")
         .await
         .expect("start durable run");
-    owner
-        .run_engine
-        .persist_status(
-            "user-1",
-            "session-cross-pod-settlement",
-            run_id,
-            STATUS_PAUSED,
-            Some("user_resume"),
-            None,
-        )
-        .await
-        .expect("pause durable run");
+    assert!(
+        owner
+            .run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "session-cross-pod-settlement",
+                run_id,
+                status: STATUS_PAUSED,
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .expect("pause durable run")
+    );
     assert!(
         AgenticRunLifecycleService::persist_settlement_started(
             &owner.run_engine,
@@ -31910,18 +32460,21 @@ async fn cross_pod_settlement_fence_linearizes_with_resume_cas() {
         .start_run(run_id, "user-1", "session-cross-pod-settlement-cas")
         .await
         .expect("start durable run");
-    owner
-        .run_engine
-        .persist_status(
-            "user-1",
-            "session-cross-pod-settlement-cas",
-            run_id,
-            STATUS_PAUSED,
-            Some("user_resume"),
-            None,
-        )
-        .await
-        .expect("pause durable run");
+    assert!(
+        owner
+            .run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "session-cross-pod-settlement-cas",
+                run_id,
+                status: STATUS_PAUSED,
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .expect("pause durable run")
+    );
     let (mut observer_live, _, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
         run_id.to_string(),
         "session-cross-pod-settlement-cas".to_string(),
@@ -32021,10 +32574,20 @@ async fn concurrent_orphan_pause_and_cancel_release_session_slot_consistently() 
         .start_run("run-a", "user-1", session_id)
         .await
         .unwrap();
-    engine
-        .persist_status("user-1", session_id, "run-a", STATUS_PAUSED, None, None)
-        .await
-        .unwrap();
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: session_id,
+                run_id: "run-a",
+                status: STATUS_PAUSED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
     engine
         .start_run("run-b", "user-1", session_id)
         .await
@@ -32084,17 +32647,20 @@ async fn concurrent_cancel_and_resume_of_same_paused_run_preserves_durable_consi
         .start_run("run-a", "user-1", session_id)
         .await
         .unwrap();
-    engine
-        .persist_status(
-            "user-1",
-            session_id,
-            "run-a",
-            STATUS_PAUSED,
-            Some("user_resume"),
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: session_id,
+                run_id: "run-a",
+                status: STATUS_PAUSED,
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
 
     // Concurrent cancel and resume from two agents
     let (cancel, resume) = tokio::join!(
@@ -32273,17 +32839,20 @@ async fn submit_run_user_intent_is_idempotent_and_does_not_mutate_execution_stat
     assert_eq!(durable.status, STATUS_RUNNING);
     assert!(durable.waiting_for.is_none());
 
-    engine
-        .persist_status(
-            "user-1",
-            "session-1",
-            "run-input",
-            STATUS_COMPLETED,
-            None,
-            None,
-        )
-        .await
-        .expect("settle after durable intent commit");
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "session-1",
+                run_id: "run-input",
+                status: STATUS_COMPLETED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .expect("settle after durable intent commit")
+    );
     let terminal_retry = ok(svc
         .submit_run_user_intent(
             "run-input".into(),
@@ -32716,17 +33285,20 @@ async fn submit_run_user_intent_rejects_terminal_durable_run() {
         .start_run("run-terminal-input", "user-1", "session-1")
         .await
         .unwrap();
-    engine
-        .persist_status(
-            "user-1",
-            "session-1",
-            "run-terminal-input",
-            STATUS_COMPLETED,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "session-1",
+                run_id: "run-terminal-input",
+                status: STATUS_COMPLETED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
 
     let e = err(svc
         .submit_run_user_intent(
@@ -32759,17 +33331,20 @@ async fn submit_run_user_intent_rejects_paused_durable_run_without_terminal_code
         .start_run("run-paused-input", "user-1", "session-1")
         .await
         .unwrap();
-    engine
-        .persist_status(
-            "user-1",
-            "session-1",
-            "run-paused-input",
-            STATUS_PAUSED,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "session-1",
+                run_id: "run-paused-input",
+                status: STATUS_PAUSED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
 
     let e = err(svc
         .submit_run_user_intent(
@@ -32795,17 +33370,20 @@ async fn submit_run_user_intent_preserves_waiting_execution_state() {
         .start_run("run-queued-input", "user-1", "session-1")
         .await
         .unwrap();
-    engine
-        .persist_status(
-            "user-1",
-            "session-1",
-            "run-queued-input",
-            STATUS_WAITING,
-            Some("edge_executor"),
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "session-1",
+                run_id: "run-queued-input",
+                status: STATUS_WAITING,
+                waiting_for: Some("edge_executor"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
     install_live_run_state(
         &svc,
         "user-1",
@@ -32858,17 +33436,20 @@ async fn submit_run_user_intent_rejects_paused_durable_run() {
         .start_run("run-paused-input", "user-1", "session-1")
         .await
         .unwrap();
-    engine
-        .persist_status(
-            "user-1",
-            "session-1",
-            "run-paused-input",
-            STATUS_PAUSED,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "session-1",
+                run_id: "run-paused-input",
+                status: STATUS_PAUSED,
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
 
     let e = err(svc
         .submit_run_user_intent(
@@ -33212,7 +33793,9 @@ async fn fail_started_run_before_spawn_persists_terminal_events() {
         .await
         .unwrap();
 
-    svc.fail_started_run_before_spawn(
+    AgenticRunLifecycleService::fail_started_run_before_spawn_with_handles(
+        &svc.run_engine,
+        &svc.runs,
         "user-1",
         "session-1",
         "run-pre-spawn",
@@ -33265,7 +33848,9 @@ async fn fail_started_run_before_spawn_transition_failure_does_not_commit_partia
         .await
         .unwrap();
 
-    svc.fail_started_run_before_spawn(
+    AgenticRunLifecycleService::fail_started_run_before_spawn_with_handles(
+        &svc.run_engine,
+        &svc.runs,
         "user-1",
         "session-1",
         "run-pre-spawn-fail",
@@ -34442,7 +35027,7 @@ fn edge_tool_request_has_a_replayable_canonical_fact() {
 #[tokio::test]
 async fn full_live_queue_cannot_hide_or_precede_durable_approval_truth() {
     let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-    engine
+    let authority = engine
         .start_run("run-approval", "user-1", "session-1")
         .await
         .unwrap();
@@ -34459,7 +35044,7 @@ async fn full_live_queue_cannot_hide_or_precede_durable_approval_truth() {
         agent_id: None,
         event_tx: Some(event_tx),
     };
-    let delivery = server_loop_host::HostInteractionSink::commit_and_deliver(
+    let delivery = server_loop_host::HostInteractionSink::commit_approval_batch_and_deliver(
         &sink,
         json!({
             "type": "approval_required",
@@ -34467,6 +35052,8 @@ async fn full_live_queue_cannot_hide_or_precede_durable_approval_truth() {
             "tool": "bash",
             "approval_kind": "standard"
         }),
+        -1,
+        authority.owner_generation,
     );
     tokio::pin!(delivery);
 
@@ -34500,7 +35087,7 @@ async fn full_live_queue_cannot_hide_or_precede_durable_approval_truth() {
 #[tokio::test]
 async fn detached_observer_does_not_revoke_committed_interaction() {
     let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-    engine
+    let authority = engine
         .start_run("run-detached-approval", "user-1", "session-1")
         .await
         .unwrap();
@@ -34515,7 +35102,7 @@ async fn detached_observer_does_not_revoke_committed_interaction() {
         event_tx: Some(event_tx),
     };
 
-    server_loop_host::HostInteractionSink::commit_and_deliver(
+    server_loop_host::HostInteractionSink::commit_approval_batch_and_deliver(
         &sink,
         json!({
             "type": "approval_required",
@@ -34523,6 +35110,8 @@ async fn detached_observer_does_not_revoke_committed_interaction() {
             "tool": "bash",
             "approval_kind": "standard"
         }),
+        -1,
+        authority.owner_generation,
     )
     .await
     .expect("durable interaction remains valid after live observer detaches");

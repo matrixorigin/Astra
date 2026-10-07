@@ -307,12 +307,10 @@ fn build_basic_cli_turn_params<'a>(
     token: &'a str,
     session_id: Option<&'a str>,
     perm_manager: &'a mut PermissionManager,
-    skill_quality_tracker: &'a mut astra_skills::quality::SkillQualityTracker,
     options: &BasicCliTurnOptions,
     attempt: BasicCliTurnAttempt<'a>,
 ) -> ChatTurnParams<'a> {
-    let mut params =
-        ChatTurnParams::basic_cli(ctx, token, session_id, perm_manager, skill_quality_tracker);
+    let mut params = ChatTurnParams::basic_cli(ctx, token, session_id, perm_manager);
     params.pre_loaded_messages = attempt.pre_loaded_messages;
     params.deferred_tool_activations = Some(attempt.deferred_tool_activations);
     params.append_system_prompt = options.append_system_prompt.clone();
@@ -355,7 +353,6 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
     session_id: Option<&'a str>,
     profile: Option<&str>,
     perm_manager: &'a mut PermissionManager,
-    skill_quality_tracker: &'a mut astra_skills::quality::SkillQualityTracker,
     mut options: BasicCliTurnOptions,
 ) -> Result<StreamResult, TurnFailure> {
     let pre_loaded_messages = options.pre_loaded_messages.take();
@@ -366,7 +363,6 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
         token,
         session_id,
         perm_manager,
-        skill_quality_tracker,
         &options,
         BasicCliTurnAttempt {
             pre_loaded_messages,
@@ -405,7 +401,6 @@ pub(crate) async fn execute_basic_cli_turn<'a>(
                 token,
                 None,
                 perm_manager,
-                skill_quality_tracker,
                 &options,
                 BasicCliTurnAttempt {
                     pre_loaded_messages: retry_messages,

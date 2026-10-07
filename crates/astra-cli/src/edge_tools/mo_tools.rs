@@ -11,11 +11,15 @@
 //! Uses the `mysql` CLI client (MySQL protocol compatible), same pattern as
 //! git tools — shell out to native CLI for zero Rust-side connection overhead.
 
+pub(crate) use astra_turn_core::database_snapshots::{
+    DatabaseSnapshotRollbackEntry, DatabaseSnapshotRollbackJournal,
+};
+use astra_turn_core::safety_middleware::sql_requires_pre_state_snapshot as mo_query_requires_pre_state_snapshot;
 use std::process::Command;
 
 use super::{ToolExecutionOutcome, ToolExecutor};
 use crate::tool_safety_guard::check_sql_safety;
-use serde_json::{Value, json};
+use serde_json::Value;
 use uuid::Uuid;
 
 // ─── MatrixOne connection helper ────────────────────────────────────────────
@@ -84,129 +88,19 @@ fn resolved_mo_database(database: Option<&str>) -> String {
 }
 
 fn mo_create_snapshot_sql(name: &str, database: Option<&str>) -> String {
-    format!(
-        "CREATE SNAPSHOT `{name}` FOR DATABASE `{}`",
-        resolved_mo_database(database)
-    )
+    astra_services::snapshot_sql::create_snapshot_for_db_sql(name, &resolved_mo_database(database))
 }
 
 fn mo_restore_snapshot_sql(name: &str, database: Option<&str>) -> String {
-    let account = mo_current_account();
-    format!(
-        "RESTORE ACCOUNT `{account}` DATABASE `{}` FROM SNAPSHOT `{name}`",
-        resolved_mo_database(database)
+    astra_services::snapshot_sql::restore_database_from_snapshot_sql(
+        name,
+        mo_current_account(),
+        &resolved_mo_database(database),
     )
-}
-
-fn mo_query_requires_pre_state_snapshot(sql: &str, allow_destructive: bool) -> bool {
-    match sql
-        .split_whitespace()
-        .next()
-        .map(|keyword| keyword.trim_matches(|c: char| c == '(' || c == ';'))
-        .map(str::to_ascii_uppercase)
-        .as_deref()
-    {
-        // Mutating statements — always snapshot for rollback safety.
-        Some("INSERT" | "UPDATE" | "REPLACE" | "CREATE") => true,
-        Some("DROP" | "DELETE" | "TRUNCATE" | "ALTER" | "GRANT" | "REVOKE") => true,
-        // Pure reads — never mutate state; skip the snapshot cost regardless
-        // of allow_destructive (the flag gates *execution* of writes, not
-        // snapshot capture on reads).
-        Some(
-            "SELECT" | "SHOW" | "EXPLAIN" | "DESC" | "DESCRIBE" | "USE" | "HELP" | "SOURCE"
-            | "START_TRANSACTION" | "BEGIN" | "COMMIT" | "ROLLBACK" | "SET" | "LOAD" | "PREPARE",
-        ) => false,
-        // Unknown keyword: snapshot only when destructive ops are permitted,
-        // so unrecognized potentially-mutating statements are still covered.
-        _ => allow_destructive,
-    }
 }
 
 fn mo_pre_state_snapshot_name() -> String {
     format!("moq_{}", Uuid::now_v7().simple())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DatabaseSnapshotRollbackEntry {
-    sequence: u64,
-    pub snapshot_id: String,
-    pub database: Option<String>,
-    pub turn_index: u32,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct DatabaseSnapshotRollbackJournal {
-    entries: Vec<DatabaseSnapshotRollbackEntry>,
-    next_sequence: u64,
-}
-
-impl DatabaseSnapshotRollbackJournal {
-    fn record(
-        &mut self,
-        snapshot_id: impl Into<String>,
-        database: Option<String>,
-        turn_index: u32,
-    ) {
-        self.entries.push(DatabaseSnapshotRollbackEntry {
-            sequence: self.next_sequence,
-            snapshot_id: snapshot_id.into(),
-            database,
-            turn_index,
-        });
-        self.next_sequence = self.next_sequence.saturating_add(1);
-    }
-
-    fn list(&self) -> Vec<DatabaseSnapshotRollbackEntry> {
-        self.entries.iter().rev().cloned().collect()
-    }
-
-    fn entry_for_snapshot(&self, snapshot_id: &str) -> Option<DatabaseSnapshotRollbackEntry> {
-        self.entries
-            .iter()
-            .rev()
-            .find(|entry| entry.snapshot_id == snapshot_id)
-            .cloned()
-    }
-
-    fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<DatabaseSnapshotRollbackEntry> {
-        self.restore_plan_for_turn_since(turn_index, 0)
-    }
-
-    fn restore_plan_for_turn_since(
-        &self,
-        turn_index: u32,
-        checkpoint: u64,
-    ) -> Vec<DatabaseSnapshotRollbackEntry> {
-        let mut seen_databases = std::collections::HashSet::new();
-        let mut plan = Vec::new();
-        for entry in self
-            .entries
-            .iter()
-            .filter(|entry| entry.turn_index == turn_index && entry.sequence >= checkpoint)
-        {
-            if seen_databases.insert(entry.database.clone()) {
-                plan.push(entry.clone());
-            }
-        }
-        plan
-    }
-
-    fn checkpoint(&self) -> u64 {
-        self.next_sequence
-    }
-
-    fn remove_snapshot(&mut self, snapshot_id: &str) -> bool {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .rposition(|entry| entry.snapshot_id == snapshot_id)
-        {
-            self.entries.remove(index);
-            true
-        } else {
-            false
-        }
-    }
 }
 
 fn is_mo_error(output: &str) -> bool {
@@ -318,20 +212,10 @@ fn schema_hint_for_error(lower_err: &str, sql: &str, database: Option<&str>) -> 
     None
 }
 
-// ─── Snapshot name validation ───────────────────────────────────────────────
-
-/// Validate snapshot name: alphanumeric + underscore + hyphen only.
-fn is_valid_snapshot_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-}
-
 // ─── Tool implementations ───────────────────────────────────────────────────
 
 impl ToolExecutor {
+    #[cfg(test)]
     fn record_database_snapshot_rollback(
         &self,
         snapshot_id: impl Into<String>,
@@ -348,46 +232,6 @@ impl ToolExecutor {
         }
     }
 
-    fn database_snapshot_entries(&self) -> Vec<DatabaseSnapshotRollbackEntry> {
-        match self.database_snapshot_journal.lock() {
-            Ok(journal) => journal.list(),
-            Err(poisoned) => poisoned.into_inner().list(),
-        }
-    }
-
-    fn database_snapshot_entry_for_snapshot(
-        &self,
-        snapshot_id: &str,
-    ) -> Option<DatabaseSnapshotRollbackEntry> {
-        match self.database_snapshot_journal.lock() {
-            Ok(journal) => journal.entry_for_snapshot(snapshot_id),
-            Err(poisoned) => poisoned.into_inner().entry_for_snapshot(snapshot_id),
-        }
-    }
-
-    fn database_snapshot_restore_plan_for_turn(
-        &self,
-        turn_index: u32,
-    ) -> Vec<DatabaseSnapshotRollbackEntry> {
-        match self.database_snapshot_journal.lock() {
-            Ok(journal) => journal.restore_plan_for_turn(turn_index),
-            Err(poisoned) => poisoned.into_inner().restore_plan_for_turn(turn_index),
-        }
-    }
-
-    fn database_snapshot_restore_plan_for_turn_since(
-        &self,
-        turn_index: u32,
-        checkpoint: u64,
-    ) -> Vec<DatabaseSnapshotRollbackEntry> {
-        match self.database_snapshot_journal.lock() {
-            Ok(journal) => journal.restore_plan_for_turn_since(turn_index, checkpoint),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .restore_plan_for_turn_since(turn_index, checkpoint),
-        }
-    }
-
     pub(crate) fn database_snapshot_journal_checkpoint(&self) -> u64 {
         match self.database_snapshot_journal.lock() {
             Ok(journal) => journal.checkpoint(),
@@ -395,44 +239,25 @@ impl ToolExecutor {
         }
     }
 
-    fn remove_database_snapshot_rollback(&self, snapshot_id: &str) {
-        match self.database_snapshot_journal.lock() {
-            Ok(mut journal) => {
-                journal.remove_snapshot(snapshot_id);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().remove_snapshot(snapshot_id);
-            }
-        }
-    }
-
-    fn rollback_database_snapshot_entry_json(entry: &DatabaseSnapshotRollbackEntry) -> Value {
-        let mut value = serde_json::Map::from_iter([
-            (
-                "snapshot_id".to_string(),
-                Value::String(entry.snapshot_id.clone()),
-            ),
-            ("turn_index".to_string(), Value::from(entry.turn_index)),
-        ]);
-        if let Some(database) = entry.database.as_ref() {
-            value.insert("database".to_string(), Value::String(database.clone()));
-        }
-        Value::Object(value)
-    }
-
-    fn restore_database_snapshot_entry(
+    fn execute_snapshot_rollback(
         &self,
         entry: &DatabaseSnapshotRollbackEntry,
-    ) -> Result<String, String> {
-        let restore_output = mo_execute_sql(
-            &mo_restore_snapshot_sql(&entry.snapshot_id, entry.database.as_deref()),
-            None,
-        )
-        .unwrap_or_else(|e| e);
-        if is_mo_error(&restore_output) {
-            Err(restore_output)
+        operation: astra_turn_core::database_snapshots::SnapshotRollbackOperation,
+    ) -> Result<(), String> {
+        use astra_turn_core::database_snapshots::SnapshotRollbackOperation;
+        let sql = match operation {
+            SnapshotRollbackOperation::Restore => {
+                mo_restore_snapshot_sql(&entry.snapshot_id, entry.database.as_deref())
+            }
+            SnapshotRollbackOperation::Drop => {
+                astra_services::snapshot_sql::drop_snapshot_sql(&entry.snapshot_id)
+            }
+        };
+        let output = mo_execute_sql(&sql, None)?;
+        if is_mo_error(&output) {
+            Err(output)
         } else {
-            Ok(restore_output)
+            Ok(())
         }
     }
 
@@ -443,10 +268,14 @@ impl ToolExecutor {
     /// Mutating queries capture a pre-state snapshot before execution so the
     /// runtime can surface a concrete rollback hint on staged mutations.
     pub(crate) fn mo_query(&self, args: &Value) -> String {
-        self.mo_query_with_metadata(args).output
+        self.mo_query_with_metadata(args, None).output
     }
 
-    pub(crate) fn mo_query_with_metadata(&self, args: &Value) -> ToolExecutionOutcome {
+    pub(crate) fn mo_query_with_metadata(
+        &self,
+        args: &Value,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> ToolExecutionOutcome {
         let sql = match args.get("sql").and_then(Value::as_str) {
             Some(s) if !s.trim().is_empty() => s,
             _ => {
@@ -468,232 +297,73 @@ impl ToolExecutor {
             ));
         }
 
-        let database = args.get("database").and_then(Value::as_str);
-        let resolved_database = resolved_mo_database(database);
-        let mut tool_result_fields = None;
-        if mo_query_requires_pre_state_snapshot(sql, allow_destructive) {
-            let snapshot_id = mo_pre_state_snapshot_name();
-            let snapshot_output =
-                mo_execute_sql(&mo_create_snapshot_sql(&snapshot_id, database), None)
-                    .unwrap_or_else(|e| e);
-            if is_mo_error(&snapshot_output) {
-                return ToolExecutionOutcome::error(format!(
-                    "Error: failed to capture pre-state snapshot `{snapshot_id}` before executing query.\n{snapshot_output}"
-                ));
-            }
-            self.record_database_snapshot_rollback(
-                snapshot_id.clone(),
-                Some(resolved_database.clone()),
-            );
-            tool_result_fields = Some(serde_json::Map::from_iter([
-                (
-                    "pre_state_snapshot_id".to_string(),
-                    Value::String(snapshot_id),
-                ),
-                (
-                    "pre_state_snapshot_database".to_string(),
-                    Value::String(resolved_database),
-                ),
-            ]));
+        if !mo_query_requires_pre_state_snapshot(sql, allow_destructive) {
+            let output = mo_execute_sql(sql, args.get("database").and_then(Value::as_str))
+                .unwrap_or_else(|error| error);
+            return ToolExecutionOutcome {
+                is_error: is_mo_error(&output),
+                output,
+                tool_result_fields: None,
+            };
         }
+        astra_turn_core::database_snapshots::with_journal_mut(
+            &self.database_snapshot_journal,
+            "execute_mo_query",
+            |journal| {
+                if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                    return super::cancelled_tool_execution_outcome("mo_query", false);
+                }
+                let database = args.get("database").and_then(Value::as_str);
+                let resolved_database = resolved_mo_database(database);
+                let mut tool_result_fields = None;
+                if mo_query_requires_pre_state_snapshot(sql, allow_destructive) {
+                    let snapshot_id = mo_pre_state_snapshot_name();
+                    let snapshot_output =
+                        mo_execute_sql(&mo_create_snapshot_sql(&snapshot_id, database), None)
+                            .unwrap_or_else(|e| e);
+                    if is_mo_error(&snapshot_output) {
+                        return ToolExecutionOutcome::error(format!(
+                            "Error: failed to capture pre-state snapshot `{snapshot_id}` before executing query.\n{snapshot_output}"
+                        ));
+                    }
+                    journal.record(
+                        snapshot_id.clone(),
+                        Some(resolved_database.clone()),
+                        self.journal_turn_index
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    tool_result_fields = Some(serde_json::Map::from_iter([
+                        (
+                            "pre_state_snapshot_id".to_string(),
+                            Value::String(snapshot_id),
+                        ),
+                        (
+                            "pre_state_snapshot_database".to_string(),
+                            Value::String(resolved_database),
+                        ),
+                    ]));
+                }
 
-        let output = mo_execute_sql(sql, database).unwrap_or_else(|e| e);
-        let is_error = is_mo_error(&output);
-        ToolExecutionOutcome {
-            output,
-            tool_result_fields,
-            is_error,
-        }
+                let output = mo_execute_sql(sql, database).unwrap_or_else(|e| e);
+                let is_error = is_mo_error(&output);
+                ToolExecutionOutcome {
+                    output,
+                    tool_result_fields,
+                    is_error,
+                }
+            },
+        )
     }
 
     pub(crate) fn rollback_database_snapshots(&self, args: &Value) -> String {
-        if args.get("after_sequence").is_some() {
-            return json!({
-                "success": false,
-                "error": "unknown field 'after_sequence'; use 'database_after_sequence'",
-            })
-            .to_string();
-        }
-        let scope = args
-            .get("scope")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                if args.get("snapshot_id").is_some() {
-                    Some("snapshot")
-                } else {
-                    None
-                }
-            })
-            .unwrap_or("current_turn");
-
-        match scope {
-            "list" => {
-                let entries: Vec<Value> = self
-                    .database_snapshot_entries()
-                    .into_iter()
-                    .map(|entry| Self::rollback_database_snapshot_entry_json(&entry))
-                    .collect();
-                json!({
-                    "success": true,
-                    "scope": "list",
-                    "total_entries": entries.len(),
-                    "entries": entries,
-                })
-                .to_string()
-            }
-            "snapshot" => {
-                let snapshot_id = match args.get("snapshot_id").and_then(Value::as_str) {
-                    Some(snapshot_id) if is_valid_snapshot_name(snapshot_id) => snapshot_id,
-                    Some(snapshot_id) => {
-                        return json!({
-                            "success": false,
-                            "scope": "snapshot",
-                            "error": format!("invalid snapshot_id `{snapshot_id}`"),
-                        })
-                        .to_string();
-                    }
-                    None => {
-                        return json!({
-                            "success": false,
-                            "scope": "snapshot",
-                            "error": "missing 'snapshot_id' for scope=snapshot",
-                        })
-                        .to_string();
-                    }
-                };
-                let journal_entry = self.database_snapshot_entry_for_snapshot(snapshot_id);
-                let database = args
-                    .get("database")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|database| !database.is_empty())
-                    .map(ToString::to_string)
-                    .or_else(|| {
-                        journal_entry
-                            .as_ref()
-                            .and_then(|entry| entry.database.clone())
-                    });
-                let entry = DatabaseSnapshotRollbackEntry {
-                    sequence: journal_entry.as_ref().map_or(0, |entry| entry.sequence),
-                    snapshot_id: snapshot_id.to_string(),
-                    database,
-                    turn_index: journal_entry.as_ref().map_or_else(
-                        || {
-                            self.journal_turn_index
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                        },
-                        |entry| entry.turn_index,
-                    ),
-                };
-                match self.restore_database_snapshot_entry(&entry) {
-                    Ok(_) => {
-                        self.remove_database_snapshot_rollback(snapshot_id);
-                        let database = entry.database.clone();
-                        let summary = format!(
-                            "Restored MatrixOne snapshot `{}`{}",
-                            snapshot_id,
-                            database
-                                .as_deref()
-                                .map(|database| format!(" for database `{database}`"))
-                                .unwrap_or_default()
-                        );
-                        json!({
-                            "success": true,
-                            "scope": "snapshot",
-                            "snapshot_id": snapshot_id,
-                            "database": database,
-                            "summary": summary,
-                        })
-                        .to_string()
-                    }
-                    Err(error) => json!({
-                        "success": false,
-                        "scope": "snapshot",
-                        "snapshot_id": snapshot_id,
-                        "database": entry.database.clone(),
-                        "error": error,
-                    })
-                    .to_string(),
-                }
-            }
-            "turn" | "current_turn" => {
-                let turn_index = if scope == "turn" {
-                    match args.get("turn_index").and_then(Value::as_u64) {
-                        Some(turn_index) => turn_index as u32,
-                        None => {
-                            return json!({
-                                "success": false,
-                                "scope": "turn",
-                                "error": "missing 'turn_index' for scope=turn",
-                            })
-                            .to_string();
-                        }
-                    }
-                } else {
-                    self.journal_turn_index
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                };
-                let checkpoint = args
-                    .get("database_after_sequence")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let plan =
-                    self.database_snapshot_restore_plan_for_turn_since(turn_index, checkpoint);
-                let mut restored = Vec::new();
-                let mut failed = Vec::new();
-                for entry in &plan {
-                    match self.restore_database_snapshot_entry(entry) {
-                        Ok(_) => {
-                            self.remove_database_snapshot_rollback(&entry.snapshot_id);
-                            restored.push(Self::rollback_database_snapshot_entry_json(entry));
-                        }
-                        Err(error) => {
-                            let mut failed_entry =
-                                Self::rollback_database_snapshot_entry_json(entry)
-                                    .as_object()
-                                    .cloned()
-                                    .unwrap_or_default();
-                            failed_entry.insert("error".to_string(), Value::String(error));
-                            failed.push(Value::Object(failed_entry));
-                        }
-                    }
-                }
-                let success = !restored.is_empty() && failed.is_empty();
-                let summary = if plan.is_empty() {
-                    format!("No recorded MatrixOne snapshots found for turn {turn_index}")
-                } else if failed.is_empty() {
-                    format!(
-                        "Restored {} MatrixOne snapshot{} for turn {turn_index}",
-                        restored.len(),
-                        if restored.len() == 1 { "" } else { "s" }
-                    )
-                } else {
-                    format!(
-                        "Restored {} MatrixOne snapshot{} for turn {turn_index} with {} failure{}",
-                        restored.len(),
-                        if restored.len() == 1 { "" } else { "s" },
-                        failed.len(),
-                        if failed.len() == 1 { "" } else { "s" }
-                    )
-                };
-                json!({
-                    "success": success,
-                    "scope": scope,
-                    "turn_index": turn_index,
-                    "restored": restored,
-                    "failed": failed,
-                    "summary": summary,
-                })
-                .to_string()
-            }
-            other => json!({
-                "success": false,
-                "error": format!(
-                    "unknown scope `{other}`. Supported: current_turn, turn, snapshot, list"
-                ),
-            })
-            .to_string(),
-        }
+        astra_turn_core::database_snapshots::rollback_database_snapshots(
+            &self.database_snapshot_journal,
+            args,
+            self.journal_turn_index
+                .load(std::sync::atomic::Ordering::Relaxed),
+            &resolved_mo_database(None),
+            |entry, operation| self.execute_snapshot_rollback(entry, operation),
+        )
     }
 }
 
@@ -703,11 +373,12 @@ impl ToolExecutor {
 mod tests {
     use super::super::ToolExecutor;
     use super::{
-        DatabaseSnapshotRollbackJournal, extract_table_from_sql, is_valid_snapshot_name,
-        mo_create_snapshot_sql, mo_execute_sql, mo_mysql_cmd, mo_pre_state_snapshot_name,
+        DatabaseSnapshotRollbackJournal, extract_table_from_sql, mo_create_snapshot_sql,
+        mo_execute_sql, mo_mysql_cmd, mo_pre_state_snapshot_name,
         mo_query_requires_pre_state_snapshot,
     };
-    use crate::tool_safety_guard::{check_sql_safety, strip_sql_comments};
+    use crate::tool_safety_guard::check_sql_safety;
+    use astra_turn_core::database_snapshots::is_valid_snapshot_name;
     use serde_json::Value;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -833,6 +504,189 @@ mod tests {
         assert_eq!(value["entries"][0]["database"], "reporting");
         assert_eq!(value["entries"][1]["snapshot_id"], "snap_1");
         assert_eq!(value["entries"][1]["turn_index"], 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_entry_captures_batch_and_retries_only_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = env_guard();
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv(
+            ["PATH", "MATRIXONE_PASSWORD"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        let fixture = tempfile::tempdir().unwrap();
+        let mysql = fixture.path().join("mysql");
+        std::fs::write(
+            &mysql,
+            include_str!("../../../astra-turn-core/tests/fixtures/mysql_snapshot/mysql.sh"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&mysql, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(fixture.path().to_path_buf()).chain(std::env::split_paths(&path)),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("PATH", path);
+            std::env::set_var("MATRIXONE_PASSWORD", "offline-test-password");
+        }
+        let executor = ToolExecutor::new(fixture.path().to_path_buf());
+        executor
+            .journal_turn_index
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let query = "SELECT 1; UPDATE metrics SET value = 1";
+        let result = runtime.block_on(executor.execute_with_metadata(
+            "mo_query",
+            &serde_json::json!({"sql": query, "database": "test`db"}),
+        ));
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(
+            result.tool_result_fields.unwrap()["pre_state_snapshot_database"],
+            "test`db"
+        );
+        std::fs::write(fixture.path().join("fail_drop"), "").unwrap();
+        let failed: Value = serde_json::from_str(&runtime.block_on(executor.execute(
+            "rollback_database_snapshots",
+            &serde_json::json!({"scope": "current_turn"}),
+        )))
+        .unwrap();
+        assert_eq!(failed["success"], false);
+        assert_eq!(
+            executor
+                .database_snapshot_journal
+                .lock()
+                .unwrap()
+                .list()
+                .len(),
+            1
+        );
+        std::fs::remove_file(fixture.path().join("fail_drop")).unwrap();
+        let result: Value = serde_json::from_str(&runtime.block_on(executor.execute(
+            "rollback_database_snapshots",
+            &serde_json::json!({"scope": "current_turn"}),
+        )))
+        .unwrap();
+        assert_eq!(result["success"], true);
+        assert!(
+            executor
+                .database_snapshot_journal
+                .lock()
+                .unwrap()
+                .list()
+                .is_empty()
+        );
+        let sql = std::fs::read_to_string(fixture.path().join("sql.log")).unwrap();
+        let commands: Vec<_> = sql.lines().collect();
+        assert!(
+            commands
+                .iter()
+                .position(|sql| sql.starts_with("CREATE SNAPSHOT") && sql.ends_with("`test``db`"))
+                .unwrap()
+                < commands.iter().position(|sql| *sql == query).unwrap()
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|sql| sql.starts_with("RESTORE ACCOUNT"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|sql| sql.starts_with("DROP SNAPSHOT"))
+                .count(),
+            2
+        );
+        std::fs::write(fixture.path().join("fail_capture"), "").unwrap();
+        let load = "LOAD DATA INFILE 'rows.csv' INTO TABLE metrics";
+        assert!(
+            runtime
+                .block_on(
+                    executor.execute_with_metadata("mo_query", &serde_json::json!({"sql": load}))
+                )
+                .is_error
+        );
+        assert!(
+            executor
+                .database_snapshot_journal
+                .lock()
+                .unwrap()
+                .list()
+                .is_empty()
+        );
+        assert!(
+            !std::fs::read_to_string(fixture.path().join("sql.log"))
+                .unwrap()
+                .lines()
+                .any(|sql| sql == load)
+        );
+
+        let before_cancel = std::fs::read_to_string(fixture.path().join("sql.log")).unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let journal_guard = executor.database_snapshot_journal.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                started_tx.send(()).unwrap();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(executor.execute_with_metadata_cancelable(
+                    "mo_query",
+                    &serde_json::json!({"sql": query}),
+                    Some(&token),
+                ))
+            });
+            started_rx.recv().unwrap();
+            token.cancel();
+            drop(journal_guard);
+            assert!(waiter.join().unwrap().is_error);
+        });
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("sql.log")).unwrap(),
+            before_cancel
+        );
+        assert!(
+            executor
+                .database_snapshot_journal
+                .lock()
+                .unwrap()
+                .list()
+                .is_empty()
+        );
+        // Recheck cancellation in the synchronous handler after public preflight.
+        assert!(
+            executor
+                .mo_query_with_metadata(&serde_json::json!({"sql": query}), Some(&token))
+                .is_error
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("sql.log")).unwrap(),
+            before_cancel
+        );
     }
 
     // ── Parameter validation ──
@@ -1120,18 +974,6 @@ mod tests {
         assert_eq!(
             check_sql_safety("-- safe\nSELECT 1; /* comment */ ALTER TABLE t ADD c INT"),
             Some("ALTER")
-        );
-    }
-
-    #[test]
-    fn strip_sql_comments_preserves_content() {
-        assert_eq!(
-            strip_sql_comments("SELECT /* col */ name FROM t").trim(),
-            "SELECT   name FROM t"
-        );
-        assert_eq!(
-            strip_sql_comments("SELECT 1 -- inline\nFROM t").trim(),
-            "SELECT 1  FROM t"
         );
     }
 

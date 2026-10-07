@@ -234,7 +234,7 @@ mod tests {
             Ok(HostTurnResult {
                 accum: Default::default(),
                 ttft_ms: None,
-                edge_tool_round: Vec::new(),
+
                 error_kind: None,
             })
         }

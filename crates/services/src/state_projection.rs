@@ -7,7 +7,6 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::CancellationSafePoolConnection;
-use crate::context_manifest::artifact_id_from_raw_ref;
 use crate::db_row::RowExt as StateProjectionDbRow;
 
 const STATE_ITEM_ID_MAX_BYTES: usize = 128;
@@ -63,8 +62,6 @@ pub enum StateProjectionError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("invalid mutation {mutation}")]
-    InvalidMutation { mutation: String },
     #[error("invalid retry_scope for run {run_id}: {retry_scope}")]
     InvalidRetryScope { run_id: String, retry_scope: String },
     #[error("invalid database value: operation={operation}, column={column}, reason={reason}")]
@@ -87,25 +84,6 @@ pub enum StateProjectionError {
     },
     #[error("personal skill version is not activatable: version={version_id}, status={status}")]
     PersonalSkillVersionNotActivatable { version_id: String, status: String },
-}
-
-fn state_projection_session_admission_error(
-    source: sqlx::Error,
-    user_id: &str,
-    session_id: &str,
-    entity: &str,
-) -> StateProjectionError {
-    match source {
-        sqlx::Error::RowNotFound => StateProjectionError::SessionNotActive {
-            user_id: user_id.to_string(),
-            session_id: session_id.to_string(),
-        },
-        source => StateProjectionError::Database {
-            operation: "admit_state_item_session",
-            entity: entity.to_string(),
-            source,
-        },
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -139,26 +117,6 @@ impl DelegationProjectionUpsert {
             self.sibling_exposed_artifacts_json.is_some(),
         ]
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct StateItemUpsert {
-    pub item_id: Option<String>,
-    pub user_id: String,
-    pub session_id: String,
-    pub scope: String,
-    pub category: String,
-    pub item_key: String,
-    pub status: String,
-    pub priority: i32,
-    pub source: String,
-    pub provenance_event_id: Option<String>,
-    pub run_id: Option<String>,
-    pub title: Option<String>,
-    pub summary_text: Option<String>,
-    pub payload_json: serde_json::Value,
-    pub token_estimate: u32,
-    pub mutation: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -291,136 +249,6 @@ pub struct DatabaseStateProjectionStore {
 impl DatabaseStateProjectionStore {
     pub fn new(pool: SharedPool) -> Self {
         Self { pool }
-    }
-
-    pub async fn upsert_state_item(
-        &self,
-        item: StateItemUpsert,
-    ) -> Result<String, StateProjectionError> {
-        validate_state_mutation(&item.mutation)?;
-        let item_id = item
-            .item_id
-            .clone()
-            .unwrap_or_else(|| format!("state-{}-{}", item.category, Uuid::new_v4()));
-        let payload_json = serde_json::to_string(&item.payload_json).map_err(|source| {
-            StateProjectionError::Json {
-                operation: "serialize_state_item",
-                entity: item_id.clone(),
-                source,
-            }
-        })?;
-        let payload_hash = content_hash(&payload_json);
-        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
-            .await
-            .map_err(|source| StateProjectionError::Database {
-                operation: "acquire_state_item_upsert_connection",
-                entity: item_id.clone(),
-                source,
-            })?;
-        let mut tx = connection
-            .begin()
-            .await
-            .map_err(|source| StateProjectionError::Database {
-                operation: "begin_state_item_upsert",
-                entity: item_id.clone(),
-                source,
-            })?;
-        crate::storage::admit_session_event_write(&mut tx, &item.session_id, &item.user_id, false)
-            .await
-            .map_err(|source| {
-                state_projection_session_admission_error(
-                    source,
-                    &item.user_id,
-                    &item.session_id,
-                    &item_id,
-                )
-            })?;
-        sqlx::query(
-            "INSERT INTO session_state_items
-             (item_id, user_id, session_id, scope, category, item_key, status, priority, source,
-              provenance_event_id, run_id, title, summary_text, payload_json, payload_hash,
-              token_estimate, version, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(6), NOW(6))
-             ON DUPLICATE KEY UPDATE
-              status = VALUES(status), priority = VALUES(priority), source = VALUES(source),
-              provenance_event_id = VALUES(provenance_event_id), run_id = VALUES(run_id),
-              title = VALUES(title), summary_text = VALUES(summary_text),
-              payload_json = VALUES(payload_json), payload_hash = VALUES(payload_hash),
-              token_estimate = VALUES(token_estimate), version = version + 1, updated_at = NOW(6)",
-        )
-        .bind(&item_id)
-        .bind(&item.user_id)
-        .bind(&item.session_id)
-        .bind(&item.scope)
-        .bind(&item.category)
-        .bind(&item.item_key)
-        .bind(&item.status)
-        .bind(i64::from(item.priority))
-        .bind(&item.source)
-        .bind(&item.provenance_event_id)
-        .bind(&item.run_id)
-        .bind(&item.title)
-        .bind(&item.summary_text)
-        .bind(&payload_json)
-        .bind(&payload_hash)
-        .bind(i64::from(item.token_estimate))
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| StateProjectionError::Database {
-            operation: "upsert_state_item",
-            entity: item_id.clone(),
-            source,
-        })?;
-        sqlx::query(
-            "INSERT INTO session_state_item_events
-             (event_id, item_id, user_id, session_id, category, item_key, mutation, next_hash,
-              payload_json, provenance_event_id, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        )
-        .bind(new_state_item_event_id())
-        .bind(&item_id)
-        .bind(&item.user_id)
-        .bind(&item.session_id)
-        .bind(&item.category)
-        .bind(&item.item_key)
-        .bind(&item.mutation)
-        .bind(&payload_hash)
-        .bind(&payload_json)
-        .bind(&item.provenance_event_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| StateProjectionError::Database {
-            operation: "insert_state_item_event",
-            entity: item_id.clone(),
-            source,
-        })?;
-        for artifact_id in artifact_ids_from_state_payload(&item.payload_json) {
-            sqlx::query(
-                "UPDATE session_artifacts
-                 SET referenced_by_state_items_count = referenced_by_state_items_count + 1,
-                     updated_at = NOW(6)
-                 WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
-            )
-            .bind(&item.user_id)
-            .bind(&item.session_id)
-            .bind(&artifact_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|source| StateProjectionError::Database {
-                operation: "increment_state_item_artifact_ref",
-                entity: artifact_id,
-                source,
-            })?;
-        }
-        tx.commit()
-            .await
-            .map_err(|source| StateProjectionError::Database {
-                operation: "commit_state_item_upsert",
-                entity: item_id.clone(),
-                source,
-            })?;
-        connection.release();
-        Ok(item_id)
     }
 
     pub async fn upsert_delegation_projection_for_run(
@@ -973,82 +801,9 @@ fn new_state_item_event_id() -> String {
     Uuid::new_v4().to_string()
 }
 
-fn artifact_ids_from_state_payload(payload: &serde_json::Value) -> Vec<String> {
-    fn visit(value: &serde_json::Value, out: &mut Vec<String>) {
-        match value {
-            serde_json::Value::String(raw) => {
-                if let Some(artifact_id) = artifact_id_from_raw_ref(raw) {
-                    out.push(artifact_id);
-                }
-            }
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    visit(item, out);
-                }
-            }
-            serde_json::Value::Object(map) => {
-                for (key, value) in map {
-                    if matches!(
-                        key.as_str(),
-                        "artifact_id" | "source_artifact_id" | "derived_from_artifact_id"
-                    ) && let Some(raw) = value.as_str()
-                    {
-                        out.push(raw.to_string());
-                    }
-                    visit(value, out);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut ids = Vec::new();
-    visit(payload, &mut ids);
-    ids.sort();
-    ids.dedup();
-    ids
-}
-
-pub fn validate_state_mutation(mutation: &str) -> Result<(), StateProjectionError> {
-    match mutation {
-        "insert" | "update" | "replace" | "archive" | "delete" | "apply_suggestion"
-        | "activate" => Ok(()),
-        other => Err(StateProjectionError::InvalidMutation {
-            mutation: other.to_string(),
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn state_session_admission_only_reclassifies_row_not_found() {
-        let inactive = state_projection_session_admission_error(
-            sqlx::Error::RowNotFound,
-            "user-1",
-            "session-1",
-            "state-1",
-        );
-        assert!(matches!(
-            inactive,
-            StateProjectionError::SessionNotActive { .. }
-        ));
-
-        let database = state_projection_session_admission_error(
-            sqlx::Error::Protocol("database connection lost".to_string()),
-            "user-1",
-            "session-1",
-            "state-1",
-        );
-        assert!(matches!(
-            database,
-            StateProjectionError::Database {
-                operation: "admit_state_item_session",
-                ..
-            }
-        ));
-    }
 
     #[test]
     fn state_item_id_preserves_readable_identity_when_it_fits() {
@@ -1243,29 +998,6 @@ mod tests {
         assert!(!display.contains("user-sensitive"));
         assert!(!display.contains("session-sensitive"));
         assert!(!display.contains("secret-value"));
-    }
-
-    #[test]
-    fn state_mutation_validator_accepts_only_current_operations() {
-        for mutation in [
-            "insert",
-            "update",
-            "replace",
-            "archive",
-            "delete",
-            "apply_suggestion",
-            "activate",
-        ] {
-            validate_state_mutation(mutation).expect("valid mutation");
-        }
-
-        for unsupported in ["teleport", "bubble_up"] {
-            let error = validate_state_mutation(unsupported).expect_err("unsupported mutation");
-            assert!(matches!(
-                error,
-                StateProjectionError::InvalidMutation { mutation } if mutation == unsupported
-            ));
-        }
     }
 
     #[test]

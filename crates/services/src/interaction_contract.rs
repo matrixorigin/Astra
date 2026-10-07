@@ -152,15 +152,6 @@ pub fn approval_decision_status(decision: &str) -> InteractionStatus {
     }
 }
 
-pub fn ask_user_response_status(status: &str) -> InteractionStatus {
-    match normalize_status(status).as_str() {
-        "pending" | "prompted" | "waiting" => InteractionStatus::Pending,
-        "timeout" | "timed_out" | "expired" => InteractionStatus::Expired,
-        "cancelled" | "canceled" => InteractionStatus::Cancelled,
-        _ => InteractionStatus::Resolved,
-    }
-}
-
 pub fn edge_dispatch_status(status: &str, _result_json: Option<&str>) -> InteractionStatus {
     match normalize_status(status).as_str() {
         "pending" | "dispatched" => InteractionStatus::Pending,
@@ -220,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_and_user_prompt_statuses_map_to_common_contract() {
+    fn approval_statuses_map_to_common_contract() {
         assert_eq!(
             approval_decision_status("approved"),
             InteractionStatus::Resolved
@@ -232,18 +223,6 @@ mod tests {
         assert_eq!(
             approval_decision_status("timed-out"),
             InteractionStatus::Expired
-        );
-        assert_eq!(
-            ask_user_response_status("submitted"),
-            InteractionStatus::Resolved
-        );
-        assert_eq!(
-            ask_user_response_status("cancelled"),
-            InteractionStatus::Cancelled
-        );
-        assert_eq!(
-            ask_user_response_status("waiting"),
-            InteractionStatus::Pending
         );
     }
 

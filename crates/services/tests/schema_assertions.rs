@@ -69,6 +69,8 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         );
     }
     for retired in [
+        "tool_result_projection_decisions",
+        "tool_result_projection_receipts",
         "config_versions",
         "plan_step_runs",
         "work_plan_proposal_sequences",

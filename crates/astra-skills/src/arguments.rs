@@ -130,60 +130,6 @@ pub fn substitute_arguments(
     result
 }
 
-/// Parse a raw arguments string into named arguments.
-///
-/// Supports two formats:
-/// - Positional: `"value1 value2"` (matched against argument definitions by order)
-/// - Named: `"name1=value1 name2=value2"`
-pub fn parse_arguments(
-    raw: &str,
-    arg_defs: &[super::manifest::SkillArgument],
-) -> HashMap<String, String> {
-    let mut result = HashMap::new();
-    let raw = raw.trim();
-    if raw.is_empty() {
-        // Fill in defaults
-        for def in arg_defs {
-            if let Some(ref default) = def.default {
-                result.insert(def.name.clone(), default.clone());
-            }
-        }
-        return result;
-    }
-
-    // Try named format first (key=value)
-    let parts: Vec<&str> = raw.split_whitespace().collect();
-    let is_named = parts.iter().any(|p| p.contains('='));
-
-    if is_named {
-        for part in &parts {
-            if let Some(eq_pos) = part.find('=') {
-                let key = part[..eq_pos].to_string();
-                let value = part[eq_pos + 1..].to_string();
-                result.insert(key, value);
-            }
-        }
-    } else {
-        // Positional matching
-        for (i, def) in arg_defs.iter().enumerate() {
-            if i < parts.len() {
-                result.insert(def.name.clone(), parts[i].to_string());
-            }
-        }
-    }
-
-    // Fill in defaults for missing arguments
-    for def in arg_defs {
-        if !result.contains_key(&def.name)
-            && let Some(ref default) = def.default
-        {
-            result.insert(def.name.clone(), default.clone());
-        }
-    }
-
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,46 +244,5 @@ mod tests {
     #[test]
     fn shell_tokenize_empty() {
         assert_eq!(shell_tokenize(""), Vec::<String>::new());
-    }
-
-    #[test]
-    fn parse_named_args() {
-        let defs = vec![];
-        let result = parse_arguments("file=main.rs branch=develop", &defs);
-        assert_eq!(result.get("file").unwrap(), "main.rs");
-        assert_eq!(result.get("branch").unwrap(), "develop");
-    }
-
-    #[test]
-    fn parse_positional_args() {
-        let defs = vec![
-            super::super::manifest::SkillArgument {
-                name: "file".into(),
-                description: String::new(),
-                required: true,
-                default: None,
-            },
-            super::super::manifest::SkillArgument {
-                name: "branch".into(),
-                description: String::new(),
-                required: false,
-                default: Some("main".into()),
-            },
-        ];
-        let result = parse_arguments("src/lib.rs", &defs);
-        assert_eq!(result.get("file").unwrap(), "src/lib.rs");
-        assert_eq!(result.get("branch").unwrap(), "main"); // default
-    }
-
-    #[test]
-    fn parse_empty_uses_defaults() {
-        let defs = vec![super::super::manifest::SkillArgument {
-            name: "mode".into(),
-            description: String::new(),
-            required: false,
-            default: Some("fast".into()),
-        }];
-        let result = parse_arguments("", &defs);
-        assert_eq!(result.get("mode").unwrap(), "fast");
     }
 }

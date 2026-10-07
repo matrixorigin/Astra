@@ -1,8 +1,8 @@
 //! Outbound `/chat/stream` payload preparation + fetch + SSE consume.
 //!
-//! The heavy orchestrator (`run_agentic_loop_iteration`) has been replaced by
-//! the runtime's [`run_agentic_loop_with_host`]; this module now only exposes
-//! `fetch_chat_turn_sse` for use by the CLI Server-admission adapter.
+//! `fetch_chat_turn_sse` performs the single Server-owned execution exchange.
+//! Local tools return exact callbacks within that stream; the CLI does not
+//! schedule further model rounds.
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use astra_config::user_profile::{Scenario, TurnIntent, WorkspaceMutationIntent};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_runtime::{
     prompts,
@@ -33,14 +32,10 @@ use astra_runtime::{
         deferred_provider_schemas_for_names, read_git_branch_abbrev,
     },
     turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
-    turn::chat_turn_payload::{
-        ChatTurnBasePayloadInput, attach_turn_identity, chat_turn_base_payload,
-        merge_edge_profile_extensions, set_payload_tool_results_if_non_empty,
-    },
+    turn::chat_turn_payload::merge_edge_profile_extensions,
     turn::chat_turn_step_plan::record_agentic_step_plan_after_payload_prep,
     turn::prepare_turn_explain_text::restricted_tools_explain_text,
-    turn::tool_schema_prune::retain_invoked_tool_schemas,
-    turn::turn_guard::TurnGuard,
+    turn::tool_health::ToolHealthTracker,
 };
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_registry_report::ToolSelectionReport;
@@ -257,16 +252,14 @@ struct PrepareChatTurnRequest<'a> {
     message: &'a str,
     user_intent: &'a str,
     semantic_query_override: Option<&'a str>,
-    turn_intent: Option<&'a TurnIntent>,
     history: &'a [(String, String)],
     recent_tools: &'a [String],
     executor: Arc<ToolExecutor>,
 
     registry: &'a ToolRegistry,
-    tool_results: &'a [Value],
     all_schemas: &'a [Value],
     valid_tool_names: &'a mut HashSet<String>,
-    turn_guard: &'a TurnGuard,
+    tool_health: &'a ToolHealthTracker,
     restricted_tools: &'a mut HashSet<String>,
     step_recorder: &'a mut StepRecorder,
     assembly_start: Instant,
@@ -277,23 +270,11 @@ struct PrepareChatTurnRequest<'a> {
     timing_phases: bool,
     /// Normal chat: human-readable step shown after the elapsed second count on stderr.
     prep_ui_phase: Option<ChatPrepPhaseLabel>,
-    /// Effort level override from skill activation.
-    skill_effort: Option<String>,
-    /// Agent type hint from skill activation.
-    skill_agent_type: Option<String>,
     interaction_mode: TurnInteractionMode,
     turn_policy: &'a mut TurnInteractionPolicy,
-    /// Skill-scoped tool allowlist — tools the active skill declared as needed.
-    /// After the tool surface includes tools, any allowed tools it missed are force-injected.
-    skill_allowed_tools: Option<Vec<String>>,
-    /// Current agentic loop round (0-based). Sent to bridge for tool round directives.
-    round_index: u32,
     /// Authoritative visible-turn number from the outer loop.
     session_turn: u32,
     /// Stable bridge turn-chain id reused across retries within the same visible turn.
-    turn_chain_id: Option<&'a str>,
-    /// Stable root user-query event id reused across retries within the same visible turn.
-    user_query_event_id: Option<&'a str>,
     /// Snapshot of session-wide denial pressure (current, max_total) taken at
     /// call time. Published to the observability session so SelfModel can
     /// render it in the system prompt.
@@ -395,7 +376,6 @@ fn tool_surface_should_inject(
     surface_report: &ToolSelectionReport,
     had_tools_before_runtime_filter: bool,
     has_recent_tools: bool,
-    has_tool_results: bool,
     plan_mode_active: bool,
 ) -> (bool, &'static str) {
     if !turn_schemas.is_empty() {
@@ -409,9 +389,6 @@ fn tool_surface_should_inject(
     }
     if has_recent_tools {
         return (true, "recent_tool_context");
-    }
-    if has_tool_results {
-        return (true, "tool_results_followup");
     }
     if plan_mode_active {
         return (true, "plan_mode_active");
@@ -438,10 +415,6 @@ fn chat_turn_budget_pressure(
 struct PreparedChatTurnPayload {
     payload: Value,
     context_window_estimate: astra_turn_types::ContextWindowUsage,
-    /// Exact token cost of the schemas actually sent in this request. The
-    /// loop carries it into the next compaction decision, including deferred
-    /// schemas materialized from retained conversation context.
-    pinned_tool_schema_tokens: u64,
 }
 
 impl std::fmt::Display for PreparedChatTurnPayload {
@@ -463,91 +436,86 @@ impl Deref for PreparedChatTurnPayload {
 /// turn identity deliberately do not cross this boundary: the Server restores
 /// and advances those authorities itself.
 pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
-    prepared: &Value,
+    mut prepared: Value,
     message: &str,
     explain: bool,
     execution_time_budget: Option<astra_services::runs::ExecutionTimeBudget>,
 ) -> Result<Value, &'static str> {
     let source = prepared
-        .as_object()
-        .ok_or("prepared developer loop payload must be an object")?;
-    let required = |field: &'static str| {
-        source
-            .get(field)
-            .cloned()
-            .ok_or("prepared developer loop payload is missing a required field")
-    };
-    let mut context = serde_json::Map::new();
-    if let Some(value) = source.get("edge_tools") {
-        context.insert("edge_tools".to_string(), value.clone());
-    }
-    if let Some(value) = source.get("edge_profile") {
-        context.insert("edge_profile".to_string(), value.clone());
-    }
-    if let Some(value) = source.get("edge_skills") {
-        context.insert("edge_skills".to_string(), value.clone());
-    }
+        .as_object_mut()
+        .ok_or("client admission facts must be an object")?;
+    let model_selection = source
+        .remove("model_selection")
+        .ok_or("client admission facts are missing a required field")?;
+    let capabilities = source
+        .remove("capabilities")
+        .ok_or("client admission facts are missing a required field")?;
 
-    // `/chat/stream` is an active CLI-to-Server execution channel, not an
-    // offline registration hint. Project that fact into the typed execution
-    // binding contract so prompt admission, dispatch, child inheritance, and
-    // observability all resolve the same provider.
+    // The active CLI transport explicitly binds the workspace and executor.
+    // Only the selected Edge boundary has access to the local filesystem.
     let edge_executor_id = source
         .get("edge_executor_id")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or("prepared developer loop payload has no executable edge identity")?;
+        .ok_or("client admission facts have no executable edge identity")?
+        .to_string();
     let edge_profile = source
         .get("edge_profile")
         .and_then(Value::as_object)
-        .ok_or("prepared developer loop payload has no edge workspace profile")?;
+        .ok_or("client admission facts have no edge workspace profile")?;
     let workspace_root = edge_profile
         .get("cwd")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or("prepared developer loop payload has no edge workspace root")?;
+        .ok_or("client admission facts have no edge workspace root")?
+        .to_string();
     let workspace_display_name = edge_profile
         .get("display_name")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("CLI workspace");
+        .unwrap_or("CLI workspace")
+        .to_string();
     let workspace_authority = match edge_profile.get("authority") {
         None => "read_write",
         Some(Value::String(authority)) if authority == "read_only" => "read_only",
         Some(Value::String(authority)) if authority == "read_write" => "read_write",
         Some(Value::String(authority)) if authority == "none" => "none",
-        Some(_) => return Err("prepared developer loop payload has invalid workspace authority"),
-    };
+        Some(_) => return Err("client admission facts have invalid workspace authority"),
+    }
+    .to_string();
+    let mut context = serde_json::Map::new();
     for field in [
+        "edge_tools",
+        "edge_profile",
+        "edge_skills",
         "thinking",
-        "effort",
-        "agent_type",
         "rollback_on_failure",
         "rollback_boundary",
     ] {
-        if let Some(value) = source.get(field) {
-            context.insert(field.to_string(), value.clone());
+        if let Some(value) = source.remove(field) {
+            context.insert(field.to_string(), value);
         }
     }
-    if let Some(value) = source
-        .get("context")
-        .and_then(|context| context.get(astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY))
+    if let Some(mut extra) = source.remove("context")
+        && let Some(value) = extra.as_object_mut().and_then(|context| {
+            context.remove(astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY)
+        })
     {
         context.insert(
             astra_turn_types::DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY.to_string(),
-            value.clone(),
+            value,
         );
     }
 
     let mut request = serde_json::Map::from_iter([
         ("message".to_string(), Value::String(message.to_string())),
-        ("model_selection".to_string(), required("model_selection")?),
+        ("model_selection".to_string(), model_selection),
         (
             "edge_executor_id".to_string(),
-            Value::String(edge_executor_id.to_string()),
+            Value::String(edge_executor_id.clone()),
         ),
         (
             "workspace_binding".to_string(),
@@ -569,7 +537,7 @@ pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
                 "status": "online",
             }),
         ),
-        ("capabilities".to_string(), required("capabilities")?),
+        ("capabilities".to_string(), capabilities),
         ("explain".to_string(), Value::Bool(explain)),
         ("interactive_client".to_string(), Value::Bool(true)),
         (
@@ -595,8 +563,8 @@ pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
         "requested_model_policy",
         "agent_profile_selection",
     ] {
-        if let Some(value) = source.get(field) {
-            request.insert(field.to_string(), value.clone());
+        if let Some(value) = source.remove(field) {
+            request.insert(field.to_string(), value);
         }
     }
     if let Some(execution_time_budget) = execution_time_budget {
@@ -693,13 +661,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     let thinking_config = match requested_model.filter(|_| !profile_default) {
         Some(m) => {
             let (_, cfg) = astra_turn_core::thinking_config::resolve_model_thinking_request(m);
-            // Per-turn dampener: the model suffix encodes the user's CEILING
-            // (e.g. `thinking:high`), not a command to burn that budget on every
-            // turn regardless of content. Short read-only questions get a
-            // capped effort — multi-step / modification turns pass through
-            // unchanged. See `ThinkingConfig::scale_for_turn` for the policy.
-            let signals = thinking_complexity_signals(ctx.message, ctx.turn_intent);
-            cfg.scale_for_turn(signals)
+            cfg
         }
         None => astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
     };
@@ -708,24 +670,25 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         &prompt_messages,
     );
     let edge_executor_id = edge_executor_instance_id();
-    let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
-        messages: &prompt_messages,
-        user_intent: Some(ctx.user_intent),
-        session_id: ctx.current_session_id,
-        agent_id: Some("astra-cli"),
-        inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-        round_index: ctx.round_index,
-        offering_id: ctx.offering_id,
-        expected_model_name: None,
-        interaction_mode: Some(ctx.interaction_mode.label()),
-        explain_verbose: ctx.explain.explain_verbose,
-        explain_on: ctx.explain.explain_on,
-        edge_executor_id,
-        capabilities: astra_thin_client::builtin_capability_preset(),
-        project_root: ctx.project_root,
-        git_branch,
-        thinking: thinking_config.clone(),
+    // Prepare only client-owned admission facts. Model messages and turn
+    // identities are restored and advanced by the Server.
+    let mut payload = json!({
+        "user_intent": ctx.user_intent,
+        "session_id": ctx.current_session_id,
+        "agent_id": "astra-cli",
+        "interaction_mode": ctx.interaction_mode.label(),
+        "edge_executor_id": edge_executor_id,
+        "capabilities": astra_thin_client::builtin_capability_preset(),
+        "edge_profile": astra_turn_core::chat_turn_edge_profile::build_base_edge_profile_value(
+            ctx.project_root.to_string_lossy().as_ref(),
+            git_branch,
+            astra_turn_core::edge_prompt_context::detect_workspace_context(ctx.project_root),
+        ),
+        "thinking": thinking_config.to_payload_value(),
     });
+    if let Some(offering_id) = ctx.offering_id {
+        payload["model_selection"] = json!({"offering_id": offering_id});
+    }
     payload["requested_model_policy"] =
         serde_json::to_value(requested_model_policy).expect("model policy serializes");
     if let Some(selection) = profile_selection {
@@ -812,65 +775,34 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
 
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Preparing tools…");
 
-    let judged_domain_hints = ctx
-        .turn_intent
-        .and_then(|intent| intent.domain)
-        .map(|domain| vec![domain.as_str().to_string()])
-        .unwrap_or_default();
     ctx.step_recorder
-        .record_perceive(semantic_query_str, &[], &judged_domain_hints);
+        .record_perceive(semantic_query_str, &[], &[]);
 
     // Skill activation is handled exclusively by the `skill` tool in the agentic loop
     // (see turn/skill_tool.rs + partition_and_execute_skills). The model decides when
     // to invoke skills by calling the tool, rather than having skills pre-injected by
     // the tool surface builder.
 
-    let typed_tool_surface_allowed = match ctx.turn_intent {
-        Some(intent) => intent.communicative_act.uses_tool_surface(),
-        None => true,
-    };
     let (turn_schemas, surface_report, surface_latency_ms) = {
         let sel_start = Instant::now();
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
         let budget = ctx.registry.default_schema_budget();
-        let (mut schemas, mut report) = ctx
-            .registry
-            .build_turn_surface_with_report(ctx.turn_intent, budget);
-        if typed_tool_surface_allowed && !ctx.tool_results.is_empty() {
-            let previous_visible_schemas = ctx.executor.current_visible_tool_schemas_snapshot();
-            retain_invoked_tool_schemas(
-                &mut schemas,
-                &mut report,
-                ctx.tool_results,
-                &previous_visible_schemas,
-            );
-        }
+        let (schemas, report) = ctx.registry.build_turn_surface_with_report(None, budget);
         let sel_latency_ms = sel_start.elapsed().as_millis() as u64;
         (schemas, report, sel_latency_ms)
     };
     log_chat_turn_timing_phase(timing, "registry_load_schemas", &mut mark);
 
-    // Force-inject any skill allowed_tools that the assembled surface missed.
     let mut turn_schemas = turn_schemas;
     let mut surface_report = surface_report;
-    if typed_tool_surface_allowed {
-        if let Some(ref allowed) = ctx.skill_allowed_tools {
-            astra_turn_core::tool_schema_prune::inject_skill_allowed_tools(
-                &mut turn_schemas,
-                &mut surface_report,
-                allowed,
-                ctx.all_schemas,
-            );
-        }
-        if let Some(required) = ctx.executor.take_pending_round_tool_boost() {
-            let required_refs: Vec<&str> = required.iter().map(String::as_str).collect();
-            astra_turn_core::tool_schema_prune::inject_required_tool_names(
-                &mut turn_schemas,
-                &mut surface_report,
-                &required_refs,
-                ctx.all_schemas,
-            );
-        }
+    if let Some(required) = ctx.executor.take_pending_round_tool_boost() {
+        let required_refs: Vec<&str> = required.iter().map(String::as_str).collect();
+        astra_turn_core::tool_schema_prune::inject_required_tool_names(
+            &mut turn_schemas,
+            &mut surface_report,
+            &required_refs,
+            ctx.all_schemas,
+        );
     }
     let had_tools_before_runtime_filter = runtime_filter_turn_schemas_and_report(
         ctx.executor.as_ref(),
@@ -884,18 +816,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     // never consumed. See test
     // `surface_report_from_visible_schemas_is_single_source_for_budget`.
 
-    let (inject_tools, surface_reason) = if typed_tool_surface_allowed {
-        tool_surface_should_inject(
-            &turn_schemas,
-            &surface_report,
-            had_tools_before_runtime_filter,
-            !ctx.recent_tools.is_empty(),
-            !ctx.tool_results.is_empty(),
-            ctx.plan_mode_active,
-        )
-    } else {
-        (false, "typed_non_work_act")
-    };
+    let (inject_tools, surface_reason) = tool_surface_should_inject(
+        &turn_schemas,
+        &surface_report,
+        had_tools_before_runtime_filter,
+        !ctx.recent_tools.is_empty(),
+        ctx.plan_mode_active,
+    );
     tracing::trace!(
         target: "astra.tool_surface",
         reason = surface_reason,
@@ -1129,7 +1056,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             eprintln!("{}", restricted_line.as_str().dim());
         }
     }
-    set_payload_tool_results_if_non_empty(&mut payload, ctx.tool_results);
 
     record_agentic_step_plan_after_payload_prep(
         ctx.step_recorder,
@@ -1139,19 +1065,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
 
     record_first_latency_ms_since(ctx.telem.first_context_assembly_ms, ctx.assembly_start);
 
-    inject_runtime_turn_overrides(
-        &mut payload,
-        ctx.is_plan_subtask,
-        ctx.plan_subtask_id,
-        ctx.skill_effort.as_deref(),
-        ctx.skill_agent_type.as_deref(),
-    );
-    let _ = attach_turn_identity(
-        &mut payload,
-        ctx.session_turn,
-        ctx.turn_chain_id,
-        ctx.user_query_event_id,
-    );
+    inject_runtime_turn_overrides(&mut payload, ctx.is_plan_subtask, ctx.plan_subtask_id);
     // ─── SelfModel: inject self-awareness text into edge_profile ───
     // Publish fresh denial-pressure + per-tool outcome bias + recent
     // rejections to the observability session so SelfModel can render the
@@ -1162,8 +1076,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             String,
             astra_turn_core::tool_health::OutcomeBiasEntry,
         > = ctx
-            .turn_guard
-            .health
+            .tool_health
             .outcome_bias_by_tool(3600)
             .into_iter()
             .filter(|(_, e)| e.score.abs() >= 0.005)
@@ -1193,7 +1106,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             // reachable here; for now we mirror `all_selected_skills` which
             // tracks skills actually chosen this session.
             let skills = ctx.telem.all_selected_skills.clone();
-            let tool_health_entries = ctx.turn_guard.health.export();
+            let tool_health_entries = ctx.tool_health.export();
             let scenario = session.current_scenario();
             let recent_signals = ctx
                 .observability_hub
@@ -1330,30 +1243,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             u64::from(estimated_total),
             u64::from(max_tokens),
         ),
-        pinned_tool_schema_tokens: visible_tool_tokens_total_u64,
-    }
-}
-
-fn thinking_complexity_signals(
-    message: &str,
-    turn_intent: Option<&TurnIntent>,
-) -> astra_turn_core::thinking_config::TurnComplexitySignals {
-    let typed_lightweight = turn_intent.is_some_and(|intent| {
-        intent.workspace_mutation == WorkspaceMutationIntent::ReadOnly
-            && intent.requested_scenario == Some(Scenario::QuickAnswer)
-    });
-    let continues_current_objective = turn_intent.is_some_and(|intent| {
-        matches!(
-            intent.objective_relation,
-            astra_turn_types::ObjectiveRelation::Continue
-                | astra_turn_types::ObjectiveRelation::Refine
-                | astra_turn_types::ObjectiveRelation::Correct
-        )
-    });
-    astra_turn_core::thinking_config::TurnComplexitySignals {
-        input_char_len: message.trim().chars().count(),
-        typed_lightweight,
-        continues_current_objective,
     }
 }
 
@@ -1361,8 +1250,6 @@ fn inject_runtime_turn_overrides(
     payload: &mut Value,
     is_plan_subtask: bool,
     plan_subtask_id: Option<&str>,
-    skill_effort: Option<&str>,
-    skill_agent_type: Option<&str>,
 ) {
     let Some(root) = payload.as_object_mut() else {
         return;
@@ -1375,12 +1262,6 @@ fn inject_runtime_turn_overrides(
     }
     if let Some(id) = plan_subtask_id.map(str::trim).filter(|s| !s.is_empty()) {
         root.insert("plan_subtask_id".into(), json!(id));
-    }
-    if let Some(effort) = skill_effort {
-        root.insert("effort".into(), json!(effort));
-    }
-    if let Some(agent_type) = skill_agent_type {
-        root.insert("agent_type".into(), json!(agent_type));
     }
 }
 
@@ -1406,7 +1287,6 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub message: &'a str,
     pub user_intent: &'a str,
     pub semantic_query_override: Option<&'a str>,
-    pub turn_intent: Option<&'a TurnIntent>,
     pub history: &'a [(String, String)],
     pub recent_tools: &'a [String],
     pub project_root: &'a Path,
@@ -1425,17 +1305,12 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// (e.g., skill listing). Not stored in conversation history.
     pub ephemeral_prefix: Option<&'a Value>,
     pub current_session_id: Option<&'a str>,
-    pub tool_results: &'a [Value],
     pub all_schemas: &'a [Value],
     /// Tool names admitted by the headless validator for the current LLM
     /// round. This is overwritten during payload preparation from the final
     /// `edge_tools` actually sent to the model.
     pub valid_tool_names: &'a mut HashSet<String>,
-    /// Exact schema footprint from the last outbound payload. Updated after
-    /// preparing this request so the next loop iteration compacts against the
-    /// same tool surface that the model actually saw.
-    pub pinned_tool_schema_tokens: &'a mut u64,
-    pub turn_guard: &'a astra_turn_core::turn_guard::TurnGuard,
+    pub tool_health: &'a astra_turn_core::tool_health::ToolHealthTracker,
     pub restricted_tools: &'a mut HashSet<String>,
     pub step_recorder: &'a mut StepRecorder,
     pub assembly_start: Instant,
@@ -1461,25 +1336,11 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub ask_user_request_tx: Option<crate::cli::chat_stream::AskUserRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls.
     pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
-    /// Effort level override from skill activation.
-    pub skill_effort: Option<String>,
-    /// Agent type hint from skill activation.
-    pub skill_agent_type: Option<String>,
     pub interaction_mode: TurnInteractionMode,
     pub turn_policy: &'a mut TurnInteractionPolicy,
-    /// Skill-scoped tool allowlist — tools the active skill declared as needed.
-    /// After the tool surface includes tools, any allowed tools it missed are force-injected.
-    pub skill_allowed_tools: Option<Vec<String>>,
-    /// When true, this is a continuation turn after a skill has already produced output.
-    /// Propagated to `EdgeSseContext` to buffer text and suppress thinking previews.
-    pub skill_continuation: bool,
     /// Cross-turn tool output cache retained by the CLI admission adapter.
     pub tool_cache: &'a mut crate::cli::stream::stream_render::EdgeToolCache,
-    /// Current agentic loop round (0-based). Sent to bridge for tool round directives.
-    pub round_index: u32,
     pub session_turn: u32,
-    pub turn_chain_id: Option<&'a str>,
-    pub user_query_event_id: Option<&'a str>,
     /// Optional shared observability hub for reading recent feedback signals
     /// window when publishing SelfModel inputs. Threaded through so the
     /// per-turn ingest can attach `recent_signals` to the session without
@@ -1553,7 +1414,6 @@ async fn chat_turn_post_payload_after_prepare(
     (
         astra_thin_client::HttpResponse,
         ChatTurnPrepLineGuard,
-        u64,
         Option<crate::cli::stream::stream_json::StreamJsonExchange>,
     ),
     String,
@@ -1573,17 +1433,13 @@ async fn chat_turn_post_payload_after_prepare(
     // request. A missing persisted materialization is an actionable local
     // setup error; never silently replace it with a process-scoped identity.
     try_edge_executor_instance_id()?;
-    let (current_session_id, session_turn, round_index) = (
-        prepare.current_session_id,
-        prepare.session_turn,
-        prepare.round_index,
-    );
+    let (current_session_id, session_turn) = (prepare.current_session_id, prepare.session_turn);
     let server_message = prepare.message.to_string();
     let server_explain = prepare.explain.explain_on || prepare.explain.explain_verbose;
     let prepared = prepare_chat_turn_payload(prepare).await;
     let execution_time_budget = execution_time_budget_clock.map(|budget| budget.remaining());
     let server_payload = server_loop_admission_payload_with_execution_time_budget(
-        &prepared.payload,
+        prepared.payload,
         &server_message,
         server_explain,
         execution_time_budget,
@@ -1605,9 +1461,7 @@ async fn chat_turn_post_payload_after_prepare(
     // non-success status, this observer is dropped without an
     // `exchange_finished`; only a protocol `[DONE]` can close it.
     let stream_json_exchange = match stream_json_emitter {
-        Some(emitter) => {
-            Some(emitter.start_exchange(current_session_id, session_turn, round_index)?)
-        }
+        Some(emitter) => Some(emitter.start_exchange(current_session_id, session_turn, 0)?),
         None => None,
     };
     let http_mark = Instant::now();
@@ -1663,12 +1517,7 @@ async fn chat_turn_post_payload_after_prepare(
             .dim()
         );
     }
-    Ok((
-        resp,
-        prep_line,
-        prepared.pinned_tool_schema_tokens,
-        stream_json_exchange,
-    ))
+    Ok((resp, prep_line, stream_json_exchange))
 }
 
 pub(crate) async fn fetch_chat_turn_sse(
@@ -1690,7 +1539,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         render_policy,
         message,
         user_intent,
-        turn_intent,
         history,
         recent_tools,
         project_root,
@@ -1702,11 +1550,9 @@ pub(crate) async fn fetch_chat_turn_sse(
         runtime_volatile_injections,
         ephemeral_prefix,
         current_session_id,
-        tool_results,
         all_schemas,
         valid_tool_names,
-        pinned_tool_schema_tokens,
-        turn_guard,
+        tool_health,
         restricted_tools,
         step_recorder,
         assembly_start,
@@ -1722,17 +1568,10 @@ pub(crate) async fn fetch_chat_turn_sse(
         approval_request_tx,
         ask_user_request_tx,
         skill_resolver,
-        skill_effort,
-        skill_agent_type,
         interaction_mode,
         turn_policy,
-        skill_allowed_tools,
-        skill_continuation,
         tool_cache,
-        round_index,
         session_turn,
-        turn_chain_id,
-        user_query_event_id,
         observability_hub,
         incremental_state,
         request_session_execution_lease,
@@ -1763,7 +1602,7 @@ pub(crate) async fn fetch_chat_turn_sse(
     };
     let lessons_text_ref: Option<&str> = lessons_text.as_deref();
 
-    let (resp, prep_line, prepared_schema_tokens, stream_json_exchange) =
+    let (resp, prep_line, stream_json_exchange) =
         chat_turn_post_payload_after_prepare(ChatTurnPostPayloadRequest {
             api,
             token,
@@ -1794,15 +1633,13 @@ pub(crate) async fn fetch_chat_turn_sse(
                 message,
                 user_intent,
                 semantic_query_override,
-                turn_intent,
                 history,
                 recent_tools,
                 executor: Arc::clone(&executor),
                 registry,
-                tool_results,
                 all_schemas,
                 valid_tool_names,
-                turn_guard,
+                tool_health,
                 restricted_tools,
                 step_recorder,
                 assembly_start,
@@ -1811,15 +1648,9 @@ pub(crate) async fn fetch_chat_turn_sse(
                 plan_subtask_id,
                 timing_phases: ui.timing,
                 prep_ui_phase: ui.prep_ui_phase.clone(),
-                skill_effort,
-                skill_agent_type,
                 interaction_mode,
                 turn_policy,
-                skill_allowed_tools,
-                round_index,
                 session_turn,
-                turn_chain_id,
-                user_query_event_id,
                 denial_pressure: perm_manager.denial_pressure(),
                 recent_rejections: perm_manager.recent_rejections(),
                 observability_hub,
@@ -1830,8 +1661,6 @@ pub(crate) async fn fetch_chat_turn_sse(
             },
         })
         .await?;
-
-    *pinned_tool_schema_tokens = prepared_schema_tokens;
 
     let status = resp.status();
     if !status.is_success() {
@@ -1863,7 +1692,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         approval_request_tx,
         ask_user_request_tx,
         skill_resolver,
-        skill_continuation,
         turn_rollback_on_failure: is_plan_subtask,
         tool_cache,
         incremental_state: incremental_state.clone(),
@@ -1910,18 +1738,16 @@ mod tests {
         msg_content, prepare_chat_turn_payload, retained_history_messages,
         runtime_filter_turn_schemas_and_report,
         server_loop_admission_payload_with_execution_time_budget,
-        surface_report_from_visible_schemas, thinking_complexity_signals,
+        surface_report_from_visible_schemas,
     };
-    use astra_config::user_profile::{Scenario, TurnIntent, WorkspaceMutationIntent};
     use astra_runtime::turn::agentic_loop::host::{
         ASK_USER_TOOL_NAME, TurnInteractionMode, VolatileInjection,
     };
     use astra_turn_core::chat_history_openai::merge_skill_names_track;
     use astra_turn_core::chat_turn_edge_profile::{
         EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
-        EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS, EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
-        EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS, EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS,
-        EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
+        EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS, EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
+        EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS, EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
     };
 
     #[test]
@@ -1980,7 +1806,7 @@ mod tests {
         });
 
         let admitted = server_loop_admission_payload_with_execution_time_budget(
-            &prepared,
+            prepared.clone(),
             "current request",
             true,
             None,
@@ -2048,7 +1874,7 @@ mod tests {
         });
 
         let admitted = server_loop_admission_payload_with_execution_time_budget(
-            &prepared,
+            prepared.clone(),
             "request",
             false,
             Some(astra_services::runs::ExecutionTimeBudget {
@@ -2100,7 +1926,7 @@ mod tests {
         });
 
         let admitted = server_loop_admission_payload_with_execution_time_budget(
-            &prepared,
+            prepared.clone(),
             "child request",
             false,
             None,
@@ -2120,7 +1946,7 @@ mod tests {
     #[test]
     fn server_loop_admission_fails_closed_without_execution_binding() {
         let error = server_loop_admission_payload_with_execution_time_budget(
-            &json!({
+            json!({
                 "model_selection": {"offering_id": "deepseek-flash"},
                 "capabilities": []
             }),
@@ -2131,14 +1957,14 @@ mod tests {
         .expect_err("missing edge executor must fail before transport");
         assert_eq!(
             error,
-            "prepared developer loop payload has no executable edge identity"
+            "client admission facts have no executable edge identity"
         );
     }
 
     #[test]
     fn server_loop_admission_rejects_identity_without_workspace() {
         let error = server_loop_admission_payload_with_execution_time_budget(
-            &json!({
+            json!({
                 "model_selection": {"offering_id": "deepseek-flash"},
                 "edge_executor_id": "edge-1",
                 "capabilities": [],
@@ -2150,16 +1976,13 @@ mod tests {
         )
         .expect_err("an executor identity without an executable workspace must fail closed");
 
-        assert_eq!(
-            error,
-            "prepared developer loop payload has no edge workspace root"
-        );
+        assert_eq!(error, "client admission facts have no edge workspace root");
     }
 
     #[test]
     fn server_loop_admission_never_widens_invalid_workspace_authority() {
         let error = server_loop_admission_payload_with_execution_time_budget(
-            &json!({
+            json!({
                 "model_selection": {"offering_id": "deepseek-flash"},
                 "edge_executor_id": "edge-1",
                 "capabilities": [],
@@ -2173,10 +1996,9 @@ mod tests {
 
         assert_eq!(
             error,
-            "prepared developer loop payload has invalid workspace authority"
+            "client admission facts have invalid workspace authority"
         );
     }
-    use astra_turn_core::chat_turn_payload::attach_turn_identity;
     use serde_json::{Value, json};
 
     #[test]
@@ -2194,33 +2016,6 @@ mod tests {
             ThinkingConfig::Adaptive {
                 effort: astra_turn_core::thinking_config::ThinkingEffort::High,
             }
-        );
-    }
-
-    #[test]
-    fn thinking_complexity_consumes_typed_llm_intent_without_text_matching() {
-        let unjudged = thinking_complexity_signals("fix implement 修复 为什么", None);
-        assert!(!unjudged.typed_lightweight);
-        assert!(!unjudged.continues_current_objective);
-
-        let quick_answer = TurnIntent::default()
-            .with_requested_scenario(Scenario::QuickAnswer)
-            .with_workspace_mutation(WorkspaceMutationIntent::ReadOnly);
-        let judged = thinking_complexity_signals("arbitrary wording", Some(&quick_answer));
-        assert!(judged.typed_lightweight);
-        assert!(!judged.continues_current_objective);
-
-        let continuation = quick_answer
-            .clone()
-            .with_objective_relation(astra_turn_types::ObjectiveRelation::Continue);
-        let continued = thinking_complexity_signals("unrelated wording", Some(&continuation));
-        assert!(continued.typed_lightweight);
-        assert!(continued.continues_current_objective);
-
-        let mutating = quick_answer.with_workspace_mutation(WorkspaceMutationIntent::MustMutate);
-        assert!(
-            !thinking_complexity_signals("why?", Some(&mutating)).typed_lightweight,
-            "typed mutation intent must override a quick-answer scenario"
         );
     }
 
@@ -2288,7 +2083,6 @@ mod tests {
         reasoning: Option<(
             &str,
             &str,
-            &TurnIntent,
             Option<&crate::cli::cli_config::cli_context::CliContext>,
         )>,
     ) -> (
@@ -2301,20 +2095,21 @@ mod tests {
             tool_registry::ToolRegistry,
             turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
         };
-        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use astra_turn_core::{
+            interaction_types::TurnInteractionPolicy, tool_health::ToolHealthTracker,
+        };
         use std::{collections::HashSet, sync::Arc, time::Instant};
 
         let temp_dir = tempfile::tempdir().unwrap();
         let all_schemas: Vec<Value> = Vec::new();
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(100);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
-        let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
-        let turn_guard = TurnGuard::default();
+        let tool_health = ToolHealthTracker::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
@@ -2322,7 +2117,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let prepared = prepare_chat_turn_payload(PrepareChatTurnRequest {
-            cli_context: reasoning.and_then(|(_, _, _, context)| context),
+            cli_context: reasoning.and_then(|(_, _, context)| context),
             tool_surface_config: &Default::default(),
             messages: &messages,
             runtime_required_texts,
@@ -2330,8 +2125,8 @@ mod tests {
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
-            offering_id: reasoning.map(|(offering, _, _, _)| offering),
-            model: reasoning.map(|(_, model, _, _)| model),
+            offering_id: reasoning.map(|(offering, _, _)| offering),
+            model: reasoning.map(|(_, model, _)| model),
             context_window_tokens: 200_000,
             effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
@@ -2339,15 +2134,13 @@ mod tests {
             message,
             user_intent: semantic_query_override.unwrap_or(message),
             semantic_query_override,
-            turn_intent: reasoning.map(|(_, _, intent, _)| intent),
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
             registry: &registry,
-            tool_results: &tool_results,
             all_schemas: &all_schemas,
             valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
+            tool_health: &tool_health,
             restricted_tools: &mut restricted_tools,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
@@ -2362,15 +2155,9 @@ mod tests {
             plan_subtask_id: None,
             timing_phases: false,
             prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
             session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
             denial_pressure: (0, 0),
             recent_rejections: Vec::new(),
             observability_hub: None,
@@ -2385,16 +2172,13 @@ mod tests {
     #[tokio::test]
     async fn prepare_chat_turn_payload_publishes_effective_parent_reasoning() {
         use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
-        let intent = TurnIntent::default()
-            .with_requested_scenario(Scenario::QuickAnswer)
-            .with_workspace_mutation(WorkspaceMutationIntent::ReadOnly);
         let (payload, parent) = prepare_payload_with_reasoning_for_test(
             vec![json!({"role":"user", "content":"Explain this."})],
             &[],
             &[],
             "Explain this.",
             None,
-            Some(("offer-parent", "model-a(thinking:high)", &intent, None)),
+            Some(("offer-parent", "model-a(thinking:high)", None)),
         )
         .await;
         let parent = parent.unwrap();
@@ -2402,7 +2186,7 @@ mod tests {
         assert_eq!(
             parent.thinking,
             ThinkingConfig::Adaptive {
-                effort: ThinkingEffort::Medium
+                effort: ThinkingEffort::High
             }
         );
         assert_eq!(
@@ -2432,7 +2216,7 @@ mod tests {
             (
                 Some("model-a(thinking:high)"),
                 ThinkingConfig::Adaptive {
-                    effort: ThinkingEffort::Medium,
+                    effort: ThinkingEffort::High,
                 },
             ),
             (Some("model-a(thinking:off)"), ThinkingConfig::Off),
@@ -2452,13 +2236,12 @@ mod tests {
                 Some((
                     "offer-parent",
                     explicit.unwrap_or("model-a(thinking:high)"),
-                    &intent,
                     Some(&context),
                 )),
             )
             .await;
             let admitted = server_loop_admission_payload_with_execution_time_budget(
-                &payload,
+                payload.clone(),
                 "Explain this.",
                 false,
                 None,
@@ -2492,16 +2275,11 @@ mod tests {
                     &[],
                     "Explain this.",
                     None,
-                    Some((
-                        "offer-parent",
-                        "model-a(thinking:high)",
-                        &intent,
-                        Some(&context),
-                    )),
+                    Some(("offer-parent", "model-a(thinking:high)", Some(&context))),
                 )
                 .await;
                 let admitted = server_loop_admission_payload_with_execution_time_budget(
-                    &payload,
+                    payload,
                     "Explain this.",
                     false,
                     None,
@@ -2539,11 +2317,7 @@ mod tests {
                 .is_none(),
             "ordinary user turns with runtime context must remain user turns"
         );
-        let messages = serde_json::to_string(&payload["messages"]).unwrap();
-        assert!(messages.contains("continue"));
-        assert!(!messages.contains("Resume the interrupted turn"));
-        assert!(!messages.contains("Background task completed"));
-        assert!(!messages.contains("<system-reminder>"));
+        assert!(payload.get("messages").is_none());
     }
 
     #[tokio::test]
@@ -2608,7 +2382,7 @@ mod tests {
                 turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
             };
             use astra_turn_core::{
-                interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard,
+                interaction_types::TurnInteractionPolicy, tool_health::ToolHealthTracker,
             };
             use std::{collections::HashSet, sync::Arc, time::Instant};
 
@@ -2616,13 +2390,12 @@ mod tests {
             let all_schemas: Vec<Value> = Vec::new();
             let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(100);
             let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
-            let tool_results = Vec::new();
             let history: Vec<(String, String)> = Vec::new();
             let recent_tools: Vec<String> = Vec::new();
             let mut restricted_tools = HashSet::new();
             let mut valid_tool_names = HashSet::new();
             let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
-            let turn_guard = TurnGuard::default();
+            let tool_health = ToolHealthTracker::default();
             let mut turn_policy = TurnInteractionPolicy::default();
             let mut first_selection_report = None;
             let mut first_budget_pressure = 0.0;
@@ -2647,15 +2420,13 @@ mod tests {
                 message: "continue",
                 user_intent: "continue",
                 semantic_query_override: None,
-                turn_intent: None,
                 history: &history,
                 recent_tools: &recent_tools,
                 executor,
                 registry: &registry,
-                tool_results: &tool_results,
                 all_schemas: &all_schemas,
                 valid_tool_names: &mut valid_tool_names,
-                turn_guard: &turn_guard,
+                tool_health: &tool_health,
                 restricted_tools: &mut restricted_tools,
                 step_recorder: &mut step_recorder,
                 assembly_start: Instant::now(),
@@ -2670,15 +2441,9 @@ mod tests {
                 plan_subtask_id: None,
                 timing_phases: false,
                 prep_ui_phase: None,
-                skill_effort: None,
-                skill_agent_type: None,
                 interaction_mode: TurnInteractionMode::NonInteractive,
                 turn_policy: &mut turn_policy,
-                skill_allowed_tools: None,
-                round_index: 0,
                 session_turn: 1,
-                turn_chain_id: None,
-                user_query_event_id: None,
                 denial_pressure: (0, 0),
                 recent_rejections: Vec::new(),
                 observability_hub: None,
@@ -2735,13 +2500,7 @@ mod tests {
             None,
         )
         .await;
-        let payload_messages = serde_json::to_string(&payload["messages"]).unwrap();
-
-        assert!(payload_messages.contains("我说过的所有话"));
-        assert!(payload_messages.contains("你问过我总结这段会话。"));
-        assert!(payload_messages.contains("继续"));
-        assert!(!payload_messages.contains("skill-auto-route"));
-        assert!(!payload_messages.contains("<skill-loaded"));
+        assert!(payload.get("messages").is_none());
         assert_eq!(
             payload["edge_profile"][EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS],
             json!([
@@ -2761,35 +2520,13 @@ mod tests {
     #[test]
     fn inject_runtime_turn_overrides_adds_plan_fields() {
         let mut payload = json!({});
-        inject_runtime_turn_overrides(
-            &mut payload,
-            true,
-            Some("sub-1"),
-            Some("high"),
-            Some("coder"),
-        );
+        inject_runtime_turn_overrides(&mut payload, true, Some("sub-1"));
 
         assert!(payload.get("skill_search").is_none());
         assert_eq!(payload["is_plan_subtask"], json!(true));
         assert_eq!(payload["rollback_on_failure"], json!(true));
         assert_eq!(payload["rollback_boundary"], json!("turn"));
         assert_eq!(payload["plan_subtask_id"], json!("sub-1"));
-        assert_eq!(payload["effort"], json!("high"));
-        assert_eq!(payload["agent_type"], json!("coder"));
-    }
-
-    #[test]
-    fn shared_turn_provenance_identity_adds_authoritative_ids() {
-        let mut payload = json!({});
-        assert!(attach_turn_identity(
-            &mut payload,
-            2,
-            Some("root-chain"),
-            Some("root-query")
-        ));
-        assert_eq!(payload["session_turn"], json!(2));
-        assert_eq!(payload["turn_chain_id"], json!("root-chain"));
-        assert_eq!(payload["user_query_event_id"], json!("root-query"));
     }
 
     #[test]
@@ -3082,7 +2819,7 @@ mod tests {
 
         // ── Individual signals (only one true, others false) ──
         assert_eq!(
-            super::tool_surface_should_inject(&[], &empty_report(100), false, false, false, false),
+            super::tool_surface_should_inject(&[], &empty_report(100), false, false, false),
             (false, ""),
             "no signals → tool-free"
         );
@@ -3090,7 +2827,6 @@ mod tests {
             super::tool_surface_should_inject(
                 &[schema("bash")],
                 &empty_report(100),
-                false,
                 false,
                 false,
                 false
@@ -3102,28 +2838,25 @@ mod tests {
             r.visible_tools = vec!["git".into()];
             r.visible_count = 1;
             assert_eq!(
-                super::tool_surface_should_inject(&[], &r, false, false, false, false),
+                super::tool_surface_should_inject(&[], &r, false, false, false),
                 (true, "surface_report_names"),
             );
         }
         assert_eq!(
-            super::tool_surface_should_inject(&[], &empty_report(100), true, false, false, false),
+            super::tool_surface_should_inject(&[], &empty_report(100), true, false, false),
             (true, "had_tools_before_runtime_filter"),
         );
         assert_eq!(
-            super::tool_surface_should_inject(&[], &empty_report(100), false, true, false, false),
+            super::tool_surface_should_inject(&[], &empty_report(100), false, true, false),
             (true, "recent_tool_context"),
         );
+
         assert_eq!(
-            super::tool_surface_should_inject(&[], &empty_report(100), false, false, true, false),
-            (true, "tool_results_followup"),
-        );
-        assert_eq!(
-            super::tool_surface_should_inject(&[], &empty_report(100), false, false, false, true),
+            super::tool_surface_should_inject(&[], &empty_report(100), false, false, true),
             (true, "plan_mode_active"),
         );
         assert_eq!(
-            super::tool_surface_should_inject(&[], &empty_report(0), false, false, false, false),
+            super::tool_surface_should_inject(&[], &empty_report(0), false, false, false),
             (true, "budget_starved_surface"),
             "schema_budget_total == 0 with no prior candidates → structurally starved"
         );
@@ -3140,7 +2873,6 @@ mod tests {
             report: astra_turn_core::tool_registry_report::ToolSelectionReport,
             had_tools_before_runtime_filter: bool,
             recent_tool_context: bool,
-            tool_results_followup: bool,
             plan_mode_active: bool,
             expected_reason: &'static str,
             desc: &'static str,
@@ -3152,7 +2884,6 @@ mod tests {
                 report: report_with_tools.clone(),
                 had_tools_before_runtime_filter: true,
                 recent_tool_context: true,
-                tool_results_followup: true,
                 plan_mode_active: true,
                 expected_reason: "visible_tool_candidates",
                 desc: "turn_schemas beats all",
@@ -3162,7 +2893,6 @@ mod tests {
                 report: report_with_tools,
                 had_tools_before_runtime_filter: true,
                 recent_tool_context: true,
-                tool_results_followup: true,
                 plan_mode_active: true,
                 expected_reason: "surface_report_names",
                 desc: "surface report beats signals below",
@@ -3172,7 +2902,6 @@ mod tests {
                 report: empty_report(0),
                 had_tools_before_runtime_filter: true,
                 recent_tool_context: true,
-                tool_results_followup: true,
                 plan_mode_active: true,
                 expected_reason: "had_tools_before_runtime_filter",
                 desc: "pre-filter snapshot beats context signals",
@@ -3182,27 +2911,15 @@ mod tests {
                 report: empty_report(0),
                 had_tools_before_runtime_filter: false,
                 recent_tool_context: true,
-                tool_results_followup: true,
                 plan_mode_active: true,
                 expected_reason: "recent_tool_context",
-                desc: "recent tools beats results + plan",
+                desc: "recent tools beats plan mode",
             },
             PriorityCase {
                 schemas: Vec::new(),
                 report: empty_report(0),
                 had_tools_before_runtime_filter: false,
                 recent_tool_context: false,
-                tool_results_followup: true,
-                plan_mode_active: true,
-                expected_reason: "tool_results_followup",
-                desc: "tool results beats plan mode",
-            },
-            PriorityCase {
-                schemas: Vec::new(),
-                report: empty_report(0),
-                had_tools_before_runtime_filter: false,
-                recent_tool_context: false,
-                tool_results_followup: false,
                 plan_mode_active: true,
                 expected_reason: "plan_mode_active",
                 desc: "plan mode beats budget starved",
@@ -3215,7 +2932,6 @@ mod tests {
                     &case.report,
                     case.had_tools_before_runtime_filter,
                     case.recent_tool_context,
-                    case.tool_results_followup,
                     case.plan_mode_active
                 ),
                 (true, case.expected_reason),
@@ -3234,14 +2950,14 @@ mod tests {
             ..empty_report(100)
         };
         assert_eq!(
-            super::tool_surface_should_inject(&[], &count_only, false, false, false, false),
+            super::tool_surface_should_inject(&[], &count_only, false, false, false),
             (true, "surface_report_names"),
         );
 
         // schema_budget_total == 0 but HadToolsBeforeRuntimeFilter is already set →
         // the pre-filter signal wins (priority), not BudgetStarved
         assert_eq!(
-            super::tool_surface_should_inject(&[], &empty_report(0), true, false, false, false),
+            super::tool_surface_should_inject(&[], &empty_report(0), true, false, false),
             (true, "had_tools_before_runtime_filter"),
             "pre-filter snapshot beats budget starved in priority order"
         );
@@ -3252,45 +2968,6 @@ mod tests {
     // When a skill declares allowed_tools (e.g. review-changes allows grep, glob),
     // the surface builder may not include them. The skill instructions reference
     // these tools, so they must be present in the final selection.
-
-    #[test]
-    fn skill_allowed_tools_injected_into_selection() {
-        use astra_turn_core::tool_registry_report::ToolSelectionReport;
-        use astra_turn_core::tool_schema_prune::inject_skill_allowed_tools;
-
-        let all_schemas = [
-            schema("bash"),
-            schema("read_file"),
-            schema("grep"),
-            schema("glob"),
-        ];
-
-        // Surface included bash and read_file, but not grep/glob
-        let mut turn_schemas = vec![schema("bash"), schema("read_file")];
-        let mut report = ToolSelectionReport {
-            visible_tools: vec!["bash".into(), "read_file".into()],
-            visible_count: 2,
-            schema_budget_used: 0,
-            schema_budget_total: 0,
-        };
-
-        // Skill allows bash, read_file, grep, glob
-        let allowed: Vec<String> = vec![
-            "bash".into(),
-            "read_file".into(),
-            "grep".into(),
-            "glob".into(),
-        ];
-
-        let injected =
-            inject_skill_allowed_tools(&mut turn_schemas, &mut report, &allowed, &all_schemas);
-
-        assert_eq!(injected, 2);
-        assert_eq!(report.visible_count, 4);
-        assert!(report.visible_tools.contains(&"grep".into()));
-        assert!(report.visible_tools.contains(&"glob".into()));
-        assert_eq!(turn_schemas.len(), 4);
-    }
 
     #[test]
     fn enabled_optional_tools_are_derived_from_executable_schema_facts() {
@@ -3319,7 +2996,9 @@ mod tests {
             tool_registry::ToolRegistry,
             turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
         };
-        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use astra_turn_core::{
+            interaction_types::TurnInteractionPolicy, tool_health::ToolHealthTracker,
+        };
         use std::{collections::HashSet, sync::Arc, time::Instant};
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -3332,13 +3011,12 @@ mod tests {
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(100);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         let messages = vec![json!({"role": "user", "content": "inspect the repo state"})];
-        let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
-        let turn_guard = TurnGuard::default();
+        let tool_health = ToolHealthTracker::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
@@ -3363,15 +3041,13 @@ mod tests {
             message: "inspect the repo state",
             user_intent: "inspect the repo state",
             semantic_query_override: None,
-            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,
             registry: &registry,
-            tool_results: &tool_results,
             all_schemas: &all_schemas,
             valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
+            tool_health: &tool_health,
             restricted_tools: &mut restricted_tools,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
@@ -3386,15 +3062,9 @@ mod tests {
             plan_subtask_id: None,
             timing_phases: false,
             prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
             session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
             denial_pressure: (0, 0),
             recent_rejections: Vec::new(),
             observability_hub: None,
@@ -3490,7 +3160,9 @@ mod tests {
             tool_registry::ToolRegistry,
             turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
         };
-        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use astra_turn_core::{
+            interaction_types::TurnInteractionPolicy, tool_health::ToolHealthTracker,
+        };
         use std::{collections::HashSet, sync::Arc, time::Instant};
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -3507,13 +3179,12 @@ mod tests {
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(2);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         let messages = vec![json!({"role": "user", "content": "inspect the repo state"})];
-        let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
-        let turn_guard = TurnGuard::default();
+        let tool_health = ToolHealthTracker::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
@@ -3538,15 +3209,13 @@ mod tests {
             message: "inspect the repo state",
             user_intent: "inspect the repo state",
             semantic_query_override: None,
-            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,
             registry: &registry,
-            tool_results: &tool_results,
             all_schemas: &all_schemas,
             valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
+            tool_health: &tool_health,
             restricted_tools: &mut restricted_tools,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
@@ -3561,15 +3230,9 @@ mod tests {
             plan_subtask_id: None,
             timing_phases: false,
             prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
             session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
             denial_pressure: (0, 0),
             recent_rejections: Vec::new(),
             observability_hub: None,
@@ -3630,330 +3293,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_chat_turn_payload_honors_typed_non_work_act_and_preserves_activation() {
-        use crate::edge_tools::ToolExecutor;
-        use astra_config::user_profile::{TurnCommunicativeAct, TurnIntent};
-        use astra_pipeline::step_recorder::StepRecorder;
-        use astra_runtime::{
-            tool_registry::ToolRegistry,
-            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
-        };
-        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
-        use std::{collections::HashSet, sync::Arc, time::Instant};
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let all_schemas = astra_tools::schemas::all_tool_schemas();
-        let registry = ToolRegistry::new(all_schemas.clone());
-        let social_intent =
-            TurnIntent::default().with_communicative_act(TurnCommunicativeAct::Social);
-        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
-        let empty_surface_message = "empty tool surface";
-        let messages = vec![json!({"role": "user", "content": empty_surface_message})];
-        let tool_results = Vec::new();
-        let history: Vec<(String, String)> = Vec::new();
-        let recent_tools: Vec<String> = Vec::new();
-        let mut restricted_tools = HashSet::new();
-        let mut valid_tool_names = HashSet::new();
-        let mut step_recorder =
-            StepRecorder::new("test-user", "session-empty-selector", "task-empty-selector");
-        let turn_guard = TurnGuard::default();
-        let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_selection_report = None;
-        let mut first_budget_pressure = 0.0;
-        let mut first_context_assembly_ms = None;
-        let mut all_selected_skills = Vec::new();
-
-        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
-            cli_context: None,
-            tool_surface_config: &Default::default(),
-            messages: &messages,
-            runtime_required_texts: &[],
-            runtime_volatile_texts: &[],
-            runtime_volatile_injections: &[],
-            ephemeral_prefix: None,
-            current_session_id: Some("session-empty-surface"),
-            offering_id: None,
-            model: None,
-            context_window_tokens: 200_000,
-            effective_input_budget_tokens: 200_000,
-            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
-            project_root: temp_dir.path(),
-            message: empty_surface_message,
-            user_intent: empty_surface_message,
-            semantic_query_override: None,
-            turn_intent: Some(&social_intent),
-            history: &history,
-            recent_tools: &recent_tools,
-            executor: Arc::clone(&executor),
-            registry: &registry,
-            tool_results: &tool_results,
-            all_schemas: &all_schemas,
-            valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
-            restricted_tools: &mut restricted_tools,
-            step_recorder: &mut step_recorder,
-            assembly_start: Instant::now(),
-            telem: PrepareTurnTelemetry {
-                first_selection_report: &mut first_selection_report,
-                first_budget_pressure: &mut first_budget_pressure,
-                first_context_assembly_ms: &mut first_context_assembly_ms,
-                all_selected_skills: &mut all_selected_skills,
-                trace_collector: None,
-            },
-            is_plan_subtask: false,
-            plan_subtask_id: None,
-            timing_phases: false,
-            prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
-            interaction_mode: TurnInteractionMode::Auto,
-            turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
-            session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
-            denial_pressure: (0, 0),
-            recent_rejections: Vec::new(),
-            observability_hub: None,
-            append_system_prompt: None,
-            plan_mode_active: false,
-            lessons_text: None,
-        })
-        .await;
-
-        let edge_tools = payload["edge_tools"].as_array().unwrap();
-        assert!(
-            edge_tools.is_empty(),
-            "a typed social turn should not include tool schemas: {:?}",
-            edge_tools
-                .iter()
-                .filter_map(|schema| schema["function"]["name"].as_str())
-                .collect::<Vec<_>>()
-        );
-        let enabled_tools = payload["enabled_tools"]
-            .as_array()
-            .expect("CLI payload must publish its executable optional capability set");
-        assert!(
-            enabled_tools.iter().any(|name| name == "web_fetch"),
-            "deferred optional capabilities are request facts even when this turn is tool-free: {enabled_tools:?}"
-        );
-        assert!(
-            payload["edge_profile"]
-                .get(EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT)
-                .is_none(),
-            "tool-free turns without visible tool_search should not advertise deferred tools"
-        );
-        assert!(
-            valid_tool_names.is_empty(),
-            "executor admission must mirror the tool-free payload"
-        );
-        assert_eq!(
-            first_selection_report
-                .as_ref()
-                .map(|report| report.visible_count),
-            Some(0),
-            "surface telemetry must reflect the final no-tool surface"
-        );
-
-        executor.set_current_visible_tool_schemas(&[schema("tool_search")]);
-        // Use a capability classified as Deferred by the canonical ToolSpec
-        // registry; its invocation follows activation rather than a
-        // model-visible native schema.
-        executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
-        let selected = executor
-            .execute("tool_search", &json!({"query": "select:web_fetch"}))
-            .await;
-        let selected_json: Value = serde_json::from_str(&selected).unwrap_or_else(|error| {
-            panic!("tool_search select should return JSON, got {error}: {selected}")
-        });
-        assert_eq!(
-            selected_json["matches"][0]["name"].as_str(),
-            Some("web_fetch")
-        );
-
-        let mut restricted_tools = HashSet::new();
-        let mut valid_tool_names = HashSet::new();
-        let mut step_recorder = StepRecorder::new(
-            "test-user",
-            "session-pending-activation",
-            "task-pending-activation",
-        );
-        let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_selection_report = None;
-        let mut first_budget_pressure = 0.0;
-        let mut first_context_assembly_ms = None;
-        let mut all_selected_skills = Vec::new();
-
-        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
-            cli_context: None,
-            tool_surface_config: &Default::default(),
-            messages: &messages,
-            runtime_required_texts: &[],
-            runtime_volatile_texts: &[],
-            runtime_volatile_injections: &[],
-            ephemeral_prefix: None,
-            current_session_id: Some("session-pending-activation"),
-            offering_id: None,
-            model: None,
-            context_window_tokens: 200_000,
-            effective_input_budget_tokens: 200_000,
-            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
-            project_root: temp_dir.path(),
-            message: empty_surface_message,
-            user_intent: empty_surface_message,
-            semantic_query_override: None,
-            turn_intent: None,
-            history: &history,
-            recent_tools: &recent_tools,
-            executor: Arc::clone(&executor),
-            registry: &registry,
-            tool_results: &tool_results,
-            all_schemas: &all_schemas,
-            valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
-            restricted_tools: &mut restricted_tools,
-            step_recorder: &mut step_recorder,
-            assembly_start: Instant::now(),
-            telem: PrepareTurnTelemetry {
-                first_selection_report: &mut first_selection_report,
-                first_budget_pressure: &mut first_budget_pressure,
-                first_context_assembly_ms: &mut first_context_assembly_ms,
-                all_selected_skills: &mut all_selected_skills,
-                trace_collector: None,
-            },
-            is_plan_subtask: false,
-            plan_subtask_id: None,
-            timing_phases: false,
-            prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
-            interaction_mode: TurnInteractionMode::Auto,
-            turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
-            session_turn: 2,
-            turn_chain_id: None,
-            user_query_event_id: None,
-            denial_pressure: (0, 0),
-            recent_rejections: Vec::new(),
-            observability_hub: None,
-            append_system_prompt: None,
-            plan_mode_active: false,
-            lessons_text: None,
-        })
-        .await;
-
-        let edge_tool_names: Vec<&str> = payload["edge_tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|schema| schema["function"]["name"].as_str())
-            .collect();
-        assert!(
-            !edge_tool_names.contains(&"web_fetch"),
-            "pending selection must not surface a variable deferred schema: {edge_tool_names:?}"
-        );
-        assert!(
-            edge_tool_names.contains(&"invoke_tool"),
-            "the stable carrier must remain available for the selected target: {edge_tool_names:?}"
-        );
-        assert!(
-            !valid_tool_names.contains("web_fetch"),
-            "direct target admission must not be inferred from selection evidence"
-        );
-        executor.clear_current_tool_surface_for_tests();
-
-        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(0);
-        let messages = vec![json!({"role": "user", "content": "inspect the repository"})];
-        let mut restricted_tools = HashSet::new();
-        let mut valid_tool_names = HashSet::new();
-        let mut step_recorder = StepRecorder::new("test-user", "session-empty", "task-empty");
-        let mut turn_policy = TurnInteractionPolicy::default();
-        let mut first_selection_report = None;
-        let mut first_budget_pressure = 0.0;
-        let mut first_context_assembly_ms = None;
-        let mut all_selected_skills = Vec::new();
-
-        let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
-            cli_context: None,
-            tool_surface_config: &Default::default(),
-            messages: &messages,
-            runtime_required_texts: &[],
-            runtime_volatile_texts: &[],
-            runtime_volatile_injections: &[],
-            ephemeral_prefix: None,
-            current_session_id: Some("session-empty"),
-            offering_id: None,
-            model: None,
-            context_window_tokens: 200_000,
-            effective_input_budget_tokens: 200_000,
-            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
-            project_root: temp_dir.path(),
-            message: "inspect the repository",
-            user_intent: "inspect the repository",
-            semantic_query_override: None,
-            turn_intent: None,
-            history: &history,
-            recent_tools: &recent_tools,
-            executor: Arc::clone(&executor),
-            registry: &registry,
-            tool_results: &tool_results,
-            all_schemas: &all_schemas,
-            valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
-            restricted_tools: &mut restricted_tools,
-            step_recorder: &mut step_recorder,
-            assembly_start: Instant::now(),
-            telem: PrepareTurnTelemetry {
-                first_selection_report: &mut first_selection_report,
-                first_budget_pressure: &mut first_budget_pressure,
-                first_context_assembly_ms: &mut first_context_assembly_ms,
-                all_selected_skills: &mut all_selected_skills,
-                trace_collector: None,
-            },
-            is_plan_subtask: false,
-            plan_subtask_id: None,
-            timing_phases: false,
-            prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
-            interaction_mode: TurnInteractionMode::Auto,
-            turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
-            session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
-            denial_pressure: (0, 0),
-            recent_rejections: Vec::new(),
-            observability_hub: None,
-            append_system_prompt: None,
-            plan_mode_active: false,
-            lessons_text: None,
-        })
-        .await;
-
-        let edge_tool_names: Vec<&str> = payload["edge_tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|schema| schema["function"]["name"].as_str())
-            .collect();
-        assert!(
-            edge_tool_names.contains(&"tool_search"),
-            "budget-starved turns must keep deferred discovery reachable through the declarative default surface: {edge_tool_names:?}"
-        );
-        assert!(
-            payload["edge_profile"]
-                .get(EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT)
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("<deferred-tools>")),
-            "tool_search visibility must be paired with a deferred manifest"
-        );
-    }
-
-    #[tokio::test]
     async fn prepare_chat_turn_payload_does_not_equate_bash_with_background_task_state() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
@@ -3961,7 +3300,9 @@ mod tests {
             tool_registry::ToolRegistry,
             turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
         };
-        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use astra_turn_core::{
+            interaction_types::TurnInteractionPolicy, tool_health::ToolHealthTracker,
+        };
         use std::{collections::HashSet, sync::Arc, time::Instant};
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -3978,13 +3319,12 @@ mod tests {
                 .with_bg_task_commands(Arc::new(std::sync::Mutex::new(Vec::new()))),
         );
         let messages = vec![json!({"role": "user", "content": "run make check"})];
-        let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
-        let turn_guard = TurnGuard::default();
+        let tool_health = ToolHealthTracker::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
@@ -4009,15 +3349,13 @@ mod tests {
             message: "run make check",
             user_intent: "run make check",
             semantic_query_override: None,
-            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,
             registry: &registry,
-            tool_results: &tool_results,
             all_schemas: &all_schemas,
             valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
+            tool_health: &tool_health,
             restricted_tools: &mut restricted_tools,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
@@ -4032,15 +3370,9 @@ mod tests {
             plan_subtask_id: None,
             timing_phases: false,
             prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
             session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
             denial_pressure: (0, 0),
             recent_rejections: Vec::new(),
             observability_hub: None,
@@ -4102,7 +3434,9 @@ mod tests {
             turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
             turn::turn_trace_collector::TurnTraceCollector,
         };
-        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use astra_turn_core::{
+            interaction_types::TurnInteractionPolicy, tool_health::ToolHealthTracker,
+        };
         use std::{collections::HashSet, sync::Arc, time::Instant};
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -4117,11 +3451,10 @@ mod tests {
             "Need a fix.".to_string(),
         )];
         let recent_tools: Vec<String> = Vec::new();
-        let tool_results = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
-        let turn_guard = TurnGuard::default();
+        let tool_health = ToolHealthTracker::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_selection_report =
             Some(astra_turn_core::tool_registry_report::ToolSelectionReport {
@@ -4155,15 +3488,13 @@ mod tests {
             message,
             user_intent,
             semantic_query_override: Some(semantic_query_override),
-            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,
             registry: &registry,
-            tool_results: &tool_results,
             all_schemas: &all_schemas,
             valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
+            tool_health: &tool_health,
             restricted_tools: &mut restricted_tools,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
@@ -4178,15 +3509,9 @@ mod tests {
             plan_subtask_id: None,
             timing_phases: false,
             prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
             session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
             denial_pressure: (0, 0),
             recent_rejections: Vec::new(),
             observability_hub: None,
@@ -4203,7 +3528,10 @@ mod tests {
             "edge payload must preserve structured user_intent separately from prompt-facing message"
         );
         let admission = server_loop_admission_payload_with_execution_time_budget(
-            &payload, message, false, None,
+            payload.clone(),
+            message,
+            false,
+            None,
         )
         .expect("prepared request must project into the production admission contract");
         assert_eq!(
@@ -4266,7 +3594,9 @@ mod tests {
             tool_registry::ToolRegistry,
             turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
         };
-        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use astra_turn_core::{
+            interaction_types::TurnInteractionPolicy, tool_health::ToolHealthTracker,
+        };
         use std::{collections::HashSet, sync::Arc, time::Instant};
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -4285,13 +3615,12 @@ mod tests {
             "str_replace",
         ]);
         let messages = vec![json!({"role": "user", "content": "implement the approved plan"})];
-        let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
-        let turn_guard = TurnGuard::default();
+        let tool_health = ToolHealthTracker::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
@@ -4316,15 +3645,13 @@ mod tests {
             message: "implement the approved plan",
             user_intent: "implement the approved plan",
             semantic_query_override: None,
-            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
             registry: &registry,
-            tool_results: &tool_results,
             all_schemas: &all_schemas,
             valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
+            tool_health: &tool_health,
             restricted_tools: &mut restricted_tools,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
@@ -4339,15 +3666,9 @@ mod tests {
             plan_subtask_id: None,
             timing_phases: false,
             prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
             session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
             denial_pressure: (0, 0),
             recent_rejections: Vec::new(),
             observability_hub: None,
@@ -4379,7 +3700,9 @@ mod tests {
             tool_registry::ToolRegistry,
             turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
         };
-        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use astra_turn_core::{
+            interaction_types::TurnInteractionPolicy, tool_health::ToolHealthTracker,
+        };
         use std::{collections::HashSet, sync::Arc, time::Instant};
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -4410,13 +3733,12 @@ mod tests {
         );
 
         let messages = vec![json!({"role": "user", "content": "remember this"})];
-        let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
-        let turn_guard = TurnGuard::default();
+        let tool_health = ToolHealthTracker::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
@@ -4441,15 +3763,13 @@ mod tests {
             message: "remember this",
             user_intent: "remember this",
             semantic_query_override: None,
-            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
             registry: &registry,
-            tool_results: &tool_results,
             all_schemas: &all_schemas,
             valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
+            tool_health: &tool_health,
             restricted_tools: &mut restricted_tools,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
@@ -4464,15 +3784,9 @@ mod tests {
             plan_subtask_id: None,
             timing_phases: false,
             prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
             session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
             denial_pressure: (0, 0),
             recent_rejections: Vec::new(),
             observability_hub: None,
@@ -4502,8 +3816,9 @@ mod tests {
             .map(|name| u64::from(registry.token_cost(name)))
             .sum();
         assert_eq!(
-            payload.pinned_tool_schema_tokens, expected_pinned_tokens,
-            "next-round compaction must account only for schemas actually materialized in the payload"
+            u64::from(first_selection_report.as_ref().unwrap().schema_budget_used),
+            expected_pinned_tokens,
+            "surface telemetry must account only for schemas actually materialized in the payload"
         );
         assert!(
             !valid_tool_names.contains("web_fetch"),
@@ -4520,7 +3835,9 @@ mod tests {
             tool_registry::ToolRegistry,
             turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
         };
-        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use astra_turn_core::{
+            interaction_types::TurnInteractionPolicy, tool_health::ToolHealthTracker,
+        };
         use std::{collections::HashSet, sync::Arc, time::Instant};
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -4531,13 +3848,12 @@ mod tests {
         executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
 
         let messages = vec![json!({"role": "user", "content": "no deferred tools"})];
-        let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
-        let turn_guard = TurnGuard::default();
+        let tool_health = ToolHealthTracker::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
@@ -4562,15 +3878,13 @@ mod tests {
             message: "no deferred tools",
             user_intent: "no deferred tools",
             semantic_query_override: None,
-            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
             registry: &registry,
-            tool_results: &tool_results,
             all_schemas: &all_schemas,
             valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
+            tool_health: &tool_health,
             restricted_tools: &mut restricted_tools,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
@@ -4585,15 +3899,9 @@ mod tests {
             plan_subtask_id: None,
             timing_phases: false,
             prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
             session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
             denial_pressure: (0, 0),
             recent_rejections: Vec::new(),
             observability_hub: None,
@@ -4625,7 +3933,9 @@ mod tests {
             tool_registry::ToolRegistry,
             turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
         };
-        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use astra_turn_core::{
+            interaction_types::TurnInteractionPolicy, tool_health::ToolHealthTracker,
+        };
         use std::{collections::HashSet, sync::Arc, time::Instant};
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -4635,13 +3945,12 @@ mod tests {
 
         let messages =
             vec![json!({"role": "user", "content": "delegate review with parallel agents"})];
-        let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
-        let turn_guard = TurnGuard::default();
+        let tool_health = ToolHealthTracker::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
@@ -4666,15 +3975,13 @@ mod tests {
             message: "delegate review with parallel agents",
             user_intent: "delegate review with parallel agents",
             semantic_query_override: None,
-            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
             registry: &registry,
-            tool_results: &tool_results,
             all_schemas: &all_schemas,
             valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
+            tool_health: &tool_health,
             restricted_tools: &mut restricted_tools,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
@@ -4689,15 +3996,9 @@ mod tests {
             plan_subtask_id: None,
             timing_phases: false,
             prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
             session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
             denial_pressure: (0, 0),
             recent_rejections: Vec::new(),
             observability_hub: None,
@@ -4737,7 +4038,9 @@ mod tests {
             tool_registry::ToolRegistry,
             turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
         };
-        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use astra_turn_core::{
+            interaction_types::TurnInteractionPolicy, tool_health::ToolHealthTracker,
+        };
         use std::{collections::HashSet, sync::Arc, time::Instant};
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -4747,13 +4050,12 @@ mod tests {
         executor.debug_stage_pending_round_tool_boost_for_test(&["agent_fanout"]);
 
         let messages = vec![json!({"role": "user", "content": "fan out this work"})];
-        let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
-        let turn_guard = TurnGuard::default();
+        let tool_health = ToolHealthTracker::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
@@ -4778,15 +4080,13 @@ mod tests {
             message: "fan out this work",
             user_intent: "fan out this work",
             semantic_query_override: None,
-            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
             registry: &registry,
-            tool_results: &tool_results,
             all_schemas: &all_schemas,
             valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
+            tool_health: &tool_health,
             restricted_tools: &mut restricted_tools,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
@@ -4801,15 +4101,9 @@ mod tests {
             plan_subtask_id: None,
             timing_phases: false,
             prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
             session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
             denial_pressure: (0, 0),
             recent_rejections: Vec::new(),
             observability_hub: None,
@@ -4844,7 +4138,9 @@ mod tests {
             tool_registry::ToolRegistry,
             turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
         };
-        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use astra_turn_core::{
+            interaction_types::TurnInteractionPolicy, tool_health::ToolHealthTracker,
+        };
         use std::{collections::HashSet, sync::Arc, time::Instant};
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -4852,13 +4148,12 @@ mod tests {
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(100);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         let messages = vec![json!({"role": "user", "content": "fix the bug"})];
-        let tool_results = Vec::new();
         let history: Vec<(String, String)> = Vec::new();
         let recent_tools: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
-        let turn_guard = TurnGuard::default();
+        let tool_health = ToolHealthTracker::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
@@ -4883,15 +4178,13 @@ mod tests {
             message: "fix the bug",
             user_intent: "fix the bug",
             semantic_query_override: None,
-            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,
             registry: &registry,
-            tool_results: &tool_results,
             all_schemas: &all_schemas,
             valid_tool_names: &mut valid_tool_names,
-            turn_guard: &turn_guard,
+            tool_health: &tool_health,
             restricted_tools: &mut restricted_tools,
             step_recorder: &mut step_recorder,
             assembly_start: Instant::now(),
@@ -4906,15 +4199,9 @@ mod tests {
             plan_subtask_id: None,
             timing_phases: false,
             prep_ui_phase: None,
-            skill_effort: None,
-            skill_agent_type: None,
             interaction_mode: TurnInteractionMode::NonInteractive,
             turn_policy: &mut turn_policy,
-            skill_allowed_tools: None,
-            round_index: 0,
             session_turn: 1,
-            turn_chain_id: None,
-            user_query_event_id: None,
             denial_pressure: (0, 0),
             recent_rejections: Vec::new(),
             observability_hub: None,

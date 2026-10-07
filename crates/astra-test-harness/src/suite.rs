@@ -1662,7 +1662,7 @@ mod tests {
     use crate::case::PromptCacheReuseScope;
     use crate::criteria::Criterion;
     use crate::exec::test_support::FakeExecutor;
-    use crate::judger::JudgerScore;
+    use crate::judger::{JudgerAssessment, JudgerResult};
     use crate::runner::RunOutcome;
     use crate::session_capture::SessionCapture;
     use async_trait::async_trait;
@@ -2092,14 +2092,13 @@ mod tests {
 
     #[async_trait]
     impl Judger for FixedJudger {
-        async fn score(
+        async fn judge(
             &self,
-            _q: &str,
-            _m: Option<&str>,
+            _criterion: &Criterion,
             _o: &RunOutcome,
-        ) -> Result<JudgerScore, String> {
-            Ok(JudgerScore {
-                score: self.score,
+        ) -> Result<JudgerResult, String> {
+            Ok(JudgerResult {
+                assessment: JudgerAssessment::Grade(self.score),
                 rationale: "fixed".into(),
                 full_rationale: "fixed".into(),
                 votes: Vec::new(),
@@ -2948,15 +2947,14 @@ mod tests {
         }
         #[async_trait]
         impl Judger for TrackingJudger {
-            async fn score(
+            async fn judge(
                 &self,
-                _q: &str,
-                _m: Option<&str>,
+                _criterion: &Criterion,
                 _o: &RunOutcome,
-            ) -> Result<JudgerScore, String> {
+            ) -> Result<JudgerResult, String> {
                 *self.hits.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-                Ok(JudgerScore {
-                    score: 1.0,
+                Ok(JudgerResult {
+                    assessment: JudgerAssessment::Grade(1.0),
                     rationale: "".into(),
                     full_rationale: "".into(),
                     votes: Vec::new(),
@@ -4436,18 +4434,21 @@ mod tests {
         }
         #[async_trait]
         impl Judger for CaptureJudger {
-            async fn score(
+            async fn judge(
                 &self,
-                q: &str,
-                _m: Option<&str>,
+                criterion: &Criterion,
                 _o: &RunOutcome,
-            ) -> Result<crate::judger::JudgerScore, String> {
+            ) -> Result<crate::judger::JudgerResult, String> {
                 self.questions
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .push(q.to_string());
-                Ok(crate::judger::JudgerScore {
-                    score: 1.0,
+                    .push(match criterion {
+                        Criterion::Judger { question, .. }
+                        | Criterion::HardJudger { question, .. } => question.clone(),
+                        _ => panic!("expected judger criterion"),
+                    });
+                Ok(crate::judger::JudgerResult {
+                    assessment: JudgerAssessment::Grade(1.0),
                     rationale: "ok".into(),
                     full_rationale: "ok".into(),
                     votes: vec![],

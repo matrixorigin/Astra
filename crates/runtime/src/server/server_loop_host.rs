@@ -63,11 +63,8 @@ use crate::turn::agentic_loop::host::{
     interaction_scoped_tool_restrictions,
 };
 use crate::turn::llm::client::{
-    LlmCall, LlmCallResult, LlmCancel, LlmStreamUpdate, OwnedLlmExecutionRoute,
-    call_llm_and_collect_with_stream_callback,
-    call_llm_and_collect_with_stream_callback_and_budget,
-    call_llm_and_collect_with_stream_callback_and_budget_and_no_tool_choice,
-    call_llm_and_collect_with_stream_callback_and_no_tool_choice, provider_supports_no_tool_choice,
+    LlmCall, LlmCallResult, LlmCancel, LlmStreamUpdate, OwnedLlmExecutionRoute, RuntimeToolChoice,
+    call_llm_and_collect_with_stream_callback, provider_supports_no_tool_choice,
     sleep_ms_or_llm_cancel,
 };
 use crate::turn::llm::summary_client::{DurableSummaryAttemptAllocator, RuntimeSummaryClient};
@@ -92,9 +89,7 @@ use astra_turn_core::agent_live_event::{
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
-use astra_turn_core::rate_limit_cooldown::{
-    CooldownReason, FallbackOutcome, PerModelCooldown, RateLimitAction, try_resolve_fallback,
-};
+use astra_turn_core::rate_limit_cooldown::RateLimitAction;
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
@@ -941,10 +936,9 @@ fn provider_context_tool_surface<'a>(
         .unwrap_or(authority_surface)
 }
 
-/// The semantic judge is auxiliary to the primary conversation. It runs in
-/// parallel with primary request preparation/inference, so this bound limits
-/// how long a slow provider can delay the first *executable* boundary without
-/// serially adding that time to every turn.
+/// Semantic observations settle before provider context construction. A
+/// classification first requested by a typed response settles before tool
+/// execution. Both use this bounded deadline and the existing cancellation owner.
 const TURN_INTENT_JUDGE_DEADLINE: Duration = Duration::from_secs(12);
 /// A canonical Work item is deliberately narrow. After a few executed tools,
 /// the next model boundary must re-evaluate its exact expected result rather
@@ -1940,7 +1934,6 @@ struct ResolvedTurnLlmConfig {
     /// Mode-independent fixed temperature resolved at model admission.
     fixed_temperature: Option<f64>,
     thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
-    fallback_chain: Vec<String>,
     header_overrides: HashMap<String, String>,
     request_body_overrides: Option<Map<String, Value>>,
     completions_url_override: Option<String>,
@@ -1970,42 +1963,6 @@ impl ResolvedTurnLlmConfig {
             request_timeout: self.request_timeout,
         }
     }
-
-    fn shares_credential_owner_with(&self, candidate: &Self) -> bool {
-        self.provider == candidate.provider
-            && self.api_key == candidate.api_key
-            && self.base_url == candidate.base_url
-            && self.header_overrides == candidate.header_overrides
-            && self.completions_url_override == candidate.completions_url_override
-    }
-}
-
-async fn try_resolve_same_owner_fallback(
-    cooldown: &PerModelCooldown,
-    chain: &[String],
-    reason: CooldownReason,
-    matrixone: &MatrixOneSettings,
-    encryptor: &FernetTokenEncryptor,
-    pool: Option<&sqlx::Pool<sqlx::MySql>>,
-    credential_owner: &ResolvedTurnLlmConfig,
-) -> FallbackOutcome<ResolvedTurnLlmConfig> {
-    try_resolve_fallback(cooldown, chain, reason, |fallback_name| async move {
-        let candidate = resolve_llm_model_for_turn(
-            matrixone,
-            encryptor,
-            Some(fallback_name.as_str()),
-            pool,
-            None,
-        )
-        .await?;
-        if !credential_owner.shares_credential_owner_with(&candidate) {
-            return Err(
-                "fallback Offering belongs to a different provider credential owner".to_string(),
-            );
-        }
-        Ok(candidate)
-    })
-    .await
 }
 
 type PipelineTurnOutcome = crate::turn::llm::context::LlmContextAssemblyOutput;
@@ -2588,6 +2545,9 @@ fn inherited_delegation_source_from_state(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ClassifiedWorkAdmission {
     decision: astra_services::WorkAdmissionDecision,
+    /// Original optional observations share the admitted human-source owner;
+    /// graph planning must not supply or replace them.
+    user_turn_semantics: Option<astra_turn_types::UserTurnSemantics>,
     /// `None` means this decision came from a path that did not classify model
     /// requirements; it must never be interpreted as an explicit negative.
     delegation_model_requirement: Option<astra_services::WorkAdmissionTruth>,
@@ -2608,6 +2568,7 @@ impl ClassifiedWorkAdmission {
     fn unclassified(decision: astra_services::WorkAdmissionDecision) -> Self {
         Self {
             decision,
+            user_turn_semantics: None,
             delegation_model_requirement: None,
             source: None,
             work_handoff_pending: true,
@@ -2626,9 +2587,49 @@ impl std::ops::Deref for ClassifiedWorkAdmission {
 type WorkAdmissionDecisionResult =
     Result<ClassifiedWorkAdmission, astra_services::TurnIntentJudgeError>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SemanticJudgmentPurpose {
+    WorkAdmission,
+    UserObservation,
+}
+
+impl SemanticJudgmentPurpose {
+    fn phase_attempt_index(self) -> u32 {
+        // Both tasks may occur in one model round. Their existing owners
+        // publish distinct phase identities, including cancellation receipts.
+        match self {
+            Self::WorkAdmission => 0,
+            Self::UserObservation => 1,
+        }
+    }
+}
+
+enum SemanticJudgmentResult {
+    WorkAdmission(Box<ClassifiedWorkAdmission>),
+    UserObservation(astra_turn_types::UserTurnSemantics),
+}
+
+#[cfg(test)]
+impl From<ClassifiedWorkAdmission> for SemanticJudgmentResult {
+    fn from(decision: ClassifiedWorkAdmission) -> Self {
+        Self::WorkAdmission(Box::new(decision))
+    }
+}
+
+#[cfg(test)]
+impl From<astra_services::WorkAdmissionDecision> for SemanticJudgmentResult {
+    fn from(decision: astra_services::WorkAdmissionDecision) -> Self {
+        Self::WorkAdmission(Box::new(decision.into()))
+    }
+}
+
 struct PendingWorkAdmissionJudge {
+    purpose: SemanticJudgmentPurpose,
     wait_node_id: Option<String>,
-    handle: JoinHandle<(WorkAdmissionDecisionResult, Instant)>,
+    handle: JoinHandle<(
+        Result<SemanticJudgmentResult, astra_services::TurnIntentJudgeError>,
+        Instant,
+    )>,
     usage: Arc<std::sync::Mutex<WorkAdmissionUsage>>,
     started_at: Instant,
     round_index: u32,
@@ -2665,6 +2666,7 @@ fn pending_work_admission_judge_for_test(
         }
     });
     PendingWorkAdmissionJudge {
+        purpose: SemanticJudgmentPurpose::WorkAdmission,
         wait_node_id: None,
         handle,
         usage,
@@ -2824,6 +2826,7 @@ impl SummaryClientWorkAdmissionJudge {
             }
             result => result?,
         };
+        let user_turn_semantics = Some(classification.user_turn_semantics());
         if classification.work_lifecycle == WorkLifecycleIntent::NotRequired {
             let presence = classification.delegation_model_requirement;
             return Ok(ClassifiedWorkAdmission {
@@ -2831,6 +2834,7 @@ impl SummaryClientWorkAdmissionJudge {
                     ctx,
                     classification.into_not_required()?,
                 )?,
+                user_turn_semantics,
                 delegation_model_requirement: Some(presence),
                 source: None,
                 work_handoff_pending: true,
@@ -2840,10 +2844,11 @@ impl SummaryClientWorkAdmissionJudge {
         let mut decision = planner.judge_messages(ctx, messages).await?;
         classification.validate_plan(&decision)?;
         if let astra_services::WorkAdmissionDecision::Required { assessment, .. } = &mut decision {
-            *assessment = classification.assessment.or(*assessment);
+            *assessment = classification.assessment;
         }
         Ok(ClassifiedWorkAdmission {
             decision,
+            user_turn_semantics,
             delegation_model_requirement: Some(classification.delegation_model_requirement),
             source: None,
             work_handoff_pending: true,
@@ -3029,62 +3034,33 @@ fn skill_auto_route_service_context(
     }
 }
 
-async fn resolve_llm_model_for_turn(
-    matrixone: &MatrixOneSettings,
-    encryptor: &FernetTokenEncryptor,
+fn resolve_llm_model_for_turn(
     preferred_model: Option<&str>,
-    pool: Option<&sqlx::Pool<sqlx::MySql>>,
     admitted_execution: Option<&astra_services::AdmittedModelExecution>,
 ) -> Result<ResolvedTurnLlmConfig, String> {
-    if let Some(execution) = admitted_execution {
-        if preferred_model.is_some_and(|preferred| preferred != execution.model_name) {
-            return Err(
-                "model override does not match the Offering admitted for this run".to_string(),
-            );
-        }
-        return Ok(ResolvedTurnLlmConfig {
-            model_name: execution.model_name.clone(),
-            wire_model_name: execution.wire_model_name.clone(),
-            api_key: execution.api_key.clone(),
-            base_url: execution.base_url.clone(),
-            provider: execution.provider.clone(),
-            cache_capability: crate::turn::llm::context::cache_capability_from_model_metadata(
-                execution.cache_capability,
-            ),
-            thinking_capability: execution.thinking_capability,
-            fixed_temperature: execution.fixed_temperature,
-            thinking_protocol: execution.thinking_protocol,
-            fallback_chain: Vec::new(),
-            header_overrides: execution.header_overrides.clone(),
-            request_body_overrides: execution.request_body_overrides.clone(),
-            completions_url_override: execution.completions_url_override.clone(),
-            request_timeout: execution.request_timeout_ms.map(Duration::from_millis),
-            context_window: execution.context_window,
-            max_completion_tokens: execution.max_completion_tokens,
-        });
+    let execution = admitted_execution
+        .ok_or_else(|| "Server execution has no admitted Offering material".to_string())?;
+    if preferred_model.is_some_and(|preferred| preferred != execution.model_name) {
+        return Err("model override does not match the Offering admitted for this run".to_string());
     }
-    let resolved =
-        astra_services::resolve_active_llm_model(matrixone, encryptor, preferred_model, pool)
-            .await?;
     Ok(ResolvedTurnLlmConfig {
-        model_name: resolved.model_name,
-        wire_model_name: resolved.wire_model_name,
-        api_key: resolved.api_key,
-        base_url: resolved.base_url,
-        provider: resolved.provider,
+        model_name: execution.model_name.clone(),
+        wire_model_name: execution.wire_model_name.clone(),
+        api_key: execution.api_key.clone(),
+        base_url: execution.base_url.clone(),
+        provider: execution.provider.clone(),
         cache_capability: crate::turn::llm::context::cache_capability_from_model_metadata(
-            resolved.prompt_cache_capability,
+            execution.cache_capability,
         ),
-        thinking_capability: resolved.thinking_capability,
-        fixed_temperature: resolved.fixed_temperature,
-        thinking_protocol: resolved.thinking_protocol,
-        fallback_chain: resolved.fallback_chain,
-        header_overrides: HashMap::new(),
-        request_body_overrides: resolved.request_body_overrides,
-        completions_url_override: None,
-        request_timeout: None,
-        context_window: resolved.context_window,
-        max_completion_tokens: resolved.max_completion_tokens,
+        thinking_capability: execution.thinking_capability,
+        fixed_temperature: execution.fixed_temperature,
+        thinking_protocol: execution.thinking_protocol,
+        header_overrides: execution.header_overrides.clone(),
+        request_body_overrides: execution.request_body_overrides.clone(),
+        completions_url_override: execution.completions_url_override.clone(),
+        request_timeout: execution.request_timeout_ms.map(Duration::from_millis),
+        context_window: execution.context_window,
+        max_completion_tokens: execution.max_completion_tokens,
     })
 }
 
@@ -3714,10 +3690,9 @@ pub struct ServerAgenticLoopHost {
     /// consumed to materialize a graph, so every later tool round in the user
     /// turn keeps the same effect boundary.
     admitted_workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent,
-    /// Built-in Work admission runs as a bounded preflight in parallel with
-    /// primary request preparation/inference. Its typed capabilities are
-    /// projected before the primary request when ready; the result is
-    /// reconciled before any provider tool side effect. A completed Required
+    /// Built-in semantic admission runs as a bounded preflight, settled before
+    /// primary context construction. A classification started by a typed
+    /// response settles before any provider tool side effect. A Required
     /// decision is materialized through the same synthetic typed `start_work`
     /// boundary only when the provider emitted no durable carrier.
     pending_work_admission_judge: Option<PendingWorkAdmissionJudge>,
@@ -3749,7 +3724,7 @@ pub struct ServerAgenticLoopHost {
     /// The optional semantic sidecar gets at most one attempt per user turn.
     /// An unavailable classifier is not retried inside the same user turn.
     /// Absence or failure leaves primary typed proposals on normal admission.
-    work_admission_attempted: bool,
+    semantic_judgment_attempted: Option<SemanticJudgmentPurpose>,
     /// The sole admission attempt ended without a typed decision. This fact is
     /// retained for diagnostics, not promoted into a runtime prohibition.
     work_admission_unavailable: bool,
@@ -3769,11 +3744,6 @@ pub struct ServerAgenticLoopHost {
     /// A completed post-response Work admission waiting to be projected
     /// through the shared trace/Explain phase fan-out exactly once.
     completed_work_admission_phase: Option<(Instant, Instant, u32, TurnPhaseOutcome)>,
-    /// One synthetic Work declaration may cross the common loop after the
-    /// primary response and before any tool side effect. It is ingested as a
-    /// real lifecycle event, but must not seed prompt-cache diagnostics or
-    /// provider manifests.
-    control_plane_turn_pending: bool,
     /// Per-turn semantic execution choice retained after the initial Work
     /// declaration is consumed. This lets a typed parallel-subrun request
     /// promote its capability without inferring it from prompt text or a
@@ -4481,31 +4451,13 @@ impl HostEventGapTracker {
 
 #[async_trait]
 pub(crate) trait HostInteractionSink: Send + Sync {
-    /// Commit durable replay truth before exposing an interaction. Success is
-    /// the producer's permission to begin waiting for its callback.
-    #[cfg(test)]
-    async fn commit_and_deliver(&self, event: Value) -> Result<(), String>;
-
-    /// Register every approval item in one canonical provider batch before
-    /// execution scheduling begins, then project the batch UI. Durable sinks
-    /// must persist per-item facts before returning.
-    #[cfg(not(test))]
+    /// Register canonical approval facts before projecting the batch UI.
     async fn commit_approval_batch_and_deliver(
         &self,
         event: Value,
-        _expected_control_epoch: i64,
-        _expected_owner_generation: u64,
+        expected_control_epoch: i64,
+        expected_owner_generation: u64,
     ) -> Result<(), String>;
-
-    #[cfg(test)]
-    async fn commit_approval_batch_and_deliver(
-        &self,
-        event: Value,
-        _expected_control_epoch: i64,
-        _expected_owner_generation: u64,
-    ) -> Result<(), String> {
-        self.commit_and_deliver(event).await
-    }
 
     /// Open the exact execution frontier for one registered approval. A
     /// callback for a later item may be durable already, but cannot resume a
@@ -5954,14 +5906,13 @@ impl ServerAgenticLoopHostBuilder {
             pending_classification_observations: Vec::new(),
             work_admission_explain_admission: None,
             pending_classification_executions: BTreeMap::new(),
-            work_admission_attempted: false,
+            semantic_judgment_attempted: None,
             work_admission_unavailable: false,
             work_admission_unavailable_reason: None,
             work_admission_degradation_reported: false,
             work_admission_semantic_diagnostic: None,
             work_admission_skill_revision: 0,
             completed_work_admission_phase: None,
-            control_plane_turn_pending: false,
             work_admission_execution_topology: Default::default(),
             work_admission_topology_authoritative: false,
             work_admission_conflict: None,
@@ -8542,7 +8493,7 @@ impl ServerAgenticLoopHost {
         state: &mut AgenticLoopState,
     ) -> usize {
         let skill_revision = state.skills.execution.invoked.len();
-        if self.work_admission_attempted
+        if self.semantic_judgment_attempted == Some(SemanticJudgmentPurpose::WorkAdmission)
             && self.pending_work_establishment.is_none()
             && skill_revision > self.work_admission_skill_revision
         {
@@ -8558,7 +8509,7 @@ impl ServerAgenticLoopHost {
                 assessment.work_handoff_pending = false;
             }
             self.work_admission_explain_admission = None;
-            self.work_admission_attempted = false;
+            self.semantic_judgment_attempted = None;
             self.work_admission_unavailable = false;
             self.work_admission_unavailable_reason = None;
             self.work_admission_degradation_reported = false;
@@ -8604,7 +8555,7 @@ impl ServerAgenticLoopHost {
                     WorkLifecycleIntent::Required | WorkLifecycleIntent::NotRequired
                 )
             })
-            || self.work_admission_attempted
+            || self.semantic_judgment_attempted == Some(SemanticJudgmentPurpose::WorkAdmission)
         {
             return false;
         }
@@ -8616,7 +8567,7 @@ impl ServerAgenticLoopHost {
             // admission fact for the action/completion gate. BoundaryOnly's
             // ordinary-turn skip remains Unchecked until a typed boundary.
             if reason == "disabled" {
-                self.work_admission_attempted = true;
+                self.semantic_judgment_attempted = Some(SemanticJudgmentPurpose::WorkAdmission);
                 self.work_admission_unavailable = true;
                 self.work_admission_unavailable_reason =
                     Some(WorkAdmissionUnavailableReason::Disabled);
@@ -8633,7 +8584,7 @@ impl ServerAgenticLoopHost {
             );
             return false;
         }
-        self.work_admission_attempted = true;
+        self.semantic_judgment_attempted = Some(SemanticJudgmentPurpose::WorkAdmission);
         self.work_admission_unavailable = false;
         self.work_admission_unavailable_reason = None;
         self.work_admission_semantic_diagnostic = None;
@@ -8751,9 +8702,13 @@ impl ServerAgenticLoopHost {
                     ),
                 )),
             };
-            (result, Instant::now())
+            (
+                result.map(|decision| SemanticJudgmentResult::WorkAdmission(Box::new(decision))),
+                Instant::now(),
+            )
         });
         self.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            purpose: SemanticJudgmentPurpose::WorkAdmission,
             wait_node_id: None,
             handle,
             usage: judge_usage,
@@ -8780,14 +8735,102 @@ impl ServerAgenticLoopHost {
         true
     }
 
-    /// Reconcile the built-in semantic Work preflight without adding another
-    /// model boundary to the happy path. A non-blocking poll is used before
-    /// primary provider I/O; the final reconciliation waits for the bounded
-    /// judge deadline and therefore cannot expose or execute a provider tool
-    /// before the typed Work decision is known.
+    async fn start_user_observation_preflight(&mut self, state: &AgenticLoopState) {
+        if self.turn_intent_policy != TurnIntentExecutionPolicy::Auto
+            || self.semantic_judgment_attempted.is_some()
+            || self.pending_work_admission_judge.is_some()
+            || !state.owns_session_composite_snapshot()
+            || should_skip_auxiliary_llm_for_capacity().is_some()
+        {
+            return;
+        }
+        let context = work_admission_context(state);
+        let Some(human_source) = context.source.as_ref() else {
+            return;
+        };
+        if !context.has_prior_assistant_turn
+            || !state
+                .messages
+                .get(human_source.message_index)
+                .is_some_and(|message| {
+                    astra_turn_types::user_turn_semantics(message)
+                        .is_ok_and(|semantics| semantics.is_none())
+                })
+        {
+            return;
+        }
+        // A bounded observation attempt, including failure or abstention, is
+        // not repeated each provider round. A later actual Work boundary may
+        // still run its own admission judgment; this purpose is not a decision.
+        let Some(source) = delegation_intent_source_from_text(state, &context.message) else {
+            return;
+        };
+        self.semantic_judgment_attempted = Some(SemanticJudgmentPurpose::UserObservation);
+        let request =
+            astra_services::work_admission_judgment::user_turn_observation_request(&context);
+        let Ok(client) = self
+            .judgment_summary_client(state, "user_observation", &request)
+            .await
+        else {
+            return;
+        };
+        let mut judge = SummaryClientWorkAdmissionJudge::new(client);
+        judge.timings = Arc::clone(&self.work_admission_timing_buffer);
+        let usage = Arc::clone(&judge.usage);
+        let started_at = Instant::now();
+        self.on_turn_phase_started(
+            state,
+            TurnPhaseKind::SemanticAdmission,
+            state.current_round_index,
+            SemanticJudgmentPurpose::UserObservation.phase_attempt_index(),
+            started_at,
+        );
+        let handle = tokio::spawn(async move {
+            let result = tokio::time::timeout(TURN_INTENT_JUDGE_DEADLINE, async {
+                let response = judge
+                    .summarize(
+                        "user_observation",
+                        "initial",
+                        &astra_turn_types::judgment_messages(&request),
+                    )
+                    .await?;
+                SummaryClientWorkAdmissionJudge::require_completed(&response)?;
+                astra_services::work_admission_judgment::parse_user_turn_observation(
+                    &request,
+                    &response.text,
+                    &response.model_used,
+                    response.judgment_provenance,
+                )
+                .map(SemanticJudgmentResult::UserObservation)
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(astra_services::TurnIntentJudgeError::Inference(
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ProviderDeadline,
+                        "User observation exceeded the semantic judgment deadline",
+                    ),
+                ))
+            });
+            (result, Instant::now())
+        });
+        self.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            purpose: SemanticJudgmentPurpose::UserObservation,
+            wait_node_id: None,
+            handle,
+            usage,
+            started_at,
+            round_index: state.current_round_index,
+            source: Some(source),
+        });
+    }
+
+    /// Reconcile the owned semantic task. Provider preparation waits for its
+    /// observations before building context; response-triggered admission waits
+    /// before tool effects. Polling remains available to non-execution callers.
     async fn resolve_pending_work_admission(
         &mut self,
-        state: Option<&AgenticLoopState>,
+        mut state: Option<&mut AgenticLoopState>,
         wait: bool,
     ) -> bool {
         let Some(pending) = self.pending_work_admission_judge.as_ref() else {
@@ -8835,6 +8878,7 @@ impl ServerAgenticLoopHost {
             started_at,
             round_index,
             source,
+            purpose,
             ..
         } = self
             .pending_work_admission_judge
@@ -8857,7 +8901,11 @@ impl ServerAgenticLoopHost {
             ),
         };
         if source.as_ref().is_some_and(|expected| {
-            state.and_then(delegation_intent_source_from_state).as_ref() != Some(expected)
+            state
+                .as_deref()
+                .and_then(delegation_intent_source_from_state)
+                .as_ref()
+                != Some(expected)
         }) {
             result = Err(astra_services::TurnIntentJudgeError::Inference(
                 astra_core::ClassifiedError::new(
@@ -8881,6 +8929,52 @@ impl ServerAgenticLoopHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.work_admission_usage.merge(usage);
+        if purpose == SemanticJudgmentPurpose::UserObservation {
+            let phase_outcome = match result {
+                Ok(SemanticJudgmentResult::UserObservation(semantics)) => {
+                    if let Some(state) = state.as_deref_mut() {
+                        let mut intent = state.turn_intent.clone().unwrap_or_default();
+                        intent.objective_relation = semantics.objective_relation;
+                        intent.feedback = semantics.feedback;
+                        intent.assessment = semantics.assessment;
+                        if crate::turn::agentic_loop::lifecycle::apply_current_user_turn_semantics(
+                            state, &intent,
+                        ) {
+                            state.turn_intent = Some(intent);
+                        }
+                    }
+                    TurnPhaseOutcome::Decided
+                }
+                _ => TurnPhaseOutcome::Unavailable,
+            };
+            if let Some(state) = state {
+                crate::turn::agentic_loop::host::complete_turn_phase_at(
+                    self,
+                    state,
+                    TurnPhaseReceipt {
+                        started_at,
+                        finished_at,
+                        phase: TurnPhaseKind::SemanticAdmission,
+                        round_index,
+                        attempt_index: purpose.phase_attempt_index(),
+                        outcome: phase_outcome,
+                        duration_ms: 0,
+                    },
+                    format!("user_observation_{round_index}"),
+                );
+            }
+            // Observations neither authorize nor reject Work admission.
+            return false;
+        }
+        let result = result.and_then(|result| match result {
+            SemanticJudgmentResult::WorkAdmission(decision) => Ok(*decision),
+            SemanticJudgmentResult::UserObservation(_) => Err(
+                astra_services::TurnIntentJudgeError::Inference(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "Work judgment returned an observation-only result",
+                )),
+            ),
+        });
         let observations = std::mem::take(
             &mut *self
                 .work_admission_classification_observations
@@ -9265,21 +9359,35 @@ impl ServerAgenticLoopHost {
             // Work and workspace effects. Keep its minimal typed projection
             // on loop state so delegation and completion policy inherit the
             // same authority instead of running disconnected classifiers.
-            let boundary_intent = decision.turn_intent();
-            if record_feedback && boundary_intent.assessment.is_some() {
-                crate::turn::agentic_loop::lifecycle::record_current_user_turn_semantics(
+            let mut boundary_intent = decision.turn_intent();
+            let observations = self
+                .pending_work_admission
+                .as_ref()
+                .and_then(|owner| owner.user_turn_semantics.as_ref());
+            if let Some(observations) = observations {
+                boundary_intent.objective_relation = observations.objective_relation;
+                boundary_intent.feedback = observations.feedback;
+                boundary_intent.assessment = observations.assessment;
+            }
+            let new_semantics = record_feedback
+                && (observations.is_some() || boundary_intent.assessment.is_some())
+                && crate::turn::agentic_loop::lifecycle::apply_current_user_turn_semantics(
                     state,
                     &boundary_intent,
                 );
-            }
             let mut intent = state.turn_intent.take().unwrap_or_default();
             // Work admission is the authoritative semantic boundary for the
             // fields it projects.  Preserve its typed domain even though the
-            // compact admission contract does not classify scenario,
-            // objective changes, or presentation.  In particular, a memory mutation
+            // compact admission control contract does not classify scenario
+            // or presentation. Optional objective/feedback observations retain
+            // their original source owner. In particular, a memory mutation
             // must bind its executor receipt to the memory domain; retaining
             // a stale/empty value here would make a real receipt look like an
             // unrelated external effect at terminal settlement.
+            if new_semantics {
+                intent.objective_relation = boundary_intent.objective_relation;
+                intent.feedback = boundary_intent.feedback;
+            }
             intent.assessment = intent.assessment.or(boundary_intent.assessment);
             if boundary_intent.domain.is_some()
                 || boundary_intent.workspace_mutation
@@ -9394,31 +9502,32 @@ impl ServerAgenticLoopHost {
                 context,
                 TurnPhaseKind::SemanticAdmission,
                 pending.round_index,
-                0,
+                pending.purpose.phase_attempt_index(),
                 pending.started_at,
             )
             .node_id
         });
-        let observations = std::mem::take(
-            &mut *self
-                .work_admission_classification_observations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        let classification_result = observations
-            .iter()
-            .rev()
-            .map(|observation| observation.fact.result.clone())
-            .next();
-        let not_dispatched = observations.is_empty()
-            && usage_attempts == 0
-            && joined.as_ref().is_err_and(|error| error.is_cancelled());
-        if not_dispatched {
-            self.record_classification_not_dispatched(
-                astra_turn_types::SemanticJudgmentPreDispatchReasonV1::Cancelled,
+        if pending.purpose == SemanticJudgmentPurpose::WorkAdmission {
+            let observations = std::mem::take(
+                &mut *self
+                    .work_admission_classification_observations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
-        } else {
-            self.work_admission_explain_admission =
+            let classification_result = observations
+                .iter()
+                .rev()
+                .map(|observation| observation.fact.result.clone())
+                .next();
+            let not_dispatched = observations.is_empty()
+                && usage_attempts == 0
+                && joined.as_ref().is_err_and(|error| error.is_cancelled());
+            if not_dispatched {
+                self.record_classification_not_dispatched(
+                    astra_turn_types::SemanticJudgmentPreDispatchReasonV1::Cancelled,
+                );
+            } else {
+                self.work_admission_explain_admission =
                 Some(astra_turn_types::ExplainAnalyzeAdmissionSettlementV1 {
                     status:
                         astra_turn_types::ExplainAnalyzeAdmissionSettlementStatusV1::Unavailable,
@@ -9429,9 +9538,10 @@ impl ServerAgenticLoopHost {
                     classification: classification_result,
                     decision: None,
                 });
+            }
+            self.retain_classification_observations(observations, interruption_reason);
+            self.work_admission_semantic_diagnostic = None;
         }
-        self.retain_classification_observations(observations, interruption_reason);
-        self.work_admission_semantic_diagnostic = None;
         for id in node_id.into_iter().chain(pending.wait_node_id) {
             self.finish_explain_analyze_timed_node(&id, terminal_outcome, Instant::now());
         }
@@ -11107,6 +11217,9 @@ impl ServerAgenticLoopHost {
         &mut self,
         state: &AgenticLoopState,
     ) -> Result<ResolvedTurnLlmConfig, String> {
+        if self.admitted_model_execution.is_none() {
+            return Err("Server execution has no admitted Offering material".to_string());
+        }
         self.revalidate_catalog_execution().await?;
         if let Some(config) = self.resolved_llm_config.as_ref() {
             if self.cached_llm_config_matches_state(state) {
@@ -11119,15 +11232,10 @@ impl ServerAgenticLoopHost {
         let effective_model_override = self
             .effective_model_override_for_state(state)
             .map(ToString::to_string);
-        let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
         let llm_cfg = resolve_llm_model_for_turn(
-            &self.matrixone,
-            self.encryptor.as_ref(),
             effective_model_override.as_deref(),
-            pool_ref,
             self.admitted_model_execution.as_ref(),
-        )
-        .await?;
+        )?;
         self.remember_resolved_llm_config(&llm_cfg);
         Ok(llm_cfg)
     }
@@ -11297,15 +11405,7 @@ impl ServerAgenticLoopHost {
                 return Err(JudgmentClientUnavailable::RouteUnavailable);
             }
         };
-        let route = resolve_llm_model_for_turn(
-            &self.matrixone,
-            &self.encryptor,
-            None,
-            Some(pool.get()),
-            Some(&execution),
-        )
-        .await
-        .map_err(|error| {
+        let route = resolve_llm_model_for_turn(None, Some(&execution)).map_err(|error| {
             tracing::warn!(operation_id, %error, "configured judgment route unavailable");
             JudgmentClientUnavailable::RouteUnavailable
         })?;
@@ -12786,34 +12886,8 @@ impl ServerAgenticLoopHost {
     /// for its callback. Production installs a durable sink; direct host tests
     /// fall back to bounded channel send, which is still lossless.
     #[cfg(test)]
-    async fn emit_committed_interaction(&mut self, mut event: Value) -> Result<(), String> {
-        if !Self::interaction_event_requires_commit(&event) {
-            let fault = Self::event_route_contract_error(
-                &event,
-                "committed interaction lane",
-                "emit_progress_event",
-            );
-            let message = fault.message.clone();
-            self.record_event_protocol_fault(fault);
-            return Err(message);
-        }
-        self.attach_execution_metadata_to_tool_event(&mut event);
-        let streaming_turn = self.streaming_turn_started || self.interaction_sink.is_some();
-
-        if let Some(sink) = self.interaction_sink.clone() {
-            sink.commit_and_deliver(event.clone()).await?;
-        } else if let Some(sender) = self.event_tx.as_ref().map(|sender| sender.tx.clone()) {
-            sender
-                .send(event.clone())
-                .await
-                .map_err(|_| "interaction delivery lane is closed".to_string())?;
-        } else {
-            return Err("interactive event has no durable delivery owner".to_string());
-        }
-
-        self.mirror_agent_live_event(&event);
-        self.retain_emitted_event(event, streaming_turn);
-        Ok(())
+    async fn emit_committed_interaction(&mut self, event: Value) -> Result<(), String> {
+        self.emit_committed_approval_batch(event, -1, 0).await
     }
 
     async fn emit_committed_approval_batch(
@@ -14823,9 +14897,7 @@ impl ServerAgenticLoopHost {
             tool_calls.retain(|call| !cloud_tool_requires_approval_for_delivery(call));
         }
 
-        let indices = (0..tool_calls.len())
-            .map(astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx::ServerToolCall)
-            .collect::<Vec<_>>();
+        let indices = (0..tool_calls.len()).collect::<Vec<_>>();
         let batches = crate::turn::agentic::headless_round::
             partition_tool_batches_with_provider_policy_and_serial_gate(
                 &indices,
@@ -14926,16 +14998,7 @@ impl ServerAgenticLoopHost {
             };
             let batch_calls = batch_indices
                 .iter()
-                .filter_map(|index| {
-                    match index {
-                    astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx::ServerToolCall(
-                        index,
-                    ) => tool_calls.get(*index),
-                    astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx::SyntheticEdge(
-                        _,
-                    ) => None,
-                }
-                })
+                .filter_map(|index| tool_calls.get(*index))
                 .collect::<Vec<_>>();
             if batch_calls.is_empty() {
                 continue;
@@ -17599,7 +17662,6 @@ impl ServerAgenticLoopHost {
             turn = state.session_turn,
             "materializing semantic Work admission at the lifecycle boundary"
         );
-        self.control_plane_turn_pending = true;
         let start_work = admitted
             .pop()
             .expect("the length check above guarantees one canonical Work call");
@@ -17618,7 +17680,7 @@ impl ServerAgenticLoopHost {
         Ok(Some(HostTurnResult {
             accum,
             ttft_ms: Some(turn_started.elapsed().as_millis() as u64),
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         }))
     }
@@ -18795,19 +18857,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         true // Server injects guidance into the system prompt in execute_turn.
     }
 
-    fn requires_turn_intent_decision(&self) -> bool {
-        // The built-in auxiliary admission judge is an optimization and a
-        // typed Work projection, not the only authority capable of starting
-        // a safe turn.  If it times out or is unavailable, the primary model
-        // still receives the normal Work contract and can establish Work
-        // through `start_work`; returning an empty turn here makes the CLI
-        // retry the same user request and is materially worse than that
-        // bounded fallback.  Hosts with a genuinely mandatory sidecar may
-        // still opt in through the trait method (the lifecycle keeps that
-        // fail-closed path for them).
-        false
-    }
-
     fn on_turn_started(&mut self, state: &AgenticLoopState) {
         self.work_admission_explain_admission = None;
         *self
@@ -19190,20 +19239,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         true
     }
 
-    fn consume_control_plane_turn(
-        &mut self,
-        _result: &crate::turn::agentic_loop::host::HostTurnResult,
-    ) -> crate::turn::agentic_loop::host::ControlPlaneTurnBoundary {
-        if std::mem::take(&mut self.control_plane_turn_pending) {
-            // Work admission replaces provisional provider prose with a
-            // canonical lifecycle carrier, but the provider request and its
-            // usage already happened and must remain in round accounting.
-            crate::turn::agentic_loop::host::ControlPlaneTurnBoundary::ProviderBacked
-        } else {
-            crate::turn::agentic_loop::host::ControlPlaneTurnBoundary::Ordinary
-        }
-    }
-
     async fn judge_turn_intent(
         &mut self,
         state: &AgenticLoopState,
@@ -19250,7 +19285,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 reason = "work_already_bound",
                 "turn intent judge skipped for an already-bound Work"
             );
-            return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault;
+            self.start_user_observation_preflight(state).await;
+            return if self.pending_work_admission_judge.is_some() {
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Pending
+            } else {
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault
+            };
         }
         if self.turn_intent_policy == TurnIntentExecutionPolicy::FixedDefault {
             // FixedDefault is used by delegated sub-runs because their parent
@@ -19268,9 +19308,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
             return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault;
         }
-        // Auto may start bounded semantic admission in parallel with the
-        // primary request only in the explicit Always policy. The default
-        // waits until a typed provider boundary has an immediate admission
+        // Auto may start bounded semantic admission in the explicit Always
+        // policy; execute_turn settles it before preparing provider context.
+        // The default waits until a typed boundary has an immediate admission
         // consumer. If no durable inference material is available, action
         // and completion both fail closed below.
         if self
@@ -19279,7 +19319,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         {
             crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Pending
         } else {
-            crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
+            self.start_user_observation_preflight(state).await;
+            if self.pending_work_admission_judge.is_some() {
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Pending
+            } else {
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
+            }
         }
     }
 
@@ -19546,7 +19591,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         self.pending_work_admission = None;
         self.pending_work_establishment = None;
         self.work_establishment_hydrated = false;
-        self.work_admission_attempted = false;
+        self.semantic_judgment_attempted = None;
         self.work_admission_unavailable = false;
         self.work_admission_unavailable_reason = None;
         self.work_admission_degradation_reported = false;
@@ -19616,6 +19661,31 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // before another LLM is allowed to reinterpret the same user intent.
         self.hydrate_pending_work_establishment(state).await?;
         self.reconcile_work_admission_skill_revision(state).await;
+        self.start_user_observation_preflight(state).await;
+        // User feedback must reach WorkingMemory before this request's context
+        // is assembled. Settling the semantic owner does not materialize its
+        // Work graph; the existing post-response carrier boundary still does.
+        let cancellation = state.cancellation.clone();
+        let cancel = match (&cancellation.flag, &cancellation.token) {
+            (Some(flag), Some(token)) => LlmCancel::FlagAndToken(flag, token),
+            (Some(flag), None) => LlmCancel::Flag(flag),
+            (None, Some(token)) => LlmCancel::Token(token),
+            (None, None) => LlmCancel::None,
+        };
+        let cancelled = tokio::select! {
+            biased;
+            _ = crate::turn::llm::client::wait_llm_cancel(cancel) => true,
+            _ = self.resolve_pending_work_admission(Some(state), true) => false,
+        };
+        if cancelled {
+            self.abort_pending_work_admission().await;
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Cancelled,
+                "Execution cancelled while awaiting semantic judgment",
+            ));
+        }
+        self.flush_completed_work_admission_phase(state);
+        let request_preparation_started = Instant::now();
         // This begins after semantic admission has completed in the shared
         // lifecycle. It therefore measures actual pre-provider work (model
         // resolution, cooldown, prompt/context construction, and durable
@@ -19627,17 +19697,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             TurnPhaseKind::RequestPreparation,
             state.current_round_index,
             0,
-            turn_started,
+            request_preparation_started,
         );
 
-        // Reconcile a fast semantic preflight before the primary request so
-        // its typed optional capabilities (for example `agent_fanout`) are
-        // projected onto the provider surface. Do not materialize Required
-        // Work here: the provider may emit a complete typed execution
-        // carrier, and preempting it would rewrite the requested topology.
-        // If no carrier is emitted, the post-response boundary below creates
-        // the server-owned synthetic `start_work` exactly once.
-        self.resolve_pending_work_admission(Some(state), false).await;
         if let Some(error) = self.work_admission_terminal_error() {
             tracing::error!(
                 target: "astra::turn_intent",
@@ -19652,7 +19714,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
 
         // ── 1. Resolve LLM model ────────────────────────────────────────
-        let mut llm_cfg = match self.resolve_llm_config_for_state(state).await {
+        let llm_cfg = match self.resolve_llm_config_for_state(state).await {
             Ok(m) => m,
             Err(e) => {
                 let message = format!("Model resolution failed: {e}");
@@ -19662,7 +19724,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 );
                 self.complete_request_preparation_phase(
                     state,
-                    turn_started,
+                    request_preparation_started,
                     0,
                     &mut request_preparation_recorded_attempts,
                     TurnPhaseOutcome::Failed,
@@ -19670,13 +19732,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 return Err(error);
             }
         };
-        let fallback_chain = llm_cfg.fallback_chain.clone();
-        let credential_owner = llm_cfg.clone();
-        let has_fallback = !fallback_chain.is_empty();
-
-        // ── 1b. Check rate-limit cooldown and handle fallback model resolution ──
+        // ── 1b. Honor cooldown for the admitted Offering ──
         let cooldown = rate_limit_cooldown();
-        match cooldown.with(&llm_cfg.model_name, |c| c.check_request(has_fallback)) {
+        match cooldown.with(&llm_cfg.model_name, |c| c.check_request()) {
             RateLimitAction::Proceed => {}
             RateLimitAction::WaitAndRetry { delay_ms } => {
                 astra_core::agent_info!(
@@ -19688,56 +19746,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 {
                     self.complete_request_preparation_phase(
                         state,
-                        turn_started,
+                        request_preparation_started,
                         0,
                         &mut request_preparation_recorded_attempts,
                         TurnPhaseOutcome::Failed,
                     );
                     return Err(error);
-                }
-            }
-            RateLimitAction::UseFallback { reason } => {
-                let mx = &self.matrixone;
-                let enc = self.encryptor.as_ref();
-                let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
-                match try_resolve_same_owner_fallback(
-                    cooldown,
-                    &fallback_chain,
-                    reason,
-                    mx,
-                    enc,
-                    pool_ref,
-                    &credential_owner,
-                )
-                .await
-                {
-                    FallbackOutcome::Resolved(fb) => {
-                        llm_cfg = fb;
-                    }
-                    FallbackOutcome::NoFallbackConfigured => {
-                        astra_core::agent_warn!(
-                            "llm",
-                            "rate-limit cooldown: fallback requested ({}) but no fallback configured",
-                            reason.as_str()
-                        );
-                    }
-                    FallbackOutcome::AllExhausted { chain_len } => {
-                        let error = astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::RateLimit,
-                            format!(
-                                "Rate limit cooldown requires a same-owner fallback, but all {chain_len} configured candidates are unavailable ({})",
-                                reason.as_str()
-                            ),
-                        );
-                        self.complete_request_preparation_phase(
-                            state,
-                            turn_started,
-                            0,
-                            &mut request_preparation_recorded_attempts,
-                            TurnPhaseOutcome::Failed,
-                        );
-                        return Err(error);
-                    }
                 }
             }
             RateLimitAction::Reject {
@@ -19754,7 +19768,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 );
                 self.complete_request_preparation_phase(
                     state,
-                    turn_started,
+                    request_preparation_started,
                     0,
                     &mut request_preparation_recorded_attempts,
                     TurnPhaseOutcome::Failed,
@@ -19905,7 +19919,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }
                 self.complete_request_preparation_phase(
                     state,
-                    turn_started,
+                    request_preparation_started,
                     0,
                     &mut request_preparation_recorded_attempts,
                     TurnPhaseOutcome::Failed,
@@ -20024,7 +20038,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }
                 self.complete_request_preparation_phase(
                     state,
-                    turn_started,
+                    request_preparation_started,
                     0,
                     &mut request_preparation_recorded_attempts,
                     TurnPhaseOutcome::Failed,
@@ -20162,7 +20176,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }
                 self.complete_request_preparation_phase(
                     state,
-                    turn_started,
+                    request_preparation_started,
                     0,
                     &mut request_preparation_recorded_attempts,
                     TurnPhaseOutcome::Failed,
@@ -20412,10 +20426,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let repeated_provider_output_cap;
             // A retry begins a new physical provider attempt.  Its preparation
             // receipt must not inherit the elapsed inference time of the
-            // preceding attempt; the first attempt intentionally starts at
-            // turn admission so it also accounts for initial request setup.
+            // preceding attempt; the first attempt starts after semantic
+            // settlement and includes only actual request preparation.
             let request_attempt_started_at = if attempt_in_round == 0 {
-                turn_started
+                request_preparation_started
             } else {
                 Instant::now()
             };
@@ -21075,55 +21089,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         route: execution_route.borrowed(),
                         max_output_tokens: Some(effective_max_output),
                         temperature: None,
-                        has_fallback,
                         thinking: &primary_thinking,
                     };
                     let llm_cancel = llm_cancel_for_state(state);
-                    match (dispatch_budget.client_timeout, use_no_tool_choice) {
-                        (Some(budget), true) => {
-                            call_llm_and_collect_with_stream_callback_and_budget_and_no_tool_choice(
-                                call,
-                                llm_cancel,
-                                Some(&mut on_stream_update),
-                                Some(&explain_provider_attempt_observer),
-                                budget,
-                            )
-                            .await
-                        }
-                        (Some(budget), false) => {
-                            call_llm_and_collect_with_stream_callback_and_budget(
-                                call,
-                                llm_cancel,
-                                Some(&mut on_stream_update),
-                                Some(&explain_provider_attempt_observer),
-                                budget,
-                            )
-                            .await
-                        }
-                        (None, true) => {
-                            call_llm_and_collect_with_stream_callback_and_no_tool_choice(
-                                call,
-                                llm_cancel,
-                                Some(&mut on_stream_update),
-                                Some(&explain_provider_attempt_observer),
-                            )
-                            .await
-                        }
-                        (None, false) => {
-                            // The schema remains on the wire so the provider can
-                            // reuse the prior prefix. The explicit wire-level choice
-                            // asks for text, while the host-owned admission gate
-                            // still prevents a terminal response from executing a
-                            // tool if a provider violates that contract.
-                            call_llm_and_collect_with_stream_callback(
-                                call,
-                                llm_cancel,
-                                Some(&mut on_stream_update),
-                                Some(&explain_provider_attempt_observer),
-                            )
-                            .await
-                        }
-                    }
+                    call_llm_and_collect_with_stream_callback(
+                        call,
+                        llm_cancel,
+                        Some(&mut on_stream_update),
+                        Some(&explain_provider_attempt_observer),
+                        if use_no_tool_choice { RuntimeToolChoice::None } else { RuntimeToolChoice::Auto },
+                        dispatch_budget.client_timeout,
+                    ).await
                 };
                 // Root answer text stays provisional while Work admission is
                 // unresolved, but a provider failure closes that admission
@@ -21312,36 +21288,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // Fatal handler can trigger auto-compaction + retry.
             let mut r = match r {
                 Ok(r) => r,
-                Err(e)
-                    if let Some(reason) =
-                        crate::turn::model_cooldown::fallback_required_reason(&e) =>
-                {
-                    record_llm_main_attempt_metrics(
-                        "call",
-                        attempt_label,
-                        llm_main_error_outcome(&e),
-                        admission_estimated_tokens as u64,
-                    );
-                    record_full_llm_response_event(
-                        state,
-                        self.full_llm_capture,
-                        &self.session_id,
-                        "server_loop_host",
-                        &llm_cfg.model_name,
-                        &llm_cfg.provider,
-                        cache_cap,
-                        attempt_in_round,
-                        "fallback_required",
-                        llm_capture_error_response(&e),
-                    );
-                    durable_invocation.finish_error(&e).await?;
-                    return Err(astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::ContractViolation,
-                        format!(
-                            "admitted Offering attempted to cross its credential-owner boundary: {reason:?}"
-                        ),
-                    ));
-                }
                 Err(ref e) if e.kind == astra_core::ErrorKind::ContextWindow => {
                     record_llm_main_attempt_metrics(
                         "call",
@@ -21431,7 +21377,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     return Ok(HostTurnResult {
                         accum,
                         ttft_ms,
-                        edge_tool_round: Vec::new(),
+
                         error_kind: Some(astra_core::ErrorKind::ContextWindow),
                     });
                 }
@@ -21897,9 +21843,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 .await;
         }
 
-        // The primary request was allowed to overlap the semantic preflight,
-        // but its provider response is not yet an executable boundary. Once
-        // the bounded judge settles, materialize the authoritative graph
+        // A typed response may start a new semantic admission task when the
+        // ordinary turn did not require one. Settle it and materialize the graph
         // before any model-requested tool can enter the tool phase. The
         // primary response was already durably observed/captured above; the
         // next loop iteration will use the newly bound, stable Work surface.
@@ -22204,7 +22149,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         Ok(HostTurnResult {
             accum,
             ttft_ms,
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         })
         }
@@ -23456,7 +23401,7 @@ mod tests {
         let result = HostTurnResult {
             accum: ChatTurnSseAccum::default(),
             ttft_ms: None,
-            edge_tool_round: Vec::new(),
+
             error_kind: Some(astra_core::ErrorKind::StreamTransport),
         };
         assert_eq!(
@@ -25720,7 +25665,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HostInteractionSink for FixedApprovalSettlementSink {
-        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+        async fn commit_approval_batch_and_deliver(
+            &self,
+            _event: Value,
+            _expected_control_epoch: i64,
+            _expected_owner_generation: u64,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -26168,6 +26118,7 @@ mod tests {
         let finished_at = started_at + Duration::from_millis(5);
         let decision = astra_services::parse_work_admission_response(r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary"}"#).unwrap();
         host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            purpose: SemanticJudgmentPurpose::WorkAdmission,
             wait_node_id: None,
             handle: tokio::spawn(async move { (Ok(decision.into()), finished_at) }),
             usage: Default::default(),
@@ -26219,6 +26170,7 @@ mod tests {
                 }),
         );
         host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            purpose: SemanticJudgmentPurpose::WorkAdmission,
             wait_node_id: None,
             handle: tokio::spawn(std::future::pending()),
             usage: Default::default(),
@@ -26239,6 +26191,7 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire)
         );
         host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            purpose: SemanticJudgmentPurpose::WorkAdmission,
             wait_node_id: None,
             handle: tokio::spawn(async {
                 (
@@ -26269,62 +26222,95 @@ mod tests {
 
     #[tokio::test]
     async fn work_judgment_cancellation_closes_live_span_once() {
-        let mut host = test_host_builder("u", "s").build();
-        let mut state = create_test_state();
-        state.current_run_id = Some("cancel-run".into());
-        host.on_turn_started(&state);
-        let started_at = Instant::now();
-        host.on_turn_phase_started(&state, TurnPhaseKind::SemanticAdmission, 0, 0, started_at);
-        host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
-            wait_node_id: None,
-            handle: tokio::spawn(std::future::pending()),
-            usage: Arc::new(std::sync::Mutex::new(WorkAdmissionUsage {
-                completed_calls: 0,
-                qualified_usage: None,
-                attempts: 1,
-                provider_reported: 1,
-                usage: crate::turn::token_usage::TokenUsage {
-                    input_tokens: 17,
-                    ..Default::default()
-                },
-            })),
-            started_at,
-            round_index: 0,
-            source: None,
-        });
-        let task = host
-            .pending_work_admission_judge
-            .as_ref()
-            .unwrap()
-            .handle
-            .abort_handle();
-        {
-            let mut resolving = Box::pin(host.resolve_pending_work_admission(None, true));
-            assert!(futures_util::poll!(&mut resolving).is_pending());
+        for purpose in [
+            SemanticJudgmentPurpose::WorkAdmission,
+            SemanticJudgmentPurpose::UserObservation,
+        ] {
+            let mut host = test_host_builder("u", "s").build();
+            let mut state = create_test_state();
+            state.current_run_id = Some("cancel-run".into());
+            host.on_turn_started(&state);
+            let started_at = Instant::now();
+            host.on_turn_phase_started(
+                &state,
+                TurnPhaseKind::SemanticAdmission,
+                0,
+                purpose.phase_attempt_index(),
+                started_at,
+            );
+            host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+                purpose,
+                wait_node_id: None,
+                handle: tokio::spawn(std::future::pending()),
+                usage: Arc::new(std::sync::Mutex::new(WorkAdmissionUsage {
+                    completed_calls: 0,
+                    qualified_usage: None,
+                    attempts: 1,
+                    provider_reported: 1,
+                    usage: crate::turn::token_usage::TokenUsage {
+                        input_tokens: 17,
+                        ..Default::default()
+                    },
+                })),
+                started_at,
+                round_index: 0,
+                source: None,
+            });
+            let task = host
+                .pending_work_admission_judge
+                .as_ref()
+                .unwrap()
+                .handle
+                .abort_handle();
+            let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+            state.cancellation.token = Some(Arc::clone(&cancel));
+            {
+                let mut executing = Box::pin(host.execute_turn(&mut state));
+                assert!(futures_util::poll!(&mut executing).is_pending());
+                cancel.cancel();
+                let outcome = tokio::time::timeout(Duration::from_millis(500), &mut executing)
+                    .await
+                    .expect("real cancellation must interrupt pending semantic judgment");
+                let error = match outcome {
+                    Err(error) => error,
+                    Ok(_) => panic!("cancelled judgment must not proceed to provider admission"),
+                };
+                assert_eq!(error.kind, astra_core::ErrorKind::Cancelled);
+                let details: Value =
+                    serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+                assert_eq!(details["work_admission_usage"]["attempts"], 1);
+                assert_eq!(details["work_admission_usage"]["input_tokens"], 17);
+            }
+            host.abort_pending_work_admission().await;
+            assert!(task.is_finished());
+            assert_eq!(host.work_admission_usage.attempts, 0);
+            assert_eq!(state.total_prompt, 17);
+            assert_eq!(state.token_usage_coverage().attempts, 1);
+            host.abort_pending_work_admission().await;
+            assert_eq!(state.total_prompt, 17);
+            assert_eq!(
+                host.work_admission_explain_admission.is_some(),
+                purpose == SemanticJudgmentPurpose::WorkAdmission
+            );
+            let events = host.take_emitted_events();
+            let stages = events
+                .iter()
+                .filter(|e| e["kind"] == "admission")
+                .collect::<Vec<_>>();
+            assert_eq!(stages.len(), 2);
+            assert_eq!(stages[1]["outcome"], "cancelled");
+            let waits = events
+                .iter()
+                .filter(|e| e["kind"] == "wait")
+                .collect::<Vec<_>>();
+            assert_eq!(waits.len(), 2);
+            assert_eq!(waits[1]["outcome"], "cancelled");
+            assert!(host.explain_analyze_open_nodes.values().all(|n| !matches!(
+                n.kind,
+                astra_turn_types::ExplainAnalyzeNodeKindV1::Admission
+                    | astra_turn_types::ExplainAnalyzeNodeKindV1::Wait
+            )));
         }
-        host.abort_pending_work_admission().await;
-        host.abort_pending_work_admission().await;
-        assert!(task.is_finished());
-        assert_eq!(host.work_admission_usage.attempts, 1);
-        assert_eq!(host.work_admission_usage.usage.input_tokens, 17);
-        let events = host.take_emitted_events();
-        let stages = events
-            .iter()
-            .filter(|e| e["kind"] == "admission")
-            .collect::<Vec<_>>();
-        assert_eq!(stages.len(), 2);
-        assert_eq!(stages[1]["outcome"], "cancelled");
-        let waits = events
-            .iter()
-            .filter(|e| e["kind"] == "wait")
-            .collect::<Vec<_>>();
-        assert_eq!(waits.len(), 2);
-        assert_eq!(waits[1]["outcome"], "cancelled");
-        assert!(host.explain_analyze_open_nodes.values().all(|n| !matches!(
-            n.kind,
-            astra_turn_types::ExplainAnalyzeNodeKindV1::Admission
-                | astra_turn_types::ExplainAnalyzeNodeKindV1::Wait
-        )));
     }
 
     #[test]
@@ -26938,6 +26924,7 @@ mod tests {
                     interrupted: false,
                 });
             host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+                purpose: SemanticJudgmentPurpose::WorkAdmission,
                 wait_node_id: None,
                 handle: tokio::spawn(async {
                     (
@@ -27027,6 +27014,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            purpose: SemanticJudgmentPurpose::WorkAdmission,
             wait_node_id: None,
             handle,
             usage: Default::default(),
@@ -27065,11 +27053,15 @@ mod tests {
             let planner =
                 SummaryClientWorkAdmissionJudge::new(Box::new(PendingClassificationClient));
             (
-                judge.classify_and_plan(&planner, &Default::default()).await,
+                judge
+                    .classify_and_plan(&planner, &Default::default())
+                    .await
+                    .map(|decision| SemanticJudgmentResult::WorkAdmission(Box::new(decision))),
                 Instant::now(),
             )
         });
         host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            purpose: SemanticJudgmentPurpose::WorkAdmission,
             wait_node_id: None,
             handle,
             usage,
@@ -27397,9 +27389,14 @@ mod tests {
             provider_reported: 1,
         }));
         host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            purpose: SemanticJudgmentPurpose::WorkAdmission,
             wait_node_id: None,
             handle: tokio::spawn(async {
-                std::future::pending::<(WorkAdmissionDecisionResult, Instant)>().await
+                std::future::pending::<(
+                    Result<SemanticJudgmentResult, astra_services::TurnIntentJudgeError>,
+                    Instant,
+                )>()
+                .await
             }),
             usage,
             started_at: Instant::now(),
@@ -27431,6 +27428,7 @@ mod tests {
             provider_reported: 1,
         }));
         host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            purpose: SemanticJudgmentPurpose::WorkAdmission,
             wait_node_id: None,
             handle: tokio::spawn(async { panic!("injected admission task failure") }),
             usage,
@@ -27510,7 +27508,7 @@ mod tests {
                         ..Default::default()
                     },
                     ttft_ms: None,
-                    edge_tool_round: Vec::new(),
+
                     error_kind: None,
                 }),
             )
@@ -28500,7 +28498,6 @@ mod tests {
             thinking_capability: None,
             fixed_temperature: None,
             thinking_protocol: None,
-            fallback_chain: Vec::new(),
             header_overrides: HashMap::new(),
             request_body_overrides: None,
             completions_url_override: None,
@@ -28518,7 +28515,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HostInteractionSink for InMemoryInteractionSink {
-        async fn commit_and_deliver(&self, event: Value) -> Result<(), String> {
+        async fn commit_approval_batch_and_deliver(
+            &self,
+            event: Value,
+            _expected_control_epoch: i64,
+            _expected_owner_generation: u64,
+        ) -> Result<(), String> {
             self.committed.lock().expect("interaction sink").push(event);
             Ok(())
         }
@@ -28574,7 +28576,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HostInteractionSink for RecordingApprovalCleanupSink {
-        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+        async fn commit_approval_batch_and_deliver(
+            &self,
+            _event: Value,
+            _expected_control_epoch: i64,
+            _expected_owner_generation: u64,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -28617,7 +28624,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HostInteractionSink for PendingApprovalInteractionSink {
-        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+        async fn commit_approval_batch_and_deliver(
+            &self,
+            _event: Value,
+            _expected_control_epoch: i64,
+            _expected_owner_generation: u64,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -28635,7 +28647,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HostInteractionSink for PolledApprovalInteractionSink {
-        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+        async fn commit_approval_batch_and_deliver(
+            &self,
+            _event: Value,
+            _expected_control_epoch: i64,
+            _expected_owner_generation: u64,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -28654,7 +28671,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HostInteractionSink for ImmediatelyResolvedApprovalDeliverySink {
-        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+        async fn commit_approval_batch_and_deliver(
+            &self,
+            _event: Value,
+            _expected_control_epoch: i64,
+            _expected_owner_generation: u64,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -28739,7 +28761,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HostInteractionSink for AlreadyCommittedInteractionSink {
-        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+        async fn commit_approval_batch_and_deliver(
+            &self,
+            _event: Value,
+            _expected_control_epoch: i64,
+            _expected_owner_generation: u64,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -28771,7 +28798,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HostInteractionSink for PartiallySupersedingInteractionSink {
-        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+        async fn commit_approval_batch_and_deliver(
+            &self,
+            _event: Value,
+            _expected_control_epoch: i64,
+            _expected_owner_generation: u64,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -28807,7 +28839,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HostInteractionSink for FailingGuardedInteractionSink {
-        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+        async fn commit_approval_batch_and_deliver(
+            &self,
+            _event: Value,
+            _expected_control_epoch: i64,
+            _expected_owner_generation: u64,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -29392,7 +29429,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HostInteractionSink for RecordingProjectionInteractionSink {
-        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+        async fn commit_approval_batch_and_deliver(
+            &self,
+            _event: Value,
+            _expected_control_epoch: i64,
+            _expected_owner_generation: u64,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -35558,11 +35600,11 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        let second = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_durable_base(
+        let second = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_deltas(
             first.transition_id.clone(),
             first.result.clone(),
             durable_base.clone(),
-            &after_first,
+            vec![first_provider_response.clone()],
             vec![assistant.clone(), retry_authority.clone()],
         )
         .unwrap();
@@ -39815,6 +39857,7 @@ mod tests {
                 execution_topology: astra_services::WorkExecutionTopology::Primary,
                 required_capabilities: Vec::new(),
             },
+            user_turn_semantics: None,
             delegation_model_requirement: Some(astra_services::WorkAdmissionTruth::Yes),
             source: None,
             work_handoff_pending: true,
@@ -39849,9 +39892,14 @@ mod tests {
             provider_reported: 1,
         }));
         running.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            purpose: SemanticJudgmentPurpose::WorkAdmission,
             wait_node_id: None,
             handle: tokio::spawn(async {
-                std::future::pending::<(WorkAdmissionDecisionResult, Instant)>().await
+                std::future::pending::<(
+                    Result<SemanticJudgmentResult, astra_services::TurnIntentJudgeError>,
+                    Instant,
+                )>()
+                .await
             }),
             usage,
             started_at: Instant::now(),
@@ -40605,6 +40653,7 @@ mod tests {
                 execution_topology: astra_services::WorkExecutionTopology::Primary,
                 required_capabilities: Vec::new(),
             },
+            user_turn_semantics: None,
             delegation_model_requirement: Some(astra_services::WorkAdmissionTruth::Yes),
             source: None,
             work_handoff_pending: true,
@@ -40816,15 +40865,18 @@ mod tests {
             required_capabilities: Vec::new(),
         };
         host.pending_work_admission_judge = Some(PendingWorkAdmissionJudge {
+            purpose: SemanticJudgmentPurpose::WorkAdmission,
             wait_node_id: None,
             handle: tokio::spawn(async move {
                 (
                     Ok(ClassifiedWorkAdmission {
                         decision,
+                        user_turn_semantics: None,
                         delegation_model_requirement: Some(astra_services::WorkAdmissionTruth::Yes),
                         source: None,
                         work_handoff_pending: true,
-                    }),
+                    }
+                    .into()),
                     Instant::now(),
                 )
             }),
@@ -40836,7 +40888,7 @@ mod tests {
         state.user_intent = "Review with A".into();
         assert!(
             !host
-                .resolve_pending_work_admission(Some(&state), true)
+                .resolve_pending_work_admission(Some(&mut state), true)
                 .await
         );
         assert!(host.pending_work_admission.is_none());
@@ -40870,6 +40922,7 @@ mod tests {
         let source = delegation_intent_source_from_state(&state).unwrap();
         let assessment = |source, truth| ClassifiedWorkAdmission {
             decision: decision.clone(),
+            user_turn_semantics: None,
             delegation_model_requirement: Some(truth),
             source: Some(source),
             work_handoff_pending: true,
@@ -41338,7 +41391,7 @@ mod tests {
                         ..Default::default()
                     },
                     ttft_ms: None,
-                    edge_tool_round: Vec::new(),
+
                     error_kind: None,
                 },
             };
@@ -42364,13 +42417,6 @@ mod tests {
                 astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::WorkEstablishment
             )
         );
-        assert_eq!(
-            crate::turn::agentic_loop::host::AgenticLoopHost::consume_control_plane_turn(
-                &mut host,
-                &replacement,
-            ),
-            crate::turn::agentic_loop::host::ControlPlaneTurnBoundary::ProviderBacked
-        );
     }
 
     #[test]
@@ -43083,6 +43129,7 @@ mod tests {
         };
         host.apply_classified_work_admission(ClassifiedWorkAdmission {
             decision: initial_decision.clone(),
+            user_turn_semantics: None,
             delegation_model_requirement: Some(astra_services::WorkAdmissionTruth::Yes),
             source: None,
             work_handoff_pending: true,
@@ -43894,6 +43941,7 @@ mod tests {
                 execution_topology: astra_services::WorkExecutionTopology::Primary,
                 required_capabilities: Vec::new(),
             },
+            user_turn_semantics: None,
             delegation_model_requirement: Some(astra_services::WorkAdmissionTruth::Yes),
             source: None,
             work_handoff_pending: true,
@@ -43914,7 +43962,7 @@ mod tests {
                 classification: None,
                 decision: Some(adopted),
             });
-        host.work_admission_attempted = true;
+        host.semantic_judgment_attempted = Some(SemanticJudgmentPurpose::WorkAdmission);
         host.work_admission_skill_revision = 0;
         host.work_admission_recovery_used
             .store(true, std::sync::atomic::Ordering::Release);
@@ -43950,7 +43998,7 @@ mod tests {
             host.work_admission_explain_admission.is_none(),
             "a superseded settlement must not be published as the new turn's decision"
         );
-        assert!(!host.work_admission_attempted);
+        assert!(host.semantic_judgment_attempted.is_none());
         assert!(!host.work_admission_topology_authoritative);
         assert!(
             host.work_admission_recovery_used
@@ -43964,7 +44012,7 @@ mod tests {
         host.start_work_admission_preflight(&state, true, true)
             .await;
         assert!(
-            host.work_admission_attempted,
+            host.semantic_judgment_attempted.is_some(),
             "the invalidated owned projection must not prevent fresh admission"
         );
         assert!(host.pending_work_admission_judge.is_some());
@@ -43999,7 +44047,7 @@ mod tests {
     #[tokio::test]
     async fn skill_refresh_preserves_independent_caller_work_intent() {
         let mut host = test_host_builder("u-caller-refresh", "s-caller-refresh").build();
-        host.work_admission_attempted = true;
+        host.semantic_judgment_attempted = Some(SemanticJudgmentPurpose::WorkAdmission);
         let mut state = create_test_state();
         state.turn_intent = Some(astra_config::user_profile::TurnIntent {
             work_lifecycle: WorkLifecycleIntent::Required,
@@ -44026,7 +44074,7 @@ mod tests {
                 .start_work_admission_preflight(&state, true, true)
                 .await
         );
-        assert!(!host.work_admission_attempted);
+        assert!(host.semantic_judgment_attempted.is_none());
     }
 
     #[test]
@@ -44616,125 +44664,6 @@ mod tests {
         );
     }
 
-    // ── Mock host tests for agentic loop integration ───────────────────────
-
-    /// A mock host that returns pre-configured results, simulating
-    /// ServerAgenticLoopHost behavior without network calls.
-    struct MockServerHost {
-        turns: Vec<HostTurnResult>,
-        valid_tools: HashSet<String>,
-        emitted: Vec<String>,
-    }
-
-    fn edge_runtime_environment_fields() -> serde_json::Map<String, Value> {
-        let registry = astra_runtime_env::ToolRegistry::builtins();
-        let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
-            astra_runtime_env::RunBinding::edge_developer("/workspace/project", &registry),
-        );
-        serde_json::Map::from_iter([(
-            "runtime_environment_advertisement".to_string(),
-            serde_json::to_value(advertisement).expect("serialize advertisement"),
-        )])
-    }
-
-    impl MockServerHost {
-        fn with_text_response(text: &str, prompt: u64, completion: u64) -> Self {
-            Self {
-                turns: vec![HostTurnResult {
-                    accum: ChatTurnSseAccum {
-                        full_text: text.to_string(),
-                        has_usage: true,
-                        prompt_tokens: prompt,
-                        completion_tokens: completion,
-                        ..ChatTurnSseAccum::default()
-                    },
-                    ttft_ms: Some(50),
-                    edge_tool_round: Vec::new(),
-                    error_kind: None,
-                }],
-                valid_tools: HashSet::new(),
-                emitted: Vec::new(),
-            }
-        }
-
-        fn with_tool_response(
-            tools: Vec<EdgeToolExecResult>,
-            prompt: u64,
-            completion: u64,
-        ) -> Self {
-            let tool_calls = tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "id": tool.request_id,
-                        "type": "function",
-                        "function": {
-                            "name": tool.tool,
-                            "arguments": tool.args.to_string(),
-                        }
-                    })
-                })
-                .collect();
-            Self {
-                turns: vec![
-                    HostTurnResult {
-                        accum: ChatTurnSseAccum {
-                            has_tool_calls: !tools.is_empty(),
-                            has_usage: true,
-                            prompt_tokens: prompt,
-                            completion_tokens: completion,
-                            tool_calls,
-                            ..ChatTurnSseAccum::default()
-                        },
-                        ttft_ms: Some(30),
-                        edge_tool_round: tools,
-                        error_kind: None,
-                    },
-                    HostTurnResult {
-                        accum: ChatTurnSseAccum {
-                            full_text: "Tool response acknowledged.".to_string(),
-                            has_usage: true,
-                            ..ChatTurnSseAccum::default()
-                        },
-                        ttft_ms: Some(30),
-                        edge_tool_round: Vec::new(),
-                        error_kind: None,
-                    },
-                ],
-                valid_tools: HashSet::from(["bash".to_string(), "read_file".to_string()]),
-                emitted: Vec::new(),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl AgenticLoopHost for MockServerHost {
-        async fn execute_turn(
-            &mut self,
-            _state: &mut AgenticLoopState,
-        ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
-            if self.turns.is_empty() {
-                return Err(astra_core::ClassifiedError::new(
-                    astra_core::ErrorKind::BudgetExhausted,
-                    "no more turns",
-                ));
-            }
-            Ok(self.turns.remove(0))
-        }
-
-        fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
-            self.emitted.push(line);
-        }
-
-        fn is_quiet(&self) -> bool {
-            true
-        }
-
-        fn valid_tool_names(&self) -> &HashSet<String> {
-            &self.valid_tools
-        }
-    }
-
     fn boundary_instruction_test_system_policy() -> Value {
         let policy = crate::turn::wire_assembly::active_turn_focus_policy();
         json!({
@@ -45207,7 +45136,7 @@ mod tests {
         // A second user turn is a new execution, not same-run custody recovery.
         // Settle the original run and obtain the new owner through RunEngine.
         assert!(run_engine
-            .persist_status(USER_ID, SESSION_ID, RUN_ID, "completed", None, None)
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest { user_id: USER_ID, expected_session_id: SESSION_ID, run_id: RUN_ID, status: "completed", waiting_for: None, error_message: None, expected_statuses: &["running"] })
             .await
             .expect("settle original run"));
         let warm_start_run_id = format!("{RUN_ID}-warm-start");
@@ -47700,54 +47629,6 @@ mod tests {
         assert_eq!(host.turn_interaction_mode(), TurnInteractionMode::Prompt);
     }
 
-    #[tokio::test]
-    async fn server_host_mock_text_response() {
-        let mut host = MockServerHost::with_text_response("Hello from server", 100, 50);
-        let mut state = create_test_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "hi"}));
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-        assert_eq!(state.final_text.trim(), "Hello from server");
-        assert_eq!(state.total_prompt, 100);
-        assert_eq!(state.total_completion, 50);
-    }
-
-    #[tokio::test]
-    async fn server_host_mock_tool_response() {
-        let tools = vec![EdgeToolExecResult {
-            execution_completion: None,
-            request_id: "r1".to_string(),
-            tool: "bash".to_string(),
-            args: json!({"command": "echo hello"}),
-            output: "hello\n".to_string(),
-            tool_result_fields: Some(edge_runtime_environment_fields()),
-            status: "completed".to_string(),
-            duration_ms: 10,
-        }];
-
-        let mut host = MockServerHost::with_tool_response(tools, 200, 100);
-        let mut state = create_test_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "run bash"}));
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok(), "tool round should complete: {outcome:?}");
-        assert_eq!(state.final_text.trim(), "Tool response acknowledged.");
-        assert_eq!(state.total_tool_calls, 1);
-        assert!(
-            state
-                .messages
-                .iter()
-                .any(|message| message.to_string().contains("hello")),
-            "edge tool output must be added to the next-round messages: {:?}",
-            state.messages
-        );
-    }
-
     #[cfg(feature = "e2e-hooks")]
     #[tokio::test]
     async fn provider_usage_is_counted_once_by_the_agentic_loop() {
@@ -47867,67 +47748,6 @@ mod tests {
         assert_eq!(wire_rejection["error_kind"], "tool_call_arguments_invalid");
     }
 
-    #[tokio::test]
-    async fn server_host_budget_tracking() {
-        let mut host = MockServerHost::with_text_response("response", 500, 200);
-        let mut state = create_test_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "test"}));
-
-        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(state.has_any_usage);
-        assert_eq!(state.total_prompt, 500);
-        assert_eq!(state.total_completion, 200);
-        assert!(state.telemetry.first_ttft_ms.is_some());
-    }
-
-    #[tokio::test]
-    async fn server_host_multi_turn_budget_exhaustion() {
-        let mut state = create_test_state();
-        state.max_turns = 2;
-        state.remaining_turns = 2;
-        state
-            .messages
-            .push(json!({"role": "user", "content": "test"}));
-
-        // Two text responses — loop should complete after consuming both
-        let mut host = MockServerHost {
-            turns: vec![
-                HostTurnResult {
-                    accum: ChatTurnSseAccum {
-                        full_text: "turn1".to_string(),
-                        has_usage: true,
-                        prompt_tokens: 100,
-                        completion_tokens: 50,
-                        ..ChatTurnSseAccum::default()
-                    },
-                    ttft_ms: Some(10),
-                    edge_tool_round: Vec::new(),
-                    error_kind: None,
-                },
-                HostTurnResult {
-                    accum: ChatTurnSseAccum {
-                        full_text: "turn2".to_string(),
-                        has_usage: true,
-                        prompt_tokens: 100,
-                        completion_tokens: 50,
-                        ..ChatTurnSseAccum::default()
-                    },
-                    ttft_ms: Some(10),
-                    edge_tool_round: Vec::new(),
-                    error_kind: None,
-                },
-            ],
-            valid_tools: HashSet::new(),
-            emitted: Vec::new(),
-        };
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-        assert!(state.final_text.contains("turn1"));
-    }
-
     // ── inject_tool_schema tests ────────────────────────────────────────────
 
     #[test]
@@ -48033,15 +47853,8 @@ mod tests {
             .header_overrides
             .insert("x-workspace-id".to_string(), "ws-001".to_string());
 
-        let resolved = resolve_llm_model_for_turn(
-            &mock_matrixone(),
-            mock_encryptor().as_ref(),
-            Some("gpt-5-mini"),
-            None,
-            Some(&execution),
-        )
-        .await
-        .expect("resolve admitted execution");
+        let resolved = resolve_llm_model_for_turn(Some("gpt-5-mini"), Some(&execution))
+            .expect("resolve admitted execution");
 
         assert_eq!(resolved.model_name, "gpt-5-mini");
         assert_eq!(resolved.provider, "openai");
@@ -48070,15 +47883,8 @@ mod tests {
     #[tokio::test]
     async fn admitted_model_execution_supplies_model_when_no_override_is_requested() {
         let execution = test_gateway_execution("http://catalog:8081/api/v1/chat/completions", None);
-        let resolved = resolve_llm_model_for_turn(
-            &mock_matrixone(),
-            mock_encryptor().as_ref(),
-            None,
-            None,
-            Some(&execution),
-        )
-        .await
-        .expect("resolve admitted execution");
+        let resolved =
+            resolve_llm_model_for_turn(None, Some(&execution)).expect("resolve admitted execution");
         assert_eq!(resolved.model_name, "gpt-5-mini");
         assert!(resolved.request_timeout.is_none());
     }
@@ -48093,7 +47899,6 @@ mod tests {
                 api_key: "provider-secret".to_string(),
                 base_url: "https://provider.example/v1".to_string(),
                 provider: "openai".to_string(),
-                fallback_chain: vec!["legacy-model-name".to_string()],
                 tags: Vec::new(),
                 request_body_overrides: None,
                 fixed_temperature: None,
@@ -48114,15 +47919,8 @@ mod tests {
     async fn admitted_offering_material_drives_turn_without_model_name_resolution() {
         let execution = AdmittedModelExecution::from_offering(admitted_test_offering())
             .expect("valid Offering material");
-        let resolved = resolve_llm_model_for_turn(
-            &mock_matrixone(),
-            mock_encryptor().as_ref(),
-            Some("catalog-model"),
-            None,
-            Some(&execution),
-        )
-        .await
-        .expect("admitted material should not require a database lookup");
+        let resolved = resolve_llm_model_for_turn(Some("catalog-model"), Some(&execution))
+            .expect("admitted material should not require a database lookup");
 
         assert_eq!(resolved.model_name, "catalog-model");
         assert_eq!(resolved.wire_model_name.as_deref(), Some("upstream-model"));
@@ -48135,54 +47933,28 @@ mod tests {
                 .map(String::as_str),
             Some("coding")
         );
-        assert!(
-            resolved.fallback_chain.is_empty(),
-            "legacy model-name fallback must not bypass Offering admission"
-        );
     }
 
     #[tokio::test]
-    async fn fallback_route_cannot_change_credential_owner_material() {
-        let execution = AdmittedModelExecution::from_offering(admitted_test_offering())
-            .expect("valid Offering material");
-        let primary = resolve_llm_model_for_turn(
-            &mock_matrixone(),
-            mock_encryptor().as_ref(),
-            None,
-            None,
-            Some(&execution),
-        )
-        .await
-        .expect("resolve credential owner");
-        let mut same_owner = primary.clone();
-        same_owner.model_name = "alternate-model".to_string();
-        same_owner.wire_model_name = Some("alternate-upstream".to_string());
-        assert!(primary.shares_credential_owner_with(&same_owner));
-
-        for candidate in [
-            ResolvedTurnLlmConfig {
-                api_key: "different-secret".to_string(),
-                ..same_owner.clone()
-            },
-            ResolvedTurnLlmConfig {
-                provider: "anthropic".to_string(),
-                ..same_owner.clone()
-            },
-            ResolvedTurnLlmConfig {
-                base_url: "https://other-provider.example/v1".to_string(),
-                ..same_owner.clone()
-            },
-            ResolvedTurnLlmConfig {
-                completions_url_override: Some(
-                    "https://other-gateway.example/v1/chat/completions".to_string(),
-                ),
-                ..same_owner.clone()
-            },
-        ] {
-            assert!(
-                !primary.shares_credential_owner_with(&candidate),
-                "fallback must never change the provider credential owner"
-            );
+    async fn host_model_resolution_requires_admission_even_with_cached_config() {
+        let state = create_test_state();
+        let mut host = test_host_builder("user-model-cache", "session-model-cache")
+            .with_model(Some("gpt-5-mini".to_string()))
+            .build();
+        let execution =
+            test_gateway_execution("http://catalog/api/v1/chat/completions".to_string(), None);
+        let cached = resolve_llm_model_for_turn(Some("gpt-5-mini"), Some(&execution))
+            .expect("project admitted material");
+        for cache_present in [false, true] {
+            if cache_present {
+                host.remember_resolved_llm_config(&cached);
+                assert!(host.cached_llm_config_matches_state(&state));
+            }
+            let error = host
+                .resolve_llm_config_for_state(&state)
+                .await
+                .expect_err("cached config and model name cannot replace admission");
+            assert!(error.contains("no admitted Offering material"));
         }
     }
 
@@ -48327,14 +48099,7 @@ mod tests {
     async fn admitted_offering_rejects_unresolved_model_override() {
         let execution = AdmittedModelExecution::from_offering(admitted_test_offering())
             .expect("valid Offering material");
-        let result = resolve_llm_model_for_turn(
-            &mock_matrixone(),
-            mock_encryptor().as_ref(),
-            Some("other-model"),
-            None,
-            Some(&execution),
-        )
-        .await;
+        let result = resolve_llm_model_for_turn(Some("other-model"), Some(&execution));
 
         assert!(result.is_err());
     }
@@ -48470,7 +48235,6 @@ mod tests {
             .await
             .expect("actual idless provider turn");
         state.commit_volatile_attempt_lease();
-        assert!(result.edge_tool_round.is_empty());
         let admission = AgenticLoopHost::admit_tool_calls(
             &mut host,
             &result.accum.tool_calls,
@@ -48691,7 +48455,362 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-    async fn provisional_work_admission_keeps_reasoning_preview_live() {
+    async fn user_observation_reaches_provider_context_once_without_creating_work() {
+        use crate::server::provider_test_support::{
+            InferenceLedgerFixture, loop_state, server_host_builder,
+        };
+        let _policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
+        let _mode = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let correction = "Use the Server-owned executor.\nKeep the original durable project fact.";
+        for (native, work_boundary, suppress_observer) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, true, true),
+        ] {
+            let _case_policy = EnvVarGuard::set(
+                AUX_LLM_POLICY_ENV,
+                if suppress_observer {
+                    "boundary_only"
+                } else {
+                    "capacity_aware"
+                },
+            );
+            let request = astra_services::work_admission_judgment::user_turn_observation_request(
+                &Default::default(),
+            );
+            let answers: serde_json::Map<String, Value> = request.questions.iter().map(|(id, question)| {
+                let chosen = match id.as_str() {
+                    "user.objective_relation" => "correct",
+                    "user.feedback_kind" => "correction",
+                    "user.feedback_target" => "approach",
+                    _ => unreachable!(),
+                };
+                let answer = if native {
+                    let astra_turn_types::JudgmentQuestion::Choice { criteria, .. } = question else { unreachable!() };
+                    let probabilities: serde_json::Map<String, Value> = criteria.keys().map(|option| (option.clone(), json!(if option == chosen { 1.0 } else { 0.0 }))).collect();
+                    json!({"type":"choice", "choice":chosen, "probabilities":probabilities, "confidence":1.0})
+                } else {
+                    json!({"type":"discrete_choice", "option":chosen})
+                };
+                (id.clone(), answer)
+            }).collect();
+            let model = if native {
+                "jev-1.13.0"
+            } else {
+                "observer-model"
+            };
+            let auxiliary = if native {
+                ProviderResponse::Json {
+                    status: axum::http::StatusCode::OK,
+                    body: json!({"model":model, "answers":answers, "usage":{"input_tokens":7,"output_tokens":3}}),
+                }
+            } else {
+                ProviderResponse::OpenAi(
+                    json!({"model":model, "choices":[{"index":0,"message":{"role":"assistant","content":json!({"answers":answers}).to_string()},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+                )
+            };
+            let observer_path = if native {
+                "/v1/systemone"
+            } else {
+                "/v1/chat/completions"
+            };
+            let provider = ProviderGateway::start(vec![
+                ProviderScript::bounded("source-bound observation", move |wire| {
+                    if wire.path != observer_path || wire.body["model"] != model { return false; }
+                    let context = if native { wire.body["state"].clone() } else {
+                        let message = wire.body["messages"].as_array().unwrap().iter().find(|message| message["role"] == "user").unwrap();
+                        let request = serde_json::from_str::<Value>(message["content"].as_str().unwrap()).unwrap();
+                        if request["questions"].as_object().unwrap().len() != 3 { return false; }
+                        request["state"].clone()
+                    };
+                    assert_eq!(context["context"]["latest_user_message"], correction);
+                    if native {
+                        let questions = wire.body["questions"].as_object().unwrap();
+                        assert_eq!(questions.len(), 3);
+                        assert!(questions.values().all(|question| question["type"] == "choice" && question.get("optional").is_none()));
+                    }
+                    true
+                }, usize::from(!suppress_observer), vec![auxiliary]),
+                ProviderScript::new("primary after feedback", move |wire| {
+                    if wire.path != "/v1/chat/completions" || wire.body["model"] != "primary-model" { return false; }
+                    let context = wire.body["messages"].to_string();
+                    assert_eq!(context.contains("Latest user correction overrides conflicting prior working memory"), !suppress_observer);
+                    assert_eq!(context.contains("stale tool outage"), suppress_observer);
+                    if !suppress_observer { assert!(context.contains("Server-owned executor")); }
+                    true
+                }, vec![ProviderResponse::OpenAi(json!({"model":"primary-model","choices":[{"index":0,"message":{"role":"assistant","content":"acknowledged", "tool_calls": if work_boundary { json!([{"id":"work-boundary","type":"function","function":{"name":"start_work","arguments":r#"{"goal":"Verify the change","activation":"start","tasks":[{"objective":"Verify","expected_result":"Evidence"}]}"#}}]) } else { json!([]) }},"finish_reason":if work_boundary {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":11,"completion_tokens":2}})), ProviderResponse::OpenAi(json!({"model":"primary-model","choices":[{"index":0,"message":{"role":"assistant","content":"continued"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2}}))]),
+                ProviderScript::new("typed Work boundary judgment", |wire| {
+                    if wire.path != "/v1/chat/completions" || wire.body["model"] != "observer-model" { return false; }
+                    let request = astra_turn_types::judgment_request_from_messages(wire.body["messages"].as_array().unwrap()).unwrap();
+                    request.questions.len() == 23
+                }, if work_boundary { vec![ProviderResponse::OpenAi(json!({"model":"observer-model","choices":[{"index":0,"message":{"role":"assistant","content":discrete_classification_response(false)},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}))] } else { vec![] }),
+            ]).await;
+            let ledger = InferenceLedgerFixture::default();
+            let session = "source-bound-user-observation";
+            let mut host =
+                server_host_builder(&provider, &ledger, session, "openai", "primary-model", None)
+                    .with_turn_intent_policy(TurnIntentExecutionPolicy::Auto)
+                    .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                        true, false,
+                    ))
+                    .build();
+            let execution = crate::server::provider_test_support::admitted_execution(
+                &provider,
+                if native { "typesafe" } else { "openai" },
+                model,
+                None,
+            );
+            let mut config = summary_test_config(format!("{}/v1", provider.base_url));
+            config.model_name = model.to_string();
+            config.api_key = "fixture-key".into();
+            config.provider = if native { "typesafe" } else { "openai" }.to_string();
+            host.judgment_route_cache = Some(Ok(ResolvedJudgmentRoute { config, execution }));
+            let mut state = loop_state(
+                session,
+                vec![
+                    json!({"role":"user","content":"original task"}),
+                    json!({"role":"assistant","content":"prior approach"}),
+                ],
+                correction,
+            );
+            state.context_manifest_user_id = Some("provider-fixture-user".into());
+            state.canonical_turn_chain_id = Some("observation-turn-chain".into());
+            crate::turn::agentic::turn_intent::capture_turn_intent_context(&mut state);
+            state.message = "last fragment".into();
+            state.user_intent = "original task with cumulative guidance".into();
+            state.restricted_tools.insert("bash".into());
+            state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+            ));
+            let memory = state
+                .pipeline_session
+                .as_mut()
+                .unwrap()
+                .working_memory_mut();
+            memory.push_decision("original durable project fact");
+            memory.push_blocker("stale tool outage");
+            memory.set_next_action("retry stale path");
+            let hub = crate::turn::agentic_loop::host::tests::make_hub();
+            state.telemetry.observability_hub = Some(Arc::clone(&hub));
+            host.on_turn_started(&state);
+            crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 0)
+                .await
+                .expect("real preparation starts the source-bound task");
+            assert_eq!(
+                host.pending_work_admission_judge
+                    .as_ref()
+                    .map(|pending| pending.purpose),
+                (!suppress_observer).then_some(SemanticJudgmentPurpose::UserObservation)
+            );
+            let first = host
+                .execute_turn(&mut state)
+                .await
+                .expect("real native/discrete observation and primary request");
+            assert_eq!(first.accum.full_text, "acknowledged");
+            let auxiliary_calls = usize::from(!suppress_observer) + usize::from(work_boundary);
+            assert_eq!(state.total_prompt, (7 * auxiliary_calls) as u64);
+            assert_eq!(state.total_completion, (3 * auxiliary_calls) as u64);
+            assert_eq!(ledger.attempt_count(), 1 + auxiliary_calls);
+            assert!(state.restricted_tools.contains("bash"));
+            assert_eq!(
+                host.pending_work_admission
+                    .as_ref()
+                    .is_some_and(|entry| matches!(
+                        entry.decision,
+                        astra_services::WorkAdmissionDecision::NotRequired { .. }
+                    )),
+                work_boundary,
+                "a real classification retains its settled NotRequired fact without creating a graph"
+            );
+            assert_eq!(
+                host.work_admission_explain_admission.is_some(),
+                work_boundary
+            );
+            assert!(!host.work_admission_unavailable);
+            assert_eq!(
+                host.semantic_judgment_attempted,
+                Some(if work_boundary {
+                    SemanticJudgmentPurpose::WorkAdmission
+                } else {
+                    SemanticJudgmentPurpose::UserObservation
+                })
+            );
+            let memory = state
+                .pipeline_session
+                .as_ref()
+                .unwrap()
+                .working_memory()
+                .render_prompt_section();
+            assert!(memory.contains("original durable project fact"));
+            if !suppress_observer {
+                for fragment in correction.lines() {
+                    assert!(
+                        memory.contains(fragment),
+                        "both acknowledged guidance fragments must reach working memory"
+                    );
+                }
+            }
+            assert!(!memory.contains("last fragment"));
+            assert_eq!(
+                hub.recent_feedback_signals().len(),
+                usize::from(!suppress_observer)
+            );
+            // The shared execution phase owns this success acknowledgement;
+            // this host-boundary test must settle its returned lease too.
+            state.commit_volatile_attempt_lease();
+            state.current_round_index = 1;
+            state.llm_rounds_completed = 1;
+            let second = host
+                .execute_turn(&mut state)
+                .await
+                .expect("same human source continues without another observer request");
+            assert_eq!(second.accum.full_text, "continued");
+            assert_eq!(ledger.attempt_count(), 2 + auxiliary_calls);
+            assert_eq!(state.total_prompt, (7 * auxiliary_calls) as u64);
+            assert_eq!(
+                hub.recent_feedback_signals().len(),
+                usize::from(!suppress_observer)
+            );
+            assert_eq!(
+                state
+                    .pipeline_session
+                    .as_ref()
+                    .unwrap()
+                    .working_memory()
+                    .render_prompt_section(),
+                memory
+            );
+            let events = host.take_emitted_events();
+            let admission: Vec<_> = events
+                .iter()
+                .filter(|event| event["kind"] == "admission")
+                .collect();
+            assert_eq!(
+                admission.len(),
+                2 * auxiliary_calls,
+                "each real task has one start and one finish"
+            );
+            let mut graph = astra_turn_types::ExplainAnalyzeGraphV1::default();
+            for event in events.iter().filter(|event| event.get("node_id").is_some()) {
+                graph.apply(
+                    astra_turn_types::decode_explain_analyze_wire(event)
+                        .expect("actual Explain fact"),
+                );
+            }
+            graph.finish_ingest();
+            assert_eq!(
+                graph.conflicted_node_ids().len(),
+                0,
+                "same-round tasks must not conflict"
+            );
+            let slots: std::collections::HashSet<_> = admission
+                .iter()
+                .map(|event| event["node_id"].as_str().unwrap())
+                .collect();
+            assert_eq!(slots.len(), auxiliary_calls);
+            assert_eq!(
+                slots
+                    .iter()
+                    .any(|id| id.ends_with("/turn_intent_admission/0/1")),
+                !suppress_observer
+            );
+            assert_eq!(
+                slots
+                    .iter()
+                    .any(|id| id.ends_with("/turn_intent_admission/0/0")),
+                work_boundary
+            );
+            ledger.assert_quiescent();
+            provider.assert_complete();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn user_observation_respects_optional_auxiliary_capacity_policy() {
+        use crate::server::provider_test_support::{
+            InferenceLedgerFixture, loop_state, server_host_builder,
+        };
+        for (policy, admission_mode) in [
+            ("boundary_only", "disabled"),
+            ("capacity_aware", "db_fixed_window"),
+            ("disabled", "disabled"),
+        ] {
+            let _policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, policy);
+            let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", admission_mode);
+            let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "60");
+            let provider = ProviderGateway::start(vec![ProviderScript::new(
+                "primary without optional observation",
+                |wire| wire.path == "/v1/chat/completions" && wire.body["model"] == "primary-model",
+                vec![ProviderResponse::OpenAi(json!({"model":"primary-model","choices":[{"index":0,"message":{"role":"assistant","content":"continued"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":2}}))].into_iter().filter(|_| admission_mode == "disabled").collect(),
+            )]).await;
+            let ledger = InferenceLedgerFixture::default();
+            let session = "capacity-gated-observation";
+            let mut host =
+                server_host_builder(&provider, &ledger, session, "openai", "primary-model", None)
+                    .with_turn_intent_policy(TurnIntentExecutionPolicy::Auto)
+                    .build();
+            let mut config = summary_test_config(format!("{}/v1", provider.base_url));
+            config.model_name = "observer-model".into();
+            config.api_key = "fixture-key".into();
+            host.judgment_route_cache = Some(Ok(ResolvedJudgmentRoute {
+                config,
+                execution: crate::server::provider_test_support::admitted_execution(
+                    &provider,
+                    "openai",
+                    "observer-model",
+                    None,
+                ),
+            }));
+            let mut state = loop_state(
+                session,
+                vec![
+                    json!({"role":"user","content":"original task"}),
+                    json!({"role":"assistant","content":"prior approach"}),
+                ],
+                "Change the approach.",
+            );
+            state.context_manifest_user_id = Some("provider-fixture-user".into());
+            state.canonical_turn_chain_id = Some("capacity-turn-chain".into());
+            crate::turn::agentic::turn_intent::capture_turn_intent_context(&mut state);
+            if admission_mode == "db_fixed_window" {
+                // A valid quota still requires a database. The actual
+                // execution boundary must reject primary admission, while
+                // suppressing the optional observation before any dispatch.
+                let error = host
+                    .execute_turn(&mut state)
+                    .await
+                    .err()
+                    .expect("database admission must fail closed");
+                assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+                assert!(error.message.contains("no shared database pool"));
+                assert!(host.semantic_judgment_attempted.is_none());
+                assert!(host.pending_work_admission_judge.is_none());
+                assert!(host.work_admission_explain_admission.is_none());
+                assert_eq!(ledger.attempt_count(), 0);
+                ledger.assert_quiescent();
+                provider.assert_complete();
+                continue;
+            }
+            let result = host
+                .execute_turn(&mut state)
+                .await
+                .expect("capacity policy keeps primary execution available");
+            assert_eq!(result.accum.full_text, "continued");
+            assert_eq!(ledger.attempt_count(), 1);
+            assert_eq!(state.total_prompt, 0);
+            assert!(host.semantic_judgment_attempted.is_none());
+            assert!(host.pending_work_admission_judge.is_none());
+            assert!(host.work_admission_explain_admission.is_none());
+            ledger.assert_quiescent();
+            provider.assert_complete();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn settled_work_admission_keeps_reasoning_preview_live() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let session_id = "session-work-admission-reasoning";
         let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
@@ -48712,9 +48831,21 @@ mod tests {
             .map(|event| format!("data: {event}\n\n").into_bytes())
             .chain(std::iter::once(b"data: [DONE]\n\n".to_vec()))
             .collect();
+        let judgment_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wire_judgment_finished = Arc::clone(&judgment_finished);
+        let judge_started = Arc::new(tokio::sync::Notify::new());
+        let finish_judge = Arc::new(tokio::sync::Notify::new());
+        let task_started = Arc::clone(&judge_started);
+        let task_release = Arc::clone(&finish_judge);
         let provider = ProviderGateway::start(vec![ProviderScript::new(
-            "provisional_work_admission_keeps_reasoning_preview_live",
-            |request| request.path == "/v1/chat/completions" && request.body["stream"] == true,
+            "settled_work_admission_keeps_reasoning_preview_live",
+            move |request| {
+                assert!(
+                    wire_judgment_finished.load(std::sync::atomic::Ordering::Acquire),
+                    "semantic observations must settle before the actual provider request"
+                );
+                request.path == "/v1/chat/completions" && request.body["stream"] == true
+            },
             vec![ProviderResponse::Stream {
                 content_type: "text/event-stream",
                 chunks,
@@ -48727,9 +48858,11 @@ mod tests {
             .with_test_inference_ledger(inference_ledger.clone())
             .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
             .build();
-        host.pending_work_admission_judge =
-            Some(pending_work_admission_judge_for_test(tokio::spawn(async {
-                tokio::time::sleep(Duration::from_millis(1_500)).await;
+        host.pending_work_admission_judge = Some(pending_work_admission_judge_for_test(
+            tokio::spawn(async move {
+                task_started.notify_one();
+                task_release.notified().await;
+                judgment_finished.store(true, std::sync::atomic::Ordering::Release);
                 (
                     Err(astra_services::TurnIntentJudgeError::Inference(
                         astra_core::ClassifiedError::new(
@@ -48739,7 +48872,8 @@ mod tests {
                     )),
                     WorkAdmissionUsage::default(),
                 )
-            })));
+            }),
+        ));
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         host.set_event_tx(tx);
         let mut state = create_durable_execution_test_state(session_id);
@@ -48747,6 +48881,8 @@ mod tests {
         state.user_intent = state.message.clone();
 
         let observe_reasoning = async {
+            judge_started.notified().await;
+            finish_judge.notify_one();
             loop {
                 let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
                     .await
@@ -49156,7 +49292,6 @@ mod tests {
 
         let result = host.execute_turn(&mut state).await.expect("terminal turn");
         state.commit_volatile_attempt_lease();
-        assert!(result.edge_tool_round.is_empty());
         assert!(host.edge_callback_ledger.lock().await.is_empty());
         assert_eq!(result.accum.prompt_tokens, 8);
         assert_eq!(result.accum.completion_tokens, 4);
@@ -52056,23 +52191,6 @@ mod tests {
             assert!(requests.lock().unwrap().is_empty());
         }
 
-        #[test]
-        fn builtin_auto_work_admission_keeps_turn_live_without_sidecar() {
-            let auto = test_host_builder("u-auto-admission", "s-auto-admission").build();
-            assert!(
-                !auto.requires_turn_intent_decision(),
-                "built-in Auto admission must keep the primary turn alive when its auxiliary judge is unavailable"
-            );
-
-            let fixed = test_host_builder("u-fixed-admission", "s-fixed-admission")
-                .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
-                .build();
-            assert!(
-                !fixed.requires_turn_intent_decision(),
-                "FixedDefault is the explicit no-inference policy"
-            );
-        }
-
         #[tokio::test]
         #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
         async fn ordinary_primary_turn_defers_work_admission_without_a_boundary() {
@@ -52091,7 +52209,7 @@ mod tests {
                 host.pending_work_admission_judge.is_none(),
                 "an ordinary primary turn must not create a speculative judge task"
             );
-            assert!(!host.work_admission_attempted);
+            assert!(host.semantic_judgment_attempted.is_none());
             assert!(!host.work_admission_unavailable);
         }
 
@@ -52126,7 +52244,7 @@ mod tests {
                     .await,
                 "a host without admitted model material cannot start the sidecar"
             );
-            assert!(host.work_admission_attempted);
+            assert!(host.semantic_judgment_attempted.is_some());
             assert!(
                 host.work_admission_terminal_error().is_none(),
                 "missing auxiliary material must preserve the primary execution path"
@@ -52152,7 +52270,7 @@ mod tests {
                     .start_work_admission_preflight(&state, false, false)
                     .await
             );
-            assert!(auto.work_admission_attempted);
+            assert!(auto.semantic_judgment_attempted.is_some());
             assert!(
                 auto.work_admission_terminal_error().is_none(),
                 "disabling auxiliary inference does not disable the primary baseline"
@@ -52170,7 +52288,7 @@ mod tests {
                     .start_work_admission_preflight(&state, false, false)
                     .await
             );
-            assert!(!fixed.work_admission_attempted);
+            assert!(fixed.semantic_judgment_attempted.is_none());
             assert!(!fixed.work_admission_unavailable);
         }
 

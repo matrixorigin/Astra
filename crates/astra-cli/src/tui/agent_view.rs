@@ -41,7 +41,7 @@ pub(crate) fn reopen_agents_view(
     true
 }
 
-pub(crate) fn refresh_open_agent_detail_for_event(
+pub(crate) fn refresh_open_agent_transcript_for_event(
     ae: &TuiAppEvent,
     chat_widget: &chat_widget::ChatWidget,
     bottom_pane: &mut BottomPane,
@@ -68,39 +68,7 @@ pub(crate) fn refresh_open_agent_detail_for_event(
         _ => false,
     };
 
-    let Some(open_id) = bottom_pane.active_live_task_id() else {
-        return rebound_pending_transcript || transcript_updated;
-    };
-    let task_updated = match ae {
-        TuiAppEvent::AgentLive(event) => {
-            if open_id != event.agent_id {
-                return rebound_pending_transcript || transcript_updated;
-            }
-            refresh_open_agent_detail_by_id(&event.agent_id, chat_widget, bottom_pane)
-        }
-        TuiAppEvent::AgentLiveBatch(events) => {
-            let Some(event) = events.iter().rev().find(|event| open_id == event.agent_id) else {
-                return rebound_pending_transcript || transcript_updated;
-            };
-            refresh_open_agent_detail_by_id(&event.agent_id, chat_widget, bottom_pane)
-        }
-        TuiAppEvent::AgentLiveGap(_) => false,
-        TuiAppEvent::AgentControlStarted {
-            agent_id: Some(agent_id),
-            ..
-        }
-        | TuiAppEvent::AgentControlCompleted {
-            agent_id: Some(agent_id),
-            ..
-        } => {
-            if open_id != agent_id {
-                return false;
-            }
-            refresh_open_agent_detail_by_id(agent_id, chat_widget, bottom_pane)
-        }
-        _ => false,
-    };
-    rebound_pending_transcript || transcript_updated || task_updated
+    rebound_pending_transcript || transcript_updated
 }
 
 pub(crate) fn agent_live_event_affects_monitor_row(event: &AgentLiveEvent) -> bool {
@@ -147,38 +115,14 @@ pub(crate) fn refresh_open_agent_monitor(
     bottom_pane.refresh_agent_monitor(chat_widget.agent_workbench_snapshot())
 }
 
-pub(crate) fn refresh_open_agent_views(
-    chat_widget: &chat_widget::ChatWidget,
-    bottom_pane: &mut BottomPane,
-) -> bool {
-    let active_agent_id = bottom_pane.active_live_task_id().map(str::to_owned);
-    let detail = active_agent_id.is_some_and(|agent_id| {
-        refresh_open_agent_detail_by_id(&agent_id, chat_widget, bottom_pane)
-    });
-    let monitor = refresh_open_agent_monitor(chat_widget, bottom_pane);
-    detail || monitor
-}
-
 pub(crate) fn refresh_open_agent_views_for_event(
     ae: &TuiAppEvent,
     chat_widget: &chat_widget::ChatWidget,
     bottom_pane: &mut BottomPane,
 ) -> bool {
-    let detail = refresh_open_agent_detail_for_event(ae, chat_widget, bottom_pane);
+    let transcript = refresh_open_agent_transcript_for_event(ae, chat_widget, bottom_pane);
     let monitor = refresh_open_agent_monitor_for_event(ae, chat_widget, bottom_pane);
-    detail || monitor
-}
-
-pub(crate) fn refresh_open_agent_detail_by_id(
-    agent_id: &str,
-    chat_widget: &chat_widget::ChatWidget,
-    bottom_pane: &mut BottomPane,
-) -> bool {
-    if let Some(cell) = chat_widget.task_cell_anywhere(agent_id) {
-        bottom_pane.refresh_task_detail(agent_id, cell)
-    } else {
-        false
-    }
+    transcript || monitor
 }
 
 #[cfg(test)]
@@ -239,7 +183,7 @@ mod tests {
             },
         ]);
 
-        assert!(refresh_open_agent_detail_for_event(
+        assert!(refresh_open_agent_transcript_for_event(
             &batch,
             &chat_widget,
             &mut bottom_pane,
@@ -291,7 +235,7 @@ mod tests {
             }),
         ));
 
-        assert!(refresh_open_agent_detail_for_event(
+        assert!(refresh_open_agent_transcript_for_event(
             &output,
             &chat_widget,
             &mut bottom_pane,

@@ -200,4 +200,5 @@ astra admin feedback export [--agent-id <agent_id>] [--format jsonl]
 - CLIs share credential storage: `~/.astra/credentials.json` (tests may set `ASTRA_CREDENTIALS_DIR`)
 - `--profile` lets you isolate credentials by environment/user
 - API errors are returned with HTTP status and compact response body for easier debugging
+- Once a chat stream has started, `astra chat --json` and `--print --output-format json` also return a structured result on hard failure (exit code 3). It retains the validated root run identity, partial output and observed usage, with `success: false` and partial evidence coverage. A request rejected before Run admission has no run identity; an error does not imply successful or resumable execution.
 - Interactive mode launches the TUI (requires a TTY; use `astra chat -m` or `--print` for non-interactive invocations). There is no separate console slash frontend.

@@ -183,6 +183,10 @@ mod tests {
         assert!(mixed.contains(&"repository".to_string()));
         assert!(mixed.contains(&"code".to_string()));
         assert!(mixed.contains(&"仓库".to_string()));
+        assert!(
+            !mixed.contains(&"析仓".to_string()),
+            "CJK bigrams must not cross ASCII text"
+        );
     }
 
     #[test]

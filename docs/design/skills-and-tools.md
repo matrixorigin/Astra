@@ -43,6 +43,12 @@ its contract and capability remain current. Selection is knowledge, not a
 permission grant: request projection and execution still enforce current provider
 and policy admission. After compaction removes necessary argument knowledge,
 rediscovery is legitimate; do not require or prohibit it merely by turn count.
+The unused source-public `CanonicalToolInvocationBatch`,
+`canonicalize_tool_invocation_batch`, and `recordable_deferred_tool_activations`
+wrappers are retired. Runtime admission owns provider-batch partitioning and
+ordered result reconciliation; the shared invocation parser and canonical
+history evidence remain the carrier and recovery contracts.
+
 Ordinary `agent` spawn, status (`list`), result collection (`get_result`), wait (`wait`), and
 communication (`send_message`) share a compact resident contract when the
 delegation capability is admitted. Its fields and per-action requirements and
@@ -107,6 +113,21 @@ built-in markdown/concise switch and its client-only selection state are removed
 Server and provider skill facts retain their canonical request and trace owners.
 The unused session-local automatic `SKILL.md` rewrite proposal chain is retired.
 Evaluated, approved tuning and activation remain owned by [tuning jobs](tuning-jobs.md).
+
+The source-only `arguments::parse_arguments` API is retired. Production skill
+instruction substitution continues to consume explicit named arguments and
+shell-quoted positional arguments through `substitute_arguments`; it does not
+infer a named-argument request protocol from raw text.
+
+The source-only health-ranking injection API is also retired: no production
+caller supplied its turn-scoped inputs. Discovery retains stable provider source
+priority and its metadata budget. Runtime tool-health feedback and skill-quality
+learning remain separate, active responsibilities.
+
+The unused source-only `check_compatibility` diagnostic is retired. Manifest
+compatibility metadata remains serializable descriptive data; it does not grant
+execution authority or enforce compatibility admission. Actual execution
+capability, permission and provider checks remain at their canonical boundaries.
 
 The operating workflow is:
 

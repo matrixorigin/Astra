@@ -4,7 +4,6 @@
 //! the KV cache prefix is broken. Classifies breaks by cause and logs
 //! diagnostics with token impact estimates.
 //!
-//! diagnostics with token impact estimates and auto-remediation suggestions.
 
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -12,11 +11,6 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use crate::context_serializer::SerializedSystemBlock;
-
-/// Default source key used by the shortcut `record_turn` API. Callers that
-/// only track a single query stream (e.g., a CLI main loop) never need to
-/// deal with source keys — they always read/write this slot.
-pub const DEFAULT_SOURCE: &str = "main";
 
 /// Upper bound on concurrently tracked sources, capped at 10.
 /// Each entry is one `PromptStateSnapshot`
@@ -34,86 +28,6 @@ pub struct ProviderAttemptCacheIdentity {
     pub request_id: String,
     pub attempt: u32,
 }
-pub const MAX_WARM_CACHE_READ_SHARE_DROP: f64 = 0.05;
-
-/// Rollout gate derived from provider-reported warm-cache read share.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct WarmCacheRolloutEvidence {
-    pub baseline_read_share: f64,
-    pub observed_read_share: f64,
-    pub percentage_point_drop: f64,
-    pub intentional_policy_change: bool,
-    pub decision: WarmCacheRolloutDecision,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WarmCacheRolloutDecision {
-    Pass,
-    Blocked,
-    ExplainedPolicyChange,
-}
-
-/// Evaluate the Phase-6 warm-cache rollout gate.
-///
-/// Shares are fractions in `[0, 1]`. A drop strictly greater than five
-/// percentage points blocks rollout unless the caller supplies typed evidence
-/// that the cache loss is an intentional policy change.
-pub fn evaluate_warm_cache_rollout(
-    baseline_read_share: f64,
-    observed_read_share: f64,
-    intentional_policy_change: bool,
-) -> Result<WarmCacheRolloutEvidence, &'static str> {
-    if !baseline_read_share.is_finite()
-        || !observed_read_share.is_finite()
-        || !(0.0..=1.0).contains(&baseline_read_share)
-        || !(0.0..=1.0).contains(&observed_read_share)
-    {
-        return Err("warm-cache read shares must be finite fractions in [0, 1]");
-    }
-    let percentage_point_drop = (baseline_read_share - observed_read_share).max(0.0);
-    let decision = if percentage_point_drop <= MAX_WARM_CACHE_READ_SHARE_DROP + f64::EPSILON * 8.0 {
-        WarmCacheRolloutDecision::Pass
-    } else if intentional_policy_change {
-        WarmCacheRolloutDecision::ExplainedPolicyChange
-    } else {
-        WarmCacheRolloutDecision::Blocked
-    };
-    Ok(WarmCacheRolloutEvidence {
-        baseline_read_share,
-        observed_read_share,
-        percentage_point_drop,
-        intentional_policy_change,
-        decision,
-    })
-}
-
-#[cfg(test)]
-mod warm_cache_rollout_tests {
-    use super::*;
-
-    #[test]
-    fn five_point_drop_passes_but_larger_unexplained_drop_blocks() {
-        let boundary = evaluate_warm_cache_rollout(0.80, 0.75, false).expect("valid evidence");
-        assert_eq!(boundary.decision, WarmCacheRolloutDecision::Pass);
-
-        let blocked = evaluate_warm_cache_rollout(0.80, 0.749, false).expect("valid evidence");
-        assert_eq!(blocked.decision, WarmCacheRolloutDecision::Blocked);
-
-        let explained = evaluate_warm_cache_rollout(0.80, 0.70, true).expect("valid evidence");
-        assert_eq!(
-            explained.decision,
-            WarmCacheRolloutDecision::ExplainedPolicyChange
-        );
-    }
-
-    #[test]
-    fn invalid_share_is_rejected_instead_of_clamped() {
-        assert!(evaluate_warm_cache_rollout(1.1, 0.8, false).is_err());
-        assert!(evaluate_warm_cache_rollout(f64::NAN, 0.8, false).is_err());
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Cache break classification
 // ---------------------------------------------------------------------------
@@ -235,8 +149,8 @@ pub struct PromptStateSnapshot {
     /// Total estimated cache-eligible tokens (system + tools).
     pub cache_eligible_tokens: usize,
     /// Provider-final component identity captured from the immutable body
-    /// receipt.  This is optional only for backward-compatible restoration of
-    /// snapshots written before provider-final receipts existed.
+    /// receipt. Pending plan snapshots have no receipt yet; this field is
+    /// attached only when a dispatched physical request supplies one.
     #[serde(default)]
     pub provider_final_fingerprint: Option<ProviderFinalPromptFingerprint>,
 }
@@ -686,16 +600,11 @@ const CACHE_TTL_1HOUR_SECS: u64 = 3_600;
 /// prerequisite for the fork-prefix primitive (PR 1+), where parent
 /// and child streams need independent attribution.
 ///
-/// Backwards compatibility: the legacy `record_turn(snapshot, actual)`
-/// helper writes through to the [`DEFAULT_SOURCE`] slot, so pre-existing
-/// single-stream callers are unaffected.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheBreakDetectorState {
     pub per_source: HashMap<String, PromptStateSnapshot>,
-    /// Last usage-bearing provider attempt per source. `None` denotes a
-    /// pre-field snapshot; restoration seeds it from the legacy turn baseline.
-    #[serde(default)]
-    pub usage_per_source: Option<HashMap<String, PromptStateSnapshot>>,
+    /// Last usage-bearing provider attempt per source, separate from structural observations.
+    pub usage_per_source: HashMap<String, PromptStateSnapshot>,
     pub source_order: Vec<String>,
     pub stats: CacheStats,
     #[serde(default)]
@@ -776,12 +685,9 @@ impl CacheBreakDetector {
 
     #[must_use]
     pub fn from_state(state: CacheBreakDetectorState) -> Self {
-        let usage_per_source = state
-            .usage_per_source
-            .unwrap_or_else(|| state.per_source.clone());
         Self {
             per_source: state.per_source,
-            usage_per_source,
+            usage_per_source: state.usage_per_source,
             source_order: state.source_order,
             stats: state.stats,
             diff_dir: None,
@@ -794,7 +700,7 @@ impl CacheBreakDetector {
     pub fn snapshot_state(&self) -> CacheBreakDetectorState {
         CacheBreakDetectorState {
             per_source: self.per_source.clone(),
-            usage_per_source: Some(self.usage_per_source.clone()),
+            usage_per_source: self.usage_per_source.clone(),
             source_order: self.source_order.clone(),
             stats: self.stats.clone(),
             diff_seq: self.diff_seq,
@@ -892,79 +798,6 @@ impl CacheBreakDetector {
         self.diff_dir = Some(dir.into());
     }
 
-    /// Record a turn against the [`DEFAULT_SOURCE`] stream. Shortcut for
-    /// `record_turn_for_source(DEFAULT_SOURCE, …)`. Existing single-stream
-    /// callers should continue using this method; multi-source callers
-    /// (fork primitive, subagent managers) should use the source-keyed form.
-    pub fn record_turn(
-        &mut self,
-        current: PromptStateSnapshot,
-        actual_cache_read_tokens: Option<u64>,
-    ) -> Option<CacheBreakEvent> {
-        self.record_turn_for_source(DEFAULT_SOURCE, current, actual_cache_read_tokens)
-    }
-
-    /// Record a new turn's prompt state against a named source stream, and
-    /// detect cache breaks relative to that source's previous snapshot.
-    ///
-    /// Sources are logical query streams — e.g. `"main"`, `"agent:explore"`,
-    /// `"fork:<run_id>"`. Each source has its own previous snapshot; a
-    /// break in stream A does not poison attribution for stream B. Up to
-    /// [`MAX_TRACKED_SOURCES`] sources are tracked concurrently; the
-    /// least-recently-written source is dropped on overflow.
-    ///
-    /// Returns `Some(event)` if this source's prefix broke, `None` if it
-    /// was stable (cache hit). The first turn for a new source is a
-    /// non-break miss (no baseline to compare against).
-    ///
-    /// `actual_cache_read_tokens` is from the API response — if available
-    /// and near zero, it confirms a cache miss even when hashes match
-    /// (TTL expiry).
-    pub fn record_turn_for_source(
-        &mut self,
-        source: &str,
-        current: PromptStateSnapshot,
-        actual_cache_read_tokens: Option<u64>,
-    ) -> Option<CacheBreakEvent> {
-        self.stats.total_turns += 1;
-
-        let previous_for_source = self.per_source.get(source);
-
-        let event = if let Some(prev) = previous_for_source.as_ref() {
-            self.detect_break(prev, &current, actual_cache_read_tokens)
-        } else {
-            // First turn for this source — always a "miss" but not a "break"
-            self.stats.cache_misses += 1;
-            None
-        };
-
-        if let Some(ref evt) = event {
-            self.stats.cache_misses += 1;
-            self.stats.total_miss_tokens += evt.estimated_token_impact;
-            self.stats.recent_breaks.push_back(evt.clone());
-            if self.stats.recent_breaks.len() > 10 {
-                self.stats.recent_breaks.pop_front();
-            }
-            if let Some(dir) = self.diff_dir.clone() {
-                self.diff_seq = self.diff_seq.wrapping_add(1);
-                spawn_diff_artifact_write(
-                    dir,
-                    self.diff_seq,
-                    previous_for_source.cloned(),
-                    current.clone(),
-                    evt.clone(),
-                );
-            }
-        } else if previous_for_source.is_some() {
-            self.stats.cache_hits += 1;
-        }
-
-        self.usage_per_source
-            .insert(source.to_string(), current.clone());
-        self.write_source_snapshot(source, current);
-        event
-    }
-
     /// Reset all tracked source baselines after an expected cache-boundary
     /// event such as compaction or native provider history clearing.
     pub fn reset_all_sources(&mut self) {
@@ -974,7 +807,7 @@ impl CacheBreakDetector {
     }
 
     /// Insert/refresh a source's snapshot and maintain LRU order. Called
-    /// from `record_turn_for_source` after detection completes so the
+    /// from `record_provider_attempt_for_source` after detection completes so the
     /// detection path reads the OLD snapshot, then we overwrite.
     fn write_source_snapshot(&mut self, source: &str, snapshot: PromptStateSnapshot) {
         self.per_source.insert(source.to_string(), snapshot);
@@ -1028,65 +861,23 @@ impl CacheBreakDetector {
             });
         }
 
-        // 2. System prompt change. Once both sides have immutable provider
-        // receipts, only the exact post-projection component identity owns
-        // this decision. A mixed legacy/exact pair is an authority migration,
-        // not evidence that the provider-visible prefix changed.
-        let system_changed = match (
-            prev.provider_final_fingerprint.as_ref(),
-            curr.provider_final_fingerprint.as_ref(),
-        ) {
-            (Some(prev), Some(curr)) => {
-                prev.cache_key_system_sha256 != curr.cache_key_system_sha256
-            }
-            (None, None) => {
-                effective_prefix_system_prompt_hash(prev)
-                    != effective_prefix_system_prompt_hash(curr)
-            }
-            _ => false,
-        };
-        if system_changed {
-            reasons.push(CacheBreakReason::SystemPromptChanged);
-        }
-
-        // 2b. Cache-control / stable-boundary change
-        // Provider-final system/tool component identities already include
-        // their protocol-native cache markers. Detailed cache-control
-        // attribution is available only to the legacy typed block projection;
-        // never scan arbitrary JSON keys to guess marker semantics.
-        let cache_control_changed = match (
-            prev.provider_final_fingerprint.as_ref(),
-            curr.provider_final_fingerprint.as_ref(),
-        ) {
-            (Some(prev), Some(curr)) => {
-                prev.cache_capability.protocol != curr.cache_capability.protocol
-            }
-            (None, None) => prev.cache_control_hash != curr.cache_control_hash,
-            _ => false,
-        };
-        if cache_control_changed {
-            reasons.push(CacheBreakReason::CacheControlChanged);
-        }
-
-        // 3. Tool schemas change — diff which tools changed
-        let exact_tool_pair = prev
+        // Structural attribution belongs only to immutable provider-final
+        // receipts. Pending plan metadata does not establish cache identity.
+        if let Some((prev, curr)) = prev
             .provider_final_fingerprint
             .as_ref()
-            .zip(curr.provider_final_fingerprint.as_ref());
-        let tools_changed = match exact_tool_pair {
-            Some((prev, curr)) => {
-                prev.cache_key_tool_schema_sequence_sha256
-                    != curr.cache_key_tool_schema_sequence_sha256
+            .zip(curr.provider_final_fingerprint.as_ref())
+        {
+            if prev.cache_key_system_sha256 != curr.cache_key_system_sha256 {
+                reasons.push(CacheBreakReason::SystemPromptChanged);
             }
-            None if prev.provider_final_fingerprint.is_none()
-                && curr.provider_final_fingerprint.is_none() =>
-            {
-                prev.tools_hash != curr.tools_hash
+            // Protocol-native markers are included in the exact component
+            // hashes; only a protocol change receives separate attribution.
+            if prev.cache_capability.protocol != curr.cache_capability.protocol {
+                reasons.push(CacheBreakReason::CacheControlChanged);
             }
-            None => false,
-        };
-        if tools_changed {
-            let (mut added, mut removed, mut changed) = if let Some((prev, curr)) = exact_tool_pair
+            if prev.cache_key_tool_schema_sequence_sha256
+                != curr.cache_key_tool_schema_sequence_sha256
             {
                 let prev_map: std::collections::HashMap<&str, &str> = prev
                     .cache_key_tool_schema_items
@@ -1106,63 +897,32 @@ impl CacheBreakDetector {
                             .map(|name| (name, tool.sha256.as_str()))
                     })
                     .collect();
-                let added: Vec<String> = curr_map
+                let mut added: Vec<String> = curr_map
                     .keys()
                     .filter(|name| !prev_map.contains_key(*name))
                     .map(|name| (*name).to_string())
                     .collect();
-                let removed: Vec<String> = prev_map
+                let mut removed: Vec<String> = prev_map
                     .keys()
                     .filter(|name| !curr_map.contains_key(*name))
                     .map(|name| (*name).to_string())
                     .collect();
-                let changed: Vec<String> = curr_map
+                let mut changed: Vec<String> = curr_map
                     .iter()
                     .filter_map(|(name, hash)| match prev_map.get(name) {
                         Some(previous) if previous != hash => Some((*name).to_string()),
                         _ => None,
                     })
                     .collect();
-                (added, removed, changed)
-            } else {
-                let prev_map: std::collections::HashMap<&str, u64> = prev
-                    .per_tool_hashes
-                    .iter()
-                    .map(|(name, hash)| (name.as_str(), *hash))
-                    .collect();
-                let curr_map: std::collections::HashMap<&str, u64> = curr
-                    .per_tool_hashes
-                    .iter()
-                    .map(|(name, hash)| (name.as_str(), *hash))
-                    .collect();
-                let added: Vec<String> = curr_map
-                    .keys()
-                    .filter(|name| !prev_map.contains_key(*name))
-                    .map(|name| (*name).to_string())
-                    .collect();
-                let removed: Vec<String> = prev_map
-                    .keys()
-                    .filter(|name| !curr_map.contains_key(*name))
-                    .map(|name| (*name).to_string())
-                    .collect();
-                let changed: Vec<String> = curr_map
-                    .iter()
-                    .filter_map(|(name, hash)| match prev_map.get(name) {
-                        Some(previous) if previous != hash => Some((*name).to_string()),
-                        _ => None,
-                    })
-                    .collect();
-                (added, removed, changed)
-            };
-            added.sort();
-            removed.sort();
-            changed.sort();
-
-            reasons.push(CacheBreakReason::ToolSchemasChanged {
-                added,
-                removed,
-                changed,
-            });
+                added.sort();
+                removed.sort();
+                changed.sort();
+                reasons.push(CacheBreakReason::ToolSchemasChanged {
+                    added,
+                    removed,
+                    changed,
+                });
+            }
         }
 
         // Fingerprint drift identifies a possible invalidation cause, not an
@@ -1314,127 +1074,6 @@ impl CacheBreakDetector {
 }
 
 // ---------------------------------------------------------------------------
-// D-12: Cache-Aware Compression Hints
-// ---------------------------------------------------------------------------
-
-/// Hint from cache diagnostics to the compression pipeline (D-4).
-/// Tells the compressor which message prefix is cache-valid and should
-/// NOT be compressed/reordered/removed.
-#[derive(Debug, Clone)]
-pub struct CacheAwareCompressionHint {
-    /// Number of messages from the start that form the cache-valid prefix.
-    /// The compression pipeline should not modify these messages.
-    pub protected_prefix_len: usize,
-    /// Estimated tokens in the protected prefix.
-    pub protected_token_estimate: usize,
-    /// Whether the cache is currently healthy (high hit rate).
-    pub cache_healthy: bool,
-    /// Suggested compression strategy based on cache state.
-    pub strategy: CompressionStrategy,
-}
-
-/// Suggested strategy for the compression pipeline.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CompressionStrategy {
-    /// Cache is healthy — only compress messages AFTER the protected prefix.
-    PreservePrefix,
-    /// Cache is already broken — free to compress anything.
-    CompressFreely,
-    /// Cache is marginal — try to preserve prefix but allow light compression.
-    PreservePrefixLight,
-}
-
-impl CacheBreakDetector {
-    /// Generate a compression hint based on current cache state.
-    ///
-    /// The hint tells the compression pipeline (D-4's `CompressionPipeline`)
-    /// how many leading messages are "cache-valid" and should be preserved.
-    ///
-    /// `message_count`: total messages in current conversation.
-    /// `system_message_count`: number of system messages at the start.
-    pub fn compression_hint(
-        &self,
-        message_count: usize,
-        system_message_count: usize,
-    ) -> CacheAwareCompressionHint {
-        self.compression_hint_for_source(DEFAULT_SOURCE, message_count, system_message_count)
-    }
-
-    /// Generate a compression hint for a specific query source.
-    ///
-    /// If the requested source has not been written yet, fall back to the most
-    /// recently refreshed source so replay-only streams do not silently lose the
-    /// protected-token estimate.
-    pub fn compression_hint_for_source(
-        &self,
-        source: &str,
-        message_count: usize,
-        system_message_count: usize,
-    ) -> CacheAwareCompressionHint {
-        let stats = &self.stats;
-        let hit_rate = stats.hit_rate_percent();
-
-        // If cache hit rate is high, protect the prefix
-        let cache_healthy = hit_rate >= 70.0;
-        let cache_marginal = (40.0..70.0).contains(&hit_rate);
-
-        let strategy = if cache_healthy {
-            CompressionStrategy::PreservePrefix
-        } else if cache_marginal {
-            CompressionStrategy::PreservePrefixLight
-        } else {
-            CompressionStrategy::CompressFreely
-        };
-
-        // The protected prefix is: system messages + tool schema context.
-        // This is what the API caches (the stable prefix bytes).
-        let protected_prefix_len = if cache_healthy || cache_marginal {
-            // Protect system messages and first few user/assistant exchanges
-            // that form the cache hit prefix
-            system_message_count.min(message_count)
-        } else {
-            0
-        };
-
-        // Compression hints are a whole-session property, but the token estimate
-        // still needs a representative snapshot. Prefer the caller's stream, and
-        // fall back to the most recently refreshed tracked stream so bridge-only
-        // replay state remains usable.
-        let protected_token_estimate = self
-            .per_source
-            .get(source)
-            .or_else(|| {
-                self.source_order
-                    .last()
-                    .and_then(|latest| self.per_source.get(latest))
-            })
-            .map(|s| s.cache_eligible_tokens)
-            .unwrap_or(0);
-
-        CacheAwareCompressionHint {
-            protected_prefix_len,
-            protected_token_estimate,
-            cache_healthy,
-            strategy,
-        }
-    }
-
-    /// Check if compressing a specific message range would break the cache.
-    /// Returns true if the range overlaps with the cache-valid prefix.
-    pub fn would_break_cache(
-        &self,
-        start_index: usize,
-        _end_index: usize,
-        system_message_count: usize,
-    ) -> bool {
-        if self.stats.hit_rate_percent() < 40.0 {
-            return false; // cache already broken, can't make it worse
-        }
-        start_index < system_message_count
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1517,36 +1156,6 @@ fn hash_serialized_system_prompt(system_blocks: &[SerializedSystemBlock]) -> u64
             0,
         );
     }
-    hasher.finish()
-}
-
-fn effective_prefix_system_prompt_hash(snapshot: &PromptStateSnapshot) -> u64 {
-    if snapshot.system_blocks.is_empty() {
-        return snapshot.system_prompt_hash;
-    }
-    let mut hasher = DefaultHasher::new();
-    let mut wrote_any = false;
-    for block in &snapshot.system_blocks {
-        if block.scope == "None" {
-            continue;
-        }
-        if wrote_any {
-            hasher.write(b"\n\n");
-        }
-        block.kind.hash(&mut hasher);
-        hasher.write_u8(0x1f);
-        block.scope.hash(&mut hasher);
-        hasher.write_u8(0x1e);
-        block.text_hash.hash(&mut hasher);
-        wrote_any = true;
-    }
-    if !wrote_any {
-        // No cache-scoped blocks exist in the prefix. Return 0 as a sentinel
-        // so the detector treats this turn as having no prefix to compare
-        // against (a real hash from hash_serialized_system_prompt is never 0).
-        return 0;
-    }
-    hasher.write_u8(0xff);
     hasher.finish()
 }
 
@@ -1771,6 +1380,13 @@ mod tests {
         );
     }
 
+    fn attempt(request_id: impl Into<String>) -> ProviderAttemptCacheIdentity {
+        ProviderAttemptCacheIdentity {
+            request_id: request_id.into(),
+            attempt: 0,
+        }
+    }
+
     fn make_tools(names: &[&str]) -> Vec<serde_json::Value> {
         names
             .iter()
@@ -1787,8 +1403,19 @@ mod tests {
     }
 
     fn snap(prompt: &str, tools: &[serde_json::Value], model: &str) -> PromptStateSnapshot {
-        let mut s = PromptStateSnapshot::capture(prompt, tools, model, 15_000);
+        // Fixture arguments describe opaque provider-final identities; the
+        // separate planned metadata deliberately carries no matching hashes.
+        let mut s = PromptStateSnapshot::capture(&format!("planned-{prompt}"), &[], model, 15_000);
         s.timestamp_secs = 1000; // fixed for testing
+        let tools: Vec<_> = tools
+            .iter()
+            .map(|tool| (tool["function"]["name"].as_str().unwrap(), tool.to_string()))
+            .collect();
+        let identities: Vec<_> = tools
+            .iter()
+            .map(|(name, schema)| (*name, schema.as_str()))
+            .collect();
+        s.attach_provider_final_fingerprint(exact_fingerprint(prompt, &identities));
         s
     }
 
@@ -1878,6 +1505,73 @@ mod tests {
     }
 
     #[test]
+    fn exact_marker_and_protocol_changes_have_distinct_attribution() {
+        let stable = exact_fingerprint("stable-with-5m-marker", &[]);
+        let marker_changed = exact_fingerprint("stable-with-1h-marker", &[]);
+        let mut protocol_changed = stable.clone();
+        protocol_changed.cache_capability.protocol =
+            crate::cache_placement::CacheProtocol::StrictHistoryMatch;
+        for (fingerprint, expected) in [
+            (stable.clone(), None),
+            (marker_changed, Some(CacheBreakReason::SystemPromptChanged)),
+            (
+                protocol_changed,
+                Some(CacheBreakReason::CacheControlChanged),
+            ),
+        ] {
+            let mut detector = CacheBreakDetector::new();
+            let mut baseline = snap("planned-system", &[], "m");
+            baseline.attach_provider_final_fingerprint(stable.clone());
+            assert!(
+                detector
+                    .record_provider_attempt_for_source(
+                        "main",
+                        &attempt("baseline"),
+                        baseline,
+                        None,
+                    )
+                    .1
+                    .is_none()
+            );
+            let mut current = snap(
+                "different-planned-system",
+                &make_tools(&["planned-tool"]),
+                "m",
+            );
+            current.attach_provider_final_fingerprint(fingerprint);
+            let (accepted, event) = detector.record_provider_attempt_for_source(
+                "main",
+                &attempt("changed"),
+                current,
+                None,
+            );
+            assert!(accepted);
+            assert_eq!(event.map(|event| event.reason), expected);
+            assert_eq!(detector.stats.total_turns, 0);
+        }
+    }
+
+    #[test]
+    fn pending_plan_drift_cannot_establish_a_physical_cache_break() {
+        let mut detector = CacheBreakDetector::new();
+        let first = PromptStateSnapshot::capture("planned-v1", &make_tools(&["bash"]), "m", 1000);
+        let second = PromptStateSnapshot::capture("planned-v2", &make_tools(&["grep"]), "m", 1000);
+        assert!(
+            detector
+                .record_provider_attempt_for_source("main", &attempt("plan-v1"), first, None,)
+                .1
+                .is_none()
+        );
+        assert!(
+            detector
+                .record_provider_attempt_for_source("main", &attempt("plan-v2"), second, None,)
+                .1
+                .is_none()
+        );
+        assert_eq!(detector.stats.total_turns, 0);
+    }
+
+    #[test]
     fn provider_attempt_without_usage_advances_baseline_without_counting_or_duplication() {
         let mut detector = CacheBreakDetector::new();
         let mut first = snap("planned", &[], "m");
@@ -1891,6 +1585,19 @@ mod tests {
         assert!(accepted);
         assert!(event.is_none());
         assert_eq!(detector.stats.total_turns, 0);
+        let checkpoint = serde_json::to_vec(&detector.snapshot_state()).unwrap();
+        let restored: CacheBreakDetectorState = serde_json::from_slice(&checkpoint).unwrap();
+        let mut missing_usage: serde_json::Value = serde_json::from_slice(&checkpoint).unwrap();
+        missing_usage
+            .as_object_mut()
+            .unwrap()
+            .remove("usage_per_source");
+        assert!(serde_json::from_value::<CacheBreakDetectorState>(missing_usage.clone()).is_err());
+        missing_usage["usage_per_source"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<CacheBreakDetectorState>(missing_usage).is_err());
+        assert!(restored.usage_per_source.is_empty());
+        assert!(restored.per_source.contains_key("main"));
+        let mut detector = CacheBreakDetector::from_state(restored);
         let mut duplicate = snap("different", &[], "m");
         duplicate.attach_provider_final_fingerprint(exact_fingerprint("changed", &[]));
         let (accepted, event) =
@@ -2059,23 +1766,10 @@ mod tests {
         .expect("second snapshot");
 
         assert_ne!(first.system_prompt_hash, second.system_prompt_hash);
-        assert_eq!(
-            effective_prefix_system_prompt_hash(&first),
-            effective_prefix_system_prompt_hash(&second),
-            "a preserved post-history system tail diverges after the leading cache prefix"
-        );
+        assert_eq!(first.system_blocks[0], second.system_blocks[0]);
+        assert_ne!(first.system_blocks[1], second.system_blocks[1]);
         assert_eq!(first.system_blocks[0].scope, "provider_visible");
         assert_eq!(first.system_blocks[1].scope, "None");
-
-        let mut detector = CacheBreakDetector::default();
-        assert!(detector.record_turn(first, None).is_none());
-        let event = detector.record_turn(second, None);
-        assert!(
-            event
-                .as_ref()
-                .is_none_or(|event| event.reason != CacheBreakReason::SystemPromptChanged),
-            "a post-history system suffix is outside the leading cache identity: {event:?}"
-        );
     }
 
     #[test]
@@ -2112,10 +1806,7 @@ mod tests {
         )
         .expect("second snapshot");
 
-        assert_ne!(
-            effective_prefix_system_prompt_hash(&first),
-            effective_prefix_system_prompt_hash(&second)
-        );
+        assert_ne!(first.system_blocks, second.system_blocks);
         assert!(
             first
                 .system_blocks
@@ -2186,8 +1877,16 @@ mod tests {
         let s1 = snap("system prompt", &tools, "claude-3.5-sonnet");
         let s2 = snap("system prompt", &tools, "claude-3.5-sonnet");
 
-        assert!(det.record_turn(s1, None).is_none()); // first turn
-        assert!(det.record_turn(s2, None).is_none()); // same = hit
+        assert!(
+            det.record_provider_attempt_for_source("main", &attempt("receipt-1"), s1, Some(15_000))
+                .1
+                .is_none()
+        ); // first turn
+        assert!(
+            det.record_provider_attempt_for_source("main", &attempt("receipt-2"), s2, Some(15_000))
+                .1
+                .is_none()
+        ); // same = hit
         assert_eq!(det.stats.cache_hits, 1);
         assert_eq!(det.stats.cache_misses, 1); // first turn counts as miss
     }
@@ -2197,8 +1896,20 @@ mod tests {
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new();
 
-        det.record_turn(snap("prompt v1", &tools, "claude"), None);
-        let event = det.record_turn(snap("prompt v2", &tools, "claude"), None);
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-1"),
+            snap("prompt v1", &tools, "claude"),
+            None,
+        );
+        let event = det
+            .record_provider_attempt_for_source(
+                "main",
+                &attempt("receipt-2"),
+                snap("prompt v2", &tools, "claude"),
+                None,
+            )
+            .1;
 
         assert!(event.is_some());
         let e = event.unwrap();
@@ -2210,14 +1921,20 @@ mod tests {
     fn detect_tool_schema_change() {
         let mut det = CacheBreakDetector::new();
 
-        det.record_turn(
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-1"),
             snap("prompt", &make_tools(&["bash", "str_replace"]), "claude"),
             None,
         );
-        let event = det.record_turn(
-            snap("prompt", &make_tools(&["bash", "grep"]), "claude"),
-            None,
-        );
+        let event = det
+            .record_provider_attempt_for_source(
+                "main",
+                &attempt("receipt-2"),
+                snap("prompt", &make_tools(&["bash", "grep"]), "claude"),
+                None,
+            )
+            .1;
 
         let e = event.unwrap();
         match &e.reason {
@@ -2245,17 +1962,35 @@ mod tests {
         let tracked_prefix = changed.cache_eligible_tokens as u64;
 
         let mut warm = CacheBreakDetector::new();
-        warm.record_turn(baseline.clone(), None);
+        warm.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-1"),
+            baseline.clone(),
+            Some(0),
+        );
         assert!(
-            warm.record_turn(changed.clone(), Some(tracked_prefix))
-                .is_none(),
+            warm.record_provider_attempt_for_source(
+                "main",
+                &attempt("receipt-2"),
+                changed.clone(),
+                Some(tracked_prefix)
+            )
+            .1
+            .is_none(),
             "measured cache reuse covering the tracked prefix must outrank a structural hypothesis"
         );
 
         let mut cold = CacheBreakDetector::new();
-        cold.record_turn(baseline, None);
+        cold.record_provider_attempt_for_source("main", &attempt("receipt-3"), baseline, Some(0));
         assert!(matches!(
-            cold.record_turn(changed, Some(0)).map(|event| event.reason),
+            cold.record_provider_attempt_for_source(
+                "main",
+                &attempt("receipt-4"),
+                changed,
+                Some(0)
+            )
+            .1
+            .map(|event| event.reason),
             Some(CacheBreakReason::ToolSchemasChanged { .. })
         ));
     }
@@ -2275,8 +2010,20 @@ mod tests {
             "function": {"name": "agent", "description": "rewritten dynamically"}
         })];
 
-        det.record_turn(snap("prompt", &t1, "claude"), None);
-        let event = det.record_turn(snap("prompt", &t2, "claude"), None);
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-1"),
+            snap("prompt", &t1, "claude"),
+            None,
+        );
+        let event = det
+            .record_provider_attempt_for_source(
+                "main",
+                &attempt("receipt-2"),
+                snap("prompt", &t2, "claude"),
+                None,
+            )
+            .1;
         let e = event.expect("break should fire on same-name schema churn");
         match &e.reason {
             CacheBreakReason::ToolSchemasChanged {
@@ -2302,8 +2049,20 @@ mod tests {
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new();
 
-        det.record_turn(snap("prompt", &tools, "claude-3.5-sonnet"), None);
-        let event = det.record_turn(snap("prompt", &tools, "gpt-4o"), None);
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-1"),
+            snap("prompt", &tools, "claude-3.5-sonnet"),
+            None,
+        );
+        let event = det
+            .record_provider_attempt_for_source(
+                "main",
+                &attempt("receipt-2"),
+                snap("prompt", &tools, "gpt-4o"),
+                None,
+            )
+            .1;
 
         let e = event.unwrap();
         match &e.reason {
@@ -2329,11 +2088,13 @@ mod tests {
 
         let mut s1 = snap("prompt", &tools, "claude");
         s1.timestamp_secs = 1000;
-        det.record_turn(s1, None);
+        det.record_provider_attempt_for_source("main", &attempt("receipt-1"), s1, Some(0));
 
         let mut s2 = snap("prompt", &tools, "claude");
         s2.timestamp_secs = 1000 + CACHE_TTL_1HOUR_SECS + 1;
-        let event = det.record_turn(s2, Some(0)); // API says 0 cache read
+        let event = det
+            .record_provider_attempt_for_source("main", &attempt("receipt-2"), s2, Some(0))
+            .1; // API says 0 cache read
 
         let e = event.unwrap();
         match &e.reason {
@@ -2351,199 +2112,15 @@ mod tests {
 
         let mut s1 = snap("prompt", &tools, "claude");
         s1.timestamp_secs = 1000;
-        det.record_turn(s1, None);
+        det.record_provider_attempt_for_source("main", &attempt("receipt-1"), s1, Some(0));
 
         let mut s2 = snap("prompt", &tools, "claude");
         s2.timestamp_secs = 5000;
         // API says plenty of cache reads — not a miss
-        let event = det.record_turn(s2, Some(10_000));
+        let event = det
+            .record_provider_attempt_for_source("main", &attempt("receipt-2"), s2, Some(10_000))
+            .1;
         assert!(event.is_none());
-    }
-
-    #[test]
-    fn system_prompt_change_does_not_also_claim_cache_control_changed() {
-        use crate::section_types::{CacheScope, SectionKind};
-
-        let block_v1 = SerializedSystemBlock {
-            kind: SectionKind::Identity,
-            scope: CacheScope::Session,
-            text: "system v1".into(),
-            cache_control: Some(serde_json::json!({"type": "ephemeral"})),
-        };
-        let block_v2 = SerializedSystemBlock {
-            text: "system v2".into(),
-            ..block_v1.clone()
-        };
-
-        let mut det = CacheBreakDetector::new();
-        det.record_turn(
-            PromptStateSnapshot::capture_serialized(&[block_v1], &[], "anthropic", "claude", 8_000),
-            None,
-        );
-        let event = det
-            .record_turn(
-                PromptStateSnapshot::capture_serialized(
-                    &[block_v2],
-                    &[],
-                    "anthropic",
-                    "claude",
-                    8_000,
-                ),
-                Some(0),
-            )
-            .expect("system prompt change should be detected");
-
-        let reasons = match event.reason {
-            CacheBreakReason::Multiple(reasons) => reasons,
-            other => vec![other],
-        };
-        assert!(
-            reasons
-                .iter()
-                .any(|reason| matches!(reason, CacheBreakReason::SystemPromptChanged))
-        );
-        assert!(
-            reasons
-                .iter()
-                .all(|reason| !matches!(reason, CacheBreakReason::CacheControlChanged)),
-            "text-only changes must not be misattributed as cache-control churn"
-        );
-    }
-
-    #[test]
-    fn detect_cache_control_change() {
-        use crate::section_types::{CacheScope, SectionKind};
-
-        let block_v1 = SerializedSystemBlock {
-            kind: SectionKind::Identity,
-            scope: CacheScope::Session,
-            text: "stable".into(),
-            cache_control: Some(json!({"type": "ephemeral"})),
-        };
-        let block_v2 = SerializedSystemBlock {
-            cache_control: Some(json!({"type": "ephemeral", "ttl": "1h"})),
-            ..block_v1.clone()
-        };
-
-        let mut det = CacheBreakDetector::new();
-        det.record_turn(
-            PromptStateSnapshot::capture_serialized(&[block_v1], &[], "anthropic", "claude", 8_000),
-            None,
-        );
-        let event = det
-            .record_turn(
-                PromptStateSnapshot::capture_serialized(
-                    &[block_v2],
-                    &[],
-                    "anthropic",
-                    "claude",
-                    8_000,
-                ),
-                Some(0),
-            )
-            .expect("cache-control change should be detected");
-
-        assert_eq!(event.reason, CacheBreakReason::CacheControlChanged);
-    }
-
-    #[test]
-    fn volatile_system_tail_change_does_not_claim_system_prompt_changed() {
-        use crate::section_types::{CacheScope, SectionKind};
-
-        let stable = SerializedSystemBlock {
-            kind: SectionKind::Identity,
-            scope: CacheScope::Session,
-            text: "stable prefix".into(),
-            cache_control: Some(json!({"type": "ephemeral"})),
-        };
-        let volatile_v1 = SerializedSystemBlock {
-            kind: SectionKind::RuntimeVolatile,
-            scope: CacheScope::None,
-            text: "tail v1".into(),
-            cache_control: None,
-        };
-        let volatile_v2 = SerializedSystemBlock {
-            text: "tail v2".into(),
-            ..volatile_v1.clone()
-        };
-
-        let mut det = CacheBreakDetector::new();
-        det.record_turn(
-            PromptStateSnapshot::capture_serialized(
-                &[stable.clone(), volatile_v1],
-                &[],
-                "anthropic",
-                "claude",
-                8_000,
-            ),
-            None,
-        );
-        let event = det.record_turn(
-            PromptStateSnapshot::capture_serialized(
-                &[stable, volatile_v2],
-                &[],
-                "anthropic",
-                "claude",
-                8_000,
-            ),
-            None,
-        );
-
-        assert!(
-            event.is_none(),
-            "changing only CacheScope::None system blocks must not count as a cache-prefix break"
-        );
-    }
-
-    #[test]
-    fn adding_no_cache_system_block_does_not_claim_cache_control_changed() {
-        use crate::section_types::{CacheScope, SectionKind};
-
-        let stable = SerializedSystemBlock {
-            kind: SectionKind::Identity,
-            scope: CacheScope::Session,
-            text: "stable prefix".into(),
-            cache_control: Some(json!({"type": "ephemeral"})),
-        };
-        let volatile = SerializedSystemBlock {
-            kind: SectionKind::RuntimeVolatile,
-            scope: CacheScope::None,
-            text: "volatile tail".into(),
-            cache_control: None,
-        };
-        let working_memory = SerializedSystemBlock {
-            kind: SectionKind::WorkingMemory,
-            scope: CacheScope::None,
-            text: "dynamic memory".into(),
-            cache_control: None,
-        };
-
-        let mut det = CacheBreakDetector::new();
-        det.record_turn(
-            PromptStateSnapshot::capture_serialized(
-                &[stable.clone(), volatile.clone()],
-                &[],
-                "anthropic",
-                "claude",
-                8_000,
-            ),
-            None,
-        );
-        let event = det.record_turn(
-            PromptStateSnapshot::capture_serialized(
-                &[stable, volatile, working_memory],
-                &[],
-                "anthropic",
-                "claude",
-                8_000,
-            ),
-            None,
-        );
-
-        assert!(
-            event.is_none(),
-            "adding no-cache system blocks must not be classified as cache-control drift"
-        );
     }
 
     #[test]
@@ -2553,8 +2130,15 @@ mod tests {
         let mut snapshot = snap("prompt", &tools, "claude");
         snapshot.cache_eligible_tokens = 512;
 
-        det.record_turn(snapshot.clone(), None);
-        let event = det.record_turn(snapshot, Some(900));
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-1"),
+            snapshot.clone(),
+            Some(0),
+        );
+        let event = det
+            .record_provider_attempt_for_source("main", &attempt("receipt-2"), snapshot, Some(900))
+            .1;
         assert!(
             event.is_none(),
             "small stable prefixes should not need a 2k cache_read to count as a hit"
@@ -2568,12 +2152,13 @@ mod tests {
 
         let mut s1 = snap("prompt", &tools, "claude");
         s1.timestamp_secs = 1_000;
-        det.record_turn(s1, None);
+        det.record_provider_attempt_for_source("main", &attempt("receipt-1"), s1, Some(0));
 
         let mut s2 = snap("prompt", &tools, "claude");
         s2.timestamp_secs = 1_100;
         let event = det
-            .record_turn(s2, Some(0))
+            .record_provider_attempt_for_source("main", &attempt("receipt-2"), s2, Some(0))
+            .1
             .expect("near-zero cache read with same fingerprint should surface");
         assert_eq!(event.reason, CacheBreakReason::UnknownColdStart);
     }
@@ -2582,11 +2167,20 @@ mod tests {
     fn multiple_reasons_combined() {
         let mut det = CacheBreakDetector::new();
 
-        det.record_turn(snap("prompt v1", &make_tools(&["bash"]), "claude"), None);
-        let event = det.record_turn(
-            snap("prompt v2", &make_tools(&["bash", "str_replace"]), "gpt-4o"),
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-1"),
+            snap("prompt v1", &make_tools(&["bash"]), "claude"),
             None,
         );
+        let event = det
+            .record_provider_attempt_for_source(
+                "main",
+                &attempt("receipt-2"),
+                snap("prompt v2", &make_tools(&["bash", "str_replace"]), "gpt-4o"),
+                None,
+            )
+            .1;
 
         let e = event.unwrap();
         match &e.reason {
@@ -2600,10 +2194,34 @@ mod tests {
     #[test]
     fn reset_all_sources_treats_next_turn_as_fresh_baseline() {
         let mut det = CacheBreakDetector::new();
-        det.record_turn(snap("prompt v1", &make_tools(&["bash"]), "claude"), None);
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-1"),
+            snap("prompt v1", &make_tools(&["bash"]), "claude"),
+            Some(0),
+        );
         det.reset_all_sources();
+        assert!(det.per_source.is_empty());
+        assert!(det.usage_per_source.is_empty());
+        assert!(
+            !det.record_provider_attempt_for_source(
+                "main",
+                &attempt("receipt-1"),
+                snap("replayed", &[], "claude"),
+                Some(0),
+            )
+            .0
+        );
+        assert!(det.per_source.is_empty());
 
-        let event = det.record_turn(snap("prompt v2", &make_tools(&["bash"]), "claude"), Some(0));
+        let event = det
+            .record_provider_attempt_for_source(
+                "main",
+                &attempt("receipt-2"),
+                snap("prompt v2", &make_tools(&["bash"]), "claude"),
+                Some(0),
+            )
+            .1;
         assert!(
             event.is_none(),
             "post-reset cold start should not be misclassified"
@@ -2616,11 +2234,36 @@ mod tests {
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new();
 
-        det.record_turn(snap("p", &tools, "c"), None); // miss (first)
-        det.record_turn(snap("p", &tools, "c"), None); // hit
-        det.record_turn(snap("p", &tools, "c"), None); // hit
-        det.record_turn(snap("p", &tools, "c"), None); // hit
-        det.record_turn(snap("p2", &tools, "c"), None); // miss (changed)
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-1"),
+            snap("p", &tools, "c"),
+            Some(0),
+        ); // miss (first)
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-2"),
+            snap("p", &tools, "c"),
+            Some(15_000),
+        ); // hit
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-3"),
+            snap("p", &tools, "c"),
+            Some(15_000),
+        ); // hit
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-4"),
+            snap("p", &tools, "c"),
+            Some(15_000),
+        ); // hit
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-5"),
+            snap("p2", &tools, "c"),
+            Some(0),
+        ); // miss (changed)
 
         assert_eq!(det.stats.total_turns, 5);
         assert_eq!(det.stats.cache_hits, 3);
@@ -2632,8 +2275,18 @@ mod tests {
     fn status_line_format() {
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new();
-        det.record_turn(snap("p", &tools, "c"), None);
-        det.record_turn(snap("p", &tools, "c"), None);
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-1"),
+            snap("p", &tools, "c"),
+            Some(15_000),
+        );
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-2"),
+            snap("p", &tools, "c"),
+            Some(15_000),
+        );
         let line = det.status_line();
         assert!(line.contains("Cache:"));
         assert!(line.contains("hit rate"));
@@ -2643,9 +2296,19 @@ mod tests {
     fn recent_breaks_capped_at_10() {
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new();
-        det.record_turn(snap("p0", &tools, "c"), None);
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("recent_breaks_capped_at_10:1"),
+            snap("p0", &tools, "c"),
+            Some(0),
+        );
         for i in 1..=15 {
-            det.record_turn(snap(&format!("p{i}"), &tools, "c"), None);
+            det.record_provider_attempt_for_source(
+                "main",
+                &attempt(format!("recent_breaks_capped_at_10:2:{i}")),
+                snap(&format!("p{i}"), &tools, "c"),
+                Some(0),
+            );
         }
         assert!(det.stats.recent_breaks.len() <= 10);
     }
@@ -2761,26 +2424,38 @@ mod tests {
         let mut s2 = PromptStateSnapshot::capture("prompt", &tools, "claude", 0);
         s2.timestamp_secs = 1001;
 
-        assert!(det.record_turn(s1, None).is_none());
-        assert!(det.record_turn(s2, None).is_none());
+        assert!(
+            det.record_provider_attempt_for_source("main", &attempt("receipt-1"), s1, Some(15_000))
+                .1
+                .is_none()
+        );
+        assert!(
+            det.record_provider_attempt_for_source("main", &attempt("receipt-2"), s2, Some(15_000))
+                .1
+                .is_none()
+        );
         assert_eq!(det.stats.cache_hits, 1);
     }
 
     #[test]
-    fn hundred_percent_hit_rate() {
+    fn stable_measured_requests_reuse_the_initial_baseline() {
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new();
 
-        // First turn is always a miss, then 4 hits → 4/5 = 80% hits
-        // To get ~100% we need the first turn (miss) plus all subsequent as hits.
-        // Actually: first turn = miss, turns 2-6 = hits → 5 hits / 6 turns ≈ 83%
-        // For true 100% hit rate on record_turn logic, first turn is always miss.
-        // So record 1 first turn + 5 identical turns → 5 hits out of 6 turns.
-        // But the ask is "cache_read_tokens >= cache_eligible_tokens" for 5 turns.
-        // Let's just verify the hit rate from the stats perspective.
-        det.record_turn(snap("p", &tools, "c"), Some(15_000)); // first turn = miss
-        for _ in 0..5 {
-            det.record_turn(snap("p", &tools, "c"), Some(15_000)); // hits
+        // The initial measured request establishes the baseline; five retries reuse it.
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-1"),
+            snap("p", &tools, "c"),
+            Some(15_000),
+        ); // first turn = miss
+        for attempt_index in 0..5 {
+            det.record_provider_attempt_for_source(
+                "main",
+                &attempt(format!("receipt-2:{attempt_index}")),
+                snap("p", &tools, "c"),
+                Some(15_000),
+            ); // hits
         }
         // 5 hits out of 6 total turns
         let rate = det.stats.hit_rate_percent();
@@ -2798,7 +2473,12 @@ mod tests {
 
         // Every turn changes the prompt → all misses
         for i in 0..5 {
-            det.record_turn(snap(&format!("prompt-{i}"), &tools, "c"), Some(0));
+            det.record_provider_attempt_for_source(
+                "main",
+                &attempt(format!("receipt-1:{i}")),
+                snap(&format!("prompt-{i}"), &tools, "c"),
+                Some(0),
+            );
         }
         assert_eq!(det.stats.total_turns, 5);
         // First turn = miss, turns 2-5 = breaks (also misses) → 0 hits
@@ -2813,9 +2493,19 @@ mod tests {
         let mut det = CacheBreakDetector::new();
 
         // 1 miss (first) + 9 hits = 90% hit rate → green
-        det.record_turn(snap("p", &tools, "c"), None);
-        for _ in 0..9 {
-            det.record_turn(snap("p", &tools, "c"), None);
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-1"),
+            snap("p", &tools, "c"),
+            Some(15_000),
+        );
+        for attempt_index in 0..9 {
+            det.record_provider_attempt_for_source(
+                "main",
+                &attempt(format!("receipt-2:{attempt_index}")),
+                snap("p", &tools, "c"),
+                Some(15_000),
+            );
         }
         assert!(det.stats.hit_rate_percent() >= 80.0);
         assert!(det.status_line().contains("🟢"));
@@ -2828,7 +2518,12 @@ mod tests {
 
         // All different prompts → 0% hit rate → red
         for i in 0..5 {
-            det.record_turn(snap(&format!("p{i}"), &tools, "c"), None);
+            det.record_provider_attempt_for_source(
+                "main",
+                &attempt(format!("receipt-1:{i}")),
+                snap(&format!("p{i}"), &tools, "c"),
+                Some(0),
+            );
         }
         assert!(det.stats.hit_rate_percent() < 50.0);
         assert!(
@@ -2845,11 +2540,15 @@ mod tests {
 
         let mut s1 = PromptStateSnapshot::capture("prompt v1", &tools, "claude", 100_000);
         s1.timestamp_secs = 1000;
-        det.record_turn(s1, None);
+        s1.attach_provider_final_fingerprint(exact_fingerprint("system-v1", &[]));
+        det.record_provider_attempt_for_source("main", &attempt("receipt-1"), s1, Some(0));
 
         let mut s2 = PromptStateSnapshot::capture("prompt v2", &tools, "claude", 100_000);
         s2.timestamp_secs = 1001;
-        let event = det.record_turn(s2, None);
+        s2.attach_provider_final_fingerprint(exact_fingerprint("system-v2", &[]));
+        let event = det
+            .record_provider_attempt_for_source("main", &attempt("receipt-2"), s2, Some(0))
+            .1;
 
         assert!(event.is_some());
         assert_eq!(event.unwrap().estimated_token_impact, 100_000);
@@ -2863,8 +2562,21 @@ mod tests {
         // SystemPromptChanged
         {
             let mut det = CacheBreakDetector::new();
-            det.record_turn(snap("v1", &tools, "c"), None);
-            let e = det.record_turn(snap("v2", &tools, "c"), None).unwrap();
+            det.record_provider_attempt_for_source(
+                "main",
+                &attempt("receipt-1"),
+                snap("v1", &tools, "c"),
+                None,
+            );
+            let e = det
+                .record_provider_attempt_for_source(
+                    "main",
+                    &attempt("receipt-2"),
+                    snap("v2", &tools, "c"),
+                    None,
+                )
+                .1
+                .unwrap();
             assert!(
                 e.suggestion.is_some(),
                 "SystemPromptChanged should have remediation"
@@ -2873,9 +2585,20 @@ mod tests {
         // ToolSchemasChanged
         {
             let mut det = CacheBreakDetector::new();
-            det.record_turn(snap("p", &make_tools(&["bash"]), "c"), None);
+            det.record_provider_attempt_for_source(
+                "main",
+                &attempt("receipt-3"),
+                snap("p", &make_tools(&["bash"]), "c"),
+                None,
+            );
             let e = det
-                .record_turn(snap("p", &make_tools(&["bash", "str_replace"]), "c"), None)
+                .record_provider_attempt_for_source(
+                    "main",
+                    &attempt("receipt-4"),
+                    snap("p", &make_tools(&["bash", "str_replace"]), "c"),
+                    None,
+                )
+                .1
                 .unwrap();
             assert!(
                 e.suggestion.is_some(),
@@ -2885,8 +2608,21 @@ mod tests {
         // ModelChanged
         {
             let mut det = CacheBreakDetector::new();
-            det.record_turn(snap("p", &tools, "claude"), None);
-            let e = det.record_turn(snap("p", &tools, "gpt-4o"), None).unwrap();
+            det.record_provider_attempt_for_source(
+                "main",
+                &attempt("receipt-5"),
+                snap("p", &tools, "claude"),
+                None,
+            );
+            let e = det
+                .record_provider_attempt_for_source(
+                    "main",
+                    &attempt("receipt-6"),
+                    snap("p", &tools, "gpt-4o"),
+                    None,
+                )
+                .1
+                .unwrap();
             assert!(
                 e.suggestion.is_some(),
                 "ModelChanged should have remediation"
@@ -2897,110 +2633,16 @@ mod tests {
             let mut det = CacheBreakDetector::new();
             let mut s1 = snap("p", &tools, "c");
             s1.timestamp_secs = 1000;
-            det.record_turn(s1, None);
+            det.record_provider_attempt_for_source("main", &attempt("receipt-7"), s1, Some(0));
 
             let mut s2 = snap("p", &tools, "c");
             s2.timestamp_secs = 1000 + CACHE_TTL_1HOUR_SECS + 1;
-            let e = det.record_turn(s2, Some(0)).unwrap();
+            let e = det
+                .record_provider_attempt_for_source("main", &attempt("receipt-8"), s2, Some(0))
+                .1
+                .unwrap();
             assert!(e.suggestion.is_some(), "TtlExpired should have remediation");
         }
-    }
-
-    // D-12: Cache-aware compression hint tests
-
-    #[test]
-    fn compression_hint_healthy_cache() {
-        let tools = make_tools(&["bash", "str_replace"]);
-        let mut det = CacheBreakDetector::new();
-
-        // Record 5 turns with no breaks → high hit rate
-        for _ in 0..5 {
-            det.record_turn(snap("prompt", &tools, "claude"), None);
-        }
-
-        let hint = det.compression_hint(20, 2);
-        assert!(hint.cache_healthy);
-        assert_eq!(hint.strategy, CompressionStrategy::PreservePrefix);
-        assert_eq!(hint.protected_prefix_len, 2);
-    }
-
-    #[test]
-    fn compression_hint_broken_cache() {
-        let tools = make_tools(&["bash"]);
-        let mut det = CacheBreakDetector::new();
-
-        // Force breaks by changing prompt each turn
-        for i in 0..5 {
-            det.record_turn(snap(&format!("prompt{}", i), &tools, "claude"), None);
-        }
-
-        let hint = det.compression_hint(20, 2);
-        assert!(!hint.cache_healthy);
-        assert_eq!(hint.strategy, CompressionStrategy::CompressFreely);
-        assert_eq!(hint.protected_prefix_len, 0);
-    }
-
-    #[test]
-    fn compression_hint_falls_back_to_latest_tracked_source() {
-        let tools = make_tools(&["bash"]);
-        let mut det = CacheBreakDetector::new();
-
-        for _ in 0..5 {
-            det.record_turn_for_source("server_loop", snap("prompt", &tools, "claude"), None);
-        }
-
-        let hint = det.compression_hint(20, 2);
-        assert!(hint.cache_healthy);
-        assert_eq!(hint.protected_token_estimate, 15_000);
-    }
-
-    #[test]
-    fn compression_hint_for_source_prefers_requested_snapshot() {
-        let tools = make_tools(&["bash"]);
-        let mut det = CacheBreakDetector::new();
-
-        let mut main = snap("main", &tools, "claude");
-        main.cache_eligible_tokens = 7_000;
-        let mut bridge = snap("bridge", &tools, "claude");
-        bridge.cache_eligible_tokens = 11_000;
-
-        det.record_turn_for_source(DEFAULT_SOURCE, main.clone(), None);
-        det.record_turn_for_source(DEFAULT_SOURCE, main, None);
-        det.record_turn_for_source("server_loop", bridge.clone(), None);
-        det.record_turn_for_source("server_loop", bridge, None);
-
-        let hint = det.compression_hint_for_source(DEFAULT_SOURCE, 20, 2);
-        assert_eq!(hint.protected_token_estimate, 7_000);
-    }
-
-    #[test]
-    fn would_break_cache_detects_overlap() {
-        let tools = make_tools(&["bash"]);
-        let mut det = CacheBreakDetector::new();
-
-        // Build healthy cache
-        for _ in 0..5 {
-            det.record_turn(snap("prompt", &tools, "claude"), None);
-        }
-
-        // Compressing from index 0 overlaps system messages
-        assert!(det.would_break_cache(0, 5, 2));
-        // Compressing from index 3 does not
-        assert!(!det.would_break_cache(3, 10, 2));
-    }
-
-    #[test]
-    fn would_break_cache_already_broken() {
-        let tools = make_tools(&["bash"]);
-        let mut det = CacheBreakDetector::new();
-
-        // Break cache every turn
-        for i in 0..5 {
-            det.record_turn(snap(&format!("p{}", i), &tools, "claude"), None);
-        }
-
-        // Even overlapping range is fine since cache is already broken
-        assert!(!det.would_break_cache(0, 5, 2));
     }
 
     #[test]
@@ -3008,8 +2650,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut det = CacheBreakDetector::new().with_diff_dir(tmp.path());
 
-        det.record_turn(snap("v1", &make_tools(&["bash"]), "claude"), None);
-        det.record_turn(snap("v2", &make_tools(&["bash"]), "claude"), None);
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-1"),
+            snap("v1", &make_tools(&["bash"]), "claude"),
+            Some(0),
+        );
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-2"),
+            snap("v2", &make_tools(&["bash"]), "claude"),
+            Some(0),
+        );
 
         let files: Vec<_> = wait_for_artifacts(tmp.path(), 2)
             .into_iter()
@@ -3047,8 +2699,18 @@ mod tests {
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new().with_diff_dir(tmp.path());
 
-        det.record_turn(snap("p", &tools, "claude"), None);
-        det.record_turn(snap("p", &tools, "claude"), None); // hit, no artifact
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-1"),
+            snap("p", &tools, "claude"),
+            Some(15_000),
+        );
+        det.record_provider_attempt_for_source(
+            "main",
+            &attempt("receipt-2"),
+            snap("p", &tools, "claude"),
+            Some(15_000),
+        ); // hit, no artifact
 
         let count = std::fs::read_dir(tmp.path()).unwrap().count();
         assert_eq!(count, 0, "no artifacts should be written on hits");
@@ -3061,22 +2723,6 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    fn default_source_constant_is_stable() {
-        // Guard DEFAULT_SOURCE's literal value in one place rather than
-        // duplicating "main" across every test that uses the shortcut API.
-        assert_eq!(DEFAULT_SOURCE, "main");
-    }
-
-    #[test]
-    fn legacy_record_turn_writes_default_source() {
-        let tools = make_tools(&["bash"]);
-        let mut det = CacheBreakDetector::new();
-        det.record_turn(snap("p", &tools, "claude"), None);
-        assert_eq!(det.tracked_source_count(), 1);
-        assert!(det.snapshot_for_source(DEFAULT_SOURCE).is_some());
-    }
-
-    #[test]
     fn sources_are_independent_on_divergence() {
         // Source A keeps a stable prefix (should register hits).
         // Source B changes its system prompt each turn (should register breaks).
@@ -3086,18 +2732,42 @@ mod tests {
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new();
 
-        det.record_turn_for_source("A", snap("prompt-A", &tools, "m"), None);
-        det.record_turn_for_source("B", snap("prompt-B-v1", &tools, "m"), None);
+        det.record_provider_attempt_for_source(
+            "A",
+            &attempt("receipt-1"),
+            snap("prompt-A", &tools, "m"),
+            Some(0),
+        );
+        det.record_provider_attempt_for_source(
+            "B",
+            &attempt("receipt-2"),
+            snap("prompt-B-v1", &tools, "m"),
+            Some(0),
+        );
 
         // A stable — this must be a HIT, even though B was written in between.
-        let a_second = det.record_turn_for_source("A", snap("prompt-A", &tools, "m"), None);
+        let a_second = det
+            .record_provider_attempt_for_source(
+                "A",
+                &attempt("receipt-3"),
+                snap("prompt-A", &tools, "m"),
+                Some(15_000),
+            )
+            .1;
         assert!(
             a_second.is_none(),
             "A's second turn must hit because A's own previous matched"
         );
 
         // B breaks — system prompt changed for B.
-        let b_second = det.record_turn_for_source("B", snap("prompt-B-v2", &tools, "m"), None);
+        let b_second = det
+            .record_provider_attempt_for_source(
+                "B",
+                &attempt("receipt-4"),
+                snap("prompt-B-v2", &tools, "m"),
+                Some(0),
+            )
+            .1;
         assert!(
             matches!(
                 b_second.as_ref().map(|e| &e.reason),
@@ -3116,17 +2786,42 @@ mod tests {
     #[test]
     fn break_in_one_source_does_not_corrupt_another_baseline() {
         // After a break in source B, source A's subsequent identical turn
-        // must still hit — baselines are per-source.
+        // must remain structurally unchanged — baselines are per-source.
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new();
 
-        det.record_turn_for_source("A", snap("p-A", &tools, "m"), None);
-        det.record_turn_for_source("B", snap("p-B-v1", &tools, "m"), None);
-        det.record_turn_for_source("B", snap("p-B-v2", &tools, "m"), None); // B break
+        det.record_provider_attempt_for_source(
+            "A",
+            &attempt("receipt-1"),
+            snap("p-A", &tools, "m"),
+            None,
+        );
+        det.record_provider_attempt_for_source(
+            "B",
+            &attempt("receipt-2"),
+            snap("p-B-v1", &tools, "m"),
+            None,
+        );
+        det.record_provider_attempt_for_source(
+            "B",
+            &attempt("receipt-3"),
+            snap("p-B-v2", &tools, "m"),
+            None,
+        ); // B break
 
-        // A's prefix is unchanged — must hit.
-        let a_next = det.record_turn_for_source("A", snap("p-A", &tools, "m"), None);
-        assert!(a_next.is_none(), "A must still hit after B broke");
+        // A's prefix is unchanged — must remain structurally unchanged.
+        let a_next = det
+            .record_provider_attempt_for_source(
+                "A",
+                &attempt("receipt-4"),
+                snap("p-A", &tools, "m"),
+                None,
+            )
+            .1;
+        assert!(
+            a_next.is_none(),
+            "A must remain structurally unchanged after B broke"
+        );
     }
 
     #[test]
@@ -3137,9 +2832,20 @@ mod tests {
         // Fill past the cap. The oldest source ("s00") must be evicted.
         for i in 0..(MAX_TRACKED_SOURCES + 3) {
             let source = format!("s{i:02}");
-            det.record_turn_for_source(&source, snap("p", &tools, "m"), None);
+            det.record_provider_attempt_for_source(
+                &source,
+                &attempt(format!("receipt-1:{i}")),
+                snap("p", &tools, "m"),
+                Some(0),
+            );
         }
         assert_eq!(det.tracked_source_count(), MAX_TRACKED_SOURCES);
+        assert_eq!(det.usage_per_source.len(), MAX_TRACKED_SOURCES);
+        assert!(!det.usage_per_source.contains_key("s00"));
+        assert!(
+            det.usage_per_source
+                .contains_key(&format!("s{:02}", MAX_TRACKED_SOURCES + 2))
+        );
         assert!(
             det.snapshot_for_source("s00").is_none(),
             "oldest source should have been evicted"
@@ -3159,15 +2865,35 @@ mod tests {
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new();
 
-        det.record_turn_for_source("stable", snap("p", &tools, "m"), None);
+        det.record_provider_attempt_for_source(
+            "stable",
+            &attempt("receipt-1"),
+            snap("p", &tools, "m"),
+            None,
+        );
         // Fill the rest to the cap; "stable" is currently oldest.
         for i in 0..(MAX_TRACKED_SOURCES - 1) {
-            det.record_turn_for_source(&format!("t{i}"), snap("p", &tools, "m"), None);
+            det.record_provider_attempt_for_source(
+                &format!("t{i}"),
+                &attempt(format!("receipt-2:{i}")),
+                snap("p", &tools, "m"),
+                None,
+            );
         }
         // Refresh stable — it becomes most recent.
-        det.record_turn_for_source("stable", snap("p", &tools, "m"), None);
+        det.record_provider_attempt_for_source(
+            "stable",
+            &attempt("receipt-3"),
+            snap("p", &tools, "m"),
+            None,
+        );
         // One more write triggers eviction — but "stable" is no longer oldest.
-        det.record_turn_for_source("overflow", snap("p", &tools, "m"), None);
+        det.record_provider_attempt_for_source(
+            "overflow",
+            &attempt("receipt-4"),
+            snap("p", &tools, "m"),
+            None,
+        );
 
         assert!(
             det.snapshot_for_source("stable").is_some(),
@@ -3185,15 +2911,31 @@ mod tests {
         // would shield it from eviction — that's a footgun.
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new();
-        det.record_turn_for_source("first", snap("p", &tools, "m"), None);
-        for i in 0..MAX_TRACKED_SOURCES {
-            det.record_turn_for_source(&format!("s{i}"), snap("p", &tools, "m"), None);
+        det.record_provider_attempt_for_source(
+            "first",
+            &attempt("receipt-1"),
+            snap("p", &tools, "m"),
+            None,
+        );
+        for i in 0..(MAX_TRACKED_SOURCES - 1) {
+            det.record_provider_attempt_for_source(
+                &format!("s{i}"),
+                &attempt(format!("receipt-2:{i}")),
+                snap("p", &tools, "m"),
+                None,
+            );
         }
+        assert!(det.snapshot_for_source("first").is_some());
         // Peek "first" many times; it must still be the eviction candidate.
         for _ in 0..5 {
             let _ = det.snapshot_for_source("first");
         }
-        det.record_turn_for_source("final", snap("p", &tools, "m"), None);
+        det.record_provider_attempt_for_source(
+            "final",
+            &attempt("receipt-3"),
+            snap("p", &tools, "m"),
+            None,
+        );
         assert!(
             det.snapshot_for_source("first").is_none(),
             "peek must not count as a refresh — 'first' should have been evicted"
@@ -3209,12 +2951,32 @@ mod tests {
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new().with_diff_dir(tmp.path());
 
-        det.record_turn_for_source("A", snap("prompt-A-stable", &tools, "m"), None);
-        det.record_turn_for_source("B", snap("prompt-B-v1", &tools, "m"), None);
+        det.record_provider_attempt_for_source(
+            "A",
+            &attempt("receipt-1"),
+            snap("prompt-A-stable", &tools, "m"),
+            Some(0),
+        );
+        det.record_provider_attempt_for_source(
+            "B",
+            &attempt("receipt-2"),
+            snap("prompt-B-v1", &tools, "m"),
+            Some(0),
+        );
         // Now write A again (unchanged) so that A is globally last-written.
-        det.record_turn_for_source("A", snap("prompt-A-stable", &tools, "m"), None);
+        det.record_provider_attempt_for_source(
+            "A",
+            &attempt("receipt-3"),
+            snap("prompt-A-stable", &tools, "m"),
+            Some(15_000),
+        );
         // Now break B. The artifact's `prev` must be B's v1, not A's prompt.
-        det.record_turn_for_source("B", snap("prompt-B-v2", &tools, "m"), None);
+        det.record_provider_attempt_for_source(
+            "B",
+            &attempt("receipt-4"),
+            snap("prompt-B-v2", &tools, "m"),
+            Some(0),
+        );
 
         let files = wait_for_artifacts(tmp.path(), 2);
         assert_eq!(files.len(), 2, "json + patch artifacts expected");

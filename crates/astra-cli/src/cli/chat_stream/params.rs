@@ -1,7 +1,6 @@
 use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity;
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use astra_turn_core::turn_event_sink::IncrementalTurnState;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -575,9 +574,9 @@ pub(crate) struct ChatTurnParams<'a> {
     /// request snapshots it immediately before POST; it is never rendered into
     /// the static runtime system prompt or another cache-stable prompt prefix.
     pub(crate) execution_time_budget: Option<ExecutionTimeBudgetClock>,
-    /// Optional run-control provider for the active turn. CLI/TUI uses this
-    /// to feed in-process deferred user input into the runtime loop.
-    pub(crate) run_control: Option<Arc<dyn astra_runtime::turn::run_control::RunControlProvider>>,
+    /// Turn-scoped cancellation, pending runtime facts and remote guidance
+    /// dispositions. Durable admission remains Server-owned.
+    pub(crate) run_control: Option<Arc<crate::cli::turn::local_run_control::LocalRunControl>>,
     /// Incremental turn state for surviving interruptions.
     /// Written during streaming; snapped on force-exit to recover partial data.
     pub(crate) incremental_state: Option<Arc<IncrementalTurnState>>,
@@ -622,10 +621,6 @@ pub(crate) struct ChatTurnParams<'a> {
     /// MCP client manager for external tool servers.
     pub(crate) mcp_manager:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
-    /// Session-scoped skill quality tracker for learning loop.
-    pub(crate) skill_quality_tracker: &'a mut astra_skills::quality::SkillQualityTracker,
-    /// Session-scoped discover cache so surfaced skills survive across user turns.
-    pub(crate) discovered_skills: Option<&'a mut HashSet<String>>,
     /// Session-local child recovery and observation projection; execution is Server-owned.
     pub(crate) agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Optional logical root agent ID for this top-level turn when agent spawning is enabled.
@@ -692,10 +687,7 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Shared harness snapshot sink for /inspect command.
     #[cfg(feature = "harness")]
     pub(crate) harness_sink: Option<std::sync::Arc<astra_harness::InMemorySnapshotSink>>,
-    /// Shared harness trace for /inspect trace command.
-    #[cfg(feature = "harness")]
-    pub(crate) harness_trace:
-        Option<std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>>,
+
     /// Optional benchmark profile for one-shot/headless runs.
     #[cfg(feature = "harness")]
     pub(crate) benchmark_profile: Option<astra_harness::HarnessProfile>,
@@ -748,9 +740,7 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Shared harness snapshot sink for /inspect command (non-REPL one-shot paths).
     #[cfg(feature = "harness")]
     pub harness_sink: Option<std::sync::Arc<astra_harness::InMemorySnapshotSink>>,
-    /// Shared harness trace for /inspect trace command (non-REPL one-shot paths).
-    #[cfg(feature = "harness")]
-    pub harness_trace: Option<std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>>,
+
     /// Optional benchmark profile for one-shot/headless runs.
     #[cfg(feature = "harness")]
     pub benchmark_profile: Option<astra_harness::HarnessProfile>,
@@ -758,15 +748,13 @@ pub(crate) struct BasicCliChatContext<'a> {
 
 impl<'a> ChatTurnParams<'a> {
     /// Build a `ChatTurnParams` for a basic one-shot CLI chat invocation with
-    /// optional session-id and a freshly-borrowed `PermissionManager` /
-    /// `SkillQualityTracker` / token. All multi-agent / observability /
-    /// journal fields default to `None`.
+    /// optional session identity, credentials and permission manager.
+    /// Multi-agent, observability and journal fields default to `None`.
     pub(crate) fn basic_cli(
         ctx: &'a BasicCliChatContext<'a>,
         token: &'a str,
         session_id: Option<&'a str>,
         perm_manager: &'a mut PermissionManager,
-        skill_quality_tracker: &'a mut astra_skills::quality::SkillQualityTracker,
     ) -> ChatTurnParams<'a> {
         ChatTurnParams {
             api: ctx.api,
@@ -816,8 +804,6 @@ impl<'a> ChatTurnParams<'a> {
             ask_user_request_tx: None,
             plan_review_request_tx: None,
             mcp_manager: ctx.mcp_manager.clone(),
-            skill_quality_tracker,
-            discovered_skills: None,
             agent_spawner: ctx.agent_spawner.clone(),
             root_agent_id: ctx.root_agent_id,
             observability_hub: None,
@@ -841,8 +827,7 @@ impl<'a> ChatTurnParams<'a> {
             append_system_prompt: None,
             #[cfg(feature = "harness")]
             harness_sink: ctx.harness_sink.clone(),
-            #[cfg(feature = "harness")]
-            harness_trace: ctx.harness_trace.clone(),
+
             #[cfg(feature = "harness")]
             benchmark_profile: ctx.benchmark_profile,
         }

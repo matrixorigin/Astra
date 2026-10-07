@@ -1,5 +1,3 @@
-use crate::tool::args::shape::{parse_tool_call_arguments, tool_call_name};
-
 // ── Fallback messages when guards fire ──────────────────────────────
 /// Replacement text when the LLM leaks the system prompt.
 pub const PROMPT_LEAK_FALLBACK: &str =
@@ -14,14 +12,9 @@ pub const INTERNAL_PROTOCOL_FALLBACK: &str = "I can’t use an internal control 
 /// because this safety boundary was applied.
 pub const RESPONSE_GUARD_REDACTED_FINISH_REASON: &str = "safety_redacted";
 
-/// Apply response guards to LLM output. Returns `Some(replacement)` if the
-/// text was blocked, `None` if it passed all guards.
-pub fn apply_response_guards(
-    text: &str,
-    tool_calls: &[serde_json::Value],
-    allowed_tools: &[&str],
-    user_query: &str,
-) -> ResponseGuardResult {
+/// Apply hard guards and advisory quality checks to a final text response.
+/// The caller owns the boundary that separates final text from tool preambles.
+pub fn apply_response_guards(text: &str, user_query: &str) -> ResponseGuardResult {
     if text.is_empty() {
         return ResponseGuardResult {
             replacement: None,
@@ -43,7 +36,7 @@ pub fn apply_response_guards(
         };
     }
     // Soft signals: return quality report (caller decides what to do)
-    let mut quality = check_response_quality(text, tool_calls, allowed_tools, user_query);
+    let mut quality = check_response_quality(text, user_query);
     quality.has_repetition_loop = is_repetition_loop(text);
     ResponseGuardResult {
         replacement: None,
@@ -187,48 +180,11 @@ pub fn is_repetition_loop(text: &str) -> bool {
     false
 }
 
-// ── Tool hallucination detection ────────────────────────────────────
-
-/// Check if tool calls reference tools that don't exist in the allowed set.
-/// Returns a list of hallucinated tool names (empty = all valid).
-pub fn find_hallucinated_tools(
-    tool_calls: &[serde_json::Value],
-    allowed_tools: &[&str],
-) -> Vec<String> {
-    let mut hallucinated = Vec::new();
-    for tc in tool_calls {
-        let name = tool_call_name(tc).unwrap_or("");
-        if !name.is_empty() && !allowed_tools.contains(&name) {
-            hallucinated.push(name.to_string());
-        }
-    }
-    hallucinated
-}
-
-/// Check if tool call arguments are valid JSON.
-/// Returns names of tools with malformed arguments.
-pub fn find_malformed_args(tool_calls: &[serde_json::Value]) -> Vec<String> {
-    let mut malformed = Vec::new();
-    for tc in tool_calls {
-        let Some(name) = tool_call_name(tc) else {
-            continue;
-        };
-        if parse_tool_call_arguments(tc).is_err() {
-            malformed.push(name.to_string());
-        }
-    }
-    malformed
-}
-
 // ── Response quality signals ────────────────────────────────────────
 
 /// Quality issues detected in a response.
 #[derive(Debug, Clone, Default)]
 pub struct QualityReport {
-    /// Tool names that don't exist in the allowed set.
-    pub hallucinated_tools: Vec<String>,
-    /// Tool names with malformed JSON arguments.
-    pub malformed_args: Vec<String>,
     /// Whether the response contains fabricated path/data markers.
     pub has_fabrication_markers: bool,
     /// Whether the response is a non-answer (just the user's question echoed back).
@@ -237,68 +193,11 @@ pub struct QualityReport {
     pub has_repetition_loop: bool,
 }
 
-impl QualityReport {
-    /// True if any quality issue was detected.
-    pub fn has_issues(&self) -> bool {
-        !self.hallucinated_tools.is_empty()
-            || !self.malformed_args.is_empty()
-            || self.has_fabrication_markers
-            || self.is_echo
-            || self.has_repetition_loop
-    }
-
-    /// Human-readable summary of quality issues for injection into conversation.
-    pub fn to_warning(&self) -> Option<String> {
-        if !self.has_issues() {
-            return None;
-        }
-        let mut parts = Vec::new();
-        if !self.hallucinated_tools.is_empty() {
-            parts.push(format!(
-                "Unknown tools: {}. Use get_agent_info to check available tools.",
-                self.hallucinated_tools.join(", ")
-            ));
-        }
-        if !self.malformed_args.is_empty() {
-            parts.push(format!(
-                "Malformed arguments for: {}. Fix the JSON and retry.",
-                self.malformed_args.join(", ")
-            ));
-        }
-        if self.has_fabrication_markers {
-            parts.push(
-                "Response may contain placeholder paths. Use real paths from the project."
-                    .to_string(),
-            );
-        }
-        if self.is_echo {
-            parts.push(
-                "You echoed the question instead of answering it. Use tools to find the answer."
-                    .to_string(),
-            );
-        }
-        if self.has_repetition_loop {
-            parts.push("Response contains a repeated-token loop.".to_string());
-        }
-        Some(format!("⚠ Quality issues: {}", parts.join(" ")))
-    }
-}
-
-/// Run quality checks on an LLM response + tool calls.
+/// Inspect advisory quality signals in a final text response.
 ///
-/// * `text`          – the LLM's text response (may be empty if tool calls only)
-/// * `tool_calls`    – tool calls the LLM wants to make
-/// * `allowed_tools` – tool names available this turn
+/// * `text`       – the final text response
 /// * `user_query`    – the user's original message (for echo detection)
-pub fn check_response_quality(
-    text: &str,
-    tool_calls: &[serde_json::Value],
-    allowed_tools: &[&str],
-    user_query: &str,
-) -> QualityReport {
-    let hallucinated_tools = find_hallucinated_tools(tool_calls, allowed_tools);
-    let malformed_args = find_malformed_args(tool_calls);
-
+pub fn check_response_quality(text: &str, user_query: &str) -> QualityReport {
     // Fabrication detection: check text response for placeholder patterns
     let has_fabrication_markers = if text.len() > 20 {
         FABRICATION_MARKERS
@@ -309,11 +208,7 @@ pub fn check_response_quality(
     };
 
     // Echo detection: LLM just repeated user's question
-    let is_echo = if !user_query.is_empty()
-        && !text.is_empty()
-        && tool_calls.is_empty()
-        && user_query.len() > 10
-    {
+    let is_echo = if !user_query.is_empty() && !text.is_empty() && user_query.len() > 10 {
         let query_trimmed = user_query.trim();
         let text_trimmed = text.trim();
         // Exact or near-exact echo (text is just the query with minor additions)
@@ -325,8 +220,6 @@ pub fn check_response_quality(
     };
 
     QualityReport {
-        hallucinated_tools,
-        malformed_args,
         has_fabrication_markers,
         is_echo,
         has_repetition_loop: false,
@@ -392,7 +285,7 @@ mod tests {
     fn internal_protocol_markers_inside_code_are_not_blocked() {
         let review = "The code contains `__astra_required_runtime_context` and:\n```rust\nlet tag = \"<ask_astra_data>\";\n```";
         assert!(!contains_internal_protocol_marker(review));
-        let result = apply_response_guards(review, &[], &[], "review guard code");
+        let result = apply_response_guards(review, "review guard code");
         assert!(result.replacement.is_none());
     }
 
@@ -403,112 +296,21 @@ mod tests {
         ));
     }
 
-    // ── Tool hallucination ──────────────────────────────────────
-
-    #[test]
-    fn hallucinated_tools_detected() {
-        let calls = vec![
-            serde_json::json!({"id":"call-1","type":"function","function":{"name":"bash","arguments":"{}"}}),
-            serde_json::json!({"id":"call-2","type":"function","function":{"name":"imaginary_tool","arguments":"{}"}}),
-            serde_json::json!({"id":"call-3","type":"function","function":{"name":"execute_code","arguments":"{}"}}),
-        ];
-        let allowed = &["bash", "read_file", "grep"];
-        let result = find_hallucinated_tools(&calls, allowed);
-        assert_eq!(result, vec!["imaginary_tool", "execute_code"]);
-    }
-
-    #[test]
-    fn no_hallucination_when_all_valid() {
-        let calls = vec![
-            serde_json::json!({"id":"call-1","type":"function","function":{"name":"bash","arguments":"{}"}}),
-            serde_json::json!({"id":"call-2","type":"function","function":{"name":"grep","arguments":"{}"}}),
-        ];
-        let allowed = &["bash", "read_file", "grep"];
-        assert!(find_hallucinated_tools(&calls, allowed).is_empty());
-    }
-
-    #[test]
-    fn hallucinated_tools_detected_for_canonical_shape() {
-        let calls = vec![
-            serde_json::json!({
-                "id": "call_1",
-                "type": "function",
-                "function": {"name": "imaginary_tool", "arguments": "{}"}
-            }),
-            serde_json::json!({
-                "id": "call_2",
-                "type": "function",
-                "function": {"name": "bash", "arguments": "{}"}
-            }),
-        ];
-        let allowed = &["bash", "read_file", "grep"];
-        assert_eq!(
-            find_hallucinated_tools(&calls, allowed),
-            vec!["imaginary_tool"]
-        );
-    }
-
-    #[test]
-    fn hallucination_empty_calls() {
-        assert!(find_hallucinated_tools(&[], &["bash"]).is_empty());
-    }
-
-    // ── Malformed arguments ─────────────────────────────────────
-
-    #[test]
-    fn malformed_args_detected() {
-        let calls = vec![
-            serde_json::json!({"id":"call-1","type":"function","function":{"name":"bash","arguments":"{invalid json"}}),
-            serde_json::json!({"id":"call-2","type":"function","function":{"name":"grep","arguments":"{\"pattern\": \"test\"}"}}),
-        ];
-        let result = find_malformed_args(&calls);
-        assert_eq!(result, vec!["bash"]);
-    }
-
-    #[test]
-    fn malformed_args_object_is_valid() {
-        let calls = vec![
-            serde_json::json!({"id":"call-1","type":"function","function":{"name":"bash","arguments":{"command":"ls"}}}),
-        ];
-        assert!(find_malformed_args(&calls).is_empty());
-    }
-
-    #[test]
-    fn malformed_args_null_is_rejected() {
-        let calls = vec![
-            serde_json::json!({"id":"call-1","type":"function","function":{"name":"bash","arguments":null}}),
-        ];
-        assert_eq!(find_malformed_args(&calls), vec!["bash"]);
-    }
-
-    #[test]
-    fn malformed_args_empty_string_is_rejected() {
-        let calls = vec![
-            serde_json::json!({"id":"call-1","type":"function","function":{"name":"bash","arguments":""}}),
-        ];
-        assert_eq!(find_malformed_args(&calls), vec!["bash"]);
-    }
-
     // ── Fabrication markers ─────────────────────────────────────
 
     #[test]
     fn fabrication_detected_in_text() {
         let report = check_response_quality(
             "You can find the config at path/to/your/config.yaml and edit it",
-            &[],
-            &["bash"],
             "where is the config?",
         );
         assert!(report.has_fabrication_markers);
-        assert!(report.has_issues());
     }
 
     #[test]
     fn fabrication_not_triggered_for_real_paths() {
         let report = check_response_quality(
             "The config is at crates/runtime/src/config.rs",
-            &[],
-            &["bash"],
             "where is the config?",
         );
         assert!(!report.has_fabrication_markers);
@@ -518,8 +320,6 @@ mod tests {
     fn fabrication_not_triggered_for_legitimate_urls() {
         let report = check_response_quality(
             "See https://api.github.com/path/to/repo for the API docs and example.com/api/v1",
-            &[],
-            &["bash"],
             "where are the docs?",
         );
         assert!(
@@ -530,7 +330,7 @@ mod tests {
 
     #[test]
     fn fabrication_not_triggered_for_short_text() {
-        let report = check_response_quality("Done.", &[], &["bash"], "fix it");
+        let report = check_response_quality("Done.", "fix it");
         assert!(!report.has_fabrication_markers);
     }
 
@@ -539,7 +339,7 @@ mod tests {
     #[test]
     fn echo_detected() {
         let query = "How does authentication work in this project?";
-        let report = check_response_quality(query, &[], &["bash"], query);
+        let report = check_response_quality(query, query);
         assert!(report.is_echo);
     }
 
@@ -547,93 +347,24 @@ mod tests {
     fn echo_not_triggered_with_real_answer() {
         let report = check_response_quality(
             "Authentication uses JWT tokens stored in cookies.",
-            &[],
-            &["bash"],
             "How does authentication work?",
         );
         assert!(!report.is_echo);
-    }
-
-    #[test]
-    fn echo_not_triggered_when_tools_present() {
-        let query = "How does authentication work?";
-        let calls = vec![
-            serde_json::json!({"id":"call-1","type":"function","function":{"name":"grep","arguments":"{}"}}),
-        ];
-        let report = check_response_quality(query, &calls, &["grep"], query);
-        assert!(!report.is_echo, "tool calls mean it's not just an echo");
-    }
-
-    // ── QualityReport ───────────────────────────────────────────
-
-    #[test]
-    fn quality_report_clean() {
-        let report = check_response_quality(
-            "Here's what I found...",
-            &[
-                serde_json::json!({"id":"call-1","type":"function","function":{"name":"bash","arguments":"{}"}}),
-            ],
-            &["bash"],
-            "list files",
-        );
-        assert!(!report.has_issues());
-        assert!(report.to_warning().is_none());
-    }
-
-    #[test]
-    fn quality_report_multiple_issues() {
-        let calls = vec![
-            serde_json::json!({"id":"call-1","type":"function","function":{"name":"fake_tool","arguments":"{bad json"}}),
-        ];
-        let report = check_response_quality(
-            "Check path/to/your/file for details and edit it",
-            &calls,
-            &["bash"],
-            "find file",
-        );
-        assert!(report.has_issues());
-        let warning = report.to_warning().unwrap();
-        assert!(warning.contains("Unknown tools"));
-        assert!(warning.contains("Malformed arguments"));
-        assert!(warning.contains("placeholder paths"));
-    }
-
-    #[test]
-    fn quality_report_warning_format() {
-        let report = QualityReport {
-            hallucinated_tools: vec!["invented_tool".to_string()],
-            malformed_args: vec![],
-            has_fabrication_markers: false,
-            is_echo: false,
-            has_repetition_loop: false,
-        };
-        let warning = report.to_warning().unwrap();
-        assert!(warning.starts_with("⚠ Quality issues:"));
-        assert!(warning.contains("invented_tool"));
-        assert!(warning.contains("get_agent_info"));
     }
 
     // ── apply_response_guards ───────────────────────────────────
 
     #[test]
     fn guard_blocks_prompt_leak() {
-        let result = apply_response_guards(
-            "Here are ## Core Rules that must be followed",
-            &[],
-            &["bash"],
-            "help me",
-        );
+        let result =
+            apply_response_guards("Here are ## Core Rules that must be followed", "help me");
         assert_eq!(result.replacement.as_deref(), Some(PROMPT_LEAK_FALLBACK));
     }
 
     #[test]
     fn guard_reports_repetition_without_replacing_output() {
-        let result = apply_response_guards(
-            "loop loop loop loop loop loop loop loop loop",
-            &[],
-            &["bash"],
-            "help me",
-        );
+        let result =
+            apply_response_guards("loop loop loop loop loop loop loop loop loop", "help me");
         assert!(result.replacement.is_none());
         assert!(result.quality.has_repetition_loop);
     }
@@ -642,8 +373,6 @@ mod tests {
     fn guard_blocks_internal_control_protocol_leak() {
         let result = apply_response_guards(
             "<ask_astra_data><query>previous task?</query></ask_astra_data>",
-            &[],
-            &["bash"],
             "hi",
         );
         assert_eq!(
@@ -661,22 +390,20 @@ mod tests {
 
     #[test]
     fn guard_passes_clean_text() {
-        let result = apply_response_guards(
-            "Here's what I found in the codebase.",
-            &[],
-            &["bash"],
-            "what did you find?",
-        );
+        let result =
+            apply_response_guards("Here's what I found in the codebase.", "what did you find?");
         assert!(
             result.replacement.is_none(),
             "clean text should pass all guards"
         );
-        assert!(!result.quality.has_issues());
+        assert!(!result.quality.has_fabrication_markers);
+        assert!(!result.quality.is_echo);
+        assert!(!result.quality.has_repetition_loop);
     }
 
     #[test]
     fn guard_empty_text_passes() {
-        let result = apply_response_guards("", &[], &["bash"], "query");
+        let result = apply_response_guards("", "query");
         assert!(result.replacement.is_none());
     }
 
@@ -684,8 +411,6 @@ mod tests {
     fn guard_returns_quality_for_fabrication() {
         let result = apply_response_guards(
             "Check path/to/your/config.yaml for the settings",
-            &[],
-            &["bash"],
             "where is config?",
         );
         assert!(
@@ -704,73 +429,6 @@ mod tests {
         assert!(
             !PROMPT_LEAK_FALLBACK.contains("error code"),
             "fallback should be user-friendly"
-        );
-    }
-
-    // ── P0-A: Hallucinated tool name behavioral tests ───────────────
-
-    /// Scenario: LLM returns a mix of valid and invented tool names.
-    /// Expected: find_hallucinated_tools returns ONLY the invented ones.
-    #[test]
-    fn hallucinated_tool_detected_among_valid_calls() {
-        let tool_calls = vec![
-            serde_json::json!({"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\": \"src/main.rs\"}"}}),
-            serde_json::json!({"id":"call-2","type":"function","function":{"name":"super_analyze_code","arguments":"{}"}}),
-            serde_json::json!({"id":"call-3","type":"function","function":{"name":"grep","arguments":"{\"pattern\": \"TODO\"}"}}),
-            serde_json::json!({"id":"call-4","type":"function","function":{"name":"quantum_refactor","arguments":"{}"}}),
-        ];
-        let allowed = vec!["read_file", "grep", "write_file", "bash"];
-        let hallucinated = find_hallucinated_tools(&tool_calls, &allowed);
-        assert_eq!(
-            hallucinated,
-            vec!["super_analyze_code", "quantum_refactor"],
-            "must detect exactly the invented tool names"
-        );
-    }
-
-    /// Scenario: LLM returns only valid tool names.
-    /// Expected: no hallucinations detected.
-    #[test]
-    fn no_false_positive_on_valid_tools() {
-        let tool_calls = vec![
-            serde_json::json!({"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{}"}}),
-            serde_json::json!({"id":"call-2","type":"function","function":{"name":"bash","arguments":"{}"}}),
-        ];
-        let allowed = vec!["read_file", "bash", "grep"];
-        assert!(
-            find_hallucinated_tools(&tool_calls, &allowed).is_empty(),
-            "valid tools must not be flagged"
-        );
-    }
-
-    /// Scenario: LLM returns malformed JSON arguments alongside valid ones.
-    /// Expected: find_malformed_args catches the broken ones.
-    #[test]
-    fn malformed_args_detected_in_mixed_calls() {
-        let tool_calls = vec![
-            serde_json::json!({"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\": \"ok.rs\"}"}}),
-            serde_json::json!({"id":"call-2","type":"function","function":{"name":"bash","arguments":"{broken json!!!"}}),
-            serde_json::json!({"id":"call-3","type":"function","function":{"name":"grep","arguments":{"pattern":"x"}}}),
-        ];
-        let malformed = find_malformed_args(&tool_calls);
-        assert_eq!(malformed, vec!["bash"], "only the broken-JSON call flagged");
-    }
-
-    /// Scenario: LLM returns XML artifact as tool name (e.g. "<reflect>").
-    /// Expected: empty name after XML filtering → not treated as hallucination
-    /// (handled by a different layer), but find_hallucinated_tools must not
-    /// panic or produce garbage.
-    #[test]
-    fn xml_artifact_tool_name_handled_gracefully() {
-        let tool_calls = vec![
-            serde_json::json!({"id":"call-1","type":"function","function":{"name":"","arguments":"{}"}}),
-            serde_json::json!({"id":"call-2","type":"function","function":{"name":"read_file","arguments":"{}"}}),
-        ];
-        let allowed = vec!["read_file"];
-        let hallucinated = find_hallucinated_tools(&tool_calls, &allowed);
-        assert!(
-            hallucinated.is_empty(),
-            "empty names should be skipped, not flagged as hallucination"
         );
     }
 }

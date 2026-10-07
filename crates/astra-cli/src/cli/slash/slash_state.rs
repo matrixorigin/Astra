@@ -1,5 +1,5 @@
 use crate::cli::{
-    cli_config::cli_utils::{map_thin_err, prefix_chars, urlencoding},
+    cli_config::cli_utils::{map_thin_err, urlencoding},
     session::session_state::SessionState,
 };
 /// Create a fresh server session without publishing it as the profile's
@@ -421,131 +421,9 @@ pub(crate) fn parse_reflection_report(
         .map_err(|error| format!("Reflection returned an invalid typed report: {error}"))
 }
 
-/// Compact line-mode projection for the current `ReflectReport` contract.
-/// It reports only observed data and explicit advisory proposals; it does not
-/// infer a healthy outcome merely because no finding was returned.
-pub(crate) fn reflection_report_lines(
-    report: &astra_services::reflect::ReflectReport,
-) -> Vec<String> {
-    let coverage = &report.data_coverage;
-    let mut lines = vec![
-        format!("Session · {}", prefix_chars(&report.session_id, 8)),
-        format!(
-            "Scope · {} / {} · {} · {}",
-            report.topic, report.facet, report.horizon, report.depth
-        ),
-        format!(
-            "Coverage · {} · {} · {} events · {} decisions",
-            coverage.overall, coverage.source, coverage.events, coverage.decisions
-        ),
-    ];
-
-    if !report.summary.trim().is_empty() {
-        lines.push(String::new());
-        lines.push(format!("Summary · {}", report.summary));
-    }
-
-    for warning in &coverage.warnings {
-        lines.push(format!("Coverage warning · {warning}"));
-    }
-
-    if !report.observations.is_empty() {
-        lines.push(String::new());
-        lines.push("Observed findings".into());
-        for observation in &report.observations {
-            lines.push(format!(
-                "  [{}] {}",
-                observation.severity, observation.summary
-            ));
-            lines.push(format!("    observation · {}", observation.ref_id));
-            if !observation.evidence_refs.is_empty() {
-                lines.push(format!(
-                    "    evidence refs · {}",
-                    compact_refs(&observation.evidence_refs)
-                ));
-            }
-        }
-    }
-
-    if !report.failure_clusters.is_empty() {
-        lines.push(String::new());
-        lines.push("Failure clusters".into());
-        for cluster in &report.failure_clusters {
-            lines.push(format!("  {} · {}", cluster.label, cluster.summary));
-            lines.push(format!("    cluster · {}", cluster.cluster_ref));
-            if !cluster.observation_refs.is_empty() {
-                lines.push(format!(
-                    "    observations · {}",
-                    compact_refs(&cluster.observation_refs)
-                ));
-            }
-        }
-    }
-
-    if !report.evidence.is_empty() {
-        lines.push(String::new());
-        lines.push("Evidence".into());
-        for evidence in &report.evidence {
-            lines.push(format!(
-                "  {} · {}",
-                evidence.evidence_class, evidence.summary
-            ));
-            lines.push(format!("    source · {}", evidence.source));
-            lines.push(format!("    ref · {}", evidence.ref_id));
-        }
-    }
-
-    if !report.action_hints.is_empty() {
-        lines.push(String::new());
-        lines.push("Advisory next steps".into());
-        for hint in &report.action_hints {
-            lines.push(format!("  {} · {}", hint.target_type, hint.summary));
-            if !hint.observation_refs.is_empty() {
-                lines.push(format!(
-                    "    supported by · {}",
-                    compact_refs(&hint.observation_refs)
-                ));
-            }
-        }
-    }
-
-    if report.budget_result.truncated {
-        let omitted = &report.budget_result.omitted;
-        lines.push(String::new());
-        lines.push(format!(
-            "Evidence is bounded · omitted {} observations, {} previews, {} hints",
-            omitted.observations, omitted.evidence_previews, omitted.action_hints
-        ));
-        if let Some(cursor) = report.budget_result.next_cursor.as_deref() {
-            lines.push(format!("Continuation cursor · {cursor}"));
-        }
-    }
-
-    if report.observations.is_empty()
-        && report.evidence.is_empty()
-        && report.action_hints.is_empty()
-        && report.failure_clusters.is_empty()
-    {
-        lines.push(String::new());
-        lines.push("No observation records were returned for this scope.".into());
-    }
-
-    lines
-}
-
-fn compact_refs(refs: &[String]) -> String {
-    let mut values: Vec<&str> = refs.iter().take(2).map(String::as_str).collect();
-    if refs.len() > values.len() {
-        values.push("…");
-    }
-    values.join(" · ")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        parse_reflect_args, parse_reflection_report, reflection_report_lines, render_reflect_diff,
-    };
+    use super::{parse_reflect_args, parse_reflection_report, render_reflect_diff};
 
     #[test]
     fn parse_reflect_args_recognises_diff_branch() {
@@ -558,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn reflection_projection_preserves_typed_evidence_and_advisory_proposals() {
+    fn reflection_parser_preserves_typed_evidence_and_advisory_proposals() {
         let body = serde_json::json!({
             "schema_version": 1,
             "tool": "reflect",
@@ -605,32 +483,16 @@ mod tests {
         .to_string();
 
         let report = parse_reflection_report(&body).expect("current reflect payload");
-        let lines = reflection_report_lines(&report);
-
-        assert!(
-            lines
-                .iter()
-                .any(|line| line == "Coverage · fresh · session_journal · 9 events · 2 decisions")
+        assert_eq!(report.data_coverage.events, 9);
+        assert_eq!(
+            report.observations[0].evidence_refs[0],
+            report.evidence[0].ref_id
         );
-        assert!(
-            lines
-                .iter()
-                .any(|line| line == "  [warning] Repeated command failure")
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|line| line == "    source · session_journal")
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|line| line == "  user_guidance · Narrow the command scope")
-        );
-        assert!(
-            lines.iter().any(|line| line
-                == "    supported by · urn:astra:observation:local:reflect:session:diagnosis:0"),
-            "an advisory must retain its supporting observation reference"
+        assert_eq!(report.evidence[0].source, "session_journal");
+        assert_eq!(report.action_hints[0].target_type, "user_guidance");
+        assert_eq!(
+            report.action_hints[0].observation_refs[0],
+            report.observations[0].ref_id
         );
     }
 

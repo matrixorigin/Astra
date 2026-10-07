@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::{MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
-use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
+use astra_core::{
+    ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error,
+    is_duplicate_key_error,
+};
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -196,6 +199,14 @@ fn decode_is_active(
     }
 }
 
+fn agent_write_error(error: sqlx::Error) -> (StatusCode, Json<ErrorResponse>) {
+    if is_duplicate_key_error(&error) {
+        error_response(StatusCode::CONFLICT, "agent name already exists")
+    } else {
+        internal_error(error)
+    }
+}
+
 #[async_trait]
 impl AgentService for DatabaseAgentService {
     async fn create_agent(
@@ -228,7 +239,7 @@ impl AgentService for DatabaseAgentService {
         .bind(&source_str)
         .execute(&pool)
         .await
-        .map_err(internal_error)?;
+        .map_err(agent_write_error)?;
 
         let select_sql = format!(
             "SELECT {} FROM agent_agents WHERE agent_id = ?",
@@ -357,7 +368,7 @@ impl AgentService for DatabaseAgentService {
             .build()
             .execute(&pool)
             .await
-            .map_err(internal_error)?;
+            .map_err(agent_write_error)?;
 
         let select_sql = format!(
             "SELECT {} FROM agent_agents WHERE agent_id = ?",
@@ -452,143 +463,6 @@ impl AgentService for UnconfiguredAgentService {
     }
 }
 
-// ── In-memory implementation for testing ─────────────────────────────────────
-
-/// In-memory agent store for unit / integration tests.
-///
-/// Uses `std::sync::RwLock` internally — not intended for production use.
-pub struct InMemoryAgentService {
-    agents: std::sync::RwLock<Vec<AgentRecord>>,
-}
-
-impl Default for InMemoryAgentService {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl InMemoryAgentService {
-    pub fn new() -> Self {
-        Self {
-            agents: std::sync::RwLock::new(Vec::new()),
-        }
-    }
-}
-
-#[async_trait]
-impl AgentService for InMemoryAgentService {
-    async fn create_agent(
-        &self,
-        user_id: String,
-        request: AgentCreateRequestData,
-    ) -> Result<AgentRecord, (StatusCode, Json<ErrorResponse>)> {
-        let mut agents = self.agents.write().expect("agent lock poisoned");
-        if agents
-            .iter()
-            .any(|a| a.owner_user_id == user_id && a.name == request.name)
-        {
-            return Err(error_response(
-                StatusCode::CONFLICT,
-                "agent name already exists",
-            ));
-        }
-        let now = chrono::Utc::now().to_rfc3339();
-        let record = AgentRecord {
-            agent_id: Uuid::new_v4().to_string(),
-            name: request.name,
-            agent_type: "custom".to_string(),
-            owner_user_id: user_id,
-            agent_config: request.agent_config.unwrap_or(serde_json::json!({})),
-            data_source: request.data_source.unwrap_or(serde_json::json!({})),
-            is_active: true,
-            created_at: now,
-            updated_at: None,
-        };
-        agents.push(record.clone());
-        Ok(record)
-    }
-
-    async fn list_agents(
-        &self,
-        user_id: String,
-    ) -> Result<AgentListRecord, (StatusCode, Json<ErrorResponse>)> {
-        let agents = self.agents.read().expect("agent lock poisoned");
-        let items: Vec<AgentListItem> = agents
-            .iter()
-            .filter(|a| a.owner_user_id == user_id)
-            .map(|a| AgentListItem {
-                agent_id: a.agent_id.clone(),
-                name: a.name.clone(),
-                agent_type: a.agent_type.clone(),
-                owner_user_id: a.owner_user_id.clone(),
-                is_active: a.is_active,
-                created_at: a.created_at.clone(),
-                updated_at: a.updated_at.clone(),
-            })
-            .collect();
-        let total = items.len() as i64;
-        Ok(AgentListRecord {
-            agents: items,
-            total: Some(total),
-        })
-    }
-
-    async fn get_agent(
-        &self,
-        agent_id: String,
-        user_id: String,
-    ) -> Result<AgentRecord, (StatusCode, Json<ErrorResponse>)> {
-        let agents = self.agents.read().expect("agent lock poisoned");
-        agents
-            .iter()
-            .find(|a| a.agent_id == agent_id && a.owner_user_id == user_id)
-            .cloned()
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "agent not found"))
-    }
-
-    async fn update_agent(
-        &self,
-        agent_id: String,
-        user_id: String,
-        request: AgentUpdateRequestData,
-    ) -> Result<AgentRecord, (StatusCode, Json<ErrorResponse>)> {
-        let mut agents = self.agents.write().expect("agent lock poisoned");
-        let agent = agents
-            .iter_mut()
-            .find(|a| a.agent_id == agent_id && a.owner_user_id == user_id)
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "agent not found"))?;
-        if let Some(name) = request.name {
-            agent.name = name;
-        }
-        if let Some(config) = request.agent_config {
-            agent.agent_config = config;
-        }
-        if let Some(ds) = request.data_source {
-            agent.data_source = ds;
-        }
-        if let Some(active) = request.is_active {
-            agent.is_active = active;
-        }
-        agent.updated_at = Some(chrono::Utc::now().to_rfc3339());
-        Ok(agent.clone())
-    }
-
-    async fn delete_agent(
-        &self,
-        agent_id: String,
-        user_id: String,
-    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        let mut agents = self.agents.write().expect("agent lock poisoned");
-        let len_before = agents.len();
-        agents.retain(|a| !(a.agent_id == agent_id && a.owner_user_id == user_id));
-        if agents.len() == len_before {
-            Err(error_response(StatusCode::NOT_FOUND, "agent not found"))
-        } else {
-            Ok(())
-        }
-    }
-}
-
 // ── HTTP types ───────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -678,222 +552,6 @@ impl From<AgentListRecord> for AgentListResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn create_agent_returns_record() {
-        let svc = InMemoryAgentService::new();
-        let record = svc
-            .create_agent(
-                "u1".into(),
-                AgentCreateRequestData {
-                    name: "my-agent".into(),
-                    agent_config: Some(serde_json::json!({"model": "gpt-4"})),
-                    data_source: None,
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(record.name, "my-agent");
-        assert_eq!(record.owner_user_id, "u1");
-        assert!(record.is_active);
-        assert!(!record.agent_id.is_empty());
-    }
-
-    #[tokio::test]
-    async fn list_agents_filters_by_user() {
-        let svc = InMemoryAgentService::new();
-        svc.create_agent(
-            "u1".into(),
-            AgentCreateRequestData {
-                name: "a1".into(),
-                agent_config: None,
-                data_source: None,
-            },
-        )
-        .await
-        .unwrap();
-        svc.create_agent(
-            "u2".into(),
-            AgentCreateRequestData {
-                name: "a2".into(),
-                agent_config: None,
-                data_source: None,
-            },
-        )
-        .await
-        .unwrap();
-
-        let list = svc.list_agents("u1".into()).await.unwrap();
-        assert_eq!(list.total, Some(1));
-        assert_eq!(list.agents[0].name, "a1");
-    }
-
-    #[tokio::test]
-    async fn create_duplicate_name_returns_conflict() {
-        let svc = InMemoryAgentService::new();
-        svc.create_agent(
-            "u1".into(),
-            AgentCreateRequestData {
-                name: "dup".into(),
-                agent_config: None,
-                data_source: None,
-            },
-        )
-        .await
-        .unwrap();
-        let result = svc
-            .create_agent(
-                "u1".into(),
-                AgentCreateRequestData {
-                    name: "dup".into(),
-                    agent_config: None,
-                    data_source: None,
-                },
-            )
-            .await;
-        assert!(result.is_err());
-        let (status, _) = result.unwrap_err();
-        assert_eq!(status, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn same_name_different_user_ok() {
-        let svc = InMemoryAgentService::new();
-        svc.create_agent(
-            "u1".into(),
-            AgentCreateRequestData {
-                name: "shared".into(),
-                agent_config: None,
-                data_source: None,
-            },
-        )
-        .await
-        .unwrap();
-        // Different user can use the same name
-        svc.create_agent(
-            "u2".into(),
-            AgentCreateRequestData {
-                name: "shared".into(),
-                agent_config: None,
-                data_source: None,
-            },
-        )
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn get_agent_by_id() {
-        let svc = InMemoryAgentService::new();
-        let created = svc
-            .create_agent(
-                "u1".into(),
-                AgentCreateRequestData {
-                    name: "test".into(),
-                    agent_config: None,
-                    data_source: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        let fetched = svc
-            .get_agent(created.agent_id.clone(), "u1".into())
-            .await
-            .unwrap();
-        assert_eq!(fetched.agent_id, created.agent_id);
-    }
-
-    #[tokio::test]
-    async fn get_nonexistent_agent_returns_404() {
-        let svc = InMemoryAgentService::new();
-        let result = svc.get_agent("nope".into(), "u1".into()).await;
-        assert!(result.is_err());
-        let (status, _) = result.unwrap_err();
-        assert_eq!(status, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn update_agent_fields() {
-        let svc = InMemoryAgentService::new();
-        let created = svc
-            .create_agent(
-                "u1".into(),
-                AgentCreateRequestData {
-                    name: "old".into(),
-                    agent_config: None,
-                    data_source: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        let updated = svc
-            .update_agent(
-                created.agent_id.clone(),
-                "u1".into(),
-                AgentUpdateRequestData {
-                    name: Some("new".into()),
-                    agent_config: None,
-                    data_source: None,
-                    is_active: Some(false),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(updated.name, "new");
-        assert!(!updated.is_active);
-        assert!(updated.updated_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn delete_agent_removes_it() {
-        let svc = InMemoryAgentService::new();
-        let created = svc
-            .create_agent(
-                "u1".into(),
-                AgentCreateRequestData {
-                    name: "doomed".into(),
-                    agent_config: None,
-                    data_source: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        svc.delete_agent(created.agent_id.clone(), "u1".into())
-            .await
-            .unwrap();
-        let result = svc.get_agent(created.agent_id, "u1".into()).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn delete_nonexistent_returns_404() {
-        let svc = InMemoryAgentService::new();
-        let result = svc.delete_agent("nope".into(), "u1".into()).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn user_isolation_on_get() {
-        let svc = InMemoryAgentService::new();
-        let created = svc
-            .create_agent(
-                "u1".into(),
-                AgentCreateRequestData {
-                    name: "private".into(),
-                    agent_config: None,
-                    data_source: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        // u2 cannot access u1's agent
-        let result = svc.get_agent(created.agent_id, "u2".into()).await;
-        assert!(result.is_err());
-    }
 
     #[tokio::test]
     async fn unconfigured_service_returns_error() {

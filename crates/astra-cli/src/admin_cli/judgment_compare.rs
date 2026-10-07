@@ -683,6 +683,7 @@ mod tests {
         cases[0].request.questions.insert(
             "route".into(),
             JudgmentQuestion::Choice {
+                optional: false,
                 instructions: "Choose a route".into(),
                 criteria: [("a".into(), json!("A")), ("b".into(), json!("B"))].into(),
             },

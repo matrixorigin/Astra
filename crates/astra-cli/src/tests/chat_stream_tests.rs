@@ -18,6 +18,41 @@ const TEST_SSE_HEADERS: [(&str, &str); 2] = [
     ),
 ];
 
+fn basic_chat_context<'a>(
+    api: &'a astra_thin_client::ThinClient,
+    registry: &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
+    message: &'a str,
+) -> BasicCliChatContext<'a> {
+    BasicCliChatContext {
+        api: &api,
+        auth_profile: None,
+        message,
+        offering_id: None,
+        model: Some("test-model"),
+        provider: None,
+        explain: ExplainMode::Off,
+        runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::default()),
+        render_md: false,
+        verbose_mode: false,
+        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
+        cli_context: None,
+        unified_skill_registry: registry,
+        stream_event_tx: None,
+        stream_json_emitter: None,
+        mcp_manager: None,
+        agent_spawner: None,
+        root_agent_id: None,
+        bg_task_commands: None,
+        bg_task_list_cache: None,
+        bash_detach_slot: None,
+        #[cfg(feature = "harness")]
+        harness_sink: None,
+
+        #[cfg(feature = "harness")]
+        benchmark_profile: None,
+    }
+}
+
 // ── chat_stream (SSE agentic loop) ────────────────────────────────────
 
 /// Build a canonical SSE response for the mock chat-turn endpoint. Exposed
@@ -188,8 +223,7 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
         stream_json_emitter: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
-        #[cfg(feature = "harness")]
-        harness_trace: None,
+
         #[cfg(feature = "harness")]
         benchmark_profile: None,
     };
@@ -205,13 +239,12 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
         .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnTerminal),
     ];
     let mut permission_manager = PermissionManager::new(true);
-    let mut skill_quality_tracker = astra_skills::quality::SkillQualityTracker::new();
+
     let mut params = ChatTurnParams::basic_cli(
         &context,
         "fake-token",
         Some("sess-active-fanout"),
         &mut permission_manager,
-        &mut skill_quality_tracker,
     );
     params.input_work_unit_observations = &observations;
     assert!(std::sync::Arc::ptr_eq(
@@ -274,7 +307,6 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
         "fake-token",
         Some("sess-active-fanout"),
         &mut permission_manager,
-        &mut skill_quality_tracker,
     );
     stream_chat_sse(follow_up).await.unwrap();
     let follow_up = captured_request.lock().unwrap().clone().unwrap();
@@ -301,7 +333,11 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
             (
                 TEST_SSE_HEADERS,
                 with_root_communication(
-                    sse_text_response("Hello!", "sess-step-adopt"),
+                    format!("data: {}\n\n{}", serde_json::json!({"type":"context_meta", "compactions":[{
+                        "id":"server-compact-1", "kind":"wire_assembly", "tier":"compact_history",
+                        "messages_before":8, "messages_after":4, "tokens_before":5000,
+                        "tokens_after":3000, "tokens_saved":2000
+                    }]}), sse_text_response("Hello!", "sess-step-adopt")),
                     "sess-step-adopt",
                 ),
             )
@@ -310,11 +346,12 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+
     let request_lease =
         crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(None)
             .unwrap();
     let turn_start = std::time::Instant::now();
+    let (event_tx, mut event_rx) = crate::cli::chat_stream::stream_event_channel();
 
     let mut result = stream_chat_sse(ChatTurnParams {
         api: &api,
@@ -356,7 +393,7 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         incremental_state: None,
         request_session_execution_lease: Some(request_lease.clone()),
         plan_assemble_line_release: None,
-        stream_event_tx: None,
+        stream_event_tx: Some(event_tx),
         explain_analyze_terminal_degraded: None,
         stream_json_emitter: None,
         agent_live_event_sink: None,
@@ -364,8 +401,7 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_quality_tracker: &mut skill_qt,
-        discovered_skills: None,
+
         agent_spawner: None,
         root_agent_id: None,
         observability_hub: None,
@@ -388,8 +424,7 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         append_system_prompt: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
-        #[cfg(feature = "harness")]
-        harness_trace: None,
+
         #[cfg(feature = "harness")]
         benchmark_profile: None,
     })
@@ -397,6 +432,20 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
     .unwrap();
 
     assert_eq!(result.session_id.as_deref(), Some("sess-step-adopt"));
+    let trace = &result
+        .pending_context_assembly_trace
+        .as_ref()
+        .expect("shared measured trace")
+        .1;
+    assert_eq!(trace["token_budget"]["compression_triggered"], true);
+    let mut observed_compactions = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        if let crate::cli::chat_stream::StreamEvent::Compaction(event) = event {
+            observed_compactions.push(event);
+        }
+    }
+    assert_eq!(observed_compactions.len(), 1);
+    assert_eq!(observed_compactions[0].tokens_freed, 2000);
     // A later physical exchange/recovery may repeat an already observed C1.
     // Conversion must deduplicate evidence, not ordinary equal-text messages.
     let replay = result
@@ -487,7 +536,7 @@ async fn stream_chat_sse_simple_text_response() {
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
@@ -536,8 +585,7 @@ async fn stream_chat_sse_simple_text_response() {
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_quality_tracker: &mut skill_qt,
-        discovered_skills: None,
+
         agent_spawner: None,
         root_agent_id: None,
         observability_hub: None,
@@ -560,8 +608,7 @@ async fn stream_chat_sse_simple_text_response() {
         append_system_prompt: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
-        #[cfg(feature = "harness")]
-        harness_trace: None,
+
         #[cfg(feature = "harness")]
         benchmark_profile: None,
     })
@@ -614,7 +661,6 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
     let (event_tx, mut event_rx) = crate::cli::chat_stream::stream_event_channel();
     let turn = stream_chat_sse(ChatTurnParams {
@@ -665,8 +711,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_quality_tracker: &mut skill_qt,
-        discovered_skills: None,
+
         agent_spawner: None,
         root_agent_id: None,
         observability_hub: None,
@@ -689,8 +734,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         append_system_prompt: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
-        #[cfg(feature = "harness")]
-        harness_trace: None,
+
         #[cfg(feature = "harness")]
         benchmark_profile: None,
     });
@@ -760,7 +804,6 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let unified_skill_registry = astra_runtime::skills::empty_unified_registry().clone();
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(20),
@@ -818,8 +861,7 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
             ask_user_request_tx: None,
             plan_review_request_tx: None,
             mcp_manager: None,
-            skill_quality_tracker: &mut skill_qt,
-            discovered_skills: None,
+
             agent_spawner: None,
             root_agent_id: None,
             observability_hub: None,
@@ -842,8 +884,7 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
             append_system_prompt: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
-            #[cfg(feature = "harness")]
-            harness_trace: None,
+
             #[cfg(feature = "harness")]
             benchmark_profile: None,
         }),
@@ -877,7 +918,7 @@ async fn stream_chat_sse_api_error_propagated() {
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
@@ -926,8 +967,7 @@ async fn stream_chat_sse_api_error_propagated() {
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_quality_tracker: &mut skill_qt,
-        discovered_skills: None,
+
         agent_spawner: None,
         root_agent_id: None,
         observability_hub: None,
@@ -950,8 +990,7 @@ async fn stream_chat_sse_api_error_propagated() {
         append_system_prompt: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
-        #[cfg(feature = "harness")]
-        harness_trace: None,
+
         #[cfg(feature = "harness")]
         benchmark_profile: None,
     })
@@ -998,7 +1037,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
         let base = spawn_mock(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let mut pm = PermissionManager::new(true); // auto-approve
-        let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
             token: "fake-token",
@@ -1047,8 +1086,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
             ask_user_request_tx: None,
             plan_review_request_tx: None,
             mcp_manager: None,
-            skill_quality_tracker: &mut skill_qt,
-            discovered_skills: None,
+
             agent_spawner: None,
             root_agent_id: None,
             observability_hub: None,
@@ -1071,8 +1109,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
             append_system_prompt: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
-            #[cfg(feature = "harness")]
-            harness_trace: None,
+
             #[cfg(feature = "harness")]
             benchmark_profile: None,
         })
@@ -1173,7 +1210,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
@@ -1222,8 +1259,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_quality_tracker: &mut skill_qt,
-        discovered_skills: None,
+
         agent_spawner: None,
         root_agent_id: None,
         observability_hub: None,
@@ -1246,8 +1282,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         append_system_prompt: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
-        #[cfg(feature = "harness")]
-        harness_trace: None,
+
         #[cfg(feature = "harness")]
         benchmark_profile: None,
     })
@@ -1342,7 +1377,7 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+
     let mut config = astra_config::RuntimeConfig::default();
     config.tool_surface.pinned_tools = vec!["glob".into(), "-read_file".into()];
     let result = stream_chat_sse(ChatTurnParams {
@@ -1393,8 +1428,7 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_quality_tracker: &mut skill_qt,
-        discovered_skills: None,
+
         agent_spawner: None,
         root_agent_id: None,
         observability_hub: None,
@@ -1417,8 +1451,7 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         append_system_prompt: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
-        #[cfg(feature = "harness")]
-        harness_trace: None,
+
         #[cfg(feature = "harness")]
         benchmark_profile: None,
     })
@@ -1513,7 +1546,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let mut pm = PermissionManager::new(true);
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+
     let failure = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
@@ -1562,8 +1595,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: None,
-        skill_quality_tracker: &mut skill_qt,
-        discovered_skills: None,
+
         agent_spawner: None,
         root_agent_id: None,
         observability_hub: None,
@@ -1586,8 +1618,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         append_system_prompt: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
-        #[cfg(feature = "harness")]
-        harness_trace: None,
+
         #[cfg(feature = "harness")]
         benchmark_profile: None,
     })
@@ -1651,7 +1682,8 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
 
     // Exercise the public entrypoint with both a genuine callback request
     // and an unauthorized client-continuation response, using one fixture.
-    for callback_admitted in [false, true] {
+    for mode in ["unadmitted", "completed", "missing_terminal"] {
+        let callback_admitted = mode != "unadmitted";
         let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let callbacks = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let captured_callbacks = callbacks.clone();
@@ -1686,6 +1718,10 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
                          data: [DONE]\n\n",
                         tn
                     ) };
+                let body = if mode == "missing_terminal" {
+                    let end = body.find("data: {\"type\":\"run_finished\"").unwrap();
+                    format!("{}data: [DONE]\n\n", &body[..end])
+                } else { body };
                 (TEST_SSE_HEADERS, body)
             }
         }),
@@ -1700,7 +1736,6 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
 
         let mut pm = PermissionManager::new(true);
-        let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
         let unified_skill_registry = astra_runtime::skills::empty_unified_registry().clone();
         let context = BasicCliChatContext {
@@ -1727,8 +1762,7 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
             bash_detach_slot: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
-            #[cfg(feature = "harness")]
-            harness_trace: None,
+
             #[cfg(feature = "harness")]
             benchmark_profile: None,
         };
@@ -1737,14 +1771,31 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
             "fake-token",
             None,
             &mut pm,
-            &mut skill_qt,
         )))
         .await;
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
         let callbacks = callbacks.lock().await;
         if callback_admitted {
-            let result = result.expect("Server callback must execute the real MCP tool");
-            assert_eq!(result.full_text, "MCP done!");
+            if mode == "completed" {
+                let result = result.expect("Server callback must execute the real MCP tool");
+                assert_eq!(result.full_text, "MCP done!");
+            } else {
+                let failure =
+                    result.expect_err("completed callback cannot authorize an unfinished run");
+                assert_eq!(failure.partial.partial_text, "MCP done!");
+                assert_eq!(failure.partial.tool_call_records.len(), 1);
+                let outcomes = failure.partial.tool_outcomes.unwrap();
+                assert_eq!(outcomes.executed, 1);
+                assert_eq!(outcomes.succeeded, 1);
+                assert!(
+                    !failure
+                        .partial
+                        .run_transcript_messages
+                        .iter()
+                        .any(|message| message["role"] == "assistant"
+                            && message["content"] == "MCP done!")
+                );
+            }
             assert_eq!(callbacks.len(), 1);
             assert_eq!(callbacks[0]["request_id"], "mcp-1");
             assert_eq!(callbacks[0]["status"], "completed");
@@ -1764,4 +1815,341 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
             );
         }
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn stream_chat_sse_preserves_runtime_notifications_across_admission_and_failure() {
+    use crate::cli::turn::local_run_control::LocalRunControl;
+    use axum::response::IntoResponse;
+    use std::sync::{Arc, Mutex};
+
+    let temp = tempfile::tempdir().unwrap();
+    let _journal_guard = ProcessJournalDirGuard::new(temp.path());
+    for outcome in [
+        "completed",
+        "failed",
+        "runtime_cancelled",
+        "http_failure",
+        "retry",
+        "cancelled_before_admission",
+    ] {
+        let control = LocalRunControl::shared();
+        control
+            .accept_runtime_notification("first child finished")
+            .unwrap();
+        control
+            .accept_runtime_notification("second child finished")
+            .unwrap();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().route("/chat/stream", post({
+            let bodies = bodies.clone();
+            let control = control.clone();
+            move |Json(body): Json<serde_json::Value>| {
+                let bodies = bodies.clone();
+                let control = control.clone();
+                async move {
+                    let call = {
+                        let mut bodies = bodies.lock().unwrap();
+                        bodies.push(body);
+                        bodies.len()
+                    };
+                    if outcome == "retry" && call == 1 {
+                        return (TEST_SSE_HEADERS,
+                            "data: {\"type\":\"error\",\"message\":\"session not found\",\"error_code\":\"session_not_found\",\"metadata\":{\"admission_state\":\"rejected\"}}\n\ndata: [DONE]\n\n".to_string()).into_response();
+                    }
+                if outcome == "runtime_cancelled" {
+                        control.request_cancel_for_runtime();
+                    }
+                    // This arrives after input admission, so the next turn owns it.
+                    control.accept_runtime_notification("third child finished").unwrap();
+                    if outcome == "http_failure" {
+                        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
+                    }
+                    let response = if matches!(outcome, "completed" | "retry") {
+                        sse_text_response("Done!", "sess-notifications")
+                    } else {
+                        "data: {\"type\":\"session_info\",\"session_id\":\"sess-notifications\",\"run_id\":\"run-sess-notifications\"}\n\n\
+                         data: {\"type\":\"text_delta\",\"content\":\"Partial answer\"}\n\n\
+                         data: [DONE]\n\n".into()
+                    };
+                    let guidance = serde_json::json!({
+                        "type": "user_intent_applied", "run_id": "run-sess-notifications",
+                        "intent_id": "guidance-1", "delivery": "guide_current_run",
+                        "status": "applied", "event_index": 7, "content": "wait for the review"
+                    });
+                    let mut child_guidance = guidance.clone();
+                    child_guidance["run_id"] = serde_json::json!("child-run");
+                    child_guidance["intent_id"] = serde_json::json!("guidance-child");
+                    child_guidance["content"] = serde_json::json!("child-only guidance");
+                    let response = response.replacen(
+                        "data: {\"type\":\"text_delta\"",
+                        &format!("data: {guidance}\n\ndata: {guidance}\n\ndata: {child_guidance}\n\ndata: {{\"type\":\"text_delta\""),
+                        1,
+                    );
+                    let response = if outcome == "failed" {
+                        response.replace("data: [DONE]", "data: {\"type\":\"error\",\"message\":\"stream stalled\",\"error_kind\":\"stream_idle\"}\n\ndata: [DONE]")
+                    } else if outcome == "runtime_cancelled" {
+                        response.replace("data: [DONE]", "data: {\"type\":\"error\",\"message\":\"runtime cancelled\",\"error_kind\":\"cancelled\"}\n\ndata: [DONE]")
+                    } else { response };
+                    (TEST_SSE_HEADERS, response).into_response()
+                }
+            }
+        }));
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let mut pm = PermissionManager::new(true);
+
+        let registry = astra_runtime::skills::empty_unified_registry();
+        let context = basic_chat_context(&api, &registry, "review results");
+        #[cfg(feature = "harness")]
+        let harness_sink = astra_harness::InMemorySnapshotSink::arc();
+        let hub = Arc::new(astra_runtime::observability::ObservabilityHub::new());
+        let observer = hub.start_session("test-owner", "sess-notifications");
+        let mut params = ChatTurnParams::basic_cli(&context, "fake-token", None, &mut pm);
+        params.run_control = Some(control.clone());
+        #[cfg(feature = "harness")]
+        {
+            params.harness_sink = Some(harness_sink.clone());
+            params.benchmark_profile = Some(astra_harness::HarnessProfile::Swebench);
+        }
+        if matches!(outcome, "failed" | "http_failure") {
+            params.observability_session = Some(observer.clone());
+            params.session_state_journal = Some(Arc::new(Mutex::new(
+                crate::edge_tools::SessionStateRollbackJournal::default(),
+            )));
+        }
+        if outcome == "cancelled_before_admission" {
+            let token = Arc::new(tokio_util::sync::CancellationToken::new());
+            token.cancel();
+            params.cancel_token = Some(token);
+            control.request_cancel_for_user();
+        }
+        let mut result = stream_chat_sse(params).await;
+        if outcome == "retry" {
+            let rejected = result.unwrap_err();
+            assert!(rejected.partial.admission_rejected);
+            assert!(rejected.partial.interruption.is_none());
+            control
+                .accept_runtime_notification("between requests finished")
+                .unwrap();
+            let mut retry = ChatTurnParams::basic_cli(&context, "fake-token", None, &mut pm);
+            retry.run_control = Some(control.clone());
+            result = stream_chat_sse(retry).await;
+        }
+        let bodies = bodies.lock().unwrap();
+        if outcome == "cancelled_before_admission" {
+            assert!(result.is_err());
+            assert!(bodies.is_empty(), "cancelled input must never be admitted");
+        } else {
+            assert_eq!(bodies.len(), if outcome == "retry" { 2 } else { 1 });
+            for (index, body) in bodies.iter().enumerate() {
+                let request = body.to_string();
+                assert!(request.contains("first child finished"));
+                assert!(request.contains("second child finished"));
+                assert!(!request.contains("third child finished"));
+                assert_eq!(
+                    request.contains("between requests finished"),
+                    outcome == "retry" && index == 1
+                );
+                assert_eq!(request.matches("first child finished").count(), 1);
+                assert_eq!(request.matches("second child finished").count(), 1);
+            }
+            if matches!(outcome, "completed" | "retry") {
+                let result = result.unwrap();
+                assert_eq!(result.full_text, "Done!");
+                assert_eq!(result.applied_user_intents.len(), 1);
+                assert_eq!(result.applied_user_intents[0].intent_id, "guidance-1");
+                assert_eq!(
+                    result.applied_user_intents[0].content,
+                    "wait for the review"
+                );
+
+                assert_eq!(
+                    result
+                        .run_transcript_messages
+                        .iter()
+                        .filter(|message| message["role"] == "assistant"
+                            && message["content"] == "Done!")
+                        .count(),
+                    1
+                );
+                // This is the enclosing successful settlement's existing commit.
+                control.commit_applied_runtime_notifications();
+            } else {
+                let failure = result.unwrap_err();
+                assert_eq!(
+                    failure.partial.partial_text,
+                    if outcome == "http_failure" {
+                        ""
+                    } else {
+                        "Partial answer"
+                    }
+                );
+                if outcome != "http_failure" {
+                    assert_eq!(failure.partial.applied_user_intents.len(), 1);
+                    assert_eq!(
+                        failure.partial.applied_user_intents[0].intent_id,
+                        "guidance-1"
+                    );
+                }
+                if outcome == "http_failure" {
+                    assert_eq!(
+                        failure
+                            .partial
+                            .interruption
+                            .as_ref()
+                            .expect("HTTP transport recovery")["kind"],
+                        "stream_transport"
+                    );
+                }
+                if outcome == "failed" {
+                    let interruption = failure
+                        .partial
+                        .interruption
+                        .as_ref()
+                        .expect("typed error recovery");
+                    assert_eq!(interruption["kind"], "stream_idle");
+                    let Some(astra_pipeline::step_protocol::StepCheckpoint::Heavy(checkpoint)) =
+                        failure.partial.last_heavy_checkpoint.as_ref()
+                    else {
+                        panic!("admitted failure retains root heavy checkpoint");
+                    };
+                    assert_eq!(
+                        checkpoint.budget_remaining_rounds, 0,
+                        "CLI continuity must not invent a Server execution allowance"
+                    );
+                    let observed = observer.read().unwrap();
+                    assert_eq!(
+                        observed.context_traces.len(),
+                        1,
+                        "failure settles measured trace"
+                    );
+                    assert_eq!(observed.context_traces[0].session_id, "sess-notifications");
+                }
+                if outcome == "runtime_cancelled" {
+                    assert!(
+                        failure
+                            .partial
+                            .interruption
+                            .as_ref()
+                            .is_none_or(|value| value["kind"] != "user_cancelled")
+                    );
+                }
+                assert!(
+                    !failure
+                        .partial
+                        .run_transcript_messages
+                        .iter()
+                        .any(|message| message["role"] == "assistant"
+                            && message["content"] == "Partial answer")
+                );
+            }
+        }
+        #[cfg(feature = "harness")]
+        if matches!(outcome, "completed" | "failed") {
+            use astra_harness::SnapshotSink;
+            let snapshot = harness_sink.latest().expect("terminal runtime snapshot");
+            let (final_state, interruption, tokens) = if outcome == "completed" {
+                ("completed", None, 15)
+            } else {
+                ("interrupted", Some("stream_idle"), 0)
+            };
+            assert_eq!(snapshot.session_id, "sess-notifications");
+            assert_eq!(snapshot.final_state.as_deref(), Some(final_state));
+            // Partial failure text remains observable; typed state determines settlement.
+            assert!(snapshot.has_final_text);
+            assert_eq!(snapshot.interruption_kind.as_deref(), interruption);
+            assert_eq!(snapshot.tokens_used_session, tokens);
+            let state = crate::cli::session::session_state::SessionState {
+                harness_sink: harness_sink.clone(),
+                ..Default::default()
+            };
+            let displayed = crate::tui::inspection::render_snapshot_summary(&state)
+                .expect("inspect reads the stream's snapshot sink");
+            assert_eq!(
+                displayed
+                    .lines()
+                    .find(|line| line.contains("Tokens (session):"))
+                    .and_then(|line| line.split_whitespace().last())
+                    .and_then(|value| value.parse::<u64>().ok()),
+                Some(tokens)
+            );
+        }
+        let pending = control.take_pending_runtime_notifications();
+        let expected = match outcome {
+            "completed" | "retry" => vec!["third child finished"],
+            "failed" | "runtime_cancelled" | "http_failure" => vec![
+                "first child finished",
+                "second child finished",
+                "third child finished",
+            ],
+            _ => vec!["first child finished", "second child finished"],
+        };
+        assert_eq!(pending, expected, "input ownership after {outcome}");
+    }
+}
+
+#[test]
+fn stream_chat_sse_publishes_headless_answer_once() {
+    for policy in ["stream", "final_only"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::chat_stream_tests::stream_chat_sse_stdout_probe",
+                "--nocapture",
+            ])
+            .env("ASTRA_STREAM_STDOUT_PROBE", policy)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{policy}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .matches("terminal publication marker")
+                .count(),
+            1,
+            "the real {policy} stream consumer must publish terminal text exactly once"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stream_chat_sse_stdout_probe() {
+    let Ok(policy) = std::env::var("ASTRA_STREAM_STDOUT_PROBE") else {
+        return;
+    };
+    let app = Router::new().route(
+        "/chat/stream",
+        post(|| async {
+            (
+                TEST_SSE_HEADERS,
+                sse_text_response("terminal publication marker", "sess-stdout"),
+            )
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let mut context = basic_chat_context(&api, &registry, "review results");
+    context.render_policy = match policy.as_str() {
+        "stream" => crate::cli::stream::stream_render::RenderPolicy::Stream,
+        "final_only" => crate::cli::stream::stream_render::RenderPolicy::FinalOnly,
+        _ => panic!("unexpected probe render policy"),
+    };
+    let mut pm = PermissionManager::new(true);
+
+    let result = stream_chat_sse(ChatTurnParams::basic_cli(
+        &context,
+        "fake-token",
+        None,
+        &mut pm,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(result.full_text, "terminal publication marker");
 }

@@ -538,7 +538,7 @@ async fn run_turn(
         &std::env::current_dir().unwrap_or_default(),
         &PermissionLoadPolicy::HeadlessSafe,
     );
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+
     let explain_mode = explain_mode_from_params(&params)?;
     let unified_skill_registry = astra_runtime::skills::default_unified_registry();
     let chat_ctx = BasicCliChatContext {
@@ -565,8 +565,7 @@ async fn run_turn(
         stream_json_emitter: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
-        #[cfg(feature = "harness")]
-        harness_trace: None,
+
         #[cfg(feature = "harness")]
         benchmark_profile: None,
     };
@@ -597,7 +596,6 @@ async fn run_turn(
         Some(&thread_id),
         None,
         &mut pm,
-        &mut skill_qt,
         turn_options,
     )
     .await;

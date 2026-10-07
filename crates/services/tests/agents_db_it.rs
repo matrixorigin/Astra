@@ -219,3 +219,142 @@ async fn agent_service_filters_owner_before_decoding_persisted_row_on_live_matri
     cleanup_user_agents(&pool, &owner_user_id).await;
     cleanup_user_agents(&pool, &other_user_id).await;
 }
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn agent_name_conflicts_and_mutations_are_owner_scoped_on_live_matrixone() {
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let owner = Uuid::new_v4().to_string();
+    let foreign_owner = Uuid::new_v4().to_string();
+    let service = DatabaseAgentService::new(settings).with_pool(shared);
+    let request = AgentCreateRequestData {
+        name: format!("agent-{}", Uuid::new_v4().simple()),
+        agent_config: Some(json!({"model": "test-model"})),
+        data_source: Some(json!({"type": "matrixone"})),
+    };
+    let original = service
+        .create_agent(owner.clone(), request.clone())
+        .await
+        .unwrap();
+    let (status, _) = service
+        .create_agent(owner.clone(), request.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        service
+            .get_agent(original.agent_id.clone(), owner.clone())
+            .await
+            .unwrap(),
+        original
+    );
+    assert_eq!(
+        service
+            .list_agents(owner.clone())
+            .await
+            .unwrap()
+            .agents
+            .len(),
+        1
+    );
+
+    let foreign = service
+        .create_agent(foreign_owner.clone(), request.clone())
+        .await
+        .unwrap();
+    assert_ne!(foreign.agent_id, original.agent_id);
+    for (user, agent) in [(&owner, &original), (&foreign_owner, &foreign)] {
+        let listed = service.list_agents(user.clone()).await.unwrap();
+        assert_eq!(listed.agents.len(), 1);
+        assert_eq!(listed.agents[0].agent_id, agent.agent_id);
+        assert_eq!(listed.agents[0].owner_user_id, *user);
+    }
+    let occupied = service
+        .create_agent(
+            owner.clone(),
+            AgentCreateRequestData {
+                name: format!("occupied-{}", Uuid::new_v4().simple()),
+                ..request
+            },
+        )
+        .await
+        .unwrap();
+    let rename = AgentUpdateRequestData {
+        name: Some(occupied.name.clone()),
+        agent_config: Some(json!({"model": "must-not-be-installed"})),
+        data_source: Some(json!({"type": "must-not-be-installed"})),
+        is_active: Some(false),
+    };
+    let (status, _) = service
+        .update_agent(original.agent_id.clone(), owner.clone(), rename.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        service
+            .list_agents(owner.clone())
+            .await
+            .unwrap()
+            .agents
+            .len(),
+        2
+    );
+    for expected in [&original, &occupied] {
+        assert_eq!(
+            service
+                .get_agent(expected.agent_id.clone(), owner.clone())
+                .await
+                .unwrap(),
+            *expected
+        );
+    }
+
+    let (status, _) = service
+        .get_agent(original.agent_id.clone(), foreign_owner.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = service
+        .update_agent(original.agent_id.clone(), foreign_owner.clone(), rename)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "check owner before applying a conflicting name"
+    );
+    let (status, _) = service
+        .delete_agent(original.agent_id.clone(), foreign_owner.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        service
+            .get_agent(original.agent_id.clone(), owner.clone())
+            .await
+            .unwrap(),
+        original
+    );
+    assert_eq!(
+        service
+            .get_agent(foreign.agent_id.clone(), foreign_owner.clone())
+            .await
+            .unwrap(),
+        foreign
+    );
+
+    let missing = Uuid::new_v4().to_string();
+    let (status, _) = service
+        .get_agent(missing.clone(), owner.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = service
+        .delete_agent(missing, owner.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    cleanup_user_agents(&pool, &owner).await;
+    cleanup_user_agents(&pool, &foreign_owner).await;
+}

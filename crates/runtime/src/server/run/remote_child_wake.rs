@@ -511,17 +511,20 @@ mod tests {
             .unwrap();
         assert!(!receiver.has_changed().unwrap());
 
-        writer
-            .persist_status(
-                "wake-user",
-                "wake-session",
-                "wake-child",
-                STATUS_PAUSED,
-                Some("user_resume"),
-                None,
-            )
-            .await
-            .unwrap();
+        assert!(
+            writer
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "wake-user",
+                    expected_session_id: "wake-session",
+                    run_id: "wake-child",
+                    status: STATUS_PAUSED,
+                    waiting_for: Some("user_resume"),
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         assert_eq!(hub.sweep().await, Some(false));
         tokio::time::timeout(std::time::Duration::from_secs(1), receiver.changed())
             .await

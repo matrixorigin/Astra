@@ -652,14 +652,6 @@ pub(crate) async fn complete_session_startup(
     // background; startup and the first interactive frame stay responsive.
     crate::cli::cloud_sync::schedule_sync_outbox_journal_reconcile_all();
 
-    // Load persisted skill quality data from previous sessions
-    let skill_quality_path = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("astra")
-        .join("skill_quality.json");
-    state.skill_quality_tracker =
-        astra_skills::quality::SkillQualityTracker::load(&skill_quality_path);
-
     tracer.phase("config_load");
 
     let pipeline_modules = session_runtime::create_tui_pipeline_modules(

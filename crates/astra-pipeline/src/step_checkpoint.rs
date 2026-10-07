@@ -313,18 +313,18 @@ fn validate_versioned_step_artifact<T>(
     Ok(envelope.payload)
 }
 
-fn read_checkpoint_entry(
+fn read_checkpoint_path(
     user_id: &str,
     session_id: &str,
-    entry: &std::fs::DirEntry,
+    path: &Path,
 ) -> std::io::Result<Option<StepCheckpoint>> {
-    let content = match std::fs::read_to_string(entry.path()) {
+    let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) => {
             astra_core::agent_warn!(
                 "checkpoint",
                 "Skipping unreadable checkpoint {:?}: {}",
-                entry.file_name(),
+                path.file_name(),
                 error
             );
             return Ok(None);
@@ -340,7 +340,7 @@ fn read_checkpoint_entry(
             astra_core::agent_warn!(
                 "checkpoint",
                 "Skipping malformed checkpoint {:?}: {}",
-                entry.file_name(),
+                path.file_name(),
                 error
             );
             return Ok(None);
@@ -348,21 +348,6 @@ fn read_checkpoint_entry(
     };
     validate_versioned_step_artifact(STEP_CHECKPOINT_ARTIFACT_KIND, user_id, session_id, envelope)
         .map(Some)
-}
-
-/// Returns whether a local heavy checkpoint artifact exists for this owner/session.
-pub fn heavy_checkpoint_exists(user_id: &str, session_id: &str) -> std::io::Result<bool> {
-    let dir = checkpoint_dir_for(user_id, session_id)?;
-    if !dir.exists() {
-        return Ok(false);
-    }
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        if entry.file_name().to_string_lossy().ends_with("-heavy.json") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// Write a step checkpoint to local filesystem.
@@ -451,6 +436,19 @@ fn with_session_checkpoint_lock<T>(
     operation()
 }
 
+/// Read one numbered heavy artifact in the expected owner/session partition.
+pub fn read_heavy_checkpoint(
+    user_id: &str,
+    session_id: &str,
+    number: u32,
+) -> std::io::Result<Option<HeavyCheckpoint>> {
+    let path = checkpoint_dir_for(user_id, session_id)?.join(format!("{number:06}-heavy.json"));
+    match read_checkpoint_path(user_id, session_id, &path)? {
+        Some(StepCheckpoint::Heavy(checkpoint)) => Ok(Some(*checkpoint)),
+        _ => Ok(None),
+    }
+}
+
 /// Read the latest heavy checkpoint for session recovery.
 /// Returns None if no heavy checkpoint exists.
 pub fn read_latest_heavy_checkpoint(
@@ -481,7 +479,7 @@ pub fn read_latest_heavy_checkpoint(
     heavy_files.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
 
     for entry in &heavy_files {
-        let Some(checkpoint) = read_checkpoint_entry(user_id, session_id, entry)? else {
+        let Some(checkpoint) = read_checkpoint_path(user_id, session_id, &entry.path())? else {
             continue;
         };
         match checkpoint {
@@ -557,17 +555,6 @@ pub fn next_checkpoint_number(user_id: &str, session_id: &str) -> std::io::Resul
 /// finalization. Once a newer composite index is durable, those unreferenced
 /// anchors are neither rollback points nor the latest recovery authority and
 /// retaining them makes long tool loops grow storage quadratically.
-pub fn prune_unreferenced_heavy_checkpoints(
-    user_id: &str,
-    session_id: &str,
-    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
-) -> std::io::Result<usize> {
-    let dir = checkpoint_dir_for(user_id, session_id)?;
-    with_session_checkpoint_lock(&dir, || {
-        prune_unreferenced_heavy_checkpoints_unlocked(&dir, index)
-    })
-}
-
 fn prune_unreferenced_heavy_checkpoints_unlocked(
     dir: &Path,
     index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
@@ -701,7 +688,10 @@ pub fn commit_composite_checkpoint(
             std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
         })?;
         write_composite_snapshot_index_unlocked(user_id, session_id, &index, &dir)?;
-        prune_unreferenced_heavy_checkpoints_unlocked(&dir, &index)?;
+        if let Err(error) = prune_unreferenced_heavy_checkpoints_unlocked(&dir, &index) {
+            tracing::warn!(user_id, session_id, error = %error,
+                "composite checkpoint committed but unreferenced artifact cleanup failed");
+        }
         Ok((number, snapshot, index))
     })
 }
@@ -1395,41 +1385,70 @@ mod tests {
 
     #[test]
     fn composite_index_prunes_only_unreferenced_heavy_recovery_anchors() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
-        let session_id = unique_session_id("prune-unreferenced-heavy");
-        for number in 1..=3 {
-            write_step_checkpoint(
-                TEST_USER_ID,
-                &session_id,
-                number,
-                &StepCheckpoint::Heavy(Box::new(make_heavy(
-                    &format!("step-{number}"),
-                    vec![json!({"role": "assistant", "content": number})],
-                ))),
-            )
-            .unwrap();
-        }
-
-        let mut index = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
-        for number in [1, 3] {
-            let mut snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(
+        for obstruct_cleanup in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+            let session_id = unique_session_id("prune-unreferenced-heavy");
+            let checkpoint = StepCheckpoint::Heavy(Box::new(make_heavy(
+                "step-1",
+                vec![json!({"role": "assistant", "content": 1})],
+            )));
+            let snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(
                 session_id.clone(),
-                number,
+                1,
             )
-            .session_state(format!("{number:06}-heavy.json"))
             .build();
-            index.append(&mut snapshot).unwrap();
+            let (first, _, _) =
+                commit_composite_checkpoint(TEST_USER_ID, &session_id, &checkpoint, snapshot)
+                    .unwrap();
+            assert_eq!(first, 1);
+            let dir = checkpoint_dir_for(TEST_USER_ID, &session_id).unwrap();
+            let original = std::fs::read(dir.join("000001-heavy.json")).unwrap();
+            write_step_checkpoint(TEST_USER_ID, &session_id, 2, &checkpoint).unwrap();
+            let obstruction = dir.join("orphan-heavy.json");
+            if obstruct_cleanup {
+                // Force a cleanup failure after publication without relying on permission timing.
+                std::fs::create_dir(&obstruction).unwrap();
+            }
+            let snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(
+                session_id.clone(),
+                3,
+            )
+            .build();
+            let latest_messages = vec![json!({"role":"assistant", "content":3})];
+            let latest =
+                StepCheckpoint::Heavy(Box::new(make_heavy("step-3", latest_messages.clone())));
+            let (number, _, committed) =
+                commit_composite_checkpoint(TEST_USER_ID, &session_id, &latest, snapshot).unwrap();
+            assert_eq!(number, 3);
+            assert_eq!(committed.snapshots.len(), 2);
+            assert_eq!(
+                std::fs::read(dir.join("000001-heavy.json")).unwrap(),
+                original
+            );
+            for snapshot in &committed.snapshots {
+                assert!(dir.join(snapshot.session_state().unwrap()).is_file());
+            }
+            if !obstruct_cleanup {
+                assert_eq!(
+                    list_checkpoints(TEST_USER_ID, &session_id).unwrap(),
+                    vec![(1, CheckpointTier::Heavy), (3, CheckpointTier::Heavy)]
+                );
+            }
+            assert_eq!(obstruction.exists(), obstruct_cleanup);
+            let durable = read_composite_snapshot_index(TEST_USER_ID, &session_id).unwrap();
+            assert_eq!(
+                serde_json::to_value(durable).unwrap(),
+                serde_json::to_value(committed).unwrap()
+            );
+            assert_eq!(
+                read_latest_heavy_checkpoint(TEST_USER_ID, &session_id)
+                    .unwrap()
+                    .unwrap()
+                    .messages,
+                latest_messages
+            );
         }
-
-        assert_eq!(
-            prune_unreferenced_heavy_checkpoints(TEST_USER_ID, &session_id, &index).unwrap(),
-            1
-        );
-        assert_eq!(
-            list_checkpoints(TEST_USER_ID, &session_id).unwrap(),
-            vec![(1, CheckpointTier::Heavy), (3, CheckpointTier::Heavy)]
-        );
     }
 
     #[test]

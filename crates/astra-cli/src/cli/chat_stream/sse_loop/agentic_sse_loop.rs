@@ -1,9 +1,9 @@
-//! Post-loop finalization: CLI sidecars (explain and verdict reports)
-//! and [`StreamResult`] assembly from [`AgenticLoopState`].
+//! CLI sidecar presentation and [`StreamResult`] assembly from the accepted
+//! Server stream and its local callback records.
 
 use astra_core::canonical_names::normalize_name_list;
 use astra_pipeline::step_protocol::StepCheckpoint;
-use astra_runtime::turn::turn_guard::TurnGuard;
+use astra_runtime::turn::tool_health::ToolHealthTracker;
 use astra_services::session_journal::ToolCallRecord;
 use astra_turn_core::{
     tool_health_persistence::ToolHealthEntry, tool_registry_report::ToolSelectionReport,
@@ -103,7 +103,7 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) budget_pressure: f64,
     pub(crate) stall_events: Vec<(String, u32)>,
     pub(crate) verdict_events: Vec<VerdictEvent>,
-    pub(crate) turn_guard: &'a TurnGuard,
+    pub(crate) tool_health: &'a ToolHealthTracker,
     pub(crate) last_heavy_checkpoint: Option<StepCheckpoint>,
     pub(crate) ttft_ms: Option<u64>,
     pub(crate) context_ms: Option<u64>,
@@ -233,7 +233,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         budget_pressure,
         stall_events,
         verdict_events,
-        turn_guard,
+        tool_health,
         last_heavy_checkpoint,
         ttft_ms,
         context_ms,
@@ -347,7 +347,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         budget_pressure,
         stall_events: deduped_stall_events,
         verdict_events: deduped_verdict_events,
-        tool_health_export: turn_guard.health.export_merged(tool_health_entries),
+        tool_health_export: tool_health.export_merged(tool_health_entries),
         last_heavy_checkpoint,
         ttft_ms,
         context_ms,
@@ -376,14 +376,14 @@ mod tests {
         StreamResultBuild, build_stream_result, partial_interruption_notice, resolved_tool_metrics,
     };
     use crate::cli::stream::streaming_types::UsageAttribution;
-    use astra_runtime::turn::turn_guard::TurnGuard;
+    use astra_runtime::turn::tool_health::ToolHealthTracker;
     use astra_services::session_journal::ToolCallRecord;
     use std::collections::HashSet;
 
     use crate::VerdictEvent;
 
-    fn make_turn_guard() -> TurnGuard {
-        TurnGuard::new()
+    fn make_tool_health() -> ToolHealthTracker {
+        ToolHealthTracker::new()
     }
 
     fn succeeded_aggregate(
@@ -401,7 +401,7 @@ mod tests {
         }
     }
 
-    fn make_build_ctx<'a>(turn_guard: &'a TurnGuard) -> StreamResultBuild<'a> {
+    fn make_build_ctx<'a>(tool_health: &'a ToolHealthTracker) -> StreamResultBuild<'a> {
         StreamResultBuild {
             turn_evaluation: None,
             qualified_usage: None,
@@ -423,7 +423,7 @@ mod tests {
             budget_pressure: 0.5,
             stall_events: vec![],
             verdict_events: vec![],
-            turn_guard,
+            tool_health,
             last_heavy_checkpoint: None,
             ttft_ms: Some(42),
             context_ms: Some(100),
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_passes_cache_tokens_through() {
-        let tg = make_turn_guard();
+        let tg = make_tool_health();
         let ctx = make_build_ctx(&tg);
         let result = build_stream_result(ctx);
         assert_eq!(result.cache_read_tokens, 800);
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_passes_basic_fields() {
-        let tg = make_turn_guard();
+        let tg = make_tool_health();
         let ctx = make_build_ctx(&tg);
         let result = build_stream_result(ctx);
         assert_eq!(result.session_id.as_deref(), Some("sess-1"));
@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_interrupts_when_canonical_classes_do_not_close() {
-        let guard = make_turn_guard();
+        let guard = make_tool_health();
         let mut ctx = make_build_ctx(&guard);
         ctx.tool_ledger_aggregate.result_classes.succeeded = 2;
 
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_marks_interrupted_state() {
-        let tg = make_turn_guard();
+        let tg = make_tool_health();
         let mut ctx = make_build_ctx(&tg);
         ctx.interruption = Some(serde_json::json!({"kind": "budget_exhausted"}));
 
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_surfaces_empty_text_interruption() {
-        let tg = make_turn_guard();
+        let tg = make_tool_health();
         let mut ctx = make_build_ctx(&tg);
         ctx.full_text.clear();
         ctx.interruption = Some(serde_json::json!({
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_keeps_partial_answer_and_interruption_notice_separate() {
-        let tg = make_turn_guard();
+        let tg = make_tool_health();
         let mut ctx = make_build_ctx(&tg);
         ctx.full_text = "The requested file was updated successfully.".into();
         ctx.interruption = Some(serde_json::json!({
@@ -560,7 +560,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_falls_back_when_interruption_lacks_user_message() {
-        let tg = make_turn_guard();
+        let tg = make_tool_health();
         let mut ctx = make_build_ctx(&tg);
         ctx.full_text = "  ".into();
         ctx.interruption = Some(serde_json::json!({
@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_marks_malformed_interruption_as_interrupted() {
-        let tg = make_turn_guard();
+        let tg = make_tool_health();
         let mut ctx = make_build_ctx(&tg);
         ctx.full_text.clear();
         ctx.interruption = Some(serde_json::json!({
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_keeps_server_aggregate_over_partial_records() {
-        let tg = make_turn_guard();
+        let tg = make_tool_health();
         let mut ctx = make_build_ctx(&tg);
         ctx.tool_calls_count = 34;
         ctx.tool_ledger_aggregate = succeeded_aggregate(34);
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_keeps_remote_aggregate_after_edge_terminal() {
-        let tg = make_turn_guard();
+        let tg = make_tool_health();
         let mut ctx = make_build_ctx(&tg);
         ctx.tool_calls_count = 34;
         ctx.tool_ledger_aggregate = succeeded_aggregate(34);
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_excludes_blocked_tools_from_metrics() {
-        let tg = make_turn_guard();
+        let tg = make_tool_health();
         let mut ctx = make_build_ctx(&tg);
         ctx.tool_calls_count = 2;
         ctx.tool_ledger_aggregate =
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_ignores_synthetic_tool_metrics() {
-        let tg = make_turn_guard();
+        let tg = make_tool_health();
         let mut ctx = make_build_ctx(&tg);
         ctx.tool_calls_count = 1;
         ctx.tool_ledger_aggregate = succeeded_aggregate(1);
@@ -769,7 +769,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_deduplicates_stall_events() {
-        let tg = make_turn_guard();
+        let tg = make_tool_health();
         let mut ctx = make_build_ctx(&tg);
         ctx.stall_events = vec![
             ("slow_tool".into(), 1),
@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_deduplicates_verdict_events() {
-        let tg = make_turn_guard();
+        let tg = make_tool_health();
         let mut ctx = make_build_ctx(&tg);
         ctx.verdict_events = vec![
             VerdictEvent {
@@ -852,7 +852,7 @@ mod tests {
 
     #[test]
     fn build_stream_result_zero_cache_tokens() {
-        let tg = make_turn_guard();
+        let tg = make_tool_health();
         let mut ctx = make_build_ctx(&tg);
         ctx.cache_read_tokens = 0;
         ctx.cache_creation_tokens = 0;

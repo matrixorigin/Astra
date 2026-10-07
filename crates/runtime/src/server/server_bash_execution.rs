@@ -920,8 +920,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn server_verify_requires_stable_authoritative_observation() {
+    #[tokio::test]
+    async fn server_verify_requires_stable_authoritative_observation() {
         let workspace = tempfile::tempdir().expect("workspace");
         let git_init = std::process::Command::new("git")
             .args(["init", "--quiet"])
@@ -935,8 +935,13 @@ mod tests {
                     .expect("before");
             if writer_intervened {
                 let writer =
-                    astra_tools::workspace_observation::begin_workspace_writer(workspace.path())
-                        .expect("writer generation");
+                    astra_tools::workspace_observation::begin_workspace_writer_with_options(
+                        workspace.path(),
+                        None,
+                        Duration::from_secs(120),
+                    )
+                    .await
+                    .expect("writer generation");
                 drop(writer);
             }
             let after =

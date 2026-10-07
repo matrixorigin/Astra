@@ -20,7 +20,9 @@ helping new contributors understand the full "business event" surface.
 
 `TaskCell` with > 3 children auto-collapses after completion:
 - Collapsed: `└ 12 tools · 10 succeeded, 2 failed`
-- Expand via `TaskDetailView` (push to view_stack)
+- Inspect agent conversations through the Ctrl+G agent navigator; the current
+  `InspectAgent` action opens `AgentTranscriptView` with typed run identity.
+  Task cards remain compact summaries and do not reconstruct conversation history.
 
 ## Non-Cell Events (handled by indicators, not scrollback)
 

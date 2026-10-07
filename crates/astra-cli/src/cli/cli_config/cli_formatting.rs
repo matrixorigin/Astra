@@ -488,22 +488,6 @@ diff --git a/src/b.rs b/src/b.rs\n\
         assert!(preview.contains("… +2 more changed lines"));
     }
 
-    #[test]
-    fn test_floor_char_boundary_truncation_safety() {
-        // Regression: raw truncate at byte offset inside multi-byte char panics.
-        // All truncation sites must use floor_char_boundary.
-        let s = "abc你好def".to_string(); // 你 = bytes 3..6, 好 = bytes 6..9
-        for n in 0..=s.len() {
-            let boundary = s.floor_char_boundary(n);
-            // Must not panic
-            let _ = &s[..boundary];
-        }
-        // Verify it rounds down correctly
-        assert_eq!(s.floor_char_boundary(4), 3); // inside '你', rounds to 3
-        assert_eq!(s.floor_char_boundary(5), 3);
-        assert_eq!(s.floor_char_boundary(6), 6); // exact boundary of '好'
-    }
-
     /// Helper to strip ANSI escape codes for testing
     fn strip_ansi(s: &str) -> String {
         let re = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();

@@ -65,46 +65,64 @@ async fn load_models(
     args: &ModelLoadArgs,
 ) -> Result<(), String> {
     let judgment_default = judgment_default_name(models)?;
+    let prepared = models
+        .iter()
+        .map(|entry| {
+            let model_name = entry
+                .get("name")
+                .and_then(serde_yaml_ng::Value::as_str)
+                .ok_or_else(|| "model.name missing".to_string())?;
+            let provider = entry
+                .get("provider")
+                .and_then(serde_yaml_ng::Value::as_str)
+                .ok_or_else(|| "model.provider missing".to_string())?;
+            let api_key = entry
+                .get("api_key")
+                .and_then(serde_yaml_ng::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let base_url = entry
+                .get("base_url")
+                .and_then(serde_yaml_ng::Value::as_str)
+                .map(ToString::to_string);
+            let metadata_only_update = args.update_existing && api_key.is_none();
+            let payload = if metadata_only_update {
+                build_model_update_payload(entry, provider, None, base_url.as_deref())?
+            } else {
+                build_model_create_payload(
+                    entry,
+                    model_name,
+                    provider,
+                    api_key.ok_or_else(|| {
+                        format!("model.api_key missing or empty for new model {model_name}")
+                    })?,
+                    base_url.as_deref(),
+                )?
+            };
+            let update = if args.update_existing && !metadata_only_update {
+                let mut update = payload.clone();
+                update
+                    .as_object_mut()
+                    .expect("prepared model payload is an object")
+                    .remove("name");
+                Some(update)
+            } else {
+                None
+            };
+            Ok((model_name, metadata_only_update, payload, update))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let mut judgment_available = false;
-    for entry in models {
-        let model_name = entry
-            .get("name")
-            .and_then(serde_yaml_ng::Value::as_str)
-            .ok_or_else(|| "model.name missing".to_string())?;
-        let provider = entry
-            .get("provider")
-            .and_then(serde_yaml_ng::Value::as_str)
-            .ok_or_else(|| "model.provider missing".to_string())?;
-        let api_key = entry
-            .get("api_key")
-            .and_then(serde_yaml_ng::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let base_url = entry
-            .get("base_url")
-            .and_then(serde_yaml_ng::Value::as_str)
-            .map(ToString::to_string);
-        let metadata_only_update = args.update_existing && api_key.is_none();
+    for (model_name, metadata_only_update, payload, update) in prepared {
         let needs_check = if metadata_only_update {
-            let upd = build_model_update_payload(entry, provider, None, base_url.as_deref())?;
             let body = api
-                .put_bearer_path_json_text(token, &paths::model(model_name), &upd)
+                .put_bearer_path_json_text(token, &paths::model(model_name), &payload)
                 .await
                 .map_err(map_thin_err)?;
             stdout_println!("re-synced existing model metadata: {model_name}");
             print_model_load_server_result(&body, model_name);
             true
         } else {
-            let api_key = api_key.ok_or_else(|| {
-                format!("model.api_key missing or empty for new model {model_name}")
-            })?;
-            let payload = build_model_create_payload(
-                entry,
-                model_name,
-                provider,
-                api_key,
-                base_url.as_deref(),
-            )?;
             match api
                 .post_bearer_path_json_text(token, paths::MODELS, &payload)
                 .await
@@ -117,15 +135,9 @@ async fn load_models(
                 Err(astra_thin_client::ThinClientError::Api { body, .. })
                     if body.contains("already exists") =>
                 {
-                    if args.update_existing {
-                        let upd = build_model_update_payload(
-                            entry,
-                            provider,
-                            Some(api_key),
-                            base_url.as_deref(),
-                        )?;
+                    if let Some(update) = update.as_ref() {
                         let body = api
-                            .put_bearer_path_json_text(token, &paths::model(model_name), &upd)
+                            .put_bearer_path_json_text(token, &paths::model(model_name), update)
                             .await
                             .map_err(map_thin_err)?;
                         stdout_println!("re-synced existing model: {model_name}");
@@ -243,23 +255,34 @@ fn print_model_load_server_result(body: &str, model_name: &str) {
     }
 }
 
-fn yaml_str(entry: &serde_yaml_ng::Value, key: &str) -> Option<String> {
+fn take_yaml_field(entry: &mut serde_yaml_ng::Value, key: &str) -> Option<serde_yaml_ng::Value> {
     entry
-        .get(key)
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string)
+        .as_mapping_mut()?
+        .remove(serde_yaml_ng::Value::String(key.to_string()))
 }
 
-fn yaml_i64(entry: &serde_yaml_ng::Value, key: &str) -> Option<i64> {
-    entry.get(key).and_then(|v| v.as_i64())
+fn yaml_str(entry: &mut serde_yaml_ng::Value, key: &str) -> Result<Option<String>, String> {
+    match take_yaml_field(entry, key) {
+        None | Some(serde_yaml_ng::Value::Null) => Ok(None),
+        Some(serde_yaml_ng::Value::String(value)) => Ok(Some(value)),
+        _ => Err(format!("model.{key} must be a string")),
+    }
 }
 
-fn require_yaml_positive_i64(entry: &serde_yaml_ng::Value, key: &str) -> Result<i64, String> {
-    match yaml_i64(entry, key) {
+fn yaml_i64(entry: &mut serde_yaml_ng::Value, key: &str) -> Result<Option<i64>, String> {
+    take_yaml_field(entry, key)
+        .map(|value| {
+            value
+                .as_i64()
+                .ok_or_else(|| format!("model.{key} must be an integer"))
+        })
+        .transpose()
+}
+
+fn require_yaml_positive_i64(entry: &mut serde_yaml_ng::Value, key: &str) -> Result<i64, String> {
+    match yaml_i64(entry, key)? {
         Some(value) if value > 0 => Ok(value),
-        Some(value) => Err(format!(
-            "model.{key} must be a positive integer, got {value}"
-        )),
+        Some(_) => Err(format!("model.{key} must be a positive integer")),
         None => Err(format!(
             "model.{key} missing; model registry metadata must declare {key}"
         )),
@@ -276,53 +299,73 @@ fn require_positive_context_window(value: i32) -> Result<i32, String> {
     }
 }
 
-fn yaml_f64(entry: &serde_yaml_ng::Value, key: &str) -> Option<f64> {
-    entry.get(key).and_then(|v| v.as_f64())
+fn yaml_f64(entry: &mut serde_yaml_ng::Value, key: &str) -> Result<Option<f64>, String> {
+    take_yaml_field(entry, key)
+        .map(|value| {
+            value
+                .as_f64()
+                .ok_or_else(|| format!("model.{key} must be a number"))
+        })
+        .transpose()
 }
 
-fn yaml_str_vec(entry: &serde_yaml_ng::Value, key: &str) -> Option<Vec<String>> {
-    entry.get(key).and_then(|v| v.as_sequence()).map(|seq| {
-        seq.iter()
-            .filter_map(|item| item.as_str().map(ToString::to_string))
-            .collect()
-    })
-}
-
-fn yaml_json(entry: &serde_yaml_ng::Value, key: &str) -> Option<serde_json::Value> {
-    entry.get(key).and_then(|v| serde_json::to_value(v).ok())
+fn yaml_str_vec(
+    entry: &mut serde_yaml_ng::Value,
+    key: &str,
+) -> Result<Option<Vec<String>>, String> {
+    take_yaml_field(entry, key)
+        .map(|value| {
+            let values = value
+                .as_sequence()
+                .ok_or_else(|| format!("model.{key} must be a string list"))?;
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(ToString::to_string)
+                        .ok_or_else(|| format!("model.{key} must contain strings"))
+                })
+                .collect()
+        })
+        .transpose()
 }
 
 /// Merge optional YAML model fields into an existing JSON object in-place.
 fn apply_optional_yaml_fields(
     obj: &mut serde_json::Map<String, serde_json::Value>,
-    entry: &serde_yaml_ng::Value,
+    entry: &mut serde_yaml_ng::Value,
 ) -> Result<(), String> {
-    if let Some(v) = yaml_str(entry, "description") {
+    if let Some(v) = yaml_str(entry, "description")? {
         obj.insert("description".into(), serde_json::json!(v));
     }
-    if let Some(v) = yaml_i64(entry, "max_completion_tokens") {
+    if let Some(v) = yaml_i64(entry, "max_completion_tokens")? {
         obj.insert("max_completion_tokens".into(), serde_json::json!(v));
     }
-    if let Some(v) = yaml_str_vec(entry, "tags") {
-        obj.insert("tags".into(), serde_json::json!(v));
+    for field in [
+        "tags",
+        "supported_parameters",
+        "input_modalities",
+        "output_modalities",
+    ] {
+        if let Some(value) = yaml_str_vec(entry, field)? {
+            obj.insert(field.into(), serde_json::json!(value));
+        }
     }
-    if let Some(v) = yaml_str_vec(entry, "supported_parameters") {
-        obj.insert("supported_parameters".into(), serde_json::json!(v));
-    }
-    if let Some(v) = yaml_str(entry, "architecture") {
+    if let Some(v) = yaml_str(entry, "architecture")? {
         obj.insert("architecture".into(), serde_json::json!(v));
     }
-    let prompt_price = yaml_f64(entry, "pricing_prompt");
-    let completion_price = yaml_f64(entry, "pricing_completion");
     let price_declared = entry.get("pricing_prompt").is_some()
         || entry.get("pricing_completion").is_some()
         || entry.get("pricing_currency").is_some()
         || entry.get("pricing_unit").is_some();
+    let prompt_price = yaml_f64(entry, "pricing_prompt")?;
+    let completion_price = yaml_f64(entry, "pricing_completion")?;
     if price_declared {
         let prompt = prompt_price.ok_or("pricing_prompt must be an explicit number")?;
         let completion = completion_price.ok_or("pricing_completion must be an explicit number")?;
-        if yaml_str(entry, "pricing_currency").as_deref() != Some("USD")
-            || yaml_str(entry, "pricing_unit").as_deref() != Some("per_token")
+        if yaml_str(entry, "pricing_currency")?.as_deref() != Some("USD")
+            || yaml_str(entry, "pricing_unit")?.as_deref() != Some("per_token")
         {
             return Err(
                 "pricing requires pricing_currency: USD and pricing_unit: per_token".into(),
@@ -341,62 +384,20 @@ fn apply_optional_yaml_fields(
             }),
         );
     }
-    if let Some(chain) = yaml_str_vec(entry, "fallback_chain") {
-        let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
-        if let Some(qobj) = quirks.as_object_mut() {
-            qobj.insert("fallback_chain".into(), serde_json::json!(chain));
-        }
-    }
-    // `wire_model_name` — literal name to send in the upstream LLM `model`
-    // field when the local row's `name` differs (e.g. two rows pointing at
-    // the same upstream model id but configured under different providers
-    // or endpoints). Routed through `quirks_json` like `fallback_chain`,
-    // so no DB migration was needed.
-    if let Some(wire) = yaml_str(entry, "wire_model_name") {
-        let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
-        if let Some(qobj) = quirks.as_object_mut() {
-            qobj.insert("wire_model_name".into(), serde_json::json!(wire));
-        }
-    }
-    if let Some(cache_capability) = yaml_json(entry, "prompt_cache_capability") {
-        if cache_capability.is_object() {
-            let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
-            if let Some(qobj) = quirks.as_object_mut() {
-                qobj.insert("prompt_cache_capability".into(), cache_capability);
-            }
-        } else {
-            eprintln!(
-                "warning: prompt_cache_capability must be a JSON object; ignoring non-object value"
-            );
-        }
-    }
-    if let Some(overrides) = yaml_json(entry, "request_body_overrides") {
-        if overrides.is_object() {
-            let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
-            if let Some(qobj) = quirks.as_object_mut() {
-                qobj.insert("request_body_overrides".into(), overrides);
-            }
-        } else {
-            eprintln!(
-                "warning: request_body_overrides must be a JSON object; ignoring non-object value"
-            );
-        }
-    }
-    if let Some(headers) = yaml_json(entry, "probe_headers") {
-        if headers.is_object() {
-            let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
-            if let Some(qobj) = quirks.as_object_mut() {
-                qobj.insert("probe_headers".into(), headers);
-            }
-        } else {
-            eprintln!("warning: probe_headers must be a JSON object; ignoring non-object value");
-        }
-    }
-    if let Some(endpoint) = yaml_str(entry, "probe_endpoint") {
-        let quirks = obj.entry("quirks").or_insert_with(|| serde_json::json!({}));
-        if let Some(qobj) = quirks.as_object_mut() {
-            qobj.insert("probe_endpoint".into(), serde_json::json!(endpoint));
-        }
+    let remaining = entry
+        .as_mapping()
+        .ok_or("model definition must be a mapping")?;
+    if !remaining.is_empty() {
+        let fields = remaining
+            .keys()
+            .map(|key| key.as_str().unwrap_or("<non-string field>"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let quirks = serde_json::to_value(&*entry)
+            .map_err(|_| format!("invalid model quirks fields: {fields}"))?;
+        serde_json::from_value::<astra_services::models::QuirksData>(quirks.clone())
+            .map_err(|_| format!("invalid or unknown model quirks fields: {fields}"))?;
+        obj.insert("quirks".into(), quirks);
     }
     Ok(())
 }
@@ -407,19 +408,28 @@ fn build_model_update_payload(
     api_key: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    let mut remaining = entry.clone();
+    for key in ["name", "provider", "api_key", "base_url"] {
+        yaml_str(&mut remaining, key)?;
+    }
+    if let Some(value) = take_yaml_field(&mut remaining, "judgment_default") {
+        if !value.is_bool() {
+            return Err("model.judgment_default must be true or false".into());
+        }
+    }
     let mut obj = serde_json::Map::new();
     obj.insert("provider".into(), serde_json::json!(provider));
     obj.insert(
         "context_window".into(),
-        serde_json::json!(require_yaml_positive_i64(entry, "context_window")?),
+        serde_json::json!(require_yaml_positive_i64(&mut remaining, "context_window")?),
     );
-    if let Some(v) = api_key.filter(|v| !v.is_empty()) {
-        obj.insert("api_key".into(), serde_json::json!(v));
+    if let Some(value) = api_key.filter(|value| !value.is_empty()) {
+        obj.insert("api_key".into(), serde_json::json!(value));
     }
-    if let Some(v) = base_url {
-        obj.insert("base_url".into(), serde_json::json!(v));
+    if let Some(value) = base_url {
+        obj.insert("base_url".into(), serde_json::json!(value));
     }
-    apply_optional_yaml_fields(&mut obj, entry)?;
+    apply_optional_yaml_fields(&mut obj, &mut remaining)?;
     Ok(serde_json::Value::Object(obj))
 }
 
@@ -436,17 +446,9 @@ fn build_model_create_payload(
             "model.api_key missing or empty for new model {name}"
         ));
     }
-    let mut obj = serde_json::Map::new();
-    obj.insert("name".into(), serde_json::json!(name));
-    obj.insert("provider".into(), serde_json::json!(provider));
-    obj.insert("api_key".into(), serde_json::json!(api_key));
-    obj.insert("base_url".into(), serde_json::json!(base_url));
-    obj.insert(
-        "context_window".into(),
-        serde_json::json!(require_yaml_positive_i64(entry, "context_window")?),
-    );
-    apply_optional_yaml_fields(&mut obj, entry)?;
-    Ok(serde_json::Value::Object(obj))
+    let mut payload = build_model_update_payload(entry, provider, Some(api_key), base_url)?;
+    payload["name"] = serde_json::json!(name);
+    Ok(payload)
 }
 
 pub async fn run_from_env() -> Result<(), String> {
@@ -916,6 +918,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_load_rejects_invalid_later_entry_before_any_request() {
+        for invalid in [
+            "fallback_chain: [other]",
+            "context_wid: 1000",
+            "fixed_temperature: invalid",
+        ] {
+            for update_existing in [false, true] {
+                let server = wiremock::MockServer::start().await;
+                let doc = yaml(&format!(
+                    "- name: first\n  provider: openai\n  api_key: test-key\n  context_window: 1000\n- name: second\n  provider: openai\n  api_key: test-key\n  context_window: 1000\n  {invalid}\n"
+                ));
+                let args = ModelLoadArgs {
+                    path: "unused.yaml".into(),
+                    update_existing,
+                };
+                let api = ThinClient::new(&server.uri(), None).unwrap();
+                let result =
+                    load_models(&api, "fake-token", doc.as_sequence().unwrap(), &args).await;
+                assert!(result.is_err(), "{invalid}: {result:?}");
+                assert!(server.received_requests().await.unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn model_load_binds_default_only_after_successful_checks() {
         use wiremock::matchers::{body_json, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1077,6 +1104,10 @@ mod tests {
             max_completion_tokens: 4096
             tags: [code, chat]
             supported_parameters: [tools]
+            input_modalities: [text, image]
+            output_modalities: [text]
+            fixed_temperature: 0.7
+            request_headers: {X-Provider-Option: enabled}
             architecture: transformer
             pricing_currency: USD
             pricing_unit: per_token
@@ -1099,6 +1130,16 @@ mod tests {
         assert_eq!(
             payload["supported_parameters"],
             serde_json::json!(["tools"])
+        );
+        assert_eq!(
+            payload["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(payload["output_modalities"], serde_json::json!(["text"]));
+        assert_eq!(payload["quirks"]["fixed_temperature"], 0.7);
+        assert_eq!(
+            payload["quirks"]["request_headers"]["X-Provider-Option"],
+            "enabled"
         );
         assert_eq!(payload["architecture"], "transformer");
         assert!(payload["pricing"]["prompt"].as_f64().unwrap() > 0.0);

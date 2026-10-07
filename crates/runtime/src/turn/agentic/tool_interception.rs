@@ -714,6 +714,7 @@ fn intercept_disallowed_tool_calls(
 pub(crate) async fn try_prepare_intercepted_tool_round(
     state: &mut AgenticLoopState,
     turn_result: &HostTurnResult,
+    mut edge_tool_round: Vec<EdgeToolExecResult>,
     admitted_tool_calls: &[CanonicalToolInvocation],
     effective_tool_calls: &[Value],
     rejected_tool_calls: Vec<RejectedToolCall>,
@@ -778,38 +779,12 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
             logical_tool_calls.push(logical);
         }
     }
-    if !turn_result.accum.tool_calls.is_empty()
-        && (!physical_by_id.is_empty() || !logical_by_id.is_empty())
-    {
+    if !physical_by_id.is_empty() || !logical_by_id.is_empty() {
         return Err(format!(
             "intercepted tool round lost provider identities while restoring provider order: physical_leftovers={:?}, logical_leftovers={:?}",
             physical_by_id.keys().collect::<Vec<_>>(),
             logical_by_id.keys().collect::<Vec<_>>(),
         ));
-    }
-    // Unit-level callers without a provider transcript still exercise the
-    // interception layer. Production always has the provider order above;
-    // this fallback is deliberately confined to an absent transcript and
-    // preserves the caller's explicit disposition ordering.
-    if physical_tool_calls.is_empty() && !physical_by_id.is_empty() {
-        for call in admitted_tool_calls {
-            if let Some(id) = call.provider_call_id()
-                && let (Some(physical), Some(logical)) =
-                    (physical_by_id.remove(id), logical_by_id.remove(id))
-            {
-                physical_tool_calls.push(physical);
-                logical_tool_calls.push(logical);
-            }
-        }
-        for physical in &rejected_calls {
-            if let Some(id) = physical.get("id").and_then(Value::as_str)
-                && let (Some(physical), Some(logical)) =
-                    (physical_by_id.remove(id), logical_by_id.remove(id))
-            {
-                physical_tool_calls.push(physical);
-                logical_tool_calls.push(logical);
-            }
-        }
     }
     // Invalid provider identities cannot be matched to source order; their
     // canonical rejection still gets a terminal tool result, but never an
@@ -1007,16 +982,9 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
     let mut runtime_control_calls_by_id = runtime_control_calls_by_id;
     runtime_control_calls_by_id.retain(|call_id, _| !surgically_removed_ids.contains(call_id));
 
-    let edge_tool_round = if delegation_intercepted {
-        turn_result
-            .edge_tool_round
-            .iter()
-            .filter(|r| r.tool != DELEGATE_TOOL_NAME)
-            .cloned()
-            .collect()
-    } else {
-        turn_result.edge_tool_round.clone()
-    };
+    if delegation_intercepted {
+        edge_tool_round.retain(|result| result.tool != DELEGATE_TOOL_NAME);
+    }
 
     Ok(PreparedToolRound {
         physical_tool_calls,
@@ -1041,6 +1009,7 @@ async fn prepare_intercepted_tool_round(
     try_prepare_intercepted_tool_round(
         state,
         turn_result,
+        Vec::new(),
         admitted_tool_calls,
         effective_tool_calls,
         rejected_tool_calls,
@@ -1787,10 +1756,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_round_rejects_dispositions_missing_from_provider_batch() {
+        let calls = vec![json!({
+            "id": "call-unrequested",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{}"}
+        })];
+        let mut state = make_state();
+        let error = try_prepare_intercepted_tool_round(
+            &mut state,
+            &empty_host_turn_result(),
+            Vec::new(),
+            &ordinary_calls(&calls),
+            &calls,
+            Vec::new(),
+            false,
+            &HashSet::from(["bash".to_string()]),
+        )
+        .await
+        .err()
+        .expect("an admission disposition cannot create a provider request");
+        assert!(error.contains("call-unrequested"));
+        assert!(state.stall.tool_call_records.is_empty());
+    }
+
+    #[tokio::test]
     async fn malformed_arguments_are_returned_to_model_without_tool_execution() {
         let mut state = make_state();
         state.last_finish_reason = Some("length".to_string());
-        let turn_result = empty_host_turn_result();
         let calls = vec![json!({
             "id": "call-python",
             "type": "function",
@@ -1799,6 +1792,7 @@ mod tests {
                 "arguments": "{\"code\":\"from docx import Document"
             }
         })];
+        let turn_result = provider_host_turn_result(&calls);
         let valid_tool_names = HashSet::from(["python".to_string()]);
         let admission = admit_tool_calls(&calls, state.last_finish_reason.as_deref());
 
@@ -1954,7 +1948,6 @@ mod tests {
     async fn policy_rejection_preserves_canonical_cause_and_arguments() {
         let mut state = make_state();
         state.step_recorder.begin_turn(1);
-        let turn_result = empty_host_turn_result();
         let rejected = RejectedToolCall::ordinary(
             json!({
                 "id": "call-web",
@@ -1973,6 +1966,9 @@ mod tests {
             .to_string(),
         );
 
+        let turn_result = provider_host_turn_result(std::slice::from_ref(
+            rejected.invocation.physical_provider_call(),
+        ));
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &turn_result,
@@ -2054,7 +2050,9 @@ mod tests {
 
         prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(std::slice::from_ref(
+                rejected.invocation.physical_provider_call(),
+            )),
             &[],
             &[],
             vec![rejected],
@@ -2069,11 +2067,18 @@ mod tests {
         assert!(args_full.contains("[REDACTED:TOKEN_ARGUMENT]"));
     }
 
+    fn provider_host_turn_result(tool_calls: &[Value]) -> HostTurnResult {
+        let mut result = empty_host_turn_result();
+        result.accum.tool_calls = tool_calls.to_vec();
+        result.accum.has_tool_calls = !tool_calls.is_empty();
+        result
+    }
+
     fn empty_host_turn_result() -> HostTurnResult {
         HostTurnResult {
             accum: ChatTurnSseAccum::default(),
             ttft_ms: None,
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         }
     }
@@ -2280,7 +2285,7 @@ mod tests {
         ];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
@@ -2339,7 +2344,7 @@ mod tests {
         ];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
@@ -2383,7 +2388,7 @@ mod tests {
         })];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
@@ -2426,7 +2431,7 @@ mod tests {
         })];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
@@ -2463,7 +2468,7 @@ mod tests {
         ];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
@@ -2504,7 +2509,7 @@ mod tests {
 
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
@@ -2548,7 +2553,7 @@ mod tests {
         })];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
@@ -2583,7 +2588,7 @@ mod tests {
         })];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
@@ -2929,14 +2934,20 @@ mod tests {
 
         let stale = super::resolve_deferred_tool_admission(
             super::admit_tool_calls(
-                &[json!({
-                    "id": "carrier-2",
-                    "type": "function",
-                    "function": {
-                        "name": "invoke_tool",
-                        "arguments": r#"{"name":"web_fetch","arguments":{}}"#
-                    }
-                })],
+                &[
+                    json!({
+                        "id": "direct-2", "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"}
+                    }),
+                    json!({
+                        "id": "carrier-2",
+                        "type": "function",
+                        "function": {
+                            "name": "invoke_tool",
+                            "arguments": r#"{"name":"web_fetch","arguments":{}}"#
+                        }
+                    }),
+                ],
                 Some("tool_calls"),
             ),
             &[DeferredToolActivation {
@@ -2946,7 +2957,13 @@ mod tests {
             }],
             |_| Some("sha256:changed".to_string()),
         );
-        assert!(stale.admitted.is_empty());
+        assert_eq!(stale.admitted.len(), 1);
+        assert_eq!(stale.admitted[0].provider_call_id(), Some("direct-2"));
+        assert_eq!(
+            stale.admitted[0].physical_provider_call(),
+            stale.admitted[0].logical_target_call(),
+            "rejecting a stale carrier must preserve independent direct calls"
+        );
         assert_eq!(stale.rejected.len(), 1);
         assert_eq!(stale.rejected[0].provider_call_id(), "carrier-2");
         assert_eq!(

@@ -71,7 +71,6 @@ pub mod storage;
 pub mod sync_outbox;
 pub mod team_persistence;
 pub mod tool_invocation_ledger;
-pub mod tool_result_selection_observation;
 pub mod tuning;
 pub mod turn_intent_judge;
 pub mod verification;
@@ -134,7 +133,7 @@ pub use agent_lessons::{
 };
 pub use agents::{
     AgentCreateRequestData, AgentListItem, AgentListRecord, AgentRecord, AgentService,
-    AgentUpdateRequestData, DatabaseAgentService, InMemoryAgentService, UnconfiguredAgentService,
+    AgentUpdateRequestData, DatabaseAgentService, UnconfiguredAgentService,
 };
 pub use artifact_policy::{
     PresignedArtifactDownload, artifact_download_signature, build_presigned_artifact_download,
@@ -195,17 +194,16 @@ pub use inference_execution::{
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
     finish_successful_inference_provider_attempt_and_invocation,
-    load_existing_inference_operation_ids_for_route,
     load_inference_canonical_transitions_for_session, load_session_auxiliary_capture,
-    load_tool_result_projection_decisions, next_inference_logical_attempt_pair_base,
-    plan_inference_invocation, plan_inference_provider_attempt,
-    plan_inference_provider_attempt_with_context, reconcile_inference_settlement,
-    reconcile_inference_settlements, renew_inference_invocation_owner,
-    retire_inference_canonical_transitions_through_turn, settle_uncertain_inference_admission,
+    next_inference_logical_attempt_pair_base, plan_inference_invocation,
+    plan_inference_provider_attempt, plan_inference_provider_attempt_with_context,
+    reconcile_inference_settlement, reconcile_inference_settlements,
+    renew_inference_invocation_owner, retire_inference_canonical_transitions_through_turn,
+    settle_uncertain_inference_admission,
 };
 pub use interaction_contract::{
     InteractionContract, InteractionDurableStore, InteractionIdentity, InteractionKind,
-    InteractionStatus, approval_decision_status, ask_user_response_status, edge_dispatch_status,
+    InteractionStatus, approval_decision_status, edge_dispatch_status,
 };
 pub use introspection::{
     DatabaseIntrospectionService, IntrospectionService, UnconfiguredIntrospectionService,
@@ -322,10 +320,9 @@ pub use session_context_coordinator::{
     AcquireWriterAndReserveTurnOutcome, AcquireWriterOutcome, BeginSessionExecutionSwitchV1,
     DatabaseSessionContextCoordinator, MaterializedConversationV1, RenewedTurnAuthority,
     ReserveTurnOutcome, SESSION_EXECUTION_BINDING_SCHEMA_VERSION, SessionAdmissionSnapshotV1,
-    SessionAuthorityEventV1, SessionContextCoordinator, SessionContextCoordinatorError,
-    SessionExecutionBindingStateV1, SessionExecutionBindingV1, SessionExecutionSwitchReceiptV1,
-    SessionExecutionSwitchStateV1, TransferWriterOutcome, WriterTransferConflictV1,
-    WriterTransferRequestV1,
+    SessionContextCoordinator, SessionContextCoordinatorError, SessionExecutionBindingStateV1,
+    SessionExecutionBindingV1, SessionExecutionSwitchReceiptV1, SessionExecutionSwitchStateV1,
+    TransferWriterOutcome, WriterTransferConflictV1, WriterTransferRequestV1,
 };
 pub use session_fork_coordinator::{
     DatabaseSessionForkCoordinator, PrepareSessionForkV1, SessionForkCoordinatorError,
@@ -350,8 +347,8 @@ pub use skills::{
     UnconfiguredSkillService,
 };
 pub use state_projection::{
-    DatabaseStateProjectionStore, DelegationProjectionUpsert, StateItemUpsert,
-    StateProjectionError, UserAnchorMemoryItem, validate_state_mutation,
+    DatabaseStateProjectionStore, DelegationProjectionUpsert, StateProjectionError,
+    UserAnchorMemoryItem,
 };
 pub use state_sync::MatrixOneSyncService;
 pub use storage::{

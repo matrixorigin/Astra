@@ -2889,43 +2889,6 @@ mod tests {
         );
     }
 
-    // ── git_snapshot() helper: non-git directory ────────────────────────
-
-    #[test]
-    fn git_snapshot_returns_none_outside_git_repo() {
-        // Run git_snapshot() from a temp dir that is not a git repo.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let head = std::process::Command::new("git")
-            .args(["rev-parse", "--short", "HEAD"])
-            .current_dir(tmp.path())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty());
-        let branch = std::process::Command::new("git")
-            .args(["symbolic-ref", "--short", "HEAD"])
-            .current_dir(tmp.path())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty());
-        // A temp dir might still be inside a git repo (the astra repo itself),
-        // so we can't assert None. Instead verify the function doesn't panic
-        // and returns valid types.
-        assert!(
-            head.is_none()
-                || head
-                    .as_ref()
-                    .unwrap()
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit()),
-            "head must be None or valid hex"
-        );
-        let _ = branch; // may or may not be None depending on test environment
-    }
-
     #[test]
     fn digest_surfaces_failed_tool_calls_with_categories() {
         let tmp = tempfile::tempdir().expect("tempdir");

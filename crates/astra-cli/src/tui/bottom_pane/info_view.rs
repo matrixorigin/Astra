@@ -574,22 +574,63 @@ mod tests {
                 "kind": "tool_error",
                 "severity": "warning",
                 "summary": "The command failed",
+                "confidence": {"evidence": 0.9},
+                "evidence_refs": ["urn:astra:artifact:local:reflect:session:0"]
+            }],
+            "evidence": [{
+                "ref_id": "urn:astra:artifact:local:reflect:session:0",
+                "evidence_class": "observed_evidence",
+                "source": "session_journal",
+                "summary": "permission denied",
                 "confidence": {"evidence": 0.9}
             }],
             "action_hints": [{
                 "target_type": "user_guidance",
                 "summary": "Narrow the scope",
-                "confidence": {"evidence": 0.9}
+                "confidence": {"evidence": 0.9},
+                "observation_refs": ["urn:astra:observation:local:reflect:session:0"]
             }]
         }))
         .expect("valid current reflection payload");
 
         let view = InfoView::from_reflection("Reflection", "local artifacts", report);
 
-        assert_eq!(view.lines[6].spans[0].style.fg, Some(theme::current().warn));
+        let rendered: Vec<String> = view
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        let finding = rendered
+            .iter()
+            .position(|line| line.contains("The command failed"))
+            .unwrap();
+        let advisory = rendered
+            .iter()
+            .position(|line| line.contains("Narrow the scope"))
+            .unwrap();
         assert_eq!(
-            view.lines[10].spans[0].style.fg,
+            view.lines[finding].spans[0].style.fg,
+            Some(theme::current().warn)
+        );
+        assert_eq!(
+            view.lines[advisory].spans[0].style.fg,
             Some(theme::current().accent)
         );
+        assert!(rendered.iter().any(|line| {
+            line.contains("evidence refs · urn:astra:artifact:local:reflect:session:0")
+        }));
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("source · session_journal"))
+        );
+        assert!(rendered.iter().any(|line| {
+            line.contains("supported by · urn:astra:observation:local:reflect:session:0")
+        }));
     }
 }

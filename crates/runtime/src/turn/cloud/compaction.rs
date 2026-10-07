@@ -672,47 +672,6 @@ pub struct CompactResult {
     pub runtime_contexts: Vec<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Compact Circuit Breaker
-// ---------------------------------------------------------------------------
-
-/// Circuit breaker for auto-compaction — stops retrying after consecutive failures.
-#[derive(Debug, Clone)]
-pub struct CompactCircuitBreaker {
-    pub consecutive_failures: u32,
-    pub max_failures: u32,
-    pub last_failure_reason: Option<String>,
-}
-
-impl Default for CompactCircuitBreaker {
-    fn default() -> Self {
-        Self {
-            consecutive_failures: 0,
-            max_failures: 3,
-            last_failure_reason: None,
-        }
-    }
-}
-
-impl CompactCircuitBreaker {
-    /// Returns true if compaction should be attempted.
-    pub fn should_compact(&self) -> bool {
-        self.consecutive_failures < self.max_failures
-    }
-
-    /// Record a successful compaction — resets the breaker.
-    pub fn record_success(&mut self) {
-        self.consecutive_failures = 0;
-        self.last_failure_reason = None;
-    }
-
-    /// Record a failed compaction — increments failure count.
-    pub fn record_failure(&mut self, reason: String) {
-        self.consecutive_failures += 1;
-        self.last_failure_reason = Some(reason);
-    }
-}
-
 /// Test entrypoint for the same tier-aware budget pass used by Memoria and
 /// `CompactionEngine::compact_tiered`.
 #[cfg(test)]
@@ -1393,34 +1352,6 @@ mod tests {
         assert!(cfg.should_summarize(CompactionTier::AggressivePrune));
     }
 
-    // ── CompactCircuitBreaker tests ──
-
-    #[test]
-    fn circuit_breaker_allows_first_attempt() {
-        let cb = CompactCircuitBreaker::default();
-        assert!(cb.should_compact());
-    }
-
-    #[test]
-    fn circuit_breaker_blocks_after_3_failures() {
-        let mut cb = CompactCircuitBreaker::default();
-        cb.record_failure("err1".into());
-        cb.record_failure("err2".into());
-        cb.record_failure("err3".into());
-        assert!(!cb.should_compact());
-    }
-
-    #[test]
-    fn circuit_breaker_resets_on_success() {
-        let mut cb = CompactCircuitBreaker::default();
-        cb.record_failure("err1".into());
-        cb.record_failure("err2".into());
-        assert!(cb.should_compact()); // 2 < 3
-        cb.record_success();
-        assert_eq!(cb.consecutive_failures, 0);
-        assert!(cb.should_compact());
-    }
-
     // ═══════════════════════════════════════════════════════════════════
     // Long-conversation scenario: proves the full compaction pipeline
     // constrains context growth across 25 tool-call turns.
@@ -1597,26 +1528,6 @@ mod tests {
             has_recent,
             "most recent turn should survive aggressive prune"
         );
-    }
-
-    /// Scenario 4: Circuit breaker stops compaction retries after failures,
-    /// then recovers on success.
-    #[test]
-    fn scenario_circuit_breaker_lifecycle() {
-        let mut cb = CompactCircuitBreaker::default();
-
-        // Simulate 3 failed compactions (e.g., LLM summary keeps failing)
-        for i in 0..3 {
-            assert!(cb.should_compact(), "attempt {i} should be allowed");
-            cb.record_failure(format!("PTL error attempt {i}"));
-        }
-        assert!(!cb.should_compact(), "should be blocked after 3 failures");
-        assert_eq!(cb.consecutive_failures, 3);
-
-        // Simulate external recovery (e.g., user ran /compact manually)
-        cb.record_success();
-        assert!(cb.should_compact(), "should recover after success");
-        assert_eq!(cb.consecutive_failures, 0);
     }
 
     /// Scenario 5: Full pipeline — micro-compact → tiered → boundary metadata

@@ -6,12 +6,12 @@
 //! formatting.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::context_optimizer::{CacheMarker, ContextOptimized};
 use crate::microcompact::PromptCacheProtocol;
 use crate::pipeline_config::ProviderCachePolicy;
-use crate::section_types::{CacheScope, PromptSection, PromptTokenBucket, SectionKind};
+use crate::section_types::{CacheScope, SectionKind};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializedProviderRequest {
@@ -84,37 +84,6 @@ pub fn serialize_provider_request(
     }
 }
 
-#[must_use]
-pub fn serialize_prompt_sections(
-    sections: &[PromptSection],
-    policy: &ProviderCachePolicy,
-) -> SerializedProviderRequest {
-    let mut system_blocks: Vec<SerializedSystemBlock> = sections
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, section)| {
-            if section.text.is_empty() {
-                return None;
-            }
-            Some(SerializedSystemBlock {
-                kind: prompt_section_kind(section, idx),
-                scope: section.scope,
-                text: section.text.clone(),
-                cache_control: None,
-            })
-        })
-        .collect();
-
-    let cache_markers = apply_cache_policy_to_blocks(&mut system_blocks, policy);
-
-    SerializedProviderRequest {
-        system_blocks,
-        messages: Vec::new(),
-        tool_schemas: Vec::new(),
-        cache_markers,
-    }
-}
-
 /// Flatten all system blocks into a single concatenated string (for OpenAI-style providers).
 #[must_use]
 pub fn flatten_serialized_system_blocks(request: &SerializedProviderRequest) -> String {
@@ -138,7 +107,6 @@ pub fn flatten_serialized_system_blocks(request: &SerializedProviderRequest) -> 
 /// Convert system blocks into the Anthropic multi-block format:
 /// `[{"type": "text", "text": "...", "cache_control": {...}}, ...]`
 ///
-/// in the legacy path, enabling drop-in replacement.
 #[must_use]
 pub fn system_blocks_to_anthropic_content(request: &SerializedProviderRequest) -> Vec<Value> {
     request
@@ -170,23 +138,6 @@ pub fn system_blocks_to_anthropic_message(request: &SerializedProviderRequest) -
     (msg, plain)
 }
 
-fn prompt_section_kind(section: &PromptSection, idx: usize) -> SectionKind {
-    if idx == 0 {
-        return SectionKind::Identity;
-    }
-    match section.token_bucket {
-        PromptTokenBucket::BasePersona => {
-            if section.scope == CacheScope::Global {
-                SectionKind::Constraints
-            } else {
-                SectionKind::SelfModel
-            }
-        }
-        PromptTokenBucket::Environment => SectionKind::ProjectContext,
-        PromptTokenBucket::UserPreferences => SectionKind::WorkingMemory,
-    }
-}
-
 fn remap_cache_markers_to_blocks(
     markers: &[CacheMarker],
     section_to_block: &[Option<usize>],
@@ -201,9 +152,8 @@ fn remap_cache_markers_to_blocks(
     // runtime's budget is:
     //   1 × system  +  1 × tools  +  1 × messages
     // So we collapse all system-level markers onto a single block (the
-    // latest one the planner requested), matching the single-marker
-    // policy applied on the legacy path in `apply_cache_policy_to_blocks`
-    // and leaving one spare slot rather than overcommitting the request.
+    // latest one the optimizer supplied), leaving one spare slot rather
+    // than overcommitting the request. Marker selection stays with the optimizer.
     let mut chosen_block: Option<usize> = None;
     let mut chosen_marker: Option<CacheMarker> = None;
     for marker in markers {
@@ -222,7 +172,7 @@ fn remap_cache_markers_to_blocks(
     }
     if let (Some(idx), Some(marker)) = (chosen_block, chosen_marker) {
         if let Some(block) = system_blocks.get_mut(idx) {
-            block.cache_control = Some(cache_control_for_scope(block.scope, policy));
+            block.cache_control = Some(anthropic_ephemeral_cache_control());
             return vec![marker];
         }
     }
@@ -241,58 +191,6 @@ fn block_index_for_marker(
         .iter()
         .rev()
         .find_map(|idx| *idx)
-}
-
-/// Apply cache policy to legacy-path system blocks.
-///
-/// Places a single `cache_control` marker on the last Session-scoped
-/// block (falling back to the last Global block if no Session block
-/// exists). We intentionally emit at most one marker here to leave the
-/// remaining breakpoint budget for the tool marker plus the reference agent's
-/// single tail marker in `annotate_last_message_cache_breakpoint`.
-/// Anthropic caps requests at 4 `cache_control` entries (system + tool +
-/// message comfortably fit), and the message marker must always remain
-/// available for the current tail.
-///
-/// The last Session block is preferred over the last Global block
-/// because it extends the cached prefix further (blocks are emitted in
-/// Global → Session → None order, so Session is further along than
-/// Global in the serialized prefix).
-fn apply_cache_policy_to_blocks(
-    system_blocks: &mut [SerializedSystemBlock],
-    policy: &ProviderCachePolicy,
-) -> Vec<CacheMarker> {
-    if policy.protocol != PromptCacheProtocol::AnthropicCacheControl || policy.max_markers == 0 {
-        return Vec::new();
-    }
-
-    let chosen = system_blocks
-        .iter()
-        .rposition(|block| block.scope == CacheScope::Session)
-        .or_else(|| {
-            system_blocks
-                .iter()
-                .rposition(|block| block.scope == CacheScope::Global)
-        });
-
-    let Some(idx) = chosen else {
-        return Vec::new();
-    };
-
-    system_blocks[idx].cache_control =
-        Some(cache_control_for_scope(system_blocks[idx].scope, policy));
-    vec![CacheMarker {
-        after_section_index: idx,
-        scope: system_blocks[idx].scope,
-        cumulative_tokens: 0,
-    }]
-}
-
-fn cache_control_for_scope(_scope: CacheScope, _policy: &ProviderCachePolicy) -> Value {
-    // Simple ephemeral marker — compatible with Bedrock Claude and vanilla Anthropic.
-    // The "scope: global" and "ttl: 1h" variants require the extended-cache-ttl-2025-04-11
-    // beta header which Bedrock doesn't propagate; using them silently disables cache.
-    json!({ "type": "ephemeral" })
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -318,137 +216,6 @@ pub use wire_cache_annotations::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::section_types::{CacheScope, PromptSection};
-
-    fn make_section(text: &str, scope: CacheScope) -> PromptSection {
-        PromptSection::stable(text, scope)
-    }
-
-    #[test]
-    fn legacy_path_applies_cache_control_for_anthropic_policy() {
-        let sections = vec![
-            make_section("identity block", CacheScope::Global),
-            make_section("constraints", CacheScope::Global),
-            make_section("project context", CacheScope::None),
-        ];
-        let policy = ProviderCachePolicy::anthropic();
-        let result = serialize_prompt_sections(&sections, &policy);
-
-        // Should have cache_control on global blocks
-        let cached_blocks: Vec<_> = result
-            .system_blocks
-            .iter()
-            .filter(|b| b.cache_control.is_some())
-            .collect();
-        assert!(
-            !cached_blocks.is_empty(),
-            "anthropic policy should place cache markers"
-        );
-        assert_eq!(
-            cached_blocks[0].cache_control.as_ref().unwrap(),
-            &json!({ "type": "ephemeral" })
-        );
-        // None-scoped block should NOT have cache_control
-        let none_block = result
-            .system_blocks
-            .iter()
-            .find(|b| b.scope == CacheScope::None)
-            .unwrap();
-        assert!(none_block.cache_control.is_none());
-    }
-
-    #[test]
-    fn legacy_path_no_cache_control_for_prefix_policy() {
-        let sections = vec![
-            make_section("identity", CacheScope::Global),
-            make_section("constraints", CacheScope::Global),
-        ];
-        let policy = ProviderCachePolicy::openai_compatible();
-        let result = serialize_prompt_sections(&sections, &policy);
-
-        for block in &result.system_blocks {
-            assert!(block.cache_control.is_none());
-        }
-        assert!(result.cache_markers.is_empty());
-    }
-
-    #[test]
-    fn legacy_path_emits_single_system_marker_for_stable_prefix() {
-        // Anthropic allows at most 4 cache_control entries per request.
-        // Current requests use at most one each for system, tools, and the
-        // latest message, leaving one slot unused. The system serializer
-        // marks only the deepest stable block even when several qualify.
-        let sections = vec![
-            make_section("global 1", CacheScope::Global),
-            make_section("global 2", CacheScope::Global),
-            make_section("session 1", CacheScope::Session),
-            make_section("session 2", CacheScope::Session),
-        ];
-        let policy = ProviderCachePolicy::anthropic();
-        let result = serialize_prompt_sections(&sections, &policy);
-
-        let cached_count = result
-            .system_blocks
-            .iter()
-            .filter(|b| b.cache_control.is_some())
-            .count();
-        assert_eq!(
-            cached_count, 1,
-            "system must emit exactly 1 marker at the deepest stable block"
-        );
-        assert_eq!(result.cache_markers.len(), 1);
-        // Preference: last Session block (index 3) over last Global (index 1),
-        // because Session sits further along the serialized prefix and its
-        // marker caches strictly more content.
-        assert!(result.system_blocks[3].cache_control.is_some());
-        assert!(result.system_blocks[1].cache_control.is_none());
-    }
-
-    #[test]
-    fn legacy_path_falls_back_to_global_when_no_session_block() {
-        // If only Global-scoped blocks exist, the single marker lands on
-        // the last Global block rather than being dropped.
-        let sections = vec![
-            make_section("global 1", CacheScope::Global),
-            make_section("global 2", CacheScope::Global),
-        ];
-        let policy = ProviderCachePolicy::anthropic();
-        let result = serialize_prompt_sections(&sections, &policy);
-        assert_eq!(result.cache_markers.len(), 1);
-        assert!(result.system_blocks[1].cache_control.is_some());
-    }
-
-    #[test]
-    fn legacy_path_cache_markers_in_ascending_order() {
-        let sections = vec![
-            make_section("a", CacheScope::Global),
-            make_section("b", CacheScope::None),
-            make_section("c", CacheScope::Global),
-            make_section("d", CacheScope::Global),
-        ];
-        let policy = ProviderCachePolicy::anthropic();
-        let result = serialize_prompt_sections(&sections, &policy);
-
-        for window in result.cache_markers.windows(2) {
-            assert!(window[0].after_section_index < window[1].after_section_index);
-        }
-    }
-
-    #[test]
-    fn legacy_path_skips_empty_sections() {
-        let sections = vec![
-            make_section("identity", CacheScope::Global),
-            make_section("", CacheScope::Global), // empty — filtered out
-            make_section("constraints", CacheScope::Global),
-        ];
-        let policy = ProviderCachePolicy::anthropic();
-        let result = serialize_prompt_sections(&sections, &policy);
-
-        // Only 2 blocks emitted (empty filtered)
-        assert_eq!(result.system_blocks.len(), 2);
-        assert!(result.system_blocks[0].cache_control.is_none());
-        assert!(result.system_blocks[1].cache_control.is_some());
-    }
 
     #[test]
     fn block_index_for_marker_reverse_scans() {

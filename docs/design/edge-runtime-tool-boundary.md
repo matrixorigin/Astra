@@ -76,6 +76,14 @@ Edge/CLI local runtime may expose local capabilities only within declared author
 
 Path authority must be checked before execution. A model-provided path is not authority by itself.
 
+File outlines use the shared AST parser for supported languages, including
+Python stub, JavaScript module and TypeScript module extensions. Unsupported
+languages and comment-only files do not acquire signatures from text-prefix
+heuristics. Outline signatures are redacted for display and do not establish
+full-file delivery or authorize replacement. A bounded prefix is identified as
+partial content; its measured line count does not describe the unread suffix.
+
+
 ### Server-owned execution
 
 The CLI admits one Server-owned loop; local tools execute only through the
@@ -117,6 +125,18 @@ replacement tools retain their independent parser-based structural checks and
 explicit `allow_structural_change` control.
 Text replacements reject invalid UTF-8 before changing file bytes or recording
 journal entries, rather than silently replacing unrelated bytes during decoding.
+
+Single and batch replacement candidates share the same matching owner, including
+quote-normalized ambiguity rejection, quote-style preservation and structural
+validation. Batch edits resolve sequentially against the current candidate;
+exact anchors may target an earlier edit's result, while a stale fuzzy anchor
+cannot overwrite a previously fuzzy-edited region. Region coordinates follow
+byte-length changes between edits. A failed preparation publishes no files.
+
+CLI same-file batches supply an authorized bound target and captured UTF-8
+preimage to the shared candidate owner. The physical target determines content
+normalization; the logical spelling is a display label. CLI publishes those
+candidate bytes exactly and records the committed bytes in its local journal.
 
 The shared `fs_ops::Prepared*` owner stages files using exclusive sibling
 creation and checks the captured preimage immediately before publication.
@@ -191,6 +211,12 @@ coordination authority inside the tool-writable workspace.
   for the active lease.
 - Platforms without an equivalent trusted namespace and tamper watch fail
   closed before launching a local command.
+
+Workspace lease admission uses the asynchronous options APIs with explicit
+cancellation and wait budgets. The unused synchronous acquisition APIs and
+no-options observation wrapper are retired from the Rust source API. Process
+coordination, generation watches, diagnostic paths, and guard cleanup remain
+shared; tests exercise the same acquisition paths as executors.
 
 Receipt attribution and execution coordination are independent. A completed
 foreground process group may be too weak to authorize future fingerprint-based
@@ -330,3 +356,14 @@ it does not inherit synchronous invocation ownership or post-execution binding
 validation. Its input/output exchange runs concurrently under one five-second
 deadline after spawn, and cancellation drops the kill-on-drop direct child.
 Synchronous repository validation precedes that exchange.
+
+## Shared search execution
+
+CLI grep applies its current path policy, including approved additional paths,
+before invoking the shared search implementation. An authorized external target
+does not become the workspace root or acquire workspace-observation authority.
+Independent User Runner executors continue resolving targets through their own
+workspace boundary. Both paths share search arguments, ignore rules, pagination,
+bounded output, timeout and caller-owned cancellation. The CLI supplies its
+pressure-scaled output budget through the existing execution context. It preserves source
+error and exit metadata instead of reinterpreting result text.

@@ -542,7 +542,6 @@ impl ModelService for TestModelService {
                     "mock"
                 }
                 .to_string(),
-                fallback_chain: Vec::new(),
                 tags: Vec::new(),
                 request_body_overrides: None,
                 fixed_temperature: None,
@@ -5258,10 +5257,6 @@ ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assista
     assert!(
         guidance_signals["parallel_batching_nudge"].is_boolean(),
         "context_meta should expose the parallel_batching_nudge flag"
-    );
-    assert!(
-        guidance_signals["parallel_feedback"].is_boolean(),
-        "context_meta should expose the parallel_feedback flag"
     );
 
     gateway.assert_complete();

@@ -8,8 +8,8 @@
 //!
 //! ## Sync Flow
 //!
-//! - **Preferences**: [`try_cloud_pull_preferences`] / [`try_cloud_push_preferences`].
-//!   Both go through [`crate::preferences_client`] now.
+//! - **Preferences**: [`try_cloud_pull_preferences`].
+//!   Pulls go through [`crate::preferences_client`] now.
 
 use astra_core::sync_poison::recover_mutex_lock;
 use astra_services::session_journal;
@@ -1047,73 +1047,6 @@ pub(crate) async fn try_cloud_pull_preferences(state: &mut SessionState) -> Vec<
     // TUI owns the terminal, and a stray "✓ Pulled N preferences"
     // line would scribble across the rendered viewport.
     keys
-}
-
-/// Push user preferences to cloud at session end.
-pub(crate) async fn try_cloud_push_preferences(state: &SessionState) {
-    let Some(cloud_base) = resolve_cloud_base() else {
-        return;
-    };
-    let token = session_runtime::current_access_token(None);
-
-    let blocked: Vec<String> = state
-        .tool_health_entries
-        .iter()
-        .filter(|e| e.failure_rate >= 1.0)
-        .map(|e| e.name.clone())
-        .collect();
-    let blocked_json = serde_json::to_string(&blocked).unwrap_or_else(|_| "[]".to_string());
-
-    let prefs = [
-        (pref_keys::EXPLAIN_MODE, state.explain.to_string()),
-        (pref_keys::BLOCKED_TOOLS, blocked_json),
-        (
-            pref_keys::AUTO_MEMORY_ENABLED,
-            state.auto_memory_enabled.to_string(),
-        ),
-        (
-            pref_keys::NOTIFICATIONS_ENABLED,
-            state.notifications_enabled.to_string(),
-        ),
-        (
-            pref_keys::NOTIFICATION_METHOD,
-            state.notification_method.to_string(),
-        ),
-        (
-            pref_keys::NOTIFICATION_THRESHOLD_SECS,
-            state.notification_threshold_secs.to_string(),
-        ),
-    ];
-    for (key, value) in &prefs {
-        if let Err(e) = crate::cli::preferences_client::push_preference(
-            &cloud_base,
-            token.as_deref(),
-            key,
-            value,
-        )
-        .await
-        {
-            tracing::warn!(
-                target: "astra_cli::cloud_sync",
-                error = %e,
-                key = %key,
-                "preference push failed"
-            );
-        }
-    }
-    let report = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
-    if report.is_incomplete() {
-        tracing::warn!(
-            target: "astra_cli::cloud_sync",
-            attempted = report.attempted,
-            acked = report.acked,
-            failed = report.failed,
-            terminal = report.terminal,
-            remaining_ready = report.remaining_ready,
-            blocker = ?report.blocker,
-            "sync outbox drain did not fully converge"
-        );
-    }
 }
 
 pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport {

@@ -89,6 +89,17 @@ Team or lead is disabled with an explanation. Reopen `/team` after the turn ends
 to change conversation intent; viewing configuration never changes admitted work.
 Closing an editor never undoes a sent save or reconfigures admitted work.
 
+A CLI turn consumes one Server-owned SSE execution stream. Edge callbacks run
+inside that stream; their completion never grants the client another model
+round. The client uses shared ingestion, context trace and continuity checkpoint
+projections without constructing the runtime execution-loop state. Provider
+recovery, action admission and completion policy remain with the Server.
+
+Process-local runtime notifications remain with the turn's local control owner
+until successful durable settlement. Authentication and session retries resend
+uncommitted facts; notifications arriving after request admission remain queued.
+Durable user guidance keeps its Server acceptance and disposition protocol.
+
 The startup card reserves terminal width before styling and clips text by Unicode
 display cells. Native MOI login uses a short `MOI` display label, not its internal
 credential profile identifier. Narrow or short terminals use a static presentation;
@@ -105,6 +116,12 @@ cannot advance the remembered screen size; viewport growth erases
 transient UI before scrolling. Resize must preserve native history and must
 not purge scrollback. Terminals that do not answer cursor queries fall back to
 height-clamping corrections; width-reflow recovery requires a cursor reply.
+
+The agent navigator and typed run transcript are the active inspection surfaces.
+The disconnected task-detail overlay and its TaskCell refresh hooks are retired;
+local runtime snapshots update navigator status, while typed live events update
+run conversations. An unused standalone plan spinner is also retired; active
+terminal progress indicators keep their existing owners.
 
 ## MOI-managed local client updates
 
@@ -148,3 +165,9 @@ not by Rust startup or authentication code.
 - Sync state is derived from outbox/ack/degraded facts.
 - Provider state is derived from provider decisions and health.
 - Cancel/delete/archive must round-trip through durable state.
+
+CLI skill discovery uses the current unified catalog. Skill execution outcomes
+and quality ranking remain Server-owned; CLI turns do not load a separate
+quality tracker or mirror discovery into session state. Existing workspace
+skill history remains an informational field for self-inspection and is retained
+when recovery and subsequent turn commits update other workspace facts.

@@ -8592,7 +8592,7 @@ mod tests {
             .start_run("parent-live", "user-1", "session-live")
             .await
             .unwrap();
-        engine
+        let execution_authority = engine
             .start_run_ext(
                 "sub-waiting",
                 "user-1",
@@ -8618,10 +8618,11 @@ mod tests {
         tracker.register_pause_flag("sub-waiting").await;
         assert!(
             engine
-                .persist_delegation_outcome_status(
+                .persist_delegation_outcome_status_if_current_owner(
                     "user-1",
                     "session-live",
                     "sub-waiting",
+                    execution_authority.owner_generation,
                     STATUS_WAITING,
                     Some("user_input"),
                     None,
@@ -8652,16 +8653,17 @@ mod tests {
             ("stale-after-cancel", STATUS_CANCELLED),
         ] {
             let (_, engine, _) = setup();
-            engine
+            let execution_authority = engine
                 .start_run(run_id, "user-1", "session-1")
                 .await
                 .unwrap();
             if durable_status == STATUS_CANCELLED {
                 engine
-                    .persist_delegation_outcome_status(
+                    .persist_delegation_outcome_status_if_current_owner(
                         "user-1",
                         "session-1",
                         run_id,
+                        execution_authority.owner_generation,
                         durable_status,
                         None,
                         Some("control-plane"),
@@ -8669,17 +8671,20 @@ mod tests {
                     .await
                     .unwrap();
             } else {
-                engine
-                    .persist_status(
-                        "user-1",
-                        "session-1",
-                        run_id,
-                        durable_status,
-                        Some("control-plane"),
-                        None,
-                    )
-                    .await
-                    .unwrap();
+                assert!(
+                    engine
+                        .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                            user_id: "user-1",
+                            expected_session_id: "session-1",
+                            run_id,
+                            status: durable_status,
+                            waiting_for: Some("control-plane"),
+                            error_message: None,
+                            expected_statuses: &["running"],
+                        })
+                        .await
+                        .unwrap()
+                );
             }
 
             let authoritative = reconcile_agent_result_with_durable_authority(
@@ -8941,16 +8946,17 @@ mod tests {
     async fn identical_terminal_replay_preserves_richer_agent_result() {
         let (_, engine, _) = setup();
         let run_id = "completed-result-replay";
-        engine
+        let execution_authority = engine
             .start_run(run_id, "user-1", "session-1")
             .await
             .unwrap();
         assert!(
             engine
-                .persist_delegation_outcome_status(
+                .persist_delegation_outcome_status_if_current_owner(
                     "user-1",
                     "session-1",
                     run_id,
+                    execution_authority.owner_generation,
                     STATUS_COMPLETED,
                     None,
                     None,
@@ -9480,37 +9486,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_and_read_retry_count() {
-        let store = Arc::new(InMemoryRunStateStore::new());
-        let engine = RunEngine::new(store.clone());
-
-        engine.start_run("run-1", "u1", "s1").await.unwrap();
-        assert_eq!(
-            store
-                .load_run("u1", "run-1")
-                .await
-                .unwrap()
-                .unwrap()
-                .retry_count,
-            0
-        );
-
-        engine
-            .persist_retry_count("u1", "s1", "run-1", 2)
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .load_run("u1", "run-1")
-                .await
-                .unwrap()
-                .unwrap()
-                .retry_count,
-            2
-        );
-    }
-
-    #[tokio::test]
     async fn load_from_run_records_rebuilds_tracker() {
         use astra_services::runs::DurableRunRecord;
 
@@ -9537,7 +9512,6 @@ mod tests {
                 checkpoint_json: None,
                 error_code: None,
                 error_message: None,
-                retry_count: 0,
                 total_prompt_tokens: 0,
                 total_completion_tokens: 0,
                 total_tool_calls: 0,
@@ -9575,7 +9549,6 @@ mod tests {
                 checkpoint_json: None,
                 error_code: None,
                 error_message: None,
-                retry_count: 1,
                 total_prompt_tokens: 0,
                 total_completion_tokens: 0,
                 total_tool_calls: 0,
@@ -9613,7 +9586,6 @@ mod tests {
                 checkpoint_json: None,
                 error_code: None,
                 error_message: None,
-                retry_count: 0,
                 total_prompt_tokens: 0,
                 total_completion_tokens: 0,
                 total_tool_calls: 0,
@@ -9652,7 +9624,6 @@ mod tests {
                 checkpoint_json: None,
                 error_code: None,
                 error_message: None,
-                retry_count: 0,
                 total_prompt_tokens: 0,
                 total_completion_tokens: 0,
                 total_tool_calls: 0,
@@ -10943,10 +10914,20 @@ mod tests {
         assert_eq!(result.status, STATUS_COMPLETED);
 
         let reread = engine.start_run("reread", "u", "s").await.unwrap();
-        engine
-            .persist_status("u", "s", "reread", STATUS_COMPLETED, None, None)
-            .await
-            .unwrap();
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "u",
+                    expected_session_id: "s",
+                    run_id: "reread",
+                    status: STATUS_COMPLETED,
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .unwrap()
+        );
         let mailbox = router.register(mailbox_for("reread"), None).await.unwrap();
         let reread_retirement =
             MailboxRetirement::from_mailbox(&router_option, Some(&mailbox)).unwrap();
@@ -11036,10 +11017,20 @@ mod tests {
         let mut deadline = Some(tokio::time::Instant::now());
         for run_id in ["first", "second"] {
             let authority = engine.start_run(run_id, "u", "s").await.unwrap();
-            engine
-                .persist_status("u", "s", run_id, STATUS_COMPLETED, None, None)
-                .await
-                .unwrap();
+            assert!(
+                engine
+                    .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                        user_id: "u",
+                        expected_session_id: "s",
+                        run_id,
+                        status: STATUS_COMPLETED,
+                        waiting_for: None,
+                        error_message: None,
+                        expected_statuses: &["running"],
+                    })
+                    .await
+                    .unwrap()
+            );
             let mailbox = router
                 .register(
                     astra_messaging::types::AgentAddress::new(run_id, "worker"),

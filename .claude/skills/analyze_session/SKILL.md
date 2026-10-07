@@ -29,11 +29,13 @@ already obtained within the relevant scope. Expand depth or facets only for a
 specific evidence gap or an explicitly requested deep audit; discover the full
 tool contract before using fields absent from the resident schema.
 
-Use `astra journal digest` for a named past/offline session, exact aggregate
-metrics, durable-event ordering, or a concrete gap reported by structured
-observation. Raw JSONL parsing is a fallback only when the digest is unavailable
-or missing a required field. Never estimate missing metrics or describe session
-memory, assistant prose, or a prior answer as live runtime evidence.
+Use `astra journal digest` for a named past/offline session or explicitly
+requested persisted metrics/event ordering, when an authorized local provider
+owns that journal. A structured observation gap alone does not establish that a
+local journal contains the missing evidence. Unsupported telemetry is unknown;
+do not probe shell commands, binaries, or files to infer it. Never estimate
+missing metrics or describe session memory, assistant prose, or a prior answer
+as live runtime evidence.
 
 ## Task
 
@@ -46,9 +48,11 @@ For an ordinary retrospective of the active session, use the single composite
 when they answer the user's question; repeated observation adds latency and can
 create contradictory evidence.
 
-Resolve and run a journal digest only if the user names a past session, requests
-exact persisted metrics/event order, or structured observation reports a concrete
-coverage gap:
+Resolve and run a journal digest only for the requested persisted evidence
+boundary, with available local execution and authorized journal ownership.
+Preserve the user's tool restrictions. Server observation does not imply access
+to the caller's local files or CLI executable; a missing capability or journal
+is a source limitation, not a reason to discover another execution path:
 
 ```bash
 command -v astra
@@ -158,7 +162,10 @@ Async work and delegation:
 
 ## Phase 4: Optional Deep Evidence
 
-Use only when the digest does not answer the question.
+Use only for a specific unresolved question within the selected, authorized
+local evidence boundary. These are local forensic sources, not alternatives to
+unsupported Server telemetry. Do not acquire them for a routine active-session
+retrospective.
 
 | Evidence                       | Path                                                                                |
 | ------------------------------ | ----------------------------------------------------------------------------------- |

@@ -38,7 +38,9 @@ use astra_tools::{
     AskUserGate, ProviderInteractionDecision, ProviderInteractionGate, ToolExecutor,
 };
 use astra_turn_core::capability::Capability;
-use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_reset_on_poison};
+use astra_turn_core::sync_utils::{
+    rwlock_read_clone_or_default, rwlock_read_project_or_default, rwlock_write_reset_on_poison,
+};
 use astra_turn_core::tool::schema::{
     prompt_schema_conflicting_tool_names, retain_tool_schemas_by_names, tool_schema_name,
 };
@@ -4113,17 +4115,37 @@ impl RuntimeToolExecutor {
         {
             astra_tools::schemas::validate_tool_arguments(&request.tool_name, &public_arguments)
         } else {
-            self.current_edge_provider_schemas_snapshot()
-                .into_iter()
-                .chain(self.current_deferred_tool_schemas_snapshot())
-                .find(|schema| tool_schema_name(schema) == Some(request.tool_name.as_str()))
-                .map_or(Ok(()), |schema| {
-                    astra_tools::schemas::validate_tool_arguments_against_schema(
-                        &request.tool_name,
-                        &public_arguments,
-                        &schema,
-                    )
-                })
+            rwlock_read_project_or_default(
+                &self.current_edge_provider_schemas,
+                "current_edge_provider_schemas",
+                |schemas| {
+                    schemas
+                        .iter()
+                        .find(|schema| tool_schema_name(schema) == Some(request.tool_name.as_str()))
+                        .cloned()
+                },
+            )
+            .or_else(|| {
+                rwlock_read_project_or_default(
+                    &self.current_deferred_tool_schemas,
+                    "current_deferred_tool_schemas",
+                    |schemas| {
+                        schemas
+                            .iter()
+                            .find(|schema| {
+                                tool_schema_name(schema) == Some(request.tool_name.as_str())
+                            })
+                            .cloned()
+                    },
+                )
+            })
+            .map_or(Ok(()), |schema| {
+                astra_tools::schemas::validate_tool_arguments_against_schema(
+                    &request.tool_name,
+                    &public_arguments,
+                    &schema,
+                )
+            })
         };
         validation.err().map(|error| {
             let mut result = error.into_tool_result();
@@ -6165,7 +6187,6 @@ pub(crate) mod tests {
                 model_requests: Default::default(),
                 judgment_usage: None,
                 semantic_judgments: None,
-                tool_result_judgments: None,
                 view: None,
                 summary: "reflect ready".to_string(),
                 observations: Vec::new(),
@@ -8602,31 +8623,7 @@ pub(crate) mod tests {
         let script = dir.join("mysql");
         std::fs::write(
             &script,
-            r#"#!/bin/sh
-case "$*" in
-  *"SELECT current_account_name() AS name"*)
-    printf '+------+\n| name |\n+------+\n| sys  |\n+------+\n'
-    ;;
-  *"CREATE SNAPSHOT"*)
-    printf 'Query OK, 1 row affected\n'
-    ;;
-  *"RESTORE ACCOUNT"*)
-    printf 'Query OK, 1 row affected\n'
-    ;;
-  *"DROP SNAPSHOT"*)
-    printf 'Query OK, 1 row affected\n'
-    ;;
-  *"UPDATE metrics SET value = 1"*)
-    printf 'Query OK, 1 row affected\n'
-    ;;
-  *"SELECT 1"*)
-    printf '+---+\n| 1 |\n+---+\n| 1 |\n+---+\n'
-    ;;
-  *)
-    printf 'Query OK, 1 row affected\n'
-    ;;
-esac
-"#,
+            include_str!("../../../astra-turn-core/tests/fixtures/mysql_snapshot/mysql.sh"),
         )
         .unwrap();
         let mut perms = std::fs::metadata(&script).unwrap().permissions();
@@ -10398,6 +10395,17 @@ esac
         assert_eq!(
             conflict.metadata.as_ref().unwrap()["side_effects_maybe"],
             false
+        );
+        let fields = conflict.metadata.as_ref().unwrap();
+        assert_eq!(fields["execution_started"], false);
+        assert_eq!(
+            astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
+                fields.get("disposition"),
+                fields.get("execution_started").and_then(Value::as_bool),
+                astra_services::session_journal::ToolCallDisposition::Executed,
+            ),
+            astra_services::session_journal::ToolCallDisposition::Rejected,
+            "ledger rejection must not be counted as a dispatched execution"
         );
     }
 
@@ -14628,12 +14636,16 @@ esac
         )
         .unwrap();
         let _path_guard = set_env_var("PATH", joined);
+        let _password_guard = set_env_var("MATRIXONE_PASSWORD", "offline-test-password");
 
         let (exec, _dir) = test_executor();
         exec.set_turn_index(11);
 
         let result = exec
-            .execute_with_metadata("mo_query", &json!({"sql": "UPDATE metrics SET value = 1"}))
+            .execute_with_metadata(
+                "mo_query",
+                &json!({"sql": "SELECT 1; UPDATE metrics SET value = 1"}),
+            )
             .await;
         assert!(!result.is_error, "got: {}", result.output);
         let fields = result.metadata.as_ref().expect("mo_query metadata");
@@ -14648,6 +14660,20 @@ esac
             Some(expected_database.as_str())
         );
 
+        std::fs::write(fake_bin.path().join("fail_drop"), "").unwrap();
+        let cleanup_failure = exec
+            .execute(
+                "rollback_database_snapshots",
+                &json!({"scope": "current_turn"}),
+            )
+            .await;
+        let failed: Value = serde_json::from_str(&cleanup_failure).unwrap();
+        assert_eq!(failed["success"], false, "{cleanup_failure}");
+        assert_eq!(
+            exec.database_snapshot_journal.lock().unwrap().list().len(),
+            1
+        );
+        std::fs::remove_file(fake_bin.path().join("fail_drop")).unwrap();
         let rollback = exec
             .execute(
                 "rollback_database_snapshots",
@@ -14662,6 +14688,39 @@ esac
         );
         assert_eq!(rollback_json["turn_index"].as_u64(), Some(11));
         assert_eq!(rollback_json["restored"].as_array().map(Vec::len), Some(1));
+        assert!(
+            exec.database_snapshot_journal
+                .lock()
+                .unwrap()
+                .list()
+                .is_empty()
+        );
+        let sql = std::fs::read_to_string(fake_bin.path().join("sql.log")).unwrap();
+        let commands: Vec<_> = sql.lines().collect();
+        assert!(
+            commands
+                .iter()
+                .position(|sql| sql.starts_with("CREATE SNAPSHOT"))
+                .unwrap()
+                < commands
+                    .iter()
+                    .position(|sql| *sql == "SELECT 1; UPDATE metrics SET value = 1")
+                    .unwrap()
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|sql| sql.starts_with("RESTORE ACCOUNT"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|sql| sql.starts_with("DROP SNAPSHOT"))
+                .count(),
+            2
+        );
     }
 
     // ── Memory tool user isolation ─────────────────────────────────────

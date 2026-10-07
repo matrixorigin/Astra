@@ -78,6 +78,54 @@ pub struct ContextCompactionObservation {
 }
 
 impl ContextCompactionObservation {
+    /// Project validated Server compaction facts into shared audit and display.
+    /// This records observations; it never chooses or executes compression.
+    pub fn record_projection(
+        &self,
+        input_budget_tokens: u64,
+        recorder: &mut astra_pipeline::step_recorder::StepRecorder,
+        pipeline: Option<&mut crate::pipeline_session::PipelineSession>,
+    ) -> Option<crate::compaction_types::CompactionEvent> {
+        if !self.is_consistent() {
+            tracing::warn!(observation_id = %self.id, "ignoring inconsistent context compaction observation");
+            return None;
+        }
+        let compacted_messages = self
+            .messages_before
+            .saturating_sub(self.messages_after)
+            .min(u64::from(u32::MAX)) as u32;
+        let pressure = if input_budget_tokens > 0 {
+            (self.tokens_before as f64 / input_budget_tokens as f64).min(1.0)
+        } else {
+            0.0
+        };
+        recorder.record_compaction_with_kind(
+            &self.kind.to_string(),
+            compacted_messages,
+            self.tokens_saved,
+            pressure,
+        );
+        if let Some(pipeline) = pipeline {
+            pipeline.record_compaction_audit(
+                &self.kind.to_string(),
+                compacted_messages,
+                self.tokens_saved.min(u64::from(u32::MAX)) as u32,
+            );
+            pipeline.stats.record_compaction(self.tokens_saved);
+        }
+        Some(crate::compaction_types::CompactionEvent::new(
+            self.kind,
+            pressure,
+            self.tokens_saved,
+            self.tokens_before,
+            input_budget_tokens,
+            compacted_messages as usize,
+            self.messages_after
+                .min(u64::try_from(usize::MAX).unwrap_or(u64::MAX)) as usize,
+            Vec::new(),
+        ))
+    }
+
     /// Whether all redundant counters agree with one another.
     ///
     /// This validates only typed structural facts; it never interprets
@@ -318,11 +366,36 @@ impl ChatTurnSseAccum {
     /// Enforce terminal evidence for a Server-owned admission without losing
     /// observed execution facts or replacing an existing failure.
     pub fn require_server_terminal_evidence(&mut self) {
-        if !self.server_loop_terminal && self.error_message.is_none() && self.error_kind.is_none() {
-            self.error_kind = Some(astra_core::ErrorKind::ContractViolation);
-            self.error_message =
-                Some("Server admission stream ended without terminal execution evidence".into());
+        if let Some(error) = self.remote_admission_error(None) {
+            self.error_kind = Some(error.kind);
+            self.error_message = Some(error.message);
         }
+    }
+
+    pub(crate) fn remote_admission_error(
+        &self,
+        error_kind: Option<astra_core::ErrorKind>,
+    ) -> Option<astra_core::ClassifiedError> {
+        if self.error_message.is_some() {
+            return None;
+        }
+        if let Some(kind) = error_kind.or(self.error_kind) {
+            return Some(astra_core::ClassifiedError::new(
+                kind,
+                "Server admission stream reported an error without an error message",
+            ));
+        }
+        let message = if !self.server_loop_terminal {
+            "Server admission stream ended without terminal execution evidence"
+        } else if self.has_tool_calls || !self.tool_calls.is_empty() {
+            "remote Server returned pending client continuation work"
+        } else {
+            return None;
+        };
+        Some(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            message,
+        ))
     }
 
     /// Context occupancy is independent of complete billing evidence.
@@ -471,6 +544,26 @@ pub struct ServerLoopExecutionSummary {
 }
 
 impl ServerLoopExecutionSummary {
+    /// Select Server-produced feedback for the accepted terminal boundary.
+    /// Clients consume this fact without reconstructing execution state.
+    pub fn runtime_feedback_for(
+        &self,
+        session_id: Option<&str>,
+        run_id: Option<&str>,
+        model_id: Option<&str>,
+        session_turn: u32,
+    ) -> Option<&RuntimeFeedbackFrame> {
+        self.runtime_feedback.as_ref().filter(|frame| {
+            session_id == Some(frame.identity.session_id.as_str())
+                && run_id == Some(frame.identity.run_id.as_str())
+                && model_id == Some(frame.identity.model_id.as_str())
+                && frame.progress.session_turn == session_turn
+                // An interrupted summary may include a failed provider
+                // attempt after its last successfully ingested feedback.
+                && frame.progress.llm_rounds_completed <= self.llm_rounds
+        })
+    }
+
     /// Whether the terminal receipt closes every tool attempt reported by the
     /// same immutable server aggregate. A receipt may be internally complete
     /// for a strict prefix while still lacking authority for the whole run.
@@ -2014,6 +2107,152 @@ pub fn parse_chat_turn_sse_utf8_body(body: &str) -> ParsedChatTurnSseBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn server_feedback_frame() -> crate::context_feedback::RuntimeFeedbackFrame {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": crate::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
+            "identity": {
+                "session_id": "session-1",
+                "run_id": "run-1",
+                "agent_id": "agent-1",
+                "model_id": "deepseek-v4-flash",
+                "topology": "server_only"
+            },
+            "progress": {
+                "session_turn": 4,
+                "agentic_round_index": 2,
+                "llm_rounds_completed": 3,
+                "slice_round_limit": 60,
+                "slice_rounds_remaining": 57
+            },
+            "context": {
+                "model_context_window_tokens": 1000000,
+                "effective_input_limit_tokens": 800000,
+                "estimated_input_tokens": 840000,
+                "token_pressure": 1.05,
+                "compaction_tier": "compact_history"
+            },
+            "request_usage": {
+                "prompt": 100,
+                "cache_read": 200,
+                "cache_creation": 0,
+                "completion": 20
+            },
+            "run_usage": {
+                "prompt": 300,
+                "cache_read": 600,
+                "cache_creation": 0,
+                "completion": 60
+            },
+            "was_truncated": false,
+            "policy_feedback": {
+                "state": "evaluated",
+                "schema_version": crate::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
+                "revision": 2,
+                "evaluated_at_round": 2,
+                "subject": {
+                    "kind": "work_item",
+                    "attempt_id": "attempt-1",
+                    "item_id": "item-1",
+                    "item_revision": 1,
+                    "objective": "Inspect one bounded target",
+                    "expected_result": "One verified result"
+                },
+                "entries": [{
+                    "signal": "read_coverage_overlap",
+                    "stage": "observe",
+                    "observed_at_round": 2,
+                    "evidence_count": 3,
+                    "recommendation": "review_read_coverage"
+                }]
+            }
+        }))
+        .expect("valid server feedback frame")
+    }
+
+    fn server_summary_tool_receipt(
+        attempted: u32,
+    ) -> crate::tool_ledger_receipt::ToolLedgerReceipt {
+        crate::tool_ledger_receipt::ToolLedgerReceipt::new(
+            "run-1",
+            1,
+            attempted,
+            attempted,
+            0,
+            crate::tool_ledger_receipt::ToolLedgerResultClassCounts {
+                succeeded: attempted,
+                ..Default::default()
+            },
+            u64::from(attempted),
+            crate::tool_ledger_receipt::EMPTY_TOOL_LEDGER_ROOT,
+            true,
+        )
+    }
+
+    #[test]
+    fn remote_server_feedback_is_exact_and_bound_to_terminal_progress() {
+        let frame = server_feedback_frame();
+        let summary = ServerLoopExecutionSummary {
+            tool_calls_count: 0,
+            observation_tool_calls_count: 0,
+            tools_used: Vec::new(),
+            llm_rounds: 3,
+            tool_ledger_receipt: server_summary_tool_receipt(0),
+            token_usage_coverage: None,
+            runtime_feedback: Some(frame.clone()),
+        };
+        assert_eq!(
+            summary
+                .runtime_feedback_for(
+                    Some("session-1"),
+                    Some("run-1"),
+                    Some("deepseek-v4-flash"),
+                    4,
+                )
+                .cloned(),
+            Some(frame.clone())
+        );
+
+        let mut terminal_includes_failed_attempt = summary.clone();
+        terminal_includes_failed_attempt.llm_rounds = 4;
+        assert_eq!(
+            terminal_includes_failed_attempt
+                .runtime_feedback_for(
+                    Some("session-1"),
+                    Some("run-1"),
+                    Some("deepseek-v4-flash"),
+                    4,
+                )
+                .cloned(),
+            Some(frame.clone())
+        );
+        let mut impossible_future_feedback = summary.clone();
+        impossible_future_feedback.llm_rounds = 2;
+        assert!(
+            impossible_future_feedback
+                .runtime_feedback_for(
+                    Some("session-1"),
+                    Some("run-1"),
+                    Some("deepseek-v4-flash"),
+                    4,
+                )
+                .cloned()
+                .is_none()
+        );
+        assert!(
+            summary
+                .runtime_feedback_for(
+                    Some("session-1"),
+                    Some("run-1"),
+                    Some("deepseek-v4-flash"),
+                    5,
+                )
+                .cloned()
+                .is_none()
+        );
+    }
+
     fn dispatch_evaluation_event(accum: &mut ChatTurnSseAccum, event: &Value) {
         dispatch_chat_turn_sse_event_block(&format!("data: {event}\n\n"), accum, &mut Vec::new());
     }
@@ -2375,26 +2614,7 @@ mod tests {
     /// regression again.
     #[test]
     fn signature_round_trips_from_sse_into_next_assistant_message() {
-        use crate::headless_tool_assembly::{
-            EdgeToolRoundRow, openai_assistant_with_tool_calls_message_ext,
-        };
-
-        struct Row;
-        impl EdgeToolRoundRow for Row {
-            fn tool_name(&self) -> &str {
-                "noop"
-            }
-            fn tool_args(&self) -> &Value {
-                static NULL: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-                NULL.get_or_init(|| Value::Null)
-            }
-            fn tool_output(&self) -> &str {
-                ""
-            }
-            fn tool_duration_ms(&self) -> u64 {
-                0
-            }
-        }
+        use crate::headless_tool_assembly::openai_assistant_with_tool_calls_message_ext;
 
         let mut accum = ChatTurnSseAccum::default();
         let stream = format!(
@@ -2415,9 +2635,8 @@ mod tests {
             "type": "function",
             "function": {"name": "noop", "arguments": "{}"}
         })];
-        let msg = openai_assistant_with_tool_calls_message_ext::<Row>(
+        let msg = openai_assistant_with_tool_calls_message_ext(
             &server_tool_calls,
-            &[],
             &accum.reasoning_content,
             &accum.reasoning_signature,
             true,

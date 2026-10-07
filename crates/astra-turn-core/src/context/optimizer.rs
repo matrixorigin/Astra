@@ -439,7 +439,6 @@ mod tests {
     use crate::context_binder::bind_all;
     use crate::context_planner::{PlanInput, plan_turn};
     use crate::context_sources::*;
-    use crate::emergent_context::EmergentContext;
     use crate::microcompact::{CompactStrategy, ProviderCacheStrategy};
     use crate::pipeline_config::ProviderCachePolicy;
     use crate::pipeline_stats::PipelineStats;
@@ -484,7 +483,6 @@ mod tests {
             memory_entries: Vec::new(),
             ..Default::default()
         };
-        let emergent = EmergentContext::default();
         let stats = PipelineStats::default();
 
         let sources = ContextSources {
@@ -494,7 +492,6 @@ mod tests {
             session: &session,
             turn: &turn,
             external: &external,
-            emergent: &emergent,
             working_memory: None,
             stats: &stats,
         };
@@ -1238,9 +1235,6 @@ mod tests {
                 Just(SectionKind::Skills),
                 Just(SectionKind::RuntimeIdentity),
                 Just(SectionKind::RuntimeVolatile),
-                Just(SectionKind::EmergentSkills),
-                Just(SectionKind::EmergentMemory),
-                Just(SectionKind::EmergentSummary),
             ]
         }
 

@@ -3,7 +3,6 @@ pub mod health_status_surface;
 pub mod run_status_surface;
 pub mod self_surface;
 pub mod session_source_surface;
-pub mod session_workspace_status_surface;
 
 use serde_json::Value;
 

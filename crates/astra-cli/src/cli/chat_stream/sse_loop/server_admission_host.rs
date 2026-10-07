@@ -1,9 +1,9 @@
 //! CLI adapter for one Server-owned developer-loop admission.
 //!
 //! Wraps CLI-specific concerns (tool executor, permission manager, tool surface,
-//! skill registry, terminal rendering) behind the runtime trait so the
-//! Remote continuation remains Server-owned. The runtime host contract is
-//! retained for common ingestion/finalization, not for client-side rounds.
+//! skill registry, terminal rendering) around a single SSE exchange. Shared
+//! ingestion and finalization consume its projection; continuation remains
+//! Server-owned.
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
@@ -12,20 +12,13 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+use super::remote_turn::RemoteTurnState;
 use astra_runtime::{
     tool_registry::ToolRegistry,
     turn::agentic::headless_round::HeadlessStderrStyle,
-    turn::agentic_loop::host::{
-        AgenticLoopHost, AgenticLoopState, ContinuationAuthority, HostTurnResult,
-        SkillAutoRouteDecision, SkillAutoRouteJudgeContext, TerminalExecutionAuthority,
-        TurnIntentJudgeOutcome, TurnInteractionMode, interaction_scoped_tool_restrictions,
-    },
+    turn::agentic_loop::host::{TurnInteractionMode, interaction_scoped_tool_restrictions},
 };
-use astra_turn_core::{
-    chat_turn_sse_dispatch::ServerLoopExecutionSummary, compaction_types::CompactionEvent,
-    tool::schema::tool_names_from_schemas,
-};
-use async_trait::async_trait;
+use astra_turn_core::chat_turn_sse_dispatch::ServerLoopExecutionSummary;
 use crossterm::style::Stylize;
 use serde_json::Value;
 
@@ -99,10 +92,9 @@ fn terminal_stream_projection_warning(
     )
 }
 
-/// Merge per-exchange canonical snapshots into the logical turn snapshot.
-/// Edge tool rounds can open more than one physical SSE exchange; retaining
-/// only the latest snapshot would silently discard Explain Analyze facts from
-/// an earlier round when the observer queue stays full.
+/// Merge canonical snapshots from one execution stream. Retaining only the
+/// newest suffix would discard earlier Explain Analyze facts when the observer
+/// queue stays full.
 fn merge_explain_analyze_snapshot(
     existing: Option<crate::cli::chat_stream::StreamEvent>,
     incoming: crate::cli::chat_stream::StreamEvent,
@@ -244,10 +236,7 @@ impl Drop for SandboxPolicyGuard<'_> {
     }
 }
 
-/// CLI host for the runtime agentic loop.
-///
-/// Holds all CLI-specific dependencies; the runtime loop calls `execute_turn()`
-/// which delegates to the existing `fetch_chat_turn_sse` pipeline.
+/// Client dependencies for one Server execution stream and its local callbacks.
 pub(crate) struct CliServerAdmissionHost<'a> {
     pub runtime_config: Arc<astra_config::RuntimeConfig>,
     pub api: &'a astra_thin_client::ThinClient,
@@ -354,8 +343,8 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// Exact durable owner to cancel. Callback failures may name a projected
     /// child; physical-stream failures use the immutable root owner.
     pub remote_cancel_run_id: Option<String>,
-    /// Latest immutable physical SSE owner, retained through the runtime's
-    /// later final-output hook where the full AgenticLoopState is unavailable.
+    /// Latest immutable physical SSE owner, retained through final-output
+    /// delivery and durable cancellation.
     pub last_physical_run_id: Option<String>,
     pub turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
     /// Structured admission failure metadata retained after the accumulator is
@@ -454,9 +443,7 @@ fn derive_turn_interaction_mode(
 }
 
 impl CliServerAdmissionHost<'_> {
-    /// Internal accessor. The trait impl delegates here; this method
-    /// exists separately so other CLI-only call sites can use it
-    /// without going through the `AgenticLoopHost` trait object.
+    /// Interaction capability for local callbacks in this Server stream.
     fn turn_interaction_mode_inherent(&self) -> TurnInteractionMode {
         derive_turn_interaction_mode(
             self.perm_manager.mode(),
@@ -646,51 +633,6 @@ async fn emit_ordered_control_event_with_backpressure(
     if let Err(error) = tx.send(event).await {
         tracing::debug!(%error, "ordered stream receiver closed during control delivery");
     }
-}
-
-fn user_intent_stream_event(
-    event: &astra_runtime::turn::run_control::QueuedUserIntent,
-) -> Option<crate::cli::chat_stream::StreamEvent> {
-    let content = astra_runtime::turn::run_control::user_intent_content(&event.input)?;
-    Some(crate::cli::chat_stream::StreamEvent::UserIntentApplied {
-        intent_id: event.intent_id.clone(),
-        delivery: event.delivery,
-        status: astra_turn_types::UserIntentStatus::Applied,
-        event_index: event.event_index,
-        content,
-    })
-}
-
-fn record_remote_applied_user_intents(
-    state: &mut astra_runtime::turn::agentic_loop::host::UserIntentState,
-    intents: &[astra_turn_core::chat_turn_sse_dispatch::StreamAppliedUserIntent],
-) {
-    let applied = intents
-        .iter()
-        .map(
-            |intent| astra_runtime::turn::agentic_loop::host::AppliedUserIntent {
-                intent_id: intent.intent_id.clone(),
-                delivery: intent.delivery,
-                status: astra_turn_types::UserIntentStatus::Applied,
-                event_index: intent.event_index,
-                content: intent.content.clone(),
-            },
-        )
-        .collect::<Vec<_>>();
-    state.record_applied_user_intents(&applied);
-}
-
-fn returned_user_intent_stream_event(
-    event: &astra_runtime::turn::run_control::QueuedUserIntent,
-) -> Option<crate::cli::chat_stream::StreamEvent> {
-    let content = astra_runtime::turn::run_control::user_intent_content(&event.input)?;
-    Some(crate::cli::chat_stream::StreamEvent::UserIntentReturned {
-        intent_id: event.intent_id.clone(),
-        delivery: event.delivery,
-        status: astra_turn_types::UserIntentStatus::Returned,
-        event_index: event.event_index,
-        content,
-    })
 }
 
 async fn emit_final_output_ready(
@@ -940,75 +882,11 @@ fn append_permission_mode_change_audit(
     }
 }
 
-#[async_trait]
-impl AgenticLoopHost for CliServerAdmissionHost<'_> {
-    fn parent_model_reasoning_snapshot(
-        &self,
-        _state: &AgenticLoopState,
-    ) -> Option<astra_turn_core::orchestration_spawn_tool::ParentModelReasoning> {
-        self.executor.parent_model_reasoning_snapshot()
-    }
-
-    fn is_pre_admission_rejection(&self) -> bool {
-        is_pre_admission_rejection(
-            self.last_error_code.as_deref(),
-            self.last_error_metadata.as_ref(),
-            self.last_physical_run_id.as_deref(),
-        )
-    }
-
-    fn continuation_authority(&self, _result: &HostTurnResult) -> ContinuationAuthority {
-        ContinuationAuthority::RemoteServer
-    }
-
-    fn direct_child_completion_owner(
-        &self,
-        _state: &AgenticLoopState,
-    ) -> Option<Arc<astra_runtime::orchestration::FanoutParentAdmission>> {
-        Some(Arc::clone(
-            &self.executor.spawn_context.as_ref()?.fanout_admission,
-        ))
-    }
-
-    fn execution_time_budget_remaining(&self) -> Option<astra_turn_types::ExecutionTimeRemaining> {
-        Some(
-            self.executor
-                .spawn_context
-                .as_ref()?
-                .execution_deadline?
-                .remaining_at(std::time::Instant::now()),
-        )
-    }
-
-    fn injects_round_guidance(&self) -> bool {
-        // This host is the CLI edge of a remote Server-owned provider
-        // boundary.  The server's canonical context pipeline computes the
-        // round guidance from the authoritative server history.  Claiming
-        // local ownership here would enqueue the same BudgetAdvisory on the
-        // edge and send a duplicate dynamic block across the boundary.
-        true
-    }
-
-    fn memory_recall_scope(&self, _state: &AgenticLoopState) -> Option<(String, String)> {
-        self.executor.memory_recall_scope()
-    }
-
-    fn agent_live_event_sink(
-        &self,
-    ) -> Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink> {
-        self.agent_live_event_sink.clone()
-    }
-
-    fn apply_permission_mode(&mut self, mode: PermissionMode) -> Result<(), String> {
-        self.perm_manager.set_mode(mode);
-        self.executor.apply_runtime_permission_sandbox(mode);
-        Ok(())
-    }
-
-    async fn execute_turn(
+impl CliServerAdmissionHost<'_> {
+    pub(super) async fn fetch_remote_turn(
         &mut self,
-        state: &mut AgenticLoopState,
-    ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
+        state: &mut RemoteTurnState,
+    ) -> Result<crate::cli::stream::stream_render::TurnResult, astra_core::ClassifiedError> {
         let assembly_start = Instant::now();
 
         // Preserve the lifecycle-created collector: it may already contain
@@ -1057,9 +935,8 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         // ToolExecutor so tools that need a TUI overlay
         // (currently `exit_plan_mode` for the Approve / Keep
         // planning dialog) can reach the bottom-pane handler. The
-        // slot is cleared after the turn completes via the
-        // `on_turn_completed` hook so a stale sender never leaks
-        // into background sub-runs.
+        // scoped turn guard clears the slot on completion, failure or abort
+        // so a stale sender never leaks into background sub-runs.
         self.executor
             .set_ask_user_request_tx(self.ask_user_request_tx.clone());
         self.executor
@@ -1082,7 +959,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         let effective_model_owned = self.model.map(str::to_owned);
         let effective_model = effective_model_owned.as_deref();
         let effective_offering_id = self.offering_id.as_deref();
-        let runtime_volatile_injections = state.lease_volatile_pending()?;
+        let runtime_volatile_injections = &state.volatile_pending;
         let runtime_volatile_texts = self
             .input_runtime_volatile_texts
             .iter()
@@ -1095,7 +972,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         // callback failures must stop this physical stream and cancel its
         // durable run without being misreported as a user cancellation or
         // cancelling other work that shares the caller token.
-        let stream_cancel_token = child_cancellation_scope(state.cancellation.token.as_ref());
+        let stream_cancel_token = child_cancellation_scope(state.cancel_token.as_ref());
         let persistent_restricted_tools = state.restricted_tools.clone();
         let interaction_scoped_restrictions =
             interaction_scoped_tool_restrictions(interaction_mode);
@@ -1106,38 +983,12 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         // mode. Skill-level `allowed_tools` must not: those are enforced later
         // in runtime interception so the advertised tool schema remains stable
         // across turns for prompt-cache efficiency.
-        let request_scoped_restrictions = request_allowlist_restriction_names(
-            &self.all_schemas,
-            state.skills.request_constraints.allowed_tools.as_ref(),
-        );
-        state
-            .restricted_tools
-            .extend(request_scoped_restrictions.iter().cloned());
-
-        // A textless provider response gets one bounded settlement call. The
-        // runtime state is authoritative: remove every advertised schema for
-        // this boundary so "produce the final answer" is enforced by the
-        // capability surface rather than left as prompt-only guidance.
-        if state.hooks.completion_settlement.text_only {
-            state
-                .restricted_tools
-                .extend(tool_names_from_schemas(&self.all_schemas));
-        }
-
-        // Propagate skill sandbox policy to the tool executor for this turn.
-        // The guard restores the previous policy on drop — including on the
-        // `?` early-return path below — so a turn that errored out cannot leak
-        // a skill-scoped policy into subsequent turns.
-        let _sandbox_guard = SandboxPolicyGuard::for_permission_mode(
-            &self.executor,
-            state.skills.execution.sandbox_policy.clone(),
-            self.perm_manager.mode(),
-        );
-        if let Some(context) = self.executor.spawn_context.as_ref() {
-            state.messaging.reply_obligations = Arc::clone(&context.reply_obligations);
-        }
+        let _sandbox_guard =
+            SandboxPolicyGuard::for_permission_mode(&self.executor, None, self.perm_manager.mode());
         let append_system_prompt = self.append_system_prompt.as_deref();
 
+        let mut turn_policy =
+            astra_runtime::turn::agentic_loop::host::TurnInteractionPolicy::default();
         macro_rules! fetch_turn_sse {
             () => {
                 fetch_chat_turn_sse(ChatTurnSseFetchRequest {
@@ -1157,7 +1008,6 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                     message: self.message,
                     user_intent: self.user_intent,
                     semantic_query_override: self.semantic_query_override,
-                    turn_intent: state.turn_intent.as_ref(),
                     history: self.history,
                     recent_tools: self.recent_tools,
                     project_root: self.project_root.as_path(),
@@ -1166,14 +1016,12 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                     messages: state.messages.as_slice(),
                     runtime_required_texts: self.input_runtime_required_texts,
                     runtime_volatile_texts: &runtime_volatile_texts,
-                    runtime_volatile_injections: &runtime_volatile_injections,
+                    runtime_volatile_injections,
                     ephemeral_prefix: state.skills.listing_message.as_ref(),
                     current_session_id: state.current_session_id.as_deref(),
-                    tool_results: state.tool_results.as_slice(),
                     all_schemas: &self.all_schemas,
                     valid_tool_names: &mut self.valid_tool_names,
-                    pinned_tool_schema_tokens: &mut state.pinned_tool_schema_tokens,
-                    turn_guard: &state.turn_guard,
+                    tool_health: &state.tool_health,
                     restricted_tools: &mut state.restricted_tools,
                     step_recorder: &mut state.step_recorder,
                     assembly_start,
@@ -1195,27 +1043,10 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                     approval_request_tx: self.approval_request_tx.clone(),
                     ask_user_request_tx: self.ask_user_request_tx.clone(),
                     skill_resolver: state.skills.resolver.clone(),
-                    skill_effort: state
-                        .skills
-                        .execution
-                        .effort
-                        .as_ref()
-                        .map(|e| e.to_string()),
-                    skill_agent_type: state.skills.execution.agent_type.clone(),
                     interaction_mode,
-                    turn_policy: &mut state.last_turn_policy,
-                    skill_allowed_tools: state
-                        .skills
-                        .execution
-                        .allowed_tools
-                        .as_ref()
-                        .map(|s| s.iter().cloned().collect::<Vec<_>>()),
-                    skill_continuation: state.skill_produced_output,
+                    turn_policy: &mut turn_policy,
                     tool_cache: &mut self.tool_cache,
-                    round_index: state.current_round_index,
                     session_turn: state.session_turn,
-                    turn_chain_id: state.canonical_turn_chain_id.as_deref(),
-                    user_query_event_id: state.root_user_query_event_id.as_deref(),
                     observability_hub: state.telemetry.observability_hub.as_ref(),
                     incremental_state: self.incremental_state.clone(),
                     request_session_execution_lease: self.request_session_execution_lease.clone(),
@@ -1319,10 +1150,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         // a live-render notification. Fold exact root-scoped applied facts
         // into the same run-local accumulator used by local admission so the
         // final conversation commit and restart history match durable state.
-        record_remote_applied_user_intents(
-            &mut state.user_intents,
-            &turn_result.core.applied_user_intents,
-        );
+        state.applied_user_intents = turn_result.core.applied_user_intents.clone();
 
         if let Some(interruption) = turn_result.core.server_interruption.clone() {
             let interruption = serde_json::from_value(interruption).map_err(|error| {
@@ -1350,8 +1178,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             state.stall.server_terminal_unverified = server_terminal_requires_unverified(
                 turn_result.core.server_execution_summary.as_ref(),
             );
-            state.telemetry.terminal_execution_authority =
-                Some(TerminalExecutionAuthority::RemoteServer);
+            state.server_terminal_authoritative = true;
 
             // Terminal server usage is aggregate accounting for the entire
             // run (including child runs).  Context pressure, compaction and
@@ -1452,7 +1279,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         self.last_error_metadata = turn_result.core.error_metadata.clone();
         if self.output_transport_failure.is_none()
             && !turn_result.callback_delivery_failed
-            && let Some(output_failure) = turn_result.output_transport_failure
+            && let Some(output_failure) = turn_result.output_transport_failure.take()
         {
             self.output_transport_failure = Some(output_failure);
             self.remote_cancel_required = true;
@@ -1468,35 +1295,10 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         if self.remote_cancel_run_id.is_none() {
             self.remote_cancel_run_id = turn_result
                 .callback_failure_run_id
+                .take()
                 .or(unsettled_physical_owner_run_id);
         }
-        let error_kind = turn_result.core.error_kind;
-        Ok(HostTurnResult {
-            accum: turn_result.core,
-            ttft_ms: turn_result.ttft_ms,
-            edge_tool_round: turn_result.edge_tool_round,
-            error_kind,
-        })
-    }
-
-    async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> TurnIntentJudgeOutcome {
-        // The CLI is an admission adapter for the Server-owned loop. It must
-        // not start a second auxiliary inference exchange before the canonical
-        // /chat/stream request even when the Server supports an opt-in judge.
-        // Report that delegation explicitly so local explain/trace output does
-        // not claim that semantic admission was disabled.
-        TurnIntentJudgeOutcome::Delegated
-    }
-
-    async fn judge_skill_auto_route(
-        &mut self,
-        _state: &AgenticLoopState,
-        _ctx: SkillAutoRouteJudgeContext<'_>,
-    ) -> Option<SkillAutoRouteDecision> {
-        // Skill discovery and explicit activation remain available to the
-        // primary model. Hidden client-side auto-routing would duplicate the
-        // Server decision and make request admission depend on another model.
-        None
+        Ok(turn_result)
     }
 
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {
@@ -1553,21 +1355,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         self.try_emit_stream_event(stream_event);
     }
 
-    fn on_compaction(&mut self, event: CompactionEvent) {
-        if !self.is_quiet() {
-            self.emit_headless_line(HeadlessStderrStyle::Dim, event.summary.clone());
-        }
-        // Structured event for TUI / stream consumers.
-        self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::Compaction(event));
-    }
-
-    fn on_agent_communication(&mut self, event: astra_messaging::AgentCommunicationEvent) {
-        self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::AgentCommunication(
-            event,
-        ));
-    }
-
-    fn on_session_bound(&mut self, session_id: &str) {
+    pub(super) fn on_session_bound(&mut self, session_id: &str) {
         if session_id.trim().is_empty() {
             return;
         }
@@ -1599,66 +1387,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         }
     }
 
-    fn is_quiet(&self) -> bool {
-        self.render_policy.is_silent()
-    }
-
-    fn turn_interaction_mode(&self) -> TurnInteractionMode {
-        self.turn_interaction_mode_inherent()
-    }
-
-    fn plan_mode_active(
-        &self,
-        _state: &astra_runtime::turn::agentic_loop::host::AgenticLoopState,
-    ) -> bool {
-        self.perm_manager.mode() == crate::cli::permission_manager::PermissionMode::Plan
-    }
-
-    fn valid_tool_names(&self) -> &HashSet<String> {
-        &self.valid_tool_names
-    }
-
-    fn deferred_tool_names(&self) -> HashSet<String> {
-        self.executor.current_activatable_tool_names_snapshot()
-    }
-
-    async fn on_user_intent_applied(
-        &mut self,
-        event: &astra_runtime::turn::run_control::QueuedUserIntent,
-    ) {
-        if let Some(event) = user_intent_stream_event(event) {
-            self.emit_ordered_control_event(event).await;
-        }
-    }
-
-    async fn on_user_intent_returned(
-        &mut self,
-        event: &astra_runtime::turn::run_control::QueuedUserIntent,
-    ) {
-        if let Some(event) = returned_user_intent_stream_event(event) {
-            self.emit_ordered_control_event(event).await;
-        }
-    }
-
-    fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
-        self.capabilities.clone()
-    }
-
-    fn turn_start_lifecycle_summary(
-        &self,
-        _state: &astra_runtime::turn::agentic_loop::host::AgenticLoopState,
-    ) -> String {
-        self.append_system_prompt.clone().unwrap_or_default()
-    }
-
-    fn on_introspect_snapshot(
-        &mut self,
-        snapshot: &astra_turn_core::introspect::IntrospectSnapshot,
-    ) {
-        self.executor.update_introspect_snapshot(snapshot.clone());
-    }
-
-    async fn cancel_child_agents(
+    pub(super) async fn cancel_child_agents(
         &mut self,
         agent_ids: &[String],
         reason: &str,
@@ -1744,7 +1473,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         cancelled
     }
 
-    fn inject_tool_schema(&mut self, schema: Value) {
+    pub(super) fn inject_tool_schema(&mut self, schema: Value) {
         crate::cli::tool_surface_injection::install_injected_tool_schema(
             self.executor.as_ref(),
             schema,
@@ -1754,7 +1483,17 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         );
     }
 
-    fn render_final_text(&mut self, text: &str, _model_item_id: Option<&str>) {
+    pub(super) fn on_compaction(
+        &mut self,
+        event: astra_turn_core::compaction_types::CompactionEvent,
+    ) {
+        if !self.render_policy.is_silent() {
+            self.emit_headless_line(HeadlessStderrStyle::Dim, event.summary.clone());
+        }
+        self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::Compaction(event));
+    }
+
+    pub(super) fn render_final_text(&mut self, text: &str, _model_item_id: Option<&str>) {
         if self.render_policy.suppress_final_text() {
             return;
         }
@@ -1788,7 +1527,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         }
     }
 
-    async fn on_final_output_ready(&mut self, _state: &AgenticLoopState) {
+    pub(super) async fn on_final_output_ready(&mut self) {
         let snapshot_was_pending = self.pending_explain_analyze_snapshot.is_some();
         let (delivered, snapshot_delivered) = emit_final_output_ready(
             self.stream_event_tx.as_ref(),
@@ -1879,10 +1618,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         }
     }
 
-    fn on_turn_completed(
-        &mut self,
-        state: &astra_runtime::turn::agentic_loop::host::AgenticLoopState,
-    ) {
+    pub(super) fn on_turn_completed(&mut self, state: &RemoteTurnState) {
         // A turn without terminal text does not enter
         // `on_final_output_ready`. If a canonical Explain Analyze snapshot is
         // still retained at the full settlement boundary, preserve the same
@@ -1890,13 +1626,6 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         if self.pending_explain_analyze_snapshot.is_some() {
             self.mark_explain_analyze_terminal_degraded();
         }
-        // Drop the per-turn ask_user channel so a stale sender from
-        // this turn doesn't leak into background sub-runs that share
-        // the same `Arc<ToolExecutor>` (the channel is reinstalled at
-        // the start of every turn).
-        self.executor.set_ask_user_request_tx(None);
-        self.executor.set_plan_review_request_tx(None);
-
         // Sync incremental state for interruption recovery.
         // Token counts are updated per-round in execute_turn (so
         // force-exit captures accurate cumulative totals).  Here we
@@ -1923,7 +1652,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                 state.total_tool_calls,
                 state.telemetry.all_tools_used.iter().cloned(),
                 &tool_records,
-                !state.telemetry.server_summary_run_usage.is_empty(),
+                state.remote_summary.is_some(),
             );
             inc.replace_tool_records(tool_records);
             // Retained records may be filtered (policy/synthetic entries) and
@@ -1933,29 +1662,6 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
             inc.replace_tools_used(tools_used);
         }
     }
-}
-
-fn request_allowlist_restriction_names(
-    schemas: &[serde_json::Value],
-    request_allowed: Option<&HashSet<String>>,
-) -> HashSet<String> {
-    let effective_allowed =
-        astra_turn_core::tool_allowlist::compute_effective_allowlist(request_allowed, None);
-    let Some(allowed) = effective_allowed else {
-        return HashSet::new();
-    };
-
-    schemas
-        .iter()
-        .filter_map(|schema| {
-            schema
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(serde_json::Value::as_str)
-        })
-        .filter(|name| !allowed.contains(*name))
-        .map(str::to_string)
-        .collect()
 }
 
 /// Isolate one Server stream from its caller's cancellation domain.
@@ -1978,9 +1684,8 @@ mod tests {
         child_cancellation_scope, derive_turn_interaction_mode, emit_final_output_ready,
         emit_ordered_control_event_with_backpressure, is_pre_admission_rejection,
         permission_mode_change_audit_event, reconcile_terminal_stream_projection,
-        record_remote_applied_user_intents, request_allowlist_restriction_names,
         retain_ordered_stream_event_in_queue, server_terminal_requires_unverified,
-        stream_event_requires_ordered_delivery, user_intent_stream_event,
+        stream_event_requires_ordered_delivery,
     };
 
     #[test]
@@ -2035,7 +1740,6 @@ mod tests {
     use astra_runtime::turn::agentic_loop::host::TurnInteractionMode;
     use astra_services::session_journal::JournalEventType;
     use serde_json::json;
-    use std::collections::HashSet;
 
     #[test]
     fn server_terminal_uses_receipt_integrity_not_policy_quality_feedback() {
@@ -2888,44 +2592,6 @@ mod tests {
     }
 
     #[test]
-    fn user_intent_stream_event_preserves_identity_and_content() {
-        let event = user_intent_stream_event(&astra_runtime::turn::run_control::QueuedUserIntent {
-            intent_id: "input-7".into(),
-            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-            status: astra_turn_types::UserIntentStatus::AcceptedLocal,
-            event_index: 7,
-            input: json!({"content": "先停啊！"}),
-        })
-        .expect("user intent feedback should be emitted");
-        assert!(matches!(
-            event,
-            crate::cli::chat_stream::StreamEvent::UserIntentApplied {
-                intent_id,
-                event_index: 7,
-                content,
-                ..
-            } if intent_id == "input-7" && content == "先停啊！"
-        ));
-    }
-
-    #[test]
-    fn remote_applied_guidance_enters_local_conversation_commit_state_once() {
-        let mut state = astra_runtime::turn::agentic_loop::host::UserIntentState::default();
-        let intent = astra_turn_core::chat_turn_sse_dispatch::StreamAppliedUserIntent {
-            intent_id: "remote-guidance".into(),
-            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
-            event_index: 17,
-            content: "wait".into(),
-        };
-
-        record_remote_applied_user_intents(&mut state, std::slice::from_ref(&intent));
-        record_remote_applied_user_intents(&mut state, std::slice::from_ref(&intent));
-
-        assert_eq!(state.applied_user_intents().len(), 1);
-        assert_eq!(state.applied_user_intents()[0].content, "wait");
-    }
-
-    #[test]
     fn derive_turn_interaction_mode_forces_noninteractive_without_tty_or_native_prompt_sink() {
         assert_eq!(
             derive_turn_interaction_mode(PermissionMode::Prompt, false, false, false, false, false),
@@ -3031,38 +2697,4 @@ mod tests {
     // restrictions are *turn-scoped* — added when the turn opens
     // with plan-mode active, removed unconditionally when the turn
     // ends. Same shape as `interaction_scoped_tool_restrictions`.
-
-    fn schema(name: &str) -> serde_json::Value {
-        serde_json::json!({"type": "function", "function": {"name": name}})
-    }
-
-    #[test]
-    fn request_allowlist_restriction_names_hides_non_request_tools() {
-        let schemas = vec![
-            schema("git"),
-            schema("read_file"),
-            schema("str_replace"),
-            schema("write_file"),
-        ];
-        let request_allowed = HashSet::from(["git".to_string(), "read_file".to_string()]);
-
-        let restricted = request_allowlist_restriction_names(&schemas, Some(&request_allowed));
-
-        assert!(!restricted.contains("git"));
-        assert!(!restricted.contains("read_file"));
-        assert!(restricted.contains("str_replace"));
-        assert!(restricted.contains("write_file"));
-    }
-
-    #[test]
-    fn request_allowlist_restriction_names_normalizes_names() {
-        let schemas = vec![schema("git"), schema("read_file"), schema("str_replace")];
-        let request_allowed = HashSet::from([" Git ".to_string(), "READ_FILE".to_string()]);
-
-        let restricted = request_allowlist_restriction_names(&schemas, Some(&request_allowed));
-
-        assert!(!restricted.contains("git"));
-        assert!(!restricted.contains("read_file"));
-        assert!(restricted.contains("str_replace"));
-    }
 }

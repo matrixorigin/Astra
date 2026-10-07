@@ -306,28 +306,6 @@ mod tests {
     }
 
     #[test]
-    fn budget_does_not_allocate_emergent_zero_budget_sections() {
-        let budget = TokenBudget::allocate(100_000, CompactionTier::Normal, &HashMap::new());
-
-        for kind in [
-            SectionKind::EmergentSkills,
-            SectionKind::EmergentMemory,
-            SectionKind::EmergentSummary,
-        ] {
-            assert_eq!(
-                budget.budget_for(kind),
-                0,
-                "{kind:?} is emitted by the planner with estimated_tokens=0, so it must not consume remainder budget"
-            );
-        }
-        assert_eq!(
-            budget.total_allocated(),
-            budget.effective_limit,
-            "usable planned sections should receive the full effective limit"
-        );
-    }
-
-    #[test]
     fn higher_tier_gets_tighter_memory_budget() {
         let history = HashMap::new();
         let normal = TokenBudget::allocate(100_000, CompactionTier::Normal, &history);

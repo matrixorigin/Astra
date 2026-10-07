@@ -318,7 +318,13 @@ pub(crate) async fn handle_grep_command(arg: &str) -> Result<(), String> {
     let (title, result) = match request {
         GrepRequest::Content(pattern) => (
             format!("Workspace grep · {pattern}"),
-            executor.grep(&serde_json::json!({"pattern": pattern, "path": "."})),
+            executor
+                .execute_with_metadata(
+                    "grep",
+                    &serde_json::json!({"pattern": pattern, "path": "."}),
+                )
+                .await
+                .output,
         ),
         GrepRequest::Files(pattern) => (
             format!("Workspace glob · {pattern}"),
@@ -425,8 +431,7 @@ pub(crate) async fn handle_review_command(
         ask_user_request_tx: None,
         plan_review_request_tx: None,
         mcp_manager: Some(state.mcp_manager.clone()),
-        skill_quality_tracker: &mut state.skill_quality_tracker,
-        discovered_skills: None,
+
         agent_spawner: state.agent_spawner.clone(),
         root_agent_id: Some("main"),
         observability_hub: state.observability_hub.clone(),
@@ -450,8 +455,7 @@ pub(crate) async fn handle_review_command(
         append_system_prompt: None,
         #[cfg(feature = "harness")]
         harness_sink: Some(state.harness_sink.clone()),
-        #[cfg(feature = "harness")]
-        harness_trace: Some(state.harness_trace.clone()),
+
         #[cfg(feature = "harness")]
         benchmark_profile: None,
     })

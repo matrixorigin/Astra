@@ -31,12 +31,6 @@ impl IntrospectReport {
                 .unwrap()
                 .push(json!("semantic_judgments"));
         }
-        if self.tool_result_judgments.is_some() {
-            projected["projection_budget"]["omitted_fields"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!("tool_result_judgments"));
-        }
         if self.judgment_usage.is_some() {
             projected["projection_budget"]["omitted_fields"]
                 .as_array_mut()
@@ -167,14 +161,6 @@ impl IntrospectReport {
                 &mut projected,
                 "semantic_judgments",
                 json!(semantics),
-                max_chars,
-            );
-        }
-        if let Some(judgments) = &self.tool_result_judgments {
-            self.fit_field(
-                &mut projected,
-                "tool_result_judgments",
-                json!(judgments),
                 max_chars,
             );
         }

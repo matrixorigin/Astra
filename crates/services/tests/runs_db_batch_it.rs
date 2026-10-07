@@ -62,7 +62,7 @@ fn durable_run_record(run_id: String, user_id: String, session_id: String) -> Du
         checkpoint_json: None,
         error_code: None,
         error_message: None,
-        retry_count: 0,
+
         total_prompt_tokens: 0,
         total_completion_tokens: 0,
         total_tool_calls: 0,

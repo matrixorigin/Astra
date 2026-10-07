@@ -177,6 +177,7 @@ fn append_tree(
                 .unwrap_or_default();
             let attempt = node
                 .attempt_index
+                .filter(|_| node.kind != ExplainAnalyzeNodeKindV1::Admission)
                 .filter(|attempt| verbose || *attempt > 0)
                 .map(|attempt| format!(" · attempt {}", u64::from(attempt).saturating_add(1)))
                 .unwrap_or_default();
@@ -443,9 +444,6 @@ fn source_label(kind: astra_turn_types::ExplainAnalyzeContextSourceKindV1) -> &'
         Skills => "Skills",
         RuntimeIdentity => "Runtime identity",
         RuntimeVolatile => "Runtime state",
-        EmergentSkills => "Emergent skills",
-        EmergentMemory => "Emergent memory",
-        EmergentSummary => "Emergent summary",
     }
 }
 
@@ -517,6 +515,56 @@ mod tests {
         start.duration_ms = Some(duration);
         start.outcome = Some(ExplainAnalyzeOutcomeV1::Succeeded);
         start
+    }
+
+    #[test]
+    fn admission_purpose_slot_is_not_displayed_as_a_provider_retry() {
+        let turn = fact(
+            "turn-start",
+            "turn",
+            None,
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeTransitionV1::Started,
+            0,
+            None,
+            None,
+        );
+        let mut observer = fact(
+            "observe-start",
+            "observe",
+            Some("turn"),
+            ExplainAnalyzeNodeKindV1::Admission,
+            ExplainAnalyzeTransitionV1::Started,
+            1,
+            None,
+            None,
+        );
+        observer.attempt_index = Some(1);
+        let mut retry = fact(
+            "retry-start",
+            "retry",
+            Some("turn"),
+            ExplainAnalyzeNodeKindV1::ProviderAttempt,
+            ExplainAnalyzeTransitionV1::Started,
+            3,
+            None,
+            None,
+        );
+        retry.attempt_index = Some(1);
+        let events = vec![
+            turn.clone(),
+            observer.clone(),
+            finished(observer, 2),
+            retry.clone(),
+            finished(retry, 3),
+            finished(turn, 8),
+        ];
+        let report = render(&events, true, false);
+        assert_eq!(
+            report.matches("attempt 2").count(),
+            1,
+            "only the physical provider retry has an attempt label"
+        );
     }
 
     #[test]

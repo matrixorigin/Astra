@@ -99,7 +99,7 @@ warnings.
 
 ## Wire-format types are `#[non_exhaustive]`
 
-`CaseRunReport`, `RunOutcome`, `JudgerScore`, `DigestArtifact`,
+`CaseRunReport`, `RunOutcome`, `JudgerResult`, `DigestArtifact`,
 `SessionCapture` all serialize to JSON as part of `--format json`
 output. They're marked `#[non_exhaustive]` so fields can be added
 without a SemVer break. Consequences:

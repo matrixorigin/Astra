@@ -2308,7 +2308,7 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
             checkpoint_json: None,
             error_code: None,
             error_message: None,
-            retry_count: 0,
+
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,

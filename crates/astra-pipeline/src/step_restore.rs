@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use crate::step_checkpoint::{FileBackedEventStore, read_latest_heavy_checkpoint};
 use crate::step_protocol::{
-    HeavyCheckpoint, PROTOCOL_VERSION, SlotState, StepEvent, StepEventType, check_protocol_version,
+    HeavyCheckpoint, PROTOCOL_VERSION, StepEventType, check_protocol_version,
     persisted_cache_key_is_context_bound,
 };
 
@@ -386,21 +386,6 @@ fn recover_completed_tool_audit_from_events_with_bounds(
     (completed_results, cache_restore_report)
 }
 
-/// Determine which execution slots are already complete and can be skipped.
-///
-/// Returns a set of slot indices that were Completed in the checkpoint cursor.
-pub fn completed_slots(heavy: &HeavyCheckpoint) -> Vec<usize> {
-    heavy
-        .light
-        .cursor
-        .slots
-        .iter()
-        .enumerate()
-        .filter(|(_, slot)| slot.state == SlotState::Completed)
-        .map(|(i, _)| i)
-        .collect()
-}
-
 /// Build a summary of what was recovered (for logging/explain mode).
 pub fn restore_summary(restored: &RestoredSession) -> String {
     let tool_count: usize = restored
@@ -435,76 +420,10 @@ pub fn restore_summary(restored: &RestoredSession) -> String {
     s
 }
 
-/// Validate and convert raw event payloads into structured tool completion records.
-/// Used for post-mortem analysis and debugging.
-pub fn extract_tool_timeline(events: &[StepEvent]) -> Vec<ToolTimelineEntry> {
-    let mut timeline = Vec::new();
-    let mut pending_starts: HashMap<String, u64> = HashMap::new();
-
-    for event in events {
-        match event.event_type {
-            StepEventType::ToolCallStarted => {
-                if let Some(payload) = &event.payload {
-                    let tool_name = payload
-                        .get("tool_name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if !tool_name.is_empty() {
-                        pending_starts.insert(tool_name, event.created_at);
-                    }
-                }
-            }
-            StepEventType::ToolCallCompleted | StepEventType::ToolCallFailed => {
-                if let Some(payload) = &event.payload {
-                    let tool_name = payload
-                        .get("tool_name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let is_error = event.event_type == StepEventType::ToolCallFailed
-                        || payload
-                            .get("is_error")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                    let started_at = pending_starts.remove(&tool_name).unwrap_or(0);
-                    let duration_ms = if started_at > 0 {
-                        event.created_at.saturating_sub(started_at)
-                    } else {
-                        0
-                    };
-
-                    timeline.push(ToolTimelineEntry {
-                        tool_name,
-                        started_at,
-                        completed_at: event.created_at,
-                        duration_ms,
-                        is_error,
-                        step_id: event.step_id.clone(),
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    timeline
-}
-
-/// A single entry in the tool execution timeline.
-#[derive(Debug, Clone)]
-pub struct ToolTimelineEntry {
-    pub tool_name: String,
-    pub started_at: u64,
-    pub completed_at: u64,
-    pub duration_ms: u64,
-    pub is_error: bool,
-    pub step_id: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::step_protocol::StepEvent;
     use crate::step_protocol::{
         ExecutionCursor, IdempotencyKey, LightCheckpoint, StepEventStore, epoch_ms,
     };
@@ -654,26 +573,6 @@ mod tests {
         heavy.light.step_id = "no-turn-info".to_string();
         // "info" isn't a number, so it should default to 0
         assert_eq!(extract_resume_turn(&heavy), 0);
-    }
-
-    // ── Completed slots ──
-
-    #[test]
-    fn completed_slots_empty_cursor() {
-        let heavy = make_heavy_checkpoint(3, vec![], vec![]);
-        assert!(completed_slots(&heavy).is_empty());
-    }
-
-    #[test]
-    fn completed_slots_with_mixed_states() {
-        let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
-        heavy.light.cursor = ExecutionCursor::for_act(3);
-        heavy.light.cursor.slots[0].state = SlotState::Completed;
-        heavy.light.cursor.slots[1].state = SlotState::Failed;
-        heavy.light.cursor.slots[2].state = SlotState::Completed;
-
-        let done = completed_slots(&heavy);
-        assert_eq!(done, vec![0, 2]);
     }
 
     // ── Restore summary ──
@@ -848,147 +747,6 @@ mod tests {
             crate::step_checkpoint::session_dir_for(TEST_USER_ID, &session_id)
                 .expect("valid session id for test cleanup"),
         );
-    }
-
-    // ── Tool timeline extraction ──
-
-    #[test]
-    fn extract_timeline_from_start_complete_pairs() {
-        let events = vec![
-            StepEvent {
-                event_id: "e1".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallStarted,
-                agent_id: None,
-                caused_by: vec![],
-                payload: Some(serde_json::json!({"tool_name": "read_file"})),
-                created_at: 1000,
-            },
-            StepEvent {
-                event_id: "e2".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallCompleted,
-                agent_id: None,
-                caused_by: vec!["e1".to_string()],
-                payload: Some(serde_json::json!({
-                    "tool_name": "read_file",
-                    "output": "file contents"
-                })),
-                created_at: 1050,
-            },
-        ];
-
-        let timeline = extract_tool_timeline(&events);
-        assert_eq!(timeline.len(), 1);
-        assert_eq!(timeline[0].tool_name, "read_file");
-        assert_eq!(timeline[0].duration_ms, 50);
-        assert!(!timeline[0].is_error);
-    }
-
-    #[test]
-    fn extract_timeline_handles_failures() {
-        let events = vec![
-            StepEvent {
-                event_id: "e1".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallStarted,
-                agent_id: None,
-                caused_by: vec![],
-                payload: Some(serde_json::json!({"tool_name": "bash"})),
-                created_at: 2000,
-            },
-            StepEvent {
-                event_id: "e2".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallFailed,
-                agent_id: None,
-                caused_by: vec!["e1".to_string()],
-                payload: Some(serde_json::json!({
-                    "tool_name": "bash",
-                    "output": "command not found"
-                })),
-                created_at: 2100,
-            },
-        ];
-
-        let timeline = extract_tool_timeline(&events);
-        assert_eq!(timeline.len(), 1);
-        assert_eq!(timeline[0].tool_name, "bash");
-        assert_eq!(timeline[0].duration_ms, 100);
-        assert!(timeline[0].is_error);
-    }
-
-    #[test]
-    fn extract_timeline_interleaved_tools() {
-        let events = vec![
-            StepEvent {
-                event_id: "e1".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallStarted,
-                agent_id: None,
-                caused_by: vec![],
-                payload: Some(serde_json::json!({"tool_name": "read_file"})),
-                created_at: 1000,
-            },
-            StepEvent {
-                event_id: "e2".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallStarted,
-                agent_id: None,
-                caused_by: vec![],
-                payload: Some(serde_json::json!({"tool_name": "grep"})),
-                created_at: 1010,
-            },
-            StepEvent {
-                event_id: "e3".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallCompleted,
-                agent_id: None,
-                caused_by: vec!["e2".to_string()],
-                payload: Some(serde_json::json!({
-                    "tool_name": "grep",
-                    "output": "match found"
-                })),
-                created_at: 1030,
-            },
-            StepEvent {
-                event_id: "e4".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallCompleted,
-                agent_id: None,
-                caused_by: vec!["e1".to_string()],
-                payload: Some(serde_json::json!({
-                    "tool_name": "read_file",
-                    "output": "file data"
-                })),
-                created_at: 1050,
-            },
-        ];
-
-        let timeline = extract_tool_timeline(&events);
-        assert_eq!(timeline.len(), 2);
-        // grep completes first
-        assert_eq!(timeline[0].tool_name, "grep");
-        assert_eq!(timeline[0].duration_ms, 20);
-        // read_file completes second
-        assert_eq!(timeline[1].tool_name, "read_file");
-        assert_eq!(timeline[1].duration_ms, 50);
     }
 
     // ── RestoreError display ──

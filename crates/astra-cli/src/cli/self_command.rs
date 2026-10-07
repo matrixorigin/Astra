@@ -621,7 +621,6 @@ async fn build_reflect_response(
         model_requests: astra_services::reflect::ModelRequestCapture::default(),
         judgment_usage: None,
         semantic_judgments: None,
-        tool_result_judgments: None,
         view: Some(view),
         summary,
         observations,
@@ -3156,6 +3155,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn malformed_local_observation_is_reported_as_partial_coverage() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
@@ -3621,6 +3621,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn snapshot_surfaces_session_journal_io_error() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());

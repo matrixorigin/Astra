@@ -3404,15 +3404,15 @@ impl DurableInferenceLedger {
                 Some(flag) => LlmCancel::FlagAndToken(flag, &owner_cancel),
                 None => LlmCancel::Token(&owner_cancel),
             };
-            let result =
-                crate::turn::llm::client::call_llm_and_collect_with_stream_callback_and_no_tool_choice(
-                    call,
-                    cancel,
-                    None,
-                    Some(attempt_observer.as_ref()),
-                )
-                .await
-            ;
+            let result = crate::turn::llm::client::call_llm_and_collect_with_stream_callback(
+                call,
+                cancel,
+                None,
+                Some(attempt_observer.as_ref()),
+                crate::turn::llm::client::RuntimeToolChoice::None,
+                None,
+            )
+            .await;
             match result {
                 Ok(result) => {
                     settlement
@@ -3420,7 +3420,9 @@ impl DurableInferenceLedger {
                             &result,
                         )))
                         .await
-                        .map_err(|error| super::client::attach_llm_result_details(error, &result))?;
+                        .map_err(|error| {
+                            super::client::attach_llm_result_details(error, &result)
+                        })?;
                     Ok(result)
                 }
                 Err(error) => {
@@ -5053,7 +5055,6 @@ mod tests {
             },
             max_output_tokens: Some(64),
             temperature: None,
-            has_fallback: false,
             thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
         }
     }

@@ -63,7 +63,7 @@ async fn batch_tradeoff_probe() {
                     "created_at":"2025-01-15T10:30:00Z", "parent_event_ids":[]
                 }))
                 .unwrap();
-                sender.enqueue_async(event).await;
+                sender.enqueue(event);
             }
             let mut first_visible = None;
             tokio::time::timeout(Duration::from_secs(20), async {

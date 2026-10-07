@@ -96,50 +96,6 @@ pub fn detect_workspace_context(project_root: &Path) -> Value {
     })
 }
 
-/// Detect project languages/frameworks from workspace marker files.
-/// Returns tags like `"rust"`, `"typescript"`, `"python"`, etc.
-pub fn detect_project_languages(root: &Path) -> Vec<String> {
-    let markers: &[(&str, &str)] = &[
-        ("Cargo.toml", "rust"),
-        ("package.json", "javascript"),
-        ("tsconfig.json", "typescript"),
-        ("pyproject.toml", "python"),
-        ("setup.py", "python"),
-        ("requirements.txt", "python"),
-        ("go.mod", "go"),
-        ("pom.xml", "java"),
-        ("build.gradle", "java"),
-        ("build.gradle.kts", "kotlin"),
-        ("Gemfile", "ruby"),
-        ("mix.exs", "elixir"),
-        ("CMakeLists.txt", "cpp"),
-        ("Makefile", "make"),
-        (".csproj", "csharp"),
-        ("composer.json", "php"),
-        ("Dockerfile", "docker"),
-    ];
-    let mut langs = Vec::new();
-    for &(file, lang) in markers {
-        if root.join(file).exists() {
-            langs.push(lang.to_string());
-        }
-    }
-    if langs.iter().all(|l| l != "csharp")
-        && let Ok(entries) = std::fs::read_dir(root)
-    {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str()
-                && (name.ends_with(".csproj") || name.ends_with(".sln"))
-            {
-                langs.push("csharp".to_string());
-                break;
-            }
-        }
-    }
-    langs.dedup();
-    langs
-}
-
 /// Keep only a small sample of changed paths in the volatile Git tail.
 const MAX_GIT_CHANGED_FILES: usize = 5;
 
@@ -621,39 +577,6 @@ mod tests {
         assert_eq!(prev.chars().count(), 80);
         let expected = format!("{}{}", "a".repeat(30), "在".repeat(49));
         assert_eq!(prev.strip_suffix('…'), Some(expected.as_str()));
-    }
-
-    #[test]
-    fn detect_project_languages_finds_cargo_toml() {
-        let tmp = tempdir().unwrap();
-        std::fs::write(tmp.path().join("Cargo.toml"), "[package]").unwrap();
-        let langs = detect_project_languages(tmp.path());
-        assert!(langs.contains(&"rust".to_string()));
-    }
-
-    #[test]
-    fn detect_project_languages_finds_multiple() {
-        let tmp = tempdir().unwrap();
-        std::fs::write(tmp.path().join("package.json"), "{}").unwrap();
-        std::fs::write(tmp.path().join("Dockerfile"), "FROM rust").unwrap();
-        let langs = detect_project_languages(tmp.path());
-        assert!(langs.contains(&"javascript".to_string()));
-        assert!(langs.contains(&"docker".to_string()));
-    }
-
-    #[test]
-    fn detect_project_languages_empty_for_unknown() {
-        let tmp = tempdir().unwrap();
-        let langs = detect_project_languages(tmp.path());
-        assert!(langs.is_empty());
-    }
-
-    #[test]
-    fn detect_project_languages_typescript_from_tsconfig() {
-        let tmp = tempdir().unwrap();
-        std::fs::write(tmp.path().join("tsconfig.json"), "{}").unwrap();
-        let langs = detect_project_languages(tmp.path());
-        assert!(langs.contains(&"typescript".to_string()));
     }
 
     #[test]

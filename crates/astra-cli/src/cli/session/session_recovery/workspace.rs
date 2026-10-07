@@ -8,7 +8,6 @@ pub(crate) fn sync_session_state_to_workspace(
 ) {
     ws.last_persistence_error = state.session_persistence_error.clone();
     ws.permission_mode = Some(state.perm_manager.mode().to_string());
-    ws.discovered_skills = state.discovered_skills.iter().cloned().collect();
 }
 
 pub(crate) fn context_trace_signal_from_trace(

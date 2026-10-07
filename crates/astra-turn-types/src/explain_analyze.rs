@@ -164,9 +164,6 @@ pub enum ExplainAnalyzeContextSourceKindV1 {
     Skills,
     RuntimeIdentity,
     RuntimeVolatile,
-    EmergentSkills,
-    EmergentMemory,
-    EmergentSummary,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

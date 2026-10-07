@@ -314,60 +314,6 @@ fn sandbox_expand_dir_from_path_args(args: &Value) -> Option<PathBuf> {
 const SANDBOX_PATH_ARG_KEYS: &[&str] = &["path", "file_path", "file", "notebook_path"];
 const SANDBOX_DIR_ARG_KEYS: &[&str] = &["cwd", "workdir", "working_dir"];
 
-/// Extract the first absolute-path token from a bash command.
-///
-/// Scans whitespace-separated tokens for one starting with `/` (Unix
-/// absolute path) or containing `:\` (Windows absolute path). Strips
-/// surrounding quote characters. Returns `None` if no token matches.
-///
-/// This is the narrow version used by sandbox retry; it intentionally
-/// does not attempt full shell parsing. Callers tolerate `None` by
-/// skipping sandbox expansion — the user sees the original denial and
-/// can re-submit with an explicit path argument.
-#[must_use]
-pub fn extract_first_absolute_path(command: &str) -> Option<String> {
-    // Strip one level of paired quotes that surround the whole command
-    // fragment we scan. We can't do full shell parsing here, but we do
-    // need to recognize the common shape `cat "/etc/hosts"` so the
-    // returned token is the path, not `/etc/hosts`.
-    //
-    // Strategy: split by unquoted whitespace first by doing a minimal
-    // quote-aware tokenize, then look for a token that starts with `/`
-    // or matches the Windows drive-letter pattern `X:\`.
-    let tokens = quote_aware_tokens(command);
-    for raw in tokens {
-        // Strip trailing shell punctuation (`;`, `&`, `)`) — a path
-        // token followed by `;` or `&` is still a concrete absolute
-        // path to the sandbox; we must not hand back the punctuation.
-        let token = trim_shell_path_token(&raw);
-        if token.is_empty() {
-            continue;
-        }
-        if token.starts_with('/') {
-            // Reject UNC-like `//server/share` — those are not Unix
-            // absolute paths and widening to `/` would be catastrophic.
-            if token.starts_with("//") {
-                continue;
-            }
-            // Reject unexpanded variable references like `$HOME/…` —
-            // `$` never appears in a real absolute path; if the shell
-            // didn't expand it, we can't validate the target.
-            if token.contains('$') {
-                continue;
-            }
-            return Some(token.to_string());
-        }
-        // Windows absolute path: `C:\...`. Avoids indexing past the end
-        // for short tokens (pre-fix bug: `&token[1..3]` panicked on any
-        // 2-char or shorter token).
-        let bytes = token.as_bytes();
-        if bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
-            return Some(token.to_string());
-        }
-    }
-    None
-}
-
 fn extract_first_sandbox_expand_path(command: &str) -> Option<String> {
     let tokens = quote_aware_tokens(command);
     for raw in tokens {
@@ -714,12 +660,11 @@ mod tests {
 
     use super::{
         SANDBOX_DENIED_ERROR_KIND, SANDBOX_DENIED_PREFIX, explicit_file_tool_path_arg,
-        explicit_file_tool_path_targets, extract_first_absolute_path,
-        glob_preflight_base_from_absolute_pattern, is_sandbox_denied, is_sandbox_denied_result,
-        sandbox_denied_message, sandbox_denied_message_from_result,
-        sandbox_denied_tool_result_fields, sandbox_expand_dir_from_args,
-        sandbox_expand_dir_from_denial, sandbox_expand_dir_from_denial_or_workspace,
-        sandbox_retry_no_expand_dir_output,
+        explicit_file_tool_path_targets, glob_preflight_base_from_absolute_pattern,
+        is_sandbox_denied, is_sandbox_denied_result, sandbox_denied_message,
+        sandbox_denied_message_from_result, sandbox_denied_tool_result_fields,
+        sandbox_expand_dir_from_args, sandbox_expand_dir_from_denial,
+        sandbox_expand_dir_from_denial_or_workspace, sandbox_retry_no_expand_dir_output,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -946,6 +891,24 @@ mod tests {
     }
 
     #[test]
+    fn expand_dir_command_path_boundaries() {
+        for (command, expected) in [
+            ("grep -n foo /tmp/a /var/b", Some("/tmp")),
+            ("cat '/tmp/hosts'", Some("/tmp")),
+            ("cat src/main.rs /tmp/hosts;", Some("/tmp")),
+            ("cat //server/share", None),
+            ("cat /tmp/$UNEXPANDED/file", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                sandbox_expand_dir_from_args(&json!({"command": command})),
+                expected.map(PathBuf::from),
+                "command: {command}"
+            );
+        }
+    }
+
+    #[test]
     fn expand_dir_none_for_relative_only() {
         // Relative paths don't escape the project root; nothing to expand.
         let args = json!({"path": "src/main.rs"});
@@ -1070,85 +1033,6 @@ mod tests {
             None,
             "sandbox retry must fail closed if a denial names a sensitive path"
         );
-    }
-
-    // ── extract_first_absolute_path ──────────────────────────────────────
-
-    #[test]
-    fn extract_path_first_absolute_wins() {
-        assert_eq!(
-            extract_first_absolute_path("grep -n foo /tmp/a /tmp/b"),
-            Some("/tmp/a".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_path_skips_relative_tokens() {
-        assert_eq!(
-            extract_first_absolute_path("cat src/main.rs /etc/hosts"),
-            Some("/etc/hosts".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_path_none_when_all_relative() {
-        assert_eq!(
-            extract_first_absolute_path("cd project && cargo build"),
-            None
-        );
-    }
-
-    #[test]
-    fn extract_path_strips_surrounding_quotes() {
-        assert_eq!(
-            extract_first_absolute_path(r#"cat "/path with spaces/file""#),
-            Some("/path with spaces/file".to_string())
-        );
-        // Trailing quote shouldn't leak into the returned string.
-        assert!(
-            !extract_first_absolute_path("echo '/a/b'")
-                .unwrap()
-                .contains('\'')
-        );
-    }
-
-    #[test]
-    fn extract_path_handles_shell_escaped_spaces() {
-        assert_eq!(
-            extract_first_absolute_path(r#"cat /path\ with\ spaces/file"#),
-            Some("/path with spaces/file".to_string())
-        );
-    }
-
-    // Ported from the legacy `stream_render::extract_first_absolute_path`
-    // (now deleted) so the behaviour the sandbox retry depends on is
-    // pinned in one place.
-
-    #[test]
-    fn extract_path_strips_trailing_semicolon() {
-        assert_eq!(
-            extract_first_absolute_path("cat /etc/passwd;"),
-            Some("/etc/passwd".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_path_rejects_unexpanded_variable() {
-        // `$HOME/.bashrc` shouldn't be widened to `$HOME/` — the shell
-        // never expanded the var, so we can't locate the real parent.
-        assert_eq!(extract_first_absolute_path("cat $HOME/.bashrc"), None);
-    }
-
-    #[test]
-    fn extract_path_rejects_unc_path() {
-        // `//server/share` is a UNC-style path; widening to `/` via
-        // parent() would be a sandbox-escape hazard.
-        assert_eq!(extract_first_absolute_path("cat //server/share"), None);
-    }
-
-    #[test]
-    fn extract_path_empty_command() {
-        assert_eq!(extract_first_absolute_path(""), None);
     }
 
     // ── SANDBOX_DENIED prefix helpers ───────────────────────────────────

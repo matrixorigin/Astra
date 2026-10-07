@@ -241,8 +241,8 @@ impl ProviderCanonicalTransitionV2 {
         }
         // The first entry is a self-contained recovery anchor. This convenience
         // constructor models an immediately adjacent successor; callers with
-        // provider/tool messages between admissions use
-        // `new_linked_from_durable_base` to persist that incremental gap.
+        // provider/tool messages between admissions pass their incremental gap
+        // to `new_linked_from_deltas`.
         let (parent_result, recovery_messages) = if parent_transition_id.is_none() {
             (None, predecessor_messages[durable_base_count..].to_vec())
         } else {
@@ -263,47 +263,6 @@ impl ProviderCanonicalTransitionV2 {
                 recovery_messages,
             },
             predecessor_messages,
-            appended_messages,
-        )
-    }
-
-    /// Construct a linked entry whose predecessor contains messages produced
-    /// after the parent provider admission. Only that gap and this entry's own
-    /// append become durable payload.
-    pub fn new_linked_from_durable_base(
-        parent_transition_id: String,
-        parent_result: ProviderCanonicalHistoryIdentityV2,
-        durable_base: ProviderCanonicalWalBaseV2,
-        predecessor_messages: &[Value],
-        appended_messages: Vec<Value>,
-    ) -> Result<Self, ProviderCanonicalTransitionError> {
-        validate_appended_messages(&appended_messages)?;
-        let durable_base_count = usize::try_from(durable_base.canonical.message_count)
-            .map_err(|_| ProviderCanonicalTransitionError::MessageCountOverflow)?;
-        let parent_count = usize::try_from(parent_result.message_count)
-            .map_err(|_| ProviderCanonicalTransitionError::MessageCountOverflow)?;
-        if predecessor_messages.len() < durable_base_count
-            || CanonicalPrefixIdentityV1::from_messages(
-                &predecessor_messages[..durable_base_count],
-            )? != durable_base.canonical
-            || ProviderCanonicalHistoryIdentityV2::from_messages(
-                &predecessor_messages[..durable_base_count],
-            )? != durable_base.history
-        {
-            return Err(ProviderCanonicalTransitionError::DurableBaseNotPrefix);
-        }
-        if predecessor_messages.len() < parent_count
-            || ProviderCanonicalHistoryIdentityV2::from_messages(
-                &predecessor_messages[..parent_count],
-            )? != parent_result
-        {
-            return Err(ProviderCanonicalTransitionError::MissingLinkedPredecessor);
-        }
-        Self::new_linked_from_deltas(
-            parent_transition_id,
-            parent_result,
-            durable_base,
-            predecessor_messages[parent_count..].to_vec(),
             appended_messages,
         )
     }
@@ -583,40 +542,6 @@ impl ProviderCanonicalTransitionV2 {
             return Err(ProviderCanonicalTransitionError::TooManyDurableBytes);
         }
         Ok(())
-    }
-
-    pub fn reconstruct_predecessor_from_durable_base(
-        &self,
-        durable_base_messages: &[Value],
-    ) -> Result<Vec<Value>, ProviderCanonicalTransitionError> {
-        self.validate()?;
-        if CanonicalPrefixIdentityV1::from_messages(durable_base_messages)?
-            != self.durable_base.canonical
-            || ProviderCanonicalHistoryIdentityV2::from_messages(durable_base_messages)?
-                != self.durable_base.history
-        {
-            return Err(ProviderCanonicalTransitionError::PrefixConflict);
-        }
-        let predecessor = match self.recovery_mode {
-            ProviderCanonicalRecoveryModeV2::AppendFromDurableBase => {
-                if self.parent_transition_id.is_some() {
-                    return Err(ProviderCanonicalTransitionError::MissingLinkedPredecessor);
-                }
-                let mut messages = durable_base_messages.to_vec();
-                messages.extend(self.recovery_messages.iter().cloned());
-                messages
-            }
-            ProviderCanonicalRecoveryModeV2::CheckpointFromParent => {
-                return Err(ProviderCanonicalTransitionError::MissingLinkedPredecessor);
-            }
-            ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase => {
-                self.recovery_messages.clone()
-            }
-        };
-        if ProviderCanonicalHistoryIdentityV2::from_messages(&predecessor)? != self.predecessor {
-            return Err(ProviderCanonicalTransitionError::RecoveryRootMismatch);
-        }
-        Ok(predecessor)
     }
 
     /// Apply to a WAL-owned history prefix. Callers must detach any fresh
@@ -1068,11 +993,11 @@ mod tests {
         let provider_response = json!({"role": "assistant", "content": "provider response"});
         let mut next_predecessor = after_parent_admission.clone();
         next_predecessor.push(provider_response.clone());
-        let second = ProviderCanonicalTransitionV2::new_linked_from_durable_base(
+        let second = ProviderCanonicalTransitionV2::new_linked_from_deltas(
             first.transition_id.clone(),
             first.result.clone(),
             durable_base,
-            &next_predecessor,
+            vec![provider_response.clone()],
             vec![authority("second")],
         )
         .unwrap();
@@ -1103,11 +1028,11 @@ mod tests {
         parent_result_messages.extend(first.appended_messages.iter().cloned());
         let mut predecessor = parent_result_messages.clone();
         predecessor.push(json!({"role": "assistant", "content": "provider response"}));
-        let mut second = ProviderCanonicalTransitionV2::new_linked_from_durable_base(
+        let mut second = ProviderCanonicalTransitionV2::new_linked_from_deltas(
             first.transition_id,
             first.result,
             durable_base,
-            &predecessor,
+            predecessor[parent_result_messages.len()..].to_vec(),
             vec![authority("second")],
         )
         .unwrap();

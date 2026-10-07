@@ -481,6 +481,8 @@ pub(crate) fn build_work_admission_prompt(ctx: &TurnIntentJudgeContext) -> Strin
         recent_tools: Vec<&'a str>,
         user_message: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
+        latest_user_message: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         immediate_previous_exchange: Option<PreviousExchange>,
         #[serde(skip_serializing_if = "Option::is_none")]
         loaded_workflow_execution_topology: Option<WorkExecutionTopology>,
@@ -508,6 +510,11 @@ pub(crate) fn build_work_admission_prompt(ctx: &TurnIntentJudgeContext) -> Strin
         has_prior_assistant_turn: ctx.has_prior_assistant_turn,
         recent_tools,
         user_message: &ctx.message,
+        latest_user_message: ctx
+            .source
+            .as_ref()
+            .map(|source| source.message_text.as_str())
+            .filter(|latest| *latest != ctx.message),
         immediate_previous_exchange: previous_exchange,
         loaded_workflow_execution_topology: ctx.loaded_workflow_execution_topology,
         turn: ctx.turn_count,

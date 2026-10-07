@@ -120,3 +120,99 @@ async fn database_data_versioning_rejects_corrupt_required_fields() {
         .execute(&pool)
         .await;
 }
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn lineage_uses_owned_database_parents_without_local_snapshot_dependency() {
+    use astra_services::{SessionArtifactStore, session_journal::JournalDirGuard};
+    let (shared_pool, settings) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get().clone();
+    let service = DatabaseDataVersioningService::new(settings).with_pool(shared_pool);
+    let owner = Uuid::new_v4().to_string();
+    let foreign = Uuid::new_v4().to_string();
+    let session = Uuid::new_v4().to_string();
+    let chain = Uuid::new_v4().to_string();
+    let ids = (0..4)
+        .map(|_| Uuid::new_v4().to_string())
+        .collect::<Vec<_>>();
+    let directory = tempfile::tempdir().unwrap();
+    let _journal = JournalDirGuard::new(directory.path());
+    let path = astra_services::local_session_artifact_store()
+        .session_path(&session, "step_checkpoints/composite_snapshots.json")
+        .unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "not a snapshot").unwrap();
+    for (index, id) in ids.iter().enumerate() {
+        let user = if index == 3 { &foreign } else { &owner };
+        let parent = (index == 2).then_some(&ids[0]);
+        sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, payload_hash, ingestion_write_id, parent_event_id, causal_chain_id, created_at) VALUES (?, ?, ?, 'assistant_message', 'lineage fixture', ?, ?, ?, ?, '2026-01-01 00:00:00.000000')")
+            .bind(id).bind(&session).bind(user)
+            .bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id": id, "session_id": session, "user_id": user, "content": "lineage fixture"})))
+            .bind(Uuid::new_v4().to_string()).bind(parent).bind(&chain)
+            .execute(&pool).await.unwrap();
+    }
+    for (user, parent, order) in [
+        (&owner, &ids[0], 1),
+        (&owner, &ids[1], 0),
+        (&foreign, &ids[3], 0),
+    ] {
+        sqlx::query("INSERT INTO agent_event_edges (user_id, session_id, child_event_id, parent_event_id, relation_kind, parent_order) VALUES (?, ?, ?, ?, 'causal', ?)")
+            .bind(user).bind(&session).bind(&ids[2]).bind(parent).bind(order)
+            .execute(&pool).await.unwrap();
+    }
+    let nodes = service
+        .get_causal_chain(owner.clone(), ids[2].clone())
+        .await
+        .unwrap();
+    let upstream = service
+        .trace_upstream(owner.clone(), ids[2].clone())
+        .await
+        .unwrap();
+    for result in [&nodes, &upstream] {
+        assert_eq!(result.len(), 3);
+        assert!(
+            ids[..3]
+                .iter()
+                .all(|id| result.iter().any(|node| &node.event_id == id))
+        );
+        assert!(!result.iter().any(|node| node.event_id == ids[3]));
+        let child = result.iter().find(|node| node.event_id == ids[2]).unwrap();
+        assert_eq!(child.parent_event_ids, ids[..2]);
+        assert_eq!(child.parent_event_id.as_deref(), Some(ids[0].as_str()));
+        assert!(
+            serde_json::to_value(child)
+                .unwrap()
+                .get("contribution_score")
+                .is_none()
+        );
+    }
+    assert_eq!(
+        service
+            .get_causal_chain(foreign.clone(), ids[2].clone())
+            .await
+            .unwrap_err()
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert!(
+        service
+            .trace_upstream(foreign.clone(), ids[2].clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "not a snapshot");
+    for user in [&owner, &foreign] {
+        sqlx::query("DELETE FROM agent_event_edges WHERE user_id = ?")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_events WHERE user_id = ?")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}

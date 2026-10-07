@@ -20,6 +20,41 @@ not first-hop queue admission, determines which streamed tool terminals require
 settlement repair. Both paths retain generation-fenced settlement, cancellation,
 usage accounting and shutdown ownership independently of observer attachment.
 
+Semantic run usage updates require the execution's captured owner generation;
+the unfenced `update_run_usage` and `persist_usage` APIs are retired. Each token
+and tool-call count is an absolute cumulative snapshot and retains its own
+high-water mark, so duplicate or delayed updates cannot reduce known totals.
+Failed or cancelled runs may still record usage already consumed by their exact
+owner. This aggregate does not replace append-only physical provider accounting.
+The in-memory store keeps its existing action fence through projection publication
+while releasing the run-map write lock before awaiting that publication.
+
+New background and streaming requests use the same preparation owner. Exact
+stream replays attach to frozen run facts before mutable model or capability
+admission. A fresh request wins the durable session slot and activates its lease
+before provisioning a workspace. Actual workspace/executor facts are committed
+as one immutable, generation-fenced binding pair before execution or delivery;
+status/list projections leave unmaterialized bindings absent.
+
+Every preparation failure after durable admission is settled by that owner,
+including state and history reconstruction errors. Its heartbeat remains alive
+through terminal commit. Workspace cleanup requires a confirmed terminal owned
+by that generation; superseded or unconfirmed authority leaves resources to
+recovery. Local projection removal checks the execution token, and failed stream
+preparation closes its own bridges. A local publication conflict after durable
+admission is an activation failure, never a pre-admission rejection.
+
+Composite checkpoint publication writes the heavy artifact and its current
+index under the existing owner/session lock. Once that index is durable,
+unreferenced-artifact cleanup failures are reported without turning the committed
+receipt into a publication failure. Failures before durable index publication
+still fail the commit. Referenced historical artifacts remain available; this
+cleanup does not impose a history-retention limit.
+The unused `heavy_checkpoint_exists`, external-index prune wrapper, and
+`completed_slots` helpers are retired; recovery and debug use the validated
+canonical artifact readers. Debug rejects invalid preceding artifacts instead
+of presenting a fabricated delta from empty history.
+
 ## Run record
 
 A run should capture:
@@ -86,6 +121,10 @@ or evidence that same-run recovery is implemented.
 ## Lease and ownership
 
 - Only the owner may advance active execution.
+- Execution status and audit events commit through the owner-fenced transition
+  boundary. Control-plane status changes use an explicit expected-state CAS;
+  there is no unconditional status writer. Cancellation requires its existing
+  typed authority and settlement flow, never a status-only write.
 - Lease expiry enables recovery.
 - Start activation whose owner renewal no longer matches returns HTTP 409 with
   `execution_authority_not_current`. This does not prove lease expiry: owner,

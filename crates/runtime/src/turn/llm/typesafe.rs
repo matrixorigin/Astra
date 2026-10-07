@@ -2,68 +2,84 @@
 use super::client::LlmCallResult;
 use astra_core::{ClassifiedError, ErrorKind};
 use astra_turn_types::{
-    JUDGMENT_SCHEMA_VERSION, JudgmentAnswer, JudgmentRequest, JudgmentResponse,
-    judgment_request_from_messages, parse_unique_judgment_json,
+    JUDGMENT_SCHEMA_VERSION, JudgmentRequest, judgment_request_from_messages,
+    normalize_judgment_response, parse_unique_judgment_json,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 
 fn invalid(message: &'static str) -> ClassifiedError {
     ClassifiedError::new(ErrorKind::ContractViolation, message)
 }
 
-pub(super) fn request(messages: &[Value], model: &str) -> Result<Value, ClassifiedError> {
-    let judgment: JudgmentRequest =
+pub(super) struct NativeJudgmentRequest {
+    pub body: Value,
+    pub contract: JudgmentRequest,
+}
+
+pub(super) fn request(
+    messages: &[Value],
+    model: &str,
+) -> Result<NativeJudgmentRequest, ClassifiedError> {
+    let mut judgment: JudgmentRequest =
         judgment_request_from_messages(messages).map_err(|error| match error {
             astra_turn_types::JudgmentCodecError::Json(_) => {
                 invalid("Invalid typed judgment schema")
             }
             astra_turn_types::JudgmentCodecError::Invalid(reason) => invalid(reason),
         })?;
-    Ok(json!({"model": model, "state": judgment.state, "questions": judgment.questions}))
+    let mut questions =
+        serde_json::to_value(&judgment.questions).expect("validated questions serialize");
+    for question in questions
+        .as_object_mut()
+        .expect("question map")
+        .values_mut()
+    {
+        question
+            .as_object_mut()
+            .expect("typed question")
+            .remove("optional");
+    }
+    let state = std::mem::replace(&mut judgment.state, json!({}));
+    Ok(NativeJudgmentRequest {
+        body: json!({"model": model, "state": state, "questions": questions}),
+        // The response needs the closed answer contract, not another full
+        // copy of the user evidence across provider I/O.
+        contract: judgment,
+    })
 }
 
 #[derive(Deserialize)]
 struct Response {
     model: String,
-    answers: BTreeMap<String, JudgmentAnswer>,
+    answers: serde_json::Map<String, Value>,
     #[serde(default)]
     assessment: Option<Value>,
     #[serde(default)]
     usage: Option<Value>,
 }
 
-pub(super) fn response(raw: &[u8], request: &Value) -> Result<LlmCallResult, ClassifiedError> {
+pub(super) fn response(
+    raw: &[u8],
+    request: &JudgmentRequest,
+) -> Result<LlmCallResult, ClassifiedError> {
     let value = parse_unique_judgment_json(raw)
         .map_err(|_| invalid("Malformed TypeSafe judgment response"))?;
     let response: Response = serde_json::from_value(value)
         .map_err(|_| invalid("Malformed TypeSafe judgment response"))?;
-    let judgment_request = JudgmentRequest {
-        schema_version: JUDGMENT_SCHEMA_VERSION,
-        state: request
-            .get("state")
-            .cloned()
-            .ok_or_else(|| invalid("Missing TypeSafe state"))?,
-        questions: serde_json::from_value(
-            request
-                .get("questions")
-                .cloned()
-                .ok_or_else(|| invalid("Missing TypeSafe questions"))?,
-        )
-        .map_err(|_| invalid("Invalid TypeSafe questions"))?,
-    };
-    let judgment = JudgmentResponse {
-        schema_version: JUDGMENT_SCHEMA_VERSION,
-        model: response.model.clone(),
-        answers: response.answers,
-    };
-    judgment
-        .validate_for_provenance(
-            &judgment_request,
-            astra_turn_types::JudgmentResponseProvenance::ProviderProbability,
-        )
-        .map_err(invalid)?;
+    let native = json!({
+        "schema_version": JUDGMENT_SCHEMA_VERSION,
+        "model": response.model,
+        "answers": response.answers,
+    });
+    let judgment = normalize_judgment_response(
+        request,
+        &native.to_string(),
+        &response.model,
+        Some(astra_turn_types::JudgmentResponseProvenance::ProviderProbability),
+    )
+    .map_err(|_| invalid("Invalid TypeSafe judgment response"))?
+    .response;
     let mut judgment = serde_json::to_value(&judgment).expect("validated judgment serialization");
     // The caller owns optional observational validation. Preserve its payload
     // without allowing it to bypass the typed answer validation above.
@@ -111,6 +127,7 @@ mod tests {
     use super::*;
     use crate::memory_hooks::relevance::{filter_memories, select_dismissed_memory_indices};
     use crate::memory_hooks::{DirectMemoryInferenceClient, MemoryInferencePort};
+    use astra_turn_types::JudgmentResponse;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
@@ -151,7 +168,10 @@ mod tests {
         json!({"model":"jev-1.13.0", "answers":{"0":{"type":"noul","noul":0.9}}, "usage":{"input_tokens":100,"output_tokens":4}})
     }
 
-    fn decode_response(value: &Value, request: &Value) -> Result<LlmCallResult, ClassifiedError> {
+    fn decode_response(
+        value: &Value,
+        request: &JudgmentRequest,
+    ) -> Result<LlmCallResult, ClassifiedError> {
         response(&serde_json::to_vec(value).unwrap(), request)
     }
 
@@ -176,9 +196,9 @@ mod tests {
             json!({"model":"m","answers":{"0":{"type":"noul","noul":1.1}},"usage":{"input_tokens":1,"output_tokens":1}}),
             json!({"model":"m","answers":{"1":{"type":"noul","noul":0.9}},"usage":{"input_tokens":1,"output_tokens":1}}),
         ] {
-            assert!(decode_response(&v, &req).is_err());
+            assert!(decode_response(&v, &req.contract).is_err());
         }
-        let result = decode_response(&good(), &req).unwrap();
+        let result = decode_response(&good(), &req.contract).unwrap();
         let decoded: JudgmentResponse = serde_json::from_str(&result.full_text).unwrap();
         assert_eq!(decoded.answers["0"].native_noul_probability(), Some(0.9));
         assert_eq!(result.usage["input_tokens"], 100);
@@ -204,18 +224,35 @@ mod tests {
             "jev-1.13.0",
         )
         .unwrap();
+        assert!(
+            req.body["questions"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|question| question.get("optional").is_none()),
+            "local abstention policy must not change the native provider protocol"
+        );
         let answers: serde_json::Map<String, Value> = judgment
             .questions
-            .keys()
-            .map(|key| {
+            .iter()
+            .map(|(key, question)| {
                 let yes = matches!(
                     key.as_str(),
                     "mutation.read_only" | "scope.unknown" | "domain.none"
                 );
-                (
-                    key.clone(),
-                    json!({"type":"noul", "noul": if yes { 1.0 } else { 0.0 }}),
-                )
+                let answer = match question {
+                    astra_turn_types::JudgmentQuestion::Noul { .. } =>
+                        json!({"type":"noul", "noul": if yes { 1.0 } else { 0.0 }}),
+                    astra_turn_types::JudgmentQuestion::Choice { criteria, .. } => {
+                        let neutral = if criteria.contains_key("unknown") { "unknown" } else { "none" };
+                        let probabilities: serde_json::Map<String, Value> = criteria.keys()
+                            .map(|option| (option.clone(), json!(if option == neutral { 1.0 } else { 0.0 })))
+                            .collect();
+                        json!({"type":"choice", "choice":neutral, "probabilities":probabilities, "confidence":1.0})
+                    }
+                    _ => unreachable!("Work judgment uses Noul and Choice"),
+                };
+                (key.clone(), answer)
             })
             .collect();
         for (assessment, expected) in [
@@ -233,7 +270,7 @@ mod tests {
         ] {
             let mut wire =
                 json!({"model":"jev-1.13.0", "answers":answers, "assessment":assessment});
-            let result = decode_response(&wire, &req).unwrap();
+            let result = decode_response(&wire, &req.contract).unwrap();
             let classification = astra_services::parse_work_admission_classification(
                 &judgment,
                 &result.full_text,
@@ -246,8 +283,47 @@ mod tests {
                 expected
             );
 
+            for invalid in [
+                None,
+                Some(Value::Null),
+                Some(json!({"type":"discrete_choice","option":"correct"})),
+                Some(
+                    json!({"type":"choice","choice":"correct","probabilities":{"correct":0.5},"confidence":1.0}),
+                ),
+                Some(json!({"type":"noul","noul":1.0})),
+            ] {
+                let mut optional_wire = wire.clone();
+                for id in [
+                    "user.objective_relation",
+                    "user.feedback_kind",
+                    "user.feedback_target",
+                ] {
+                    match &invalid {
+                        Some(answer) => {
+                            optional_wire["answers"][id] = answer.clone();
+                        }
+                        None => {
+                            optional_wire["answers"].as_object_mut().unwrap().remove(id);
+                        }
+                    }
+                }
+                let adapted = decode_response(&optional_wire, &req.contract).unwrap();
+                let parsed = astra_services::parse_work_admission_classification(
+                    &judgment,
+                    &adapted.full_text,
+                    &adapted.model_used,
+                    adapted.judgment_provenance,
+                )
+                .unwrap();
+                assert_eq!(
+                    parsed.objective_relation,
+                    astra_turn_types::ObjectiveRelation::Unknown
+                );
+                assert!(parsed.feedback.is_none());
+                assert_eq!(parsed.into_not_required().unwrap().assessment(), expected);
+            }
             wire["answers"]["mutation.read_only"]["noul"] = json!(1.1);
-            assert!(decode_response(&wire, &req).is_err());
+            assert!(decode_response(&wire, &req.contract).is_err());
         }
     }
 
@@ -257,7 +333,7 @@ mod tests {
         let mut value = good();
         value["usage"]["cache_read_input_tokens"] = json!(7);
         value["usage"]["cache_creation_input_tokens"] = json!(3);
-        let result = decode_response(&value, &req).unwrap();
+        let result = decode_response(&value, &req.contract).unwrap();
         assert_eq!(result.usage["cached_input_tokens"], 7);
         assert_eq!(result.usage["cache_creation_tokens"], 3);
         assert_eq!(result.usage["total_tokens"], 114);
@@ -273,7 +349,7 @@ mod tests {
         let req = request(&messages(), "jev-1.13.0").unwrap();
         let raw =
             br#"{"model":"jev-1.13.0","answers":{"0":{"type":"noul","noul":0.9,"noul":0.1}}}"#;
-        let error = response(raw, &req).unwrap_err();
+        let error = response(raw, &req.contract).unwrap_err();
         assert_eq!(error.kind, ErrorKind::ContractViolation);
     }
 
@@ -285,7 +361,7 @@ mod tests {
                 json!({"type":"discrete_noul","decision":"yes"}),
             ),
             (
-                json!({"type":"choice","instructions":"Which?","criteria":{"a":"A"}}),
+                json!({"type":"choice","instructions":"Which?","criteria":{"a":"A"},"optional":false}),
                 json!({"type":"discrete_choice","option":"a"}),
             ),
             (
@@ -293,7 +369,7 @@ mod tests {
                 json!({"type":"discrete_score","level":1}),
             ),
         ] {
-            let request = json!({"state":{"evidence":"bounded"},"questions":{"q":question}});
+            let request: JudgmentRequest = serde_json::from_value(json!({"schema_version":JUDGMENT_SCHEMA_VERSION,"state":{"evidence":"bounded"},"questions":{"q":question}})).unwrap();
             let response = json!({"model":"jev-1.13.0","answers":{"q":answer}});
             let error = decode_response(&response, &request).unwrap_err();
             assert_eq!(error.kind, ErrorKind::ContractViolation);
@@ -310,16 +386,21 @@ mod tests {
         ] {
             let mut body = good();
             body["usage"] = usage;
-            let result = decode_response(&body, &req).unwrap();
+            let result = decode_response(&body, &req.contract).unwrap();
             assert!(result.usage.is_empty());
             let decoded: JudgmentResponse = serde_json::from_str(&result.full_text).unwrap();
             assert_eq!(decoded.answers["0"].native_noul_probability(), Some(0.9));
         }
         let mut body = good();
         body.as_object_mut().unwrap().remove("usage");
-        assert!(decode_response(&body, &req).unwrap().usage.is_empty());
+        assert!(
+            decode_response(&body, &req.contract)
+                .unwrap()
+                .usage
+                .is_empty()
+        );
         body["usage"] = json!({"input_tokens": 0, "output_tokens": "invalid"});
-        let result = decode_response(&body, &req).unwrap();
+        let result = decode_response(&body, &req.contract).unwrap();
         assert_eq!(result.usage["input_tokens"], 0);
         assert!(result.usage_presence.fresh_input_tokens);
         assert!(!result.usage_presence.output_tokens);
@@ -331,7 +412,7 @@ mod tests {
                 .unwrap()
         );
         body["usage"] = json!({"input_tokens":-1,"output_tokens":7});
-        let result = decode_response(&body, &req).unwrap();
+        let result = decode_response(&body, &req.contract).unwrap();
         assert!(result.usage_presence.input_invalid);
         assert!(!result.usage_presence.output_invalid);
         assert_eq!(

@@ -1,4 +1,3 @@
-use super::resolve_journal_target_session;
 use crate::cli::agent_runtime::initialize_agent_projection;
 use crate::cli::command_registry;
 use crate::cli::session::session_state::SessionState;
@@ -156,18 +155,6 @@ fn resolve_unique_prefix_command() {
 fn resolve_review_command() {
     let resolved = command_registry::resolve_command("/review").expect("/review should resolve");
     assert_eq!(resolved, "/review");
-}
-
-#[test]
-fn resolve_journal_target_session_uses_active_session_without_argument() {
-    let state = SessionState {
-        session_id: Some("sess-123".to_string()),
-        ..Default::default()
-    };
-    let (resolved, from_prefix) =
-        resolve_journal_target_session("", &state, "missing").expect("should resolve");
-    assert_eq!(resolved, "sess-123");
-    assert!(!from_prefix);
 }
 
 #[test]

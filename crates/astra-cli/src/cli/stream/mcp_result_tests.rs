@@ -85,7 +85,6 @@ async fn callback_through_pipeline(
             approval_request_tx: None,
             ask_user_request_tx: None,
             skill_resolver: None,
-            skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
             incremental_state: None,

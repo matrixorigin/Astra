@@ -5,7 +5,12 @@ description: |
   **Pass means**: The parent rejects admission before child execution and reports the unavailable name accurately.
   **Fail means**: A child executes with an unregistered capability or the parent invents a child response.
 prompt: |
-  Spawn exactly one child with:
+  First select the full canonical agent contract with
+  tool_search(query="select:agent"). Use invoke_tool(name="agent", arguments=...)
+  for the selected contract; do not send selected-only arguments through the
+  smaller native agent schema.
+
+  Invoke the selected agent contract exactly once with:
     action: "spawn"
     name: "unregistered-tool-boundary-child"
     description: "Probe child tool availability boundary"
@@ -24,6 +29,26 @@ timeout_seconds: 180
 criteria:
   - type: exit_code
     code: 0
+  - type: journal_tool_call_count
+    name: tool_search
+    min: 1
+    max: 1
+    document: arguments
+    path: /query
+    equals: select:agent
+  - type: journal_tool_json
+    name: tool_search
+    document: result
+    path: /matches/0/name
+    equals: agent
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 0
+    max: 0
   - type: journal_tool_call_count
     name: agent
     min: 1

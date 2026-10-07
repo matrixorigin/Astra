@@ -164,7 +164,6 @@ fn model_request_fixture_accepted_event(
         usage: None,
         composition: Default::default(),
         wire_composition: Default::default(),
-        tool_result_projections: Vec::new(),
         cache: Default::default(),
         compaction: Default::default(),
         terminal_status: None,
@@ -6351,25 +6350,23 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         ..Default::default()
     };
     let (sender, shutdown, stats, join) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender
-        .enqueue_async(IngestionEvent {
-            event_id: non_owner_session_end_event_id.clone(),
-            session_id: session_id.clone(),
-            user_id: other_user_id.clone(),
-            event_type: "session_end".into(),
-            content: Some("non-owner close attempt".into()),
-            token_usage: None,
-            llm_model_used: None,
-            skill_name: None,
-            metadata: None,
-            created_at: "2026-09-03T08:30:00Z".into(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: None,
-            history_work_queue_reservation: None,
-            ingestion_enqueued_at: None,
-        })
-        .await;
+    sender.enqueue(IngestionEvent {
+        event_id: non_owner_session_end_event_id.clone(),
+        session_id: session_id.clone(),
+        user_id: other_user_id.clone(),
+        event_type: "session_end".into(),
+        content: Some("non-owner close attempt".into()),
+        token_usage: None,
+        llm_model_used: None,
+        skill_name: None,
+        metadata: None,
+        created_at: "2026-09-03T08:30:00Z".into(),
+        parent_event_id: None,
+        parent_event_ids: Vec::new(),
+        causal_chain_id: None,
+        history_work_queue_reservation: None,
+        ingestion_enqueued_at: None,
+    });
     shutdown.signal();
     sender.shutdown();
     tokio::time::timeout(std::time::Duration::from_secs(10), join)

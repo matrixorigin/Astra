@@ -396,17 +396,20 @@ async fn l3_11b_real_run_engine_populates_projection() {
         )
         .await
         .unwrap();
-    run_engine
-        .persist_status(
-            &user_id,
-            &session_id,
-            &child_run_id,
-            "completed",
-            None,
-            Some("child run completed"),
-        )
-        .await
-        .unwrap();
+    assert!(
+        run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: &user_id,
+                expected_session_id: &session_id,
+                run_id: &child_run_id,
+                status: "completed",
+                waiting_for: None,
+                error_message: Some("child run completed"),
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
 
     let row = sqlx::query(
         "SELECT
@@ -457,17 +460,20 @@ async fn delegation_projection_refresh_uses_current_run_status() {
         )
         .await
         .unwrap();
-    run_engine
-        .persist_status(
-            &user_id,
-            &session_id,
-            &child_run_id,
-            "completed",
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    assert!(
+        run_engine
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: &user_id,
+                expected_session_id: &session_id,
+                run_id: &child_run_id,
+                status: "completed",
+                waiting_for: None,
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
 
     sqlx::query(
         "UPDATE session_delegations

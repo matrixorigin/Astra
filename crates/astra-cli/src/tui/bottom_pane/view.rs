@@ -316,18 +316,6 @@ pub(crate) trait BottomPaneView: Send {
 
     fn pre_draw_tick(&mut self, _now: std::time::Instant) {}
 
-    fn refresh_task_cell(
-        &mut self,
-        _id: &str,
-        _cell: &crate::tui::history_cell::task::TaskCell,
-    ) -> bool {
-        false
-    }
-
-    fn live_task_id(&self) -> Option<&str> {
-        None
-    }
-
     fn refresh_agent_monitor(
         &mut self,
         _snapshot: crate::tui::bottom_pane::in_flight_agents_view::AgentMonitorSnapshot,

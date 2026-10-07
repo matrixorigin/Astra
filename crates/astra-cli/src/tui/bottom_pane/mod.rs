@@ -16,7 +16,6 @@ pub(crate) mod plan_review_view;
 pub(crate) mod root_transcript_view;
 pub(crate) mod session_picker_view;
 pub(crate) mod skill_popup;
-pub(crate) mod task_detail_view;
 pub(crate) mod team_editor_view;
 pub(crate) mod textarea;
 pub(crate) mod timeline_view;
@@ -835,19 +834,6 @@ impl BottomPane {
                 plan_markdown,
                 response_tx,
             )));
-    }
-
-    pub fn refresh_task_detail(
-        &mut self,
-        id: &str,
-        cell: &crate::tui::history_cell::task::TaskCell,
-    ) -> bool {
-        self.active_view_mut()
-            .is_some_and(|view| view.refresh_task_cell(id, cell))
-    }
-
-    pub fn active_live_task_id(&self) -> Option<&str> {
-        self.view_stack.last().and_then(|view| view.live_task_id())
     }
 
     pub fn refresh_background_task_rows(

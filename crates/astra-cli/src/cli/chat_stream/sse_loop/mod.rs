@@ -6,9 +6,10 @@
 
 mod agentic_loop_turn;
 mod agentic_sse_loop;
+mod remote_turn;
 mod server_admission_host;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,17 +17,11 @@ use std::time::{Duration, Instant};
 use astra_core::RuntimeLimits;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_runtime::{
-    semantic_dedup::SemanticDedup,
-    tool_registry::ToolRegistry,
-    turn::agentic_loop::finalization::run_agentic_loop_with_host,
-    turn::agentic_loop::host::{
-        AgenticLoopState, CancellationState, ErrorRecoveryState, MessagingState, SkillState,
-        StallTrackingState, StopHookState, TelemetryState, runtime_manifest_for_model,
-    },
-    turn::chat_turn_heuristics::infer_task_execution_profile,
-    turn::stop_hooks_yaml::detect_turn_hook_sets,
-    turn::tool_health::ToolHealthTracker,
-    turn::turn_guard::TurnGuard,
+    tool_registry::ToolRegistry, turn::chat_turn_heuristics::infer_task_execution_profile,
+    turn::stop_hooks_yaml::detect_turn_hook_sets, turn::tool_health::ToolHealthTracker,
+};
+use remote_turn::{
+    RemoteTurnAudit, RemoteTurnSkills, RemoteTurnState, RemoteTurnTelemetry, consume_remote_turn,
 };
 
 use crate::{
@@ -68,18 +63,6 @@ fn non_tty_output_failure(
             Some(OutputTransportFailure::Failed)
         }
     }
-}
-
-use astra_runtime::turn::runtime_policy::circuit_breaker_config_from_tool_policy;
-
-fn restored_compaction_effectiveness(
-    compaction_state: Option<&serde_json::Value>,
-) -> astra_runtime::turn::compaction_replay::CompactionEffectivenessTracker {
-    compaction_state
-        .map(
-            astra_runtime::turn::compaction_replay::CompactionEffectivenessTracker::from_json_lossy,
-        )
-        .unwrap_or_default()
 }
 
 type RootPermissionContextHandle = astra_runtime::orchestration::PermissionSyncHandle;
@@ -233,13 +216,8 @@ pub(crate) async fn stream_chat_sse(
     let root_agent_id = p.root_agent_id.unwrap_or("main");
     p.perm_manager.clear_turn_overrides();
 
-    // Stable run_id for this turn — shared by:
-    //   1. state.current_run_id (so on_turn_completed captures the
-    //      parent prefix keyed on this id)
-    //   2. AgentActionContext.run_id (so the spawner's resolver looks
-    //      up the same key)
-    // Pre-fix these were different ("ephemeral" vs None), so the
-    // parent capture would be skipped.
+    // Local input/transcript correlation remains stable across preparation.
+    // Only accepted SSE evidence may establish the physical Server run id.
     let parent_turn_run_id = p
         .stream_json_emitter
         .as_ref()
@@ -249,11 +227,8 @@ pub(crate) async fn stream_chat_sse(
     // Tool policy and cache behavior follow the resolved model name, never the
     // opaque Offering identity used for admission.
     let model_for_policy = p.model;
-    let runtime_manifest =
-        runtime_manifest_for_model("cli_turn_selection", "cli_edge", model_for_policy);
     let tool_policy_config = &p.runtime_config.tool_policy;
     let resolved_tool_policy = tool_policy_config.resolve_for_model(model_for_policy);
-    let circuit_breaker_config = circuit_breaker_config_from_tool_policy(tool_policy_config);
 
     // Paint an immediate spinner so the user sees feedback during init (executor, schemas,
     // skill discovery, etc.) before the per-turn prep spinner takes over.
@@ -472,7 +447,6 @@ pub(crate) async fn stream_chat_sse(
     }
     let registry =
         ToolRegistry::new_with_tool_surface(all_schemas.clone(), &p.runtime_config.tool_surface);
-    let always_load_schema_tokens = registry.total_always_load_token_cost() as u64;
     // Full runtime inventory is used only for static allow/deny policy
     // calculations. The headless validator's admitted tool set is populated
     // per round from the final `edge_tools` payload actually sent to the model.
@@ -532,35 +506,14 @@ pub(crate) async fn stream_chat_sse(
 
     let current_session_id = p.session_id.map(|s| s.to_string());
     let task_profile = infer_task_execution_profile(p.message);
-    let circuit_breaker_config = circuit_breaker_config.for_task_profile(task_profile);
 
-    let turn_guard = if p.tool_health_entries.is_empty() {
-        TurnGuard::with_profile(task_profile)
-    } else {
-        let health = ToolHealthTracker::from_entries(p.tool_health_entries);
-        TurnGuard::with_health_and_profile(health, task_profile)
-    };
-
-    // The Server owns all model rounds within this admission. Local adapter
-    // bookkeeping must not interpret CLI configuration as a remote round limit.
-    let agentic_turn_budget = astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
-        task_profile,
-        None,
-        None,
-    );
-    let max_turns = agentic_turn_budget.initial_turns;
+    let tool_health = ToolHealthTracker::from_entries(p.tool_health_entries);
     let current_user_id = cli_user_id();
     let step_recorder = step_recorder_for_cli_turn(
         &current_user_id,
         current_session_id.as_deref(),
         &parent_turn_run_id,
     );
-    let mut local_discovered_skills = HashSet::new();
-    let discovered_skills = match p.discovered_skills.as_deref_mut() {
-        Some(shared) => std::mem::take(shared),
-        None => std::mem::take(&mut local_discovered_skills),
-    };
-
     // Retain the root permission context before perm_manager is moved into the host.
     let root_permission_context = root_permission_context_handle(p.perm_manager);
 
@@ -640,38 +593,6 @@ pub(crate) async fn stream_chat_sse(
     let skill_resolver =
         crate::cli::agent_runtime::bind_skill_resolver(Arc::clone(&p.unified_skill_registry));
 
-    // Pre-compute project-level cross-session context (knowledge backflow P2).
-    // Cached per-process via OnceLock since git_root is constant for a session.
-    use std::sync::OnceLock;
-    static PROJECT_CONTEXT_CACHE: OnceLock<Option<String>> = OnceLock::new();
-
-    let project_context: Option<String> = PROJECT_CONTEXT_CACHE
-        .get_or_init(|| {
-            let git_root = std::process::Command::new("git")
-                .args(["rev-parse", "--show-toplevel"])
-                .current_dir(&project_root)
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| {
-                    String::from_utf8(o.stdout)
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                });
-            git_root.and_then(|root| {
-                let sid = current_session_id.as_deref();
-                let summaries =
-                    astra_services::session_workspace::list_sessions_by_git_root(&root, sid, 5);
-                if summaries.is_empty() {
-                    None
-                } else {
-                    let ctx = astra_services::session_workspace::format_project_context(&summaries);
-                    if ctx.is_empty() { None } else { Some(ctx) }
-                }
-            })
-        })
-        .clone();
-
     let deferred_tool_activations =
         astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
             &messages,
@@ -680,220 +601,65 @@ pub(crate) async fn stream_chat_sse(
                 .cloned()
                 .unwrap_or_default(),
         );
-    let mut state = AgenticLoopState {
-        admitted_tool_policy: tool_policy_config.clone(),
-        evaluation_thresholds:
-            astra_runtime::turn::runtime_policy::evaluation_thresholds_from_policy(
-                tool_policy_config,
-            ),
-        observation_journal: Default::default(),
-        tool_ledger_receipt: Default::default(),
+    let mut state = RemoteTurnState {
         messages,
-        run_transcript_capture: None,
-        volatile_pending: Vec::new(),
-        recent_rounds: Vec::new(),
-        tool_results: Vec::new(),
-        session_memory_state: Default::default(),
+        run_transcript_capture: Vec::new(),
         current_session_id,
-        current_run_id: Some(parent_turn_run_id.clone()),
-        current_run_owner_generation: None,
-        provider_canonical_wal_head: None,
-        inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-        context_manifest_pool: None,
+        current_run_id: None,
         context_manifest_user_id: persist_session_artifacts.then_some(current_user_id),
         context_manifest_model_name: model_for_policy.map(str::to_string),
-        runtime_manifest,
-        recursion_depth: 0,
         final_text: String::new(),
-        current_model_item_id: None,
         final_text_model_item_id: None,
-        final_text_streamed: false,
-        final_output_ready_notified: false,
         total_prompt: 0,
         total_completion: 0,
         total_cache_read: 0,
         total_cache_creation: 0,
         total_tool_calls: 0,
-        last_finish_reason: None,
         total_observation_tool_calls: 0,
         has_any_usage: false,
         qualified_usage: None,
-        last_request_usage: None,
-        max_turns,
-        remaining_turns: max_turns,
-        charged_iterations: 0,
-        agentic_turn_budget,
-        budget_is_explicit: false,
-        loop_entry: Default::default(),
-        current_round_index: 0,
+        last_finish_reason: None,
         llm_rounds_completed: 0,
-        last_request_message_count: None,
-        turn_guard,
-        budget_policy: None,
+        tool_health,
         restricted_tools: initial_restricted,
         step_recorder,
-        idempotency_cache: p.idempotency_cache.unwrap_or_default(),
-        semantic_dedup: SemanticDedup::new(
-            astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
-        ),
-        call_counts: HashMap::new(),
-        max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
-        max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
-        max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
-        stall: {
-            let mut stall = StallTrackingState::default();
-            stall.workspace_observation_quarantine = p.workspace_observation_quarantine.clone();
-            stall.circuit_breaker = astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
-                circuit_breaker_config,
-            );
-            stall
+        stall: RemoteTurnAudit {
+            compaction_state: p.compaction_state.clone(),
+            workspace_observation_quarantine: p.workspace_observation_quarantine.clone(),
+            ..Default::default()
         },
-        telemetry: TelemetryState {
-            trace_ingestion: None,
-            turn_intent_context: None,
-            explain_analyze_events: Vec::new(),
-            explain_analyze_degraded: false,
-            first_ttft_ms: None,
-            all_tools_used: HashSet::new(),
-            authoritative_llm_rounds: None,
-            server_summary_run_usage: Default::default(),
-            server_summary_llm_rounds: 0,
-            server_summary_tool_calls: 0,
-            server_summary_observation_tool_calls: 0,
-            server_summary_tools_used: HashSet::new(),
-            local_usage_attempts: 0,
-            local_usage_provider_reported: 0,
-            local_usage_unavailable: 0,
-            server_summary_usage_attempts: 0,
-            server_summary_usage_provider_reported: 0,
-            server_summary_usage_unavailable: 0,
-            server_record_gap_observed: false,
-            terminal_execution_authority: Some(
-                astra_runtime::turn::agentic_loop::host::TerminalExecutionAuthority::EdgeLedger,
-            ),
-            first_selection_report: None,
-            first_budget_pressure: 0.0,
-            first_context_assembly_ms: None,
-            first_memoria_ms: None,
-            first_round_prompt_tokens: None,
-            max_round_prompt_tokens: None,
-            all_selected_skills: Vec::new(),
+        telemetry: RemoteTurnTelemetry {
             observability_session: p.observability_session.clone(),
             observability_hub: p.observability_hub.clone(),
-            turn_trace_collector: None,
-            context_trace_persistence: None,
-            promotion_events: Vec::new(),
-            pending_context_assembly_trace: None,
-            completed_turns_for_tuning: 0,
-            initial_skill_selector_shortlist: None,
+            ..Default::default()
         },
-        skills: SkillState {
-            registry_for_activation: Some(Arc::clone(&p.unified_skill_registry)),
+        skills: RemoteTurnSkills {
             resolver: skill_resolver,
-            // Fork-skill dispatch belongs to the Server-owned execution.
-            executor: None,
-            quality_tracker: p.skill_quality_tracker.clone(),
-            quality_tracker_baseline: p.skill_quality_tracker.clone(),
-            execution: astra_runtime::turn::agentic_loop::host::SkillExecutionState {
-                discovered: discovered_skills,
-                ..Default::default()
-            },
-            tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&project_root),
-            session_event_hooks: astra_skills::hooks::load_session_event_hooks(&project_root),
             listing_message: None,
-            ..Default::default()
+            session_event_hooks: astra_skills::hooks::load_session_event_hooks(&project_root),
         },
-        hooks: StopHookState {
-            stop_hooks: hook_sets.stop_hooks,
-            stop_hook_runs: 0,
-            teammate_idle_hooks: hook_sets.teammate_idle_hooks,
-            teammate_idle_hook_runs: 0,
-            workspace_root_hint: Some(project_root.to_string_lossy().into_owned()),
-            forward_headers: std::collections::HashMap::new(),
-            admitted_model_execution: None,
-            completion_settlement: Default::default(),
-        },
-        messaging: MessagingState {
-            progress_emitter: None,
-            ..Default::default()
-        },
-        user_intents: {
-            let mut inputs = astra_runtime::turn::agentic_loop::host::UserIntentState::default();
-            inputs.bind_wake(
-                p.run_control
-                    .as_ref()
-                    .and_then(|control| control.input_wake()),
-            );
-            inputs
-        },
-        cancellation: CancellationState {
-            flag: None,
-            pause_flag: None,
-            token: p.cancel_token.clone(),
-            execution_lease_lost: None,
-            resolved_origin: None,
-        },
-        error_recovery: ErrorRecoveryState {
-            consecutive_same_error: 0,
-            last_error_category: None,
-        },
-        provider_adaptation: Default::default(),
+        applied_user_intents: Vec::new(),
+        volatile_pending: Vec::new(),
         run_control: p.run_control.clone(),
+        cancel_token: p.cancel_token.clone(),
         pipeline_session: Some({
-            let config = astra_turn_core::pipeline_config::PipelineConfig::default();
             let session_current_date =
                 astra_runtime::turn::session_current_date::resolve_session_current_date(
                     p.session_id.unwrap_or(""),
                 );
             astra_turn_core::pipeline_session_serde::restore_or_new_with_current_date(
-                config,
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
                 p.pipeline_state.as_ref(),
                 &session_current_date,
             )
         }),
-        message: p.message.to_string(),
-        user_intent: p.user_intent.to_string(),
         recent_tools: p.recent_tools.to_vec(),
         deferred_tool_activations,
-        has_prior_assistant_turn: false,
-        turn_intent: None,
-        task_profile,
-        last_turn_policy: astra_runtime::turn::agentic_loop::host::TurnInteractionPolicy::default(),
-        api: p.api.clone(),
-        api_token: p.token.to_string(),
-        delegation_engine: None,
-        delegations_this_turn: 0,
-        delegation_chain: Vec::new(),
-        self_agent_id: "tui_session".to_string(),
-        project_context,
-        last_llm_context_manifest_trace: None,
-        rate_limit_cooldown: Default::default(),
-        last_composite_snapshot: None,
         last_measured_prompt_tokens: None,
         consecutive_context_window_errors: p.consecutive_context_window_errors,
-        compaction_effectiveness: restored_compaction_effectiveness(p.compaction_state.as_ref()),
-        pinned_tool_schema_tokens: always_load_schema_tokens,
-        sticky_tool_schemas: Vec::new(),
         max_turn_input_tokens: effective_max_turn_input_tokens,
-        budget_wrapup_injected: false,
-        context_compression_triggered: false,
-        canonical_rewrite_state: Default::default(),
-        provider_canonical_wal_base: None,
-        budget_wrapup_ignored_rounds: 0,
-        compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
-        skill_produced_output: false,
-        thinking: astra_turn_core::thinking_config::ThinkingConfig::ModelDefault,
         permission_context: Some(root_permission_context),
-        applied_permission_mode: None,
-        permission_handler: None,
-        runtime_tool_executor: None,
         interruption: None,
-        session_facts: Default::default(),
-        // Canonical Server execution is the sole per-turn memory producer.
-        memory_extraction_service: None,
-        compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_explicit_or_provider(
-            None, p.provider,
-        ),
         approval_overrides: initial_approval_overrides,
         session_turn: current_session_turn,
         canonical_turn_chain_id: Some(parent_turn_run_id.clone()),
@@ -904,8 +670,12 @@ pub(crate) async fn stream_chat_sse(
                 .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
         ),
         turn_event_buffer: None,
-        canonical_turn_started_at: Default::default(),
-        canonical_trace_time_bounds: Default::default(),
+        remote_summary: None,
+        server_terminal_authoritative: false,
+        local_input_run_id: parent_turn_run_id.clone(),
+        stop_hook_prompt: astra_turn_core::stop_hooks::build_stop_hook_prompt(
+            &hook_sets.stop_hooks,
+        ),
         harness: {
             #[cfg(feature = "harness")]
             {
@@ -922,24 +692,8 @@ pub(crate) async fn stream_chat_sse(
                                 sink_for_kernel,
                             ),
                         });
-                        let session_id = p.session_id.map(|s| s.to_string());
-                        let recording = if let Some(ref trace_arc) = p.harness_trace {
-                            // Share SessionState's trace Arc so /inspect reads live data
-                            if let Ok(mut t) = trace_arc.write() {
-                                t.session_id = session_id.clone();
-                            }
-                            std::sync::Arc::new(astra_harness::RecordingKernel::with_trace(
-                                base_kernel,
-                                trace_arc.clone(),
-                            ))
-                        } else {
-                            std::sync::Arc::new(astra_harness::RecordingKernel::new(
-                                base_kernel,
-                                session_id,
-                            ))
-                        };
                         astra_runtime::turn::harness_adapter::HarnessSlot::new(
-                            recording as std::sync::Arc<dyn astra_harness::HarnessKernel>,
+                            base_kernel as std::sync::Arc<dyn astra_harness::HarnessKernel>,
                             sink.clone() as std::sync::Arc<dyn astra_harness::SnapshotSink>,
                         )
                     }
@@ -959,9 +713,6 @@ pub(crate) async fn stream_chat_sse(
         .filter(|observation| observation.is_valid())
         .cloned()
         .collect::<Vec<_>>();
-    for observation in &input_work_unit_observations {
-        state.observe_work_unit(observation);
-    }
     if !input_work_unit_observations.is_empty() {
         state.push_volatile_payload(
             astra_runtime::turn::agentic_loop::host::VolatileKind::ActiveWorkSnapshot,
@@ -986,7 +737,7 @@ pub(crate) async fn stream_chat_sse(
     if let Some(s) = early_spinner {
         s.stop_clear();
     }
-    let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
+    let loop_result = consume_remote_turn(&mut host, &mut state).await;
     let loop_failure = match loop_result {
         Err(error) => Some(error.to_string()),
         Ok(_) => host
@@ -1042,14 +793,11 @@ pub(crate) async fn stream_chat_sse(
         if let Some(slot) = &mut p.deferred_tool_activations {
             **slot = state.deferred_tool_activations.clone();
         }
-        if let Some(shared) = p.discovered_skills {
-            *shared = state.skills.execution.discovered.clone();
-        }
         let (tool_calls_count, tools_used) = resolved_tool_metrics(
             state.total_tool_calls,
             state.telemetry.all_tools_used.iter().cloned(),
             &state.stall.tool_call_records,
-            !state.telemetry.server_summary_run_usage.is_empty(),
+            !state.remote_summary.is_none(),
         );
         let tool_outcomes = astra_services::session_journal::ToolOutcomeSummary::from_records(
             &state.stall.tool_call_records,
@@ -1067,8 +815,8 @@ pub(crate) async fn stream_chat_sse(
             partial: crate::PartialTurnData {
                 tool_call_records: std::mem::take(&mut state.stall.tool_call_records),
                 tools_used,
-                stall_events: std::mem::take(&mut state.stall.events),
-                verdict_events: std::mem::take(&mut state.stall.verdict_events),
+                stall_events: Vec::new(),
+                verdict_events: Vec::new(),
                 prompt_tokens: state.total_prompt,
                 completion_tokens: state.total_completion,
                 cache_read_tokens: state.total_cache_read,
@@ -1080,25 +828,20 @@ pub(crate) async fn stream_chat_sse(
                 token_usage_coverage: state.token_usage_coverage(),
                 tool_outcomes: Some(tool_outcomes),
                 applied_user_intents: state
-                    .user_intents
-                    .applied_user_intents()
+                    .applied_user_intents
                     .iter()
                     .map(
                         |input| crate::cli::stream::streaming_types::AppliedStreamUserIntent {
                             intent_id: input.intent_id.clone(),
                             delivery: input.delivery,
-                            status: input.status,
+                            status: astra_turn_types::UserIntentStatus::Applied,
                             event_index: input.event_index,
                             content: input.content.clone(),
                         },
                     )
                     .collect(),
                 session_id: state.current_session_id.clone(),
-                // `AgenticLoopState.current_run_id` is a local turn-chain
-                // correlation id created before the HTTP request. It is not
-                // evidence that the server admitted a durable Run. Only the
-                // immutable physical owner observed in the SSE bootstrap may
-                // cross the settlement boundary.
+                // Only the verified physical Server owner crosses settlement.
                 run_id: host.last_physical_run_id.clone(),
                 error_code: host.last_error_code.clone(),
                 error_metadata: host.last_error_metadata.clone(),
@@ -1128,11 +871,6 @@ pub(crate) async fn stream_chat_sse(
     if let Some(slot) = &mut p.deferred_tool_activations {
         **slot = state.deferred_tool_activations.clone();
     }
-    // Merge skill quality data back to session-scoped tracker
-    *p.skill_quality_tracker = state.skills.quality_tracker.clone();
-    if let Some(shared) = p.discovered_skills {
-        *shared = state.skills.execution.discovered.clone();
-    }
 
     let usage_attribution = UsageAttribution::from_explain_analyze_events(
         &state.telemetry.explain_analyze_events,
@@ -1149,35 +887,30 @@ pub(crate) async fn stream_chat_sse(
         quiet: p.render_policy.is_silent(),
         explain_analyze_events: &state.telemetry.explain_analyze_events,
         explain_analyze_degraded: state.telemetry.explain_analyze_degraded,
-        verdict_events: &state.stall.verdict_events,
+        verdict_events: &Vec::new(),
         current_session_id: state.current_session_id.as_deref(),
     });
 
     // `turn_intent` is populated only by the strict LLM judge. Preserve
     // unknown as `None`; post-turn consumers must not reclassify user text.
-    let routing_domain_hint = state
-        .turn_intent
-        .as_ref()
-        .and_then(|intent| intent.domain)
-        .map(|domain| domain.as_str().to_string());
+    let routing_domain_hint = None;
 
     // Typed Explain Analyze facts have already flowed through the live event
     // channel. Emit only the independent verdict surface here; rebuilding an
     // explanation from trace records would duplicate or contradict the graph.
     if let Some(ref tx) = p.stream_event_tx {
-        let verdict_events = state.stall.verdict_events.clone();
+        let verdict_events = Vec::new().clone();
         let _ = tx.send(StreamEvent::VerdictReport(verdict_events)).await;
     }
 
     let applied_user_intents = state
-        .user_intents
-        .applied_user_intents()
+        .applied_user_intents
         .iter()
         .map(
             |input| crate::cli::stream::streaming_types::AppliedStreamUserIntent {
                 intent_id: input.intent_id.clone(),
                 delivery: input.delivery,
-                status: input.status,
+                status: astra_turn_types::UserIntentStatus::Applied,
                 event_index: input.event_index,
                 content: input.content.clone(),
             },
@@ -1187,7 +920,11 @@ pub(crate) async fn stream_chat_sse(
     let final_messages = std::mem::take(&mut state.messages);
 
     let token_usage_coverage = state.token_usage_coverage();
-    let tool_ledger_aggregate = state.tool_ledger_receipt.canonical_aggregate();
+    let tool_ledger_aggregate = state
+        .remote_summary
+        .as_ref()
+        .map(|summary| summary.tool_ledger_receipt.canonical_aggregate())
+        .unwrap_or_default();
     let result = build_stream_result(StreamResultBuild {
         turn_evaluation: host.turn_evaluation.take(),
         tool_health_entries: p.tool_health_entries,
@@ -1207,9 +944,9 @@ pub(crate) async fn stream_chat_sse(
         tools_used: state.telemetry.all_tools_used,
         tool_call_records: state.stall.tool_call_records,
         budget_pressure: state.telemetry.first_budget_pressure,
-        stall_events: state.stall.events,
-        verdict_events: state.stall.verdict_events,
-        turn_guard: &state.turn_guard,
+        stall_events: Vec::new(),
+        verdict_events: Vec::new(),
+        tool_health: &state.tool_health,
         last_heavy_checkpoint: state.stall.last_heavy_checkpoint,
         ttft_ms: state.telemetry.first_ttft_ms,
         context_ms: state.telemetry.first_context_assembly_ms,
@@ -1222,21 +959,15 @@ pub(crate) async fn stream_chat_sse(
             .as_mut()
             .map(|b| b.drain())
             .unwrap_or_default(),
-        llm_rounds: state
-            .telemetry
-            .authoritative_llm_rounds
-            .or(Some(state.llm_rounds_completed)),
+        llm_rounds: Some(state.llm_rounds_completed),
         token_usage_coverage,
         interruption: state.interruption.as_ref().map(|i| i.to_json()),
         server_terminal_unverified: state.stall.server_terminal_unverified,
-        server_terminal_authoritative: state
-            .telemetry
-            .terminal_execution_authority
-            .is_some_and(|authority| {
-                authority
-                    == astra_runtime::turn::agentic_loop::host::TerminalExecutionAuthority::RemoteServer
-            }),
-        tool_record_coverage_partial: state.telemetry.server_record_gap_observed,
+        server_terminal_authoritative: state.server_terminal_authoritative,
+        tool_record_coverage_partial: state
+            .remote_summary
+            .as_ref()
+            .is_some_and(|summary| !summary.has_complete_tool_ledger()),
         final_messages,
         deferred_tool_activations: state.deferred_tool_activations.clone(),
         run_transcript_messages,
@@ -1384,12 +1115,10 @@ fn load_turn_messages(
 #[cfg(test)]
 mod tests {
     use super::{
-        TurnMessageLoadError, circuit_breaker_config_from_tool_policy, detect_turn_hook_sets,
-        load_turn_messages, missing_model_selection_journal_event,
-        missing_model_selection_turn_failure, non_tty_output_failure, normalize_turn_model,
-        refresh_root_permission_context, require_selected_turn_model,
-        restored_compaction_effectiveness, root_permission_context_handle,
-        step_recorder_for_cli_turn,
+        TurnMessageLoadError, detect_turn_hook_sets, load_turn_messages,
+        missing_model_selection_journal_event, missing_model_selection_turn_failure,
+        non_tty_output_failure, normalize_turn_model, refresh_root_permission_context,
+        require_selected_turn_model, root_permission_context_handle, step_recorder_for_cli_turn,
     };
     use crate::cli::permission_manager::{PermissionManager, PermissionMode};
     use astra_runtime::orchestration::AgentStatus;
@@ -1690,21 +1419,6 @@ mod tests {
             Some(OutputTransportFailure::Failed)
         );
         assert_eq!(non_tty_output_failure(true, StdoutState::Closed), None);
-    }
-
-    #[test]
-    fn circuit_breaker_config_uses_runtime_config_defaults() {
-        let cfg = circuit_breaker_config_from_tool_policy(
-            &astra_config::runtime_config::ToolPolicyConfig::default(),
-        );
-
-        assert_eq!(cfg.stall_threshold, 6);
-        assert_eq!(cfg.repetition_threshold, 3);
-        assert_eq!(cfg.read_only_stall_threshold, 12);
-        // `0` in user config means "use default", NOT the BreakerConfig sentinel "unbounded".
-        assert_eq!(cfg.max_introspect_emissions, 3);
-        assert_eq!(cfg.half_open_patience, 2);
-        assert_eq!(cfg.absolute_max_rounds, 1000);
     }
 
     #[test]
@@ -2053,23 +1767,6 @@ mod tests {
     }
 
     #[test]
-    fn restored_compaction_effectiveness_decodes_checkpoint_tracker() {
-        let tracker = restored_compaction_effectiveness(Some(&json!({
-            "last_tokens_freed": 4000,
-            "last_was_insufficient": true,
-            "cumulative_tokens_freed": 15000,
-            "attempt_count": 3,
-            "consecutive_futile_attempts": 2,
-        })));
-
-        assert_eq!(tracker.last_tokens_freed, 4000);
-        assert!(tracker.last_was_insufficient);
-        assert_eq!(tracker.cumulative_tokens_freed, 15000);
-        assert_eq!(tracker.attempt_count, 3);
-        assert_eq!(tracker.consecutive_futile_attempts, 2);
-    }
-
-    #[test]
     fn turn_model_normalization_drops_symbolic_default_override() {
         assert_eq!(normalize_turn_model(None), None);
         assert_eq!(normalize_turn_model(Some(" default ")), None);
@@ -2095,45 +1792,6 @@ mod tests {
             )));
             assert_eq!(recorder.events()[0].step_id, step.step_id());
         }
-    }
-
-    #[test]
-    fn circuit_breaker_config_uses_runtime_config_overrides_with_floors() {
-        let tool_policy = astra_config::runtime_config::ToolPolicyConfig {
-            circuit_breaker_stall_threshold: 1,
-            circuit_breaker_repetition_threshold: 7,
-            circuit_breaker_read_only_stall_threshold: 2,
-            // user=0 → effective_*() returns default (3); floor is 1
-            circuit_breaker_max_introspect_emissions: 0,
-            circuit_breaker_half_open_patience: 5,
-            circuit_breaker_absolute_max_rounds: 10,
-            ..Default::default()
-        };
-
-        let cfg = circuit_breaker_config_from_tool_policy(&tool_policy);
-
-        // stall: resolve(1, 6, 3) = max(1, 3) = 3 (floored)
-        assert_eq!(cfg.stall_threshold, 3);
-        // repetition: resolve(7, 3, 2) = max(7, 2) = 7
-        assert_eq!(cfg.repetition_threshold, 7);
-        // read_only: resolve(2, 12, 4) = max(2, 4) = 4 (floored)
-        assert_eq!(cfg.read_only_stall_threshold, 4);
-        // introspect: resolve(0, 3, 1) = 3 (default)
-        assert_eq!(cfg.max_introspect_emissions, 3);
-        assert_eq!(cfg.half_open_patience, 5);
-        // absolute: resolve(10, 200, 20) = max(10, 20) = 20 (floored)
-        assert_eq!(cfg.absolute_max_rounds, 20);
-    }
-
-    #[test]
-    fn circuit_breaker_config_introspect_floor_is_one() {
-        // user supplies explicit value=1 (at the floor) — should pass through unchanged
-        let tool_policy = astra_config::runtime_config::ToolPolicyConfig {
-            circuit_breaker_max_introspect_emissions: 1,
-            ..Default::default()
-        };
-        let cfg = circuit_breaker_config_from_tool_policy(&tool_policy);
-        assert_eq!(cfg.max_introspect_emissions, 1);
     }
 
     #[test]

@@ -49,11 +49,11 @@ async fn seed_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &st
         "INSERT INTO agent_runs
          (run_id, user_id, session_id, root_run_id, ancestor_path, depth, retry_scope,
           status, execution_mode, owner_pod_id, owner_lease_expires_at,
-          run_generation, last_event_idx, retry_count,
+          run_generation, last_event_idx,
           total_prompt_tokens, total_completion_tokens, total_tool_calls,
           created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, 0, 'node', 'running', 'web_agent', ?,
-                 TIMESTAMPADD(MINUTE, 5, NOW(6)), 0, -1, 0,
+                 TIMESTAMPADD(MINUTE, 5, NOW(6)), 0, -1,
                  0, 0, 0, NOW(6), NOW(6))",
     )
     .bind(run_id)

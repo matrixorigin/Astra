@@ -1,10 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use astra_core::sync_poison::recover_mutex_lock;
-use astra_runtime::turn::run_control::{
-    ActionAdmissionOutcome, ActionAdmissionRequest, QueuedUserIntent, RunControlStatus,
-    RunStatusProvider, UserIntentAdmissionAuthority, UserIntentPoll, UserIntentProvider,
-};
+use astra_runtime::turn::run_control::{RunControlStatus, RunStatusProvider};
 use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
 use serde_json::Value;
 
@@ -52,9 +49,7 @@ impl RemoteDispositionProjectionAck {
 
 #[derive(Default)]
 struct LocalRunControlState {
-    next_event_index: usize,
-    intents: Vec<QueuedUserIntent>,
-    admitted_action_ids: std::collections::HashSet<String>,
+    pending_runtime_notifications: Vec<String>,
     /// Runtime facts that reached a model boundary but are not safe to forget
     /// until the enclosing turn settles successfully.
     applied_runtime_notifications: Vec<String>,
@@ -83,19 +78,14 @@ struct LocalRunControlState {
     cancellation_origin: Option<astra_turn_core::orchestration_types::CancellationOrigin>,
 }
 
-/// In-process run-control provider for the CLI/TUI agentic loop.
-///
-/// Server-backed runs use the durable run engine for this contract. CLI local
-/// runs use this turn-scoped provider so the same runtime polling paths can
-/// observe user cancellation and active-run guidance without requiring a server-side
-/// workspace executor.
+/// Turn-scoped CLI cancellation, runtime facts and remote guidance dispositions.
+/// Server admission owns action authorization and durable user guidance.
 pub(crate) struct LocalRunControl {
     // This lock is only held for short in-memory queue mutations and never
     // across an `.await`, so a std::sync::Mutex keeps the local TUI hot path
     // simple without introducing async lock wakeups.
     state: Mutex<LocalRunControlState>,
     remote_disposition_notify: Arc<tokio::sync::Notify>,
-    input_wake: tokio::sync::watch::Sender<i64>,
 }
 
 impl Default for LocalRunControl {
@@ -103,7 +93,6 @@ impl Default for LocalRunControl {
         Self {
             state: Mutex::new(LocalRunControlState::default()),
             remote_disposition_notify: Arc::new(tokio::sync::Notify::new()),
-            input_wake: tokio::sync::watch::channel(-1).0,
         }
     }
 }
@@ -189,32 +178,29 @@ impl LocalRunControl {
                 "Runtime notification is too large. Limit it to {MAX_USER_INTENT_CHARS} characters."
             ));
         }
-        self.accept_intent(
-            UserIntentDelivery::GuideCurrentRun,
-            astra_runtime::turn::run_control::runtime_notification_input(content),
-        );
+        recover_mutex_lock(&self.state)
+            .pending_runtime_notifications
+            .push(content.to_string());
         Ok(())
     }
 
-    /// Recover runtime facts that never reached a model boundary before the
-    /// active turn settled. Applied items have already been evicted by the
-    /// provider acknowledgement path, so this returns only genuinely pending
-    /// notifications and prevents a completion from disappearing in the
-    /// active→idle handoff.
+    /// Return uncommitted request facts and newly queued notifications together.
+    /// Failed settlement and the active-to-idle handoff must preserve both.
     pub(crate) fn take_pending_runtime_notifications(&self) -> Vec<String> {
         let mut guard = recover_mutex_lock(&self.state);
         let mut pending = std::mem::take(&mut guard.applied_runtime_notifications);
-        guard.intents.retain(|event| {
-            if let Some(content) =
-                astra_runtime::turn::run_control::runtime_notification_content(&event.input)
-            {
-                pending.push(content);
-                false
-            } else {
-                true
-            }
-        });
+        pending.extend(std::mem::take(&mut guard.pending_runtime_notifications));
         pending
+    }
+
+    /// Retain the exact request facts until enclosing settlement succeeds.
+    /// Auth/session retries reuse this same owner and must replay earlier facts;
+    /// notifications arriving after this snapshot remain pending for next time.
+    pub(crate) fn runtime_notifications_for_request(&self) -> Vec<String> {
+        let mut guard = recover_mutex_lock(&self.state);
+        let admitted = std::mem::take(&mut guard.pending_runtime_notifications);
+        guard.applied_runtime_notifications.extend(admitted);
+        guard.applied_runtime_notifications.clone()
     }
 
     /// Commit runtime facts only after the enclosing turn has produced and
@@ -397,33 +383,6 @@ impl LocalRunControl {
     ) -> Vec<crate::cli::stream::streaming_types::AppliedStreamUserIntent> {
         std::mem::take(&mut recover_mutex_lock(&self.state).remotely_applied_user_intents)
     }
-
-    fn accept_intent(&self, delivery: UserIntentDelivery, input: Value) -> UserIntentReceipt {
-        let mut guard = recover_mutex_lock(&self.state);
-        guard.next_event_index += 1;
-        let event_index = guard.next_event_index;
-        let intent_id = format!("intent_{}", uuid::Uuid::now_v7().simple());
-        guard.intents.push(QueuedUserIntent {
-            intent_id: intent_id.clone(),
-            delivery,
-            status: UserIntentStatus::AcceptedLocal,
-            event_index,
-            input,
-        });
-        let watermark = i64::try_from(event_index).unwrap_or(i64::MAX);
-        self.input_wake.send_if_modified(|current| {
-            let changed = watermark > *current;
-            *current = (*current).max(watermark);
-            changed
-        });
-        UserIntentReceipt {
-            run_id: None,
-            intent_id,
-            delivery,
-            status: UserIntentStatus::AcceptedLocal,
-            event_index: event_index as i64,
-        }
-    }
 }
 
 #[async_trait::async_trait]
@@ -447,207 +406,9 @@ impl RunStatusProvider for LocalRunControl {
     }
 }
 
-#[async_trait::async_trait]
-impl UserIntentProvider for LocalRunControl {
-    fn input_wake(&self) -> Option<tokio::sync::watch::Receiver<i64>> {
-        Some(self.input_wake.subscribe())
-    }
-
-    fn has_pending_inputs(&self) -> bool {
-        !recover_mutex_lock(&self.state).intents.is_empty()
-    }
-
-    async fn fence_user_intent_submissions(
-        &self,
-        _user_id: &str,
-        _expected_session_id: &str,
-        _run_id: &str,
-        authority: UserIntentAdmissionAuthority,
-    ) -> Result<(), String> {
-        match authority {
-            UserIntentAdmissionAuthority::ProcessLocal => Ok(()),
-            UserIntentAdmissionAuthority::DurableOwnerGeneration(_) => Err(
-                "local user-intent admission cannot validate durable owner authority".to_string(),
-            ),
-        }
-    }
-
-    async fn reopen_user_intent_submissions(
-        &self,
-        _user_id: &str,
-        _expected_session_id: &str,
-        _run_id: &str,
-        authority: UserIntentAdmissionAuthority,
-    ) -> Result<(), String> {
-        match authority {
-            UserIntentAdmissionAuthority::ProcessLocal => Ok(()),
-            UserIntentAdmissionAuthority::DurableOwnerGeneration(_) => Err(
-                "local user-intent admission cannot validate durable owner authority".to_string(),
-            ),
-        }
-    }
-
-    async fn begin_action(
-        &self,
-        _user_id: &str,
-        _run_id: &str,
-        request: ActionAdmissionRequest,
-    ) -> Result<ActionAdmissionOutcome, String> {
-        if request.action_id.trim().is_empty() {
-            return Err("local action admission requires a non-empty action id".to_string());
-        }
-        if request.expected_owner_generation.is_some() {
-            return Err(
-                "local action admission cannot validate a durable owner generation".to_string(),
-            );
-        }
-        let mut guard = recover_mutex_lock(&self.state);
-        if let Some(status) = guard.status {
-            return Ok(ActionAdmissionOutcome::Inactive {
-                status: match status {
-                    RunControlStatus::Cancelled => "cancelled",
-                    RunControlStatus::Paused => "paused",
-                }
-                .to_string(),
-            });
-        }
-        if let Some(intent) = guard.intents.iter().find(|intent| {
-            i64::try_from(intent.event_index).unwrap_or(i64::MAX) > request.expected_control_epoch
-        }) {
-            return Ok(ActionAdmissionOutcome::Superseded {
-                user_intent_event_index: i64::try_from(intent.event_index).unwrap_or(i64::MAX),
-            });
-        }
-        if guard.admitted_action_ids.contains(&request.action_id) {
-            return Ok(ActionAdmissionOutcome::AlreadyStarted {
-                event_index: i64::try_from(guard.next_event_index).unwrap_or(i64::MAX),
-            });
-        }
-        guard.next_event_index = guard.next_event_index.saturating_add(1);
-        let event_index = i64::try_from(guard.next_event_index).unwrap_or(i64::MAX);
-        guard.admitted_action_ids.insert(request.action_id);
-        Ok(ActionAdmissionOutcome::Started { event_index })
-    }
-
-    async fn poll_user_intents(
-        &self,
-        _user_id: &str,
-        _run_id: &str,
-        after_event_index: usize,
-    ) -> UserIntentPoll {
-        let guard = recover_mutex_lock(&self.state);
-        let inputs = guard
-            .intents
-            .iter()
-            .filter(|event| event.event_index > after_event_index)
-            .cloned()
-            .collect::<Vec<_>>();
-        UserIntentPoll {
-            next_cursor: guard.next_event_index.max(after_event_index),
-            snapshot_has_more: false,
-            snapshot_page_fact_count: inputs.len(),
-            inputs,
-            issues: Vec::new(),
-            error: None,
-        }
-    }
-
-    async fn mark_user_intents_applied(
-        &self,
-        _user_id: &str,
-        _expected_session_id: &str,
-        _run_id: &str,
-        event_indices: &[usize],
-        authority: astra_runtime::turn::run_control::UserIntentAdmissionAuthority,
-    ) -> Result<astra_runtime::turn::run_control::UserIntentApplyAck, String> {
-        if authority != astra_runtime::turn::run_control::UserIntentAdmissionAuthority::ProcessLocal
-        {
-            return Err(
-                "process-local user-intent apply rejects durable owner authority".to_string(),
-            );
-        }
-        if event_indices.is_empty() {
-            return Ok(astra_runtime::turn::run_control::UserIntentApplyAck::Applied);
-        }
-        let released = event_indices
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        let mut guard = recover_mutex_lock(&self.state);
-        let mut applied_runtime_notifications = Vec::new();
-        guard.intents.retain(|event| {
-            if !released.contains(&event.event_index) {
-                return true;
-            }
-            if let Some(content) =
-                astra_runtime::turn::run_control::runtime_notification_content(&event.input)
-            {
-                applied_runtime_notifications.push(content);
-            }
-            false
-        });
-        guard
-            .applied_runtime_notifications
-            .extend(applied_runtime_notifications);
-        Ok(astra_runtime::turn::run_control::UserIntentApplyAck::Applied)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn accepted_local_input_wakes_the_shared_loop_without_extra_polling() {
-        let provider = LocalRunControl::default();
-        let mut wake = provider.input_wake().expect("local input readiness");
-        assert_eq!(*wake.borrow_and_update(), -1);
-        provider
-            .accept_runtime_notification("child finished")
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), wake.changed())
-            .await
-            .expect("input wake")
-            .unwrap();
-        assert_eq!(*wake.borrow_and_update(), 1);
-        let observed = provider
-            .poll_user_intents("local-user", "run-local", 0)
-            .await;
-        assert_eq!(observed.inputs.len(), 1);
-        assert_eq!(observed.next_cursor, 1);
-    }
-
-    #[tokio::test]
-    async fn local_run_control_polls_runtime_notifications_after_cursor() {
-        let provider = LocalRunControl::default();
-        provider
-            .accept_runtime_notification("first")
-            .expect("enqueue first");
-        provider
-            .accept_runtime_notification("second")
-            .expect("enqueue second");
-
-        let first = provider
-            .poll_user_intents("local-user", "run-local", 0)
-            .await;
-        assert_eq!(first.next_cursor, 2);
-        assert_eq!(first.inputs.len(), 2);
-        assert_ne!(first.inputs[0].intent_id, first.inputs[1].intent_id);
-        assert_eq!(
-            astra_runtime::turn::run_control::runtime_notification_content(&first.inputs[0].input),
-            Some("first".to_string())
-        );
-
-        let second = provider
-            .poll_user_intents("local-user", "run-local", 1)
-            .await;
-        assert_eq!(second.next_cursor, 2);
-        assert_eq!(second.inputs.len(), 1);
-        assert_eq!(
-            astra_runtime::turn::run_control::runtime_notification_content(&second.inputs[0].input),
-            Some("second".to_string())
-        );
-    }
 
     #[tokio::test]
     async fn local_run_control_reports_cancel_status_through_shared_contract() {
@@ -718,65 +479,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_action_admission_linearizes_guidance_and_never_replays_started_action() {
-        let provider = LocalRunControl::default();
-        let started = provider
-            .begin_action(
-                "local-user",
-                "run-local",
-                ActionAdmissionRequest {
-                    action_id: "round:0:serial:first".to_string(),
-                    expected_session_id: "local-session".to_string(),
-                    expected_control_epoch: 0,
-                    expected_owner_generation: None,
-                },
-            )
-            .await
-            .expect("first action admission");
-        assert!(matches!(started, ActionAdmissionOutcome::Started { .. }));
-
-        let retry = provider
-            .begin_action(
-                "local-user",
-                "run-local",
-                ActionAdmissionRequest {
-                    action_id: "round:0:serial:first".to_string(),
-                    expected_session_id: "local-session".to_string(),
-                    expected_control_epoch: 0,
-                    expected_owner_generation: None,
-                },
-            )
-            .await
-            .expect("idempotent lookup");
-        assert!(matches!(
-            retry,
-            ActionAdmissionOutcome::AlreadyStarted { .. }
-        ));
-        assert!(!retry.is_fresh_grant());
-
-        provider
-            .accept_runtime_notification("replace stale work")
-            .expect("guidance accepted");
-        let superseded = provider
-            .begin_action(
-                "local-user",
-                "run-local",
-                ActionAdmissionRequest {
-                    action_id: "round:0:serial:second".to_string(),
-                    expected_session_id: "local-session".to_string(),
-                    expected_control_epoch: 0,
-                    expected_owner_generation: None,
-                },
-            )
-            .await
-            .expect("second action admission");
-        assert!(matches!(
-            superseded,
-            ActionAdmissionOutcome::Superseded { .. }
-        ));
-    }
-
-    #[tokio::test]
     async fn local_run_control_pause_can_resume_but_not_override_cancel() {
         let provider = LocalRunControl::default();
         provider.request_pause();
@@ -827,64 +529,6 @@ mod tests {
             .accept_runtime_notification(&text)
             .expect_err("oversized runtime notification should be rejected");
         assert!(error.contains("too large"));
-    }
-
-    #[tokio::test]
-    async fn local_run_control_evicts_released_runtime_notifications() {
-        let provider = LocalRunControl::default();
-        provider
-            .accept_runtime_notification("first")
-            .expect("enqueue first");
-        provider
-            .accept_runtime_notification("second")
-            .expect("enqueue second");
-
-        provider
-            .mark_user_intents_applied(
-                "local-user",
-                "local-session",
-                "run-local",
-                &[1],
-                astra_runtime::turn::run_control::UserIntentAdmissionAuthority::ProcessLocal,
-            )
-            .await
-            .expect("release should succeed");
-
-        let remaining = provider
-            .poll_user_intents("local-user", "run-local", 0)
-            .await;
-        assert_eq!(remaining.next_cursor, 2);
-        assert_eq!(remaining.inputs.len(), 1);
-        assert_eq!(remaining.inputs[0].event_index, 2);
-    }
-
-    #[tokio::test]
-    async fn local_run_control_rejects_durable_apply_authority() {
-        let provider = LocalRunControl::default();
-        provider
-            .accept_runtime_notification("local guidance")
-            .unwrap();
-
-        let error = provider
-            .mark_user_intents_applied(
-                "local-user",
-                "local-session",
-                "run-local",
-                &[1],
-                astra_runtime::turn::run_control::UserIntentAdmissionAuthority::DurableOwnerGeneration(7),
-            )
-            .await
-            .expect_err("process-local provider must reject durable authority");
-
-        assert!(error.contains("process-local"));
-        assert_eq!(
-            provider
-                .poll_user_intents("local-user", "run-local", 0)
-                .await
-                .inputs
-                .len(),
-            1
-        );
     }
 
     #[tokio::test]

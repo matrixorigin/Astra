@@ -168,6 +168,11 @@ pagination parameters.
 
 ### DELETE /agents/{agent_id} → 204
 
+Agent names are unique per owner. Creating a duplicate name or renaming an
+agent to another of the owner's names returns 409 without changing either
+record. Different owners may use the same name. Reads and mutations of another
+owner's agent, and reads or deletes of a missing agent, return 404.
+
 ---
 
 ## Sessions

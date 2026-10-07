@@ -2003,7 +2003,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Optional first child request output-token ceiling."},
                         "inherit_prefix": {
                             "type": ["object", "null"],
-                            "description": "Optional exact parent prefix-cache inheritance request. Omit for a fresh child prefix; set required=true only when fallback is unacceptable.",
+                            "description": "Parent prefix inheritance request. The Server child executor does not support inheritance and rejects explicit requests regardless of required. Omit for a fresh child context.",
                             "properties": {
                                 "from_run_id": {"type": ["string", "null"]},
                                 "required": {"type": "boolean"}

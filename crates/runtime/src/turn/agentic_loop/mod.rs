@@ -8,3 +8,5 @@ pub(crate) mod source_recovery;
 pub(crate) mod tool_phase;
 pub(crate) mod tool_support;
 pub(crate) mod verification_frontier;
+
+pub use execution_phase::workspace_observation_quarantine_from_records;

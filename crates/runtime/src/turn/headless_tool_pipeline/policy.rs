@@ -263,21 +263,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
     pub(super) fn handle_empty_tool_name(
         &mut self,
-        item: HeadlessRoundToolIdx,
+        item: usize,
         slot: &HeadlessResolvedToolSlot,
     ) -> HeadlessToolSlotControl {
         self.consecutive_empty_name = self.consecutive_empty_name.saturating_add(1);
-        let raw_tc = match item {
-            HeadlessRoundToolIdx::ServerToolCall(i) => {
-                self.ctx.tool_calls.get(i).map(|v| v.to_string())
-            }
-            _ => None,
-        };
+        let raw_tc = self.ctx.tool_calls.get(item).map(Value::to_string);
         agent_warn!(
             "step",
             "Empty tool name in slot {item:?} (id={}), raw tool_call: {}",
             slot.id,
-            raw_tc.as_deref().unwrap_or("(synthetic edge)")
+            raw_tc.as_deref().unwrap_or("(missing provider index)")
         );
         let err_msg = validator_denial_body(
             &slot.name,
@@ -335,16 +330,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
     pub(super) fn validate_slot(
         &mut self,
-        item: HeadlessRoundToolIdx,
+        item: usize,
     ) -> HeadlessPipelineStage<ValidatedExecution> {
         let mut slot = self.resolve_slot(item);
-        if slot.synthetic_edge_index.is_none() {
-            super::inherit_external_effect_recovery_scope(
-                &slot.name,
-                &mut slot.args,
-                self.ctx.external_effect_recovery_paths,
-            );
-        }
+        super::inherit_external_effect_recovery_scope(
+            &slot.name,
+            &mut slot.args,
+            self.ctx.external_effect_recovery_paths,
+        );
 
         if self.ctx.pre_resolved_ids.contains(slot.id.as_str()) {
             return HeadlessPipelineStage::ShortCircuit;
@@ -354,10 +347,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // settled result is historical fact, so post-execution retry and
         // budget policy must not replace it with a synthetic skip.  A
         // signature-only match is intentionally insufficient authority.
-        let has_exact_edge_result = self.exact_edge_callback_index(&slot).is_some_and(|index| {
-            self.ctx.edge_tool_round[index].has_explicit_assistant_tool_call_id()
-                && !self.consumed_edge[index]
-        });
+        let has_exact_edge_result = self
+            .exact_edge_callback_index(&slot)
+            .is_some_and(|index| !self.consumed_edge[index]);
 
         if !has_exact_edge_result && self.executed_this_turn >= self.ctx.max_tools_per_turn {
             self.emit_turn_budget_stub(&slot);

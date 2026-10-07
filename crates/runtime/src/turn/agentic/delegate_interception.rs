@@ -1839,7 +1839,7 @@ mod tests {
                 ..astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default()
             },
             ttft_ms: Some(10),
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         };
 
@@ -1887,7 +1887,7 @@ mod tests {
                 ..astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default()
             },
             ttft_ms: Some(10),
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         };
 
@@ -1937,7 +1937,7 @@ mod tests {
                 ..crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum::default()
             },
             ttft_ms: Some(10),
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         };
 

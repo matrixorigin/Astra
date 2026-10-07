@@ -8,7 +8,7 @@ use astra_services::{
     DatabaseStateProjectionStore, SessionArtifactContentChunkV1,
     SessionArtifactContentDescriptorV1, SessionArtifactContentStore, SessionArtifactJsonRecord,
     SessionArtifactJsonStore, SessionArtifactReference, SessionArtifactReferenceKind,
-    SessionArtifactStoreError, SessionService, StateItemUpsert, build_presigned_artifact_download,
+    SessionArtifactStoreError, SessionService, build_presigned_artifact_download,
     runs::ToolOutputBatchItem,
 };
 use serde_json::json;
@@ -758,7 +758,7 @@ async fn l2_49c_sealed_expiry_and_session_delete_do_not_deadlock() {
 shared_db_test! {
 
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_49d_state_projection_and_session_delete_are_fenced() {
+async fn l2_49d_personal_skill_activation_and_session_delete_are_fenced() {
     let pool = setup_pool().await;
     let (user_id, session_id, _) = ids();
     insert_session(&pool, &user_id, &session_id).await;
@@ -779,43 +779,37 @@ async fn l2_49d_state_projection_and_session_delete_are_fenced() {
     .await;
 
     let projection = DatabaseStateProjectionStore::new(pool.clone());
-    let item = StateItemUpsert {
-        item_id: Some(format!("state-race-{}", Uuid::new_v4())),
-        user_id: user_id.clone(),
-        session_id: session_id.clone(),
-        scope: "session".to_string(),
-        category: "finding".to_string(),
-        item_key: "artifact-race".to_string(),
-        status: "active".to_string(),
-        priority: 10,
-        source: "phase6-race".to_string(),
-        provenance_event_id: None,
-        run_id: None,
-        title: Some("state projection race".to_string()),
-        summary_text: Some("the writer and delete must settle cleanly".to_string()),
-        payload_json: json!({"artifact_id": artifact_id}),
-        token_estimate: 32,
-        mutation: "insert".to_string(),
-    };
+    let skill_name = format!("activation-race-{}", Uuid::new_v4());
+    let skills = astra_services::DatabasePersonalSkillStore::new(pool.clone());
+    let version = skills.submit_version(
+        &user_id,
+        &skill_name,
+        astra_services::SubmitUserSkillVersion {
+            version: "v1".to_string(),
+            manifest_json: json!({"name": skill_name, "description": "Review changes"}),
+            content_markdown: "## Instructions\n\nReview changes.\n".to_string(),
+            status: Some("published".to_string()),
+        },
+    ).await.unwrap();
     let service = DatabaseSessionService::new(astra_core::MatrixOneSettings::from_env())
         .with_pool(pool.clone());
     let (write, deleted) = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         async {
             tokio::join!(
-                projection.upsert_state_item(item),
+                projection.activate_personal_skill_from_ui(&user_id, &session_id, &skill_name, &version.version_id),
                 service.delete_session(session_id.clone(), user_id.clone()),
             )
         },
     )
     .await
-    .expect("state projection and Session delete must not deadlock");
+    .expect("skill activation and Session delete must not deadlock");
 
     deleted.expect("Session delete should succeed without saved Work");
     if let Err(error) = write {
         assert!(
             matches!(error, astra_services::StateProjectionError::SessionNotActive { .. }),
-            "a losing state writer should fail with an actionable lifecycle error: {error}"
+            "a losing skill activation should fail with an actionable lifecycle error: {error}"
         );
     }
 
@@ -824,8 +818,11 @@ async fn l2_49d_state_projection_and_session_delete_are_fenced() {
             (SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?) AS sessions,
             (SELECT COUNT(*) FROM session_state_items WHERE user_id = ? AND session_id = ?) AS state_items,
             (SELECT COUNT(*) FROM session_state_item_events WHERE user_id = ? AND session_id = ?) AS state_events,
-            (SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ?) AS artifacts",
+            (SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ?) AS artifacts,
+            (SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?) AS activation_events",
     )
+    .bind(&user_id)
+    .bind(&session_id)
     .bind(&user_id)
     .bind(&session_id)
     .bind(&user_id)
@@ -841,6 +838,12 @@ async fn l2_49d_state_projection_and_session_delete_are_fenced() {
     assert_eq!(row.try_get::<i64, _>("state_items").unwrap(), 0);
     assert_eq!(row.try_get::<i64, _>("state_events").unwrap(), 0);
     assert_eq!(row.try_get::<i64, _>("artifacts").unwrap(), 0);
+    assert_eq!(row.try_get::<i64, _>("activation_events").unwrap(), 0);
+    sqlx::query("DELETE FROM user_skill_versions WHERE owner_user_id = ? AND skill_name = ?")
+        .bind(&user_id).bind(&skill_name).execute(pool.get()).await.unwrap();
+    sqlx::query("DELETE FROM user_skill_sources WHERE owner_user_id = ? AND skill_name = ?")
+        .bind(&user_id).bind(&skill_name).execute(pool.get()).await.unwrap();
+
 }
 }
 

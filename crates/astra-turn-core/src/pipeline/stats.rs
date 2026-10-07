@@ -570,7 +570,7 @@ mod tests {
     fn cache_break_appended() {
         let mut stats = PipelineStats::default();
         let mut f = make_feedback(100, 0, 5000);
-        f.detect_cache_break(2, 1000);
+        f.attribute_cache_break(CacheBreakReason::SystemPromptChanged);
         stats.record("m", "s", &f);
         assert_eq!(stats.cache_breaks.len(), 1);
     }
@@ -792,7 +792,7 @@ mod tests {
         let mut stats = PipelineStats::default();
         for _ in 0..100 {
             let mut f = make_feedback(100, 0, 5000);
-            f.detect_cache_break(2, 1000);
+            f.attribute_cache_break(CacheBreakReason::SystemPromptChanged);
             stats.record("m", "s", &f);
         }
         assert!(stats.cache_breaks.len() <= PipelineStats::MAX_CACHE_BREAKS);

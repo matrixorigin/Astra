@@ -1,16 +1,13 @@
 //! Session-scoped pipeline orchestrator.
 //!
 //! `PipelineSession` owns the cross-turn mutable state (stats, latches,
-//! emergent context, recovery) and provides a single `run_turn()` entry point
+//! recovery) and provides a single `run_turn()` entry point
 //! that the agentic loop calls before every LLM request.
 //!
 //! This replaces the scattered inline assembly with a structured, testable
 //! pipeline invocation that carries forward learned behavior across turns.
 
-use crate::cache_diagnostics::{
-    CacheBreakDetector, CacheBreakDetectorState, DEFAULT_MIN_CACHE_BREAK_TOKENS,
-    PromptStateSnapshot,
-};
+use crate::cache_diagnostics::{CacheBreakDetector, CacheBreakDetectorState, PromptStateSnapshot};
 use crate::compaction_types::CompactionTier;
 use crate::context_feedback::{ContextFeedback, RuntimeFeedbackFrame};
 use crate::context_optimizer::ContextOptimized;
@@ -23,7 +20,6 @@ use crate::context_serializer::SerializedProviderRequest;
 use crate::context_sources::{
     AgentContext, ContextSources, ExternalSources, SessionContext, StaticSections, TurnState,
 };
-use crate::emergent_context::EmergentContext;
 use crate::optimize_limits::OptimizeLimits;
 use crate::pipeline_config::PipelineConfig;
 use crate::pipeline_stats::PipelineStats;
@@ -66,7 +62,7 @@ pub struct TurnOutput {
 
 /// Session-scoped pipeline orchestrator.
 ///
-/// Instantiated once per session. Accumulates statistics, latches, emergent
+/// Instantiated once per session. Accumulates statistics, latches
 /// context, and recovery state across turns. The agentic loop calls
 /// `run_turn()` before each LLM request and `record_feedback()` after.
 pub struct PipelineSession {
@@ -74,7 +70,6 @@ pub struct PipelineSession {
     static_sections: Option<Arc<StaticSections>>,
     pub stats: PipelineStats,
     pub latches: SessionLatches,
-    pub emergent: EmergentContext,
     pub recovery: RecoveryState,
     session_current_date: String,
     working_memory: WorkingMemoryState,
@@ -166,66 +161,7 @@ impl PipelineSession {
             static_sections: None,
             stats: PipelineStats::default(),
             latches: SessionLatches::default(),
-            emergent: EmergentContext::default(),
             recovery: RecoveryState::default(),
-            session_current_date: session_current_date.into(),
-            working_memory: WorkingMemoryState::default(),
-            cache_detector: CacheBreakDetector::new(),
-            pending_prompt_snapshot: None,
-            turns_completed: 0,
-            latest_runtime_feedback: None,
-            provider_cache_observed_since_feedback: false,
-            pending_provider_cache_break: None,
-            pending_audits: Vec::new(),
-        }
-    }
-
-    /// Create a session with pre-loaded stats (warm start from persistence).
-    #[must_use]
-    pub fn with_warm_stats(
-        config: PipelineConfig,
-        stats: PipelineStats,
-        session_current_date: impl Into<String>,
-    ) -> Self {
-        Self {
-            pipeline: ContextPipeline::new(config),
-            static_sections: None,
-            stats,
-            latches: SessionLatches::default(),
-            emergent: EmergentContext::default(),
-            recovery: RecoveryState::default(),
-            session_current_date: session_current_date.into(),
-            working_memory: WorkingMemoryState::default(),
-            cache_detector: CacheBreakDetector::new(),
-            pending_prompt_snapshot: None,
-            turns_completed: 0,
-            latest_runtime_feedback: None,
-            provider_cache_observed_since_feedback: false,
-            pending_provider_cache_break: None,
-            pending_audits: Vec::new(),
-        }
-    }
-
-    /// Create a session restored from a checkpoint (full warm start).
-    ///
-    /// Restores stats (EMA, percentile estimator), latches (frozen headers/scope),
-    /// and recovery state (escalation history). Transient error counters are
-    /// cleared by `deserialize_session_state()` before reaching this constructor.
-    #[must_use]
-    pub fn with_restored_state(
-        config: PipelineConfig,
-        stats: PipelineStats,
-        latches: SessionLatches,
-        recovery: RecoveryState,
-        session_current_date: impl Into<String>,
-    ) -> Self {
-        Self {
-            pipeline: ContextPipeline::new(config),
-            static_sections: None,
-            stats,
-            latches,
-            emergent: EmergentContext::default(),
-            recovery,
             session_current_date: session_current_date.into(),
             working_memory: WorkingMemoryState::default(),
             cache_detector: CacheBreakDetector::new(),
@@ -267,7 +203,6 @@ impl PipelineSession {
             session: input.session,
             turn: input.turn,
             external: input.external,
-            emergent: &self.emergent,
             working_memory: Some(&self.working_memory),
             stats: &self.stats,
         };
@@ -313,7 +248,6 @@ impl PipelineSession {
             session: input.session,
             turn: input.turn,
             external: input.external,
-            emergent: &self.emergent,
             working_memory: Some(&self.working_memory),
             stats: &self.stats,
         };
@@ -448,8 +382,8 @@ impl PipelineSession {
     }
 
     /// Record feedback from the API response. Updates stats, recovery state,
-    /// and enriches `feedback.cache_break_detected` from the pending prompt
-    /// snapshot before persisting the turn into `PipelineStats`.
+    /// and enriches `feedback.cache_break_detected` from physical provider
+    /// observations before persisting the turn into `PipelineStats`.
     ///
     /// Pass `turn_output` to also record per-section token usage (enables
     /// adaptive budget allocation). If unavailable, pass `None`.
@@ -475,34 +409,6 @@ impl PipelineSession {
         if provider_final_observed {
             if let Some(reason) = provider_final_break {
                 feedback.attribute_cache_break(reason);
-            }
-        } else {
-            let had_cache_baseline = pending_snapshot.as_ref().is_some_and(|pending| {
-                self.cache_detector
-                    .snapshot_for_source(&pending.query_source)
-                    .is_some()
-            });
-            if let Some(pending) = pending_snapshot {
-                if let Some(event) = self.cache_detector.record_turn_for_source(
-                    &pending.query_source,
-                    pending.snapshot,
-                    Some(feedback.tokens.cache_read),
-                ) {
-                    feedback.attribute_cache_break(event.reason);
-                } else if !had_cache_baseline {
-                    // First-turn / post-compaction cold starts are expected.
-                } else {
-                    feedback.detect_cache_break(
-                        self.stats.turns_executed + 1,
-                        DEFAULT_MIN_CACHE_BREAK_TOKENS,
-                    );
-                }
-            } else {
-                let _ = query_source;
-                feedback.detect_cache_break(
-                    self.stats.turns_executed + 1,
-                    DEFAULT_MIN_CACHE_BREAK_TOKENS,
-                );
             }
         }
 
@@ -694,70 +600,6 @@ impl PipelineSession {
         self.cache_detector.set_diff_dir(dir);
     }
 
-    // ── Emergent Context Lifecycle ───────────────────────────────────────────
-
-    /// Push a discovered skill into emergent context for the next turn.
-    /// The runtime calls this during tool execution when a skill trigger is detected.
-    pub fn push_emergent_skill(
-        &mut self,
-        skill_name: impl Into<String>,
-        trigger: impl Into<String>,
-        current_turn: u32,
-    ) {
-        use crate::emergent_context::{DiscoveredSkill, EmergentItem};
-        let skill_name = skill_name.into();
-        let hash = content_dedup_hash(&skill_name);
-        self.emergent.push_skill(EmergentItem {
-            value: DiscoveredSkill {
-                skill_name,
-                trigger: trigger.into(),
-            },
-            created_at_turn: current_turn,
-            content_hash: hash,
-        });
-    }
-
-    /// Push prefetched memory into emergent context for the next turn.
-    /// The runtime calls this when memory is fetched concurrently during streaming.
-    pub fn push_emergent_memory(
-        &mut self,
-        content: impl Into<String>,
-        relevance_score: f64,
-        current_turn: u32,
-    ) {
-        use crate::emergent_context::{EmergentItem, PrefetchedMemory};
-        let content = content.into();
-        let hash = content_dedup_hash(&content);
-        self.emergent.push_memory(EmergentItem {
-            value: PrefetchedMemory {
-                content,
-                relevance_score,
-            },
-            created_at_turn: current_turn,
-            content_hash: hash,
-        });
-    }
-
-    /// Push a tool use summary into emergent context for the next turn.
-    pub fn push_emergent_summary(
-        &mut self,
-        summary: impl Into<String>,
-        tool_calls_covered: u32,
-        current_turn: u32,
-    ) {
-        use crate::emergent_context::{EmergentItem, ToolUseSummary};
-        let summary = summary.into();
-        let hash = content_dedup_hash(&summary);
-        self.emergent.push_summary(EmergentItem {
-            value: ToolUseSummary {
-                summary,
-                tool_calls_covered,
-            },
-            created_at_turn: current_turn,
-            content_hash: hash,
-        });
-    }
-
     // ── Session Latches Lifecycle ────────────────────────────────────────────
 
     /// Latch a beta header. Call when the runtime first evaluates a beta feature.
@@ -789,14 +631,13 @@ impl PipelineSession {
     // ── Snapshot & Restore ──────────────────────────────────────────────────
 
     /// Capture a full snapshot of all session-scoped pipeline state.
-    /// Used for checkpoint persistence (includes emergent context).
+    /// Used for checkpoint persistence.
     #[must_use]
     pub fn snapshot_full_state(&self) -> PipelineSessionSnapshot {
         PipelineSessionSnapshot {
             stats: self.stats.clone(),
             latches: self.latches.clone(),
             recovery: self.recovery,
-            emergent: self.emergent.clone(),
             working_memory: self.working_memory.clone(),
             cache_detector_state: self.cache_detector.snapshot_state(),
             pending_prompt_snapshot: self.pending_prompt_snapshot.clone(),
@@ -820,7 +661,6 @@ impl PipelineSession {
             stats,
             latches,
             recovery,
-            emergent,
             working_memory,
             cache_detector_state,
             pending_prompt_snapshot,
@@ -844,7 +684,6 @@ impl PipelineSession {
             static_sections: None,
             stats,
             latches,
-            emergent,
             recovery,
             session_current_date,
             working_memory,
@@ -870,7 +709,6 @@ pub struct PipelineSessionSnapshot {
     pub stats: PipelineStats,
     pub latches: SessionLatches,
     pub recovery: RecoveryState,
-    pub emergent: EmergentContext,
     #[serde(default)]
     pub working_memory: WorkingMemoryState,
     #[serde(default)]
@@ -887,35 +725,6 @@ pub struct PipelineSessionSnapshot {
     pub pending_provider_cache_break: Option<crate::cache_diagnostics::CacheBreakReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_current_date: Option<String>,
-}
-
-/// Summary metrics extracted from pipeline state for cloud_session_facts.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PipelineSessionMetrics {
-    pub avg_cache_hit_ratio: f64,
-    pub total_compactions: u32,
-    pub turns_executed: u32,
-}
-
-impl PipelineSessionMetrics {
-    /// Extract metrics from accumulated pipeline stats.
-    #[must_use]
-    pub fn from_stats(stats: &PipelineStats) -> Self {
-        Self {
-            avg_cache_hit_ratio: stats.avg_cache_hit_ratio,
-            total_compactions: stats.compact_events.len() as u32,
-            turns_executed: stats.turns_executed,
-        }
-    }
-}
-
-/// Stable in-process dedup hash for emergent context items.
-/// Uses DefaultHasher which is fast and sufficient for same-process deduplication.
-fn content_dedup_hash(content: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut hasher);
-    hasher.finish()
 }
 
 impl PendingPromptSnapshot {
@@ -1275,6 +1084,162 @@ mod tests {
     }
 
     #[test]
+    fn runtime_feedback_without_provider_receipt_does_not_invent_cache_observations() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let mut session = test_session_context();
+        let external = test_external();
+        let limits = OptimizeLimits::default();
+        for turn_index in 1..=2 {
+            session.project_context = format!("project revision {turn_index}");
+            let turn = test_turn_state(turn_index);
+            let output = sess
+                .run_turn(TurnInput {
+                    statics: &statics,
+                    agent: &agent,
+                    session: &session,
+                    turn: &turn,
+                    external: &external,
+                    optimize_limits: &limits,
+                    model_id: "model",
+                    query_source: "repl",
+                })
+                .unwrap();
+            let mut frame = crate::introspect::test_runtime_feedback(turn_index, 1, 9);
+            assert!(sess.record_runtime_feedback("repl", &mut frame, Some(&output)));
+            assert!(frame.cache_break_detected.is_none());
+            assert_eq!(sess.cache_detector.stats().total_turns, 0);
+            assert_eq!(sess.cache_detector.stats().cache_hits, 0);
+            assert_eq!(sess.cache_detector.stats().cache_misses, 0);
+            assert_eq!(sess.stats.turns_executed, turn_index);
+            assert_eq!(sess.turns_completed(), turn_index);
+            assert_eq!(sess.latest_runtime_feedback(), Some(&frame));
+        }
+    }
+
+    #[test]
+    fn provider_receipt_requires_dispatch_and_counts_each_identity_once() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context();
+        let external = test_external();
+        let limits = OptimizeLimits::default();
+        let turn = test_turn_state(1);
+        let output = sess
+            .run_turn(TurnInput {
+                statics: &statics,
+                agent: &agent,
+                session: &session,
+                turn: &turn,
+                external: &external,
+                optimize_limits: &limits,
+                model_id: "model",
+                query_source: "repl",
+            })
+            .unwrap();
+        let mut observation = ProviderAttemptCacheObservation {
+            attempt_identity: crate::cache_diagnostics::ProviderAttemptCacheIdentity {
+                request_id: "dispatch-boundary".to_owned(),
+                attempt: 0,
+            },
+            dispatched: false,
+            fingerprint: crate::cache_diagnostics::ProviderFinalPromptFingerprint::default(),
+            cache_read_tokens: None,
+        };
+        assert!(!sess.record_provider_attempt_cache_observation("repl", observation.clone()));
+        observation.dispatched = true;
+        assert!(sess.record_provider_attempt_cache_observation("repl", observation.clone()));
+        observation.cache_read_tokens = Some(0);
+        assert!(!sess.record_provider_attempt_cache_observation("repl", observation));
+        let mut frame = crate::introspect::test_runtime_feedback(1, 1, 9);
+        assert!(sess.record_runtime_feedback("repl", &mut frame, Some(&output)));
+        assert!(frame.cache_break_detected.is_none());
+        assert_eq!(sess.cache_detector.stats().total_turns, 0);
+        assert_eq!(sess.cache_detector.stats().cache_hits, 0);
+        assert_eq!(sess.cache_detector.stats().cache_misses, 0);
+        assert_eq!(sess.stats.turns_executed, 1);
+        assert_eq!(sess.turns_completed(), 1);
+        assert_eq!(sess.latest_runtime_feedback(), Some(&frame));
+    }
+
+    #[test]
+    fn exact_receipt_break_survives_retry_restore_and_feedback_without_usage() {
+        use crate::cache_diagnostics::{
+            CacheBreakReason, ProviderAttemptCacheIdentity, ProviderFinalPromptFingerprint,
+        };
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context();
+        let external = test_external();
+        let limits = OptimizeLimits::default();
+        let turn = test_turn_state(1);
+        let output = sess
+            .run_turn(TurnInput {
+                statics: &statics,
+                agent: &agent,
+                session: &session,
+                turn: &turn,
+                external: &external,
+                optimize_limits: &limits,
+                model_id: "model",
+                query_source: "repl",
+            })
+            .unwrap();
+        let mut retry = None;
+        for (attempt, system, usage) in [
+            (0, "system-v1", Some(0)),
+            (1, "system-v2", Some(0)),
+            (2, "system-v2", Some(u64::MAX)),
+        ] {
+            let observation = ProviderAttemptCacheObservation {
+                attempt_identity: ProviderAttemptCacheIdentity {
+                    request_id: "exact-receipt-retry".into(),
+                    attempt,
+                },
+                dispatched: true,
+                fingerprint: ProviderFinalPromptFingerprint {
+                    cache_key_system_sha256: system.into(),
+                    ..Default::default()
+                },
+                cache_read_tokens: usage,
+            };
+            assert!(sess.record_provider_attempt_cache_observation("repl", observation.clone()));
+            retry = Some(observation);
+        }
+        assert_eq!(sess.cache_detector.stats().total_turns, 3);
+        assert_eq!(sess.cache_detector.stats().cache_hits, 1);
+        assert_eq!(sess.cache_detector.stats().cache_misses, 2);
+        let checkpoint = serde_json::to_vec(&sess.snapshot_full_state()).unwrap();
+        sess = PipelineSession::from_snapshot(
+            PipelineConfig::default(),
+            serde_json::from_slice(&checkpoint).unwrap(),
+            "2026-10-06",
+        );
+        assert!(!sess.record_provider_attempt_cache_observation("repl", retry.unwrap()));
+        let mut frame = crate::introspect::test_runtime_feedback(1, 1, 9);
+        frame.request_usage = None;
+        assert!(sess.record_runtime_feedback("repl", &mut frame, Some(&output)));
+        assert_eq!(
+            frame.cache_break_detected,
+            Some(CacheBreakReason::SystemPromptChanged)
+        );
+        assert_eq!(sess.latest_runtime_feedback(), Some(&frame));
+        assert_eq!(sess.cache_detector.stats().total_turns, 3);
+        assert_eq!(sess.stats.turns_executed, 0);
+        assert_eq!(sess.turns_completed(), 0);
+        assert!(sess.pending_prompt_snapshot.is_none());
+        assert!(sess.pending_provider_cache_break.is_none());
+        let mut next_frame = crate::introspect::test_runtime_feedback(1, 2, 9);
+        assert!(sess.record_runtime_feedback("repl", &mut next_frame, None));
+        assert!(next_frame.cache_break_detected.is_none());
+        assert_eq!(sess.stats.turns_executed, 1);
+        assert_eq!(sess.turns_completed(), 1);
+    }
+
+    #[test]
     fn record_feedback_increments_turns() {
         let mut sess = PipelineSession::new(PipelineConfig::default());
         let mut feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
@@ -1289,20 +1254,6 @@ mod tests {
         let mut feedback = ContextFeedback::from_usage(0, 900, 100, 200, false);
         sess.record_feedback("model", "repl", &mut feedback, None);
         assert!((sess.stats.avg_cache_hit_ratio - 0.9).abs() < 1e-9);
-    }
-
-    #[test]
-    fn warm_start_preserves_stats() {
-        let stats = PipelineStats {
-            turns_executed: 5,
-            avg_cache_hit_ratio: 0.85,
-            ..Default::default()
-        };
-
-        let sess = PipelineSession::with_warm_stats(PipelineConfig::default(), stats, "2026-05-25");
-        assert_eq!(sess.stats.turns_executed, 5);
-        assert!((sess.stats.avg_cache_hit_ratio - 0.85).abs() < 1e-9);
-        assert_eq!(sess.turns_completed(), 0);
     }
 
     #[test]
@@ -1618,10 +1569,46 @@ mod tests {
         assert_eq!(sess.turns_completed(), 1);
         assert!(sess.pending_prompt_snapshot.is_some());
 
+        let mut snapshot_json = serde_json::to_value(sess.snapshot_full_state()).unwrap();
+        assert!(!sess.stats.section_token_history().is_empty());
+        let crate::pipeline_session_serde::RestoreOutcome::Restored(snapshot) =
+            crate::pipeline_session_serde::parse_pipeline_state(Some(&snapshot_json))
+        else {
+            panic!("current nonempty pipeline snapshot must decode");
+        };
         let restored = PipelineSession::from_snapshot(
             PipelineConfig::default(),
-            sess.snapshot_full_state(),
+            *snapshot,
             sess.current_date(),
+        );
+        assert_eq!(
+            restored.stats.section_usage_ema,
+            sess.stats.section_usage_ema
+        );
+        assert_eq!(
+            restored.stats.section_fingerprints,
+            sess.stats.section_fingerprints
+        );
+        assert_eq!(restored.stats.section_churns, sess.stats.section_churns);
+        let mut restored_json = serde_json::to_value(restored.snapshot_full_state()).unwrap();
+        // These maps serialize as unordered arrays; compare their typed values above.
+        for field in [
+            "section_usage_ema",
+            "section_fingerprints",
+            "section_churns",
+        ] {
+            snapshot_json["stats"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            restored_json["stats"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        assert_eq!(
+            restored_json, snapshot_json,
+            "current statistics and pending prompt attribution must round-trip intact"
         );
 
         assert_eq!(restored.turns_completed(), 1);
@@ -1629,29 +1616,6 @@ mod tests {
             restored.pending_prompt_snapshot.is_some(),
             "mid-turn pending prompt snapshot must survive restore for exact cache-break attribution"
         );
-    }
-
-    #[test]
-    fn push_emergent_skill_populates_context() {
-        let mut sess = PipelineSession::new(PipelineConfig::default());
-        assert!(sess.emergent.is_empty());
-
-        sess.push_emergent_skill("code-review", "detected REVIEW keyword", 1);
-        assert!(!sess.emergent.is_empty());
-        assert_eq!(sess.emergent.discovered_skills.len(), 1);
-        assert_eq!(
-            sess.emergent.discovered_skills[0].value.skill_name,
-            "code-review"
-        );
-    }
-
-    #[test]
-    fn push_emergent_memory_deduplicates() {
-        let mut sess = PipelineSession::new(PipelineConfig::default());
-
-        sess.push_emergent_memory("User prefers Rust.", 0.9, 1);
-        sess.push_emergent_memory("User prefers Rust.", 0.95, 1);
-        assert_eq!(sess.emergent.prefetched_memory.len(), 1);
     }
 
     #[test]
@@ -1669,32 +1633,6 @@ mod tests {
         assert!(sess.latch_cache_scope(CacheScope::Global, 1));
         assert!(!sess.latch_cache_scope(CacheScope::Session, 2));
         assert_eq!(sess.latches.cache_scope, Some(CacheScope::Global));
-    }
-
-    #[test]
-    fn emergent_context_available_to_next_turn() {
-        let mut sess = PipelineSession::new(PipelineConfig::default());
-        sess.push_emergent_skill("debug", "error in output", 1);
-
-        let statics = test_statics();
-        let agent = AgentContext::default();
-        let session = test_session_context();
-        let turn = test_turn_state(2);
-        let external = test_external();
-        let limits = OptimizeLimits::default();
-
-        let input = TurnInput {
-            statics: &statics,
-            agent: &agent,
-            session: &session,
-            turn: &turn,
-            external: &external,
-            optimize_limits: &limits,
-            model_id: "model",
-            query_source: "repl",
-        };
-
-        let _output = sess.run_turn(input).expect("should succeed with emergent");
     }
 
     #[test]

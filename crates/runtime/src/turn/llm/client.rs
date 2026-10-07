@@ -680,8 +680,7 @@ impl PreparedProviderRequest {
         protocol: LlmProviderProtocol,
         cache_capability: Option<CacheCapability>,
     ) -> Result<Self, astra_core::ClassifiedError> {
-        let provider_body = body.clone();
-        let encoded = serde_json::to_vec(&provider_body).map_err(|error| {
+        let encoded = serde_json::to_vec(body).map_err(|error| {
             astra_core::history_work::record_serialization_failure(
                 astra_core::history_work::HistoryWorkSite::ProviderBodySerialization,
                 &error,
@@ -699,10 +698,8 @@ impl PreparedProviderRequest {
             );
         }
         let provider_wire_hash = format!("{:x}", Sha256::digest(&encoded));
-        let composition =
-            ProviderWireComposition::from_body(&provider_body, protocol, provider_wire_bytes)?;
-        let fingerprints =
-            ProviderWireFingerprints::from_body(&provider_body, protocol, cache_capability)?;
+        let composition = ProviderWireComposition::from_body(body, protocol, provider_wire_bytes)?;
+        let fingerprints = ProviderWireFingerprints::from_body(body, protocol, cache_capability)?;
         Ok(Self {
             body: Bytes::from(encoded),
             identity: ProviderWireRequestIdentity {
@@ -1120,7 +1117,6 @@ pub(crate) struct LlmCall<'a> {
     pub route: LlmExecutionRoute<'a>,
     pub max_output_tokens: Option<usize>,
     pub temperature: Option<f64>,
-    pub has_fallback: bool,
     pub thinking: &'a ThinkingConfig,
 }
 
@@ -4658,87 +4654,37 @@ pub(crate) async fn call_llm_and_collect(
     call: LlmCall<'_>,
     cancel: LlmCancel<'_>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    call_llm_and_collect_with_stream_callback(call, cancel, None, None).await
+    call_llm_and_collect_with_stream_callback(
+        call,
+        cancel,
+        None,
+        None,
+        RuntimeToolChoice::Auto,
+        None,
+    )
+    .await
 }
 
-/// Ordinary Server inference boundary with automatic tool choice.
+/// Execute one logical provider boundary with explicit tool authority and optional budget.
+/// An explicit budget is a new logical invocation, never a hidden transport retry.
 pub(crate) async fn call_llm_and_collect_with_stream_callback(
     call: LlmCall<'_>,
     cancel: LlmCancel<'_>,
     stream_callback: Option<&mut LlmStreamCallback<'_>>,
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    tool_choice: RuntimeToolChoice,
+    total_budget: Option<std::time::Duration>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    call_llm_and_collect_with_stream_callback_and_tool_choice(
-        call,
-        cancel,
-        stream_callback,
-        attempt_observer,
-        RuntimeToolChoice::Auto,
-    )
-    .await
-}
-
-/// Execute one logical provider boundary with an explicit wall-clock budget.
-/// Used by host-owned recovery slices that must not inherit the ordinary
-/// multi-minute provider allowance. This remains a new logical invocation,
-/// never a hidden transport retry.
-pub(crate) async fn call_llm_and_collect_with_stream_callback_and_budget(
-    call: LlmCall<'_>,
-    cancel: LlmCancel<'_>,
-    stream_callback: Option<&mut LlmStreamCallback<'_>>,
-    attempt_observer: Option<&dyn ProviderAttemptObserver>,
-    total_budget: std::time::Duration,
-) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let total_budget = total_budget.unwrap_or_else(|| match tool_choice {
+        RuntimeToolChoice::Auto => llm_total_budget(),
+        RuntimeToolChoice::None => auxiliary_execution_budget(call.purpose, llm_total_budget()),
+    });
     call_llm_and_collect_with_total_budget(
         call,
         cancel,
         stream_callback,
         attempt_observer,
-        RuntimeToolChoice::Auto,
-        total_budget,
-    )
-    .await
-}
-
-/// Bounded counterpart of the text-only provider boundary. The explicit
-/// choice must survive recovery-budget selection; otherwise a convergence
-/// call can re-authorize schemas that the host deliberately kept inert.
-pub(crate) async fn call_llm_and_collect_with_stream_callback_and_budget_and_no_tool_choice(
-    call: LlmCall<'_>,
-    cancel: LlmCancel<'_>,
-    stream_callback: Option<&mut LlmStreamCallback<'_>>,
-    attempt_observer: Option<&dyn ProviderAttemptObserver>,
-    total_budget: std::time::Duration,
-) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    call_llm_and_collect_with_total_budget(
-        call,
-        cancel,
-        stream_callback,
-        attempt_observer,
-        RuntimeToolChoice::None,
-        total_budget,
-    )
-    .await
-}
-
-/// Keep a stable tool-schema prefix while forbidding tool calls at a bounded
-/// text-only settlement boundary. Providers whose protocol cannot express
-/// this mode must not call this function with a non-empty tool surface.
-pub(crate) async fn call_llm_and_collect_with_stream_callback_and_no_tool_choice(
-    call: LlmCall<'_>,
-    cancel: LlmCancel<'_>,
-    stream_callback: Option<&mut LlmStreamCallback<'_>>,
-    attempt_observer: Option<&dyn ProviderAttemptObserver>,
-) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    // Reuse the provider-attempt deadline owner. Do not put a second timeout
-    // around the durable invocation, which would lose terminal settlement.
-    let total_budget = auxiliary_execution_budget(call.purpose, llm_total_budget());
-    call_llm_and_collect_with_total_budget(
-        call,
-        cancel,
-        stream_callback,
-        attempt_observer,
-        RuntimeToolChoice::None,
+        tool_choice,
         total_budget,
     )
     .await
@@ -4776,27 +4722,9 @@ fn bounded_auxiliary_budget(
 }
 
 #[derive(Clone, Copy)]
-enum RuntimeToolChoice {
+pub(crate) enum RuntimeToolChoice {
     Auto,
     None,
-}
-
-async fn call_llm_and_collect_with_stream_callback_and_tool_choice(
-    call: LlmCall<'_>,
-    cancel: LlmCancel<'_>,
-    stream_callback: Option<&mut LlmStreamCallback<'_>>,
-    attempt_observer: Option<&dyn ProviderAttemptObserver>,
-    tool_choice: RuntimeToolChoice,
-) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    call_llm_and_collect_with_total_budget(
-        call,
-        cancel,
-        stream_callback,
-        attempt_observer,
-        tool_choice,
-        llm_total_budget(),
-    )
-    .await
 }
 
 fn discrete_judgment_provenance(
@@ -4838,7 +4766,6 @@ async fn call_llm_and_collect_with_total_budget(
         route,
         max_output_tokens,
         temperature,
-        has_fallback,
         thinking,
     } = call;
     let configured_temperature = astra_core::model_wire::thinking::configured_temperature(
@@ -5365,7 +5292,7 @@ async fn call_llm_and_collect_with_total_budget(
                                 last_err = error.message.clone();
                                 last_kind = error.kind;
                                 let action =
-                                    cooldown.with(model_key, |c| c.record_429(None, has_fallback));
+                                    cooldown.with(model_key, |c| c.record_429(None));
                                 if has_partial {
                                     return Err(error);
                                 }
@@ -5374,14 +5301,8 @@ async fn call_llm_and_collect_with_total_budget(
                                         retry_delay_override_ms = Some(delay_ms);
                                         continue;
                                     }
-                                    RateLimitAction::UseFallback { reason } => {
-                                        return Err(
-                                            crate::turn::model_cooldown::fallback_required_error(
-                                                error, reason,
-                                            ),
-                                        );
-                                    }
-                                    RateLimitAction::Reject { .. } | RateLimitAction::Proceed => {
+                                    RateLimitAction::Reject { .. }
+                                    | RateLimitAction::Proceed => {
                                         return Err(error);
                                     }
                                 }
@@ -5783,7 +5704,7 @@ async fn call_llm_and_collect_with_total_budget(
                 );
             }
 
-            let action = cooldown.with(model_key, |c| c.record_429(retry_after_ms, has_fallback));
+            let action = cooldown.with(model_key, |c| c.record_429(retry_after_ms));
             astra_core::agent_warn!(
                 "llm",
                 "rate limit (429) on {}: action={:?}",
@@ -5799,12 +5720,6 @@ async fn call_llm_and_collect_with_total_budget(
                     });
                     continue;
                 }
-                RateLimitAction::UseFallback { reason } => {
-                    return Err(crate::turn::model_cooldown::fallback_required_error(
-                        observed_error,
-                        reason,
-                    ));
-                }
                 RateLimitAction::Reject { .. } | RateLimitAction::Proceed => {
                     return Err(observed_error);
                 }
@@ -5816,7 +5731,7 @@ async fn call_llm_and_collect_with_total_budget(
             let observed_error = astra_core::ClassifiedError::new(last_kind, last_err.clone());
             finish_observed_provider_error(attempt_observer, observed_attempt, &observed_error)
                 .await?;
-            let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms, has_fallback));
+            let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms));
             astra_core::agent_warn!(
                 "llm",
                 "server overload ({status}) on {}: action={:?}",
@@ -5827,12 +5742,6 @@ async fn call_llm_and_collect_with_total_budget(
                 RateLimitAction::WaitAndRetry { delay_ms } => {
                     retry_delay_override_ms = Some(delay_ms);
                     continue;
-                }
-                RateLimitAction::UseFallback { reason } => {
-                    return Err(crate::turn::model_cooldown::fallback_required_error(
-                        observed_error,
-                        reason,
-                    ));
                 }
                 RateLimitAction::Reject { .. } | RateLimitAction::Proceed => {
                     return Err(observed_error);
@@ -7255,7 +7164,6 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         route,
         max_output_tokens,
         temperature,
-        has_fallback: _,
         thinking,
     } = call;
     let configured_temperature = astra_core::model_wire::thinking::configured_temperature(
@@ -7360,9 +7268,12 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     if matches!(tool_choice, RuntimeToolChoice::None) {
         apply_no_tool_choice(&mut body, provider, tools)?;
     }
-    if let Some(typesafe_body) = typesafe_body {
-        body = typesafe_body;
-    }
+    let typesafe_contract = if let Some(prepared) = typesafe_body {
+        body = prepared.body;
+        Some(prepared.contract)
+    } else {
+        None
+    };
     let wire_output_limit = provider_request_output_limit(&body);
     let prepared_request = PreparedProviderRequest::from_json_with_cache_capability(
         &body,
@@ -7615,7 +7526,12 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         }
     };
     let mut result = if provider == "typesafe" {
-        match super::typesafe::response(&response_bytes, &body) {
+        match super::typesafe::response(
+            &response_bytes,
+            typesafe_contract
+                .as_ref()
+                .expect("native judgment contract"),
+        ) {
             Ok(result) => result,
             Err(error) => {
                 finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
@@ -8150,14 +8066,15 @@ mod tests {
                     route: route.borrowed(),
                     max_output_tokens: Some(128),
                     temperature: None,
-                    has_fallback: false,
                     thinking: &thinking,
                 };
                 if streaming {
-                    call_llm_and_collect_with_stream_callback_and_no_tool_choice(
+                    call_llm_and_collect_with_stream_callback(
                         call,
                         LlmCancel::None,
                         None,
+                        None,
+                        RuntimeToolChoice::None,
                         None,
                     )
                     .await
@@ -8228,14 +8145,15 @@ mod tests {
                     route: route.borrowed(),
                     max_output_tokens: Some(128),
                     temperature: None,
-                    has_fallback: false,
                     thinking: &ThinkingConfig::Off,
                 };
                 let result = if streaming {
-                    call_llm_and_collect_with_stream_callback_and_no_tool_choice(
+                    call_llm_and_collect_with_stream_callback(
                         call,
                         LlmCancel::None,
                         None,
+                        None,
+                        RuntimeToolChoice::None,
                         None,
                     )
                     .await
@@ -8318,16 +8236,15 @@ mod tests {
             },
             max_output_tokens: Some(1024),
             temperature: None,
-            has_fallback: false,
             thinking: &ThinkingConfig::Off,
         };
-        let result = call_llm_and_collect_with_total_budget(
+        let result = call_llm_and_collect_with_stream_callback(
             call,
             LlmCancel::None,
             None,
             None,
             RuntimeToolChoice::None,
-            std::time::Duration::from_millis(500),
+            Some(std::time::Duration::from_millis(500)),
         )
         .await;
         assert!(matches!(
@@ -8396,7 +8313,6 @@ mod tests {
                 },
                 max_output_tokens: Some(128),
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             };
             let result = if streaming {
@@ -8649,7 +8565,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -8695,7 +8610,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -8762,7 +8676,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -8822,7 +8735,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -8881,7 +8793,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -8959,7 +8870,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::Token(&cancel),
@@ -9028,7 +8938,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::Token(&cancel),
@@ -9094,7 +9003,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::Token(&cancel),
@@ -9167,7 +9075,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::Token(&cancel),
@@ -9232,7 +9139,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::Token(&cancel),
@@ -9276,7 +9182,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -9324,7 +9229,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -9391,7 +9295,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             timeout,
@@ -9483,7 +9386,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -9556,7 +9458,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -11819,7 +11720,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -11877,7 +11777,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -12473,12 +12372,13 @@ mod tests {
                     },
                     max_output_tokens: Some(128),
                     temperature: None,
-                    has_fallback: false,
                     thinking: &ThinkingConfig::Off,
                 },
                 LlmCancel::None,
                 None,
                 Some(&observer),
+                RuntimeToolChoice::Auto,
+                None,
             )
             .await
             .expect("provider call");
@@ -14221,12 +14121,13 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
             None,
             Some(&observer),
+            RuntimeToolChoice::Auto,
+            None,
         )
         .await
         .expect("llm ok");
@@ -14283,12 +14184,13 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
             None,
             Some(&RejectingAttemptObserver),
+            RuntimeToolChoice::Auto,
+            None,
         )
         .await
         .expect_err("provider delivery requires durable attempt admission");
@@ -14331,7 +14233,6 @@ mod tests {
                     },
                     max_output_tokens: None,
                     temperature: None,
-                    has_fallback: false,
                     thinking: &ThinkingConfig::Off,
                 },
                 LlmCancel::Token(&token_for_call),
@@ -14376,7 +14277,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -14418,7 +14318,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -14463,7 +14362,6 @@ mod tests {
                     },
                     max_output_tokens: None,
                     temperature: None,
-                    has_fallback: false,
                     thinking: &ThinkingConfig::Off,
                 },
                 LlmCancel::Token(&token_for_call),
@@ -14538,7 +14436,6 @@ mod tests {
                 },
                 max_output_tokens: Some(1000),
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -14570,7 +14467,6 @@ mod tests {
                 },
                 max_output_tokens: Some(4000),
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -14623,7 +14519,6 @@ mod tests {
                 },
                 max_output_tokens: Some(1000),
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -14690,7 +14585,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -14739,7 +14633,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -14792,7 +14685,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -14839,7 +14731,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -14886,7 +14777,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             };
             let error = if streaming {
@@ -15015,7 +14905,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -15060,7 +14949,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,
@@ -15185,7 +15073,6 @@ mod tests {
                 },
                 max_output_tokens: None,
                 temperature: None,
-                has_fallback: false,
                 thinking: &ThinkingConfig::Off,
             },
             LlmCancel::None,

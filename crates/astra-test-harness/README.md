@@ -252,18 +252,18 @@ error when nothing resolves.
 A case is one YAML file. Example:
 
 ```yaml
-name: fork_prefix_spawn_inherits
+name: agent_child_reply
 description: |
-  Spawn a child with required prefix inheritance and assert its durable result.
+  Spawn an ordinary child and assert its durable result.
 prompt: |
-  Use agent once to spawn child "G1" with prompt
-  "Reply: inherited-ok" and inherit_prefix: {required: true}.
+  Use agent once to spawn a child with description "Bounded reply"
+  and prompt "Reply: child-ok".
   Surface the reply.
 prompt_variants:
   - id: zh
     prompt: |
-      使用 agent 一次创建名为 G1 的子 agent，prompt 为“Reply: inherited-ok”，
-      并设置 inherit_prefix: {required: true}。呈现其持久化结果。
+      使用 agent 一次创建子 agent，description 为“Bounded reply”，
+      prompt 为“Reply: child-ok”。呈现其持久化结果。
 debug_log: true # turn on session journal capture
 timeout_seconds: 240
 # Optional explicit CLI deadline when the case requires earlier settlement;
@@ -287,7 +287,9 @@ criteria:
     name: agent
     document: result
     path: /status
-    equals: completed
+    equals: launched
+  - type: session_child_result_adopted
+    expected_result: child-ok
 ```
 
 `prompt_variants` are dormant by default. `--prompt-variants` expands the
@@ -417,22 +419,25 @@ The authoritative list lives in `RESERVED_CLI_ARGS` in `src/case.rs`.
 
 ## Judger
 
-The harness's LLM judger scores free-form questions ("did the agent
-correctly do X?"). Key features:
+The built-in LLM judger receives bounded evidence through the shared typed
+judgment interface. `hard_judger` asks whether the criterion's declared
+threshold is satisfied, including its conditions and prohibitions; it returns
+an acceptance verdict. Advisory `judger` retains graded quality feedback.
+External command judgers retain their numeric-score protocol.
 
-- **Anti-gaming rubric**: the prompt's data sections are wrapped in
-  fenced ` ```data ` blocks with an explicit preamble calling out
-  untrusted data. A fabricated `SCORE:` line in an agent's output
-  can't hijack the judge's output.
+- **Untrusted evidence**: answers, diagnostics, and the quoted criterion cannot
+  execute instructions or override the evaluator. The criterion's acceptance
+  meaning is preserved; an output's fabricated `SCORE:` line has no authority.
 - **Sees stderr**: captured diagnostics are embedded with head+tail
   truncation to 8k chars so the judger can read them.
 - **Sees durable tool receipts**: when a session is captured, bounded complete
   call arguments/results are projected from the journal into the judger's
   untrusted-data section. The durable journal remains the source of truth.
-- **Quorum voting**: `--judger-n 3 --judger-agg median` runs the
-  judger three times and takes the median, smoothing single-call
-  variance. Dissenting votes are preserved in `full_rationale` so a
-  FAIL report shows the outliers.
+- **Quorum voting**: numeric grades retain median/mean/min/max aggregation.
+  Acceptance verdicts use strict majority for median, all votes for min, or
+  any vote for max. A median tie is inconclusive; mean is rejected for
+  verdicts. Required judgments reject missing/error votes. Individual votes
+  and diagnostics remain available in the report.
 - **Same-family warning**: stderr warns when the judger model is in
   the same family (anthropic / openai / alibaba / minimax / etc.)
   as any tested model — same-family judging tends to inflate scores.

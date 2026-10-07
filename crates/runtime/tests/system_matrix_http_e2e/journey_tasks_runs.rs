@@ -50,7 +50,7 @@ async fn seed_orphan_cancel_race_run(
             checkpoint_json: None,
             error_code: None,
             error_message: None,
-            retry_count: 0,
+
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,
@@ -896,7 +896,7 @@ pub async fn run_paused_accounting_generation_fence_http() {
             checkpoint_json: None,
             error_code: None,
             error_message: None,
-            retry_count: 0,
+
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,

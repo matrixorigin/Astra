@@ -210,3 +210,15 @@ The unused local output-style registry, environment selector and custom style
 file loader are retired. Prompt overrides and admitted profile instructions
 retain their existing owners; request assembly does not infer a style from
 process-local placeholder state.
+
+Serialization consumes `ContextOptimized` and its supplied cache markers.
+The source-only `serialize_prompt_sections` path, which inferred section kinds
+and chose its own markers, is retired. Marker selection remains with the
+optimizer; serialization remaps markers after empty sections are filtered and
+preserves the optimized messages and tool schemas. The duplicate, source-only
+`detect_project_languages` helper is also retired; Edge workspace context
+continues to use `detect_workspace_context`.
+
+The unused `theme::strip_ansi` source API is retired. Terminal rendering tests
+use the same ANSI parser as production width calculation; rendering and
+terminal-control behavior remain unchanged.

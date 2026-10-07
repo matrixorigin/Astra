@@ -151,12 +151,15 @@ impl ServerAgenticLoopHost {
         routing.decision = Some(decision);
         if let Some(admission) = admission {
             self.apply_classified_work_admission(ClassifiedWorkAdmission {
+                // Restored routing/control facts are not a new judgment of
+                // the current human message and must not replay feedback.
+                user_turn_semantics: None,
                 decision: project_complete_admission_effect(admission),
                 delegation_model_requirement: model_requirement,
                 source: rebound_source,
                 work_handoff_pending: true,
             });
-            self.work_admission_attempted = true;
+            self.semantic_judgment_attempted = Some(SemanticJudgmentPurpose::WorkAdmission);
             self.work_admission_skill_revision = skill_revision;
         }
         Ok(true)

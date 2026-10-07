@@ -11,11 +11,8 @@ use astra_runtime::{
 };
 use astra_services::runs::{
     AtomicRunInteractionBatchRegistration, AtomicRunInteractionBatchRegistrationRequest,
-    AtomicRunInteractionWaitRequest, CancelRunRecord, ChatRequestData, ChatRunRecord,
-    ChatStreamRecord, DurableRunInteractionKind, DurableRunInteractionResolveOutcome,
-    DurableRunInteractionWaitOutcome, DurableRunRecord, RunLifecycleService, RunListCursor,
-    RunListRecord, RunMutationRecord, RunStateStore, RunStatusRecord, RunUserIntentData,
-    RunUserIntentRecord,
+    AtomicRunInteractionWaitRequest, DurableRunInteractionKind, DurableRunInteractionWaitOutcome,
+    DurableRunRecord, RunStateStore,
 };
 use astra_services::session_workspace::{WorkspaceMetadata, persist_remote_workspace};
 use astra_services::{
@@ -34,7 +31,6 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use sqlx::Row;
 use test_support::{parse_sse_events, require_db_it_env};
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 const HTTP_TOKEN: &str = "Bearer e2e-joint-token";
@@ -276,7 +272,7 @@ fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRe
         checkpoint_json: None,
         error_code: None,
         error_message: None,
-        retry_count: 0,
+
         total_prompt_tokens: 0,
         total_completion_tokens: 0,
         total_tool_calls: 0,
@@ -546,268 +542,21 @@ impl SessionService for JointSession {
     }
 }
 
-#[derive(Clone)]
-struct JointRunLifecycle {
-    store: Arc<RwLock<DatabaseRunStateStore>>,
-}
-
-impl JointRunLifecycle {
-    async fn store(&self) -> DatabaseRunStateStore {
-        self.store.read().await.clone()
-    }
-}
-
-#[async_trait]
-impl RunLifecycleService for JointRunLifecycle {
-    async fn create_run(
-        &self,
-        _user_id: String,
-        _request: ChatRequestData,
-    ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!("joint E2E creates durable runs directly")
-    }
-
-    async fn stream_chat(
-        &self,
-        _user_id: String,
-        _request: ChatRequestData,
-    ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!("joint E2E streams existing runs only")
-    }
-
-    async fn get_run_status(
-        &self,
-        run_id: String,
-        user_id: String,
-    ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
-        let run = self
-            .store()
-            .await
-            .load_run(&user_id, &run_id)
-            .await
-            .map_err(service_unavailable)?
-            .ok_or_else(|| not_found("run not found"))?;
-        if run.user_id != user_id {
-            return Err(forbidden("run belongs to another user"));
-        }
-        Ok(RunStatusRecord {
-            artifact_publication: None,
-            explain_requested: false,
-            run_id,
-            session_id: run.session_id,
-            parent_run_id: run.parent_run_id,
-            root_run_id: run.root_run_id,
-            depth: run.depth,
-            status: run.status,
-            waiting_for: run.waiting_for,
-            events_count: run.events.len() as i64,
-            workspace: None,
-            executor: None,
-            transport: None,
-            accounting: None,
-        })
-    }
-
-    async fn stream_run(
-        &self,
-        run_id: String,
-        user_id: String,
-        last_index: u32,
-    ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
-        let run = self
-            .store()
-            .await
-            .load_run(&user_id, &run_id)
-            .await
-            .map_err(service_unavailable)?
-            .ok_or_else(|| not_found("run not found"))?;
-        if run.user_id != user_id {
-            return Err(forbidden("run belongs to another user"));
-        }
-        Ok(astra_services::runs::DurableRunEventDelta {
-            session_id: run.session_id,
-            status: run.status,
-            last_event_idx: run.last_event_idx,
-            events: run.events.into_iter().skip(last_index as usize).collect(),
-        })
-    }
-
-    async fn get_run_interaction_event(
-        &self,
-        run_id: String,
-        user_id: String,
-        request_id: String,
-        event_type: String,
-    ) -> Result<Option<Value>, (StatusCode, Json<ErrorResponse>)> {
-        self.store()
-            .await
-            .load_run_interaction_event(&user_id, &run_id, &request_id, &event_type)
-            .await
-            .map_err(service_unavailable)
-    }
-
-    async fn resolve_run_interaction(
-        &self,
-        run_id: String,
-        user_id: String,
-        expected_session_id: String,
-        request_id: String,
-        kind: DurableRunInteractionKind,
-        response_data: Value,
-    ) -> Result<DurableRunInteractionResolveOutcome, (StatusCode, Json<ErrorResponse>)> {
-        let store = self.store().await;
-        store
-            .resolve_run_interaction(
-                &user_id,
-                &expected_session_id,
-                &run_id,
-                &request_id,
-                kind,
-                response_data,
-            )
-            .await
-            .map_err(service_unavailable)
-    }
-
-    async fn cancel_run(
-        &self,
-        run_id: String,
-        user_id: String,
-    ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        let store = self.store().await;
-        let run = store
-            .load_run(&user_id, &run_id)
-            .await
-            .map_err(service_unavailable)?
-            .ok_or_else(|| not_found("run not found"))?;
-        store
-            .update_run_status(&user_id, &run.session_id, &run_id, "cancelled", None, None)
-            .await
-            .map_err(service_unavailable)?;
-        Ok(CancelRunRecord {
-            run_id,
-            status: "cancelled".to_string(),
-            execution_settled: true,
-        })
-    }
-
-    async fn list_runs_cursor(
-        &self,
-        _user_id: String,
-        limit: u32,
-        _cursor: Option<RunListCursor>,
-    ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
-        Ok(RunListRecord {
-            runs: Vec::new(),
-            total: None,
-            limit,
-            next_cursor: None,
-        })
-    }
-
-    async fn submit_run_user_intent(
-        &self,
-        run_id: String,
-        user_id: String,
-        input: RunUserIntentData,
-    ) -> Result<RunUserIntentRecord, (StatusCode, Json<ErrorResponse>)> {
-        let intent_id = input.intent_id.clone();
-        let store = self.store().await;
-        let run = store
-            .load_run(&user_id, &run_id)
-            .await
-            .map_err(service_unavailable)?
-            .ok_or_else(|| not_found("run not found"))?;
-        if run.user_id != user_id {
-            return Err(forbidden("run belongs to another user"));
-        }
-        let duplicate = run.events.iter().any(|event| {
-            event
-                .get("data")
-                .and_then(|data| data.get("intent_id"))
-                .and_then(Value::as_str)
-                == Some(input.intent_id.as_str())
-        });
-        if !duplicate {
-            store
-                .append_event(
-                    &user_id,
-                    &run.session_id,
-                    &run_id,
-                    json!({
-                        "event_type": "user_intent",
-                        "data": {
-                            "intent_id": input.intent_id,
-                            "delivery": input.delivery,
-                            "input": input.input,
-                        },
-                    }),
-                )
-                .await
-                .map_err(service_unavailable)?;
-        }
-        Ok(RunUserIntentRecord {
-            run_id,
-            intent_id,
-            status: astra_turn_types::UserIntentStatus::AcceptedRemote,
-            duplicate,
-            event_index: 0,
-        })
-    }
-
-    async fn pause_run(
-        &self,
-        run_id: String,
-        user_id: String,
-    ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
-        let store = self.store().await;
-        let run = store
-            .load_run(&user_id, &run_id)
-            .await
-            .map_err(service_unavailable)?
-            .ok_or_else(|| not_found("run not found"))?;
-        store
-            .update_run_status(
-                &user_id,
-                &run.session_id,
-                &run_id,
-                "waiting",
-                Some("user"),
-                None,
-            )
-            .await
-            .map_err(service_unavailable)?;
-        Ok(RunMutationRecord::applied(run_id, "waiting", "running"))
-    }
-}
-
-fn service_unavailable(message: String) -> (StatusCode, Json<ErrorResponse>) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse::new(message)),
+fn build_joint_app(pool: SharedPool, user_id: String, store: DatabaseRunStateStore) -> Router {
+    let lifecycle = astra_runtime::AgenticRunLifecycleService::new(
+        pool.settings().clone(),
+        test_support::test_fernet_encryptor("joint-durability-fixture"),
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        astra_runtime::RunEngine::new(Arc::new(store)),
     )
-}
-
-fn not_found(message: &str) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::NOT_FOUND, Json(ErrorResponse::new(message)))
-}
-
-fn forbidden(message: &str) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::FORBIDDEN, Json(ErrorResponse::new(message)))
-}
-
-fn build_joint_app(
-    pool: SharedPool,
-    user_id: String,
-    store: Arc<RwLock<DatabaseRunStateStore>>,
-) -> Router {
+    .with_pool(pool.clone());
     let state = AppState::new(ServiceInfo::default(), Arc::new(JointHealth))
         .with_shared_pool(pool)
         .with_auth_service(Arc::new(JointAuth {
             user_id: user_id.clone(),
         }))
         .with_session_service(Arc::new(JointSession { user_id }))
-        .with_run_lifecycle_service(Arc::new(JointRunLifecycle { store }));
+        .with_run_lifecycle_service(Arc::new(lifecycle));
     build_app(state)
 }
 
@@ -867,7 +616,7 @@ async fn get_stream(
 ) -> Vec<Value> {
     let response = client
         .get(format!(
-            "http://{base}/chat/runs/{run_id}/stream?last_index={last_index}"
+            "http://{base}/chat/runs/{run_id}/stream?last_index={last_index}&replay_only=true"
         ))
         .header("authorization", HTTP_TOKEN)
         .send()
@@ -1112,8 +861,8 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
         .insert_run(durable_record(&run_id, &session_id, &user_id))
         .await
         .expect("S04 initial durable run insert must succeed");
-    let shared_store = Arc::new(RwLock::new(initial_store.clone()));
-    let app = build_joint_app(pool.clone(), user_id.clone(), shared_store.clone());
+    let mut writer_store = initial_store.clone();
+    let app = build_joint_app(pool.clone(), user_id.clone(), writer_store.clone());
     let (addr, handle) = spawn_tcp_router(app).await;
     let client = local_client();
     let mut seen = BTreeSet::new();
@@ -1130,7 +879,7 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
             .expect("S04 simulated dropped SSE request must reach router");
         drop(dropped);
 
-        let store = shared_store.read().await.clone();
+        let store = writer_store.clone();
         store
             .append_event(
                 &user_id,
@@ -1166,23 +915,28 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
                 won,
                 "S04 replacement pod must take over agent_runs lease after simulated restart"
             );
-            *shared_store.write().await = replacement;
+            writer_store = replacement;
         }
 
         if reconnect == 5 || reconnect == 12 {
             let approval_id = id("approval");
-            let store = shared_store.read().await.clone();
-            store
-                .update_run_status(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    "waiting",
-                    Some("approval"),
-                    None,
-                )
-                .await
-                .expect("S04 approval pause must persist waiting status");
+            let store = writer_store.clone();
+            assert!(
+                store
+                    .update_run_status_with_events_if_current(
+                        &user_id,
+                        &session_id,
+                        &run_id,
+                        &[if reconnect == 5 { "running" } else { "waiting" }],
+                        None,
+                        "waiting",
+                        Some("approval"),
+                        None,
+                        &[]
+                    )
+                    .await
+                    .expect("S04 approval pause must persist waiting status")
+            );
             store
                 .append_event(
                     &user_id,
@@ -1217,7 +971,7 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
         );
     }
 
-    let store = shared_store.read().await.clone();
+    let store = writer_store.clone();
     store
         .append_event(
             &user_id,
@@ -1227,10 +981,26 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
         )
         .await
         .expect("S04 final run_finished event must persist");
-    store
-        .update_run_status(&user_id, &session_id, &run_id, "completed", None, None)
-        .await
-        .expect("S04 final completed status must persist");
+    assert!(
+        store
+            .update_run_status_with_events_if_current(
+                &user_id,
+                &session_id,
+                &run_id,
+                &["waiting"],
+                None,
+                "completed",
+                None,
+                None,
+                &[]
+            )
+            .await
+            .expect("S04 final completed status must persist")
+    );
+    let terminal = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+    assert_eq!(terminal.status, "completed");
+    assert!(terminal.waiting_for.is_none());
+
     absorb_sse_events(
         get_stream(&client, addr, &run_id, next_index).await,
         &mut seen,
@@ -1339,11 +1109,7 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     )
     .await;
 
-    let owner_app = build_joint_app(
-        pool.clone(),
-        user_id.clone(),
-        Arc::new(RwLock::new(owner_store.clone())),
-    );
+    let owner_app = build_joint_app(pool.clone(), user_id.clone(), owner_store.clone());
     let (owner_addr, owner_handle) = spawn_tcp_router(owner_app).await;
     let client = local_client();
     let pending = get_stream(&client, owner_addr, &approval_run_id, 0).await;
@@ -1366,16 +1132,12 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
         DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("server-only-callback-pod-b");
     let callback_c =
         DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("server-only-callback-pod-c");
-    let (callback_b_addr, callback_b_handle) = spawn_tcp_router(build_joint_app(
-        pool.clone(),
-        user_id.clone(),
-        Arc::new(RwLock::new(callback_b)),
-    ))
-    .await;
+    let (callback_b_addr, callback_b_handle) =
+        spawn_tcp_router(build_joint_app(pool.clone(), user_id.clone(), callback_b)).await;
     let (callback_c_addr, callback_c_handle) = spawn_tcp_router(build_joint_app(
         pool.clone(),
         user_id.clone(),
-        Arc::new(RwLock::new(callback_c.clone())),
+        callback_c.clone(),
     ))
     .await;
     let approval_body = json!({
@@ -1527,7 +1289,7 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     let (callback_d_addr, callback_d_handle) = spawn_tcp_router(build_joint_app(
         pool.clone(),
         user_id.clone(),
-        Arc::new(RwLock::new(callback_d.clone())),
+        callback_d.clone(),
     ))
     .await;
     let (retry_status, retry_payload) = post_json(
@@ -1679,13 +1441,16 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
         .await
         .expect("S07 durable run insert must succeed");
     store
-        .update_run_status(
+        .update_run_status_with_events_if_current(
             &user_id,
             &session_id,
             &run_id,
+            &["running"],
+            None,
             "waiting",
             Some("approval"),
             None,
+            &[],
         )
         .await
         .expect("S07 approval waiting status must persist");
@@ -1707,8 +1472,8 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
         .await
         .expect("S07 approval_request event must persist");
 
-    let shared_store = Arc::new(RwLock::new(store));
-    let app = build_joint_app(pool.clone(), user_id.clone(), shared_store.clone());
+    let mut writer_store = store;
+    let app = build_joint_app(pool.clone(), user_id.clone(), writer_store.clone());
     let (addr, handle) = spawn_tcp_router(app).await;
     let client = local_client();
     let initial_events = get_stream(&client, addr, &run_id, 0).await;
@@ -1737,7 +1502,7 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
             loaded.status,
             loaded.waiting_for
         );
-        *shared_store.write().await = replacement;
+        writer_store = replacement;
     }
 
     sqlx::query(
@@ -1808,7 +1573,7 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
         json!({"content": "continue with the approved release conditions"}),
     )
     .await;
-    let final_store = shared_store.read().await.clone();
+    let final_store = writer_store.clone();
     final_store
         .append_event(
             &user_id,
@@ -1827,10 +1592,29 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
         )
         .await
         .expect("S07 run_finished must persist");
-    final_store
-        .update_run_status(&user_id, &session_id, &run_id, "completed", None, None)
+    assert!(
+        final_store
+            .update_run_status_with_events_if_current(
+                &user_id,
+                &session_id,
+                &run_id,
+                &["waiting"],
+                None,
+                "completed",
+                None,
+                None,
+                &[]
+            )
+            .await
+            .expect("S07 completed status must persist")
+    );
+    let terminal = final_store
+        .load_run(&user_id, &run_id)
         .await
-        .expect("S07 completed status must persist");
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.status, "completed");
+    assert!(terminal.waiting_for.is_none());
 
     let row = sqlx::query(
         "SELECT payload_json FROM session_state_items
@@ -1960,8 +1744,7 @@ async fn e2e_joint_4_s10_five_level_delegation_and_retry_node() {
     .await;
 
     let store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("joint-delegation");
-    let shared_store = Arc::new(RwLock::new(store));
-    let app = build_joint_app(pool.clone(), user_id.clone(), shared_store);
+    let app = build_joint_app(pool.clone(), user_id.clone(), store);
     let (addr, handle) = spawn_tcp_router(app).await;
     let client = local_client();
     let health = client
@@ -2234,8 +2017,7 @@ async fn four_devices_hydrate_revoke_and_receive_lease_expiry_events() {
         .await
         .expect("S14 context manifest insert must succeed");
 
-    let shared_store = Arc::new(RwLock::new(store));
-    let app = build_joint_app(pool.clone(), user_id.clone(), shared_store);
+    let app = build_joint_app(pool.clone(), user_id.clone(), store);
     let (addr, handle) = spawn_tcp_router(app).await;
     let client = local_client();
 

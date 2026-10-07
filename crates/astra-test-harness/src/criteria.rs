@@ -401,7 +401,9 @@ pub enum Criterion {
     /// LLM judger whose result is a required product assertion rather than
     /// advisory quality feedback. Use this when a remote side effect has no
     /// deterministic receipt in the chat envelope (for example a memory
-    /// purge) and a failed judgement must fail the case.
+    /// purge) and a failed judgement must fail the case. The built-in backend
+    /// asks directly whether the evidence meets this criterion at its threshold;
+    /// it returns a verdict rather than an advisory quality grade.
     HardJudger {
         question: String,
         #[serde(default = "default_judger_threshold")]
