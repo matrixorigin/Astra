@@ -161,6 +161,8 @@ pub struct ServerSkillSubRunExecutor {
     run_engine: Option<crate::server::run::engine::RunEngine>,
     /// Normalized execution material inherited from the admitted parent run.
     admitted_model_execution: Option<AdmittedModelExecution>,
+    /// Frozen parent completion obligations; absence never grants an empty contract.
+    completion_checks: Option<astra_turn_types::StopHookObligations>,
     /// Edge tools available to sub-runs (inherited from parent host).
     edge_tools: Vec<Value>,
     /// Edge profile (cwd, git_branch, etc.) inherited from parent.
@@ -299,6 +301,7 @@ impl ServerSkillSubRunExecutor {
             default_model: None,
             run_engine: None,
             admitted_model_execution: None,
+            completion_checks: None,
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
             execution_binding_snapshot: None,
@@ -343,6 +346,14 @@ impl ServerSkillSubRunExecutor {
 
     pub fn with_pool(mut self, pool: Option<SharedPool>) -> Self {
         self.shared_pool = pool;
+        self
+    }
+
+    pub(crate) fn with_completion_checks(
+        mut self,
+        checks: astra_turn_types::StopHookObligations,
+    ) -> Self {
+        self.completion_checks = Some(checks);
         self
     }
 
@@ -869,6 +880,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             .ok_or_else(|| {
                 "forked skill execution is missing its parent turn-chain authority".to_string()
             })?;
+        let completion_checks = self.completion_checks.as_ref().ok_or_else(|| {
+            "forked skill execution is missing its frozen parent completion contract".to_string()
+        })?;
         let outer_identity = ToolInvocationIdentity::new(
             &self.user_id,
             &self.session_id,
@@ -1083,14 +1097,18 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         let (agentic_turn_budget, max_turn_input_tokens) =
             self.resolve_execution_policy(task_profile, runtime_ceiling, effective_model.as_deref(), admitted_model_execution.as_ref())?;
         let initial_turns = agentic_turn_budget.initial_turns;
-        let workspace_root_hint = self
-            .edge_profile
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(String::from);
-
-        let (tool_event_hooks, session_event_hooks) = workspace_root_hint
+        let stop_hooks = completion_checks.declarations.clone().into_selected(
+            completion_checks.phase == astra_turn_types::CompletionCheckPhase::TaskCompleted,
+            task_profile.verification_required,
+        );
+        let workspace_root_hint = self.execution_binding_snapshot
+            .as_ref().and_then(|bindings| bindings.workspace.cwd.clone());
+        let (tool_event_hooks, session_event_hooks) = self.execution_binding_snapshot
             .as_ref()
+            .filter(|bindings| bindings.workspace.kind == crate::server::tool_execution_binding::WorkspaceBindingKind::ServerSandbox
+                && bindings.executor.kind == crate::server::tool_execution_binding::ExecutorBindingKind::ServerLocal
+                && bindings.executor.transport == crate::server::tool_execution_binding::ToolTransportKind::ServerLocal)
+            .and_then(|bindings| bindings.workspace.cwd.as_deref())
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
 
@@ -1130,6 +1148,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 ..Default::default()
             },
             hooks: StopHookState {
+                declarations: completion_checks.declarations.clone(),
+                phase: completion_checks.phase,
+                stop_hooks,
                 workspace_root_hint,
                 forward_headers: self.forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.clone(),
@@ -1360,20 +1381,39 @@ mod tests {
                 "arguments":json!({"path":path}).to_string()}})
             })
             .collect();
-        let allowed_tools = vec!["read_file".to_string()];
+        let allowed_tools = vec!["read_file".to_string(), "bash".to_string()];
+        let verification_call = |id: &str| {
+            json!({"id":id,"type":"function","function":{
+                "name":"bash","arguments":json!({"command":"true"}).to_string()
+            }})
+        };
+        let mut first_calls = reads.clone();
+        first_calls.push(verification_call("first-fork-check"));
         let read = ProviderResponse::OpenAi(json!({
             "id":"fork-first-read","model":"genesis-wire-model",
-            "choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":reads},"finish_reason":"tool_calls"}],
+            "choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":first_calls},"finish_reason":"tool_calls"}],
             "usage":{"prompt_tokens":17,"completion_tokens":5,"total_tokens":22}
         }));
         let gateway = ProviderGateway::start(vec![ProviderScript::new(
             "two actual skill forks", |request| request.path == "/v1/chat/completions"
                 && request.body["model"] == "genesis-wire-model",
-            std::iter::once(read).chain(["first", "second"].into_iter().map(|name| ProviderResponse::OpenAi(json!({
-                "id":format!("fork-{name}"),"model":"genesis-wire-model",
-                "choices":[{"index":0,"message":{"role":"assistant","content":format!("{name} explanation is complete.")},"finish_reason":"stop"}],
-                "usage":{"prompt_tokens":17,"completion_tokens":5,"total_tokens":22}
-            })))).collect(),
+            vec![read,
+                ProviderResponse::OpenAi(json!({
+                    "id":"fork-first","model":"genesis-wire-model",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"first explanation is complete."},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":17,"completion_tokens":5,"total_tokens":22}
+                })),
+                ProviderResponse::OpenAi(json!({
+                    "id":"fork-second-check","model":"genesis-wire-model",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[verification_call("second-fork-check")]},"finish_reason":"tool_calls"}],
+                    "usage":{"prompt_tokens":17,"completion_tokens":5,"total_tokens":22}
+                })),
+                ProviderResponse::OpenAi(json!({
+                    "id":"fork-second","model":"genesis-wire-model",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"second explanation is complete."},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":17,"completion_tokens":5,"total_tokens":22}
+                })),
+            ],
         )]).await;
         let mut execution = genesis_execution();
         execution.base_url = format!("{}/v1", gateway.base_url);
@@ -1402,8 +1442,33 @@ mod tests {
         .with_edge_tools(vec![json!({"type":"function","function":{
             "name":"read_file","description":"Read facts from the selected sandbox.",
             "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+        }}), json!({"type":"function","function":{
+            "name":"bash","description":"Run an admitted command in the selected sandbox.",
+            "parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
         }})])
         .with_admitted_model_execution(Some(execution))
+        .with_completion_checks(astra_turn_types::StopHookObligations {
+            declarations: astra_turn_types::CompletionCheckDeclarations {
+                stop: vec![astra_turn_types::StopHook {
+                    label: "wrong-parent-phase".into(), command: "false".into(),
+                    working_dir: None, depends_on: Vec::new(), timeout_secs: None,
+                    authoritative: true,
+                }],
+                task_completed: vec![
+                    astra_turn_types::StopHook {
+                        label: "child-completion".into(), command: "true".into(),
+                        working_dir: None, depends_on: Vec::new(), timeout_secs: None,
+                        authoritative: true,
+                    },
+                    astra_turn_types::StopHook {
+                        label: "advisory-for-work-profile".into(), command: "printf work-advisory".into(),
+                        working_dir: None, depends_on: Vec::new(), timeout_secs: None,
+                        authoritative: false,
+                    },
+                ],
+            },
+            phase: astra_turn_types::CompletionCheckPhase::TaskCompleted,
+        })
         .with_parent_invocation_authority(
             parent.into(),
             parent_record.run_generation,
@@ -1451,6 +1516,26 @@ mod tests {
                 .expect_err("fork identity must be validated at the real executor entrypoint");
             assert!(error.contains(reason), "{error}");
         }
+        let frozen = executor.completion_checks.take();
+        let record = engine.load_run(USER_ID, parent).await.unwrap().unwrap();
+        let error = executor
+            .execute_skill_subrun(
+                "explanation",
+                "Explain only; do not modify files.",
+                TASK,
+                Some(4096),
+                &allowed_tools,
+                0,
+                None,
+                None,
+                Some("missing-contract"),
+                Some(record.last_event_idx),
+                Some("parent-chain"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("frozen parent completion contract"));
+        executor.completion_checks = frozen;
         assert!(gateway.requests.lock().await.is_empty());
         assert!(inference.admissions().is_empty());
         assert_eq!(inference.attempt_count(), 0);
@@ -1477,8 +1562,14 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            assert_eq!(
+                result.outcome,
+                SubRunOutcome::Completed,
+                "{name}: {:?}",
+                result.outcome
+            );
             assert_eq!(result.output, format!("{name} explanation is complete."));
-            assert_eq!(result.tokens_used, if name == "first" { 44 } else { 22 });
+            assert_eq!(result.tokens_used, 44);
         }
         let record = engine.load_run(USER_ID, parent).await.unwrap().unwrap();
         let replay = executor
@@ -1497,13 +1588,14 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(replay.outcome, SubRunOutcome::Completed);
         assert_eq!(replay.output, "first explanation is complete.");
         assert_eq!(replay.tokens_used, 44);
         gateway.assert_complete();
         inference.assert_quiescent();
-        assert_eq!(inference.attempt_count(), 3);
+        assert_eq!(inference.attempt_count(), 4);
         let admissions = inference.admissions();
-        assert_eq!(admissions.len(), 3);
+        assert_eq!(admissions.len(), 4);
         let operations: std::collections::HashSet<_> = admissions
             .iter()
             .map(|(scope, _)| scope.operation_id())
@@ -1525,7 +1617,7 @@ mod tests {
             );
         }
         let requests = gateway.requests.lock().await;
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         let first_followup = requests[1].body["messages"].as_array().unwrap();
         for call in &reads {
             assert!(
@@ -1559,7 +1651,35 @@ mod tests {
         );
         assert!(!second_wire.contains("first-fork-read"));
         assert!(!second_wire.contains(SECRET));
+        for (index, invocation) in [(1, "first-fork-check"), (3, "second-fork-check")] {
+            assert!(
+                requests[index].body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["role"] == "tool"
+                        && message["tool_call_id"] == invocation
+                        && !message["content"].as_str().unwrap().contains("Error")),
+                "the declared check must execute through the selected tool boundary: {:?}",
+                requests[index].body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|message| message["tool_call_id"] == invocation)
+                    .map(|message| &message["content"])
+            );
+        }
         for request in requests.iter() {
+            let wire = request.body["messages"].to_string();
+            assert!(
+                wire.contains("child-completion"),
+                "fork must preserve the parent phase"
+            );
+            assert!(!wire.contains("wrong-parent-phase"));
+            assert!(
+                !wire.contains("advisory-for-work-profile"),
+                "child profile filters advisory checks"
+            );
             assert!(!request.body.to_string().contains("first-outer-call"));
             assert!(!request.body.to_string().contains("parent-chain"));
         }
@@ -1682,6 +1802,7 @@ mod tests {
         })])
         .with_admitted_model_execution(Some(execution))
         .with_inherited_permissions(inherited_permissions)
+        .with_completion_checks(Default::default())
         .with_parent_invocation_authority(
             parent.into(),
             parent_record.run_generation,
@@ -2175,6 +2296,7 @@ mod tests {
             "test-user".to_string(),
             "test-session".to_string(),
         )
+        .with_completion_checks(Default::default())
         .with_parent_invocation_authority(
             "fork-parent-run".to_string(),
             0,

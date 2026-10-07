@@ -992,6 +992,7 @@ impl CliServerAdmissionHost<'_> {
         macro_rules! fetch_turn_sse {
             () => {
                 fetch_chat_turn_sse(ChatTurnSseFetchRequest {
+                    completion_checks: Some(&state.completion_checks),
                     tool_surface_config: &self.runtime_config.tool_surface,
                     api: self.api,
                     token: self.token.as_str(),

@@ -23,7 +23,7 @@ pub(crate) enum ServerBashExecutionMode {
 }
 
 /// Maximum allowed length for a bash command string (100 KB).
-pub(crate) const MAX_COMMAND_LENGTH: usize = 100 * 1024;
+pub(crate) use astra_core::MAX_SHELL_COMMAND_BYTES as MAX_COMMAND_LENGTH;
 
 pub(crate) fn server_bash_execution_mode(policy: &SandboxPolicy) -> ServerBashExecutionMode {
     match policy.isolation {

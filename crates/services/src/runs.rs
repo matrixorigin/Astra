@@ -1169,6 +1169,8 @@ impl AgentProfileSnapshot {
 
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
+    /// Completion declarations; these never grant tool execution permission.
+    pub completion_checks: Option<astra_turn_types::CompletionCheckDeclarations>,
     /// Server authentication provenance; no transport may supply this field.
     /// This is not a continuation grant or current execution authorization.
     pub execution_authentication: Option<crate::auth::ExecutionAuthenticationProvenance>,
@@ -1272,6 +1274,7 @@ impl std::fmt::Debug for RedactedForwardHeadersDebug<'_> {
 impl std::fmt::Debug for ChatRequestData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChatRequestData")
+            .field("completion_checks", &self.completion_checks)
             .field("message", &self.message)
             .field("user_intent", &self.user_intent)
             .field("parts", &self.parts)
@@ -25274,6 +25277,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         let is_explain_analyze = client_type == "explain_analyze";
         let is_runtime_feedback = client_type == "runtime_feedback";
         let is_stream_gap = client_type == "stream_gap";
+        let is_execution_binding = matches!(client_type, "workspace_bound" | "executor_bound");
         if is_external {
             return if client_type == "artifact_publication" {
                 project_artifact_publication(event)
@@ -25287,6 +25291,8 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 project_runtime_feedback(event)
             } else if is_stream_gap {
                 project_stream_gap(event)
+            } else if is_execution_binding {
+                project_execution_binding(event)
             } else {
                 event
             };
@@ -25318,6 +25324,14 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             | "reasoning_done"
     );
     let mut projected = match event_type {
+        "workspace_bound" | "executor_bound" => {
+            let mut wire = serde_json::Value::Object(data);
+            wire["type"] = event_type.into();
+            if let Some(index) = event.get("index") {
+                wire["index"] = index.clone();
+            }
+            project_execution_binding(wire)
+        }
         "text_delta" => serde_json::json!({
             "type": "text_delta",
             "content": data.get("chunk").cloned().unwrap_or(serde_json::Value::String(String::new())),
@@ -25826,6 +25840,29 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         projected["model_item_id"] = id;
     }
     projected
+}
+
+/// Binding receipts expose routing facts, never internal completion contracts.
+fn project_execution_binding(event: serde_json::Value) -> serde_json::Value {
+    let Some(source) = event.as_object() else {
+        return serde_json::Value::Null;
+    };
+    let mut out = serde_json::Map::new();
+    for key in [
+        "type",
+        "run_id",
+        "session_id",
+        "workspace",
+        "executor",
+        "transport",
+        "capacity_provider_coverage",
+        "route",
+        "fallback_policy",
+        "index",
+    ] {
+        insert_if_present(&mut out, source, key);
+    }
+    serde_json::Value::Object(out)
 }
 
 /// The live Work board is a bounded, versioned protocol receipt. Project its
@@ -38632,6 +38669,43 @@ mod tests {
     }
 
     #[test]
+    fn execution_binding_live_and_replay_hide_internal_completion_contract() {
+        for kind in ["workspace_bound", "executor_bound"] {
+            let data = json!({
+                "run_id": "run", "session_id": "session",
+                "workspace": {"kind": "none"},
+                "executor": {"kind": "server_local", "executor_id": "server-control-plane"},
+                "transport": "server_local",
+                "capacity_provider_coverage": [{"provider": "server", "status": "ready"}],
+                "route": "server_local", "fallback_policy": "deny", "index": 7,
+                "completion_checks": {"declarations": {"stop": [], "task_completed": []}, "phase": "stop"},
+                "idempotency_key": "private-key",
+                "runtime": {"runtime_id": "private-runtime"},
+            });
+            let mut live = data.clone();
+            live["type"] = kind.into();
+            let live = transform_run_event_for_client(live);
+            let replay = transform_run_event_for_client(
+                json!({"event_type": kind, "index": 7, "data": data}),
+            );
+            assert_eq!(live, replay);
+            assert_eq!(live["run_id"], "run");
+            assert_eq!(live["workspace"]["kind"], "none");
+            assert_eq!(live["executor"]["executor_id"], "server-control-plane");
+            assert_eq!(
+                live["capacity_provider_coverage"].as_array().unwrap().len(),
+                1
+            );
+            assert_eq!(live["route"], "server_local");
+            assert_eq!(live["fallback_policy"], "deny");
+            assert_eq!(live["index"], 7);
+            assert!(live.get("completion_checks").is_none());
+            assert!(live.get("idempotency_key").is_none());
+            assert!(live.get("runtime").is_none());
+        }
+    }
+
+    #[test]
     fn event_transform_to_client_surface_covers_all_event_types() {
         type EventTransformCase<'a> = (&'a str, serde_json::Value, &'a dyn Fn(&serde_json::Value));
         let cases: Vec<EventTransformCase<'_>> = vec![
@@ -39281,6 +39355,7 @@ mod tests {
         forward_headers.insert("__astra_connection_tokens".to_string(), "x-hop".to_string());
 
         let request = ChatRequestData {
+            completion_checks: None,
             agent_profile_selection: None,
             admitted_agent_profiles: None,
             model_catalog_reader: None,
@@ -39492,6 +39567,7 @@ mod tests {
     #[test]
     fn chat_request_data_debug_redacts_runtime_auth_value() {
         let request = ChatRequestData {
+            completion_checks: None,
             agent_profile_selection: None,
             admitted_agent_profiles: None,
             model_catalog_reader: None,
@@ -39619,6 +39695,7 @@ mod tests {
             .create_run(
                 "u1".to_string(),
                 ChatRequestData {
+                    completion_checks: None,
                     agent_profile_selection: None,
                     admitted_agent_profiles: None,
                     model_catalog_reader: None,

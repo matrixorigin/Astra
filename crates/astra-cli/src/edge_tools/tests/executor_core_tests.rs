@@ -139,9 +139,8 @@ async fn unsupported_session_state_actions_are_rejected_on_cli_edge_executor() {
     }
 }
 
-/// Standalone `delegate` is not a CLI executor tool. Server/runtime
-/// interception must happen before local tool execution; if it reaches
-/// this executor, it must fail closed.
+/// Standalone `delegate` is not a built-in CLI executor tool. An undeclared
+/// tool must fail closed rather than return an execution acknowledgment.
 #[tokio::test]
 async fn execute_delegate_tool_does_not_return_fake_acknowledgment() {
     let executor = test_executor();

@@ -101,6 +101,8 @@ export type {
   SSEClientOptions,
   // API types
   ChatRequest,
+  CompletionCheck,
+  CompletionCheckDeclarations,
   WorkBinding,
   RunInputRequestBody,
   RunInputResponse,

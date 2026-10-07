@@ -727,7 +727,7 @@ mod tests {
             StepCheckpoint::Heavy(Box::new(before_answer.clone()))
                 .validate()
                 .unwrap();
-            let Some(RunExecutionControl::V3 {
+            let Some(RunExecutionControl::V4 {
                 reply_obligations: before,
                 ..
             }) = &before_answer.run_execution_control
@@ -776,7 +776,7 @@ mod tests {
                 &serde_json::to_vec(&OriginalLoopExecutionFacts::capture(&state).unwrap()).unwrap(),
             )
             .unwrap();
-            let Some(RunExecutionControl::V3 {
+            let Some(RunExecutionControl::V4 {
                 reply_obligations, ..
             }) = &heavy.run_execution_control
             else {
@@ -841,7 +841,7 @@ mod tests {
             let settled = resumed.run_execution_control_snapshot().unwrap();
             let settled: RunExecutionControl =
                 serde_json::from_slice(&serde_json::to_vec(&settled).unwrap()).unwrap();
-            let RunExecutionControl::V3 {
+            let RunExecutionControl::V4 {
                 reply_obligations, ..
             } = settled;
             assert!(reply_obligations.pending.is_empty());

@@ -5,7 +5,7 @@
 //! 1. **Skill lifecycle hooks** (`SkillHooks`) — pre/post invocation of a skill itself.
 //! 2. **Tool event hooks** (`ToolEventHook`) — fire on any tool call matching a pattern.
 //! 3. **Session event hooks** (`SessionEventHook`) — fire on session lifecycle events
-//!    (SessionStart, SessionEnd, UserPromptSubmit, SubagentStart).
+//!    (SessionStart, SessionEnd, UserPromptSubmit).
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1516,10 +1516,6 @@ pub enum SessionEvent {
     SessionEnd,
     /// Fires after the user submits a prompt, before tool surface / LLM call.
     UserPromptSubmit,
-    /// Fires when a sub-agent (delegation) is spawned.
-    SubagentStart,
-    /// Fires when a sub-agent completes (either success or failure).
-    SubagentStop,
     /// Fires before context compaction begins.
     PreCompact,
     /// Fires after context compaction completes.
@@ -3375,7 +3371,6 @@ mod tests {
             ("session_start", SessionEvent::SessionStart),
             ("session_end", SessionEvent::SessionEnd),
             ("user_prompt_submit", SessionEvent::UserPromptSubmit),
-            ("subagent_start", SessionEvent::SubagentStart),
         ] {
             let json = format!(
                 r#"{{"event":"{}","action":{{"type":"shell","command":"x"}}}}"#,
@@ -3383,6 +3378,9 @@ mod tests {
             );
             let hook: SessionEventHook = serde_json::from_str(&json).unwrap();
             assert_eq!(hook.event, expected);
+        }
+        for retired in ["subagent_start", "subagent_stop"] {
+            assert!(serde_json::from_value::<SessionEvent>(serde_json::json!(retired)).is_err());
         }
     }
 

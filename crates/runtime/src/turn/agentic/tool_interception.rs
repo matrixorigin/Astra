@@ -12,7 +12,7 @@ use astra_turn_core::tool::deferred_activation::{
 };
 
 use super::super::agentic_loop::host::{
-    AgenticLoopState, DELEGATE_TOOL_NAME, HostTurnResult, RejectedToolCall, ToolCallAdmission,
+    AgenticLoopState, HostTurnResult, RejectedToolCall, ToolCallAdmission,
 };
 
 pub(crate) const CONTROL_PLANE_TOOLS: &[&str] = &[
@@ -714,12 +714,10 @@ fn intercept_disallowed_tool_calls(
 pub(crate) async fn try_prepare_intercepted_tool_round(
     state: &mut AgenticLoopState,
     turn_result: &HostTurnResult,
-    mut edge_tool_round: Vec<EdgeToolExecResult>,
+    edge_tool_round: Vec<EdgeToolExecResult>,
     admitted_tool_calls: &[CanonicalToolInvocation],
     effective_tool_calls: &[Value],
     rejected_tool_calls: Vec<RejectedToolCall>,
-    delegation_intercepted: bool,
-    _valid_tool_names: &HashSet<String>,
 ) -> Result<PreparedToolRound, String> {
     let mut deferred_activations_by_call_id = admitted_tool_calls
         .iter()
@@ -982,10 +980,6 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
     let mut runtime_control_calls_by_id = runtime_control_calls_by_id;
     runtime_control_calls_by_id.retain(|call_id, _| !surgically_removed_ids.contains(call_id));
 
-    if delegation_intercepted {
-        edge_tool_round.retain(|result| result.tool != DELEGATE_TOOL_NAME);
-    }
-
     Ok(PreparedToolRound {
         physical_tool_calls,
         logical_tool_calls,
@@ -1003,8 +997,6 @@ async fn prepare_intercepted_tool_round(
     admitted_tool_calls: &[CanonicalToolInvocation],
     effective_tool_calls: &[Value],
     rejected_tool_calls: Vec<RejectedToolCall>,
-    delegation_intercepted: bool,
-    valid_tool_names: &HashSet<String>,
 ) -> PreparedToolRound {
     try_prepare_intercepted_tool_round(
         state,
@@ -1013,8 +1005,6 @@ async fn prepare_intercepted_tool_round(
         admitted_tool_calls,
         effective_tool_calls,
         rejected_tool_calls,
-        delegation_intercepted,
-        valid_tool_names,
     )
     .await
     .expect("test tool round has an exhaustive provider identity partition")
@@ -1770,8 +1760,6 @@ mod tests {
             &ordinary_calls(&calls),
             &calls,
             Vec::new(),
-            false,
-            &HashSet::from(["bash".to_string()]),
         )
         .await
         .err()
@@ -1793,7 +1781,6 @@ mod tests {
             }
         })];
         let turn_result = provider_host_turn_result(&calls);
-        let valid_tool_names = HashSet::from(["python".to_string()]);
         let admission = admit_tool_calls(&calls, state.last_finish_reason.as_deref());
 
         let prepared = prepare_intercepted_tool_round(
@@ -1802,8 +1789,6 @@ mod tests {
             &admission.admitted,
             &[],
             admission.rejected,
-            false,
-            &valid_tool_names,
         )
         .await;
 
@@ -1861,8 +1846,6 @@ mod tests {
             &[invocation],
             std::slice::from_ref(&call),
             Vec::new(),
-            false,
-            &HashSet::new(),
         )
         .await;
 
@@ -1921,8 +1904,6 @@ mod tests {
             &[deferred, direct],
             &logical,
             Vec::new(),
-            false,
-            &HashSet::from(["web_fetch".to_string(), "read_file".to_string()]),
         )
         .await;
 
@@ -1969,16 +1950,9 @@ mod tests {
         let turn_result = provider_host_turn_result(std::slice::from_ref(
             rejected.invocation.physical_provider_call(),
         ));
-        let prepared = prepare_intercepted_tool_round(
-            &mut state,
-            &turn_result,
-            &[],
-            &[],
-            vec![rejected],
-            false,
-            &HashSet::new(),
-        )
-        .await;
+        let prepared =
+            prepare_intercepted_tool_round(&mut state, &turn_result, &[], &[], vec![rejected])
+                .await;
 
         assert_eq!(prepared.pre_resolved_results.len(), 1);
         let result: Value = serde_json::from_str(&prepared.pre_resolved_results[0].content)
@@ -2056,8 +2030,6 @@ mod tests {
             &[],
             &[],
             vec![rejected],
-            false,
-            &HashSet::new(),
         )
         .await;
 
@@ -2289,8 +2261,6 @@ mod tests {
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from(["bash".to_string(), "str_replace".to_string()]),
         )
         .await;
 
@@ -2348,13 +2318,6 @@ mod tests {
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from([
-                "session".to_string(),
-                "notify".to_string(),
-                "ask_user".to_string(),
-                "str_replace".to_string(),
-            ]),
         )
         .await;
 
@@ -2392,8 +2355,6 @@ mod tests {
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from(["session".to_string(), "bash".to_string()]),
         )
         .await;
 
@@ -2435,8 +2396,6 @@ mod tests {
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from(["bash".to_string()]),
         )
         .await;
 
@@ -2472,8 +2431,6 @@ mod tests {
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from(["bash".to_string(), "read_file".to_string()]),
         )
         .await;
 
@@ -2513,8 +2470,6 @@ mod tests {
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from(["bash".to_string(), "read_file".to_string()]),
         )
         .await;
 
@@ -2557,8 +2512,6 @@ mod tests {
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from(["bash".to_string()]),
         )
         .await;
 
@@ -2592,8 +2545,6 @@ mod tests {
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from(["bash".to_string()]),
         )
         .await;
 

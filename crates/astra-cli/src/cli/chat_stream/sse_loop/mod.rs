@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use astra_core::RuntimeLimits;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_runtime::{
-    tool_registry::ToolRegistry, turn::chat_turn_heuristics::infer_task_execution_profile,
-    turn::stop_hooks_yaml::detect_turn_hook_sets, turn::tool_health::ToolHealthTracker,
+    tool_registry::ToolRegistry, turn::stop_hooks_yaml::load_completion_check_declarations,
+    turn::tool_health::ToolHealthTracker,
 };
 use remote_turn::{
     RemoteTurnAudit, RemoteTurnSkills, RemoteTurnState, RemoteTurnTelemetry, consume_remote_turn,
@@ -505,7 +505,6 @@ pub(crate) async fn stream_chat_sse(
     initial_restricted.extend(p.resume_restricted_tools.iter().cloned());
 
     let current_session_id = p.session_id.map(|s| s.to_string());
-    let task_profile = infer_task_execution_profile(p.message);
 
     let tool_health = ToolHealthTracker::from_entries(p.tool_health_entries);
     let current_user_id = cli_user_id();
@@ -583,7 +582,14 @@ pub(crate) async fn stream_chat_sse(
         output_transport_failure: None,
     };
 
-    let hook_sets = detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask);
+    let completion_checks =
+        load_completion_check_declarations(&project_root).map_err(|error| crate::TurnFailure {
+            error,
+            partial: crate::PartialTurnData {
+                session_id: p.session_id.map(str::to_string),
+                ..Default::default()
+            },
+        })?;
 
     // Bind the turn to the shared registry without taking ownership of
     // discovery. Interactive startup converges external providers in a
@@ -673,9 +679,7 @@ pub(crate) async fn stream_chat_sse(
         remote_summary: None,
         server_terminal_authoritative: false,
         local_input_run_id: parent_turn_run_id.clone(),
-        stop_hook_prompt: astra_turn_core::stop_hooks::build_stop_hook_prompt(
-            &hook_sets.stop_hooks,
-        ),
+        completion_checks,
         harness: {
             #[cfg(feature = "harness")]
             {
@@ -1115,10 +1119,10 @@ fn load_turn_messages(
 #[cfg(test)]
 mod tests {
     use super::{
-        TurnMessageLoadError, detect_turn_hook_sets, load_turn_messages,
-        missing_model_selection_journal_event, missing_model_selection_turn_failure,
-        non_tty_output_failure, normalize_turn_model, refresh_root_permission_context,
-        require_selected_turn_model, root_permission_context_handle, step_recorder_for_cli_turn,
+        TurnMessageLoadError, load_turn_messages, missing_model_selection_journal_event,
+        missing_model_selection_turn_failure, non_tty_output_failure, normalize_turn_model,
+        refresh_root_permission_context, require_selected_turn_model,
+        root_permission_context_handle, step_recorder_for_cli_turn,
     };
     use crate::cli::permission_manager::{PermissionManager, PermissionMode};
     use astra_runtime::orchestration::AgentStatus;
@@ -1126,6 +1130,7 @@ mod tests {
     use astra_turn_core::chat_turn_heuristics::{
         TaskComplexity, TaskExecutionProfile, infer_task_execution_profile,
     };
+    use astra_turn_core::stop_hooks_yaml::detect_turn_stop_hooks;
     use serde_json::json;
     use std::path::Path;
     use std::sync::Arc;
@@ -1796,26 +1801,28 @@ mod tests {
 
     #[test]
     fn read_only_requests_skip_stop_hooks() {
-        let s = detect_turn_hook_sets(
+        let s = detect_turn_stop_hooks(
             Path::new("."),
             infer_task_execution_profile("review 最新的commit"),
             false,
-        );
-        assert!(s.stop_hooks.is_empty());
-        let s = detect_turn_hook_sets(
+        )
+        .unwrap();
+        assert!(s.is_empty());
+        let s = detect_turn_stop_hooks(
             Path::new("."),
             infer_task_execution_profile("explain this diff"),
             false,
-        );
-        assert!(s.stop_hooks.is_empty());
+        )
+        .unwrap();
+        assert!(s.is_empty());
     }
 
     #[test]
     fn mutating_requests_keep_stop_hooks() {
-        let s = detect_turn_hook_sets(Path::new("."), mutating_profile(), false);
+        let s = detect_turn_stop_hooks(Path::new("."), mutating_profile(), false).unwrap();
         // Smart hook returns a single "verify-changes" entry (if project detected)
         // or empty (if no project markers in cwd)
-        let _ = s.stop_hooks;
+        let _ = s;
     }
 
     #[test]
@@ -1838,9 +1845,9 @@ hooks:
         )
         .unwrap();
         let prof = mutating_profile();
-        let s = detect_turn_hook_sets(dir.path(), prof, true);
-        assert_eq!(s.stop_hooks.len(), 1);
-        assert_eq!(s.stop_hooks[0].label, "sub");
+        let s = detect_turn_stop_hooks(dir.path(), prof, true).unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].label, "sub");
     }
 
     #[test]
@@ -1854,33 +1861,8 @@ hooks:
         )
         .unwrap();
         let prof = mutating_profile();
-        let s = detect_turn_hook_sets(dir.path(), prof, true);
-        assert!(s.stop_hooks.is_empty());
-    }
-
-    #[test]
-    fn teammate_idle_hooks_loaded_alongside_stop() {
-        let dir = tempdir().unwrap();
-        let mo = dir.path().join(".astra");
-        std::fs::create_dir_all(&mo).unwrap();
-        std::fs::write(
-            mo.join("stop-hooks.yaml"),
-            r#"version: 1
-auto_detect: false
-hooks:
-  - label: fin
-    command: cargo check
-    when: stop
-  - label: after_delegate
-    command: ./scripts/sync-check.sh
-    when: teammate_idle
-"#,
-        )
-        .unwrap();
-        let s = detect_turn_hook_sets(dir.path(), mutating_profile(), false);
-        assert_eq!(s.stop_hooks.len(), 1);
-        assert_eq!(s.teammate_idle_hooks.len(), 1);
-        assert_eq!(s.teammate_idle_hooks[0].label, "after_delegate");
+        let s = detect_turn_stop_hooks(dir.path(), prof, true).unwrap();
+        assert!(s.is_empty());
     }
 
     #[test]
@@ -1893,12 +1875,13 @@ hooks:
             "version: 1\nauto_detect: false\nhooks:\n  - label: audit\n    command: ./scripts/audit.sh\n",
         )
         .unwrap();
-        let s = detect_turn_hook_sets(
+        let s = detect_turn_stop_hooks(
             dir.path(),
             infer_task_execution_profile("explain this file"),
             false,
-        );
-        assert_eq!(s.stop_hooks.len(), 1);
-        assert_eq!(s.stop_hooks[0].label, "audit");
+        )
+        .unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].label, "audit");
     }
 }

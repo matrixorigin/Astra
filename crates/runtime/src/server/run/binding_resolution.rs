@@ -72,50 +72,6 @@ fn resolve_request_execution_bindings_from_request(
     Some((workspace, executor))
 }
 
-pub(crate) fn execution_bindings_from_metadata(
-    metadata: Option<&Value>,
-    server_workspace: &Path,
-) -> Option<ExecutionBindingSnapshot> {
-    execution_bindings_from_metadata_with_authority(metadata, server_workspace, None)
-}
-
-/// Reconstruct a child binding from the parent's durable metadata, applying
-/// an explicit child execution ceiling when supplied. Task mutation intent
-/// is not authorization and must not supply this override.
-pub(crate) fn execution_bindings_from_metadata_with_authority(
-    metadata: Option<&Value>,
-    server_workspace: &Path,
-    authority_override: Option<WorkspaceAuthority>,
-) -> Option<ExecutionBindingSnapshot> {
-    let metadata = metadata?.as_object()?;
-    let mut workspace: WorkspaceBinding =
-        serde_json::from_value(metadata.get("workspace")?.clone()).ok()?;
-    if matches!(workspace.kind, WorkspaceBindingKind::ServerSandbox) {
-        workspace.cwd = Some(server_workspace.display().to_string());
-    }
-    if let Some(authority) = authority_override {
-        workspace.authority = match (workspace.authority, authority) {
-            (WorkspaceAuthority::None, _) | (_, WorkspaceAuthority::None) => {
-                WorkspaceAuthority::None
-            }
-            (WorkspaceAuthority::Unknown, _) | (_, WorkspaceAuthority::Unknown) => {
-                WorkspaceAuthority::Unknown
-            }
-            (WorkspaceAuthority::ReadOnly, _) | (_, WorkspaceAuthority::ReadOnly) => {
-                WorkspaceAuthority::ReadOnly
-            }
-            _ => authority,
-        };
-    }
-    let executor: ExecutorBinding =
-        serde_json::from_value(metadata.get("executor")?.clone()).ok()?;
-    let mut snapshot = ExecutionBindingSnapshot::inferred(workspace, executor);
-    snapshot.execution_binding_generation = metadata
-        .get("execution_binding_generation")
-        .and_then(Value::as_u64);
-    Some(snapshot)
-}
-
 #[derive(Default)]
 pub(crate) struct RunExecutionBindingSnapshot {
     pub workspace: Option<Value>,
@@ -159,6 +115,7 @@ pub(crate) fn binding_snapshot_events(
     run_id: &str,
     session_id: &str,
     snapshot: &ExecutionBindingSnapshot,
+    completion_checks: &astra_turn_types::StopHookObligations,
 ) -> [Value; 2] {
     let mut workspace_event = Map::new();
     workspace_event.insert(
@@ -174,9 +131,15 @@ pub(crate) fn binding_snapshot_events(
         "session_id".to_string(),
         Value::String(session_id.to_string()),
     );
-    for (key, value) in binding_event_fields(&snapshot.workspace, &snapshot.executor) {
+    for (key, value) in binding_snapshot_fields(snapshot) {
         workspace_event.insert(key, value);
     }
+    workspace_event.insert("runtime".to_string(), serde_json::json!(snapshot.runtime));
+
+    workspace_event.insert(
+        "completion_checks".to_string(),
+        serde_json::json!(completion_checks),
+    );
 
     let mut executor_event = Map::new();
     executor_event.insert(
@@ -192,14 +155,115 @@ pub(crate) fn binding_snapshot_events(
         "session_id".to_string(),
         Value::String(session_id.to_string()),
     );
-    for (key, value) in binding_event_fields(&snapshot.workspace, &snapshot.executor) {
+    for (key, value) in binding_snapshot_fields(snapshot) {
         executor_event.insert(key, value);
     }
+    executor_event.insert("runtime".to_string(), serde_json::json!(snapshot.runtime));
 
     [
         Value::Object(workspace_event),
         Value::Object(executor_event),
     ]
+}
+
+/// Read the immutable admission pair, rather than routing observations or the
+/// display projection. A terminal parent retains this contract for descendants.
+pub(crate) fn durable_run_execution_contract(
+    run: &astra_services::runs::DurableRunRecord,
+) -> Result<
+    (
+        ExecutionBindingSnapshot,
+        astra_turn_types::StopHookObligations,
+    ),
+    String,
+> {
+    let mut pair = [None, None];
+    let keys = [
+        format!("run-start:{}:workspace-bound", run.run_id),
+        format!("run-start:{}:executor-bound", run.run_id),
+    ];
+    for event in &run.events {
+        let Some(position) = keys.iter().position(|key| {
+            event.get("idempotency_key").and_then(Value::as_str) == Some(key.as_str())
+        }) else {
+            continue;
+        };
+        let kind = astra_services::runs::extract_event_type(event);
+        if kind != ["workspace_bound", "executor_bound"][position] {
+            return Err("execution admission binding key has the wrong event kind".into());
+        }
+        let payload = if event.get("event_type").is_some() {
+            event.get("data").and_then(Value::as_object)
+        } else {
+            event.as_object()
+        }
+        .ok_or("execution admission binding payload is malformed")?;
+        if pair[position].replace(payload).is_some()
+            || payload.get("run_id").and_then(Value::as_str) != Some(run.run_id.as_str())
+            || payload.get("session_id").and_then(Value::as_str) != Some(run.session_id.as_str())
+        {
+            return Err("execution admission binding identity is duplicated or mismatched".into());
+        }
+    }
+    let [Some(workspace), Some(executor)] = pair else {
+        return Err("execution admission binding pair is missing".into());
+    };
+    for key in [
+        "workspace",
+        "executor",
+        "transport",
+        "execution_binding_generation",
+        "runtime",
+    ] {
+        if workspace.get(key) != executor.get(key) {
+            return Err("execution admission binding pair conflicts".into());
+        }
+    }
+    let binding_workspace: WorkspaceBinding = serde_json::from_value(
+        workspace
+            .get("workspace")
+            .cloned()
+            .ok_or("workspace binding is missing")?,
+    )
+    .map_err(|error| format!("workspace binding is malformed: {error}"))?;
+    let binding_executor: ExecutorBinding = serde_json::from_value(
+        workspace
+            .get("executor")
+            .cloned()
+            .ok_or("executor binding is missing")?,
+    )
+    .map_err(|error| format!("executor binding is malformed: {error}"))?;
+    let transport: ToolTransportKind = serde_json::from_value(
+        workspace
+            .get("transport")
+            .cloned()
+            .ok_or("binding transport is missing")?,
+    )
+    .map_err(|error| format!("binding transport is malformed: {error}"))?;
+    if transport != binding_executor.transport {
+        return Err("binding transport conflicts with its executor".into());
+    }
+    let checks: astra_turn_types::StopHookObligations = serde_json::from_value(
+        workspace
+            .get("completion_checks")
+            .cloned()
+            .ok_or("completion contract is missing")?,
+    )
+    .map_err(|error| format!("completion contract is malformed: {error}"))?;
+    astra_turn_types::validate_completion_check_declarations(&checks.declarations)?;
+    let mut snapshot = ExecutionBindingSnapshot::inferred(binding_workspace, binding_executor);
+    snapshot.runtime = serde_json::from_value(
+        workspace
+            .get("runtime")
+            .cloned()
+            .ok_or("runtime binding is missing")?,
+    )
+    .map_err(|error| format!("runtime binding is malformed: {error}"))?;
+    snapshot.execution_binding_generation = workspace
+        .get("execution_binding_generation")
+        .map(|value| value.as_u64().ok_or("binding generation is malformed"))
+        .transpose()?;
+    Ok((snapshot, checks))
 }
 
 pub(crate) fn run_start_context_from_request(
@@ -579,6 +643,7 @@ mod tests {
 
     fn test_request(message: &str) -> astra_services::runs::ChatRequestData {
         astra_services::runs::ChatRequestData {
+            completion_checks: None,
             agent_profile_selection: None,
             admitted_agent_profiles: None,
             model_catalog_reader: None,
@@ -703,8 +768,10 @@ mod tests {
             Some(7)
         );
 
-        for event in binding_snapshot_events("run-1", "session-1", &snapshot) {
-            assert!(event.get("execution_binding_generation").is_none());
+        for event in binding_snapshot_events("run-1", "session-1", &snapshot, &Default::default()) {
+            assert_eq!(event["execution_binding_generation"], 7);
+            let wire = astra_services::runs::transform_run_event_for_client(event);
+            assert!(wire.get("execution_binding_generation").is_none());
         }
     }
 
@@ -968,79 +1035,5 @@ mod tests {
         assert_eq!(executor.executor_id, "server-control-plane");
         assert_eq!(executor.transport, ToolTransportKind::ServerLocal);
         assert_eq!(executor.status, ExecutorStatus::Online);
-    }
-
-    #[test]
-    fn metadata_server_sandbox_binding_rewrites_cwd_to_current_workspace() {
-        let metadata = json!({
-            "workspace": {
-                "kind": "server_sandbox",
-                "display_name": "Server sandbox",
-                "cwd": "/stale/workspace",
-                "authority": "read_write"
-            },
-            "executor": {
-                "kind": "server_local",
-                "executor_id": "server-local",
-                "display_name": "Server sandbox",
-                "transport": "server_local",
-                "status": "online"
-            }
-        });
-
-        let snapshot =
-            execution_bindings_from_metadata(Some(&metadata), Path::new("/current/workspace"))
-                .expect("metadata should resolve");
-        let workspace = &snapshot.workspace;
-        let executor = &snapshot.executor;
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::ServerSandbox);
-        assert_eq!(workspace.cwd.as_deref(), Some("/current/workspace"));
-        assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
-        assert!(snapshot.runtime.is_none());
-    }
-
-    #[test]
-    fn child_authority_override_narrows_inherited_read_write_binding() {
-        let mut metadata = json!({
-            "workspace": {
-                "kind": "edge_workspace",
-                "display_name": "Edge workspace",
-                "cwd": "/workspace/project",
-                "authority": "read_write"
-            },
-            "executor": {
-                "kind": "edge_agent",
-                "executor_id": "edge-agent",
-                "display_name": "Edge workspace",
-                "transport": "edge_ledger",
-                "status": "online"
-            }
-        });
-
-        let snapshot = execution_bindings_from_metadata_with_authority(
-            Some(&metadata),
-            Path::new("/current/workspace"),
-            Some(WorkspaceAuthority::ReadOnly),
-        )
-        .expect("metadata should resolve");
-        assert_eq!(snapshot.workspace.authority, WorkspaceAuthority::ReadOnly);
-        assert_eq!(snapshot.executor.kind, ExecutorBindingKind::EdgeAgent);
-        metadata["workspace"]["authority"] = json!("none");
-        let snapshot = execution_bindings_from_metadata_with_authority(
-            Some(&metadata),
-            Path::new("/current/workspace"),
-            Some(WorkspaceAuthority::ReadOnly),
-        )
-        .expect("metadata should resolve");
-        assert_eq!(snapshot.workspace.authority, WorkspaceAuthority::None);
-        metadata["workspace"]["authority"] = json!("read_only");
-        let snapshot = execution_bindings_from_metadata_with_authority(
-            Some(&metadata),
-            Path::new("/current/workspace"),
-            Some(WorkspaceAuthority::ReadWrite),
-        )
-        .expect("metadata should resolve");
-        assert_eq!(snapshot.workspace.authority, WorkspaceAuthority::ReadOnly);
     }
 }

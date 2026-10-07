@@ -1334,6 +1334,9 @@ pub struct AuthReauthenticateRequest {
 #[serde(deny_unknown_fields)]
 pub struct ChatRequest {
     pub message: String,
+    /// Verification obligations supplied by the selected remote workspace.
+    #[serde(default)]
+    pub completion_checks: Option<astra_turn_types::CompletionCheckDeclarations>,
     #[serde(default)]
     pub user_intent: Option<String>,
     #[serde(default)]
@@ -1930,6 +1933,8 @@ pub enum WsClientMessage {
     /// Send a chat message to the agent.
     #[serde(rename = "message")]
     ChatMessage {
+        #[serde(default)]
+        completion_checks: Option<astra_turn_types::CompletionCheckDeclarations>,
         content: String,
         #[serde(default)]
         session_id: Option<String>,
@@ -2459,6 +2464,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
             .map(|ea| ea.id.clone())
     });
     ChatRequestData {
+        completion_checks: request.completion_checks,
         model_catalog_reader: None,
         message: request.message,
         user_intent: request.user_intent,

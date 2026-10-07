@@ -596,8 +596,8 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "version", deny_unknown_fields)]
 pub enum RunExecutionControl {
-    #[serde(rename = "3")]
-    V3 {
+    #[serde(rename = "4")]
+    V4 {
         completion_settlement: astra_turn_types::CompletionSettlementState,
         hook_obligations: astra_turn_types::StopHookObligations,
         reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1,
@@ -608,14 +608,18 @@ pub enum RunExecutionControl {
 
 impl RunExecutionControl {
     pub fn validate_budget(&self, budget: &RunExecutionBudget) -> Result<(), &'static str> {
-        let Self::V3 {
-            reply_obligations, ..
+        let Self::V4 {
+            reply_obligations,
+            hook_obligations,
+            ..
         } = self;
         let RunExecutionBudget::V1 {
             run_id,
             producer_owner_generation,
             ..
         } = budget;
+        astra_turn_types::validate_completion_check_declarations(&hook_obligations.declarations)
+            .map_err(|_| "invalid completion check declarations")?;
         reply_obligations.validate_owner(run_id, *producer_owner_generation)
     }
 }
@@ -1494,7 +1498,7 @@ mod tests {
 
     #[test]
     fn run_execution_control_requires_complete_known_contract() {
-        let snapshot = RunExecutionControl::V3 {
+        let snapshot = RunExecutionControl::V4 {
             completion_settlement: astra_turn_types::CompletionSettlementState::default(),
             hook_obligations: astra_turn_types::StopHookObligations::default(),
             reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
@@ -1518,9 +1522,11 @@ mod tests {
                 "missing {field}"
             );
         }
-        let mut unknown = wire;
-        unknown["version"] = serde_json::json!("future");
-        assert!(serde_json::from_value::<RunExecutionControl>(unknown).is_err());
+        for version in ["1", "2", "3", "future"] {
+            let mut unknown = wire.clone();
+            unknown["version"] = serde_json::json!(version);
+            assert!(serde_json::from_value::<RunExecutionControl>(unknown).is_err());
+        }
     }
 
     #[test]
@@ -1534,7 +1540,7 @@ mod tests {
         let StepCheckpoint::Heavy(heavy) = &mut checkpoint else {
             unreachable!()
         };
-        heavy.run_execution_control = Some(RunExecutionControl::V3 {
+        heavy.run_execution_control = Some(RunExecutionControl::V4 {
             completion_settlement: Default::default(),
             hook_obligations: Default::default(),
             reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
@@ -1575,6 +1581,35 @@ mod tests {
                 serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
             assert_eq!(decoded.validate().is_ok(), valid);
         }
+        let StepCheckpoint::Heavy(heavy) = &mut checkpoint else {
+            unreachable!()
+        };
+        let Some(RunExecutionControl::V4 {
+            hook_obligations, ..
+        }) = &mut heavy.run_execution_control
+        else {
+            unreachable!()
+        };
+        // Even a phase not selected by this execution must remain a valid
+        // declaration contract for its descendants.
+        hook_obligations
+            .declarations
+            .task_completed
+            .push(astra_turn_types::StopHook {
+                label: "child-check".into(),
+                command: "make check".into(),
+                working_dir: None,
+                depends_on: vec!["missing".into()],
+                timeout_secs: None,
+
+                authoritative: true,
+            });
+        let decoded: StepCheckpoint =
+            serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        assert!(
+            decoded.validate().is_err(),
+            "unselected malformed declarations cannot restore"
+        );
     }
 
     // ── Protocol Version ──

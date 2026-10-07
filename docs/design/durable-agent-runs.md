@@ -274,13 +274,15 @@ frontier reconciliation, and settlement-only control restoration remain required
 Execution checkpoints also carry versioned control facts using the canonical
 completion-settlement type: terminal action windows, their consumed attempts,
 retry counters, pagination obligations, and settlement-only restrictions, plus
-the loop's wrap-up flag and ignored-round count. Control V3 also requires both
-sets of stop-hook obligations and their consumed execution counts, plus the
+the loop's wrap-up flag and ignored-round count. Control V4 also requires the
+complete declarations for both completion-check phases and the selected phase, plus the
 run/producer-generation-bound question obligations (at most 16 exact request
 identities and canonical responders). It contains
 no request headers or model credentials. Missing obligations cannot decode as
 an empty set, and earlier versions are not upgraded by supplying defaults. All execution writers use one
-projection; restore passes it through without granting execution. These controls
+projection; restore selects checks using the frozen task profile and restores the
+original verification frontier, without rereading workspace configuration or
+granting execution. These controls
 must be validated at the same frontier as budget consumption before a recovery
 owner may authorize another action. Missing control state must not default to
 ordinary execution. Only a validated reconstructable snapshot proceeds

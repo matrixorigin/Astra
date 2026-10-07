@@ -1237,8 +1237,24 @@ export type WorkBinding = {
   branchId: string;
 };
 
+/** Verification obligations, executed through ordinary tool admission. */
+export type CompletionCheckDeclarations = {
+  stop: CompletionCheck[];
+  task_completed: CompletionCheck[];
+};
+
+export type CompletionCheck = {
+  label: string;
+  command: string;
+  working_dir: string | null;
+  depends_on: string[];
+  timeout_secs: number | null;
+  authoritative: boolean;
+};
+
 export type ChatRequest = {
   message: string;
+  completionChecks?: CompletionCheckDeclarations;
   parts?: unknown[];
   attachments?: unknown[];
   sessionId?: string;

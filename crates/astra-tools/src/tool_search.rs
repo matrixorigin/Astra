@@ -1205,6 +1205,31 @@ mod tests {
     #[test]
     fn explicit_selection_preserves_deferred_agent_constraints() {
         let schemas = crate::schemas::all_tool_schemas();
+        for (name, paths) in [
+            ("agent", vec!["/properties/isolated"]),
+            (
+                "agent_fanout",
+                vec![
+                    "/properties/defaults/properties/isolated",
+                    "/properties/slots/items/properties/isolated",
+                ],
+            ),
+        ] {
+            let selected: Value = serde_json::from_str(&tool_search(
+                &schemas,
+                &json!({"query": format!("select:{name}")}),
+            ))
+            .unwrap();
+            for path in paths {
+                let field = selected["matches"][0]["parameters"].pointer(path).unwrap();
+                let guidance = field["description"].as_str().unwrap();
+                assert!(
+                    guidance.contains("Writable child")
+                        && guidance.contains("read-only parent ceiling")
+                );
+                assert!(field.get("x-astra-discovery-summary").is_none());
+            }
+        }
 
         let result = tool_search(&schemas, &json!({"query": "select:agent_fanout"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();

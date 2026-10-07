@@ -554,7 +554,7 @@ fn recovery_rejects_unpaired_or_foreign_execution_control() {
     ] {
         let mut heavy = test_heavy_checkpoint("session-turn-3", 1000);
         heavy.run_execution_budget = budget;
-        heavy.run_execution_control = Some(RunExecutionControl::V3 {
+        heavy.run_execution_control = Some(RunExecutionControl::V4 {
             completion_settlement: Default::default(),
             hook_obligations: Default::default(),
             reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {

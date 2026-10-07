@@ -3323,9 +3323,8 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
 
 use crate::server::run::binding_resolution::{
     RunExecutionBindingSnapshot, agent_working_dir_for_bindings, binding_snapshot_events,
-    binding_snapshot_fields, execution_bindings_from_metadata,
-    execution_bindings_from_metadata_with_authority, executor_binding_from_request,
-    request_uses_server_workspace, resolve_request_execution_bindings,
+    binding_snapshot_fields, executor_binding_from_request, request_uses_server_workspace,
+    resolve_request_execution_bindings,
     resolve_request_execution_bindings_without_server_workspace, run_start_context_from_request,
 };
 
@@ -3959,6 +3958,7 @@ fn apply_normalized_skill_allowlist(
 /// execution contexts via [`SkillExecutionRouter`].
 fn build_server_skill_executor(
     run_engine: &RunEngine,
+    completion_checks: astra_turn_types::StopHookObligations,
     matrixone: &MatrixOneSettings,
     encryptor: &Arc<FernetTokenEncryptor>,
     model_service: Option<Arc<dyn ModelService>>,
@@ -4014,6 +4014,7 @@ fn build_server_skill_executor(
     .with_pool(shared_pool.cloned())
     .with_model_service(model_service)
     .with_run_engine(run_engine.clone())
+    .with_completion_checks(completion_checks)
     .with_model_catalog_reader(model_catalog_reader)
     .with_default_model(model_override.map(String::from))
     .with_admitted_model_execution(admitted_model_execution.cloned())
@@ -4781,7 +4782,8 @@ impl LoopExecutionFacts {
     }
 
     /// Historical facts come from committed adoption, never fresh defaults.
-    /// Current hooks are supplied by the authorized workspace owner.
+    /// Completion declarations come from the checkpoint; current workspace
+    /// authorization does not redefine the frozen verification contract.
     fn from_handoff(
         adopted: &astra_services::session_context_coordinator::ResumedExecutionTurn,
         mut hooks: StopHookState,
@@ -4817,16 +4819,6 @@ impl LoopExecutionFacts {
             .as_deref()
             .filter(|chain| !chain.is_empty())
             .ok_or_else(|| invalid("adopted execution has no original turn chain"))?;
-        let verification_frontier =
-            crate::turn::agentic_loop::verification_frontier::VerificationFrontier::restore_from_adopted_handoff(
-                hooks.workspace_root_hint.as_deref(),
-                &hooks.stop_hooks,
-                adopted,
-                &checkpoint.user_id,
-                &checkpoint.session_id,
-                &receipt.run_id,
-                chain,
-            ).map_err(|_| invalid("adopted verification frontier cannot be restored"))?;
         let astra_pipeline::step_protocol::RunExecutionBudget::V1 {
             charged_iterations,
             granted_iteration_boundary,
@@ -4842,7 +4834,7 @@ impl LoopExecutionFacts {
         let remaining_turns = usize::try_from(*remaining_iterations)
             .map_err(|_| invalid("adopted remaining iterations exceed runtime capacity"))?;
         let charged_iterations = *charged_iterations;
-        let astra_pipeline::step_protocol::RunExecutionControl::V3 {
+        let astra_pipeline::step_protocol::RunExecutionControl::V4 {
             completion_settlement,
             hook_obligations,
             reply_obligations,
@@ -4853,15 +4845,22 @@ impl LoopExecutionFacts {
             .run_execution_control
             .as_ref()
             .ok_or_else(|| invalid("adopted execution has no completion control"))?;
-        if hooks.stop_hooks != hook_obligations.stop_hooks
-            || hooks.teammate_idle_hooks != hook_obligations.teammate_idle_hooks
-        {
-            return Err(invalid(
-                "current hooks do not match the adopted execution contract",
-            ));
-        }
-        hooks.stop_hook_runs = hook_obligations.stop_hook_runs;
-        hooks.teammate_idle_hook_runs = hook_obligations.teammate_idle_hook_runs;
+        hooks.declarations = hook_obligations.declarations.clone();
+        hooks.phase = hook_obligations.phase;
+        hooks.stop_hooks = hooks.declarations.clone().into_selected(
+            hooks.phase == astra_turn_types::CompletionCheckPhase::TaskCompleted,
+            payload.original_facts.task_profile.verification_required,
+        );
+        let verification_frontier =
+            crate::turn::agentic_loop::verification_frontier::VerificationFrontier::restore_from_adopted_handoff(
+                hooks.workspace_root_hint.as_deref(),
+                &hooks.stop_hooks,
+                adopted,
+                &checkpoint.user_id,
+                &checkpoint.session_id,
+                &receipt.run_id,
+                chain,
+            ).map_err(|_| invalid("adopted verification frontier cannot be restored"))?;
         hooks.completion_settlement = completion_settlement.clone();
         let replies = Arc::new(crate::messaging::reply_obligations::ReplyObligations::default());
         replies
@@ -5118,6 +5117,10 @@ struct ServerSpawnRuntimeContext {
     /// reconstruct request-scoped edge schemas (for example `web_fetch`).
     edge_tools: Arc<Vec<Value>>,
     request_constraints: RequestConstraints,
+    execution_contract: Option<(
+        ExecutionBindingSnapshot,
+        astra_turn_types::StopHookObligations,
+    )>,
     execution_metadata: Option<Value>,
     provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
     /// The session-owned dynamic-agent lifecycle.  Kept weak here because
@@ -5655,6 +5658,7 @@ fn fresh_request_admission_bytes(request: &ChatRequestData) -> Result<u64, serde
     add_json_len!(&request.allow_skill_sources);
     add_json_len!(&request.allow_tools);
     add_json_len!(&request.enabled_tools);
+    add_json_len!(&request.completion_checks);
     Ok(total)
 }
 
@@ -6707,6 +6711,14 @@ impl AgenticRunLifecycleService {
         self
     }
 
+    pub(crate) fn with_selected_workspace_provider(
+        mut self,
+        provider: Option<ServerWorkspaceProvisioner>,
+    ) -> Self {
+        self.selected_server_workspace_provider = provider;
+        self
+    }
+
     pub(crate) fn with_workspace_record_store(
         mut self,
         store: Arc<dyn WorkspaceStateStore>,
@@ -7100,10 +7112,8 @@ impl AgenticRunLifecycleService {
         .with_reflect_service(Arc::clone(&self.reflect_service))
         .with_auxiliary_event_writer(self.auxiliary_event_writer.clone())
         .with_trace_ingestion(self.trace_ingestion.clone());
-        #[cfg(any(test, feature = "e2e-hooks"))]
-        {
-            executor._workspace_provider_guard = self.selected_server_workspace_provider.clone();
-        }
+        executor.workspace_provider = self.selected_server_workspace_provider.clone();
+        executor.workspace_record_store = self.workspace_record_store.clone();
         if let Some(service) = self.edge_dispatch_service.clone() {
             executor = executor.with_edge_dispatch_service(service);
         }
@@ -7580,6 +7590,8 @@ impl AgenticRunLifecycleService {
         request: &ChatRequestData,
         edge_tools: &[Value],
         execution_bindings: Option<&ExecutionBindingSnapshot>,
+        completion_checks: &astra_turn_types::StopHookObligations,
+        execution_owner_generation: u64,
         workspace: &std::path::Path,
         work_surface_event_tx: Option<mpsc::Sender<Value>>,
         work_surface_gap_tracker: Option<WorkSurfaceAgentLiveGapTracker>,
@@ -7605,15 +7617,23 @@ impl AgenticRunLifecycleService {
             interaction_mode: Self::effective_requested_interaction_mode(request),
             edge_tools: Arc::new(edge_tools.to_vec()),
             request_constraints: request_constraints.clone(),
+            execution_contract: execution_bindings
+                .cloned()
+                .map(|binding| (binding, completion_checks.clone())),
             execution_metadata: None,
             provider_run_owner: request.provider_run_owner.clone(),
             spawner: Arc::downgrade(&entry.spawner),
             pause_flag,
             cancel_token,
-            execution_owner_generation: Arc::new(ExecutionOwnerGenerationSink::preparing(0)),
+            execution_owner_generation: Arc::new(ExecutionOwnerGenerationSink::preparing(
+                execution_owner_generation,
+            )),
             #[cfg(feature = "harness")]
             harness_sink,
         };
+        runtime_context
+            .execution_owner_generation
+            .publish(execution_owner_generation);
         let agent_context = AgentToolContext {
             parent_profile_authority: match request.admitted_agent_profiles.as_ref() {
                 Some(snapshot) => match snapshot.lead_agent_id.as_ref() {
@@ -7721,6 +7741,21 @@ impl AgenticRunLifecycleService {
             .map_err(|error| {
                 format!("root run {run_id} runtime-context authority check failed: {error}")
             })?;
+        let captured_generation = match runtime_context
+            .execution_owner_generation
+            .wait_until_published_or_stopped()
+            .await
+        {
+            ExecutionOwnerGenerationPublication::Acquired(generation) => generation,
+            _ => return Err("root execution owner was not acquired".into()),
+        };
+        if control.as_ref().is_some_and(|control| {
+            control.run_generation != captured_generation || control.session_id != session_id
+        }) {
+            // A stale publisher cannot retire the logical run or cancel the
+            // contexts belonging to its newer execution owner.
+            return Err("root execution owner changed before runtime publication".into());
+        }
         let control_is_runnable = control.as_ref().is_some_and(|control| {
             control.session_id == session_id
                 && control.status == STATUS_RUNNING
@@ -8524,7 +8559,6 @@ impl AgenticRunLifecycleService {
     fn configure_loop_state_runtime_controls(
         &self,
         loop_state: &mut AgenticLoopState,
-        child_supervisor: &Arc<DynamicAgentSpawner>,
         cancel_flag: &Arc<AtomicBool>,
         pause_flag: &Arc<AtomicBool>,
         llm_cancel_token: CancellationToken,
@@ -8534,10 +8568,6 @@ impl AgenticRunLifecycleService {
         loop_state.cancellation.pause_flag = Some(pause_flag.clone());
         loop_state.cancellation.token = Some(Arc::new(llm_cancel_token));
         loop_state.cancellation.execution_lease_lost = Some(execution_lease_lost);
-        loop_state.delegation_engine = self
-            .delegation_engine
-            .as_ref()
-            .map(|engine| Arc::new(engine.for_execution(child_supervisor.clone())));
         // Wire cross-pod cancel/pause provider so the agentic loop can poll
         // DB for control signals from other pods in horizontally-scaled deployments.
         loop_state.run_control = Some(Arc::new(self.run_engine.clone()));
@@ -10612,6 +10642,17 @@ impl AgenticRunLifecycleService {
         user_id: &str,
         mut request: ChatRequestData,
     ) -> Result<ChatRequestData, (StatusCode, Json<ErrorResponse>)> {
+        if let Some(checks) = request.completion_checks.as_ref() {
+            astra_turn_core::stop_hooks::validate_completion_check_declarations(checks).map_err(
+                |error| {
+                    error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        error,
+                        "completion_checks_invalid",
+                    )
+                },
+            )?;
+        }
         if self.execution_handoff_requested.is_cancelled() {
             return Err(error_response_coded(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -11354,6 +11395,7 @@ impl AgenticRunLifecycleService {
         );
         let request_identity = json!({
             "version": 1,
+            "completion_checks": request.completion_checks,
             "message": request.message,
             "user_intent": request.user_intent,
             "parts": request.parts,
@@ -13174,6 +13216,7 @@ impl AgenticRunLifecycleService {
         edge_profile_override: Option<&Map<String, Value>>,
         prepared_capabilities: &PreparedRuntimeCapabilities,
         execution_owner_generation: Option<u64>,
+        execution_hooks: &StopHookState,
     ) -> LoopEnvironment {
         let (skill_registry, skill_resolver) =
             if let Some(binding_context) = prepared_capabilities.agent_binding.as_ref() {
@@ -13233,6 +13276,10 @@ impl AgenticRunLifecycleService {
         });
         let skill_executor = build_server_skill_executor(
             &self.run_engine,
+            astra_turn_types::StopHookObligations {
+                declarations: execution_hooks.declarations.clone(),
+                phase: execution_hooks.phase,
+            },
             &self.matrixone,
             &self.encryptor,
             Some(self.model_service.clone()),
@@ -13358,6 +13405,7 @@ impl AgenticRunLifecycleService {
         }
     }
 
+    #[cfg(test)]
     fn build_initial_state_inner(
         &self,
         user_id: &str,
@@ -13381,7 +13429,7 @@ impl AgenticRunLifecycleService {
             session_id,
             run_id,
             workspace_override,
-            edge_context,
+            execution_bindings,
             &request_constraints,
         )?;
         let environment = self.assemble_loop_environment(
@@ -13398,6 +13446,7 @@ impl AgenticRunLifecycleService {
             edge_profile_override,
             runtime_capabilities,
             execution_owner_generation,
+            &facts.hooks,
         );
         Ok(Self::assemble_loop_state(environment, facts))
     }
@@ -13409,12 +13458,12 @@ impl AgenticRunLifecycleService {
         session_id: &str,
         run_id: &str,
         workspace_override: Option<&std::path::Path>,
-        edge_context: &EdgeContext,
+        execution_bindings: Option<&ExecutionBindingSnapshot>,
         request_constraints: &RequestConstraints,
     ) -> Result<LoopExecutionFacts, (StatusCode, Json<ErrorResponse>)> {
         use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
         use astra_turn_core::stop_hooks_yaml::{
-            detect_turn_hook_sets, is_plan_subtask_from_chat_context, project_root_for_stop_hooks,
+            is_plan_subtask_from_chat_context, load_completion_check_declarations,
         };
 
         let prompt_user_message = request.message.trim().to_string();
@@ -13460,24 +13509,65 @@ impl AgenticRunLifecycleService {
                 requested_budget,
             );
         let budget_is_explicit = request.execution_budget.is_some();
-        // Use edge profile's git_root/cwd if available; fall back to provisioned
-        // server workspace so web-agent sessions still load stop-hooks.yaml.
-        let project_root_buf = project_root_for_stop_hooks(edge_context)
-            .or_else(|| workspace_override.map(|p| p.to_path_buf()));
-        let hook_sets = project_root_buf
-            .as_ref()
-            .map(|root| {
-                detect_turn_hook_sets(
-                    root.as_path(),
-                    task_profile,
-                    is_plan_subtask_from_chat_context(&request.context),
+        // Only the selected local workspace provider may supply Server files.
+        // Remote workspace roots remain opaque hints, never host filesystem paths.
+        let local_root = if let Some(snapshot) = execution_bindings
+            && snapshot.workspace.kind == WorkspaceBindingKind::ServerSandbox
+        {
+            if snapshot.executor.kind != ExecutorBindingKind::ServerLocal
+                || snapshot.executor.transport != ToolTransportKind::ServerLocal
+            {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Server completion checks require the selected local executor",
+                ));
+            }
+            let root = workspace_override.ok_or_else(|| {
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Server completion checks require a provider-resolved workspace",
                 )
-            })
-            .unwrap_or_default();
-        let workspace_root_hint = project_root_buf.map(|p| p.to_string_lossy().into_owned());
-        let (tool_event_hooks, session_event_hooks) = workspace_root_hint
-            .as_ref()
-            .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
+            })?;
+            if snapshot.workspace.cwd.as_deref().map(std::path::Path::new) != Some(root) {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Completion workspace does not match the selected provider",
+                ));
+            }
+            if request.completion_checks.is_some() {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Completion checks have conflicting Server and client sources",
+                ));
+            }
+            Some(root)
+        } else {
+            if request.completion_checks.is_some()
+                && execution_bindings
+                    .is_none_or(|snapshot| snapshot.workspace.kind == WorkspaceBindingKind::None)
+            {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Client completion checks require a selected remote workspace",
+                ));
+            }
+            None
+        };
+        let declarations = match local_root {
+            Some(root) => load_completion_check_declarations(root)
+                .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?,
+            None => request.completion_checks.clone().unwrap_or_default(),
+        };
+        // Client declarations were validated at request admission; the local
+        // loader validates its own source before returning declarations.
+        let hook_sets = declarations.clone().into_selected(
+            is_plan_subtask_from_chat_context(&request.context),
+            task_profile.verification_required,
+        );
+        let workspace_root_hint =
+            execution_bindings.and_then(|snapshot| snapshot.workspace.cwd.clone());
+        let (tool_event_hooks, session_event_hooks) = local_root
+            .map(crate::skills::hooks::load_all_hooks)
             .unwrap_or_default();
         let max_turn_input_tokens = effective_max_turn_input_tokens(
             astra_core::RuntimeLimits::global(),
@@ -13496,8 +13586,13 @@ impl AgenticRunLifecycleService {
             request_constraints,
             admitted_runtime_config.tool_policy,
             StopHookState {
-                stop_hooks: hook_sets.stop_hooks,
-                teammate_idle_hooks: hook_sets.teammate_idle_hooks,
+                declarations,
+                phase: if is_plan_subtask_from_chat_context(&request.context) {
+                    astra_turn_types::CompletionCheckPhase::TaskCompleted
+                } else {
+                    astra_turn_types::CompletionCheckPhase::Stop
+                },
+                stop_hooks: hook_sets,
                 workspace_root_hint,
                 forward_headers: request.forward_headers.clone(),
                 admitted_model_execution: request.admitted_model_execution.clone(),
@@ -17014,8 +17109,22 @@ impl AgenticRunLifecycleService {
                 execution_bindings.as_ref(),
             )
             .await?;
+            let facts = self.prepare_initial_execution_facts(
+                &user_id,
+                &request,
+                &session_id,
+                &run_id,
+                cloud_workspace.as_deref().or(server_workspace.as_deref()),
+                execution_bindings.as_ref(),
+                &request_constraints,
+            )?;
+            let completion_checks = astra_turn_types::StopHookObligations {
+                declarations: facts.hooks.declarations.clone(),
+                phase: facts.hooks.phase,
+            };
             if let Some(snapshot) = execution_bindings.as_ref() {
-                let binding_events = binding_snapshot_events(&run_id, &session_id, snapshot);
+                let binding_events =
+                    binding_snapshot_events(&run_id, &session_id, snapshot, &completion_checks);
                 let owner_generation = execution_owner_generation
                     .expect("an idempotent start claim owns an execution generation");
                 let binding_commit = self
@@ -17120,24 +17229,27 @@ impl AgenticRunLifecycleService {
                     return Err(error);
                 }
             };
-            let mut state = self.build_initial_state_inner(
+            let environment = self.assemble_loop_environment(
                 &user_id,
-                &request,
+                LoopEnvironmentAuthorization::fresh(
+                    &request,
+                    &request_constraints,
+                    execution_bindings.as_ref(),
+                ),
                 &session_id,
                 &run_id,
-                tool_runtime_workspace
-                    .as_deref()
-                    .or(server_workspace.as_deref()),
                 execution_bindings.as_ref(),
                 Some(llm_cancel_token.clone()),
                 Some(execution_lease_lost.clone()),
                 Some(Arc::clone(&interaction_sink)),
-                request_constraints.clone(),
+                &request_constraints,
                 &edge_context,
                 Some(&edge_profile),
                 &runtime_capabilities,
                 execution_owner_generation,
-            )?;
+                &facts.hooks,
+            );
+            let mut state = Self::assemble_loop_state(environment, facts);
             install_active_personal_skills(&mut state, active_personal_skills);
             state.context_manifest_user_id = Some(user_id.clone());
             state.current_run_owner_generation = execution_owner_generation;
@@ -17362,7 +17474,10 @@ impl AgenticRunLifecycleService {
             if let (Some(snapshot), Some(event_tx)) =
                 (execution_bindings.as_ref(), event_tx.as_ref())
             {
-                for mut event in binding_snapshot_events(&run_id, &session_id, snapshot) {
+                for event in
+                    binding_snapshot_events(&run_id, &session_id, snapshot, &completion_checks)
+                {
+                    let mut event = astra_services::runs::transform_run_event_for_client(event);
                     if let Some(object) = event.as_object_mut() {
                         object.insert(DURABLE_EVENT_COMMITTED_FIELD.to_string(), Value::Bool(true));
                     }
@@ -17405,7 +17520,6 @@ impl AgenticRunLifecycleService {
 
             self.configure_loop_state_runtime_controls(
                 &mut state,
-                &stream_agent_spawner_entry.spawner,
                 &cancel_flag,
                 &pause_flag,
                 (*llm_cancel_token).clone(),
@@ -17475,6 +17589,8 @@ impl AgenticRunLifecycleService {
                         &request,
                         &edge_context.edge_tools,
                         execution_bindings.as_ref(),
+                        &completion_checks,
+                        execution_owner_generation,
                         agent_working_dir.as_path(),
                         event_tx.clone(),
                         delivery
@@ -19263,8 +19379,8 @@ use crate::server::delegation::engine::{
 /// and observe-only harness path as delegated children. Spawn-specific
 /// semantics stay in `DynamicAgentSpawner` and `agent_tool`.
 pub struct ServerSpawnAgentExecutor {
-    #[cfg(any(test, feature = "e2e-hooks"))]
-    _workspace_provider_guard: Option<ServerWorkspaceProvisioner>,
+    workspace_provider: Option<ServerWorkspaceProvisioner>,
+    workspace_record_store: Option<Arc<dyn WorkspaceStateStore>>,
     #[cfg(any(test, feature = "e2e-hooks"))]
     test_inference_ledger: Option<crate::turn::llm::durable::TestInferenceLedgerPersistence>,
     model_service: Option<Arc<dyn ModelService>>,
@@ -19518,8 +19634,8 @@ impl ServerSpawnAgentExecutor {
         Self {
             #[cfg(any(test, feature = "e2e-hooks"))]
             test_inference_ledger: None,
-            #[cfg(any(test, feature = "e2e-hooks"))]
-            _workspace_provider_guard: None,
+            workspace_provider: None,
+            workspace_record_store: None,
             model_service: None,
             matrixone,
             encryptor,
@@ -20145,6 +20261,7 @@ impl ServerSpawnAgentExecutor {
             interaction_mode: parent.interaction_mode,
             edge_tools: parent.edge_tools.clone(),
             request_constraints,
+            execution_contract: parent.execution_contract.clone(),
             execution_metadata: config
                 .execution_metadata
                 .clone()
@@ -20177,6 +20294,10 @@ impl ServerSpawnAgentExecutor {
             self.matrixone.clone(),
             Arc::clone(&self.encryptor),
             Arc::clone(&self.edge_callback_ledger),
+        );
+        executor = executor.with_workspace_capacity(
+            self.workspace_provider.clone(),
+            self.workspace_record_store.clone(),
         );
         if let Some(run_engine) = self.run_engine.clone() {
             executor = executor.with_run_engine(run_engine);
@@ -21246,6 +21367,83 @@ impl PreparedSpawn for ServerPreparedSpawn {
 
 #[async_trait]
 impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
+    async fn publish_admitted_child_execution_contract(
+        &self,
+        config: &SubRunConfig,
+    ) -> Result<(), String> {
+        let binding_id = config
+            .cancellation_binding_id
+            .as_ref()
+            .ok_or("child contract publication has no cancellation binding")?;
+        let sink = config
+            .execution_owner_generation_sink
+            .as_ref()
+            .ok_or("child contract publication has no generation sink")?;
+        let token = config
+            .cancel_token
+            .as_ref()
+            .ok_or("child contract publication has no cancellation token")?;
+        let generation = config
+            .execution_owner_generation
+            .ok_or("child contract publication has no owner generation")?;
+        let contract = config
+            .execution_contract
+            .as_ref()
+            .ok_or("child contract publication has no execution contract")?;
+        let context = {
+            let registry = self.runtime_context_registry.read().await;
+            let id = registry
+                .context_id_by_binding
+                .get(binding_id)
+                .ok_or("child cancellation binding is no longer registered")?;
+            registry
+                .contexts_by_id
+                .get(id)
+                .cloned()
+                .ok_or("child execution context is no longer registered")?
+        };
+        let capability = Arc::clone(&context.publication_capability);
+        let _publication = capability.fence.read().await;
+        if capability.is_closed() || token.is_cancelled() {
+            return Err("child execution contract publication is closed".into());
+        }
+        if context
+            .execution_owner_generation
+            .wait_until_published_or_stopped()
+            .await
+            != ExecutionOwnerGenerationPublication::Acquired(generation)
+        {
+            return Err("child execution contract generation was superseded".into());
+        }
+        let mut registry = self.runtime_context_registry.write().await;
+        if capability.is_closed()
+            || token.is_cancelled()
+            || registry.current_context_id_by_run.get(&config.run_id)
+                != Some(&context.runtime_context_id)
+            || registry.context_id_by_binding.get(binding_id) != Some(&context.runtime_context_id)
+        {
+            return Err("child execution context was replaced or cancelled".into());
+        }
+        let current = registry
+            .contexts_by_id
+            .get_mut(&context.runtime_context_id)
+            .ok_or("child execution context disappeared")?;
+        if current.parent_run_id != config.run_id
+            || current.user_id != config.user_id
+            || current.session_id != config.session_id
+            || !Arc::ptr_eq(&current.publication_capability, &capability)
+            || !Arc::ptr_eq(&current.execution_owner_generation, sink)
+            || !current
+                .cancel_token
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            return Err("child execution contract publication identity mismatch".into());
+        }
+        current.execution_contract = Some(contract.clone());
+        Ok(())
+    }
+
     async fn bind_admitted_child_runtime(
         &self,
         config: &SubRunConfig,
@@ -21298,6 +21496,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             interaction_mode: config.interaction_mode,
             edge_tools: Arc::new(Vec::new()),
             request_constraints: config.request_constraints.clone(),
+            execution_contract: config.execution_contract.clone(),
             execution_metadata: config.execution_metadata.clone(),
             provider_run_owner: inherited_provider_run_owner(&config.context)?,
             spawner: supervisor,
@@ -21953,7 +22152,20 @@ impl ServerSpawnAgentExecutor {
 
         let mut child_permissions = config.inherited_permissions.clone();
         child_permissions.allowed_tools = request_constraints.allowed_tools.clone();
+        let mut child_execution_contract = context
+            .execution_contract
+            .clone()
+            .ok_or("dynamic child is missing its trusted parent execution contract")?;
+        child_execution_contract.1.phase =
+            if astra_turn_core::stop_hooks_yaml::is_plan_subtask_from_delegation_context(
+                &subrun_context,
+            ) {
+                astra_turn_types::CompletionCheckPhase::TaskCompleted
+            } else {
+                astra_turn_types::CompletionCheckPhase::Stop
+            };
         let subrun = SubRunConfig {
+            execution_contract: Some(child_execution_contract),
             profile_authority: config.profile_authority.clone(),
             max_output_tokens: config.max_output_tokens,
             execution_owner_generation: None,
@@ -22121,6 +22333,8 @@ fn inherited_provider_run_owner(
 /// Creates a real agentic loop for each sub-run with the agent's system prompt,
 /// model, and tool configuration.
 pub struct ServerSubRunExecutor {
+    workspace_provider: Option<ServerWorkspaceProvisioner>,
+    workspace_record_store: Option<Arc<dyn WorkspaceStateStore>>,
     #[cfg(any(test, feature = "e2e-hooks"))]
     test_inference_ledger: Option<crate::turn::llm::durable::TestInferenceLedgerPersistence>,
     model_catalog_reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
@@ -22159,6 +22373,16 @@ pub struct ServerSubRunExecutor {
 }
 
 impl ServerSubRunExecutor {
+    pub(crate) fn with_workspace_capacity(
+        mut self,
+        provider: Option<ServerWorkspaceProvisioner>,
+        store: Option<Arc<dyn WorkspaceStateStore>>,
+    ) -> Self {
+        self.workspace_provider = provider;
+        self.workspace_record_store = store;
+        self
+    }
+
     pub fn with_model_catalog_reader(
         mut self,
         reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
@@ -22209,6 +22433,8 @@ impl ServerSubRunExecutor {
         edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     ) -> Self {
         Self {
+            workspace_provider: None,
+            workspace_record_store: None,
             #[cfg(any(test, feature = "e2e-hooks"))]
             test_inference_ledger: None,
             model_service: None,
@@ -23183,27 +23409,51 @@ impl ServerSubRunExecutor {
         }
     }
 
-    /// Provision a workspace directory for a delegation sub-run.
-    ///
-    /// Sub-runs get a subdirectory under the parent session workspace to
-    /// keep file operations isolated while sharing the same base.
-    fn provision_subrun_workspace(
+    /// Resolve the selected provider's session before creating any child directory.
+    /// Remote bindings remain opaque; their Server scratch directory is private.
+    async fn provision_subrun_workspace(
         &self,
-        session_id: &str,
-        run_id: &str,
+        config: &SubRunConfig,
+        binding: &ExecutionBindingSnapshot,
     ) -> Result<std::path::PathBuf, String> {
-        validate_workspace_id(session_id)
-            .map_err(|source| format!("invalid sub-run session_id: {source}"))?;
-        validate_workspace_id(run_id)
-            .map_err(|source| format!("invalid sub-run run_id: {source}"))?;
-
-        let base = std::env::var("ASTRA_SERVER_WORKSPACES")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir().join("astra-workspaces"));
-        let workspace = base.join(session_id).join(run_id);
-        std::fs::create_dir_all(&workspace)
-            .map_err(|error| format!("failed to create run workspace directory: {error}"))?;
-        Ok(workspace)
+        let provider = self
+            .workspace_provider
+            .as_ref()
+            .ok_or("sub-run has no selected Server workspace provider")?;
+        if binding.workspace.kind == WorkspaceBindingKind::ServerSandbox {
+            if binding.executor.kind != ExecutorBindingKind::ServerLocal
+                || binding.executor.transport != ToolTransportKind::ServerLocal
+            {
+                return Err("Server child workspace requires the selected local executor".into());
+            }
+            let store = self
+                .workspace_record_store
+                .as_ref()
+                .ok_or("sub-run has no authoritative workspace store")?;
+            let record = store
+                .load_workspace_record(&config.user_id, &config.session_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or("sub-run session workspace record is missing")?;
+            let cwd = binding
+                .workspace
+                .cwd
+                .as_deref()
+                .ok_or("Server sub-run parent binding has no workspace cwd")?;
+            provider
+                .provision_subrun(
+                    &config.session_id,
+                    &config.run_id,
+                    &config.parent_run_id,
+                    &record.record,
+                    std::path::Path::new(cwd),
+                )
+                .map_err(|error| error.to_string())
+        } else {
+            provider
+                .provision_scratch_subrun(&config.run_id)
+                .map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -23666,18 +23916,18 @@ impl ServerSubRunExecutor {
             let runtime_ceiling = astra_config::RuntimeConfig::cached()
                 .runtime_limits
                 .resolve_turn_ceiling(
-                    astra_turn_core::stop_hooks_yaml::is_plan_subtask_from_delegation_context(
-                        &config.context,
-                    ),
+                    config
+                        .execution_contract
+                        .as_ref()
+                        .ok_or("sub-run is missing its trusted parent execution contract")?
+                        .1
+                        .phase
+                        == astra_turn_types::CompletionCheckPhase::TaskCompleted,
                 )?;
             if config.max_turns == Some(0) {
                 return Err("max_turns must be positive".to_string());
             }
             use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
-            use astra_turn_core::stop_hooks_yaml::{
-                detect_turn_hook_sets, is_plan_subtask_from_delegation_context,
-                project_root_from_delegation_context,
-            };
             // Install the process-local cancellation surface before any durable
             // activation I/O. A stalled authority renewal must remain bounded and
             // cancellation-responsive, and no provider/tool side effect is
@@ -23693,6 +23943,14 @@ impl ServerSubRunExecutor {
                 .unwrap_or_else(|| Arc::new(CancellationToken::new()));
             let local_execution_lease_lost = Arc::new(AtomicBool::new(false));
 
+            let (inherited_binding, completion_obligations) = config
+                .execution_contract
+                .as_ref()
+                .cloned()
+                .ok_or("sub-run is missing its trusted parent execution contract")?;
+            astra_turn_types::validate_completion_check_declarations(
+                &completion_obligations.declarations,
+            )?;
             let selected_execution = self.select_subrun_execution(&config).await?;
             let durable_admission = self
                 .ensure_durable_subrun_started(&config, selected_execution.as_ref())
@@ -23924,23 +24182,57 @@ impl ServerSubRunExecutor {
             Value::String(config.agent_profile.agent_id.clone()),
         );
         let subrun_workspace =
-            self.provision_subrun_workspace(&config.session_id, &config.run_id)?;
+            self.provision_subrun_workspace(&config, &inherited_binding).await?;
         let child_workspace_mutation = if config.agent_profile.read_only {
             astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
         } else {
             crate::orchestration::workspace_mutation_from_context(&config.context)
         };
-        let execution_bindings = if self.inherited_permissions.read_only_execution
-            || config.agent_profile.read_only
-        {
-            execution_bindings_from_metadata_with_authority(
-                config.execution_metadata.as_ref(),
-                &subrun_workspace,
-                Some(crate::server::tool_transport::WorkspaceAuthority::ReadOnly),
-            )
+        let mut inherited_binding = inherited_binding;
+        let completion_obligations = if inherited_binding.workspace.kind == WorkspaceBindingKind::ServerSandbox {
+            let parent_root = inherited_binding.workspace.cwd.as_deref()
+                .ok_or("Server child parent workspace cwd is missing")?;
+            let obligations = crate::server::run::workspace_provisioning::rebase_completion_checks(
+                completion_obligations, std::path::Path::new(parent_root), &subrun_workspace,
+            )?;
+            inherited_binding.workspace.cwd = Some(subrun_workspace.display().to_string());
+            obligations
         } else {
-            execution_bindings_from_metadata(config.execution_metadata.as_ref(), &subrun_workspace)
+            completion_obligations
         };
+        if (self.inherited_permissions.read_only_execution || config.agent_profile.read_only)
+            && inherited_binding.workspace.authority == WorkspaceAuthority::ReadWrite
+        {
+            inherited_binding.workspace.authority = WorkspaceAuthority::ReadOnly;
+        }
+        if local_cancel_token.is_cancelled() || local_execution_lease_lost.load(Ordering::Acquire) {
+            return Err("sub-run execution stopped before workspace binding commit".into());
+        }
+        let engine = durable_run_engine.as_ref()
+            .ok_or("sub-run workspace binding requires durable execution authority")?;
+        let authority = execution_authority
+            .ok_or("sub-run workspace binding has no current owner generation")?;
+        let binding_events = binding_snapshot_events(
+            &config.run_id, &config.session_id, &inherited_binding, &completion_obligations,
+        );
+        if !engine.append_events_if_current_generation_and_status(
+            &config.user_id, &config.session_id, &config.run_id,
+            authority.owner_generation, &[STATUS_RUNNING], &binding_events,
+        ).await? {
+            return Err("sub-run workspace binding owner was superseded".into());
+        }
+        if local_cancel_token.is_cancelled() || local_execution_lease_lost.load(Ordering::Acquire) {
+            return Err("sub-run execution stopped after workspace binding commit".into());
+        }
+        config.execution_contract = Some((inherited_binding.clone(), completion_obligations.clone()));
+        if let Some(supervisor) = config.child_supervisor.as_ref() {
+            let supervisor = supervisor.upgrade()
+                .ok_or("child supervisor stopped before execution contract publication")?;
+            let executor = supervisor.executor_for_admitted_child()
+                .ok_or("child supervisor has no execution owner")?;
+            executor.publish_admitted_child_execution_contract(&config).await?;
+        }
+        let execution_bindings = Some(inherited_binding);
         // Only a true thin-client callback transport may borrow the parent's
         // SSE `/tools/result` lane. An `edge_ws` workspace has an executable
         // server-to-edge dispatch service and must use RuntimeToolExecutor;
@@ -24085,20 +24377,18 @@ impl ServerSubRunExecutor {
             config.max_turns,
             config.initial_turns,
         )?;
-        let project_root_buf = project_root_from_delegation_context(&config.context);
-        let hook_sets = project_root_buf
-            .as_ref()
-            .map(|root| {
-                detect_turn_hook_sets(
-                    root.as_path(),
-                    task_profile,
-                    is_plan_subtask_from_delegation_context(&config.context),
-                )
-            })
-            .unwrap_or_default();
-        let workspace_root_hint = project_root_buf.map(|p| p.to_string_lossy().into_owned());
-        let (tool_event_hooks, session_event_hooks) = workspace_root_hint
-            .as_ref()
+        let declarations = completion_obligations.declarations.clone();
+        let phase = completion_obligations.phase;
+        let hook_sets = declarations.clone().into_selected(
+            phase == astra_turn_types::CompletionCheckPhase::TaskCompleted,
+            task_profile.verification_required,
+        );
+        let workspace_root_hint = execution_bindings.as_ref().and_then(|binding| binding.workspace.cwd.clone());
+        let (tool_event_hooks, session_event_hooks) = execution_bindings.as_ref()
+            .filter(|binding| binding.workspace.kind == WorkspaceBindingKind::ServerSandbox
+                && binding.executor.kind == ExecutorBindingKind::ServerLocal
+                && binding.executor.transport == ToolTransportKind::ServerLocal)
+            .and_then(|binding| binding.workspace.cwd.as_deref())
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
 
@@ -24135,8 +24425,9 @@ impl ServerSubRunExecutor {
             &config.request_constraints,
             admitted_tool_policy,
             StopHookState {
-                stop_hooks: hook_sets.stop_hooks,
-                teammate_idle_hooks: hook_sets.teammate_idle_hooks,
+                declarations,
+                phase,
+                stop_hooks: hook_sets,
                 workspace_root_hint,
                 forward_headers: config.forward_headers.clone(),
                 admitted_model_execution: config.admitted_model_execution.clone(),

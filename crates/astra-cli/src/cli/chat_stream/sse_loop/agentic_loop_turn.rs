@@ -235,6 +235,7 @@ pub(crate) struct PrepareTurnTelemetry<'a> {
 }
 
 struct PrepareChatTurnRequest<'a> {
+    completion_checks: Option<&'a astra_turn_types::CompletionCheckDeclarations>,
     tool_surface_config: &'a astra_config::runtime_config::ToolSurfaceConfig,
     messages: &'a [Value],
     runtime_required_texts: &'a [String],
@@ -562,6 +563,7 @@ pub(crate) fn server_loop_admission_payload_with_execution_time_budget(
         "is_plan_subtask",
         "requested_model_policy",
         "agent_profile_selection",
+        "completion_checks",
     ] {
         if let Some(value) = source.remove(field) {
             request.insert(field.to_string(), value);
@@ -694,6 +696,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     if let Some(selection) = profile_selection {
         payload["agent_profile_selection"] =
             serde_json::to_value(selection).expect("profile selection serializes");
+    }
+
+    if let Some(checks) = ctx.completion_checks {
+        payload["completion_checks"] = serde_json::to_value(checks)
+            .expect("completion declarations must remain JSON serializable");
     }
 
     // Carry only typed routing metadata across the trust boundary. Full skill
@@ -1271,6 +1278,7 @@ fn inject_runtime_turn_overrides(
 // ─── Fetch: payload → POST → consume_turn_sse ─────────────────────────────────
 
 pub(crate) struct ChatTurnSseFetchRequest<'a> {
+    pub completion_checks: Option<&'a astra_turn_types::CompletionCheckDeclarations>,
     pub tool_surface_config: &'a astra_config::runtime_config::ToolSurfaceConfig,
     pub api: &'a astra_thin_client::ThinClient,
     pub token: &'a str,
@@ -1524,6 +1532,7 @@ pub(crate) async fn fetch_chat_turn_sse(
     ctx: ChatTurnSseFetchRequest<'_>,
 ) -> Result<TurnResult, String> {
     let ChatTurnSseFetchRequest {
+        completion_checks,
         tool_surface_config,
         api,
         token,
@@ -1612,6 +1621,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             stream_json_emitter: stream_json_emitter.as_ref(),
             execution_time_budget_clock: execution_time_budget,
             prepare: PrepareChatTurnRequest {
+                completion_checks,
                 tool_surface_config,
                 messages,
                 runtime_required_texts,
@@ -1777,6 +1787,12 @@ mod tests {
     #[test]
     fn server_loop_admission_excludes_client_owned_conversation_authority() {
         let prepared = json!({
+            "completion_checks": {
+                "stop": [{"label": "root", "command": "make check", "working_dir": null,
+                    "depends_on": [], "timeout_secs": null, "authoritative": true}],
+                "task_completed": [{"label": "child", "command": "make test", "working_dir": null,
+                    "depends_on": [], "timeout_secs": null, "authoritative": true}]
+            },
             "messages": [{"role": "user", "content": "stale client history"}],
             "tool_results": [{"request_id": "call-1", "output": "already applied"}],
             "session_turn": 9,
@@ -1813,6 +1829,7 @@ mod tests {
         )
         .expect("Server loop admission");
         assert_eq!(admitted["message"], "current request");
+        assert_eq!(admitted["completion_checks"], prepared["completion_checks"]);
         assert_eq!(
             admitted["context"]["edge_tools"][0]["function"]["name"],
             "bash"
@@ -2117,6 +2134,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let prepared = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            completion_checks: None,
             cli_context: reasoning.and_then(|(_, _, context)| context),
             tool_surface_config: &Default::default(),
             messages: &messages,
@@ -2403,6 +2421,7 @@ mod tests {
             let mut all_selected_skills = Vec::new();
 
             prepare_chat_turn_payload(PrepareChatTurnRequest {
+                completion_checks: None,
                 cli_context: None,
                 tool_surface_config: &Default::default(),
                 messages: &messages,
@@ -3024,6 +3043,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            completion_checks: None,
             cli_context: None,
             tool_surface_config: &Default::default(),
             messages: &messages,
@@ -3192,6 +3212,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            completion_checks: None,
             cli_context: None,
             tool_surface_config: &Default::default(),
             messages: &messages,
@@ -3332,6 +3353,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            completion_checks: None,
             cli_context: None,
             tool_surface_config: &Default::default(),
             messages: &messages,
@@ -3471,6 +3493,7 @@ mod tests {
             "Task: review timeout handling\nAssistant summary: Need a fix.\nFollow-up: 修复?";
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            completion_checks: None,
             cli_context: None,
             tool_surface_config: &Default::default(),
             messages: &messages,
@@ -3628,6 +3651,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            completion_checks: None,
             cli_context: None,
             tool_surface_config: &Default::default(),
             messages: &messages,
@@ -3746,6 +3770,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            completion_checks: None,
             cli_context: None,
             tool_surface_config: &Default::default(),
             messages: &messages,
@@ -3861,6 +3886,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            completion_checks: None,
             cli_context: None,
             tool_surface_config: &Default::default(),
             messages: &messages,
@@ -3958,6 +3984,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            completion_checks: None,
             cli_context: None,
             tool_surface_config: &Default::default(),
             messages: &messages,
@@ -4063,6 +4090,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            completion_checks: None,
             cli_context: None,
             tool_surface_config: &Default::default(),
             messages: &messages,
@@ -4161,6 +4189,7 @@ mod tests {
         let mut all_selected_skills = Vec::new();
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
+            completion_checks: None,
             cli_context: None,
             tool_surface_config: &Default::default(),
             messages: &messages,

@@ -4413,8 +4413,7 @@ pub(crate) enum TurnExecutionControl {
     Return(AgenticLoopOutcome),
 }
 
-fn apply_terminal_control_stream_snapshot<H: AgenticLoopHost>(
-    host: &mut H,
+fn apply_terminal_control_stream_snapshot(
     state: &mut AgenticLoopState,
     snap: &AgenticTurnStreamSnapshot<'_>,
     control_outcome: crate::turn::terminal_control::TerminalControlOutcome,
@@ -4424,7 +4423,6 @@ fn apply_terminal_control_stream_snapshot<H: AgenticLoopHost>(
     }
     if let Some(session_id) = snap.session_id.as_ref() {
         state.current_session_id = Some(session_id.clone());
-        host.on_session_bound(session_id);
     }
     if let Some(run_id) = snap.run_id.as_deref() {
         state.current_run_id = Some(run_id.to_string());
@@ -5345,7 +5343,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         && turn_result.accum.error_message.is_none()
     {
         return Ok(TurnExecutionControl::Return(
-            apply_terminal_control_stream_snapshot(host, state, &snap, control_outcome),
+            apply_terminal_control_stream_snapshot(state, &snap, control_outcome),
         ));
     }
 
@@ -5396,7 +5394,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     capture_deferred_candidate_text(state, &turn_result);
     state.record_appended_prompt_history_from(transcript_append_start);
     if let Some(session_id) = state.current_session_id.as_deref() {
-        host.on_session_bound(session_id);
         if let Some(buffer) = state.turn_event_buffer.as_mut()
             && let Err(error) = buffer.bind_session_id(session_id)
         {
@@ -8331,14 +8328,12 @@ fn tool_is_terminal_completion_task_action(name: &str) -> bool {
     // execution topology: the next boundary is text-only, so a child, fanout,
     // Work graph, or planning transition could not be observed and settled.
     // Derive built-in control-plane status from the canonical registry rather
-    // than maintaining another incomplete list. Agent topologies and the
-    // runtime-owned `delegate` surface are explicitly excluded because they
-    // are not classified uniformly by that registry. Unknown admitted
+    // than maintaining another incomplete list. Agent topologies are
+    // explicitly excluded because they are not classified uniformly by that
+    // registry. Unknown admitted
     // MCP/task tools may still be valid external
     // actions and continue through ordinary admission and safety policy.
-    if matches!(name, "agent" | "agent_fanout")
-        || name == super::super::agentic::delegate_interception::DELEGATE_TOOL_NAME
-    {
+    if matches!(name, "agent" | "agent_fanout") {
         return false;
     }
     let registry = astra_runtime_env::ToolRegistry::builtins();
@@ -12364,7 +12359,7 @@ mod tests {
             working_dir: None,
             depends_on: Vec::new(),
             timeout_secs: None,
-            cache_key: None,
+
             authoritative: true,
         }
     }
@@ -14834,7 +14829,6 @@ mod tests {
             "settle_work_item",
             "inspect_work_plan",
             "propose_work_plan",
-            "delegate",
         ] {
             assert!(
                 !completion_action_match_label(&state, &action, &call(control, "{}")).is_some(),
@@ -23529,7 +23523,6 @@ mod tests {
         usage: Option<crate::turn::token_usage::TokenUsage>,
         physical: Option<astra_turn_types::RequestTokenUsage>,
         terminal: TypedTerminalGateCase,
-        quiet: bool,
     ) -> UsageGateObservation {
         let usage = usage.unwrap_or_default();
         let error_kind = match terminal {
@@ -23565,10 +23558,7 @@ mod tests {
 
         let execution = match terminal {
             TypedTerminalGateCase::TerminalControl => {
-                let mut host = MockHost::new(Vec::new()).with_quiet(quiet);
-                assert_eq!(host.is_quiet(), quiet);
                 let outcome = apply_terminal_control_stream_snapshot(
-                    &mut host,
                     &mut state,
                     &snap,
                     crate::turn::terminal_control::TerminalControlOutcome::Requested(
@@ -23612,7 +23602,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_usage_terminal_quiet_cross_product_preserves_typed_telemetry() {
+    fn provider_usage_terminal_cross_product_preserves_typed_telemetry() {
         use crate::turn::token_usage::parse_usage;
         use astra_services::InferenceTerminalStatus;
 
@@ -23656,48 +23646,42 @@ mod tests {
                 .total_input_tokens();
 
             for terminal in terminal_cases {
-                let rendered = exercise_usage_gate(extracted, physical, terminal, false);
-                let quiet = exercise_usage_gate(extracted, physical, terminal, true);
+                let observed = exercise_usage_gate(extracted, physical, terminal);
 
                 assert_eq!(
-                    rendered, quiet,
-                    "quiet changed typed telemetry or terminal state: {} / {terminal:?}",
-                    provider.name
-                );
-                assert_eq!(
-                    rendered.telemetry.fresh_input_tokens, expected.input_tokens,
+                    observed.telemetry.fresh_input_tokens, expected.input_tokens,
                     "fresh input: {} / {terminal:?}",
                     provider.name
                 );
                 assert_eq!(
-                    rendered.telemetry.cache_read_tokens, expected.cached_input_tokens,
+                    observed.telemetry.cache_read_tokens, expected.cached_input_tokens,
                     "cache read: {} / {terminal:?}",
                     provider.name
                 );
                 assert_eq!(
-                    rendered.telemetry.cache_creation_tokens, expected.cache_creation_tokens,
+                    observed.telemetry.cache_creation_tokens, expected.cache_creation_tokens,
                     "cache create: {} / {terminal:?}",
                     provider.name
                 );
                 assert_eq!(
-                    rendered.telemetry.output_tokens, expected.output_tokens,
+                    observed.telemetry.output_tokens, expected.output_tokens,
                     "output: {} / {terminal:?}",
                     provider.name
                 );
                 assert_eq!(
-                    rendered.telemetry.total_input_tokens(),
+                    observed.telemetry.total_input_tokens(),
                     expected_total_input,
                     "fresh + read + create: {} / {terminal:?}",
                     provider.name
                 );
-                assert_eq!(rendered.telemetry.has_any_usage, extracted.is_some());
-                assert_eq!(rendered.telemetry.first_ttft_ms, Some(17));
+                assert_eq!(observed.telemetry.has_any_usage, extracted.is_some());
+                assert_eq!(observed.telemetry.first_ttft_ms, Some(17));
                 assert_eq!(
-                    rendered.telemetry.current_session_id.as_deref(),
+                    observed.telemetry.current_session_id.as_deref(),
                     Some("typed-usage-session")
                 );
                 assert_eq!(
-                    rendered.telemetry.current_run_id.as_deref(),
+                    observed.telemetry.current_run_id.as_deref(),
                     Some("typed-usage-run")
                 );
 
@@ -23716,11 +23700,11 @@ mod tests {
                         unreachable!("cancelled is outside this exit-gate matrix")
                     }
                 };
-                assert_eq!(rendered.execution, expected_execution);
+                assert_eq!(observed.execution, expected_execution);
 
                 let expected_calibration = physical.map(|_| expected_total_input);
                 assert_eq!(
-                    rendered.telemetry.last_measured_prompt_tokens, expected_calibration,
+                    observed.telemetry.last_measured_prompt_tokens, expected_calibration,
                     "prompt calibration: {} / {terminal:?}",
                     provider.name
                 );

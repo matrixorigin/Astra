@@ -1031,22 +1031,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         }
 
         // Phase 2: execute all concurrently (no &mut self needed).
-        let mut executions: Vec<(
-            HeadlessResolvedExecution,
-            Option<IdempotencyKey>,
-            Option<astra_turn_core::provider_resolution::ResolvedInvocationPolicy>,
-            Option<crate::server::tool_execution_binding::ToolPermissionGrantSnapshot>,
-        )> = permitted_batch
-            .into_iter()
-            .map(|p| {
-                (
-                    p.execution,
-                    p.idem_key,
-                    p.resolved_provider_policy,
-                    p.permission_grant,
-                )
-            })
-            .collect();
+        let mut executions = permitted_batch;
 
         let server_executor = self.ctx.runtime_tool_executor;
         let api = self.ctx.api;
@@ -1062,15 +1047,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         let started_at: Vec<Instant> = executions
             .iter()
-            .map(|(execution, idem_key, _, _)| {
-                self.begin_execution_trace(execution, idem_key.as_ref());
+            .map(|permitted| {
+                self.begin_execution_trace(&permitted.execution, permitted.idem_key.as_ref());
                 Instant::now()
             })
             .collect();
 
         let futs: Vec<_> = executions
             .iter_mut()
-            .map(|(exec, _, provider_policy, permission_grant)| async move {
+            .map(|permitted| async move {
+                let exec = &mut permitted.execution;
                 let Ok(_permit) =
                     astra_turn_core::parallel_tool_exec::acquire_shared_tool_permit().await
                 else {
@@ -1106,8 +1092,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     turn_chain_id,
                     durable_dispatch_admission,
                     delegation_model_admission,
-                    provider_policy.as_ref(),
-                    permission_grant.as_ref(),
+                    permitted.resolved_provider_policy.as_ref(),
+                    permitted.permission_grant.as_ref(),
                     session_turn,
                     edge_round_present,
                     runtime_control_kind,
@@ -1118,8 +1104,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let dispatch_controls = futures_util::future::join_all(futs).await;
 
         // Phase 3: post-process + record serially (fast, needs &mut self).
-        for ((execution, idem_key, _, _), started) in executions.into_iter().zip(started_at) {
-            let executed = self.postprocess_execution(execution, idem_key, started);
+        for (permitted, started) in executions.into_iter().zip(started_at) {
+            let mut executed =
+                self.postprocess_execution(permitted.execution, permitted.idem_key, started);
+            executed.pre_tool_context = permitted.pre_tool_context;
             self.record_execution(executed).await;
         }
         let mut continue_round = true;
@@ -4538,62 +4526,60 @@ mod tests {
 
     #[tokio::test]
     async fn pre_tool_context_survives_server_execution_without_polluting_observation_cache() {
-        let mut harness = PipelineHarness::new();
-        harness.valid_tool_names.insert("read_file".to_string());
-        harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
-            event: ToolEventKind::PreToolUse,
-            matcher: "read_file".into(),
-            action: HookAction::Shell {
-                command:
-                    r#"echo '{"decision":"allow_with_context","context":"current policy context"}'"#
-                        .into(),
-            },
-            timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
-        }]);
-        configure_server_read_file(&mut harness, "call-read-context", "context.txt");
-        seed_cached_read_file(
-            &mut harness,
-            "call-read-context",
-            "context.txt",
-            "stale-cache-that-context-sensitive-calls-must-not-reuse",
-        );
-
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("context.txt"), "fresh provider observation").unwrap();
-        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
-        let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
-        let validated = match pipeline.validate_slot(0) {
-            HeadlessPipelineStage::Continue(validated) => validated,
-            _ => panic!("expected validated server read"),
-        };
-        let permitted = match pipeline.permit_execution(validated).await {
-            HeadlessPipelineStage::Continue(permitted) => permitted,
-            _ => panic!("context-sensitive reads must execute instead of reusing old cache"),
-        };
-        let executed = pipeline.execute_execution(permitted).await;
-        assert!(!executed.is_err, "got: {}", executed.execution.result_str);
-        pipeline.record_execution(executed).await;
-        drop(pipeline);
-
-        let model_visible = format!("{:?}{:?}", harness.messages, harness.tool_results);
-        assert!(model_visible.contains("fresh provider observation"));
-        assert!(model_visible.contains("[Hook context]: current policy context"));
-        assert!(!model_visible.contains("stale-cache-that-context-sensitive-calls-must-not-reuse"));
-
-        let cached = harness
-            .idempotency_cache
-            .check(&read_cache_key_for_invocation(
-                &harness,
+        for concurrent in [false, true] {
+            let mut harness = PipelineHarness::new();
+            harness.valid_tool_names.insert("read_file".to_string());
+            harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
+                event: ToolEventKind::PreToolUse,
+                matcher: "read_file".into(),
+                action: HookAction::Shell {
+                    command:
+                        r#"echo '{"decision":"allow_with_context","context":"current policy context"}'"#
+                            .into(),
+                },
+                timeout_secs: 5,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
+            }]);
+            configure_server_read_file(&mut harness, "call-read-context", "context.txt");
+            seed_cached_read_file(
+                &mut harness,
                 "call-read-context",
                 "context.txt",
-            ))
-            .expect("fresh provider observation must replace the old cache entry");
-        assert!(cached.output.contains("fresh provider observation"));
-        assert!(!cached.output.contains("current policy context"));
+                "stale-cache-that-context-sensitive-calls-must-not-reuse",
+            );
+
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::write(dir.path().join("context.txt"), "fresh provider observation").unwrap();
+            let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
+            let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
+            if concurrent {
+                assert!(pipeline.run_batch_concurrent(&[0]).await);
+            } else {
+                assert!(pipeline.run_slot_with_control(0).await);
+            }
+            drop(pipeline);
+
+            let model_visible = format!("{:?}{:?}", harness.messages, harness.tool_results);
+            assert!(model_visible.contains("fresh provider observation"));
+            assert!(model_visible.contains("[Hook context]: current policy context"));
+            assert!(
+                !model_visible.contains("stale-cache-that-context-sensitive-calls-must-not-reuse")
+            );
+
+            let cached = harness
+                .idempotency_cache
+                .check(&read_cache_key_for_invocation(
+                    &harness,
+                    "call-read-context",
+                    "context.txt",
+                ))
+                .expect("fresh provider observation must replace the old cache entry");
+            assert!(cached.output.contains("fresh provider observation"));
+            assert!(!cached.output.contains("current policy context"));
+        }
     }
 
     #[tokio::test]

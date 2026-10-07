@@ -3523,7 +3523,7 @@ fn session_warm_start_cannot_reconstruct_same_run_even_after_generation_advance(
                 remaining_iterations: 9,
                 effective_hard_turn_limit: None,
             }),
-            run_execution_control: Some(RunExecutionControl::V3 {
+            run_execution_control: Some(RunExecutionControl::V4 {
                 completion_settlement: Default::default(),
                 hook_obligations: Default::default(),
                 reply_obligations: source.snapshot("questioner", 3).unwrap(),
@@ -5167,6 +5167,7 @@ fn test_spawn_runtime_context(parent_run_id: &str, user_id: &str) -> ServerSpawn
     let execution_owner_generation = Arc::new(ExecutionOwnerGenerationSink::preparing(0));
     execution_owner_generation.publish(0);
     ServerSpawnRuntimeContext {
+        execution_contract: None,
         model_catalog_reader: None,
         parent_run_id: parent_run_id.to_string(),
         runtime_context_id: Uuid::new_v4().to_string(),
@@ -5633,6 +5634,8 @@ async fn rejected_root_wiring_fails_before_installing_the_agent_provider() {
                 &request,
                 &[],
                 None,
+                &Default::default(),
+                execution_authority.owner_generation,
                 workspace.path(),
                 None,
                 None,
@@ -5682,7 +5685,7 @@ async fn rejected_root_wiring_fails_before_installing_the_agent_provider() {
 #[tokio::test]
 async fn closed_root_publication_fence_returns_before_installing_the_agent_provider() {
     let service = test_service();
-    service
+    let execution_authority = service
         .run_engine
         .start_run("locally-fenced-root", "user-a", "session-1")
         .await
@@ -5722,6 +5725,8 @@ async fn closed_root_publication_fence_returns_before_installing_the_agent_provi
             &test_request("must not execute"),
             &[],
             None,
+            &Default::default(),
+            execution_authority.owner_generation,
             workspace.path(),
             None,
             None,
@@ -5763,6 +5768,82 @@ async fn closed_root_publication_fence_returns_before_installing_the_agent_provi
             .await
             .contexts_by_id
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn stale_root_wiring_preserves_the_current_owner_publication() {
+    let store = Arc::new(InMemoryRunStateStore::new());
+    let service = test_service_with_store(store.clone());
+    let old_owner = service
+        .run_engine
+        .start_run("rotated-root", "user-a", "session-1")
+        .await
+        .unwrap();
+    let claimed = store.claim_recoverable_active_runs(10).await.unwrap();
+    let current_generation = claimed
+        .iter()
+        .find(|claim| claim.run.run_id == "rotated-root")
+        .unwrap()
+        .run
+        .run_generation;
+    assert!(current_generation > old_owner.owner_generation);
+    let entry = service
+        .server_agent_spawner_for_session("user-a", "session-1")
+        .await;
+    let capability = entry
+        .executor
+        .publication_capability_for_run("rotated-root");
+    let token = Arc::new(CancellationToken::new());
+    let mut current = test_spawn_runtime_context("rotated-root", "user-a");
+    current.cancellation_binding_id = None;
+    current.publication_capability = capability.clone();
+    current.cancel_token = Some(token.clone());
+    current
+        .execution_owner_generation
+        .publish(current_generation);
+    let context_id = current.runtime_context_id.clone();
+    assert!(entry.executor.set_runtime_context(current).await);
+    let workspace = tempfile::tempdir().unwrap();
+    let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+        workspace.path().to_path_buf(),
+        "user-a".into(),
+        "session-1".into(),
+        None,
+        None,
+    );
+    let result = service
+        .wire_server_dynamic_agent_tools(
+            &entry,
+            Ok(()),
+            &mut executor,
+            "user-a",
+            "session-1",
+            "rotated-root",
+            1,
+            &test_request("inspect"),
+            &[],
+            None,
+            &Default::default(),
+            old_owner.owner_generation,
+            workspace.path(),
+            None,
+            None,
+            None,
+            None,
+            #[cfg(feature = "harness")]
+            None,
+        )
+        .await;
+    let error = result.err().expect("stale owner published");
+    assert!(error.contains("execution owner changed"), "{error}");
+    assert!(!capability.is_closed());
+    assert!(!token.is_cancelled());
+    let registry = entry.executor.runtime_context_registry.read().await;
+    assert!(registry.contexts_by_id.contains_key(&context_id));
+    assert_eq!(
+        registry.current_context_id_by_run.get("rotated-root"),
+        Some(&context_id)
     );
 }
 
@@ -7974,21 +8055,28 @@ async fn two_fresh_server_children_fail_closed_without_durable_owner_pod_capabil
         .start_run("root-fanout-run", "user-a", "session-1")
         .await
         .expect("durable fanout parent");
-    let executor = Arc::new(
-        ServerSpawnAgentExecutor::new(
-            test_settings(),
-            test_encryptor(),
-            Arc::new(TokioMutex::new(HashMap::new())),
+    let mut executor = ServerSpawnAgentExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    )
+    .with_run_engine(run_engine.clone())
+    .with_invocation_ledger(
+        crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
+            run_engine.clone(),
         )
-        .with_run_engine(run_engine.clone())
-        .with_invocation_ledger(
-            crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
-                run_engine.clone(),
-            )
-            .expect("process-local invocation ledger"),
-        ),
+        .expect("process-local invocation ledger"),
     );
-    let spawner = test_dynamic_agent_spawner();
+    executor.workspace_provider = Some(ServerWorkspaceProvisioner::fixture(
+        Arc::new(tempfile::tempdir().expect("private fanout scratch")),
+        "test-executor",
+    ));
+    let executor = Arc::new(executor);
+    let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+        Arc::new(astra_messaging::InProcessTransport::new()),
+        Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
+    ));
+    let spawner = Arc::new(DynamicAgentSpawner::new(router).with_executor(executor.clone()));
     let mut context = test_spawn_runtime_context("root-fanout-run", "user-a");
     context.admitted_model_execution = Some(astra_services::AdmittedModelExecution::from_endpoint(
         "model-test-model".to_string(),
@@ -7998,6 +8086,13 @@ async fn two_fresh_server_children_fail_closed_without_durable_owner_pod_capabil
         "Bearer test".to_string(),
         None,
         128_000,
+    ));
+    context.execution_contract = Some((
+        ExecutionBindingSnapshot::inferred(
+            WorkspaceBinding::none(),
+            ExecutorBinding::server_control_plane(),
+        ),
+        astra_turn_types::StopHookObligations::default(),
     ));
     context.spawner = Arc::downgrade(&spawner);
     executor.set_runtime_context(context).await;
@@ -12790,6 +12885,7 @@ async fn seed_lifecycle_run_for_pause_resume_it(
 
 fn test_request(message: &str) -> ChatRequestData {
     ChatRequestData {
+        completion_checks: None,
         agent_profile_selection: None,
         admitted_agent_profiles: None,
         model_catalog_reader: None,
@@ -13047,6 +13143,7 @@ async fn work_runtime_binding_validation_is_explicit_owner_safe_and_branch_exact
     .with_run_engine(service.run_engine.clone())
     .with_pool(pool.clone());
     let mut child_config = SubRunConfig {
+        execution_contract: None,
         profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
         max_output_tokens: None,
         execution_owner_generation: None,
@@ -13743,6 +13840,13 @@ fn test_executable_subrun_config(
     admitted_model_execution: astra_services::AdmittedModelExecution,
 ) -> SubRunConfig {
     SubRunConfig {
+        execution_contract: Some((
+            ExecutionBindingSnapshot::inferred(
+                WorkspaceBinding::none(),
+                ExecutorBinding::server_control_plane(),
+            ),
+            astra_turn_types::StopHookObligations::default(),
+        )),
         profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
         max_output_tokens: None,
         execution_owner_generation: None,
@@ -13817,6 +13921,45 @@ async fn precreated_child_runtime_reuses_admitted_controls_and_retains_pause() {
         .runtime_context_for_parent_run(&config.run_id)
         .await
         .unwrap();
+    config.execution_contract = Some((
+        ExecutionBindingSnapshot::inferred(
+            WorkspaceBinding::none(),
+            ExecutorBinding::server_control_plane(),
+        ),
+        astra_turn_types::StopHookObligations::default(),
+    ));
+    config.cancel_token = Some(Arc::new(CancellationToken::new()));
+    assert!(
+        entry
+            .executor
+            .publish_admitted_child_execution_contract(&config)
+            .await
+            .is_err()
+    );
+    assert!(!cancel.is_cancelled());
+    config.cancel_token = Some(cancel.clone());
+    entry
+        .executor
+        .publish_admitted_child_execution_contract(&config)
+        .await
+        .unwrap();
+    let published = entry
+        .executor
+        .runtime_context_for_parent_run(&config.run_id)
+        .await
+        .unwrap();
+    assert_eq!(published.runtime_context_id, context.runtime_context_id);
+    assert_eq!(published.execution_contract, config.execution_contract);
+    config.execution_owner_generation = Some(8);
+    assert!(
+        entry
+            .executor
+            .publish_admitted_child_execution_contract(&config)
+            .await
+            .is_err()
+    );
+    assert!(!cancel.is_cancelled());
+    config.execution_owner_generation = Some(7);
     assert!(Arc::ptr_eq(context.pause_flag.as_ref().unwrap(), &pause));
     assert!(Arc::ptr_eq(context.cancel_token.as_ref().unwrap(), &cancel));
     assert_eq!(
@@ -13870,6 +14013,289 @@ async fn precreated_child_runtime_reuses_admitted_controls_and_retains_pause() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn child_contract_publication_preserves_replacement_owner_and_rejects_cancelled_owner() {
+    let service = test_service();
+    let entry = service
+        .server_agent_spawner_for_session("user-1", "session-1")
+        .await;
+    let execution = test_admitted_model_execution();
+    let mut old = test_executable_subrun_config("publication-child", execution.clone());
+    old.execution_owner_generation = Some(7);
+    old.cancellation_binding_id = Some("old-child-binding".into());
+    old.child_supervisor = Some(Arc::downgrade(&entry.spawner));
+    old.execution_owner_generation_sink =
+        Some(Arc::new(ExecutionOwnerGenerationSink::preparing(7)));
+    old.cancel_token = Some(Arc::new(CancellationToken::new()));
+    let _old_guard = entry
+        .executor
+        .bind_admitted_child_runtime(&old, &execution)
+        .await
+        .unwrap();
+    let mut current = test_executable_subrun_config("publication-child", execution.clone());
+    current.execution_owner_generation = Some(8);
+    current.cancellation_binding_id = Some("current-child-binding".into());
+    current.child_supervisor = Some(Arc::downgrade(&entry.spawner));
+    current.execution_owner_generation_sink =
+        Some(Arc::new(ExecutionOwnerGenerationSink::preparing(8)));
+    let current_token = Arc::new(CancellationToken::new());
+    current.cancel_token = Some(current_token.clone());
+    let _current_guard = entry
+        .executor
+        .bind_admitted_child_runtime(&current, &execution)
+        .await
+        .unwrap();
+    let before = entry
+        .executor
+        .runtime_context_for_parent_run(&current.run_id)
+        .await
+        .unwrap();
+    old.execution_contract.as_mut().unwrap().1.phase =
+        astra_turn_types::CompletionCheckPhase::TaskCompleted;
+    assert!(
+        entry
+            .executor
+            .publish_admitted_child_execution_contract(&old)
+            .await
+            .is_err()
+    );
+    let after = entry
+        .executor
+        .runtime_context_for_parent_run(&current.run_id)
+        .await
+        .unwrap();
+    assert_eq!(after.runtime_context_id, before.runtime_context_id);
+    assert_eq!(after.execution_contract, before.execution_contract);
+    assert!(!current_token.is_cancelled());
+    assert!(!after.publication_capability.is_closed());
+    entry
+        .executor
+        .publish_admitted_child_execution_contract(&current)
+        .await
+        .unwrap();
+    current_token.cancel();
+    current.execution_contract.as_mut().unwrap().1.phase =
+        astra_turn_types::CompletionCheckPhase::TaskCompleted;
+    assert!(
+        entry
+            .executor
+            .publish_admitted_child_execution_contract(&current)
+            .await
+            .is_err()
+    );
+    let cancelled = entry
+        .executor
+        .runtime_context_for_parent_run(&current.run_id)
+        .await
+        .unwrap();
+    assert_eq!(cancelled.runtime_context_id, before.runtime_context_id);
+    assert_eq!(cancelled.execution_contract, before.execution_contract);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_and_grandchild_execute_with_their_own_frozen_workspace_contracts() {
+    let llm = spawn_gated_terminal_test_llm().await;
+    let store = Arc::new(InMemoryWorkspaceRecordStore::new());
+    let mut service = test_service().with_workspace_record_store(store);
+    service.test_inference_ledger = Some(Default::default());
+    let provider = service.selected_server_workspace_provider.as_ref().unwrap();
+    let workspace = provider.provision("session-1").unwrap();
+    ok(service
+        .persist_workspace_record(
+            "user-1",
+            "session-1",
+            "authority-parent-run",
+            &workspace.workspace,
+        )
+        .await);
+    service
+        .run_engine
+        .start_run("authority-parent-run", "user-1", "session-1")
+        .await
+        .unwrap();
+    let execution = astra_services::AdmittedModelExecution::from_endpoint(
+        "model-test-model".into(),
+        "test-model".into(),
+        "openai".into(),
+        format!("{}/chat/completions", llm.base_url),
+        "Bearer test".into(),
+        None,
+        128_000,
+    );
+    let check = |label: &str| astra_turn_types::StopHook {
+        label: label.into(),
+        command: "true".into(),
+        working_dir: Some(workspace.root.display().to_string()),
+        depends_on: vec![],
+        timeout_secs: Some(5),
+        authoritative: false,
+    };
+    let original = astra_turn_types::StopHookObligations {
+        declarations: astra_turn_types::CompletionCheckDeclarations {
+            stop: vec![check("stop")],
+            task_completed: vec![check("task")],
+        },
+        phase: astra_turn_types::CompletionCheckPhase::TaskCompleted,
+    };
+    let root_binding = ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(&workspace.root),
+        ExecutorBinding::server_local(),
+    );
+    let entry = service
+        .server_agent_spawner_for_session("user-1", "session-1")
+        .await;
+    let executor = Arc::new(entry.executor.build_subrun_executor(
+        InheritedPermissions::auto_approve(),
+        None,
+        Some(&execution),
+        Arc::new(Vec::new()),
+    ));
+    let mut child = test_executable_subrun_config("contract-child", execution.clone());
+    child.agent_profile.read_only = true;
+    child.execution_contract = Some((root_binding, original.clone()));
+    child.child_supervisor = Some(Arc::downgrade(&entry.spawner));
+    child.cancellation_binding_id = Some("contract-child-binding".into());
+    child.cancel_token = Some(Arc::new(CancellationToken::new()));
+    let admitted = executor
+        .ensure_durable_subrun_started(&child, Some(&execution))
+        .await
+        .unwrap()
+        .unwrap();
+    child.execution_owner_generation = Some(admitted.owner_generation);
+    child.execution_owner_generation_sink = Some(Arc::new(
+        ExecutionOwnerGenerationSink::preparing(admitted.owner_generation),
+    ));
+    let _child_guard = entry
+        .executor
+        .bind_admitted_child_runtime(&child, &execution)
+        .await
+        .unwrap();
+    let child_executor = executor.clone();
+    let child_task = tokio::spawn(async move { child_executor.execute(child).await });
+    tokio::time::timeout(Duration::from_secs(10), llm.blocked_entered.notified())
+        .await
+        .expect("child reaches actual provider");
+    let context = entry
+        .executor
+        .runtime_context_for_parent_run("contract-child")
+        .await
+        .unwrap();
+    let child_durable = service
+        .run_engine
+        .load_run("user-1", "contract-child")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child_durable.status, STATUS_RUNNING);
+    assert!(
+        !child_task.is_finished(),
+        "child must remain in flight during descendant admission"
+    );
+    let child_contract =
+        crate::server::run::binding_resolution::durable_run_execution_contract(&child_durable)
+            .unwrap();
+    assert_eq!(context.execution_contract.as_ref(), Some(&child_contract));
+    assert_eq!(
+        child_contract.0.workspace.authority,
+        WorkspaceAuthority::ReadOnly
+    );
+    assert_eq!(
+        child_contract.0.workspace.cwd.as_deref(),
+        workspace.root.join("contract-child").to_str()
+    );
+    for check in child_contract
+        .1
+        .declarations
+        .stop
+        .iter()
+        .chain(&child_contract.1.declarations.task_completed)
+    {
+        assert_eq!(
+            check.working_dir.as_deref(),
+            child_contract.0.workspace.cwd.as_deref()
+        );
+    }
+    // Frozen declarations must not be reloaded from a changed parent file.
+    std::fs::create_dir_all(workspace.root.join(".astra")).unwrap();
+    std::fs::write(
+        workspace.root.join(".astra/stop-hooks.yaml"),
+        "invalid yaml: [",
+    )
+    .unwrap();
+    let actual_parent = std::path::Path::new(child_contract.0.workspace.cwd.as_deref().unwrap());
+    std::fs::create_dir_all(actual_parent.join(".astra")).unwrap();
+    std::fs::write(
+        actual_parent.join(".astra/stop-hooks.yaml"),
+        "invalid yaml: [",
+    )
+    .unwrap();
+    let mut grandchild = test_executable_subrun_config("contract-grandchild", execution.clone());
+    grandchild.parent_run_id = "contract-child".into();
+    grandchild.agent_profile.read_only = true;
+    grandchild.execution_contract = Some(child_contract);
+    grandchild.child_supervisor = Some(Arc::downgrade(&entry.spawner));
+    grandchild.cancellation_binding_id = Some("contract-grandchild-binding".into());
+    grandchild.cancel_token = Some(Arc::new(CancellationToken::new()));
+    let admitted = executor
+        .ensure_durable_subrun_started(&grandchild, Some(&execution))
+        .await
+        .unwrap()
+        .unwrap();
+    grandchild.execution_owner_generation = Some(admitted.owner_generation);
+    grandchild.execution_owner_generation_sink = Some(Arc::new(
+        ExecutionOwnerGenerationSink::preparing(admitted.owner_generation),
+    ));
+    let _grandchild_guard = entry
+        .executor
+        .bind_admitted_child_runtime(&grandchild, &execution)
+        .await
+        .unwrap();
+    let (result, _) = tokio::time::timeout(Duration::from_secs(10), executor.execute(grandchild))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.status, STATUS_COMPLETED, "{result:?}");
+    let durable = service
+        .run_engine
+        .load_run("user-1", "contract-grandchild")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_COMPLETED);
+    let (binding, obligations) =
+        crate::server::run::binding_resolution::durable_run_execution_contract(&durable).unwrap();
+    assert_eq!(
+        binding.workspace.cwd.as_deref(),
+        workspace.root.join("contract-grandchild").to_str()
+    );
+    assert_eq!(binding.workspace.authority, WorkspaceAuthority::ReadOnly);
+    let mut expected = original;
+    for check in expected
+        .declarations
+        .stop
+        .iter_mut()
+        .chain(&mut expected.declarations.task_completed)
+    {
+        check.working_dir = binding.workspace.cwd.clone();
+    }
+    assert_eq!(obligations, expected);
+    llm.release_blocked.notify_one();
+    let (result, _) = tokio::time::timeout(Duration::from_secs(10), child_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.status, STATUS_COMPLETED, "{result:?}");
+    let completed_child = service
+        .run_engine
+        .load_run("user-1", "contract-child")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed_child.status, STATUS_COMPLETED);
+    assert_eq!(llm.requests.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -14041,6 +14467,13 @@ async fn durable_subrun_retry_requires_the_exact_prestarted_generation_before_pr
         Arc::new(TokioMutex::new(HashMap::new())),
     )
     .with_run_engine(run_engine.clone())
+    .with_workspace_capacity(
+        Some(ServerWorkspaceProvisioner::fixture(
+            Arc::new(tempfile::tempdir().expect("private child scratch")),
+            "test-executor",
+        )),
+        None,
+    )
     .with_invocation_ledger(
         crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
             run_engine.clone(),
@@ -14072,6 +14505,20 @@ async fn durable_subrun_retry_requires_the_exact_prestarted_generation_before_pr
         .expect("load exact prestarted child")
         .expect("exact prestarted durable child");
     assert_eq!(exact_durable.status, STATUS_FAILED);
+    let (binding, obligations) =
+        crate::server::run::binding_resolution::durable_run_execution_contract(&exact_durable)
+            .expect("actual child binding pair survives durable roundtrip");
+    assert_eq!(
+        binding,
+        ExecutionBindingSnapshot::inferred(
+            WorkspaceBinding::none(),
+            ExecutorBinding::server_control_plane(),
+        )
+    );
+    assert_eq!(
+        obligations,
+        astra_turn_types::StopHookObligations::default()
+    );
     assert_eq!(llm.requests.load(std::sync::atomic::Ordering::SeqCst), 0);
 
     let missing_authority =
@@ -14597,6 +15044,7 @@ async fn server_subrun_execution_material_is_bound_to_durable_offering_identity(
     )
     .with_run_engine(run_engine.clone());
     let mut config = SubRunConfig {
+        execution_contract: None,
         profile_authority: ParentProfileAuthority::NonDelegating {
             authority: Box::new(ParentProfileAuthority::Unbound),
         },
@@ -14902,6 +15350,7 @@ async fn generic_subrun_does_not_inherit_parent_canonical_work_identity() {
     )
     .with_run_engine(run_engine.clone());
     let mut config = SubRunConfig {
+        execution_contract: None,
         profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
         max_output_tokens: None,
         execution_owner_generation: None,
@@ -15046,6 +15495,7 @@ async fn server_subrun_rejects_work_item_without_parent_work_before_child_insert
     )
     .with_run_engine(run_engine.clone());
     let config = SubRunConfig {
+        execution_contract: None,
         profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
         max_output_tokens: None,
         execution_owner_generation: None,
@@ -15692,31 +16142,6 @@ async fn delegated_subrun_cancel_wins_generation_fenced_terminal_append() {
     );
 }
 
-#[test]
-fn provision_subrun_workspace_rejects_unsafe_identity_components() {
-    let executor = ServerSubRunExecutor::new(
-        test_settings(),
-        test_encryptor(),
-        Arc::new(TokioMutex::new(HashMap::new())),
-    );
-
-    let session_error = executor
-        .provision_subrun_workspace("session/123", "run-123")
-        .expect_err("unsafe session id must fail instead of being sanitized");
-    assert!(
-        session_error.contains("invalid sub-run session_id"),
-        "unexpected session error: {session_error}"
-    );
-
-    let run_error = executor
-        .provision_subrun_workspace("session-123", "run/123")
-        .expect_err("unsafe run id must fail instead of being sanitized");
-    assert!(
-        run_error.contains("invalid sub-run run_id"),
-        "unexpected run error: {run_error}"
-    );
-}
-
 #[tokio::test]
 async fn server_subrun_error_after_durable_start_commits_exact_failed_terminal() {
     let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
@@ -15731,6 +16156,13 @@ async fn server_subrun_error_after_durable_start_commits_exact_failed_terminal()
     )
     .with_run_engine(run_engine.clone());
     let config = SubRunConfig {
+        execution_contract: Some((
+            ExecutionBindingSnapshot::inferred(
+                WorkspaceBinding::none(),
+                ExecutorBinding::server_control_plane(),
+            ),
+            astra_turn_types::StopHookObligations::default(),
+        )),
         profile_authority: crate::orchestration::spawner::ParentProfileAuthority::Unbound,
         max_output_tokens: None,
         execution_owner_generation: None,
@@ -15772,8 +16204,11 @@ async fn server_subrun_error_after_durable_start_commits_exact_failed_terminal()
     let error = executor
         .execute(config)
         .await
-        .expect_err("unsafe post-admission workspace must fail");
-    assert!(error.contains("invalid sub-run session_id"), "{error}");
+        .expect_err("missing selected workspace provider must fail after durable admission");
+    assert!(
+        error.contains("no selected Server workspace provider"),
+        "{error}"
+    );
 
     let child = run_engine
         .load_run("user-1", "child-safe")
@@ -16909,36 +17344,6 @@ fn explicit_no_file_environment_binding_uses_server_control_plane_executor() {
     assert_eq!(executor.display_name, "Server control plane");
     assert_eq!(executor.transport, ToolTransportKind::ServerLocal);
     assert_eq!(executor.status, ExecutorStatus::Online);
-}
-
-#[test]
-fn execution_bindings_from_metadata_rebases_server_sandbox_cwd() {
-    let metadata = json!({
-        "workspace": {
-            "kind": "server_sandbox",
-            "display_name": "Server sandbox",
-            "cwd": "/tmp/parent-workspace",
-            "authority": "read_write",
-        },
-        "executor": {
-            "kind": "server_local",
-            "executor_id": "server-local",
-            "display_name": "Server sandbox",
-            "transport": "server_local",
-            "status": "online"
-        }
-    });
-
-    let snapshot =
-        execution_bindings_from_metadata(Some(&metadata), Path::new("/tmp/child-workspace"))
-            .expect("metadata bindings");
-    let workspace = &snapshot.workspace;
-    let executor = &snapshot.executor;
-
-    assert_eq!(workspace.kind, WorkspaceBindingKind::ServerSandbox);
-    assert_eq!(workspace.cwd.as_deref(), Some("/tmp/child-workspace"));
-    assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
-    assert!(snapshot.runtime.is_none());
 }
 
 #[tokio::test]
@@ -23400,7 +23805,25 @@ async fn late_execution_binding_requires_current_generation_and_is_immutable() {
         WorkspaceBinding::server_sandbox("/workspace/late-binding"),
         ExecutorBinding::server_local(),
     );
-    let events = binding_snapshot_events(run_id, session_id, &snapshot);
+    let check = astra_turn_types::StopHook {
+        label: "root-check".into(),
+        command: "true".into(),
+        working_dir: None,
+        depends_on: Vec::new(),
+        timeout_secs: None,
+        authoritative: true,
+    };
+    let mut child_check = check.clone();
+    child_check.label = "child-check".into();
+    child_check.command = "false".into();
+    let obligations = astra_turn_types::StopHookObligations {
+        declarations: astra_turn_types::CompletionCheckDeclarations {
+            stop: vec![check],
+            task_completed: vec![child_check],
+        },
+        phase: astra_turn_types::CompletionCheckPhase::Stop,
+    };
+    let events = binding_snapshot_events(run_id, session_id, &snapshot, &obligations);
     for (user, session, generation, statuses) in [
         (
             "user-1",
@@ -23467,6 +23890,90 @@ async fn late_execution_binding_requires_current_generation_and_is_immutable() {
         .unwrap()
         .unwrap();
     assert_eq!(committed.events.len(), initial.events.len() + 2);
+    let read_contract = super::super::binding_resolution::durable_run_execution_contract;
+    assert_eq!(
+        read_contract(&committed).unwrap(),
+        (snapshot.clone(), obligations.clone())
+    );
+    for scenario in [
+        "missing",
+        "duplicate",
+        "identity",
+        "pair",
+        "contract",
+        "inactive phase",
+        "reserved key wrong kind",
+        "reserved key swapped kind",
+        "missing runtime",
+        "runtime conflict",
+    ] {
+        let mut invalid = committed.clone();
+        let workspace_index = initial.events.len();
+        match scenario {
+            "missing" => {
+                invalid.events.remove(workspace_index);
+            }
+            "duplicate" => {
+                invalid.events.push(invalid.events[workspace_index].clone());
+            }
+            "identity" => {
+                invalid.events[workspace_index]["session_id"] = json!("other-session");
+            }
+            "pair" => {
+                invalid.events[workspace_index + 1]["workspace"]["cwd"] = json!("/other-root");
+            }
+            "contract" => {
+                invalid.events[workspace_index]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("completion_checks");
+            }
+            "inactive phase" => {
+                invalid.events[workspace_index]["completion_checks"]["declarations"]["task_completed"]
+                    [0]["command"] = json!(" ");
+            }
+            "reserved key wrong kind" | "reserved key swapped kind" => {
+                let mut extra = invalid.events[workspace_index].clone();
+                extra["type"] = json!(if scenario == "reserved key wrong kind" {
+                    "text_done"
+                } else {
+                    "executor_bound"
+                });
+                invalid.events.push(extra);
+            }
+            "missing runtime" => {
+                for event in &mut invalid.events[workspace_index..] {
+                    event.as_object_mut().unwrap().remove("runtime");
+                }
+            }
+            "runtime conflict" => {
+                invalid.events[workspace_index]["runtime"] = json!(
+                    astra_runtime_env::RuntimeBinding::kubernetes("cloud-runtime")
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert!(read_contract(&invalid).is_err(), "{scenario} accepted");
+    }
+    let mut terminal_parent = committed.clone();
+    terminal_parent.status = STATUS_COMPLETED.into();
+    assert_eq!(
+        read_contract(&terminal_parent).unwrap(),
+        read_contract(&committed).unwrap()
+    );
+    let cloud_snapshot = ExecutionBindingSnapshot::new(
+        WorkspaceBinding::cloud_workspace("cloud-volume", WorkspaceAuthority::ReadWrite),
+        ExecutorBinding::orchestrator_managed("cloud-executor", "Cloud", ExecutorStatus::Online),
+        astra_runtime_env::RuntimeBinding::kubernetes("cloud-runtime"),
+    );
+    let mut cloud_parent = committed.clone();
+    cloud_parent.events =
+        binding_snapshot_events(run_id, session_id, &cloud_snapshot, &obligations).to_vec();
+    assert_eq!(
+        read_contract(&cloud_parent).unwrap(),
+        (cloud_snapshot, obligations.clone())
+    );
+
     let status = ok(svc.get_run_status(run_id.into(), "user-1".into()).await);
     assert_eq!(status.workspace.unwrap()["cwd"], "/workspace/late-binding");
     assert_eq!(status.executor.unwrap()["kind"], "server_local");
@@ -23478,6 +23985,22 @@ async fn late_execution_binding_requires_current_generation_and_is_immutable() {
     assert_eq!(
         listing.runs[0].executor.as_ref().unwrap()["kind"],
         "server_local"
+    );
+    let mut changed_checks = events.clone();
+    changed_checks[0]["completion_checks"]["declarations"]["task_completed"][0]["command"] =
+        json!("true");
+    assert!(
+        svc.run_engine
+            .append_events_if_current_generation_and_status(
+                "user-1",
+                session_id,
+                run_id,
+                initial.run_generation,
+                &[STATUS_RUNNING],
+                &changed_checks,
+            )
+            .await
+            .is_err()
     );
     let mut changed = events;
     changed[0]["workspace"]["cwd"] = json!("/workspace/conflicting-binding");
@@ -26749,6 +27272,7 @@ fn extract_edge_tools_from_context() {
         json!([{"function": {"name": "bash"}}]),
     );
     let req = ChatRequestData {
+        completion_checks: None,
         model_catalog_reader: None,
         message: "hi".into(),
         conversation_authority: None,
@@ -26844,6 +27368,7 @@ fn extract_edge_profile_from_context() {
         }),
     );
     let req = ChatRequestData {
+        completion_checks: None,
         model_catalog_reader: None,
         message: "hi".into(),
         conversation_authority: None,
@@ -27078,7 +27603,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
             "same-session",
             "same-run",
             None,
-            &edge,
+            None,
             &constraints,
         )
         .unwrap();
@@ -27143,7 +27668,6 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     facts.original.budget_is_explicit = true;
     facts.original.max_turn_input_tokens = 12345;
     facts.original.last_request_message_count = Some(9);
-    facts.hooks.stop_hook_runs = 2;
     facts.hooks.completion_settlement.text_only = true;
     facts.original.error_recovery.consecutive_same_error = 2;
     facts
@@ -27226,6 +27750,7 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
         None,
         &PreparedRuntimeCapabilities::default(),
         Some(3),
+        &facts.hooks,
     );
     let mut state = AgenticRunLifecycleService::assemble_loop_state(environment, facts);
     assert_eq!(state.evaluation_thresholds.search_fanout, 37);
@@ -27291,7 +27816,6 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
     assert!(state.budget_is_explicit);
     assert_eq!(state.max_turn_input_tokens, 12345);
     assert_eq!(state.last_request_message_count, Some(9));
-    assert_eq!(state.hooks.stop_hook_runs, 2);
     assert!(state.hooks.completion_settlement.text_only);
     assert_eq!(state.error_recovery.consecutive_same_error, 2);
     assert!(state.provider_adaptation.output_cap_action_first_pending);
@@ -27407,6 +27931,7 @@ fn shared_child_assembly_preserves_restored_identity_budget_and_workspace_eviden
         None,
         &PreparedRuntimeCapabilities::default(),
         Some(3),
+        &facts.hooks,
     );
     environment.inference_purpose = astra_turn_types::InferencePurpose::SubAgent;
     environment.agent_id = "configured-member".into();
@@ -29002,15 +29527,155 @@ fn install_agent_binding_runtime_forward_headers_uses_runtime_auth() {
 }
 
 #[test]
-fn build_initial_state_loads_stop_hooks_from_edge_profile_cwd() {
+fn execution_preparation_rejects_invalid_verification_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".astra")).unwrap();
+    std::fs::write(
+        dir.path().join(".astra/stop-hooks.yaml"),
+        "hooks:\n  - label: check\n    command: true\n    when: unknown_phase",
+    )
+    .unwrap();
+    let svc = test_service();
+    let request = test_request("implement a fix");
+    let bindings = ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(dir.path()),
+        ExecutorBinding::server_local(),
+    );
+
+    let result = svc.prepare_initial_execution_facts(
+        "test-user",
+        &request,
+        "session",
+        "run",
+        Some(dir.path()),
+        Some(&bindings),
+        &RequestConstraints::default(),
+    );
+
+    let (status, Json(error)) = result.err().expect("invalid hooks must stop preparation");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error.detail.contains("stop-hooks.yaml"));
+}
+
+#[tokio::test]
+async fn chat_admission_rejects_invalid_checks_in_either_phase_before_start() {
+    let service = test_service();
+    for task_completed in [false, true] {
+        let mut declarations = astra_turn_types::CompletionCheckDeclarations::default();
+        let checks = if task_completed {
+            &mut declarations.task_completed
+        } else {
+            &mut declarations.stop
+        };
+        checks.push(astra_turn_types::StopHook {
+            label: "invalid-check".into(),
+            command: " ".into(),
+            working_dir: None,
+            depends_on: Vec::new(),
+            timeout_secs: None,
+            authoritative: true,
+        });
+        let mut request = test_request("implement a fix");
+        request.completion_checks = Some(declarations);
+        let result = service.prepare_chat_request("test-user", request).await;
+        let (status, Json(error)) = result.expect_err("invalid checks admitted");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some("completion_checks_invalid")
+        );
+        assert!(service.runs.read().await.is_empty());
+    }
+}
+
+#[test]
+fn execution_preparation_rejects_unbound_or_conflicting_completion_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let service = test_service();
+    let local = ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(root.path()),
+        ExecutorBinding::server_local(),
+    );
+    let mut wrong_executor = local.clone();
+    wrong_executor.executor = ExecutorBinding::edge_agent(
+        "edge",
+        "Edge",
+        ToolTransportKind::EdgeLedger,
+        ExecutorStatus::Online,
+    );
+    let no_workspace = ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::none(),
+        ExecutorBinding::server_local(),
+    );
+    let cases = [
+        (
+            "missing provider root",
+            Some(&local),
+            None,
+            false,
+            "provider-resolved",
+        ),
+        (
+            "mismatched provider root",
+            Some(&local),
+            Some(other.path()),
+            false,
+            "does not match",
+        ),
+        (
+            "wrong executor",
+            Some(&wrong_executor),
+            Some(root.path()),
+            false,
+            "local executor",
+        ),
+        (
+            "two sources even when empty",
+            Some(&local),
+            Some(root.path()),
+            true,
+            "conflicting",
+        ),
+        (
+            "explicit absent workspace",
+            Some(&no_workspace),
+            None,
+            true,
+            "selected remote workspace",
+        ),
+        (
+            "unbound declarations",
+            None,
+            None,
+            true,
+            "selected remote workspace",
+        ),
+    ];
+    for (name, bindings, workspace, declared, expected) in cases {
+        let mut request = test_request("implement a fix");
+        request.completion_checks = declared.then(Default::default);
+        let result = service.prepare_initial_execution_facts(
+            "test-user",
+            &request,
+            "session",
+            "run",
+            workspace,
+            bindings,
+            &RequestConstraints::default(),
+        );
+        let (status, Json(error)) = result.err().unwrap_or_else(|| panic!("{name} accepted"));
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}");
+        assert!(error.detail.contains(expected), "{name}: {}", error.detail);
+    }
+}
+
+#[test]
+fn build_initial_state_uses_remote_declarations_without_reading_edge_files() {
     let dir = tempfile::tempdir().unwrap();
     let mo = dir.path().join(".astra");
     std::fs::create_dir_all(&mo).unwrap();
-    std::fs::write(
-        mo.join("stop-hooks.yaml"),
-        "version: 1\nauto_detect: false\nhooks:\n  - label: cloud_hook\n    command: true\n",
-    )
-    .unwrap();
+    std::fs::write(mo.join("stop-hooks.yaml"), "hooks: [").unwrap();
 
     let svc = test_service();
     let mut req = test_request("implement a fix");
@@ -29023,13 +29688,61 @@ fn build_initial_state_loads_stop_hooks_from_edge_profile_cwd() {
         .clone(),
     );
 
-    let state = svc.build_initial_state("test-user", &req, "s", "r", None, None, None);
-    assert_eq!(state.hooks.stop_hooks.len(), 1);
-    assert_eq!(state.hooks.stop_hooks[0].label, "cloud_hook");
-    assert_eq!(
-        state.hooks.workspace_root_hint.as_deref(),
-        Some(dir.path().to_str().unwrap())
-    );
+    let mut checks = astra_turn_types::CompletionCheckDeclarations {
+        stop: vec![astra_turn_types::StopHook {
+            label: "remote-check".into(),
+            command: "make check".into(),
+            working_dir: None,
+            depends_on: Vec::new(),
+            timeout_secs: None,
+            authoritative: true,
+        }],
+        task_completed: Vec::new(),
+    };
+    checks.task_completed = checks.stop.clone();
+    checks.task_completed[0].label = "child-check".into();
+    req.completion_checks = Some(checks.clone());
+    for workspace in [
+        WorkspaceBinding::edge_workspace(
+            "Edge",
+            dir.path().display().to_string(),
+            WorkspaceAuthority::ReadWrite,
+        ),
+        WorkspaceBinding::cloud_workspace(
+            dir.path().display().to_string(),
+            WorkspaceAuthority::ReadWrite,
+        ),
+    ] {
+        let cloud = workspace.kind == WorkspaceBindingKind::CloudWorkspace;
+        let executor = if cloud {
+            ExecutorBinding::orchestrator_managed("cloud", "Cloud", ExecutorStatus::Online)
+        } else {
+            ExecutorBinding::edge_agent(
+                "edge",
+                "Edge",
+                ToolTransportKind::EdgeLedger,
+                ExecutorStatus::Online,
+            )
+        };
+        let bindings = ExecutionBindingSnapshot::inferred(workspace, executor);
+        let state = svc.build_initial_state(
+            "test-user",
+            &req,
+            "s",
+            "r",
+            cloud.then_some(dir.path()),
+            Some(&bindings),
+            None,
+        );
+        assert_eq!(state.hooks.stop_hooks, checks.stop);
+        assert_eq!(state.hooks.declarations, checks);
+        assert!(state.skills.tool_event_hooks.is_empty());
+        assert!(state.skills.session_event_hooks.is_empty());
+        assert_eq!(
+            state.hooks.workspace_root_hint.as_deref(),
+            Some(dir.path().to_str().unwrap())
+        );
+    }
 }
 
 #[test]
@@ -29046,7 +29759,19 @@ fn build_initial_state_uses_workspace_override_when_no_edge_cwd() {
     let svc = test_service();
     // Request with NO edge_profile.cwd — simulates web-agent mode.
     let req = test_request("fix a bug");
-    let state = svc.build_initial_state("test-user", &req, "s", "r", Some(dir.path()), None, None);
+    let bindings = ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(dir.path()),
+        ExecutorBinding::server_local(),
+    );
+    let state = svc.build_initial_state(
+        "test-user",
+        &req,
+        "s",
+        "r",
+        Some(dir.path()),
+        Some(&bindings),
+        None,
+    );
     assert_eq!(state.hooks.stop_hooks.len(), 1);
     assert_eq!(state.hooks.stop_hooks[0].label, "server_hook");
     assert_eq!(
@@ -29056,8 +29781,8 @@ fn build_initial_state_uses_workspace_override_when_no_edge_cwd() {
 }
 
 #[test]
-fn build_initial_state_edge_cwd_takes_priority_over_workspace_override() {
-    // Edge profile with cwd set — workspace_override should be ignored.
+fn build_initial_state_selected_server_workspace_ignores_edge_cwd() {
+    // Client metadata cannot replace the selected Server workspace.
     let edge_dir = tempfile::tempdir().unwrap();
     let mo = edge_dir.path().join(".astra");
     std::fs::create_dir_all(&mo).unwrap();
@@ -29087,21 +29812,25 @@ fn build_initial_state_edge_cwd_takes_priority_over_workspace_override() {
         .clone(),
     );
 
+    let bindings = ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(override_dir.path()),
+        ExecutorBinding::server_local(),
+    );
     let state = svc.build_initial_state(
         "test-user",
         &req,
         "s",
         "r",
         Some(override_dir.path()),
-        None,
+        Some(&bindings),
         None,
     );
-    // Edge profile's cwd wins over the workspace override.
+    // Only the provider-resolved Server workspace supplies configuration.
     assert_eq!(state.hooks.stop_hooks.len(), 1);
-    assert_eq!(state.hooks.stop_hooks[0].label, "edge_hook");
+    assert_eq!(state.hooks.stop_hooks[0].label, "override_hook");
     assert_eq!(
         state.hooks.workspace_root_hint.as_deref(),
-        Some(edge_dir.path().to_str().unwrap())
+        Some(override_dir.path().to_str().unwrap())
     );
 }
 
@@ -29919,6 +30648,13 @@ async fn db_lazy_explain_handler_reads_once_and_recovers_only_absence() {
             pool.settings().clone(),
             test_encryptor(),
             Arc::new(TokioMutex::new(HashMap::new())),
+        )
+        .with_workspace_capacity(
+            Some(ServerWorkspaceProvisioner::fixture(
+                Arc::new(tempfile::tempdir().unwrap()),
+                "explain-test-executor",
+            )),
+            None,
         )
         .with_run_engine(svc.run_engine.clone())
         .with_pool(pool.clone())

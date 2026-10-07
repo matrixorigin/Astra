@@ -17,9 +17,6 @@ use crate::server::tool_transport::{
 use astra_services::runs::ToolOutputBatchItem;
 use astra_services::session_journal::ToolCallRecord;
 
-use super::super::agentic::delegate_interception::{
-    DelegationInterceptionResult, intercept_delegations, tool_call_arguments_value, tool_call_name,
-};
 use super::super::agentic::headless_round::{
     HeadlessRoundTerminal, HeadlessStderrStyle, HeadlessToolRoundCtx,
     run_agentic_headless_tool_round,
@@ -39,6 +36,7 @@ use super::host::{
     extract_file_path_from_tool, finalize_and_render, finalize_turn_trace,
     publish_introspect_snapshot, record_edge_tool_observability, try_write_heavy_checkpoint,
 };
+use astra_turn_core::tool_call_shape::{tool_call_arguments_value, tool_call_name};
 
 use super::lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
 use crate::turn::inspection_service::InspectionService;
@@ -2066,22 +2064,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
 
         let valid_tool_names = host.valid_tool_names().clone();
         let deferred_tool_names = host.deferred_tool_names();
-        // Start before delegation interception as both delegation settlement and
-        // ordinary pre-resolved admission records belong to this provider round.
         let round_records_start = state.stall.tool_call_records.len();
-        let DelegationInterceptionResult {
-            effective_tool_calls,
-            pre_resolved_results: delegation_pre_resolved_results,
-            intercepted_any: delegation_intercepted,
-        } = intercept_delegations(
-            host,
-            state,
-            &admitted_logical_calls,
-            prep.quiet,
-            &valid_tool_names,
-        )
-        .await;
-
         // Capture records produced by interception/admission as part of the same
         // causal LLM round. Previously the round snapshot started *after* this
         // phase, so policy-rejected requests appeared in the transcript but were
@@ -2091,20 +2074,17 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             logical_tool_calls,
             deferred_activations_by_call_id,
             runtime_control_calls_by_id,
-            mut pre_resolved_results,
+            pre_resolved_results,
             edge_tool_round,
         } = try_prepare_intercepted_tool_round(
             state,
             &turn_result,
             edge_tool_round,
             &admitted_tool_calls,
-            &effective_tool_calls,
+            &admitted_logical_calls,
             admission.rejected,
-            delegation_intercepted,
-            &valid_tool_names,
         )
         .await?;
-        pre_resolved_results.extend(delegation_pre_resolved_results);
         record_edge_tool_selection(state, &edge_tool_round, turn_index);
         let physical_tool_calls = physical_tool_calls.as_slice();
         let all_tool_calls = logical_tool_calls.as_slice();

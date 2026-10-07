@@ -5397,14 +5397,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 } else {
                     "Error: skill resolver not available".to_string()
                 }
-            } else if tool == astra_runtime::turn::agentic_loop::host::DELEGATE_TOOL_NAME {
-                // Delegate calls must be intercepted by the agentic runtime.
-                // If a standalone delegate reaches edge execution, fail closed
-                // instead of manufacturing a success result.
-                "Error: delegate must be handled by the delegation runtime before \
-                 local tool execution. Use agent(action='spawn', description='...', \
-                 prompt='...') for direct agent spawning."
-                    .to_string()
             } else if tool == astra_turn_core::interaction_types::ASK_USER_TOOL_NAME {
                 self.ask_user_via_tui(args).await
             } else {

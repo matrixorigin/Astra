@@ -12071,13 +12071,7 @@ impl ServerAgenticLoopHost {
             ),
             format!("- Session: {session_id} · run: {run_id} · model: {model}"),
             format!(
-                "- Delegation: engine={} · this_turn={} · progress_stream={}",
-                if state.delegation_engine.is_some() {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                state.delegations_this_turn,
+                "- Agent progress stream: {}",
                 if self.progress_rx.is_some() {
                     "subscribed"
                 } else {
@@ -37229,7 +37223,7 @@ mod tests {
         let mut state = create_test_state();
         state.current_session_id = Some("s-lifecycle".into());
         state.current_run_id = Some("run-lifecycle".into());
-        state.delegations_this_turn = 2;
+
         state.max_turn_input_tokens = 200_000;
         state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
@@ -37268,7 +37262,7 @@ mod tests {
             "fork lineage must be surfaced when available: {text}"
         );
         assert!(
-            text.contains("Delegation: engine=disabled · this_turn=2 · progress_stream=none"),
+            text.contains("Agent progress stream: none"),
             "delegation state must be visible: {text}"
         );
     }
@@ -37392,10 +37386,10 @@ mod tests {
             .expect("round 0 pipeline should succeed");
         let round0_text = pipeline_outcome_text(&round0);
         assert!(round0_text.contains("Resume context: [plan-resume] goal=\"initial\""));
-        assert!(round0_text.contains("this_turn=0"));
+        assert!(round0_text.contains("Agent progress stream: none"));
 
         state.current_round_index = 3;
-        state.delegations_this_turn = 5;
+
         {
             let hint_handle = host.plan_resume_hint_handle();
             let mut guard = hint_handle.write().expect("plan hint lock");
@@ -37411,8 +37405,8 @@ mod tests {
             "plan line must refresh when the shared plan hint changes: {round3_text}"
         );
         assert!(
-            round3_text.contains("this_turn=0"),
-            "delegation counters should remain turn-start snapshot values: {round3_text}"
+            round3_text.contains("Agent progress stream: none"),
+            "agent progress source should remain explicit: {round3_text}"
         );
 
         let full_hint = astra_plan::plan_resume_prompt_hint(&astra_plan::PlanModeState::new(
@@ -37432,7 +37426,7 @@ mod tests {
         *host.plan_resume_hint_handle().write().unwrap() = None;
         let current = host.turn_start_lifecycle_summary(&state);
         assert!(!current.contains("[plan-resume]"));
-        assert!(current.contains("this_turn=0"));
+        assert!(current.contains("Agent progress stream: none"));
         let exited = host
             .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
             .expect("exited pipeline");
@@ -37441,7 +37435,7 @@ mod tests {
         assert!(!exited_text.contains("[plan-resume]"));
         assert!(!exited_text.contains("## Active Plan"));
         assert!(!exited_text.contains("A plan draft is awaiting trusted user review"));
-        assert!(exited_text.contains("this_turn=0"));
+        assert!(exited_text.contains("Agent progress stream: none"));
         assert!(authored_text.contains("name=demo - Resume context: none\n- Resume context: none"));
         assert!(exited_text.contains("name=demo - Resume context: none\n- Resume context: none"));
     }

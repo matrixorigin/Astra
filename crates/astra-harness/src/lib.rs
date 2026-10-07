@@ -77,9 +77,7 @@ pub struct RuntimeSnapshot {
     #[serde(default)]
     pub redundant_read_count: u32,
 
-    // ── Delegation (Phase 4) ──
-    #[serde(default)]
-    pub delegations_this_turn: u32,
+    // ── Delegation depth ──
     #[serde(default)]
     pub recursion_depth: u8,
 
@@ -135,7 +133,6 @@ impl RuntimeSnapshot {
             last_tool_result_class: None,
             read_only_round_streak: 0,
             redundant_read_count: 0,
-            delegations_this_turn: 0,
             recursion_depth: 0,
             consecutive_errors: 0,
             captured_at_unix_millis: 0,
@@ -375,7 +372,6 @@ mod tests {
             last_tool_result_class: Some("success".into()),
             read_only_round_streak: 0,
             redundant_read_count: 0,
-            delegations_this_turn: 0,
             recursion_depth: 0,
             consecutive_errors: 0,
             captured_at_unix_millis: 1_700_000_000_000,

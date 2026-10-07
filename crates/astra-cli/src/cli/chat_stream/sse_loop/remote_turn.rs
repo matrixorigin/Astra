@@ -109,7 +109,7 @@ pub(super) struct RemoteTurnState {
     pub remote_summary: Option<ServerLoopExecutionSummary>,
     pub server_terminal_authoritative: bool,
     pub local_input_run_id: String,
-    pub stop_hook_prompt: Option<Value>,
+    pub completion_checks: astra_turn_types::CompletionCheckDeclarations,
     pub harness: astra_runtime::turn::harness_adapter::HarnessSlot,
 }
 
@@ -267,7 +267,6 @@ impl RemoteTurnState {
                 interruption: self.interruption.as_ref(),
                 tool_records: &self.stall.tool_call_records,
                 read_only_round_streak: 0,
-                delegations: 0,
                 recursion_depth: 0,
                 consecutive_errors: 0,
                 causal_chain_id: self.canonical_turn_chain_id.as_deref(),
@@ -341,14 +340,6 @@ async fn prepare_remote_request(
                 host.capabilities.has(astra_turn_core::capability::Capability::AgentSpawner))
                 .map(|section| json!({"role":"system","content":section.text,"edge_skills":edge_skills}));
         }
-    }
-    if let Some(content) = state.stop_hook_prompt.take().and_then(|prompt| {
-        prompt
-            .get("content")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    }) {
-        state.push_volatile(VolatileKind::StopHookEvidence, content);
     }
     state
         .step_recorder

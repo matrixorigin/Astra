@@ -1022,3 +1022,26 @@ pub fn provision_workspace_fixture(
 ) -> Result<astra_runtime_env::WorkspaceRecord, astra_runtime_env::WorkspaceProvisionError> {
     lifecycle.fixture_server_workspace(session_id)
 }
+
+/// Give model-free delegation fixtures the same immutable admission pair as
+/// a no-workspace Server run. Callers still own Run creation and status.
+pub async fn append_control_plane_contract(
+    engine: &crate::server::run::engine::RunEngine,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    let binding = crate::server::tool_transport::ExecutionBindingSnapshot::inferred(
+        crate::server::tool_transport::WorkspaceBinding::none(),
+        crate::server::tool_transport::ExecutorBinding::server_control_plane(),
+    );
+    let events = crate::server::run::binding_resolution::binding_snapshot_events(
+        run_id,
+        session_id,
+        &binding,
+        &astra_turn_types::StopHookObligations::default(),
+    );
+    engine
+        .append_events_batch(user_id, session_id, run_id, &events)
+        .await
+}

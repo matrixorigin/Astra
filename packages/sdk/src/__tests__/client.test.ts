@@ -1511,8 +1511,15 @@ describe("chatRequestToWire", () => {
   });
 
   test("full snake_case mapping: session, agent, selected model, binding, context, plan, edge, capabilities, budget, bindings", () => {
+    const completionChecks = {
+      stop: [{ label: "verify", command: "make check", working_dir: null,
+        depends_on: [], timeout_secs: null, authoritative: true }],
+      task_completed: [{ label: "child", command: "make test", working_dir: null,
+        depends_on: [], timeout_secs: null, authoritative: true }],
+    };
     const body = chatRequestToWire({
       message: "q",
+      completionChecks,
       parts: [{ type: "text", text: "q" }],
       attachments: [{ id: "att-1", kind: "file" }],
       executionBudget: {
@@ -1557,6 +1564,7 @@ describe("chatRequestToWire", () => {
     });
     expect(body).toMatchObject({
       message: "q",
+      completion_checks: completionChecks,
       parts: [{ type: "text", text: "q" }],
       attachments: [{ id: "att-1", kind: "file" }],
       execution_budget: {

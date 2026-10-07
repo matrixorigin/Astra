@@ -4,31 +4,28 @@
 //! See `docs/design/stop-hooks.md`.
 
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
+use std::io::Read;
 
-use astra_services::edge_context::EdgeContext;
+use std::path::{Component, Path};
+
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
 
 use crate::chat_turn_heuristics::TaskExecutionProfile;
 use crate::stop_hooks::StopHook;
+use astra_turn_types::{CompletionCheckDeclarations, CompletionCheckPhase as HookPhase};
 
 const CANDIDATE_NAMES: [&str; 2] = ["stop-hooks.yaml", "stop-hooks.yml"];
 
-#[derive(Debug, Clone, Default)]
-pub struct TurnHookSets {
-    pub stop_hooks: Vec<StopHook>,
-    pub teammate_idle_hooks: Vec<StopHook>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileRoot {
     #[serde(default = "default_version")]
     version: u32,
     #[serde(default = "default_true")]
     auto_detect: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_file_hooks")]
     hooks: Vec<FileHook>,
 }
 
@@ -39,10 +36,38 @@ struct FileHook {
     command: String,
     #[serde(default)]
     working_dir: Option<String>,
-    #[serde(default = "default_when")]
-    when: String,
+    #[serde(default)]
+    when: HookPhase,
     #[serde(default = "default_true")]
     enabled: bool,
+}
+
+fn deserialize_file_hooks<'de, D>(deserializer: D) -> Result<Vec<FileHook>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Hooks;
+    impl<'de> serde::de::Visitor<'de> for Hooks {
+        type Value = Vec<FileHook>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a bounded list of completion checks")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            use serde::de::Error;
+            let mut hooks = Vec::new();
+            while let Some(hook) = sequence.next_element()? {
+                if hooks.len() == super::types::MAX_COMPLETION_CHECKS {
+                    return Err(A::Error::custom("too many completion checks"));
+                }
+                hooks.push(hook);
+            }
+            Ok(hooks)
+        }
+    }
+    deserializer.deserialize_seq(Hooks)
 }
 
 fn default_version() -> u32 {
@@ -53,10 +78,6 @@ fn default_true() -> bool {
     true
 }
 
-fn default_when() -> String {
-    "stop".to_string()
-}
-
 impl Default for FileRoot {
     fn default() -> Self {
         Self {
@@ -65,46 +86,6 @@ impl Default for FileRoot {
             hooks: Vec::new(),
         }
     }
-}
-
-/// Prefer git root, then cwd (edge workspace).
-pub fn project_root_for_stop_hooks(ctx: &EdgeContext) -> Option<PathBuf> {
-    let p = ctx
-        .edge_profile
-        .git_root
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            ctx.edge_profile
-                .cwd
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        })?;
-    Some(PathBuf::from(p))
-}
-
-/// Workspace hint from delegation `context` (optional keys used when edge mirrors them).
-pub fn project_root_from_delegation_context(ctx: &HashMap<String, Value>) -> Option<PathBuf> {
-    let pick = ctx
-        .get("git_root")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            ctx.get("workspace_root")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| {
-            ctx.get("cwd")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        })?;
-    Some(PathBuf::from(pick))
 }
 
 pub fn is_plan_subtask_from_context_map(m: &Map<String, Value>) -> bool {
@@ -134,44 +115,69 @@ pub fn is_plan_subtask_from_delegation_context(ctx: &HashMap<String, Value>) -> 
         .unwrap_or(false)
 }
 
-fn load_declarative_config(project_root: &Path) -> FileRoot {
+fn load_declarative_config(project_root: &Path) -> Result<FileRoot, String> {
     let dir = project_root.join(".astra");
     for name in CANDIDATE_NAMES {
         let path = dir.join(name);
-        if !path.is_file() {
-            continue;
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("inspect {}: {error}", path.display())),
         }
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) => {
-                astra_core::agent_warn!("stop_hooks", "read {}: {e}", path.display());
-                return FileRoot::default();
-            }
-        };
-        match serde_yaml_ng::from_str::<FileRoot>(&raw) {
-            Ok(cfg) => {
-                if cfg.version != 1 {
-                    astra_core::agent_warn!(
-                        "stop_hooks",
-                        "{}: unsupported version {}, expected 1 — using defaults",
-                        path.display(),
-                        cfg.version
-                    );
-                    return FileRoot::default();
-                }
-                return cfg;
-            }
-            Err(e) => {
-                astra_core::agent_warn!(
-                    "stop_hooks",
-                    "parse {}: {e} — ignoring declarative hooks",
-                    path.display()
-                );
-                return FileRoot::default();
-            }
+        let root = project_root
+            .canonicalize()
+            .map_err(|error| format!("resolve {}: {error}", project_root.display()))?;
+        let source = path
+            .canonicalize()
+            .map_err(|error| format!("resolve {}: {error}", path.display()))?;
+        if !source.starts_with(&root) {
+            return Err(format!(
+                "{}: completion config escapes workspace",
+                path.display()
+            ));
         }
+        if !std::fs::metadata(&source)
+            .map_err(|error| format!("inspect {}: {error}", path.display()))?
+            .is_file()
+        {
+            return Err(format!(
+                "{}: completion config must be a regular file",
+                path.display()
+            ));
+        }
+        let limit = super::types::MAX_COMPLETION_DECLARATION_BYTES;
+        let mut raw = String::new();
+        std::fs::File::open(&source)
+            .and_then(|file| file.take((limit + 1) as u64).read_to_string(&mut raw))
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        if raw.len() > limit {
+            return Err(format!(
+                "{}: completion config exceeds {limit} bytes",
+                path.display()
+            ));
+        }
+        let cfg: FileRoot = serde_yaml_ng::from_str(&raw)
+            .map_err(|error| format!("parse {}: {error}", path.display()))?;
+        if cfg.version != 1 {
+            return Err(format!(
+                "{}: unsupported version {}, expected 1",
+                path.display(),
+                cfg.version
+            ));
+        }
+        if cfg
+            .hooks
+            .iter()
+            .any(|hook| hook.label.trim().is_empty() || hook.command.trim().is_empty())
+        {
+            return Err(format!(
+                "{}: hook label and command must not be empty",
+                path.display()
+            ));
+        }
+        return Ok(cfg);
     }
-    FileRoot::default()
+    Ok(FileRoot::default())
 }
 
 fn resolve_working_dir(project_root: &Path, wd: Option<&str>) -> String {
@@ -214,26 +220,21 @@ fn resolve_working_dir(project_root: &Path, wd: Option<&str>) -> String {
     }
 }
 
-fn normalize_when(raw: &str) -> String {
-    raw.trim().to_lowercase().replace('-', "_")
-}
-
-fn declarative_hooks_for_when(project_root: &Path, cfg: &FileRoot, phase: &str) -> Vec<StopHook> {
-    let want = normalize_when(phase);
+fn declarative_hooks_for_when(
+    project_root: &Path,
+    cfg: &FileRoot,
+    phase: HookPhase,
+) -> Vec<StopHook> {
     let mut out = Vec::new();
     for h in &cfg.hooks {
         if !h.enabled {
             continue;
         }
-        if normalize_when(&h.when) != want {
+        if h.when != phase {
             continue;
         }
         let label = h.label.trim();
         let command = h.command.trim();
-        if label.is_empty() || command.is_empty() {
-            astra_core::agent_warn!("stop_hooks", "skip hook with empty label or command");
-            continue;
-        }
         let wd = resolve_working_dir(project_root, h.working_dir.as_deref());
         out.push(StopHook {
             label: label.to_string(),
@@ -241,25 +242,14 @@ fn declarative_hooks_for_when(project_root: &Path, cfg: &FileRoot, phase: &str) 
             working_dir: Some(wd),
             depends_on: Vec::new(),
             timeout_secs: None,
-            cache_key: None,
+
             authoritative: true,
         });
     }
     out
 }
 
-fn declarative_stop_hooks(project_root: &Path, cfg: &FileRoot) -> Vec<StopHook> {
-    declarative_hooks_for_when(project_root, cfg, "stop")
-}
-
-fn auto_detect_verify_changes_hook(
-    project_root: &Path,
-    task_profile: TaskExecutionProfile,
-) -> Vec<StopHook> {
-    if !task_profile.verification_required {
-        return Vec::new();
-    }
-
+fn auto_detect_verify_changes_hook(project_root: &Path) -> Vec<StopHook> {
     let mut tool_hints = Vec::new();
     if project_root.join("Cargo.toml").exists() {
         tool_hints.push("Rust/Cargo (cargo check, cargo test)");
@@ -291,53 +281,48 @@ fn auto_detect_verify_changes_hook(
         working_dir: Some(project_root.to_string_lossy().to_string()),
         depends_on: Vec::new(),
         timeout_secs: None,
-        cache_key: None,
         authoritative: false,
     }]
 }
 
-/// Merge declarative YAML + optional auto-detect into completion and teammate-idle sets.
-pub fn detect_turn_hook_sets(
+/// Select the declared completion phase and add advisory project checks.
+/// Invalid configuration is an admission error, never an empty verification contract.
+pub fn detect_turn_stop_hooks(
     project_root: &Path,
     task_profile: TaskExecutionProfile,
     is_plan_subtask: bool,
-) -> TurnHookSets {
-    let cfg = load_declarative_config(project_root);
-    let teammate_idle_hooks = declarative_hooks_for_when(project_root, &cfg, "teammate_idle");
+) -> Result<Vec<StopHook>, String> {
+    Ok(load_completion_check_declarations(project_root)?
+        .into_selected(is_plan_subtask, task_profile.verification_required))
+}
 
-    if is_plan_subtask {
-        let mut hooks = declarative_hooks_for_when(project_root, &cfg, "task_completed");
-        if task_profile.verification_required && cfg.auto_detect {
-            hooks.extend(auto_detect_verify_changes_hook(project_root, task_profile));
+/// Read the workspace configuration once, retaining both completion phases
+/// for callers that delegate execution after admitting the initial turn.
+pub fn load_completion_check_declarations(
+    project_root: &Path,
+) -> Result<CompletionCheckDeclarations, String> {
+    let cfg = load_declarative_config(project_root)?;
+    let mut declarations = CompletionCheckDeclarations {
+        stop: declarative_hooks_for_when(project_root, &cfg, HookPhase::Stop),
+        task_completed: declarative_hooks_for_when(project_root, &cfg, HookPhase::TaskCompleted),
+    };
+    if cfg.auto_detect {
+        let advisory = auto_detect_verify_changes_hook(project_root);
+        for checks in [&mut declarations.stop, &mut declarations.task_completed] {
+            for hint in &advisory {
+                if !checks.iter().any(|check| check.label == hint.label) {
+                    checks.push(hint.clone());
+                }
+            }
         }
-        if !task_profile.verification_required && hooks.is_empty() {
-            return TurnHookSets {
-                stop_hooks: Vec::new(),
-                teammate_idle_hooks,
-            };
-        }
-        return TurnHookSets {
-            stop_hooks: hooks,
-            teammate_idle_hooks,
-        };
     }
-
-    let mut hooks = declarative_stop_hooks(project_root, &cfg);
-    if task_profile.verification_required && cfg.auto_detect {
-        hooks.extend(auto_detect_verify_changes_hook(project_root, task_profile));
-    }
-
-    if !task_profile.verification_required && hooks.is_empty() {
-        return TurnHookSets {
-            stop_hooks: Vec::new(),
-            teammate_idle_hooks,
-        };
-    }
-
-    TurnHookSets {
-        stop_hooks: hooks,
-        teammate_idle_hooks,
-    }
+    super::types::validate_completion_check_declarations(&declarations).map_err(|error| {
+        format!(
+            "{}: {error}",
+            project_root.join(".astra/stop-hooks").display()
+        )
+    })?;
+    Ok(declarations)
 }
 
 #[cfg(test)]
@@ -362,10 +347,10 @@ hooks:
         )
         .unwrap();
         let prof = TaskExecutionProfile::default();
-        let s = detect_turn_hook_sets(dir.path(), prof, false);
-        assert_eq!(s.stop_hooks.len(), 1);
-        assert_eq!(s.stop_hooks[0].label, "test");
-        assert_eq!(s.stop_hooks[0].command, "cargo test -q");
+        let s = detect_turn_stop_hooks(dir.path(), prof, false).unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].label, "test");
+        assert_eq!(s[0].command, "cargo test -q");
     }
 
     #[test]
@@ -392,9 +377,24 @@ hooks:
             verification_required: true,
             ..TaskExecutionProfile::default()
         };
-        let s = detect_turn_hook_sets(dir.path(), prof, true);
-        assert_eq!(s.stop_hooks.len(), 1);
-        assert_eq!(s.stop_hooks[0].label, "sub");
+        let declarations = load_completion_check_declarations(dir.path()).unwrap();
+        assert_eq!(declarations.stop[0].label, "global");
+        assert_eq!(declarations.task_completed[0].label, "sub");
+        let wire = serde_json::to_value(&declarations).unwrap();
+        let restored: CompletionCheckDeclarations = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(restored, declarations);
+        for field in ["stop", "task_completed"] {
+            let mut incomplete = wire.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<CompletionCheckDeclarations>(incomplete).is_err());
+        }
+        let s = restored.into_selected(true, prof.verification_required);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].label, "sub");
+        assert_eq!(
+            detect_turn_stop_hooks(dir.path(), prof, false).unwrap(),
+            declarations.stop
+        );
     }
 
     #[test]
@@ -405,28 +405,8 @@ hooks:
     }
 
     // ──────────────────────────────────────────────────────────
-    // normalize_when
+    // Context selectors
     // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn normalize_when_lowercase_and_replace_dash() {
-        assert_eq!(normalize_when("Task-Completed"), "task_completed");
-    }
-
-    #[test]
-    fn normalize_when_trims_whitespace() {
-        assert_eq!(normalize_when("  stop  "), "stop");
-    }
-
-    #[test]
-    fn normalize_when_already_normalized() {
-        assert_eq!(normalize_when("teammate_idle"), "teammate_idle");
-    }
-
-    #[test]
-    fn normalize_when_empty() {
-        assert_eq!(normalize_when(""), "");
-    }
 
     // ──────────────────────────────────────────────────────────
     // is_plan_subtask_from_context_map
@@ -500,74 +480,6 @@ hooks:
     }
 
     // ──────────────────────────────────────────────────────────
-    // project_root_from_delegation_context
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn delegation_root_from_git_root() {
-        let mut ctx = HashMap::new();
-        ctx.insert(
-            "git_root".into(),
-            Value::String("/home/user/project".into()),
-        );
-        let r = project_root_from_delegation_context(&ctx).unwrap();
-        assert_eq!(r, PathBuf::from("/home/user/project"));
-    }
-
-    #[test]
-    fn delegation_root_from_workspace_root() {
-        let mut ctx = HashMap::new();
-        ctx.insert(
-            "workspace_root".into(),
-            Value::String("/home/user/ws".into()),
-        );
-        let r = project_root_from_delegation_context(&ctx).unwrap();
-        assert_eq!(r, PathBuf::from("/home/user/ws"));
-    }
-
-    #[test]
-    fn delegation_root_from_cwd() {
-        let mut ctx = HashMap::new();
-        ctx.insert("cwd".into(), Value::String("/tmp".into()));
-        let r = project_root_from_delegation_context(&ctx).unwrap();
-        assert_eq!(r, PathBuf::from("/tmp"));
-    }
-
-    #[test]
-    fn delegation_root_prefers_git_root_over_cwd() {
-        let mut ctx = HashMap::new();
-        ctx.insert(
-            "git_root".into(),
-            Value::String("/home/user/project".into()),
-        );
-        ctx.insert("cwd".into(), Value::String("/tmp".into()));
-        let r = project_root_from_delegation_context(&ctx).unwrap();
-        assert_eq!(r, PathBuf::from("/home/user/project"));
-    }
-
-    #[test]
-    fn delegation_root_empty_strings_skipped() {
-        let mut ctx = HashMap::new();
-        ctx.insert("git_root".into(), Value::String("".into()));
-        ctx.insert("cwd".into(), Value::String("/fallback".into()));
-        let r = project_root_from_delegation_context(&ctx).unwrap();
-        assert_eq!(r, PathBuf::from("/fallback"));
-    }
-
-    #[test]
-    fn delegation_root_empty_context() {
-        let ctx = HashMap::new();
-        assert!(project_root_from_delegation_context(&ctx).is_none());
-    }
-
-    #[test]
-    fn delegation_root_whitespace_only_skipped() {
-        let mut ctx = HashMap::new();
-        ctx.insert("git_root".into(), Value::String("   ".into()));
-        assert!(project_root_from_delegation_context(&ctx).is_none());
-    }
-
-    // ──────────────────────────────────────────────────────────
     // resolve_working_dir
     // ──────────────────────────────────────────────────────────
 
@@ -608,9 +520,14 @@ hooks:
     #[test]
     fn auto_detect_no_verification_needed() {
         let root = tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[package]").unwrap();
         let prof = TaskExecutionProfile::default(); // verification_required = false
-        let hooks = auto_detect_verify_changes_hook(root.path(), prof);
+        let hooks = detect_turn_stop_hooks(root.path(), prof, false).unwrap();
         assert!(hooks.is_empty());
+        let declarations = load_completion_check_declarations(root.path()).unwrap();
+        assert!(declarations.clone().into_selected(false, false).is_empty());
+        assert_eq!(declarations.clone().into_selected(false, true).len(), 1);
+        assert_eq!(declarations.into_selected(true, true).len(), 1);
     }
 
     #[test]
@@ -620,7 +537,7 @@ hooks:
             verification_required: true,
             ..Default::default()
         };
-        let hooks = auto_detect_verify_changes_hook(root.path(), prof);
+        let hooks = detect_turn_stop_hooks(root.path(), prof, false).unwrap();
         assert!(hooks.is_empty()); // No Cargo.toml, package.json, etc.
     }
 
@@ -632,10 +549,27 @@ hooks:
             verification_required: true,
             ..Default::default()
         };
-        let hooks = auto_detect_verify_changes_hook(root.path(), prof);
+        let hooks = detect_turn_stop_hooks(root.path(), prof, false).unwrap();
         assert_eq!(hooks.len(), 1);
         assert!(hooks[0].command.contains("Rust/Cargo"));
         assert!(hooks[0].command.contains("at most one test filter"));
+        std::fs::create_dir(root.path().join(".astra")).unwrap();
+        std::fs::write(
+            root.path().join(".astra/stop-hooks.yaml"),
+            "hooks:\n  - label: verify-changes\n    command: make explicit-check\n",
+        )
+        .unwrap();
+        let declarations = load_completion_check_declarations(root.path()).unwrap();
+        assert_eq!(declarations.stop.len(), 1);
+        assert!(declarations.stop[0].authoritative);
+        assert_eq!(declarations.stop[0].command, "make explicit-check");
+        assert!(!declarations.task_completed[0].authoritative);
+        assert_eq!(
+            detect_turn_stop_hooks(root.path(), TaskExecutionProfile::default(), false)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -647,14 +581,14 @@ hooks:
             verification_required: true,
             ..Default::default()
         };
-        let hooks = auto_detect_verify_changes_hook(root.path(), prof);
+        let hooks = detect_turn_stop_hooks(root.path(), prof, false).unwrap();
         assert_eq!(hooks.len(), 1);
         assert!(hooks[0].command.contains("Rust/Cargo"));
         assert!(hooks[0].command.contains("Node.js"));
     }
 
     // ──────────────────────────────────────────────────────────
-    // detect_turn_hook_sets (disabled hooks, teammate_idle)
+    // detect_turn_stop_hooks (disabled hooks)
     // ──────────────────────────────────────────────────────────
 
     #[test]
@@ -675,38 +609,85 @@ hooks:
 "#,
         )
         .unwrap();
-        let s = detect_turn_hook_sets(dir.path(), TaskExecutionProfile::default(), false);
-        assert_eq!(s.stop_hooks.len(), 1);
-        assert_eq!(s.stop_hooks[0].label, "active-hook");
-    }
-
-    #[test]
-    fn teammate_idle_hooks_parsed() {
-        let dir = tempdir().unwrap();
-        let mo = dir.path().join(".astra");
-        std::fs::create_dir_all(&mo).unwrap();
-        std::fs::write(
-            mo.join("stop-hooks.yaml"),
-            r#"version: 1
-auto_detect: false
-hooks:
-  - label: idle-check
-    command: echo idle
-    when: teammate_idle
-"#,
-        )
-        .unwrap();
-        let s = detect_turn_hook_sets(dir.path(), TaskExecutionProfile::default(), false);
-        assert!(s.stop_hooks.is_empty());
-        assert_eq!(s.teammate_idle_hooks.len(), 1);
-        assert_eq!(s.teammate_idle_hooks[0].label, "idle-check");
+        let s = detect_turn_stop_hooks(dir.path(), TaskExecutionProfile::default(), false).unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].label, "active-hook");
     }
 
     #[test]
     fn no_yaml_file_returns_empty() {
         let dir = tempdir().unwrap();
-        let s = detect_turn_hook_sets(dir.path(), TaskExecutionProfile::default(), false);
-        assert!(s.stop_hooks.is_empty());
-        assert!(s.teammate_idle_hooks.is_empty());
+        let s = detect_turn_stop_hooks(dir.path(), TaskExecutionProfile::default(), false).unwrap();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn invalid_declared_hooks_do_not_become_an_empty_contract() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".astra")).unwrap();
+        let path = dir.path().join(".astra/stop-hooks.yaml");
+        for invalid in [
+            "version: 2\nhooks: []",
+            "hooks: [",
+            "auto_detect: false\nhooks_list: []",
+            "hooks:\n  - label: check\n    command: true\n    when: teammate_idle",
+            "hooks:\n  - label: check\n    command: true\n    when: unknown_phase",
+            "hooks:\n  - label: ''\n    command: true",
+            "hooks:\n  - label: check\n    command: ''",
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            for plan_subtask in [false, true] {
+                let error = detect_turn_stop_hooks(
+                    dir.path(),
+                    TaskExecutionProfile::default(),
+                    plan_subtask,
+                )
+                .expect_err("invalid configuration must reject admission");
+                assert!(error.contains("stop-hooks.yaml"), "{error}");
+            }
+        }
+        std::fs::write(
+            &path,
+            " ".repeat(super::super::types::MAX_COMPLETION_DECLARATION_BYTES + 1),
+        )
+        .unwrap();
+        assert!(
+            load_completion_check_declarations(dir.path())
+                .unwrap_err()
+                .contains("exceeds")
+        );
+        let aliases = format!(
+            "hooks:\n  - &check {{label: check, command: true}}\n{}",
+            "  - *check\n".repeat(64)
+        );
+        std::fs::write(&path, aliases).unwrap();
+        assert!(
+            load_completion_check_declarations(dir.path())
+                .unwrap_err()
+                .contains("too many")
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            detect_turn_stop_hooks(dir.path(), TaskExecutionProfile::default(), false).is_err()
+        );
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(&path).unwrap();
+            std::os::unix::fs::symlink(dir.path().join("missing-config"), &path).unwrap();
+            assert!(
+                detect_turn_stop_hooks(dir.path(), TaskExecutionProfile::default(), false).is_err()
+            );
+            std::fs::remove_file(&path).unwrap();
+            let outside = tempdir().unwrap();
+            let source = outside.path().join("checks.yaml");
+            std::fs::write(&source, "hooks: []").unwrap();
+            std::os::unix::fs::symlink(source, &path).unwrap();
+            assert!(
+                load_completion_check_declarations(dir.path())
+                    .unwrap_err()
+                    .contains("escapes workspace")
+            );
+        }
     }
 }

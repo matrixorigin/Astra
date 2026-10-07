@@ -373,7 +373,7 @@ mod tests {
             effective_hard_turn_limit: None,
         };
 
-        let control = astra_pipeline::step_protocol::RunExecutionControl::V3 {
+        let control = astra_pipeline::step_protocol::RunExecutionControl::V4 {
             hook_obligations: astra_turn_types::StopHookObligations::default(),
             reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
                 run_id: "test-run".into(),

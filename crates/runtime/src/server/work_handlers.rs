@@ -3952,6 +3952,7 @@ pub(super) async fn post_work_branch_turn_handler(
         .flatten();
     let expected_run_id = turn.start_idempotency.run_id().to_string();
     let request = ChatRequestData {
+        completion_checks: None,
         execution_authentication: principal.execution_authentication_provenance(),
         agent_profile_selection: None,
         admitted_agent_profiles: None,

@@ -253,7 +253,7 @@ pub(crate) mod tests {
             working_dir: None,
             depends_on: vec![],
             timeout_secs: None,
-            cache_key: None,
+
             authoritative: true,
         }
     }

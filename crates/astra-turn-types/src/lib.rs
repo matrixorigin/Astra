@@ -226,7 +226,11 @@ pub use session_handoff::{
     SessionHandoffValidationError, SessionPlacementV1, WorkspaceHandoffEvidenceV1,
     valid_transition,
 };
-pub use stop_hooks::{StopHook, StopHookObligations};
+pub use stop_hooks::{
+    CompletionCheckDeclarations, CompletionCheckPhase, MAX_COMPLETION_CHECKS,
+    MAX_COMPLETION_DECLARATION_BYTES, StopHook, StopHookObligations, build_execution_layers,
+    validate_completion_check_declarations,
+};
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{
     DispatchCertainty, DurableToolReference, TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION,

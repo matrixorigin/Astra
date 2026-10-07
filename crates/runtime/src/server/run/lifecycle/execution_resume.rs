@@ -374,21 +374,10 @@ impl AgenticRunLifecycleService {
             handoff.original_facts.delegated_model_requirements.clone(),
         )
         .map_err(invalid_resume)?;
-        let binding = Self::durable_run_execution_binding_snapshot(run);
-        let original_workspace: WorkspaceBinding = serde_json::from_value(
-            binding
-                .workspace
-                .ok_or_else(|| invalid_resume("original workspace binding is missing"))?,
-        )
-        .map_err(|_| invalid_resume("original workspace binding is invalid"))?;
-        let original_executor = binding
-            .executor
-            .ok_or_else(|| invalid_resume("original executor binding is missing"))?;
-        let binding_metadata = json!({
-            "workspace": original_workspace,
-            "executor": original_executor,
-            "execution_binding_generation": binding.execution_binding_generation,
-        });
+        let (bindings, _) =
+            crate::server::run::binding_resolution::durable_run_execution_contract(run)
+                .map_err(invalid_resume)?;
+        let original_workspace = &bindings.workspace;
         let workspace = if original_workspace.kind == WorkspaceBindingKind::ServerSandbox {
             let store = self
                 .workspace_record_store
@@ -415,11 +404,6 @@ impl AgenticRunLifecycleService {
                 "the original workspace needs its selected execution provider",
             ));
         };
-        let bindings = crate::server::run::binding_resolution::execution_bindings_from_metadata(
-            Some(&binding_metadata),
-            &workspace,
-        )
-        .ok_or_else(|| invalid_resume("original execution binding is missing"))?;
         if bindings.executor.kind != ExecutorBindingKind::ServerLocal
             || bindings.executor.transport != ToolTransportKind::ServerLocal
         {
@@ -447,16 +431,6 @@ impl AgenticRunLifecycleService {
         let mut permissions = PermissionSyncContext::new(inherited);
         let hook_root =
             (bindings.workspace.kind != WorkspaceBindingKind::None).then(|| workspace.clone());
-        let hook_sets = hook_root
-            .as_ref()
-            .map(|root| {
-                astra_turn_core::stop_hooks_yaml::detect_turn_hook_sets(
-                    root,
-                    handoff.original_facts.task_profile,
-                    false,
-                )
-            })
-            .unwrap_or_default();
         let (tool_hooks, session_hooks) = hook_root
             .as_ref()
             .map(|root| crate::skills::hooks::load_all_hooks(root))
@@ -464,8 +438,6 @@ impl AgenticRunLifecycleService {
         let facts = LoopExecutionFacts::from_handoff(
             proof,
             StopHookState {
-                stop_hooks: hook_sets.stop_hooks,
-                teammate_idle_hooks: hook_sets.teammate_idle_hooks,
                 workspace_root_hint: hook_root.map(|root| root.to_string_lossy().into_owned()),
                 admitted_model_execution: Some(execution.clone()),
                 ..Default::default()
@@ -564,6 +536,7 @@ impl AgenticRunLifecycleService {
             Some(&handoff.edge_profile),
             &runtime,
             Some(run.run_generation),
+            &facts.hooks,
         );
         let mut state = Self::assemble_loop_state(environment, facts);
         state.skills.client_pipeline_skill_names = handoff
@@ -600,7 +573,6 @@ impl AgenticRunLifecycleService {
             .await;
         self.configure_loop_state_runtime_controls(
             &mut state,
-            &entry.spawner,
             cancel,
             pause,
             (**token).clone(),
@@ -657,6 +629,13 @@ impl AgenticRunLifecycleService {
             interaction_mode,
             edge_tools: Arc::new(handoff.edge_provider_tool_schemas.clone()),
             request_constraints: constraints.clone(),
+            execution_contract: Some((
+                bindings.clone(),
+                astra_turn_types::StopHookObligations {
+                    declarations: state.hooks.declarations.clone(),
+                    phase: state.hooks.phase,
+                },
+            )),
             execution_metadata: None,
             provider_run_owner: None,
             spawner: Arc::downgrade(&entry.spawner),
@@ -668,6 +647,9 @@ impl AgenticRunLifecycleService {
             #[cfg(feature = "harness")]
             harness_sink: state.harness.sink.clone(),
         };
+        runtime_context
+            .execution_owner_generation
+            .publish(run.run_generation);
         let agent_context = AgentToolContext {
             parent_profile_authority: profile_authority,
             admitted_agent_profiles: profiles.clone(),

@@ -4410,7 +4410,7 @@ mod tests {
                 working_dir: None,
                 depends_on: Vec::new(),
                 timeout_secs: None,
-                cache_key: None,
+
                 authoritative: true,
             });
             state.max_turns = 50;
@@ -4480,20 +4480,16 @@ mod tests {
             working_dir: Some("/workspace".into()),
             depends_on: Vec::new(),
             timeout_secs: Some(30),
-            cache_key: None,
+
             authoritative: true,
         };
         state.hooks.stop_hooks = vec![hook.clone()];
-        state.hooks.stop_hook_runs = 2;
-        state.hooks.teammate_idle_hooks = vec![hook.clone()];
-        state.hooks.teammate_idle_hook_runs = 1;
-        let expected_control = astra_pipeline::step_protocol::RunExecutionControl::V3 {
+        state.hooks.declarations.stop = vec![hook.clone()];
+        let expected_control = astra_pipeline::step_protocol::RunExecutionControl::V4 {
             completion_settlement: state.hooks.completion_settlement.clone(),
             hook_obligations: astra_turn_types::StopHookObligations {
-                stop_hooks: vec![hook.clone()],
-                stop_hook_runs: 2,
-                teammate_idle_hooks: vec![hook],
-                teammate_idle_hook_runs: 1,
+                declarations: state.hooks.declarations.clone(),
+                phase: state.hooks.phase,
             },
             reply_obligations: state
                 .messaging
@@ -5091,7 +5087,7 @@ mod tests {
             working_dir: None,
             depends_on: Vec::new(),
             timeout_secs: None,
-            cache_key: None,
+
             authoritative: true,
         }
     }

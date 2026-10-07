@@ -567,6 +567,9 @@ export function chatRequestToWire(req: ChatRequest): Record<string, unknown> {
     body.model_selection = modelSelectionToWire(req.modelSelection);
   }
   if (req.parts) body.parts = req.parts;
+  if (req.completionChecks !== undefined) {
+    body.completion_checks = req.completionChecks;
+  }
   if (req.attachments) body.attachments = req.attachments;
   if (req.executionBudget) {
     body.execution_budget = {

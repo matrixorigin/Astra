@@ -142,6 +142,8 @@ fn interaction_contract_matches(actual: Option<&str>) -> bool {
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WsChatMessage {
+    #[serde(default)]
+    completion_checks: Option<astra_turn_types::CompletionCheckDeclarations>,
     content: String,
     #[serde(default)]
     user_intent: Option<String>,
@@ -612,45 +614,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<WsClientMessage>(&text) {
                             Ok(WsClientMessage::ChatMessage(message)) => {
-                                let WsChatMessage {
-                                    content,
-                                    user_intent,
-                                    session_id,
-                                    agent_id,
-                                    model_selection,
-                                    skill_search,
-                                    allow_skills,
-                                    allow_skill_sources,
-                                    allow_tools,
-                                    enabled_tools,
-                                    context,
-                                    execution_budget,
-                                    explain,
-                                    interaction_mode,
-                                    plan_subtask_id,
-                                    is_plan_subtask,
-                                } = *message;
-                                handle_chat_message(
-                                    socket,
-                                    state,
-                                    &mut conn,
-                                    &content,
-                                    user_intent,
-                                    session_id,
-                                    agent_id,
-                                    model_selection,
-                                    skill_search,
-                                    allow_skills,
-                                    allow_skill_sources,
-                                    allow_tools,
-                                    enabled_tools,
-                                    context,
-                                    execution_budget,
-                                    explain,
-                                    interaction_mode,
-                                    plan_subtask_id,
-                                    is_plan_subtask,
-                                )
+                                handle_chat_message(socket, state, &mut conn, *message)
                                 .await;
                             }
                             Ok(WsClientMessage::CancelRun { run_id }) => {
@@ -752,23 +716,9 @@ async fn handle_chat_message(
     socket: &mut WebSocket,
     state: &AppState,
     conn: &mut WsConnection,
-    content: &str,
-    user_intent: Option<String>,
-    requested_session_id: Option<String>,
-    agent_id: Option<String>,
-    model_selection: astra_turn_types::ModelSelection,
-    skill_search: Option<astra_core::SkillSearchSettings>,
-    allow_skills: Option<Vec<String>>,
-    allow_skill_sources: Option<Vec<String>>,
-    allow_tools: Option<Vec<String>>,
-    enabled_tools: Option<Vec<String>>,
-    context: Option<serde_json::Map<String, serde_json::Value>>,
-    execution_budget: Option<astra_services::runs::ExecutionBudget>,
-    explain: bool,
-    interaction_mode: Option<astra_services::runs::RequestedTurnInteractionMode>,
-    plan_subtask_id: Option<String>,
-    is_plan_subtask: Option<bool>,
+    mut message: WsChatMessage,
 ) {
+    let requested_session_id = message.session_id.take();
     // Keep explicit per-message session routing local to this request until
     // session resolution succeeds. That avoids poisoning the bound WS
     // connection state with an empty or unknown session_id on failed requests.
@@ -777,24 +727,8 @@ async fn handle_chat_message(
     let should_clear_pending_session_id =
         requested_session_id.is_some() || conn.pending_session_id.is_some();
     let request_session_id = chat_request_session_id(conn, requested_session_id);
-    let mut request = build_ws_chat_request(
-        content,
-        user_intent,
-        request_session_id,
-        agent_id,
-        model_selection,
-        skill_search,
-        allow_skills,
-        allow_skill_sources,
-        allow_tools,
-        enabled_tools,
-        context,
-        execution_budget,
-        explain,
-        interaction_mode,
-        plan_subtask_id,
-        is_plan_subtask,
-    );
+    message.session_id = request_session_id;
+    let mut request = build_ws_chat_request(message);
     request.forward_headers = ws_forward_headers(conn);
     let resolved = match resolve_or_create_chat_session(
         state,
@@ -1300,29 +1234,32 @@ async fn handle_shared_user_prompt_response(
         }
     }
 }
-fn build_ws_chat_request(
-    content: &str,
-    user_intent: Option<String>,
-    session_id: Option<String>,
-    agent_id: Option<String>,
-    model_selection: astra_turn_types::ModelSelection,
-    skill_search: Option<astra_core::SkillSearchSettings>,
-    allow_skills: Option<Vec<String>>,
-    allow_skill_sources: Option<Vec<String>>,
-    allow_tools: Option<Vec<String>>,
-    enabled_tools: Option<Vec<String>>,
-    context: Option<serde_json::Map<String, serde_json::Value>>,
-    execution_budget: Option<astra_services::runs::ExecutionBudget>,
-    explain: bool,
-    interaction_mode: Option<astra_services::runs::RequestedTurnInteractionMode>,
-    plan_subtask_id: Option<String>,
-    is_plan_subtask: Option<bool>,
-) -> astra_services::runs::ChatRequestData {
+fn build_ws_chat_request(message: WsChatMessage) -> astra_services::runs::ChatRequestData {
+    let WsChatMessage {
+        content,
+        completion_checks,
+        user_intent,
+        session_id,
+        agent_id,
+        model_selection,
+        skill_search,
+        allow_skills,
+        allow_skill_sources,
+        allow_tools,
+        enabled_tools,
+        context,
+        execution_budget,
+        explain,
+        interaction_mode,
+        plan_subtask_id,
+        is_plan_subtask,
+    } = message;
     astra_services::runs::ChatRequestData {
+        completion_checks,
         agent_profile_selection: None,
         admitted_agent_profiles: None,
         model_catalog_reader: None,
-        message: content.to_string(),
+        message: content,
         user_intent,
         parts: Vec::new(),
         attachments: Vec::new(),
@@ -2152,6 +2089,7 @@ mod tests {
         match msg {
             WsClientMessage::ChatMessage(message) => {
                 let WsChatMessage {
+                    completion_checks: _,
                     content,
                     user_intent,
                     session_id,
@@ -2216,6 +2154,7 @@ mod tests {
         match msg {
             WsClientMessage::ChatMessage(message) => {
                 let WsChatMessage {
+                    completion_checks: _,
                     content,
                     model_selection,
                     agent_id,
@@ -2254,35 +2193,37 @@ mod tests {
 
     #[test]
     fn ws_chat_request_preserves_runtime_request_fields() {
-        let request = build_ws_chat_request(
-            "hello",
-            Some("pure hello".into()),
-            Some("session-1".into()),
-            Some("agent-1".into()),
-            astra_turn_types::ModelSelection {
-                offering_id: "offer-gpt-5.4".into(),
-            },
-            Some(astra_core::SkillSearchSettings {
-                dynamic_surface: false,
-                min_catalog_size: 12,
-                surface_cap: 20,
-            }),
-            Some(vec!["plan".into()]),
-            Some(vec!["database".into()]),
-            Some(vec!["bash".into(), "read_file".into()]),
-            Some(vec!["web_search".into(), "web_fetch".into()]),
-            Some(serde_json::Map::from_iter([(
-                "cwd".to_string(),
-                serde_json::Value::String("/tmp".into()),
-            )])),
-            Some(astra_services::runs::ExecutionBudget {
-                initial_turns: Some(7),
-                hard_turn_limit: Some(11),
-            }),
-            true,
-            Some(astra_services::runs::RequestedTurnInteractionMode::Auto),
-            Some("sub-42".into()),
-            Some(true),
+        let check = |label: &str, command: &str| {
+            serde_json::json!({
+                "label": label, "command": command, "working_dir": null,
+                "depends_on": [], "timeout_secs": null, "authoritative": true
+            })
+        };
+        let declarations = serde_json::json!({
+            "stop": [check("root-check", "make check")],
+            "task_completed": [check("child-check", "make test")]
+        });
+        let message: WsClientMessage = serde_json::from_value(serde_json::json!({
+            "type": "message", "content": "hello", "user_intent": "pure hello",
+            "session_id": "session-1", "agent_id": "agent-1",
+            "model_selection": {"offering_id": "offer-gpt-5.4"},
+            "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20},
+            "allow_skills": ["plan"], "allow_skill_sources": ["database"],
+            "allow_tools": ["bash", "read_file"], "enabled_tools": ["web_search", "web_fetch"],
+            "context": {"cwd": "/tmp"},
+            "completion_checks": declarations,
+            "execution_budget": {"initial_turns": 7, "hard_turn_limit": 11},
+            "explain": true, "interaction_mode": "auto", "plan_subtask_id": "sub-42",
+            "is_plan_subtask": true
+        }))
+        .unwrap();
+        let WsClientMessage::ChatMessage(message) = message else {
+            panic!("chat message")
+        };
+        let request = build_ws_chat_request(*message);
+        assert_eq!(
+            serde_json::to_value(request.completion_checks.as_ref().unwrap()).unwrap(),
+            declarations
         );
 
         assert_eq!(request.message, "hello");
@@ -2834,6 +2775,7 @@ mod tests {
         match msg {
             WsClientMessage::ChatMessage(message) => {
                 let WsChatMessage {
+                    completion_checks: _,
                     model_selection,
                     context,
                     ..

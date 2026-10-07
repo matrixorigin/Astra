@@ -9002,6 +9002,7 @@ mod tests {
     {
         let engine = test_engine();
         let request = astra_services::runs::ChatRequestData {
+            completion_checks: None,
             agent_profile_selection: None,
             admitted_agent_profiles: None,
             model_catalog_reader: None,

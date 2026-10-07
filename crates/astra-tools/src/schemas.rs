@@ -2011,7 +2011,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "additionalProperties": false
                         },
                         "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Initial-slice hint: `light`≤10 turns, `normal`=agent default, `deep`=2× default. Prefer normal for scoped review/refactor work; use deep only when this child independently needs broad multi-step investigation. It never expands a smaller initial_turns hint."},
-                        "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)"},
+                        "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
                         "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
                         "work_item": {
                             "type": "object",
@@ -2089,7 +2089,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                     "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
                                     "max_output_tokens": {"type": "integer", "minimum": 1},
                                     "complexity": {"type": "string", "enum": ["light","normal","deep"]},
-                                    "isolated": {"type": "boolean"},
+                                    "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
                                     "allowed_tools": {"type": "array", "items": {"type": "string"}},
                                     "requested_model_policy": requested_model_policy_schema(),
                                     "reasoning": fanout_reasoning_schema()
@@ -2106,7 +2106,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
                                 "max_output_tokens": {"type": "integer", "minimum": 1},
                                 "complexity": {"type": "string", "enum": ["light","normal","deep"]},
-                                "isolated": {"type": "boolean"},
+                                "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
                                 "allowed_tools": {"type": "array", "items": {"type": "string"}},
                                 "requested_model_policy": requested_model_policy_schema(),
                                 "reasoning": fanout_reasoning_schema()

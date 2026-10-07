@@ -17,7 +17,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 async fn callback_through_pipeline(
     fixture_tool: &str,
     fail_reconnect: bool,
-) -> (ToolResultRequest, Value, ToolCallRecord) {
+) -> (
+    ToolResultRequest,
+    Value,
+    ToolCallRecord,
+    Vec<crate::mcp_client::CallLogEntry>,
+) {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/tools/result"))
@@ -111,7 +116,6 @@ async fn callback_through_pipeline(
         }])
         .await;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].status, "failed", "{:?}", results[0]);
     if lost_ack {
         assert_eq!(std::fs::read_to_string(&counter).unwrap(), "applied\n");
     }
@@ -233,7 +237,7 @@ async fn callback_through_pipeline(
         record.effective_disposition(),
         ToolCallDisposition::Executed
     );
-    assert!(!record.ok);
+    assert_eq!(record.ok, callback.status == "completed");
     assert_eq!(
         record.tool_call_id.as_deref(),
         Some(callback.request_id.as_str())
@@ -243,14 +247,50 @@ async fn callback_through_pipeline(
         serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
     let mut message = messages.into_iter().find(|m| m["role"] == "tool").unwrap();
     astra_turn_core::tool::result::advisory::project_advisories(&mut message);
-    (callback, message, record)
+    let calls = original_connection
+        .call_log
+        .read()
+        .await
+        .iter()
+        .cloned()
+        .collect();
+    (callback, message, record, calls)
+}
+
+#[tokio::test]
+async fn mcp_native_delegate_executes_through_cli_callback_and_shared_pipeline() {
+    let (callback, message, record, calls) = callback_through_pipeline("delegate", false).await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].tool, "delegate");
+    assert!(calls[0].success);
+    assert_eq!(callback.status, "completed");
+    assert_eq!(
+        callback.tool_result_fields.as_ref().unwrap()["mcp_call_dispatched"],
+        true
+    );
+    assert!(record.ok);
+    assert_eq!(record.name, "mcp__result_path__delegate");
+    assert!(
+        message["content"]
+            .as_str()
+            .unwrap()
+            .contains("mcp-native-delegate-result")
+    );
+    assert!(
+        record
+            .result_full
+            .as_deref()
+            .unwrap()
+            .contains("mcp-native-delegate-result")
+    );
 }
 
 #[tokio::test]
 async fn mcp_lost_ack_reconnect_outcomes_preserve_uncertainty_through_callback_and_pipeline() {
     for fail_reconnect in [false, true] {
-        let (callback, message, record) =
+        let (callback, message, record, _) =
             callback_through_pipeline("apply_then_drop_ack", fail_reconnect).await;
+        assert_eq!(callback.status, "failed");
         let fields = callback.tool_result_fields.unwrap();
         assert_eq!(fields["error_kind"], "tool_outcome_unknown");
         assert_eq!(fields["dispatch_certainty"], "unknown");
@@ -291,7 +331,9 @@ async fn mcp_lost_ack_reconnect_outcomes_preserve_uncertainty_through_callback_a
 
 #[tokio::test]
 async fn mcp_acknowledged_rpc_error_preserves_correction_through_callback_and_pipeline() {
-    let (callback, message, record) = callback_through_pipeline("reject_parameters", false).await;
+    let (callback, message, record, _) =
+        callback_through_pipeline("reject_parameters", false).await;
+    assert_eq!(callback.status, "failed");
     let fields = callback.tool_result_fields.unwrap();
     assert_eq!(fields["error_kind"], "tool_invalid_args");
     assert_eq!(fields["dispatch_certainty"], "dispatched");
@@ -319,7 +361,7 @@ async fn mcp_acknowledged_rpc_error_preserves_correction_through_callback_and_pi
 
 #[tokio::test]
 async fn mcp_is_error_response_remains_tool_failure_through_callback_and_pipeline() {
-    let (callback, message, record) = callback_through_pipeline("tool_failure", false).await;
+    let (callback, message, record, _) = callback_through_pipeline("tool_failure", false).await;
     assert_eq!(callback.status, "failed");
     assert!(callback.output.contains("fixture tool failure"));
     assert_ne!(

@@ -48,23 +48,40 @@ criteria:
     path: /target_count
     equals: 3
   - type: session_event_count
-    event_type: agent_terminated
+    event_type: agent_spawned
     min: 3
+    max: 3
+    json_match:
+      path: /metadata/fanout_slot/target_count
+      equals: 3
+      unique_by: /metadata/run_id
+      result_ids_match:
+        tool_name: agent_fanout
+        event_parent_run_id_path: /metadata/parent_run_id
+        result_array_path: /agents
+        item_id_path: /run_id
   - type: journal_tool_json
     name: agent_fanout
     document: result
     path: /fanout/accepted
     equals: 3
-  - type: journal_tool_json
-    name: agent_fanout
-    document: result
-    path: /fanout/terminal
-    equals: 3
-  - type: journal_tool_json
-    name: agent_fanout
-    document: result
-    path: /provenance/all_slots_delivered
-    equals: true
+  # Start returns a launch receipt. Prove each exact slot's complete result
+  # passed from staging into its owning parent's request before finalization.
+  - type: session_child_result_adopted
+    allow_get_result: true
+    spawn_match:
+      path: /metadata/fanout_slot/slot_index
+      equals: 0
+  - type: session_child_result_adopted
+    allow_get_result: true
+    spawn_match:
+      path: /metadata/fanout_slot/slot_index
+      equals: 1
+  - type: session_child_result_adopted
+    allow_get_result: true
+    spawn_match:
+      path: /metadata/fanout_slot/slot_index
+      equals: 2
   - type: journal_tool_outcome_count
     name: agent_fanout
     ok: false
@@ -78,6 +95,9 @@ criteria:
     name: agent
     min: 0
     max: 0
+    document: arguments
+    path: /action
+    equals: spawn
   - type: journal_tool_call_count
     name: tool_search
     min: 0

@@ -90,6 +90,51 @@ async fn persist_request_parent(run_engine: &RunEngine, request: &DelegationRequ
         )
         .await
         .expect("nested cancellation fixture should persist its durable parent");
+    let binding = astra_runtime::server::tool_transport::ExecutionBindingSnapshot::inferred(
+        astra_runtime::server::tool_transport::WorkspaceBinding::none(),
+        astra_runtime::server::tool_transport::ExecutorBinding::server_control_plane(),
+    );
+    let events: Vec<_> = ["workspace_bound", "executor_bound"]
+        .into_iter()
+        .map(|kind| {
+            let mut fields = astra_runtime::server::tool_transport::binding_event_fields(
+                &binding.workspace,
+                &binding.executor,
+            );
+            fields.insert("type".into(), serde_json::json!(kind));
+            fields.insert("run_id".into(), serde_json::json!(request.parent_run_id));
+            fields.insert("session_id".into(), serde_json::json!(request.session_id));
+            fields.insert(
+                "idempotency_key".into(),
+                serde_json::json!(format!(
+                    "run-start:{}:{}-bound",
+                    request.parent_run_id,
+                    if kind == "workspace_bound" {
+                        "workspace"
+                    } else {
+                        "executor"
+                    }
+                )),
+            );
+            fields.insert("runtime".into(), serde_json::Value::Null);
+            if kind == "workspace_bound" {
+                fields.insert(
+                    "completion_checks".into(),
+                    serde_json::json!(astra_turn_types::StopHookObligations::default()),
+                );
+            }
+            serde_json::Value::Object(fields)
+        })
+        .collect();
+    run_engine
+        .append_events_batch(
+            &request.user_id,
+            &request.session_id,
+            &request.parent_run_id,
+            &events,
+        )
+        .await
+        .unwrap();
 }
 
 /// Mock executor whose `execute()` itself opens two additional nesting levels

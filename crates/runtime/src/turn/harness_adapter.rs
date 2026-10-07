@@ -135,7 +135,6 @@ mod enabled {
         pub interruption: Option<&'a astra_turn_core::interruption::InterruptionRecord>,
         pub tool_records: &'a [astra_services::session_journal::ToolCallRecord],
         pub read_only_round_streak: usize,
-        pub delegations: u32,
         pub recursion_depth: u8,
         pub consecutive_errors: u32,
         pub causal_chain_id: Option<&'a str>,
@@ -174,7 +173,6 @@ mod enabled {
             interruption: state.interruption.as_ref(),
             tool_records: &state.stall.tool_call_records,
             read_only_round_streak: state.stall.circuit_breaker.consecutive_read_only(),
-            delegations: state.delegations_this_turn,
             recursion_depth: state.recursion_depth,
             consecutive_errors: state.error_recovery.consecutive_same_error,
             causal_chain_id: state.canonical_turn_chain_id.as_deref(),
@@ -278,7 +276,6 @@ mod enabled {
             last_tool_result_class,
             read_only_round_streak,
             redundant_read_count,
-            delegations_this_turn: input.delegations,
             recursion_depth: input.recursion_depth,
             consecutive_errors: input.consecutive_errors,
             captured_at_unix_millis: now,
@@ -538,12 +535,10 @@ mod enabled {
         #[test]
         fn capture_snapshot_delegation_and_error_fields() {
             let mut state = make_state();
-            state.delegations_this_turn = 3;
             state.recursion_depth = 2;
             state.error_recovery.consecutive_same_error = 4;
 
             let snap = capture_snapshot(&state, 0);
-            assert_eq!(snap.delegations_this_turn, 3);
             assert_eq!(snap.recursion_depth, 2);
             assert_eq!(snap.consecutive_errors, 4);
         }
